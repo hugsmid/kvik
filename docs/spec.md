@@ -162,7 +162,7 @@ a different boot. The rules apply in this order:
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
 | Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, and when the cursor, or the `start` position of a newly registered consumer, is below a lost range (§3). With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
 | Future facts | Delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. |
-| Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state, is never fed to an operator or condition and must not be acted on. |
+| Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
 | Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
 
 ## 5. Summary tree
@@ -209,13 +209,13 @@ model must prove this against direct computation (invariant 6), including empty 
 nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
-A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when
-more than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still
-awaiting its time (§4), so a forward jump of the system clock cannot make a series stale. **Event-time staleness**
-applies to history and to every window evaluation (§6); live staleness applies only to live state and stale-for
-conditions: a series is stale at event time x when x > (`t` of its latest reading before x that is not
-bad quality) + S. Coverage stops at that point and time-weighted results exclude the gap. Every windowed result
-carries coverage in seconds and as a fraction of the window.
+A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when more
+than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still awaiting
+its time or an outranked fact (§4), so a forward jump of the system clock cannot make a series stale. **Event-time
+staleness** applies to history and to every window evaluation (§6): a series is stale at event time x when x > (`t`
+of its latest reading before x that is not bad quality) + S. Coverage stops at that point and time-weighted results
+exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the window. Live staleness
+applies only to live state and stale-for conditions.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
@@ -348,9 +348,9 @@ gap until they are re-ingested.
 ## 9. Edge cases
 | # | Case | Rule | Test |
 |---|---|---|---|
-| 1 | Same `(series, t)`, different value | New fact; becomes current unless outranked (row 2d); old one a revision; minute path recomputed | model + property |
+| 1 | Same `(series, t)`, different value | New fact; unless outranked (row 2d), becomes current, the old one becomes a revision and the minute path is recomputed | model + property |
 | 2 | Same `(series, t)`, identical to any fact in its history | Dropped and counted (§2.4) | unit |
-| 2a | A, then B, then a replay of A | Replay dropped; B stays current. With `revise`, A is recorded and current | property |
+| 2a | Series not versioned: A, then B, then a replay of A | Replay dropped; B stays current. With `revise`, A is recorded and current | property |
 | 2b | Identical repeat whose current fact is off every local tier | Recorded, `duplicates_unchecked` | unit |
 | 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
 | 2d | Versioned series: a fact with a lower `changed_at` than the current one and a new value | Recorded, delivered flagged `outranked`, counted; no node, live-state or condition change | property |
