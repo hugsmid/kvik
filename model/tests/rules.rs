@@ -346,10 +346,11 @@ fn consumer_model() -> (Model, SeriesId) {
 }
 
 /// §6 Edge stretches: the state transition from the reading before a window
-/// to its first reading inside is credited to the window, like the counter step.
+/// to its first reading inside is credited to the window, like the counter step,
+/// even when that reading is more than S before the window start.
 #[test]
 fn s6_leading_edge_credits_state_transition() {
-    let p = Params::new(Kind::State, None);
+    let p = Params::new(Kind::State, 2 * SECOND);
     let rs: Vec<(Nanos, Value)> = vec![
         (T0, Value::Str("idle".into())),
         (T0 + 10 * SECOND, Value::Str("running".into())),
@@ -364,7 +365,7 @@ fn s6_leading_edge_credits_state_transition() {
 /// §6 Windows: every window is evaluated in event time against `now`. After a
 /// forward jump of the system clock, `now` moves an hour ahead at once, so a
 /// device-stamped series' 5-minute rolling window is empty although the series
-/// keeps reporting. (The clock offset in health is not modelled.)
+/// keeps reporting. (Clock jumps in health are not modelled.)
 #[test]
 fn s6_rolling_window_in_event_time_after_clock_jump() {
     let (mut m, s) = consumer_model(); // S = 10 s

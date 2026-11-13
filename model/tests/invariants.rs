@@ -271,6 +271,28 @@ proptest! {
         prop_assert_eq!(whole, increase(&oracle::window(&p, &rs, start, end, now)));
     }
 
+    /// 17. For a state series, the transitions over adjacent windows that
+    /// partition a span add up to those over the span, whatever S.
+    #[test]
+    fn inv17_state_transitions_add_over_adjacent_windows(
+        p in arb_params().prop_map(|mut p| { p.kind = Kind::State; p }),
+        rs in arb_readings(Kind::State, 16),
+        mut cuts in proptest::collection::vec(arb_offset(), 2..6),
+        n in arb_offset(),
+    ) {
+        cuts.sort_unstable();
+        let now = T0 + n;
+        let tree = SeriesTree::build(p, &rs);
+        let (start, end) = (T0 + cuts[0], T0 + cuts[cuts.len() - 1]);
+        let whole = transitions(&tree.window(start, end, now));
+        let parts: u64 = cuts
+            .windows(2)
+            .map(|w| transitions(&tree.window(T0 + w[0], T0 + w[1], now)))
+            .sum();
+        prop_assert_eq!(parts, whole);
+        prop_assert_eq!(whole, transitions(&oracle::window(&p, &rs, start, end, now)));
+    }
+
     /// 18. No time is credited past `now`, nor past a reading's staleness limit:
     /// coverage never exceeds the part of `[start, min(end, now))` that lies
     /// within S after some reading at or before `now`.
@@ -366,6 +388,13 @@ fn increase(n: &Node) -> Exact {
     match &n.body {
         Body::Counter { increase, .. } => increase.clone(),
         _ => unreachable!("counter node"),
+    }
+}
+
+fn transitions(n: &Node) -> u64 {
+    match &n.body {
+        Body::State { transitions, .. } => *transitions,
+        _ => unreachable!("state node"),
     }
 }
 

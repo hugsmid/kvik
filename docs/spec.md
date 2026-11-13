@@ -32,10 +32,8 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 
 Series definitions, parameter changes (with an effective event time), aliases and retirements are log entries.
 A parameter applies to readings with `t` at or after its effective time. A definition entry always has a lower
-position than the series' first reading (the same batch is allowed). Every entry that is not a fact (definition,
-parameter, alias, retirement, routing change) is also appended, with its position, to a registry file that never
-leaves the hot tier; it is synced after the batch's log sync and before the mark is updated. Recovery removes
-registry-file entries above the recovered end of the log and appends those that the log holds and the file lacks.
+position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
+registry file that never leaves the hot tier.
 
 **Retirement** is effective at `t_r`: facts with `t < t_r` are still accepted; facts with `t ≥ t_r` are refused
 and counted. The old id stays reachable by id.
@@ -63,7 +61,7 @@ and counted. The old id stays reachable by id.
 | As-of P | the current view over facts with position ≤ P |
 | As-of time T | as-of P, where P is the last position whose batch `commit_time` ≤ T |
 | History | all facts for `(series, t)` in position order |
-| Live state | per series, the current fact with the greatest `t` among due facts (§5.4) whose engine-assigned quality is not bad |
+| Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad |
 
 A fact superseded in the current view is a **revision**.
 
@@ -106,11 +104,27 @@ interval. A healthy unchanged series is therefore never stale, and every derived
 | Group commit | While a sync is in flight, arriving readings queue and form the next batch. No added delay when idle (optional linger, default 0). |
 | Segments | Preallocated at creation (64 MiB). The directory is synced after creating, sealing or renaming a file. |
 | Sealing | At 64 MiB or 5 minutes (both configurable), whichever first; an empty segment is not sealed. Sealed segments are immutable and eligible for backup. Compaction never removes a log segment (§8). |
-| Recovery | Scan every unsealed segment to its end. A missing, unreadable or half-updated mark is treated as a different boot. The rules apply in this order. (i) **Same boot id as the mark:** truncate everything after the mark (it was never synced, never acknowledged, never delivered; adapters replay). (ii) **Corruption:** an invalid region that lies below a readable, complete mark of any boot, or that is followed by a complete batch, was synced (the mark is written only after a sync returns, and a batch only after the previous batch's sync) and is corruption, not a torn tail. Later complete batches are kept and nothing is overwritten; the byte and position range, from the last valid batch to the next valid batch or, at the tail, to the mark's last position, is recorded in the manifest as a **lost range** and reported as `data_lost`; its positions are not reused. (iii) **Different boot id** (the machine rebooted, the page cache is gone): any remaining invalid tail is torn and truncated. After a reboot, recovery syncs the segment and directory and writes the mark with the current boot id; then it resumes. If that sync fails, stay read-only and leave the old mark. **After a lost range** recovery always resumes. Registry-file entries whose positions lie in the range are appended to the log again as recovered entries, carrying their original positions, at which they take effect. If the registry file has lost them too, a kept fact whose series id has no definition is kept but excluded from views, tree and delivery, and counted (`undefined_series`), until a definition naming that id is submitted; such a definition is accepted only for an undefined id and takes effect from its earliest fact. New ids are assigned above every id seen. Tree files and the revised-key index whose checkpoint is at or above the range's start are labelled derived-unverified and recomputed from the remaining facts as in §8 Restore step 4; the recomputed value wins. A consumer whose cursor is below a lost range receives `resync`. |
+| Recovery | Below this table. |
 | Write or sync failure | On the log, manifest, cursor or registry files: stop accepting writes, mark read-only, fatal health; never retry on the same handle; recovery by restart. After a failed sync the batch's fate is unknown: a restart on the same boot truncates it; after a reboot recovery may keep it (row 7a). It was never acknowledged, so adapters may replay it, which the duplicate rule absorbs. A failed compaction, tiering or tree write abandons that job, deletes its partial output and degrades health. |
 | Disk space | Low mark: free space below 5 % of the filesystem or 2 GiB, whichever is larger → compaction pauses, health degraded. Tiering and eviction, which free space, continue at every mark. Critical: below 512 MiB free → ingest waits (back-pressure). Reads continue. Space is never freed by deleting facts. |
 | Back-pressure | Ingest is a bounded queue (default 65 536 readings); a full queue makes adapter emits wait; the wait is measured. |
 | Single writer | Exclusive `flock` on the store directory; readers never take it. |
+
+**Recovery.** Every unsealed segment is scanned to its end. A missing, unreadable or half-updated mark is treated as
+a different boot. The rules apply in this order:
+1. **Same boot id as the mark:** truncate everything after the mark. It was never synced, never acknowledged and
+   never delivered; adapters replay.
+2. **Corruption:** an invalid region that lies below a readable, complete mark of any boot, or that is followed by a
+   complete batch, was synced (the mark is written only after a sync returns, and a batch only after the previous
+   batch's sync), so it is corruption, not a torn tail. Later complete batches are kept and nothing is overwritten.
+   The byte and position range, from the last valid batch to the next valid batch or, at the tail, to the mark's last
+   position, is recorded in the manifest as a **lost range** and reported as `data_lost` for that range, which does
+   not make the store read-only. Its positions are not reused. A consumer whose cursor is below a lost range
+   receives `resync`.
+3. **Different boot id** (the machine rebooted, the page cache is gone): any remaining invalid tail is torn and is
+   truncated.
+4. After a reboot, recovery syncs the segment and directory and writes the mark with the current boot id, then
+   resumes. If that sync fails, the engine stays read-only and leaves the old mark.
 
 ## 4. Delivery (funnels)
 | Rule | |
@@ -125,7 +139,7 @@ interval. A healthy unchanged series is therefore never stale, and every derived
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
 | Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8) and when the cursor is older than the oldest local log segment. It is not flagged `replayed`; acting on it is acting on the present. |
-| Future facts | Delivered at commit, flagged `future`; ignored by live state and staleness until due (§5.4), and by windows until `t ≤ now`. |
+| Future facts | Delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. |
 | Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
 
 ## 5. Summary tree
@@ -135,7 +149,7 @@ interval. A healthy unchanged series is therefore never stale, and every derived
 | 1 second | **Never.** Computed from facts on demand (window edges, drill-down below 1 minute) | — |
 | 1 minute | Yes, aligned to UTC, only where there is data | per-series tree files on hot; never moves (§12 D7) |
 | 15 minutes | Yes, aligned to UTC, only where there is data | per-series tree files on hot; never moves |
-| Local calendar day/month | Yes, for spans whose edges fall on 15-minute boundaries (§5.7), assembled from 15-minute nodes in the site zone in force (from facts, for a series without a stored 15-minute level); an input to calendar results, not the result (§5.7) | per-series calendar file on hot |
+| Local calendar day/month | Yes, for spans whose edges fall on 15-minute boundaries (§5.7), assembled from 15-minute nodes in the site zone in force; an input to calendar results, not the result (§5.7) | per-series calendar file on hot |
 
 - **Density rule:** a level is stored for a series only where its nodes summarise many facts: the 1-minute
   level only for series whose expected interval is 5 s or shorter, the 15-minute level only for 60 s or shorter.
@@ -172,19 +186,10 @@ model must prove this against direct computation (invariant 6), including empty 
 nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
-A reading is valid for at most S. A fact is **due** at the monotonic instant of its commit plus
-max(0, `t` − `now` at commit), with `now` as in §6; while the clock is unsynchronised (§2.5) the delay is zero. This
-is the only meaning of maturity and of falling due, whether or not the fact is flagged `future`. Windows keep
-`t ≤ now` (§6), so after a forward clock jump a window may include a fact that is not yet in live state.
-
-**Live staleness** is measured on the monotonic clock. Each series has a high-water mark H, the greatest `t` its
-live state has held, and a staleness reference R. When a fact with `t` above H becomes live state, H rises; unless
-the fact is flagged `late`, R becomes max(`received_at`, `t`) of that fact and the staleness clock restarts at that
-instant. A revision at the same `t`, a fall back to an earlier `t` and a return to it, and a late fact do not restart
-it. The series is stale when more than S of monotonic time has passed since the restart. H and R are functions of
-the log in position order, stored with the checkpoint and replayed after it. After a process restart the elapsed
-time starts at max(0, `now` − R), or at zero while the clock is unsynchronised. **Event-time staleness** applies to
-history only: a series is stale at event time x when x > (`t` of its latest reading before x that is not
+A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when
+more than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still
+awaiting its time (§4), so a forward jump of the system clock cannot make a series stale. **Event-time staleness**
+applies to history only: a series is stale at event time x when x > (`t` of its latest reading before x that is not
 bad quality) + S. Coverage stops at that point and time-weighted results exclude the gap. Every windowed result
 carries coverage in seconds and as a fraction of the window.
 
@@ -225,7 +230,7 @@ carries coverage in seconds and as a fraction of the window.
 | Rule | |
 |---|---|
 | Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value: `last`, avg, integral and time-in-state use it; `min`, `max`, `count` and rate are empty. |
-| Windows | Rolling (any length) and calendar (since local midnight, this month) in the site zone; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`; only live staleness uses the monotonic clock (§5.4). The amount by which `now` is ahead of the system clock is reported in health. |
+| Windows | Rolling (any length) and calendar (since local midnight, this month) in the site zone; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: window bounds are event times, whatever the monotonic clock says. The size of system clock jumps is reported in health. |
 | Window end | `now` = an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
 | Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window for the newest edge, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past `now` are never used whole. |
 | Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, now, last.t + S). Time is never credited past `now`. |
@@ -259,7 +264,7 @@ carries coverage in seconds and as a fraction of the window.
 - **Leases:** a lease file holds the epoch, the boot id (from the same source as the mark's) and a refresh counter
   that the reader increments at every refresh. The writer expires a lease when its counter has not changed for
   1 hour of the writer's monotonic clock since the writer first observed that value; at writer start, every lease of
-  the current boot counts as first observed then. Only a lease with an earlier boot id is void.
+  the current boot counts as first observed then. A lease with a different boot id is void.
 - **Readers** take an epoch, write a lease file naming it, and refresh both at least every 30 minutes. A reader
   needs nothing from the writer's memory: it reads via the manifest, the documented layout, tree files and log
   segments up to the durable mark.
@@ -280,7 +285,7 @@ carries coverage in seconds and as a fraction of the window.
 | Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. Current detail and the stored tree stay. |
 | Fill pressure | Above 70 % fill, verified sealed log segments leave first, then the oldest current raw detail (verified first, fetched on demand); the tree, chunk indexes and revised-key index never move (§12 D4). |
 | Behind consumers | A consumer whose cursor is older than the oldest local log segment receives `resync`, not a replay. The engine never downloads from deep for catch-up. |
-| Corrupt block | File quarantined; the engine fetches the copy from cold, else deep, verifies the plaintext hash and swaps it in by a manifest record. If no other tier holds a verified copy, the file is compacted again from its kept inputs (§7), verified, and swapped in by one manifest record that retires the quarantined file. Queries over the range return an error until then. Never repaired in place. Because inputs are kept until a file is verified elsewhere (§7), the only single copies are the open log segment and a sealed log segment not yet uploaded and not yet compacted: corruption there loses that range, recorded and reported as in §3 Recovery. Such a sealed segment stays in place; one manifest record records the lost byte and position range, replaces the file's hash of record with the hash of the file as found, and lifts the quarantine. Readers, compaction and backup skip the recorded range. An optional local mirror path for sealed log segments (configuration `mirror_path`, off by default) closes this window for sealed segments. |
+| Corrupt block | File quarantined; the engine fetches the copy from cold, else deep, verifies the plaintext hash and swaps it in by a manifest record. If no other tier holds a verified copy, the file is compacted again from its kept inputs (§7), verified, and swapped in by one manifest record that retires the quarantined file. Queries over the range return an error until then. Never repaired in place. Because inputs are kept until a file is verified elsewhere (§7), the only single copies are the open log segment and a sealed log segment not yet uploaded and not yet compacted: corruption there loses that range, recorded and reported as in §3 Recovery. An optional local mirror path for sealed log segments (configuration `mirror_path`, off by default) closes this window for sealed segments. |
 | Upload stalled | Files queue locally, health degraded, nothing evicted. |
 | No deletion | Every fact is kept forever in at least the deep tier; the engine has no purge. |
 | Re-ingest | Exported or foreign data goes through the normal ingest path, in batches. |
@@ -315,8 +320,8 @@ A disaster loses facts committed after the last uploaded sealed file; they may a
 | 8 | Crash after sync, before delivery | Delivered on restart from each consumer's cursor | kill loop |
 | 9 | Crash during compaction | Output unpublished and discarded; inputs intact | kill loop |
 | 10 | Crash around the manifest record | Before: output discarded. After: inputs retired. Never both live | kill loop |
-| 11 | Torn or corrupt block in a sealed file | Quarantine; fetch from cold/deep, else compact again from kept inputs; verify, swap by manifest; errors meanwhile. Log segment with no other copy: range recorded as lost, `data_lost`, quarantine lifted | fault injection |
-| 11a | Corrupt block inside the open segment, or below an old boot's mark after a power loss | Later complete batches kept; range recorded as lost, `data_lost`; positions not reused; registry entries in it re-appended from the registry file; `resync` for cursors below it | fault injection |
+| 11 | Torn or corrupt block in a sealed file | Quarantine; fetch from cold/deep, else compact again from kept inputs; verify, swap by manifest; errors meanwhile. Log segment with no other copy: range recorded as lost, `data_lost` | fault injection |
+| 11a | Corrupt block inside the open segment, or below an old boot's mark after a power loss | Later complete batches kept; range recorded as lost, `data_lost`; positions not reused; `resync` for cursors below it | fault injection |
 | 12 | Sync returns an error | Read-only, fatal; a restart on the same boot truncates to the durable mark; after a reboot the batch may be kept (never acknowledged) | fault injection |
 | 13 | Disk fills | Degrade, then ingest waits; compaction ENOSPC abandons the job; nothing deleted | fault injection |
 | 14 | Consumer slower than the stream | Catch-up from the log after the last position enqueued, hand-over to live without gap or repeat | load test |
@@ -334,7 +339,7 @@ A disaster loses facts committed after the last uploaded sealed file; they may a
 | 23 | Series renamed | Alias entry; id and data unchanged | unit |
 | 24 | Unit, kind or scale changes | New series; old one retired | unit |
 | 25 | Series retired at `t_r` | Facts with `t < t_r` accepted; later refused and counted | integration |
-| 26 | Reader holds an old epoch | Its files stay while its lease names that epoch and its counter keeps changing; leases of an earlier boot are void | integration |
+| 26 | Reader holds an old epoch | Its files stay while its lease names that epoch and its counter keeps changing; leases of a different boot are void | integration |
 | 27 | Bucket unreachable for days | Queue grows, no eviction, degraded health | fault injection |
 | 28 | Restore onto an empty disk | New generation; queries at ≥ 1 min from the checkpoint; detail back-fills and verifies the checkpoint | restore drill |
 | 29 | Late fact for a minute whose detail is not local | Recorded; node `summary_stale` until fetched | model |
@@ -355,14 +360,12 @@ A disaster loses facts committed after the last uploaded sealed file; they may a
 5. Every stored node is bitwise equal to its canonical computation over the current view of its span.
 6. `merge` is associative with the empty node as identity and agrees with direct computation (tolerance §5.6).
 7. A window result equals direct computation over the current view at evaluation time (tolerance §5.6).
-8. Rebuilding derived structures from the log entries that remain yields exactly the live structures, once
-   verification after a lost range has finished.
+8. Rebuilding derived structures from log entries yields exactly the live structures.
 9. Compaction, tiering and backup preserve the set of positions outside lost ranges, each with identical content;
    restore preserves the positions held in sealed, backed-up files.
 10. No operation removes a durable fact. The only loss short of a disaster is corruption of a log segment, open or
     sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
-    `data_lost`. A corrupt tail above the last persisted mark after a power loss cannot be told from a torn tail and
-    is not reported.
+    `data_lost`.
 11. No reader or consumer observes a position beyond the durable mark.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
 13. A cursor or latch on disk is never ahead of the consumer's confirmation.
@@ -380,7 +383,7 @@ A disaster loses facts committed after the last uploaded sealed file; they may a
 | Ingest | `emit(reading, t_source, intent: normal | revise)` → recorded(position) / duplicate / refused(reason); waits under back-pressure |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; how far `now` is ahead of the system clock; degraded/fatal states; `data_lost`, a state of its own, latched per lost range until an operator acknowledges it by a manifest record (the range stays listed for good); it does not make the store read-only, and an as-of P query inside a lost range answers as of the range's start, flagged `lost_range` |
+| Health | counters (duplicates, unchecked, refused, regressions, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; the size of system clock jumps measured against the monotonic clock; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only |
 
 Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.
