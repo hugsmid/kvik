@@ -138,6 +138,12 @@ The specification wins where the documents differ. These follow from it, for the
   drill mode; a consumer can register with its last confirmed position after a restore, so the application must
   persist its confirmed positions; restore returns the restored end; health names a writer superseded by a higher
   generation; re-ingest needs an entry point; a store's identity across restores and drills (§8).
+- **F-9.** `format.md`: a fact row in a versioned series carries `changed_at` (u64); a series definition carries the
+  `versioned` flag and `changed_at kind`; the revised-key index carries `changed_at`; a version index file (highest
+  `changed_at` per key, hot, backed up) is needed; exports carry `changed_at` (§2.1–§2.4, §8).
+- **F-10.** `api.md`: `emit` takes `changed_at`; refusals gain `changed_at` missing, `changed_at` unexpected and
+  `revise` on a versioned series; deliveries gain the flags `outranked` and `rank_unknown`; health gains
+  `outranked_on_arrival` (§2.2, §2.4, §4, §8).
 
 ## Settled
 | ID | Question | Settled in |
@@ -170,7 +176,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-27 | Where consumer cursors come from after a restore | §8 Continuous backup, §8 Restore step 2, §4 Resync |
 | Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b (open parts: Q-37) |
 | Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (open parts: Q-38, Q-39) |
-| Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2 |
+| Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore steps 2–3; versioned series (§2.1–§2.4, §4, §5.6, §7, invariants 4, 15 and 19, rows 2c and 2d), so that a replay never reverts a correction |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
 
@@ -204,6 +210,7 @@ implement:
 | Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments | `compaction_crash_after_publish_resumes_retirement` |
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | Files leave hot after the grace period; old epochs read remotely | `reader_epoch_survives_grace_then_reads_remotely` |
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
+| Versioned series | §2.1–§2.4, §4, §5.6, §7, §8 Restore, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |

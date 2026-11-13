@@ -29,6 +29,8 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 | `record on change` | optional; see §2.6 |
 | `wrap_at`, `reset_ceiling` | counters only; §5.5. `reset_ceiling` default 10 % |
 | `lateness bound` | default 5 min; §2.2 |
+| `versioned` | optional, for sources that revise readings they have already published; fixed for the life of the series (a change is a new series, and history may be re-ingested with `changed_at`). Every reading of a versioned series carries `changed_at` (§2.2); readings of other series never do |
+| `changed_at kind` | versioned series only: `time` (UTC nanoseconds) or `version` (an opaque counter); fixed for the life of the series; used only to type exports |
 
 Series definitions, parameter changes (with an effective event time), aliases and retirements are log entries.
 A parameter applies to readings with `t` at or after its effective time. A definition entry always has a lower
@@ -45,7 +47,13 @@ and counted. The old id stays reachable by id.
   gap-free within a generation across restarts, except for lost ranges recorded in the manifest (§3); a restore
   starts a new generation (§8). Consumers see only the positions of facts routed to them, so gaps between delivered
   positions are normal.
-- Fact: `(series, t, position, received_at, value, quality, flags)`.
+- Fact: `(series, t, position, received_at, value, quality, flags)`, and `changed_at` in a versioned series.
+- `changed_at`: a u64 from the source, its revision time or version, higher for each revision of a reading and the
+  same on every replay of one revision (a time taken at replay is not permitted). It is compared as an unsigned
+  integer and never with `t`, `received_at` or any clock. A reading on a versioned series without it, or with it on
+  any other series, is refused and counted. A source whose versions are coarser than its revisions can still have a
+  correction with the same `changed_at` reverted (§2.4).
+- **Rank:** a fact's position, or in a versioned series `(changed_at, position)`, compared lexicographically.
 - `t`: event time, UTC nanoseconds, from the adapter. The adapter declares `t_source: device | host`.
 - `received_at`: host clock at commit. `commit_time`: per batch, `max(received_at, previous commit_time)`.
 - `quality`: good / estimated / suspect / bad, from best to worst. The adapter supplies it; the engine may lower
@@ -59,13 +67,14 @@ and counted. The old id stays reachable by id.
 ### 2.3 Views
 | View | Definition |
 |---|---|
-| Current | for each `(series, t)`, the fact with the highest position |
+| Current | for each `(series, t)`, the fact of highest rank (§2.2) |
 | As-of P | the current view over facts with position ≤ P |
 | As-of time T | as-of P, where P is the last position whose batch `commit_time` ≤ T |
-| History | all facts for `(series, t)` in position order |
+| History | all facts for `(series, t)` in position order, each with its `changed_at` in a versioned series |
 | Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad |
 
-A fact superseded in the current view is a **revision**.
+A fact that is not current for its key is a **revision**. In a versioned series a fact can be a revision from the
+moment it is recorded: it is **outranked** when a fact of higher rank for its key is already recorded.
 
 ### 2.4 Duplicates
 - An arriving fact is a **duplicate** if its `(series, t, value)` and adapter-supplied quality equal those of *any*
@@ -73,16 +82,26 @@ A fact superseded in the current view is a **revision**.
   by the engine are not part of identity. Values compare bitwise (`0.0` ≠ `-0.0`). Duplicates are not recorded and
   consume no position; they are counted per series (`duplicates_dropped`). Adapters may replay freely: a replay can
   no longer revert a correction.
-- A fact submitted with `revise` intent bypasses the check (deliberate return to an earlier value).
+- In a versioned series identity also includes `changed_at`. A fact whose `changed_at` is above that of every fact
+  in its key's history is never a duplicate, even when its value returns to an earlier one.
+- A fact submitted with `revise` intent bypasses the check (deliberate return to an earlier value). On a versioned
+  series `revise` is refused and counted; a return to an earlier value there is a fact with a higher `changed_at`.
 - A reading recorded without a value (§2.5) is compared as "no value", with its adapter-supplied quality.
 - Identity includes `t`: the same value one nanosecond later is a different fact and is recorded.
 - **Revised-key index** (hot tier, never moves): for every `(series, t)` with more than one recorded fact, the exact
-  value and adapter-supplied quality of each. For any other key, history holds at most the current fact, which is
-  compared directly.
+  value, adapter-supplied quality and `changed_at` of each. For any other key, history holds at most the current
+  fact, which is compared directly.
+- **Version index** (hot tier, never moves, backed up): for every key of a versioned series, its highest recorded
+  `changed_at`. The rank of an arriving fact is therefore always known, except during a restore (§8).
 - **Fast path:** a fact with `t` later than the series' latest recorded `t` cannot be a duplicate; no lookup. Other
   facts are checked against the in-memory recent window (§5.1) before any index probe.
 - If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure), the fact is
-  recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data.
+  recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data. In a versioned
+  series an arriving fact whose `changed_at` matches none in its key's history is not a duplicate and needs no
+  check; one whose `changed_at` equals that of a fact off every local tier is recorded, counted
+  `duplicates_unchecked` and takes the tie by position. An unchecked repeat therefore never reverts a correction in a
+  versioned series. In any other series it can revert a correction that differs in value, so a source that revises
+  readings must be declared versioned.
 
 ### 2.5 Quality, invalid values, clock
 - Bad-quality facts stay in views but are ignored by summaries and do not refresh staleness (§12 D6).
@@ -142,6 +161,7 @@ a different boot. The rules apply in this order:
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
 | Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, and when the cursor, or the `start` position of a newly registered consumer, is below a lost range (§3). With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
 | Future facts | Delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. |
+| Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state, is never fed to an operator or condition and must not be acted on. |
 | Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
 
 ## 5. Summary tree
@@ -212,7 +232,7 @@ carries coverage in seconds and as a fraction of the window.
   the left-to-right merge of its children. Stored nodes are therefore bitwise reproducible (invariants 5, 8).
   Series with a decimal scale sum in exact `i128`. Results assembled in other orders (windows, coarse queries) are
   compared with direct computation to a relative tolerance of 1e-9 (invariants 6, 7).
-- Each node carries a version incremented on change.
+- Each node carries a version, incremented only when its content changes. An outranked fact (§2.3) changes no node.
 - If the facts of an affected minute are on no local tier, the fact is still recorded, the node is flagged
   `summary_stale` and recomputed when the detail is fetched (§8). Chunk indexes always stay hot, so the engine
   knows whether a minute has facts off the machine.
@@ -249,9 +269,9 @@ carries coverage in seconds and as a fraction of the window.
 ## 7. Compaction and files
 - Compaction rearranges facts from whole sealed log segments into per-series chunks. It is **lossless**: every fact,
   including revisions, with its position and `received_at`. Facts are identified by position.
-- Current facts and revisions go to **separate chunks**. A revision chunk holds only facts superseded within the
-  same compaction's inputs, so the current view never needs revision chunks (a current chunk may hold facts
-  superseded later).
+- Current facts and revisions go to **separate chunks**. A revision chunk holds only facts outranked by a fact within
+  the same compaction's inputs, so the current view never needs revision chunks. A current chunk may hold facts
+  outranked later or by a fact in another file; readers resolve the current view across current chunks by rank.
 - Procedure: write new file → verify (fact count, per-series checksum of facts, each chunk's summary equals the
   summary recomputed from the input facts assigned to it) → publish.
 - **Manifest:** append-only, checksummed records, each with an epoch. One record may add files, retire files and
@@ -275,7 +295,7 @@ carries coverage in seconds and as a fraction of the window.
 ## 8. Tiers, backup and rebuild
 | Tier | Location | Holds |
 |---|---|---|
-| Hot | fast local disk | log segments < 90 days, current detail, revised-key index, chunk indexes, registry, the whole stored tree |
+| Hot | fast local disk | log segments < 90 days, current detail, revised-key index, version index, chunk indexes, registry, the whole stored tree |
 | Cold (optional) | another local path | older revision chunks and sealed log segments; moved current detail |
 | Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints, generation claims |
 
@@ -286,7 +306,7 @@ carries coverage in seconds and as a fraction of the window.
 | Hashes | The manifest records SHA-256 of the plaintext at seal (hot and cold verification) and, per upload, SHA-256 of the ciphertext, sent with a single-part upload. The bucket must reject a mismatch and its reported hash must equal the manifest's; only then is the file backed up. Scheduled check: re-read reported hashes; sampled download-decrypt-verify proves key and content. |
 | Bucket | The engine never deletes from it. Versioning or object lock required. |
 | Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. Current detail and the stored tree stay. |
-| Fill pressure | Above 70 % fill, verified sealed log segments leave first, then the oldest current raw detail (verified first, fetched on demand); the tree, chunk indexes and revised-key index never move (§12 D4). |
+| Fill pressure | Above 70 % fill, verified sealed log segments leave first, then the oldest current raw detail (verified first, fetched on demand); the tree, chunk indexes, revised-key index and version index never move (§12 D4). |
 | Behind consumers | A consumer whose cursor is older than the oldest local log segment receives `resync`, not a replay. The engine never downloads from deep for catch-up. |
 | Corrupt block | File quarantined; the engine fetches the copy from cold, else deep, verifies the plaintext hash and swaps it in by a manifest record. If no other tier holds a verified copy, the file is compacted again from its kept inputs, verified by the §7 procedure, recorded with its new identity and hash, and swapped in by one manifest record that retires the quarantined file. Queries over the range return an error until then. Never repaired in place. Because inputs are kept until a file is verified elsewhere (§7), the only single copies are the open log segment and a sealed log segment not yet uploaded and not yet compacted: corruption there loses that range, recorded when found and reported as in §3 Recovery rule 2. An optional local mirror path for sealed log segments (configuration `mirror_path`, off by default) closes this window for sealed segments. |
 | Upload stalled | Files queue locally, health degraded, nothing evicted. |
@@ -311,9 +331,14 @@ carries coverage in seconds and as a fraction of the window.
    `start: position`. A cursor of an older generation at or below the restored end receives the facts after it up to
    the restored end through catch-up, flagged `replayed`, if their segments are local; otherwise §4 Resync applies.
    Every consumer then receives `generation_changed` and `resync`, and resumes at the new generation's first
-   position.
-3. Download current chunks and the revised-key index, then revision chunks and log segments. A position present in
-   two files is one fact and must have identical content.
+   position. Until the version index is back, a fact on a versioned series with `t` at or before the latest `t` known
+   for its series is **undetermined**: recorded, counted `duplicates_unchecked`, delivered flagged `rank_unknown`,
+   treated as outranked for live state and conditions, and its minute flagged `summary_stale`. Derived state may then
+   lack such a fact for a while, but never reverts a correction.
+3. Download the version index and the revised-key index, then current chunks, then revision chunks and log
+   segments. When the version index is back, each undetermined fact is ranked and the nodes of its minute
+   recomputed; funnels whose live state changed receive `resync`. No trigger fires retroactively (§6). A position
+   present in two files is one fact and must have identical content.
 4. When detail for a span is back, recompute its nodes from facts and compare with the checkpoint; any difference
    is reported and the recomputed value wins. The checkpoint label is removed when all detail has been verified.
 
@@ -331,6 +356,8 @@ gap until they are re-ingested.
 | 2 | Same `(series, t)`, identical to any fact in its history | Dropped and counted (§2.4) | unit |
 | 2a | A, then B, then a replay of A | Replay dropped; B stays current. With `revise`, A is recorded and current | property |
 | 2b | Identical repeat whose current fact is off every local tier | Recorded, `duplicates_unchecked` | unit |
+| 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier or during a restore | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
+| 2d | Versioned series: a fact with a lower `changed_at` than the current one and a new value | Recorded, delivered flagged `outranked`, counted; no node, live-state or condition change | property |
 | 3 | Reading for last week arrives now | Flagged `late`; minute path updated; no retroactive trigger | model |
 | 4 | Reading > 60 s in the future | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
@@ -378,9 +405,10 @@ gap until they are re-ingested.
 2. Every delivered position is durable; every durable position routed to a consumer is delivered to it, or
    superseded by a `resync` covering it.
 3. For any consumer, fact deliveries are in position order.
-4. The current view equals "highest position per `(series, t)`" over all facts in all tiers, quarantined segments
+4. The current view equals "highest rank per `(series, t)`" (§2.2) over all facts in all tiers, quarantined segments
    (§8 Restore) excepted.
-5. Every stored node is bitwise equal to its canonical computation over the current view of its span.
+5. Every stored node is bitwise equal to its canonical computation over the current view of its span (nodes flagged
+   `summary_stale` excepted).
 6. `merge` is associative with the empty node as identity and agrees with direct computation (tolerance §5.6).
 7. A window result equals direct computation over the current view at evaluation time (tolerance §5.6).
 8. Rebuilding derived structures from log entries yields exactly the live structures.
@@ -394,17 +422,20 @@ gap until they are re-ingested.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
 13. A cursor or latch on disk is never ahead of the consumer's confirmation.
 14. No manifest epoch lists two live files holding the same position.
-15. An arriving fact is dropped as a duplicate iff it is identical (§2.4) to a fact in the history of its
-    `(series, t)` and lacks `revise` (except `duplicates_unchecked`, §2.4).
+15. An arriving fact is dropped as a duplicate iff it is identical (§2.4, including `changed_at` in a versioned
+    series) to a fact in the history of its `(series, t)` and lacks `revise` (except `duplicates_unchecked`, §2.4);
+    `revise` applies to series that are not versioned.
 16. After resume, every condition true now is delivered once in `resync`.
 17. For a counter, increases over adjacent windows sum to the increase over their union; for a state series, so do
     transitions (each step or transition credited once).
 18. No time is credited past `now` or past a reading's staleness limit (counter steps excepted).
+19. Re-submitting readings already recorded on a versioned series never changes the value, adapter-supplied quality
+    or `changed_at` of any current fact, whether or not the duplicate check could run.
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
 |---|---|
-| Ingest | `emit(reading, t_source, intent: normal | revise)` → recorded(position) / duplicate / refused(reason); waits under back-pressure |
+| Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
 | Health | counters (duplicates, unchecked, refused, regressions, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only |
