@@ -5,8 +5,8 @@ mod common;
 
 use common::*;
 use kvik_model::engine::{
-    Config, ConsumerDecl, ConsumerId, Error, Fault, FileClass, Level, Model, Reason, Selection,
-    Wait, WriteOutcome,
+    Config, ConsumerDecl, ConsumerId, CrashPoint, Error, Fault, FileClass, Level, Model, Reason,
+    Selection, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
@@ -321,5 +321,129 @@ fn s3_recovery_sync_failure_stays_read_only() {
     m.restart();
     assert!(!m.is_read_only());
     assert_eq!(m.facts().unwrap().len(), 2);
+    assert_eq!(m.disk.mark.unwrap().boot, m.boot);
+}
+
+const C: ConsumerId = ConsumerId(1);
+
+fn consumer_model() -> (Model, SeriesId) {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let s = m
+        .define(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    (m, s)
+}
+
+/// §6 Edge stretches: the state transition from the reading before a window
+/// to its first reading inside is credited to the window, like the counter step.
+#[test]
+fn s6_leading_edge_credits_state_transition() {
+    let p = Params::new(Kind::State, None);
+    let rs: Vec<(Nanos, Value)> = vec![
+        (T0, Value::Str("idle".into())),
+        (T0 + 10 * SECOND, Value::Str("running".into())),
+    ];
+    let w = oracle::window(&p, &rs, T0 + 5 * SECOND, T0 + 20 * SECOND, T0 + HOUR);
+    let Body::State { transitions, .. } = w.body else {
+        unreachable!()
+    };
+    assert_eq!(transitions, 1);
+}
+
+/// §6 Windows: every window is evaluated in event time against `now`. After a
+/// forward jump of the system clock, `now` moves an hour ahead at once, so a
+/// device-stamped series' 5-minute rolling window is empty although the series
+/// is live; health reports the offset.
+#[test]
+fn s6_rolling_window_in_event_time_after_clock_jump() {
+    let (mut m, s) = consumer_model(); // S = 10 s
+    let w0 = m.wall;
+    let readings: Vec<Reading> = (1..=300)
+        .map(|i| Reading::num(s, w0 - 300 * SECOND + i * SECOND, 1.0))
+        .collect();
+    m.ingest(readings).unwrap();
+    let before = m.window(s, m.now - 300 * SECOND, m.now).unwrap();
+    assert_eq!(before.coverage, i128::from(299 * SECOND));
+    m.jump_wall(HOUR);
+    m.advance(SECOND);
+    // The device clock did not jump.
+    m.ingest(vec![Reading::num(s, w0 + SECOND, 1.0)]).unwrap();
+    assert_eq!(m.latest(s).unwrap().unwrap().t, w0 + SECOND);
+    let after = m.window(s, m.now - 300 * SECOND, m.now).unwrap();
+    assert_eq!((after.count, after.coverage), (0, 0));
+}
+
+/// §2.4: a reading recorded without a value is compared as "no value", so a
+/// repeat of the same NaN reading is dropped as a duplicate.
+#[test]
+fn s2_4_reading_without_value_compared_as_no_value() {
+    let (mut m, s) = consumer_model();
+    let t = m.wall;
+    m.ingest(vec![Reading::num(s, t, f64::NAN)]).unwrap();
+    let r = m.ingest(vec![Reading::num(s, t, f64::NAN)]).unwrap();
+    assert!(r.positions.is_empty());
+    assert_eq!(m.counters.duplicates_dropped, 1);
+    let f = &m.current().unwrap()[&(s, t)];
+    assert_eq!((f.value.clone(), f.quality), (Value::Absent, Quality::Bad));
+}
+
+/// §3 Write or sync failure: after a failed sync the batch's fate is unknown;
+/// after a reboot, recovery keeps it if it reached the disk whole.
+#[test]
+fn s3_failed_sync_then_power_loss_may_keep_batch() {
+    let (mut m, s) = consumer_model();
+    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    assert_eq!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Survived))),
+        Err(Error::SyncFailed)
+    );
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.facts().unwrap().len(), 1);
+}
+
+/// §3 Recovery: after a reboot, recovery writes the mark with the new boot id
+/// even when nothing was past it, so a later process crash on the same boot
+/// truncates as row 7 requires.
+#[test]
+fn s3_recovery_writes_mark_after_reboot() {
+    let (mut m, s) = consumer_model();
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.disk.mark.unwrap().boot, m.boot);
+    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    let r = m.commit(Some(Fault::Crash(CrashPoint::AfterWrite(
+        WriteOutcome::Survived,
+    ))));
+    assert_eq!(r, Err(Error::Crashed));
+    m.restart();
+    assert!(m.facts().unwrap().is_empty());
+}
+
+/// §3 Recovery: a missing mark counts as a different boot, so a batch written
+/// but not synced before a process crash on the same boot is kept; recovery
+/// syncs it before anything sees it, and it was never acknowledged.
+#[test]
+fn s3_missing_mark_counts_as_different_boot() {
+    let (mut m, s) = consumer_model();
+    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    let r = m.commit(Some(Fault::Crash(CrashPoint::AfterWrite(
+        WriteOutcome::Survived,
+    ))));
+    assert_eq!(r, Err(Error::Crashed));
+    m.disk.mark = None;
+    m.restart();
+    assert_eq!(m.facts().unwrap().len(), 1);
     assert_eq!(m.disk.mark.unwrap().boot, m.boot);
 }
