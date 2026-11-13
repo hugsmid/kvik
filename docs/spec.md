@@ -33,8 +33,9 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 | `changed_at kind` | versioned series only: `time` (UTC nanoseconds) or `version` (an opaque counter); fixed for the life of the series; used only to type exports |
 | `retention class` | `long-term` (default) or `diagnostic` with a retention period (default 30 days), for series kept mainly for short-term diagnosis, such as a machine's own resource metrics. It decides only where raw detail is kept (§8 Retention class), never which facts exist. A change of class is a registry entry that takes effect at its position, not by event time; it moves no detail back |
 
-Series definitions, parameter changes (with an effective event time), aliases and retirements are log entries.
-A parameter applies to readings with `t` at or after its effective time. A definition entry always has a lower
+Series definitions, parameter changes (with an effective event time, except a change of retention class, which
+takes effect at its position), aliases and retirements are log entries. A parameter other than the retention class
+applies to readings with `t` at or after its effective time. A definition entry always has a lower
 position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
 registry file that stays on the hot tier (tree checkpoints carry a copy, §8).
 
