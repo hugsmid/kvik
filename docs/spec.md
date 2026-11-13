@@ -1,9 +1,8 @@
 # kvik specification, v0.1 (design; not yet implemented)
 
 This repository contains this specification and a reference model of its semantics (`model/`). The engine
-described here does not exist yet. "Must" is normative: it states what an implementation is required to do. Items
-in §12 are open; the defaults written here apply until they are decided. The byte-level format will be specified
-in a separate document. Open questions found by modelling are in `model/OPEN-QUESTIONS.md`.
+described here does not exist yet. "Must" is normative: it states what an implementation is required to do. §12
+records the choices decided between alternatives. The byte-level format will be specified in a separate document. Open questions found by modelling are in `model/OPEN-QUESTIONS.md`.
 
 ## 1. Principles
 1. **Facts are immutable.** A recorded reading is never edited or deleted by the engine.
@@ -114,7 +113,7 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
 ### 2.5 Quality, invalid values, clock
 - Bad-quality facts stay in views but are ignored by summaries and do not refresh staleness (§12 D6).
 - NaN or ±∞ is recorded as quality bad with no value, flagged and counted (§12 D1). A negative counter value
-  (§5.5) is recorded the same way whatever D1 decides; D1 concerns NaN and ±∞ only.
+  (§5.5) is recorded the same way; D1 concerns NaN and ±∞ only.
 - Until the system reports clock synchronisation, batches carry `unsynced_clock`, `future`/`late` are not set, and
   facts with `t_source = host` wait in the ingest queue (back-pressure) rather than being stamped with a wrong time.
   Device-stamped facts are accepted.
@@ -157,8 +156,9 @@ a different boot. The rules apply in this order:
    readable in it; an empty tail is not reported. New positions then continue above the highest sequence of the
    current generation among the last kept batch, any local cursor file and any local manifest record; positions
    skipped that way are recorded as a lost range whose cause is a truncated tail. So no position named by a synced
-   cursor or manifest record is reused. A missing or unreadable cursor file is reported with `possible_loss`, and its
-   consumer is treated as having no cursor.
+   cursor or manifest record is reused. A position delivered but not yet confirmed can be reused, so every consumer
+   receives `resync` and forgets its unconfirmed positions (§4 At-least-once, Resync). A missing or unreadable cursor
+   file is reported with `possible_loss`, and its consumer is treated as having no cursor.
 4. Whenever rule 1 did not apply, recovery syncs the segment and directory and writes the mark with the current boot
    id, then resumes. If that sync fails, the engine stays read-only and leaves the old mark.
 
@@ -171,10 +171,10 @@ a different boot. The rules apply in this order:
 | Consumer state | Bounded queue (default 4 096); a durable cursor (last confirmed position) and one latch per condition funnel (§6). Written to a per-consumer file, synced at most every 1 s and on clean shutdown; never ahead of the consumer's confirmation. |
 | New consumer | Declares `start: now | position | time` (default now). |
 | Order | A consumer sees fact deliveries in position order (invariant 3). Timer deliveries carry the last committed position at evaluation plus a per-funnel sequence. |
-| At-least-once | After a restart a consumer resumes after its cursor and may see a delivery again. Consumers de-duplicate fact deliveries by position and timer deliveries by `(funnel, sequence)`; commands carry ids. |
+| At-least-once | After a restart a consumer resumes after its cursor and may see a delivery again. Consumers de-duplicate fact deliveries by position and timer deliveries by `(funnel, sequence)`; commands carry ids. On `resync` a consumer must forget every position above its confirmed cursor that it has seen: after a truncated tail such a position can name a different fact (§3 Recovery rule 3), which must not be dropped as a repeat. |
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
-| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), and when it is at or above the start of a tail truncated by §3 Recovery rule 3. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
+| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), and to every consumer after §3 Recovery rule 3 truncates a tail reported as `possible_loss`, before any position above the last kept batch is delivered to it, since any consumer may have been delivered positions in that tail. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
 | Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. Scheduled and forecast facts are delivered once, at commit, in position order, not flagged `future`: the delivery is a notice of a value for `t`, and a consumer acts on live state or a condition, never on the delivery itself. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled (§6 Cadence), and `resync` for a funnel over a forecast series carries condition state only. |
 | Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
 | Timers | Window expiry, "held for N s" and staleness of an observed series use the monotonic clock; system clock corrections never fire or suppress them. A future fact matures, a scheduled value takes effect and a scheduled series falls stale by `now` (§6), so a forward correction of the system clock can bring any of them forward. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
@@ -260,9 +260,14 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
   knows whether a minute has facts off the machine.
 
 ### 5.7 Calendar
-- The site zone is a log entry with an effective time; each local day uses the zone in force at its start. A zone
-  change rebuilds calendar nodes from its effective time only (§12 D3). The tzdata version is recorded per
-  calendar file; a tzdata change rebuilds the affected days and is logged.
+- Facts and the UTC levels are in UTC; a zone only defines calendar days and months. The site zone is a log entry
+  with an effective time; each local day uses the zone in force at its start. A zone change rebuilds calendar nodes
+  from its effective time only (§12 D3). The tzdata version is recorded per calendar file; a tzdata change rebuilds
+  the affected days and is logged.
+- A calendar window or query may name an IANA zone instead; its days and months are then taken in that zone over
+  the whole span, with no effective dating. Its result is a window evaluation over the UTC data like any other. A
+  stored calendar node is an input to it only where the site zone in force for that node is the named zone;
+  elsewhere the result is evaluated as for a span off 15-minute boundaries (last item).
 - A calendar day or month **result** is a window evaluation (§6) over its span, edge stretches included. Stored day
   nodes are an input to that evaluation, not the result.
 - A local day usually has 92–100 quarter-hours. A day whose local midnight does not exist starts at its first
@@ -275,7 +280,7 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
 | Rule | |
 |---|---|
 | Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value (not for interval series): `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). **Interval series:** sum is the amount in the window; rate is sum ÷ covered seconds; count, min, max and last are over readings whose `t` lies in the window; avg, integral, increase and time-in-state are refused. Edge stretches do not apply: a window edge inside an interval credits that interval's amount pro rata, amount × overlap ÷ d computed in f64, and the result is flagged `apportioned`; sums of whole intervals stay exact for a decimal scale, and apportioned results are compared within the §5.6 tolerance. Edge lookups reach back at least d. On an observed interval series a reading enters live state and windows only once `t + d ≤ now`. |
-| Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone ("since local midnight" and "this month" end at `now`; a named or relative day or month ends at its end); a window wholly after `now` on an observed series is empty, with zero coverage; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
+| Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone, or in an IANA zone the window names (§5.7) ("since local midnight" and "this month" end at `now`; a named or relative day or month ends at its end); a window wholly after `now` on an observed series is empty, with zero coverage; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
 | `now` | The window clock: an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
 | Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window when the edge lies within it, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
 | Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, credit limit, last.t + S). Time is never credited past the **credit limit**: `now` for an observed series, the window end for a scheduled or forecast series, whose values are known in advance. |
@@ -381,7 +386,7 @@ gap until they are re-ingested.
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
 | 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and reported as `possible_loss` | kill loop |
-| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; positions named by the last kept batch, a synced cursor or a manifest record are not reused | power-loss rig |
+| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; positions named by the last kept batch, a synced cursor or a manifest record are not reused; every consumer receives `resync` before any later position and forgets its unconfirmed positions | power-loss rig |
 | 8 | Crash after sync, before delivery | Delivered on restart from each consumer's cursor | kill loop |
 | 9 | Crash during compaction | Output unpublished and discarded; inputs intact | kill loop |
 | 10 | Crash around the manifest record | Before: output discarded. After: inputs retired. Never both live | kill loop |
@@ -399,6 +404,7 @@ gap until they are re-ingested.
 | 19 | Correction changes a node's min or max | Minute recomputed from facts, ancestors from children | property |
 | 20 | DST changes | UTC levels unaffected; local days of 92–100 quarter-hours, evaluated as windows over their spans | property |
 | 21 | Site zone changed, or tzdata changes its rules | Calendar nodes rebuilt from the effective time / affected days only; logged | integration |
+| 21a | Calendar query in a named zone whose offset is not a multiple of 15 minutes (historical offsets) | Days taken in that zone for the whole span; no stored calendar node used; evaluated as a window over the UTC data, with facts at its edges | model (roadmap 1.6) |
 | 22 | System clock jumps | Timers of observed series monotonic; future-fact maturity and scheduled values follow `now`; window `now` never runs backwards; `commit_time` monotonic | unit |
 | 22a | Host clock not yet synchronised at boot | `unsynced_clock`; host-stamped facts wait | unit |
 | 23 | Series renamed | Alias entry; id and data unchanged | unit |
@@ -477,16 +483,18 @@ gap until they are re-ingested.
 Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.
 
-## 12. Open decisions (defaults above apply until decided)
-| # | Choice | Default | Alternative |
+## 12. Decided choices
+| # | Choice | Rule | Rejected alternative |
 |---|---|---|---|
 | D1 | NaN/∞ from a device | Recorded as bad quality, no value | Refused and counted |
 | D2 | Counter decrease that is not a plausible reset | Regression: contributes 0, counted | Every decrease is a reset (one glitch can add a whole counter value) |
-| D3 | Site zone change | Effective-dated; past days keep the old zone | Rebuild all history in the new zone |
+| D3 | Site zone change | Effective-dated; past days keep the old zone; a calendar window or query may name another zone for its whole span (§5.7) | Rebuild all history in the new zone |
 | D4 | Fill pressure order | Verified sealed log leaves before current detail | Only current detail moves; log stays 90 days |
 | D5 | Identical repeat whose current fact is off the machine | Recorded, counted unchecked | Ingest of that fact waits for a fetch |
 | D6 | Bad-quality reading in a gauge | Ignored; previous value's hold continues up to S | Ends the previous hold (gap) |
 | D7 | 1-minute level for old spans | Stays hot forever (≈ 38 MB per series-year with data every minute) | Follows raw detail to cold |
+
+D4 and D7 are looked at again after the measurements of roadmap section 2 (§13) and may change then.
 
 ## 13. Risks to measure
 | Risk | How measured | If it fails |
@@ -497,7 +505,7 @@ Parquet export schema, API signatures and memory figures follow in separate docu
 | Duplicate check on replay | 1 hour × 100 series replay; probes outside the recent window | Larger recent window |
 | Forecast series | Revised-key index size, chunk overlap and duplicate probes below the latest `t`, since every key of a forecast series is revised by design | Keep fewer issues hot; larger recent window |
 | Tree size | Bytes per series-year per level on real data | D7 alternative |
-| Hot disk during 90-day log retention | Log plus compacted bytes per day at expected load | D4 default; earlier move to cold |
+| Hot disk during 90-day log retention | Log plus compacted bytes per day at expected load | D4 rule; earlier move to cold |
 | Restart ≤ 1 s | Start time with 100,000 series and 60 s of log after the checkpoint | Shorter checkpoint interval |
 | Version index size | Bytes per series-year on hot for versioned series at their real reading rates | Keep index entries only for keys that were revised or are recent |
 | Deep object count | Objects per year and restore time from deep | Larger seal size for sealed-log uploads |

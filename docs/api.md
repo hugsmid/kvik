@@ -72,7 +72,7 @@ while let Some(d) = consumer.next().await {
     match d.kind {
         DeliveryKind::Fact(f) => { /* f.position, f.series, f.t, f.value */ }
         DeliveryKind::Trigger(t) => { /* t.funnel, t.state, t.value, t.coverage */ }
-        DeliveryKind::Resync(s) => { /* current live state and condition state */ }
+        DeliveryKind::Resync(s) => { /* current live state and condition state; forget unconfirmed positions */ }
     }
     consumer.confirm(d.id).await?;            // advances the durable cursor
 }
@@ -80,6 +80,8 @@ while let Some(d) = consumer.next().await {
 - A delivery carries `id` (position, or funnel and sequence for timer deliveries), `flags` (`replayed`,
   `future`) and the times needed to judge its age.
 - `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.
+- On `Resync` the consumer must forget every position above its last confirmation that it has seen: after a power
+  loss such a position can name a different fact (spec §3 Recovery rule 3, §4 At-least-once).
 - A consumer that emits readings uses `try_emit` or its own task, never the delivery callback.
 - Routes may be added and removed while running; each change is a log entry and takes effect at its position.
 
@@ -91,9 +93,13 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
 let series = reader.buckets(id, range, Resolution::Auto { max_points: 2_000 })?;   // chart query
 let facts = reader.facts(id, range, View::Current)?;         // also View::AsOf(position), View::History
 let day = reader.calendar(id, date, Aggregate::Integral)?;   // site time zone
+let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named IANA zone for the whole span
 ```
 - `Resolution::Auto` picks the coarsest stored level that yields at most `max_points`, and raw facts when the
   range is short enough. Every bucket carries count, min, max and coverage so a chart can show gaps and spikes.
+- Data is stored in UTC; a zone only defines calendar days and months. `calendar` uses the site zone in force at
+  each day's start; `calendar_in` and calendar windows that name a zone use that zone throughout, evaluated as a
+  window over the UTC data (spec §5.7).
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 

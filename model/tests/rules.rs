@@ -89,7 +89,7 @@ fn s4_future_fact_in_tree_not_in_windows_or_live_state() {
 
 #[test]
 fn s2_5_bad_reading_does_not_end_hold() {
-    // Open decision D6, default: the previous value's hold continues up to S.
+    // Decided choice D6: the previous value's hold continues up to S.
     let (mut m, s) = model(10 * SECOND);
     m.ingest(vec![
         Reading::num(s, T0, 10.0),

@@ -15,9 +15,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
 | Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
 | Q-40 | §2.4 Version index, §8 Restore | Ranking facts of versioned series during a restore |
-| Q-43 | §3 Recovery rule 3, §4, invariant 2 | Positions delivered but not confirmed, after a truncated tail |
 | Q-44 | §2.1 timing, §4, §11 | Gaps left by scheduled and forecast series |
 | Q-45 | §2.1 interval, §5.7 | Intervals of varying length |
+| Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -105,17 +105,6 @@ yet listed in the deep tier.
 **Proposed.** Each tree checkpoint carries the version index as of its position, like the registry and latest `t`
 (§8), so step 1's replay brings it up to the restored end and the rank is always known.
 
-## Q-43 — Positions delivered but not confirmed, after a truncated tail
-**Scenario.** A batch is acknowledged and delivered; the consumer acts on position p but has not yet confirmed it, so
-no synced cursor names p. Power is lost before the mark sync, and the tail holding p is damaged and truncated
-(§3 Recovery rule 3). New positions continue above the last kept batch and the synced cursors, so p can be assigned
-to a new fact. The consumer, which de-duplicates by position (§4 At-least-once), may drop that new fact silently,
-against invariant 2. Readers without a cursor have the same exposure.
-**Model.** Not modelled; the mark is always exact.
-**Needed.** Whether consumers forget positions above their confirmed cursor when they receive `resync` after a
-truncated tail, whether the engine skips a margin of positions, or whether the residual risk is accepted and stated.
-This bounds the durability decision taken for Q-35 and is for the owner.
-
 ## Q-44 — Gaps left by scheduled and forecast series
 **Scenario.** (a) A forecast feed stops: its series has no live staleness, and lookahead coverage shrinks only as the
 issued horizon runs out, so nothing reports the silence promptly. (b) A newer issue that no longer covers a valid
@@ -132,6 +121,15 @@ has intervals of 23–25 hours or 28–31 days, which no fixed d and phase descr
 **Model.** Not modelled.
 **Needed.** Whether a reading may carry its own interval length, or whether such amounts are stored at a fixed finer
 length or as calendar results.
+
+## Q-46 — Positions kept by a reader process, after a truncated tail
+**Scenario.** A reader process (§7) reads position p from the log up to the mark and keeps it, for example in an
+export it continues by position. Power is lost before the mark sync, the tail holding p is truncated and p is
+assigned to a new fact (§3 Recovery rule 3). Consumers receive `resync` and forget unconfirmed positions (§4); a
+reader receives nothing, and may skip the new fact or keep the lost one.
+**Model.** Not modelled; the mark is always exact.
+**Needed.** Whether readers can see that a tail was truncated (for example a recovery count in the mark or the
+manifest that they compare), or whether the residual risk is accepted and stated.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -236,9 +234,10 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction (open part: Q-40) |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
-| Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 (open part: Q-43) |
+| Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44) |
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (open part: Q-45) |
+| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (consumers forget unconfirmed positions on `resync`), §4 Resync (every consumer, after §3 Recovery rule 3 truncates a tail), §3 Recovery rule 3, row 7a; no margin of skipped positions (open part: Q-46) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
@@ -264,7 +263,7 @@ implement:
 | Latch and `resync` | §4, §6, rows 15–16, invariant 16 | Operator rebuilt from the tree; a true condition counts as fired | `restart_rebuilds_threshold_without_firing_again`, `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Timer deliveries with per-funnel sequence | §4 | Conditions are tested apart from delivery | — |
 | Tree checkpoints, density rule | §5.1 | Tree rebuilt from facts at restart; both levels stored for every series | — |
-| Calendar results as windows | §5.7: a result is a window evaluation; no stored node for a span off 15-minute boundaries | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
+| Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries; row 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
 | Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
 | Atomic manifest records | §7, row 10, invariant 14 | Publish and retirement are two records | `compaction_crash_after_publish_resumes_retirement` |
 | Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments | `compaction_crash_after_publish_resumes_retirement` |
@@ -277,6 +276,6 @@ implement:
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |
-| Timed mark sync; `possible_loss`; no reuse of positions after a truncation | §3 Durable mark, §3 Recovery rule 3, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
+| Timed mark sync; `possible_loss`; no reuse of positions after a truncation; `resync` to every consumer after it | §3 Durable mark, §3 Recovery rule 3, §4 Resync, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
 | Restore from a checkpoint | §8 Restore: restore record, restored end before the first gap and quarantine beyond it, checkpoint with registry and latest `t`, cursors and `resync` after a restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
 | Invariants 12–16 | §10 | Not checked yet | — |
