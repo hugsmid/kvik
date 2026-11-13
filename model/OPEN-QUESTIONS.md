@@ -15,9 +15,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
 | Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
 | Q-40 | §2.4 Version index, §8 Restore | Ranking facts of versioned series during a restore |
-| Q-42 | §5.2, §6 | Readings that cover an interval, not an instant |
 | Q-43 | §3 Recovery rule 3, §4, invariant 2 | Positions delivered but not confirmed, after a truncated tail |
 | Q-44 | §2.1 timing, §4, §11 | Gaps left by scheduled and forecast series |
+| Q-45 | §2.1 interval, §5.7 | Intervals of varying length |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -105,15 +105,6 @@ yet listed in the deep tier.
 **Proposed.** Each tree checkpoint carries the version index as of its position, like the registry and latest `t`
 (§8), so step 1's replay brings it up to the restored end and the rank is always known.
 
-## Q-42 — Readings that cover an interval, not an instant
-**Scenario.** A source reports half-hourly consumption or hourly precipitation: each value covers an interval and
-is stamped at its start. §5.2 treats readings as point samples held for up to S, so an average or integral of such a
-series has no physical meaning, and a window that cuts an interval cannot apportion it. As a cumulative counter, the
-step to the next reading would be credited to the window containing the later reading, not the interval it covers.
-**Model.** Not modelled; readings are instants.
-**Needed.** Whether interval readings are stamped at the interval's end as counters, carry an interval length, or are
-a series kind of their own, and how windows treat a partly covered interval.
-
 ## Q-43 — Positions delivered but not confirmed, after a truncated tail
 **Scenario.** A batch is acknowledged and delivered; the consumer acts on position p but has not yet confirmed it, so
 no synced cursor names p. Power is lost before the mark sync, and the tail holding p is damaged and truncated
@@ -134,6 +125,13 @@ accuracy is served: comparing each issue with the outcome series, and asking wha
 rather than as of a position.
 **Model.** Not modelled.
 **Needed.** Whether these are reported by the engine, left to the adapter's health, or accepted and stated.
+
+## Q-45 — Intervals of varying length
+**Scenario.** An interval series has a fixed length d. A source that reports one amount per local day or per month
+has intervals of 23–25 hours or 28–31 days, which no fixed d and phase describe.
+**Model.** Not modelled.
+**Needed.** Whether a reading may carry its own interval length, or whether such amounts are stored at a fixed finer
+length or as calendar results.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -196,6 +194,9 @@ The specification wins where the documents differ. These follow from it, for the
   that is not versioned, or whose `changed_at kind` is not `time`, is refused; `Window::rolling` needs offsets from
   `now`; exports label issue time and valid time. `format.md`'s series definition entry needs the timing field (and the
   versioned flag and `changed_at kind`, F-9), outside the fields a parameter change may carry (§2.1, §4, §6).
+- **F-14.** `format.md`: a series definition carries the kind `interval` with its length and phase. `api.md`: `SeriesSpec`
+  gains them; a reading off its phase is refused; avg, integral, increase and time-in-state on an interval series are
+  refused; window results gain the flag `apportioned` (§2.1, §6).
 
 ## Settled
 | ID | Question | Settled in |
@@ -233,6 +234,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 (open part: Q-43) |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44) |
+| Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (open part: Q-45) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
@@ -266,6 +268,7 @@ implement:
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
 | Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
 | Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Not modelled; every series is observed | — |
+| Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
 | Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |

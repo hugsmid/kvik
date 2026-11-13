@@ -21,10 +21,11 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 |---|---|
 | `id` | u32, assigned once by the registry, never reused |
 | `name` | `<instance>/<device>/<metric>`; a rename adds an alias, the id is unchanged; a name maps to its active series |
-| `kind` | `gauge`, `counter` (cumulative), `state` (named or boolean), `text` (UTF-8, ≤ 255 bytes) |
-| `value type` | gauge/counter: `f64`, or `i64` with a declared `decimal scale` (exact); state: u16 index into declared names or bool |
+| `kind` | `gauge`, `counter` (cumulative), `state` (named or boolean), `text` (UTF-8, ≤ 255 bytes), `interval` (an amount over a fixed interval) |
+| `value type` | gauge/counter/interval: `f64`, or `i64` with a declared `decimal scale` (exact); state: u16 index into declared names or bool |
 | `unit` | fixed for the life of the series; a change of kind, type, scale or unit is a new series |
-| `expected interval` | configuration, never learned. Default: gauge and counter 60 s; state and text none (valid until next reading) |
+| `expected interval` | configuration, never learned. Default: gauge and counter 60 s; interval its interval length; state and text none (valid until next reading) |
+| `interval length`, `interval phase` | interval series only: the length d, fixed for the life of the series, and a phase (default 0). A reading's `t` is the start of its interval and must satisfy `t ≡ phase (mod d)`, or it is refused and counted; its value is the amount over `[t, t + d)` |
 | `staleness limit` S | `3 × expected interval` unless set; none if no interval |
 | `record on change` | optional; see §2.6 |
 | `wrap_at`, `reset_ceiling` | counters only; §5.5. `reset_ceiling` default 10 % |
@@ -66,7 +67,8 @@ and counted. The old id stays reachable by id.
 - Fact flags (immutable): `future` (observed series only: `t > received_at + 60 s`; quality lowered to suspect if
   better), `late` (on an observed series, `t` earlier than the series' latest recorded `t` by more than 2 × S; on any
   series, `received_at − t` above the lateness bound), `revise` (§2.4), `host_time` (`t_source = host`),
-  `unsynced_clock` (§2.5). Delivery flags are separate (§4).
+  `unsynced_clock` (§2.5). For a reading of an interval series, `t + d` stands for `t` in `future` and in the second
+  clause of `late`. Delivery flags are separate (§4).
 
 ### 2.3 Views
 | View | Definition |
@@ -205,10 +207,11 @@ r₁ … rₙ (in `t` order) inside its span:
 | counter | — | increase += step(vᵢ, vᵢ₊₁) (§5.5), resets, regressions |
 | state | — | time[vᵢ] += hᵢ; transitions += [vᵢ ≠ vᵢ₊₁] |
 | text | — | (count, first, last and coverage only) |
+| interval | sum, min, max; coverage is the union of the readings' intervals clipped to the span | none (no hold, no S) |
 
-where the **hold** hᵢ = min(tᵢ₊₁, tᵢ + Sᵢ) − tᵢ, Sᵢ being the staleness limit in force at tᵢ (∞ if none). Time is
-held in nanoseconds and reported in seconds. **Nothing is held past a node's last reading inside the node.** Min and
-max are over readings only.
+For every kind but interval, the **hold** hᵢ = min(tᵢ₊₁, tᵢ + Sᵢ) − tᵢ, Sᵢ being the staleness limit in force at tᵢ
+(∞ if none). Time is held in nanoseconds and reported in seconds. **Nothing is held past a node's last reading inside
+the node.** Min and max are over readings only.
 
 ### 5.3 Merge
 `merge(L, R)` for adjacent L before R: if either is empty, the other; otherwise per-reading fields combine
@@ -219,15 +222,16 @@ model must prove this against direct computation (invariant 6), including empty 
 nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
-A reading is valid for at most S. For an observed series, **live staleness** is measured on the monotonic clock: a
-series is stale when more than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a
-future fact still awaiting its time or an outranked fact (§4), so a forward jump of the system clock cannot make an
-observed series stale. A scheduled series is stale when `now` is later than the `t` of its live-state fact by more
-than S, or when it has no live-state fact; commits do not refresh it. A forecast series has no live staleness.
-**Event-time staleness** applies to history and to every window evaluation (§6): a series is stale at event time x
-when x > (`t` of its latest reading before x that is not bad quality) + S. Coverage stops at that point and
-time-weighted results exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the
-window. Live staleness applies only to live state and stale-for conditions.
+A reading is valid for at most S (an interval reading for its interval only). For an observed series, **live
+staleness** is measured on the monotonic clock: a series is stale when more than S has passed since its last commit
+of a fact that is not bad quality (§2.5) and not a future fact still awaiting its time or an outranked fact (§4), so
+a forward jump of the system clock cannot make an observed series stale. A scheduled series is stale when `now` is
+later than the `t` of its live-state fact by more than S, or when it has no live-state fact; commits do not refresh
+it. A forecast series has no live staleness. **Event-time staleness** applies to history and to every window
+evaluation (§6): a series is stale at event time x when x > (`t` of its latest reading before x that is not bad
+quality) + S. Coverage stops at that point and time-weighted results exclude the gap. Every windowed result carries
+coverage in seconds and as a fraction of the window. Live staleness applies only to live state and stale-for
+conditions.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
@@ -265,7 +269,7 @@ window. Live staleness applies only to live state and stale-for conditions.
 ## 6. Windowed operators
 | Rule | |
 |---|---|
-| Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value: `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). |
+| Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value: `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). **Interval series:** sum is the amount in the window; rate is sum ÷ covered seconds; count, min, max and last are over readings whose `t` lies in the window; avg, integral, increase and time-in-state are refused. A window edge inside an interval credits that interval's amount pro rata by time, and the result is flagged `apportioned`; sums of whole intervals stay exact for a decimal scale, and apportioned parts are compared within the §5.6 tolerance. On an observed interval series a reading enters live state and windows only once `t + d ≤ now`. |
 | Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone ("since local midnight" and "this month" end at `now`; a named or relative day or month ends at its end); a window wholly after `now` on an observed series is empty, with zero coverage; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
 | `now` | The window clock: an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
 | Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window when the edge lies within it, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
@@ -411,6 +415,9 @@ gap until they are re-ingested.
 | 37 | Forecast re-issued | The higher `changed_at` is current; earlier issues stay in history; a replay of an old issue is a duplicate or outranked | property |
 | 38 | Window over tomorrow on a scheduled or forecast series | Credited up to the window end; coverage shows where the values run out | property |
 | 39 | Window ending after `now` on an observed series | Nothing credited past `now` | property |
+| 40 | Interval reading off its phase | Refused and counted | unit |
+| 41 | Window edge inside an interval | That interval's amount credited pro rata by time; result flagged `apportioned` | property |
+| 42 | Interval missing | A gap in coverage; nothing held across it | property |
 
 ## 10. Invariants (checked by the reference model and property tests)
 1. Sequences are strictly increasing and gap-free within a generation across restarts, except for lost ranges
@@ -443,13 +450,16 @@ gap until they are re-ingested.
 16. After resume, every condition true now is delivered once in `resync`.
 17. For a counter, increases over adjacent windows sum to the increase over their union; for a state series, so do
     transitions (each step or transition credited once).
-18. No time is credited past the credit limit (§6) or past a reading's staleness limit (counter steps excepted).
+18. No time is credited past the credit limit (§6) or past a reading's validity: its staleness limit, or for an
+    interval reading its interval (counter steps excepted).
 19. For a source whose `changed_at` rises with every revision, re-submitting readings already recorded on a versioned
     series never changes the value, adapter-supplied quality or `changed_at` of any current fact while the version
     index is local, whether or not the duplicate check could run.
 20. No fact of a scheduled or forecast series carries `future`, or `late` by its first clause (§2.2).
 21. A window result over a scheduled or forecast series is a function of the current view and the window's bounds
     alone (tolerance §5.6; results flagged `approximate_edges` or `summary_stale` excepted).
+22. For an interval series, the sums over adjacent windows add up to the sum over their union (within the §5.6
+    tolerance where an interval is apportioned).
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
