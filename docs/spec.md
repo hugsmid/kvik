@@ -122,12 +122,12 @@ interval. A healthy unchanged series is therefore never stale, and every derived
 |---|---|
 | Batches | Append-only segments of arrival batches. A batch ends with a **commit block** (last position, checksum of the batch's blocks). One batch = one commit = one sync. A batch never spans segments. |
 | Commit | Write batch, sync, update the durable mark, then (and only then) acknowledge adapters, update tree and live state, and deliver. |
-| Durable mark | After each successful sync the writer updates a memory-mapped mark file: segment id, byte offset, last position, boot id, sequence lock. The mark file itself is synced on a timer (`mark_sync_interval`, default 1 s) and at clean shutdown, so after a power loss the mark on disk lags acknowledged batches by at most that interval. Readers read log segments only up to the mark. |
+| Durable mark | After each successful sync the writer updates a memory-mapped mark file: segment id, byte offset, last position, boot id, sequence lock. The mark file itself is synced on a timer (`mark_sync_interval`, default 1 s) and at clean shutdown, so after a power loss the mark on disk lags acknowledged batches by about one interval. Readers read log segments only up to the mark. |
 | Group commit | While a sync is in flight, arriving readings queue and form the next batch. No added delay when idle (optional linger, default 0). |
 | Segments | Preallocated at creation (64 MiB). The directory is synced after creating, sealing or renaming a file. |
 | Sealing | At 64 MiB or 5 minutes (both configurable), whichever first; an empty segment is not sealed. Sealed segments are immutable and eligible for backup. Compaction never removes a log segment (§8). |
 | Recovery | Below this table. |
-| Write or sync failure | On the log, manifest, cursor or registry files: stop accepting writes, mark read-only, fatal health; never retry on the same handle; recovery by restart. After a failed sync the batch's fate is unknown: a restart on the same boot truncates it; after a reboot recovery may keep it (row 7a). It was never acknowledged, so adapters may replay it, which the duplicate rule absorbs. A failed compaction, tiering or tree write abandons that job, deletes its partial output and degrades health. |
+| Write or sync failure | On the log, manifest, mark, cursor or registry files: stop accepting writes, mark read-only, fatal health; never retry on the same handle; recovery by restart. After a failed sync the batch's fate is unknown: a restart on the same boot truncates it; after a reboot recovery may keep it (row 7a). It was never acknowledged, so adapters may replay it, which the duplicate rule absorbs. A failed compaction, tiering or tree write abandons that job, deletes its partial output and degrades health. |
 | Disk space | Low mark: free space below 5 % of the filesystem or 2 GiB, whichever is larger → compaction pauses, health degraded. Tiering and eviction, which free space, continue at every mark. Critical: below 512 MiB free → ingest waits (back-pressure). Reads continue. Space is never freed by deleting facts. |
 | Back-pressure | Ingest is a bounded queue (default 65 536 readings); a full queue makes adapter emits wait; the wait is measured. |
 | Single writer | Exclusive `flock` on the store directory; readers never take it. |
@@ -144,10 +144,14 @@ a different boot. The rules apply in this order:
    range, which does not make the store read-only. Its positions are not reused. A consumer whose cursor is below a
    lost range receives `resync`.
 3. **Different boot id** (the machine rebooted, the page cache is gone): any remaining invalid tail is torn and is
-   truncated. Because the mark on disk can lag acknowledged batches, a truncated tail may have held acknowledged
-   facts whose bytes were damaged: its byte and batch counts are reported as `possible_loss`. New positions then
-   continue above the highest position named by any cursor file or manifest record, and positions skipped that way
-   are recorded as a lost range, so no position a consumer may have seen is reused.
+   truncated. The same applies when the mark is missing or unreadable. Because the mark on disk can lag acknowledged
+   batches, a truncated tail may have held acknowledged facts whose bytes were damaged: it is reported as
+   `possible_loss`, with its length in bytes up to the last non-zero byte and the number of commit blocks still
+   readable in it; an empty tail is not reported. New positions then continue above the highest sequence of the
+   current generation among the last kept batch, any local cursor file and any local manifest record; positions
+   skipped that way are recorded as a lost range whose cause is a truncated tail. So no position named by a synced
+   cursor or manifest record is reused. A missing or unreadable cursor file is reported with `possible_loss`, and its
+   consumer is treated as having no cursor.
 4. Whenever rule 1 did not apply, recovery syncs the segment and directory and writes the mark with the current boot
    id, then resumes. If that sync fails, the engine stays read-only and leaves the old mark.
 
@@ -163,7 +167,7 @@ a different boot. The rules apply in this order:
 | At-least-once | After a restart a consumer resumes after its cursor and may see a delivery again. Consumers de-duplicate fact deliveries by position and timer deliveries by `(funnel, sequence)`; commands carry ids. |
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
-| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, and when the cursor, or the `start` position of a newly registered consumer, is below a lost range (§3). With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
+| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), and when it is at or above the start of a tail truncated by §3 Recovery rule 3. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
 | Future facts | Delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. |
 | Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
 | Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
@@ -361,8 +365,8 @@ gap until they are re-ingested.
 | 4 | Reading > 60 s in the future | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
-| 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged | kill loop |
-| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; positions named by a cursor are not reused | power-loss rig |
+| 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and reported as `possible_loss` | kill loop |
+| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; positions named by the last kept batch, a synced cursor or a manifest record are not reused | power-loss rig |
 | 8 | Crash after sync, before delivery | Delivered on restart from each consumer's cursor | kill loop |
 | 9 | Crash during compaction | Output unpublished and discarded; inputs intact | kill loop |
 | 10 | Crash around the manifest record | Before: output discarded. After: inputs retired. Never both live | kill loop |
@@ -414,11 +418,11 @@ gap until they are re-ingested.
 9. Compaction, tiering and backup preserve the set of positions outside lost ranges, each with identical content;
    restore preserves the positions held in sealed, backed-up files up to the restored end, and keeps later ones
    quarantined.
-10. No operation removes a durable fact. The only loss short of a disaster is corruption of a log segment, open or
-    sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
-    `data_lost`. A tail truncated after a reboot is reported as `possible_loss`; it can hold at most the batches
-    acknowledged within one mark-sync interval before the power loss.
-11. No reader or consumer observes a position beyond the durable mark.
+10. No operation removes a durable fact. The only losses short of a disaster are corruption of a log segment, open
+    or sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
+    `data_lost`, and a tail truncated by §3 Recovery rule 3 after a reboot or with the mark lost, reported as
+    `possible_loss`, which can hold about one mark-sync interval of acknowledged batches.
+11. No reader or consumer observes a position beyond the durable mark as the writer holds it in memory.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
 13. A cursor or latch on disk is never ahead of the consumer's confirmation.
 14. No manifest epoch lists two live files holding the same position.
@@ -439,7 +443,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only; `possible_loss` for each tail truncated after a reboot (§3) |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
 
 Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.

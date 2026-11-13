@@ -9,7 +9,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 |---|---|---|
 | Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
 | Q-33 | §3 Recovery, §2.1, invariants 1 and 8 | Registry entries and derived files after a lost range |
-| Q-34 | §3, §8 Corrupt block, §11 | What `data_lost` means beyond the report |
+| Q-34 | §3, §8 Corrupt block, §11 | What `data_lost` and `possible_loss` mean beyond the report |
 | Q-36 | §5.1, §5.6, §5.7 | Calendar nodes for a series without a stored 15-minute level |
 | Q-37 | §8 Generations, §8 Restore, §2.2 | Which manifest records a restore reads, and how generations begin |
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
@@ -17,6 +17,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-40 | §2.4 Version index, §8 Restore | Ranking facts of versioned series during a restore |
 | Q-41 | §2.2 `future`, §4, §5.4 | Forecasts: values issued now about future times |
 | Q-42 | §5.2, §6 | Readings that cover an interval, not an instant |
+| Q-43 | §3 Recovery rule 3, §4, invariant 2 | Positions delivered but not confirmed, after a truncated tail |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -124,6 +125,17 @@ step to the next reading would be credited to the window containing the later re
 **Needed.** Whether interval readings are stamped at the interval's end as counters, carry an interval length, or are
 a series kind of their own, and how windows treat a partly covered interval.
 
+## Q-43 — Positions delivered but not confirmed, after a truncated tail
+**Scenario.** A batch is acknowledged and delivered; the consumer acts on position p but has not yet confirmed it, so
+no synced cursor names p. Power is lost before the mark sync, and the tail holding p is damaged and truncated
+(§3 Recovery rule 3). New positions continue above the last kept batch and the synced cursors, so p can be assigned
+to a new fact. The consumer, which de-duplicates by position (§4 At-least-once), may drop that new fact silently,
+against invariant 2. Readers without a cursor have the same exposure.
+**Model.** Not modelled; the mark is always exact.
+**Needed.** Whether consumers forget positions above their confirmed cursor when they receive `resync` after a
+truncated tail, whether the engine skips a margin of positions, or whether the residual risk is accepted and stated.
+This bounds the durability decision taken for Q-35 and is for the owner.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -169,7 +181,10 @@ The specification wins where the documents differ. These follow from it, for the
   `outranked`; `Ack` and health gain an outranked count (§2.2, §2.4, §4, §11).
 - **F-11.** `format.md` A.10: the mark file is synced on a timer (`mark_sync_interval`) and at clean shutdown, not never;
   recovery reads the highest position named by cursor files and manifest records before assigning positions. `api.md`:
-  the `mark_sync_interval` configuration key and a `possible_loss` health condition (§3).
+  the `mark_sync_interval` configuration key and a `possible_loss` health reason with its counts; acknowledgement does
+  not wait for the mark sync; test seams can inject a failed mark sync (§3). The manifest's lost-range record needs a
+  cause, telling corruption (`data_lost`) from a truncated tail (`possible_loss`); A.10's recovery bullets and A.11's
+  tests need the stale-mark case. Whether `possible_loss` is latched until acknowledged is part of Q-34.
 
 ## Settled
 | ID | Question | Settled in |
@@ -205,7 +220,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction (open part: Q-40) |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
-| Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, row 7a, invariant 10 |
+| Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 (open part: Q-43) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
