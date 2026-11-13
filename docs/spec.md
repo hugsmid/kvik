@@ -30,8 +30,9 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 | `wrap_at`, `reset_ceiling` | counters only; §5.5. `reset_ceiling` default 10 % |
 | `lateness bound` | default 5 min; §2.2 |
 | `versioned` | optional, for sources that revise readings they have already published; fixed for the life of the series (a change is a new series, and history may be re-ingested with `changed_at`). Every reading of a versioned series carries `changed_at` (§2.2); readings of other series never do |
-| `changed_at kind` | versioned series only: `time` (UTC nanoseconds) or `version` (an opaque counter); fixed for the life of the series; used only to type exports |
+| `changed_at kind` | versioned series only: `time` (UTC nanoseconds) or `version` (an opaque counter); fixed for the life of the series; used to type exports, and must be `time` for a forecast series |
 | `retention class` | `long-term` (default) or `diagnostic` with a retention period (default 30 days), for series kept mainly for short-term diagnosis, such as a machine's own resource metrics. It decides only where raw detail is kept (§8 Retention class), never which facts exist. A change of class is a registry entry that takes effect at its position, not by event time; it moves no detail back |
+| `timing` | `observed` (default), `scheduled` or `forecast`; fixed for the life of the series. **Scheduled:** values known in advance that take effect at their `t`, such as published prices; a scheduled source that revises its values must be versioned. **Forecast:** values about future times, re-issued over time; the series must be versioned with `changed_at kind` `time`, `changed_at` being the issue time and `t` the valid time |
 
 Series definitions, parameter changes (with an effective event time, except a change of retention class, which
 takes effect at its position), aliases and retirements are log entries. A parameter other than the retention class
@@ -62,10 +63,10 @@ and counted. The old id stays reachable by id.
 - `quality`: good / estimated / suspect / bad, from best to worst. The adapter supplies it; the engine may lower
   it, never raise it (`future` below; invalid values, §2.5). The adapter-supplied quality is kept with the fact for
   the duplicate rule (§2.4).
-- Fact flags (immutable): `future` (`t > received_at + 60 s`; quality lowered to suspect if better), `late`
-  (`t` earlier than the series' latest recorded `t` by more than 2 × S, or `received_at − t` above the lateness
-  bound), `revise` (§2.4), `host_time` (`t_source = host`), `unsynced_clock` (§2.5). Delivery flags are separate
-  (§4).
+- Fact flags (immutable): `future` (observed series only: `t > received_at + 60 s`; quality lowered to suspect if
+  better), `late` (on an observed series, `t` earlier than the series' latest recorded `t` by more than 2 × S; on any
+  series, `received_at − t` above the lateness bound), `revise` (§2.4), `host_time` (`t_source = host`),
+  `unsynced_clock` (§2.5). Delivery flags are separate (§4).
 
 ### 2.3 Views
 | View | Definition |
@@ -74,7 +75,7 @@ and counted. The old id stays reachable by id.
 | As-of P | the current view over facts with position ≤ P |
 | As-of time T | as-of P, where P is the last position whose batch `commit_time` ≤ T |
 | History | all facts for `(series, t)` in position order, each with its `changed_at` in a versioned series |
-| Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad |
+| Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad; a forecast series has none |
 
 A fact that is not current for its key is a **revision**. In a versioned series a fact can be a revision from the
 moment it is recorded: it is **outranked** when a fact of higher rank for its key is already recorded.
@@ -170,9 +171,9 @@ a different boot. The rules apply in this order:
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
 | Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), and when it is at or above the start of a tail truncated by §3 Recovery rule 3. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
-| Future facts | Delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. |
+| Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. Scheduled and forecast facts are delivered once, at commit, in position order and unflagged: notice of a value for `t`, not the value in force, and a consumer must not act on it as present. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled, and `resync` for a funnel over a forecast series carries condition state only. |
 | Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
-| Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
+| Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. A scheduled value takes effect, and a scheduled series falls stale, by `now` (§6), so a forward correction of the system clock can bring either forward. |
 
 ## 5. Summary tree
 ### 5.1 Levels and storage
@@ -220,7 +221,9 @@ nodes and late facts inserted between existing readings.
 ### 5.4 Staleness and coverage
 A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when more
 than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still awaiting
-its time or an outranked fact (§4), so a forward jump of the system clock cannot make a series stale. **Event-time
+its time or an outranked fact (§4), so a forward jump of the system clock cannot make an observed series stale. A
+scheduled series is stale when `now` is later than the `t` of its live-state fact by more than S, or when it has no
+live-state fact; commits do not refresh it. A forecast series has no live staleness. **Event-time
 staleness** applies to history and to every window evaluation (§6): a series is stale at event time x when x > (`t`
 of its latest reading before x that is not bad quality) + S. Coverage stops at that point and time-weighted results
 exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the window. Live staleness
@@ -263,10 +266,10 @@ applies only to live state and stale-for conditions.
 | Rule | |
 |---|---|
 | Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value: `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). |
-| Windows | Rolling (any length) and calendar (since local midnight, this month) in the site zone; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
-| Window end | `now` = an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
-| Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window for the newest edge, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past `now` are never used whole. |
-| Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, now, last.t + S). Time is never credited past `now`. |
+| Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
+| `now` | The window clock: an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
+| Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window for the newest edge, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
+| Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, credit limit, last.t + S). Time is never credited past the **credit limit**: `now` for an observed series, the window end for a scheduled or forecast series, whose values are known in advance. |
 | Old spans | If an edge's raw detail is not local, the edge is evaluated at 1-minute precision and the result is flagged `approximate_edges`. |
 | Cache | The merged middle is cached with the versions of its nodes and invalidated when any changes (late data included). |
 | Cadence | A windowed funnel is evaluated on each routed fact that is not outranked (§4) and on a timer every 1 s (configurable per funnel). |
@@ -365,7 +368,7 @@ gap until they are re-ingested.
 | 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
 | 2d | Versioned series: a fact with a lower `changed_at` than the current one and a new value | Recorded, delivered flagged `outranked`, counted; no node, live-state or condition change | property |
 | 3 | Reading for last week arrives now | Flagged `late`; minute path updated; no retroactive trigger | model |
-| 4 | Reading > 60 s in the future | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
+| 4 | Reading > 60 s in the future, on an observed series | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
 | 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and reported as `possible_loss` | kill loop |
@@ -403,7 +406,11 @@ gap until they are re-ingested.
 | 32 | Format version newer than the reader | Refused with a clear error | golden files |
 | 33 | Consumer emits readings from a delivery | Non-blocking emit off the writer thread; cyclic routes rejected | integration |
 | 34 | Route added while a consumer is catching up | Applies from its position only | model |
-| 35 | Window with no new data, or edge inside the open minute | Timer evaluation; edge from the recent window; nothing credited past now or S | property |
+| 35 | Window with no new data, or edge inside the open minute | Timer evaluation; edge from the recent window; nothing credited past the credit limit or S | property |
+| 36 | Scheduled value for tomorrow | Recorded unflagged, quality kept; delivered at commit as notice; in live state from its `t`, with no second delivery; stale S after the last value takes effect | model |
+| 37 | Forecast re-issued | The higher `changed_at` is current; earlier issues stay in history; a replay of an old issue is a duplicate or outranked | property |
+| 38 | Window over tomorrow on a scheduled or forecast series | Credited up to the window end; coverage shows where the values run out | property |
+| 39 | Window ending after `now` on an observed series | Nothing credited past `now` | property |
 
 ## 10. Invariants (checked by the reference model and property tests)
 1. Sequences are strictly increasing and gap-free within a generation across restarts, except for lost ranges
@@ -436,10 +443,13 @@ gap until they are re-ingested.
 16. After resume, every condition true now is delivered once in `resync`.
 17. For a counter, increases over adjacent windows sum to the increase over their union; for a state series, so do
     transitions (each step or transition credited once).
-18. No time is credited past `now` or past a reading's staleness limit (counter steps excepted).
+18. No time is credited past the credit limit (§6) or past a reading's staleness limit (counter steps excepted).
 19. For a source whose `changed_at` rises with every revision, re-submitting readings already recorded on a versioned
     series never changes the value, adapter-supplied quality or `changed_at` of any current fact while the version
     index is local, whether or not the duplicate check could run.
+20. No fact of a scheduled or forecast series carries `future`, or `late` by its first clause (§2.2).
+21. A window result over a scheduled or forecast series is a function of the current view and the window's bounds
+    alone.
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
@@ -470,6 +480,7 @@ Parquet export schema, API signatures and memory figures follow in separate docu
 | Funnel budget ≤ 1 µs | Benchmark per-reading routing and a 24 h rolling average with cached middle | Budget excludes windowed conditions; cadence-only evaluation |
 | Batch tree update cost | Backfill at a stated target rate through normal ingest, with late facts | Larger batches for re-ingest |
 | Duplicate check on replay | 1 hour × 100 series replay; probes outside the recent window | Larger recent window |
+| Forecast series | Revised-key index size, chunk overlap and duplicate probes below the latest `t`, since every key of a forecast series is revised by design | Keep fewer issues hot; larger recent window |
 | Tree size | Bytes per series-year per level on real data | D7 alternative |
 | Hot disk during 90-day log retention | Log plus compacted bytes per day at expected load | D4 default; earlier move to cold |
 | Restart ≤ 1 s | Start time with 100,000 series and 60 s of log after the checkpoint | Shorter checkpoint interval |

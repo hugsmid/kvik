@@ -15,9 +15,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
 | Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
 | Q-40 | §2.4 Version index, §8 Restore | Ranking facts of versioned series during a restore |
-| Q-41 | §2.2 `future`, §4, §5.4 | Forecasts: values issued now about future times |
 | Q-42 | §5.2, §6 | Readings that cover an interval, not an instant |
 | Q-43 | §3 Recovery rule 3, §4, invariant 2 | Positions delivered but not confirmed, after a truncated tail |
+| Q-44 | §2.1 timing, §4, §11 | Gaps left by scheduled and forecast series |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -105,17 +105,6 @@ yet listed in the deep tier.
 **Proposed.** Each tree checkpoint carries the version index as of its position, like the registry and latest `t`
 (§8), so step 1's replay brings it up to the restored end and the rank is always known.
 
-## Q-41 — Forecasts: values issued now about future times
-**Scenario.** An adapter delivers a weather forecast or published prices: values about times up to 16 days ahead,
-re-issued with each model run. Mapped to a versioned series keyed by valid time with `changed_at` = issue time,
-every value is more than 60 s in the future, so §2.2 flags it `future` and lowers it to suspect; live state,
-staleness and windows ignore it until due; and the as-of views answer "what was known then" only by position, not by
-issue time.
-**Model.** Not modelled.
-**Needed.** Whether forecasts are facts of a versioned series, a series flag that exempts them from `future`, or a
-separate record kind; how quality and live state apply to them; and how accuracy views (forecast against outcome)
-are served.
-
 ## Q-42 — Readings that cover an interval, not an instant
 **Scenario.** A source reports half-hourly consumption or hourly precipitation: each value covers an interval and
 is stamped at its start. §5.2 treats readings as point samples held for up to S, so an average or integral of such a
@@ -135,6 +124,14 @@ against invariant 2. Readers without a cursor have the same exposure.
 **Needed.** Whether consumers forget positions above their confirmed cursor when they receive `resync` after a
 truncated tail, whether the engine skips a margin of positions, or whether the residual risk is accepted and stated.
 This bounds the durability decision taken for Q-35 and is for the owner.
+
+## Q-44 — Gaps left by scheduled and forecast series
+**Scenario.** (a) A forecast feed stops: its series has no live staleness, and lookahead coverage shrinks only as the
+issued horizon runs out, so nothing reports the silence promptly. (b) A newer issue that no longer covers a valid
+time cannot withdraw the older issue's value there, so the current view can mix issues. (c) A wrong value far in the
+future on a scheduled or forecast series is never flagged, since those series are exempt from `future`.
+**Model.** Not modelled.
+**Needed.** Whether these are reported by the engine, left to the adapter's health, or accepted and stated.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -189,6 +186,10 @@ The specification wins where the documents differ. These follow from it, for the
   not by event time. `api.md`: `SeriesSpec` gains the retention class and period, which do not count towards "same
   specification" and may change without a new series; a call to change them; the default period as a configuration key;
   statistics for bytes moved and fetches (§2.1, §8).
+- **F-13.** `format.md`: a series definition carries its timing (observed, scheduled or forecast). `api.md`: `SeriesSpec`
+  gains timing, fixed for life; window bounds may be relative to `now` with either sign, and calendar windows relative
+  to the current one; a fact delivery from a scheduled or forecast series is a notice, not the value in force; live
+  state of a forecast series is none; a stale-for condition on a forecast series is a compile error (§2.1, §4, §6).
 
 ## Settled
 | ID | Question | Settled in |
@@ -225,6 +226,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 (open part: Q-43) |
+| Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
@@ -257,6 +259,7 @@ implement:
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | Files leave hot after the grace period; old epochs read remotely | `reader_epoch_survives_grace_then_reads_remotely` |
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
 | Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
+| Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Not modelled; every series is observed | — |
 | Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
