@@ -101,6 +101,12 @@ The specification wins where the documents differ. These follow from it, for the
   size of system clock jumps (§6) and `data_lost` per lost range (§3); readers need an explicit lease refresh, with
   its counter, and `Reader::open` a source of boot identity (§7); `WindowResult.value` must allow empty (rate,
   `min`, `max`, §6).
+- **F-7.** `format.md`: a segment's first sequence is at least 1, and a last sequence of 0 means empty (§2.2).
+  Part B needs a "restore" manifest record (generation, checkpoint, restored end) and manifest records keyed by
+  generation; the deep tier holds generation claim markers; a tree checkpoint bundles the registry file and each
+  series' latest `t` (§8).
+- **F-8.** `api.md`: the backup sink needs a create-if-absent write for generation claims; restore needs a read-only
+  drill mode; a consumer can register with its last confirmed position after a restore (§8).
 
 ## Settled
 | ID | Question | Settled in |
@@ -129,6 +135,13 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-23 | Stored calendar nodes for days off 15-minute boundaries | §5.7 |
 | Q-24 | A failed sync followed by a power loss | §3 Write or sync failure, row 12 |
 | Q-25 | When recovery writes the mark; a missing or invalid mark | §3 Recovery |
+| Q-26 | The first sequence of a generation, and "no position yet" | §2.2, §8 Restore step 1 |
+| Q-27 | Where consumer cursors come from after a restore | §8 Continuous backup, §8 Restore step 2, §4 Resync |
+| Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b |
+| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 |
+| Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2 |
+| Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
+| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
@@ -138,7 +151,7 @@ implement:
 
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
-| Generations | §2.2, §8: a restore starts a new generation | Positions continue after a restore | `restore_onto_empty_disk_current_first` |
+| Generations | §2.2, §8: a restore claims a new generation, starting at sequence 1 | Positions continue after a restore | `restore_onto_empty_disk_current_first` |
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
 | `t_source`, `host_time`, `unsynced_clock` | §2.2, §2.5, row 22a | Not modelled | — |
 | Duplicate identity | §2.4: adapter-supplied quality | Quality after future stamping | `duplicate_check_compares_engine_assigned_quality` |
@@ -163,5 +176,5 @@ implement:
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |
-| Restore from a checkpoint | §8 Restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
+| Restore from a checkpoint | §8 Restore: restore record, restored end before the first gap and quarantine beyond it, checkpoint with registry and latest `t`, cursors and `resync` after a restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
 | Invariants 12–16 | §10 | Not checked yet | — |

@@ -40,10 +40,11 @@ and counted. The old id stays reachable by id.
 
 ### 2.2 Log entries, positions and facts
 - Every log entry (fact, definition, parameter, alias, retirement, routing change) has a **position**
-  `(generation: u32, sequence: u64)`, ordered lexicographically. Sequence is strictly increasing and gap-free
-  within a generation across restarts, except for lost ranges recorded in the manifest (§3); a restore starts a new
-  generation (§8). Consumers see only the positions
-  of facts routed to them, so gaps between delivered positions are normal.
+  `(generation: u32, sequence: u64)`, ordered lexicographically. Every generation starts at sequence 1; `(g, 0)`
+  means "before the first entry of generation g" and `(0, 0)` means none. Sequence is strictly increasing and
+  gap-free within a generation across restarts, except for lost ranges recorded in the manifest (§3); a restore
+  starts a new generation (§8). Consumers see only the positions of facts routed to them, so gaps between delivered
+  positions are normal.
 - Fact: `(series, t, position, received_at, value, quality, flags)`.
 - `t`: event time, UTC nanoseconds, from the adapter. The adapter declares `t_source: device | host`.
 - `received_at`: host clock at commit. `commit_time`: per batch, `max(received_at, previous commit_time)`.
@@ -139,7 +140,7 @@ a different boot. The rules apply in this order:
 | At-least-once | After a restart a consumer resumes after its cursor and may see a delivery again. Consumers de-duplicate fact deliveries by position and timer deliveries by `(funnel, sequence)`; commands carry ids. |
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
-| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, and when the cursor, or the `start` position of a newly registered consumer, is below a lost range (§3). It is not flagged `replayed`; acting on it is acting on the present. |
+| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, and when the cursor, or the `start` position of a newly registered consumer, is below a lost range (§3). With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
 | Future facts | Delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. |
 | Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
 
@@ -276,11 +277,11 @@ carries coverage in seconds and as a fraction of the window.
 |---|---|---|
 | Hot | fast local disk | log segments < 90 days, current detail, revised-key index, chunk indexes, registry, the whole stored tree |
 | Cold (optional) | another local path | older revision chunks and sealed log segments; moved current detail |
-| Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints |
+| Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints, generation claims |
 
 | Rule | |
 |---|---|
-| Continuous backup | Each sealed file is queued for upload once; upload never blocks ingest or delivery. After its files, each manifest record is uploaded; a tree checkpoint at least daily. |
+| Continuous backup | Each sealed file is queued for upload once; upload never blocks ingest or delivery. After its files, each manifest record is uploaded; a tree checkpoint at least daily, and only after all log up to its position is backed up. Each tree checkpoint carries the registry file and each series' latest recorded `t`, as of its position. Cursor files are not backed up. |
 | Encryption | On the machine before upload, once per file; key supplied by the embedding application. |
 | Hashes | The manifest records SHA-256 of the plaintext at seal (hot and cold verification) and, per upload, SHA-256 of the ciphertext, sent with a single-part upload. The bucket must reject a mismatch and its reported hash must equal the manifest's; only then is the file backed up. Scheduled check: re-read reported hashes; sampled download-decrypt-verify proves key and content. |
 | Bucket | The engine never deletes from it. Versioning or object lock required. |
@@ -291,20 +292,34 @@ carries coverage in seconds and as a fraction of the window.
 | Upload stalled | Files queue locally, health degraded, nothing evicted. |
 | No deletion | Every fact is kept forever in at least the deep tier; the engine has no purge. |
 | Re-ingest | Exported or foreign data goes through the normal ingest path, in batches. |
-| Restore drill | The restore procedure is testable end to end; operators should exercise it regularly. |
+| Restore drill | The restore procedure is testable end to end; operators should exercise it regularly. A drill restores read-only and claims nothing. |
+| Generations | Before accepting ingest, a restore claims the generation one above the highest claimed, by a create-if-absent marker in the bucket; if the claim fails it takes the next. Manifest records are keyed by generation, and a restore reads those of the highest claimed. A writer that finds a higher generation claimed stops uploading (fatal health). A restore from an empty bucket is refused. |
 
 **Restore** (onto an empty disk):
-1. Download the latest manifest, the latest tree checkpoint (labelled derived-unverified) and the sealed log
-   segments after its position; replay them into the tree. Positions continue at sequence 0 of a new generation.
-2. The store serves queries at ≥ 1-minute resolution, flagged `restoring`, and accepts ingest (until the revised-key
-   index is back, facts with `t` before the restored end count as `duplicates_unchecked`). A cursor of an older
-   generation at or below the restored end continues; beyond it, `generation_changed` and `resync`.
+1. Claim a generation (Generations above) and read the manifest records of the highest generation claimed before it.
+   The **restored end** is the last position before the first gap in the restored log. Write one manifest record
+   (generation, checkpoint, restored end) before ingest is accepted. Download the latest tree checkpoint at or below
+   the restored end (labelled derived-unverified), with its registry file and latest `t` per series, and the sealed
+   log segments after its position; replay them into the tree. With no checkpoint, download the whole sealed log.
+   Segments beyond the restored end are downloaded and kept but quarantined: outside views, trees and delivery,
+   reported as a lost range, and available for re-ingest. Positions continue at sequence 1 of the new generation.
+2. The store serves queries at ≥ 1-minute resolution, flagged `restoring`, and accepts ingest. Until the revised-key
+   index is back, facts whose `t` is at or before the latest `t` known for their series (from the checkpoint or the
+   restored log) and which match no local fact are recorded and counted `duplicates_unchecked`. A consumer without a
+   cursor is treated as beyond the restored end; one that kept its last confirmed position registers with
+   `start: position`. A cursor of an older generation at or below the restored end receives the facts after it up to
+   the restored end, flagged `replayed`, if their segments are local; otherwise §4 Resync applies. Every consumer then
+   receives `generation_changed` and `resync`, and resumes at the new generation's first position.
 3. Download current chunks and the revised-key index, then revision chunks and log segments. A position present in
    two files is one fact and must have identical content.
 4. When detail for a span is back, recompute its nodes from facts and compare with the checkpoint; any difference
    is reported and the recomputed value wins. The checkpoint label is removed when all detail has been verified.
 
-A disaster loses facts committed after the last uploaded sealed file; they may already have been acted upon.
+A restart during a restore resumes it in its generation, fetching the files its record lists that are not yet local.
+A crash before the record starts the restore again with the next generation.
+
+A disaster loses facts in files not backed up, which may already have been acted upon, and those beyond the first
+gap until they are re-ingested.
 
 ## 9. Edge cases
 | # | Case | Rule | Test |
@@ -343,7 +358,9 @@ A disaster loses facts committed after the last uploaded sealed file; they may a
 | 25 | Series retired at `t_r` | Facts with `t < t_r` accepted; later refused and counted | integration |
 | 26 | Reader holds an old epoch | Its files stay while its lease names that epoch and its counter keeps changing; leases of a different boot are void | integration |
 | 27 | Bucket unreachable for days | Queue grows, no eviction, degraded health | fault injection |
-| 28 | Restore onto an empty disk | New generation; queries at ≥ 1 min from the checkpoint; detail back-fills and verifies the checkpoint | restore drill |
+| 28 | Restore onto an empty disk | New generation, claimed in the bucket; queries at ≥ 1 min from the checkpoint; detail back-fills and verifies the checkpoint; segments beyond the first gap quarantined | restore drill |
+| 28a | Crash or reboot during a restore | Resumes in its generation from the restore record; before the record, starts again with the next generation | restore drill |
+| 28b | Two restores from one bucket, or a drill beside a live store | Each restore claims its own generation; a writer that finds a higher one stops uploading; a drill claims nothing | restore drill |
 | 29 | Late fact for a minute whose detail is not local | Recorded; node `summary_stale` until fetched | model |
 | 30 | Very many series | Memory per series bounded and documented; ceiling (default 100,000) refuses new series clearly | load test |
 | 31 | Value NaN or infinite, or a negative counter value | Recorded as bad quality without a value; counted | unit |
@@ -358,13 +375,15 @@ A disaster loses facts committed after the last uploaded sealed file; they may a
 2. Every delivered position is durable; every durable position routed to a consumer is delivered to it, or
    superseded by a `resync` covering it.
 3. For any consumer, fact deliveries are in position order.
-4. The current view equals "highest position per `(series, t)`" over all facts in all tiers.
+4. The current view equals "highest position per `(series, t)`" over all facts in all tiers, quarantined segments
+   (§8 Restore) excepted.
 5. Every stored node is bitwise equal to its canonical computation over the current view of its span.
 6. `merge` is associative with the empty node as identity and agrees with direct computation (tolerance §5.6).
 7. A window result equals direct computation over the current view at evaluation time (tolerance §5.6).
 8. Rebuilding derived structures from log entries yields exactly the live structures.
 9. Compaction, tiering and backup preserve the set of positions outside lost ranges, each with identical content;
-   restore preserves the positions held in sealed, backed-up files.
+   restore preserves the positions held in sealed, backed-up files up to the restored end, and keeps later ones
+   quarantined.
 10. No operation removes a durable fact. The only loss short of a disaster is corruption of a log segment, open or
     sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
     `data_lost`.
