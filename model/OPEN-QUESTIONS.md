@@ -12,6 +12,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-34 | §3, §8 Corrupt block, §11 | What `data_lost` means beyond the report |
 | Q-35 | §3 Durable mark, invariant 10, principle 5 | Loss above a stale mark after a power loss is not reported |
 | Q-36 | §5.1, §5.6, §5.7 | Calendar nodes for a series without a stored 15-minute level |
+| Q-37 | §8 Generations, §8 Restore, §2.2 | Which manifest records a restore reads, and how generations begin |
+| Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
+| Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -74,6 +77,32 @@ children; the density rule stores no 15-minute level for a series whose expected
 **Needed.** Whether such a series stores calendar nodes (built from facts), or answers calendar results from its facts
 directly.
 
+## Q-37 — Which manifest records a restore reads, and how generations begin
+**Scenario.** (a) A restore claims generation g and crashes before writing its restore record. The next restore
+claims g + 1 and reads the records of g, the highest claimed before its own, which has none. (b) Records are keyed by
+generation, so a second restore reads only the first restore's generation and not the files of the generations before
+it. (c) The first store's generation (0) is never claimed, so "one above the highest claimed" can equal it while that
+store is still writing, and two facts get the same position.
+**Model.** Not yet modelled: positions continue after a restore.
+**Needed.** Which records a restore reads, how a restore record carries forward the files it restored, and whether a
+new store claims its generation.
+
+## Q-38 — Segments beyond the restored end
+**Scenario.** Segments beyond the first gap are kept but quarantined. (a) A definition in them is outside the restored
+registry, which may then assign that id again, against "never reused" (§2.1). (b) Nothing keeps them out of
+compaction (§7) or out of step 3's "log segments", where they would re-enter the views. (c) "Quarantined" means
+"queries return an error" in §8 Corrupt block, and it is not said who triggers their re-ingest.
+**Model.** Restore brings back every backed-up file; it has no notion of a gap.
+**Needed.** How these segments are held, named and reported, which ids they reserve, and how re-ingest is started.
+
+## Q-39 — Failures during a restore, and when it ends
+**Scenario.** (a) After ingest has opened, a segment at or below the restored end fails to download or fails its hash
+check. (b) "A crash before the record starts the restore again" assumes an empty disk, but files may already be local.
+(c) The end of `restoring` is not defined (step 3 complete, or step 4's label removed). (d) Step 3 downloads the
+revised-key index, which the deep tier does not list.
+**Model.** Downloads do not fail; a restore completes in one step.
+**Needed.** What each failure does, what a restart clears, and when the store stops being flagged `restoring`.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -106,7 +135,9 @@ The specification wins where the documents differ. These follow from it, for the
   generation; the deep tier holds generation claim markers; a tree checkpoint bundles the registry file and each
   series' latest `t` (§8).
 - **F-8.** `api.md`: the backup sink needs a create-if-absent write for generation claims; restore needs a read-only
-  drill mode; a consumer can register with its last confirmed position after a restore (§8).
+  drill mode; a consumer can register with its last confirmed position after a restore, so the application must
+  persist its confirmed positions; restore returns the restored end; health names a writer superseded by a higher
+  generation; re-ingest needs an entry point; a store's identity across restores and drills (§8).
 
 ## Settled
 | ID | Question | Settled in |
@@ -137,11 +168,11 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-25 | When recovery writes the mark; a missing or invalid mark | §3 Recovery |
 | Q-26 | The first sequence of a generation, and "no position yet" | §2.2, §8 Restore step 1 |
 | Q-27 | Where consumer cursors come from after a restore | §8 Continuous backup, §8 Restore step 2, §4 Resync |
-| Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b |
-| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 |
+| Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b (open parts: Q-37) |
+| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (open parts: Q-38, Q-39) |
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2 |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
-| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a |
+| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future

@@ -293,29 +293,32 @@ carries coverage in seconds and as a fraction of the window.
 | No deletion | Every fact is kept forever in at least the deep tier; the engine has no purge. |
 | Re-ingest | Exported or foreign data goes through the normal ingest path, in batches. |
 | Restore drill | The restore procedure is testable end to end; operators should exercise it regularly. A drill restores read-only and claims nothing. |
-| Generations | Before accepting ingest, a restore claims the generation one above the highest claimed, by a create-if-absent marker in the bucket; if the claim fails it takes the next. Manifest records are keyed by generation, and a restore reads those of the highest claimed. A writer that finds a higher generation claimed stops uploading (fatal health). A restore from an empty bucket is refused. |
+| Generations | Before accepting ingest, a restore claims the generation one above the highest claimed, by a create-if-absent marker in the bucket; if the marker already exists it takes the next. Manifest records are keyed by generation, and a restore reads those of the highest generation claimed before its own. A writer that finds a higher generation claimed stops uploading and becomes read-only (fatal health, §3). A restore from a bucket with no manifest records is refused. |
 
 **Restore** (onto an empty disk):
 1. Claim a generation (Generations above) and read the manifest records of the highest generation claimed before it.
-   The **restored end** is the last position before the first gap in the restored log. Write one manifest record
-   (generation, checkpoint, restored end) before ingest is accepted. Download the latest tree checkpoint at or below
-   the restored end (labelled derived-unverified), with its registry file and latest `t` per series, and the sealed
-   log segments after its position; replay them into the tree. With no checkpoint, download the whole sealed log.
-   Segments beyond the restored end are downloaded and kept but quarantined: outside views, trees and delivery,
-   reported as a lost range, and available for re-ingest. Positions continue at sequence 1 of the new generation.
+   The **restored end** is the last position before the first gap in the restored log that is not a recorded lost
+   range (§3). Write one manifest record (generation, checkpoint, restored end) before ingest is accepted. Download
+   the latest tree checkpoint at or below the restored end (labelled derived-unverified), with its registry file and
+   latest `t` per series, and the sealed log segments after its position; replay them into the tree. With no
+   checkpoint, download the whole sealed log. Segments beyond the restored end are downloaded and kept but
+   quarantined: outside views, trees and delivery, reported in health like a lost range, and available for re-ingest.
+   Positions of the new generation start at sequence 1.
 2. The store serves queries at ≥ 1-minute resolution, flagged `restoring`, and accepts ingest. Until the revised-key
    index is back, facts whose `t` is at or before the latest `t` known for their series (from the checkpoint or the
    restored log) and which match no local fact are recorded and counted `duplicates_unchecked`. A consumer without a
    cursor is treated as beyond the restored end; one that kept its last confirmed position registers with
    `start: position`. A cursor of an older generation at or below the restored end receives the facts after it up to
-   the restored end, flagged `replayed`, if their segments are local; otherwise §4 Resync applies. Every consumer then
-   receives `generation_changed` and `resync`, and resumes at the new generation's first position.
+   the restored end through catch-up, flagged `replayed`, if their segments are local; otherwise §4 Resync applies.
+   Every consumer then receives `generation_changed` and `resync`, and resumes at the new generation's first
+   position.
 3. Download current chunks and the revised-key index, then revision chunks and log segments. A position present in
    two files is one fact and must have identical content.
 4. When detail for a span is back, recompute its nodes from facts and compare with the checkpoint; any difference
    is reported and the recomputed value wins. The checkpoint label is removed when all detail has been verified.
 
-A restart during a restore resumes it in its generation, fetching the files its record lists that are not yet local.
+A restart during a restore resumes it in its generation, fetching the files listed by the manifest records it
+restores from that are not yet local.
 A crash before the record starts the restore again with the next generation.
 
 A disaster loses facts in files not backed up, which may already have been acted upon, and those beyond the first
@@ -359,8 +362,8 @@ gap until they are re-ingested.
 | 26 | Reader holds an old epoch | Its files stay while its lease names that epoch and its counter keeps changing; leases of a different boot are void | integration |
 | 27 | Bucket unreachable for days | Queue grows, no eviction, degraded health | fault injection |
 | 28 | Restore onto an empty disk | New generation, claimed in the bucket; queries at ≥ 1 min from the checkpoint; detail back-fills and verifies the checkpoint; segments beyond the first gap quarantined | restore drill |
-| 28a | Crash or reboot during a restore | Resumes in its generation from the restore record; before the record, starts again with the next generation | restore drill |
-| 28b | Two restores from one bucket, or a drill beside a live store | Each restore claims its own generation; a writer that finds a higher one stops uploading; a drill claims nothing | restore drill |
+| 28a | Crash or reboot during a restore | Resumes in its generation from the restore record; before the record, starts again with the next generation | kill loop |
+| 28b | Two restores from one bucket, or a drill beside a live store | Each restore claims its own generation; a writer that finds a higher one stops uploading; a drill claims nothing | fault injection |
 | 29 | Late fact for a minute whose detail is not local | Recorded; node `summary_stale` until fetched | model |
 | 30 | Very many series | Memory per series bounded and documented; ceiling (default 100,000) refuses new series clearly | load test |
 | 31 | Value NaN or infinite, or a negative counter value | Recorded as bad quality without a value; counted | unit |
