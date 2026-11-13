@@ -10,7 +10,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
 | Q-33 | §3 Recovery, §2.1, invariants 1 and 8 | Registry entries and derived files after a lost range |
 | Q-34 | §3, §8 Corrupt block, §11 | What `data_lost` means beyond the report |
-| Q-35 | §3 Durable mark, invariant 10, principle 5 | Loss above a stale mark after a power loss is not reported |
 | Q-36 | §5.1, §5.6, §5.7 | Calendar nodes for a series without a stored 15-minute level |
 | Q-37 | §8 Generations, §8 Restore, §2.2 | Which manifest records a restore reads, and how generations begin |
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
@@ -61,17 +60,6 @@ copies until uploaded, but neither §8 Corrupt block nor invariant 10 lists them
 `s8_corrupt_log_segment_with_no_other_copy_loses_range`).
 **Needed.** Whether valid batches of such a segment are kept and the quarantine lifted, how results over or after a
 lost range are flagged, and whether the state is latched until acknowledged.
-
-## Q-35 — Loss above a stale mark after a power loss is not reported
-**Scenario.** The mark is memory-mapped and not synced (§3), so after a power loss the mark on disk may lag
-acknowledged batches. If the tail above it is corrupt, recovery cannot tell it from a torn tail and truncates it: an
-acknowledged fact disappears without a report, against principle 5. A missing or unreadable mark has the same effect.
-Worse, the truncated positions are then reused, while a consumer's cursor (synced up to every second) may already
-name them: the consumer de-duplicates by position and drops the new facts silently, against invariant 2.
-**Model.** A torn tail is truncated; the case is not distinguished.
-**Options.** Report every tail truncated after a reboot (bytes, batches) as a possible loss; sync the mark on a timer
-to bound the window; or sync the mark with every commit, at the cost of a second sync per commit. This bears on the
-durability promise and is for the owner.
 
 ## Q-36 — Calendar nodes for a series without a stored 15-minute level
 **Scenario.** §5.1 stores calendar nodes "assembled from 15-minute nodes", and §5.6 builds every higher node from its
@@ -179,6 +167,9 @@ The specification wins where the documents differ. These follow from it, for the
   change of either is an error like a change of unit; refusals gain `changed_at` missing, `changed_at` unexpected and
   `revise` on a versioned series; fact deliveries and history results carry `changed_at`; deliveries gain the flag
   `outranked`; `Ack` and health gain an outranked count (§2.2, §2.4, §4, §11).
+- **F-11.** `format.md` A.10: the mark file is synced on a timer (`mark_sync_interval`) and at clean shutdown, not never;
+  recovery reads the highest position named by cursor files and manifest records before assigning positions. `api.md`:
+  the `mark_sync_interval` configuration key and a `possible_loss` health condition (§3).
 
 ## Settled
 | ID | Question | Settled in |
@@ -201,7 +192,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-17 | Identity of a reading recorded without a value | §2.4 |
 | Q-18 | Rate flagged in windows without a gap | §6 Aggregates (replaces the Q-05 flag condition) |
 | Q-19 | A corrupt compacted file whose inputs are still local | §8 Corrupt block, row 11 |
-| Q-20 | A corrupt block inside the open segment after a reboot | §3 Recovery, §8 Corrupt block, §11 Health, rows 11 and 11a, invariants 1, 9 and 10 (open parts: Q-33 to Q-35) |
+| Q-20 | A corrupt block inside the open segment after a reboot | §3 Recovery, §8 Corrupt block, §11 Health, rows 11 and 11a, invariants 1, 9 and 10 (open parts: Q-33, Q-34) |
 | Q-21 | Which clock measures lease expiry | §7 Leases (refresh counter and boot id; grace period on the writer's monotonic clock), row 26 |
 | Q-22 | Negative counter values if D1 changes | §2.5 |
 | Q-23 | Stored calendar nodes for days off 15-minute boundaries | §5.7 |
@@ -214,6 +205,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction (open part: Q-40) |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
+| Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, row 7a, invariant 10 |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
@@ -249,5 +241,6 @@ implement:
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |
+| Timed mark sync; `possible_loss`; no reuse of positions after a truncation | §3 Durable mark, §3 Recovery rule 3, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
 | Restore from a checkpoint | §8 Restore: restore record, restored end before the first gap and quarantine beyond it, checkpoint with registry and latest `t`, cursors and `resync` after a restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
 | Invariants 12–16 | §10 | Not checked yet | — |

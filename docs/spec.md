@@ -122,7 +122,7 @@ interval. A healthy unchanged series is therefore never stale, and every derived
 |---|---|
 | Batches | Append-only segments of arrival batches. A batch ends with a **commit block** (last position, checksum of the batch's blocks). One batch = one commit = one sync. A batch never spans segments. |
 | Commit | Write batch, sync, update the durable mark, then (and only then) acknowledge adapters, update tree and live state, and deliver. |
-| Durable mark | After each successful sync the writer updates a memory-mapped mark file: segment id, byte offset, last position, boot id, sequence lock. Not synced itself. Readers read log segments only up to the mark. |
+| Durable mark | After each successful sync the writer updates a memory-mapped mark file: segment id, byte offset, last position, boot id, sequence lock. The mark file itself is synced on a timer (`mark_sync_interval`, default 1 s) and at clean shutdown, so after a power loss the mark on disk lags acknowledged batches by at most that interval. Readers read log segments only up to the mark. |
 | Group commit | While a sync is in flight, arriving readings queue and form the next batch. No added delay when idle (optional linger, default 0). |
 | Segments | Preallocated at creation (64 MiB). The directory is synced after creating, sealing or renaming a file. |
 | Sealing | At 64 MiB or 5 minutes (both configurable), whichever first; an empty segment is not sealed. Sealed segments are immutable and eligible for backup. Compaction never removes a log segment (§8). |
@@ -144,7 +144,10 @@ a different boot. The rules apply in this order:
    range, which does not make the store read-only. Its positions are not reused. A consumer whose cursor is below a
    lost range receives `resync`.
 3. **Different boot id** (the machine rebooted, the page cache is gone): any remaining invalid tail is torn and is
-   truncated.
+   truncated. Because the mark on disk can lag acknowledged batches, a truncated tail may have held acknowledged
+   facts whose bytes were damaged: its byte and batch counts are reported as `possible_loss`. New positions then
+   continue above the highest position named by any cursor file or manifest record, and positions skipped that way
+   are recorded as a lost range, so no position a consumer may have seen is reused.
 4. Whenever rule 1 did not apply, recovery syncs the segment and directory and writes the mark with the current boot
    id, then resumes. If that sync fails, the engine stays read-only and leaves the old mark.
 
@@ -359,7 +362,7 @@ gap until they are re-ingested.
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
 | 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged | kill loop |
-| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum; complete batches synced on recovery before use | power-loss rig |
+| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; positions named by a cursor are not reused | power-loss rig |
 | 8 | Crash after sync, before delivery | Delivered on restart from each consumer's cursor | kill loop |
 | 9 | Crash during compaction | Output unpublished and discarded; inputs intact | kill loop |
 | 10 | Crash around the manifest record | Before: output discarded. After: inputs retired. Never both live | kill loop |
@@ -413,7 +416,8 @@ gap until they are re-ingested.
    quarantined.
 10. No operation removes a durable fact. The only loss short of a disaster is corruption of a log segment, open or
     sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
-    `data_lost`.
+    `data_lost`. A tail truncated after a reboot is reported as `possible_loss`; it can hold at most the batches
+    acknowledged within one mark-sync interval before the power loss.
 11. No reader or consumer observes a position beyond the durable mark.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
 13. A cursor or latch on disk is never ahead of the consumer's confirmation.
@@ -435,7 +439,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only; `possible_loss` for each tail truncated after a reboot (§3) |
 
 Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.
@@ -454,7 +458,7 @@ Parquet export schema, API signatures and memory figures follow in separate docu
 ## 13. Risks to measure
 | Risk | How measured | If it fails |
 |---|---|---|
-| Sync rate and SSD wear | Syncs/s and bytes written on a representative SSD with N unbatched 1 Hz series (N stated in the benchmark), preallocated segments, `fdatasync` | Enable linger (≤ 1 ms) |
+| Sync rate and SSD wear | Syncs/s and bytes written on a representative SSD with N unbatched 1 Hz series (N stated in the benchmark), preallocated segments, `fdatasync`, plus the timed mark sync | Enable linger (≤ 1 ms); a longer `mark_sync_interval` |
 | Funnel budget ≤ 1 µs | Benchmark per-reading routing and a 24 h rolling average with cached middle | Budget excludes windowed conditions; cadence-only evaluation |
 | Batch tree update cost | Backfill at a stated target rate through normal ingest, with late facts | Larger batches for re-ingest |
 | Duplicate check on replay | 1 hour × 100 series replay; probes outside the recent window | Larger recent window |
