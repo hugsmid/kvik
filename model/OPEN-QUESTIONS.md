@@ -122,11 +122,14 @@ adapters may also replay it, which the duplicate rule absorbs." Or record the fa
 recovery syncs; if it did not also write the mark with the new boot id, a later process crash on the same boot
 would find a different boot id in the mark and keep an unsynced batch, against row 7. Also unstated: what recovery
 does when the mark file is missing or unreadable, and whether a failed recovery sync leaves the old mark.
-**Model.** Recovery after a reboot always syncs and writes the mark with the current boot id; a failed recovery
-sync leaves the old mark, so the next restart tries again; a missing mark is treated as a different boot
-(`q25_recovery_stamps_mark_after_reboot`).
-**Proposed.** "Recovery after a reboot ends by writing the mark with the current boot id. A missing or unreadable
-mark is treated as a different boot."
+**Model.** Recovery after a reboot always syncs and writes the mark with the current boot id, also when no segment
+is open; a failed recovery sync leaves the old mark and writes nothing else, so the next restart tries again
+(`q25_recovery_stamps_mark_after_reboot`, `row_09_failed_recovery_sync_discards_nothing`). A missing mark is
+treated as a different boot. So after a process crash on the same boot with the mark lost, a batch that was written
+but not synced is kept, against row 7; that is safe, because recovery syncs it before anything sees it and it was
+never acknowledged (`q25_missing_mark_keeps_unsynced_batch`).
+**Proposed.** "Recovery after a reboot ends by writing the mark with the current boot id. If its sync fails, the old
+mark is left. A missing, unreadable or half-updated mark is treated as a different boot."
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and

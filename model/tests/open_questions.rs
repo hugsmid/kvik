@@ -118,3 +118,20 @@ fn q25_recovery_stamps_mark_after_reboot() {
     m.restart();
     assert!(m.facts().unwrap().is_empty());
 }
+
+/// Q-25: a missing mark counts as a different boot, so a batch written but not
+/// synced before a process crash on the same boot is kept; recovery syncs it
+/// before anything sees it, and it was never acknowledged.
+#[test]
+fn q25_missing_mark_keeps_unsynced_batch() {
+    let (mut m, s) = model();
+    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    let r = m.commit(Some(Fault::Crash(CrashPoint::AfterWrite(
+        WriteOutcome::Survived,
+    ))));
+    assert_eq!(r, Err(Error::Crashed));
+    m.disk.mark = None;
+    m.restart();
+    assert_eq!(m.facts().unwrap().len(), 1);
+    assert_eq!(m.disk.mark.unwrap().boot, m.boot);
+}

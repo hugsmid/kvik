@@ -894,34 +894,9 @@ impl Model {
         self.vol = None;
         // 1. The active segment past the durable mark (§3 Recovery).
         let read_only = self.recover_tail(recovery_sync_fails);
-        // 2. Unpublished compaction outputs are discarded.
-        let published = self.disk.published();
-        let orphans: Vec<FileId> = self
-            .disk
-            .hot
-            .iter()
-            .filter(|f| !published.contains(f))
-            .copied()
-            .collect();
-        for f in orphans {
-            self.disk.hot.remove(&f);
-            self.counters.compaction_discarded += 1;
-        }
-        // 3. Resume retirements of files whose replacements are published.
-        let retired = self.disk.retired();
-        let pending: Vec<FileId> = self
-            .disk
-            .manifest
-            .iter()
-            .flat_map(|r| match &r.op {
-                ManifestOp::Add { replaces, .. } => replaces.clone(),
-                ManifestOp::Retire { .. } | ManifestOp::Seal { .. } => Vec::new(),
-            })
-            .filter(|f| !retired.contains_key(f))
-            .collect();
-        for f in pending {
-            let at = self.wall;
-            self.disk.retire(at, f);
+        // Read-only after a failed recovery sync: nothing more is written.
+        if !read_only {
+            self.clean_up_files();
         }
         // 4. Rebuild volatile state from every readable entry.
         let entries = self.disk.all_entries();
@@ -982,13 +957,57 @@ impl Model {
         });
     }
 
+    /// Discards unpublished compaction outputs and resumes retirements of
+    /// files whose replacements are published (§3 Recovery).
+    fn clean_up_files(&mut self) {
+        let published = self.disk.published();
+        let orphans: Vec<FileId> = self
+            .disk
+            .hot
+            .iter()
+            .filter(|f| !published.contains(f))
+            .copied()
+            .collect();
+        for f in orphans {
+            self.disk.hot.remove(&f);
+            self.counters.compaction_discarded += 1;
+        }
+        let retired = self.disk.retired();
+        let pending: Vec<FileId> = self
+            .disk
+            .manifest
+            .iter()
+            .flat_map(|r| match &r.op {
+                ManifestOp::Add { replaces, .. } => replaces.clone(),
+                ManifestOp::Retire { .. } | ManifestOp::Seal { .. } => Vec::new(),
+            })
+            .filter(|f| !retired.contains_key(f))
+            .collect();
+        for f in pending {
+            let at = self.wall;
+            self.disk.retire(at, f);
+        }
+    }
+
     /// Same boot id as the mark: truncate everything after it. Different boot
     /// id, or no mark: keep the batches that reached the disk whole (a torn or
     /// lost batch is truncated), sync, and move the mark. Returns whether the
     /// engine must stay read-only because that sync failed.
     fn recover_tail(&mut self, sync_fails: bool) -> bool {
         let Some(active) = self.disk.active else {
+            // No open segment: after a reboot the mark is still synced and
+            // stamped with the new boot id.
             self.disk.tail_fate = None;
+            let Some(mark) = self.disk.mark else {
+                return false;
+            };
+            if mark.boot == self.boot {
+                return false;
+            }
+            if sync_fails {
+                return true;
+            }
+            self.sync_mark();
             return false;
         };
         let visible = self.disk.visible_batches(active).len();
@@ -1024,6 +1043,9 @@ impl Model {
     /// the current boot id (after a successful sync).
     fn sync_mark(&mut self) {
         let Some(active) = self.disk.active else {
+            if let Some(mark) = self.disk.mark.as_mut() {
+                mark.boot = self.boot;
+            }
             return;
         };
         let file = &self.disk.files[&active];
@@ -1052,15 +1074,17 @@ impl Model {
         }
         let position = v.next_position;
         v.next_position += 1;
-        v.registry.apply(&ev);
         let entry = Entry {
             position,
             received_at: wall,
-            body: EntryBody::Registry(ev),
+            body: EntryBody::Registry(ev.clone()),
         };
-        v.entries.insert(position, entry.clone());
-        self.append_batch(vec![entry]);
+        // Durable first; only then does the registry see the change.
+        self.append_batch(vec![entry.clone()]);
         self.sync_mark();
+        let v = self.vol_mut()?;
+        v.registry.apply(&ev);
+        v.entries.insert(position, entry);
         self.maybe_seal();
         Ok(position)
     }

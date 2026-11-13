@@ -349,6 +349,28 @@ fn row_08_crash_after_sync_before_delivery() {
     assert!(obs[0].replayed);
 }
 
+/// A crash during delivery comes after the durable mark: a consumer never sees
+/// a batch that a restart on the same boot could truncate.
+#[test]
+fn row_08_crash_during_delivery_after_mark() {
+    let (mut m, s) = model();
+    m.emit(num(s, T0, 1.0)).unwrap();
+    assert_eq!(
+        m.commit(Some(Fault::Crash(CrashPoint::DuringDelivery(1)))),
+        Err(Error::Crashed)
+    );
+    let last = *m.disk.all_entries().keys().next_back().unwrap();
+    let mark = m.disk.mark.unwrap();
+    assert_eq!((mark.boot, mark.last), (m.boot, last));
+    m.restart();
+    m.drain().unwrap();
+    let obs = &m.observed[&C];
+    assert_eq!(
+        (obs.len(), obs[0].position, obs[0].replayed),
+        (1, last, true)
+    );
+}
+
 fn sealed_model() -> (Model, SeriesId) {
     let (mut m, s) = model();
     let base = m.wall - 10 * SECOND;
@@ -358,6 +380,25 @@ fn sealed_model() -> (Model, SeriesId) {
     m.ingest(vec![num(s, base, 100.0)]).unwrap(); // a revision
     m.seal_active();
     (m, s)
+}
+
+/// A failed recovery sync leaves the engine read-only before it writes
+/// anything: unpublished compaction outputs stay until a later recovery.
+#[test]
+fn row_09_failed_recovery_sync_discards_nothing() {
+    let (mut m, _) = sealed_model();
+    assert_eq!(
+        m.compact(Some(CompactionCrash::AfterWrite)),
+        Err(Error::Crashed)
+    );
+    let hot = m.disk.hot.clone();
+    m.power_loss();
+    m.restart_with(true);
+    assert!(m.is_read_only());
+    assert_eq!((m.counters.compaction_discarded, &m.disk.hot), (0, &hot));
+    m.restart();
+    assert!(!m.is_read_only());
+    assert_eq!(m.counters.compaction_discarded, 2);
 }
 
 #[test]

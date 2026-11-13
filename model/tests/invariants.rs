@@ -424,18 +424,19 @@ fn generator_coverage() {
         let (mut m, ids) = machine();
         for op in &ops {
             let tail_before = m.disk.tail_len();
-            let boot = m.disk.mark.map(|k| k.boot);
+            let discarded_before = m.counters.batches_discarded;
+            let was_up = m.is_up();
             apply(&mut m, &ids, op).unwrap();
             tails += usize::from(m.disk.tail_len() > 0);
             recovery_failed += usize::from(
                 matches!(op, Op::Restart(true) | Op::PowerLoss(Some(true))) && m.is_read_only(),
             );
             // A restart after a reboot that kept a batch past the old mark.
-            if tail_before > 0
-                && m.disk.tail_len() == 0
-                && m.disk.mark.map(|k| k.boot) != boot
-                && m.disk.mark.is_some_and(|k| k.batches > 0)
-            {
+            // Explicit, or before an operation that needs the engine up.
+            let restarted =
+                matches!(op, Op::Restart(_) | Op::PowerLoss(Some(_))) || (!was_up && m.is_up());
+            let lost = m.counters.batches_discarded - discarded_before;
+            if restarted && tail_before as u64 > lost {
                 kept_after_reboot += 1;
             }
         }
@@ -457,5 +458,5 @@ fn generator_coverage() {
     );
     assert!(facts > 1000 && revisions > 50 && discarded > 10 && overflows > 10);
     assert!(compacted > 20 && uploaded > 20);
-    assert!(tails > 50 && kept_after_reboot > 5 && recovery_failed > 5);
+    assert!(tails > 50 && kept_after_reboot > 15 && recovery_failed > 5);
 }
