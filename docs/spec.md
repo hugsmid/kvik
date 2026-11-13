@@ -31,6 +31,7 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 | `lateness bound` | default 5 min; §2.2 |
 | `versioned` | optional, for sources that revise readings they have already published; fixed for the life of the series (a change is a new series, and history may be re-ingested with `changed_at`). Every reading of a versioned series carries `changed_at` (§2.2); readings of other series never do |
 | `changed_at kind` | versioned series only: `time` (UTC nanoseconds) or `version` (an opaque counter); fixed for the life of the series; used only to type exports |
+| `retention class` | `long-term` (default) or `diagnostic` with a retention period (default 30 days), for series kept mainly for short-term diagnosis, such as a machine's own resource metrics. It decides only where raw detail is kept (§8 Retention class), never which facts exist. A change of class is a registry entry that takes effect at its position, not by event time; it moves no detail back |
 
 Series definitions, parameter changes (with an effective event time), aliases and retirements are log entries.
 A parameter applies to readings with `t` at or after its effective time. A definition entry always has a lower
@@ -96,10 +97,10 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
   `changed_at`. The rank of an arriving fact is therefore known whenever the index is local.
 - **Fast path:** a fact with `t` later than the series' latest recorded `t` cannot be a duplicate; no lookup. Other
   facts are checked against the in-memory recent window (§5.1) before any index probe.
-- If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure), the fact is
-  recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data. In a versioned
-  series an arriving fact whose `changed_at` matches none in its key's history is not a duplicate and needs no
-  check; one whose `changed_at` equals that of a fact off every local tier is recorded, counted
+- If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure or retention class),
+  the fact is recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data. In a
+  versioned series an arriving fact whose `changed_at` matches none in its key's history is not a duplicate and needs
+  no check; one whose `changed_at` equals that of a fact off every local tier is recorded, counted
   `duplicates_unchecked` and takes the tie by position. An unchecked repeat therefore never reverts a correction with
   a higher `changed_at` in a versioned series. In any other series it can revert a correction that differs in value,
   so a source that revises readings must be declared versioned.
@@ -306,7 +307,8 @@ applies only to live state and stale-for conditions.
 | Encryption | On the machine before upload, once per file; key supplied by the embedding application. |
 | Hashes | The manifest records SHA-256 of the plaintext at seal (hot and cold verification) and, per upload, SHA-256 of the ciphertext, sent with a single-part upload. The bucket must reject a mismatch and its reported hash must equal the manifest's; only then is the file backed up. Scheduled check: re-read reported hashes; sampled download-decrypt-verify proves key and content. |
 | Bucket | The engine never deletes from it. Versioning or object lock required. |
-| Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. Current detail and the stored tree stay. |
+| Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. Current detail and the stored tree stay, except as the retention class allows. |
+| Retention class | For a diagnostic series (§2.1), raw detail (current and revision chunks) whose span ends more than the retention period before `now` leaves hot once verified in cold or deep; for revision chunks, the earlier of this and their own age applies. The stored tree stays hot. Nothing is deleted: such detail is fetched on demand like moved current detail, so, as with any moved detail, the duplicate check for it is unchecked (§2.4) and window edges over it are approximate (§6). |
 | Fill pressure | Above 70 % fill, verified sealed log segments leave first, then the oldest current raw detail (verified first, fetched on demand); the tree, chunk indexes, revised-key index and version index never move (§12 D4). |
 | Behind consumers | A consumer whose cursor is older than the oldest local log segment receives `resync`, not a replay. The engine never downloads from deep for catch-up. |
 | Corrupt block | File quarantined; the engine fetches the copy from cold, else deep, verifies the plaintext hash and swaps it in by a manifest record. If no other tier holds a verified copy, the file is compacted again from its kept inputs, verified by the §7 procedure, recorded with its new identity and hash, and swapped in by one manifest record that retires the quarantined file. Queries over the range return an error until then. Never repaired in place. Because inputs are kept until a file is verified elsewhere (§7), the only single copies are the open log segment and a sealed log segment not yet uploaded and not yet compacted: corruption there loses that range, recorded when found and reported as in §3 Recovery rule 2. An optional local mirror path for sealed log segments (configuration `mirror_path`, off by default) closes this window for sealed segments. |

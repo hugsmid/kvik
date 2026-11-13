@@ -179,6 +179,10 @@ The specification wins where the documents differ. These follow from it, for the
   change of either is an error like a change of unit; refusals gain `changed_at` missing, `changed_at` unexpected and
   `revise` on a versioned series; fact deliveries and history results carry `changed_at`; deliveries gain the flag
   `outranked`; `Ack` and health gain an outranked count (§2.2, §2.4, §4, §11).
+- **F-12.** `format.md`: the parameter-change entry carries the retention class and period, taking effect at its position,
+  not by event time. `api.md`: `SeriesSpec` gains the retention class and period, which do not count towards "same
+  specification" and may change without a new series; a call to change them; the default period as a configuration key;
+  statistics for bytes moved and fetches (§2.1, §8).
 
 ## Settled
 | ID | Question | Settled in |
@@ -245,6 +249,7 @@ implement:
 | Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments | `compaction_crash_after_publish_resumes_retirement` |
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | Files leave hot after the grace period; old epochs read remotely | `reader_epoch_survives_grace_then_reads_remotely` |
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
+| Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
 | Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
