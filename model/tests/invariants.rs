@@ -436,7 +436,7 @@ fn generator_coverage() {
             let restarted =
                 matches!(op, Op::Restart(_) | Op::PowerLoss(Some(_))) || (!was_up && m.is_up());
             let lost = m.counters.batches_discarded - discarded_before;
-            if restarted && tail_before as u64 > lost {
+            if restarted && !m.is_read_only() && tail_before as u64 > lost {
                 kept_after_reboot += 1;
             }
         }

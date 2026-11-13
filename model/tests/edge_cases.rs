@@ -399,6 +399,8 @@ fn row_09_failed_recovery_sync_discards_nothing() {
     m.restart();
     assert!(!m.is_read_only());
     assert_eq!(m.counters.compaction_discarded, 2);
+    // No segment is open, yet recovery stamped the mark with the new boot.
+    assert_eq!(m.disk.mark.unwrap().boot, m.boot);
 }
 
 #[test]
