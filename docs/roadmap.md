@@ -5,7 +5,7 @@ ticked in the same pull request. A **gate** is a point where work stops until th
 again; nothing after a gate starts before it is passed.
 
 ## 1. Specification settled
-- [ ] 1.1 Apply the outstanding rulings to `docs/spec.md`
+- [x] 1.1 Apply the outstanding rulings to `docs/spec.md`
 - [ ] 1.2 Model: durable mark, boot identity, recovery, generations and restore
 - [ ] 1.3 Model: delivery — latch, resync, catch-up after overflow, run-time routes, timer deliveries
 - [ ] 1.4 Model: files — atomic manifest records, reader leases, tiers and eviction, duplicate rule with revise

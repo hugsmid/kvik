@@ -223,7 +223,8 @@ impl SeriesTree {
     }
 
     /// The stored calendar node for `date` in `zone`: the merge of its
-    /// 15-minute nodes (§5.7). It holds no edge stretches (OPEN-QUESTIONS Q-04).
+    /// 15-minute nodes (§5.7). It holds no edge stretches; the specification
+    /// makes the calendar result a window evaluation (see `OPEN-QUESTIONS.md`).
     pub fn day(&self, zone: &TimeZone, date: Date) -> Result<Node, TreeError> {
         let (start, end) = day_span(zone, date)?;
         let quarters: Vec<Node> = (0..(end - start) / QUARTER)

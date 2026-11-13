@@ -414,7 +414,8 @@ pub enum Aggregate {
     Count,
     /// Counter increase.
     Increase,
-    /// Counter increase ÷ covered seconds (OPEN-QUESTIONS Q-05).
+    /// Counter increase ÷ covered seconds. The specification divides by the
+    /// elapsed time between bounding readings (see `OPEN-QUESTIONS.md`).
     Rate,
     /// Last value (a held value if there is no reading inside).
     Last,

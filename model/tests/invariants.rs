@@ -8,9 +8,9 @@ use common::*;
 use jiff::tz::TimeZone;
 use kvik_model::engine::ConsumerId;
 use kvik_model::oracle;
-use kvik_model::summary::{Node, direct, merge};
+use kvik_model::summary::{Body, Node, direct, merge};
 use kvik_model::tree::{LEVELS, SeriesTree, SlidingWindow};
-use kvik_model::types::{MINUTE, Nanos, QUARTER, SECOND, Value, floor_to};
+use kvik_model::types::{Exact, Kind, MINUTE, Nanos, QUARTER, SECOND, Value, floor_to};
 use kvik_model::view;
 use proptest::prelude::*;
 
@@ -210,24 +210,7 @@ proptest! {
                 let (start, end) = (T0 + (*a).min(*b), T0 + (*a).max(*b));
                 let now = T0 + n;
                 let want = oracle::window(&p, &all, start, end, now);
-                prop_assert_eq!(tree.window(start, end, now), want.clone());
-                // Invariant 18: nothing credited past now or a reading's limit.
-                prop_assert!(want.coverage <= i128::from((end.min(now) - start).max(0)));
-                if let Some(s) = p.staleness {
-                    let bound: i128 = all.iter().map(|_| i128::from(s)).sum::<i128>() + i128::from(s);
-                    prop_assert!(want.coverage <= bound);
-                }
-                // Invariant 17: counter increases over adjacent windows add up.
-                if p.kind == kvik_model::types::Kind::Counter && start < end {
-                    let mid = start + (end - start) / 2;
-                    let l = oracle::window(&p, &all, start, mid, now);
-                    let r = oracle::window(&p, &all, mid, end, now);
-                    let inc = |n: &kvik_model::summary::Node| match &n.body {
-                        kvik_model::summary::Body::Counter { increase, .. } => increase.clone(),
-                        _ => unreachable!(),
-                    };
-                    prop_assert_eq!(inc(&l) + inc(&r), inc(&want));
-                }
+                prop_assert_eq!(tree.window(start, end, now), want);
                 let len = (end - start).max(1);
                 let sw = sliding.entry(len).or_insert_with(|| SlidingWindow::new(len));
                 prop_assert_eq!(sw.evaluate(&tree, now), oracle::window(&p, &all, now - len, now, now));
@@ -239,6 +222,49 @@ proptest! {
             let (ds, _) = kvik_model::tree::day_span(&tz, date).unwrap();
             prop_assert_eq!(tree.window(ds, now, now), oracle::window(&p, &all, ds, now, now));
         }
+    }
+
+    /// 17. For a counter, the increases over adjacent windows that partition a
+    /// span add up to the increase over the span: each step is credited once.
+    #[test]
+    fn inv17_counter_increase_adds_over_adjacent_windows(
+        p in arb_params().prop_map(|mut p| { p.kind = Kind::Counter; p }),
+        rs in arb_readings(Kind::Counter, 16),
+        mut cuts in proptest::collection::vec(arb_offset(), 2..6),
+        n in arb_offset(),
+    ) {
+        cuts.sort_unstable();
+        let now = T0 + n;
+        let tree = SeriesTree::build(p, &rs);
+        let (start, end) = (T0 + cuts[0], T0 + cuts[cuts.len() - 1]);
+        let whole = increase(&tree.window(start, end, now));
+        let parts = cuts
+            .windows(2)
+            .map(|w| increase(&tree.window(T0 + w[0], T0 + w[1], now)))
+            .fold(Exact::from_integer(0.into()), |a, b| a + b);
+        prop_assert_eq!(parts, whole.clone());
+        prop_assert_eq!(whole, increase(&oracle::window(&p, &rs, start, end, now)));
+    }
+
+    /// 18. No time is credited past `now`, nor past a reading's staleness limit:
+    /// coverage never exceeds the part of `[start, min(end, now))` that lies
+    /// within S after some reading at or before `now`.
+    #[test]
+    fn inv18_nothing_credited_past_now_or_staleness(
+        (p, rs) in arb_params().prop_flat_map(|p| (Just(p), arb_readings(p.kind, 16))),
+        (a, b, n) in (arb_offset(), arb_offset(), arb_offset()),
+    ) {
+        let (start, end, now) = (T0 + a.min(b), T0 + a.max(b), T0 + n);
+        let tree = SeriesTree::build(p, &rs);
+        let w = tree.window(start, end, now);
+        let until = end.min(now);
+        prop_assert!(w.coverage <= i128::from((until - start).max(0)));
+        let valid: Vec<(Nanos, Nanos)> = rs
+            .iter()
+            .filter(|(t, _)| *t <= now)
+            .map(|(t, _)| (*t, p.staleness.map_or(Nanos::MAX, |s| t.saturating_add(s))))
+            .collect();
+        prop_assert!(w.coverage <= union_within(&valid, start, until));
     }
 
     /// 8. Rebuilding derived structures from facts yields exactly the live
@@ -306,6 +332,32 @@ proptest! {
             prop_assert_eq!(after.get(p), Some(f));
         }
     }
+}
+
+fn increase(n: &Node) -> Exact {
+    match &n.body {
+        Body::Counter { increase, .. } => increase.clone(),
+        _ => unreachable!("counter node"),
+    }
+}
+
+/// Length of the union of `intervals` (half-open) clipped to `[lo, hi)`.
+fn union_within(intervals: &[(Nanos, Nanos)], lo: Nanos, hi: Nanos) -> i128 {
+    let mut clipped: Vec<(Nanos, Nanos)> = intervals
+        .iter()
+        .map(|(a, b)| ((*a).max(lo), (*b).min(hi)))
+        .filter(|(a, b)| a < b)
+        .collect();
+    clipped.sort_unstable();
+    let (mut total, mut reach) = (0i128, Nanos::MIN);
+    for (a, b) in clipped {
+        let a = a.max(reach);
+        if b > a {
+            total += i128::from(b - a);
+        }
+        reach = reach.max(b);
+    }
+    total
 }
 
 #[test]

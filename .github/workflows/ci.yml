@@ -8,6 +8,11 @@ on:
     # Nightly deep property run: new random cases every day.
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      cases:
+        description: Property-test cases for the deep jobs
+        required: false
+        default: "10000"
 
 permissions:
   contents: read
@@ -70,6 +75,8 @@ jobs:
 
   deep:
     # Many more random cases, one job per property-test file, in release mode.
+    # Measured on the runner: 100,000 cases take about 3 minutes for the
+    # slowest file (invariants), well inside the limit.
     name: deep (${{ matrix.suite }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -85,4 +92,4 @@ jobs:
           key: deep
       - run: cargo test --locked --release -p kvik-model --test ${{ matrix.suite }}
         env:
-          PROPTEST_CASES: ${{ github.event_name == 'schedule' && '100000' || '10000' }}
+          PROPTEST_CASES: ${{ inputs.cases || (github.event_name == 'schedule' && '100000' || '10000') }}

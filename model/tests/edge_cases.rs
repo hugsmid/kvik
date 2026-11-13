@@ -9,7 +9,7 @@ use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, Event, Runner};
 use kvik_model::engine::{
     CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, Error, FORMAT_VERSION, Fault,
-    FileClass, Level, Model, Reason, Refusal, Selection, WriteOutcome,
+    FileClass, Level, Model, Reason, Refusal, Selection, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Params};
@@ -389,7 +389,7 @@ fn row_12_sync_error_read_only_fatal_restart_truncates() {
             Err(Error::SyncFailed)
         );
         assert_eq!(m.health().level, Level::Fatal);
-        assert_eq!(m.emit(num(s, T0 + 1, 1.0)), Err(Refusal::ReadOnly));
+        assert_eq!(m.emit(num(s, T0 + 1, 1.0)), Err(Refusal::ReadOnly.into()));
         assert_eq!(m.commit(None), Err(Error::ReadOnly), "no retry");
         assert!(delivered(&m).is_empty());
         m.restart();
@@ -420,12 +420,21 @@ fn row_13_disk_fills_degrade_then_ingest_waits_nothing_deleted() {
     assert_eq!(m.housekeeping(), Err(Error::Paused));
     m.disk.other_bytes = 96_000;
     assert!(m.health().reasons.contains(&Reason::CriticalDisk));
-    // Back-pressure: the adapter must wait and retry.
-    assert_eq!(m.emit(num(s, T0 + 1, 2.0)), Err(Refusal::DiskFull));
-    assert_eq!(m.counters.refused[&Refusal::DiskFull], 1);
+    // Ingest waits: the reading is held back, not refused, and the wait is
+    // counted.
+    let waiting = num(s, T0 + 1, 2.0);
+    assert_eq!(m.emit(waiting.clone()), Err(Wait::DiskFull.into()));
+    assert_eq!(m.counters.waits[&Wait::DiskFull], 1);
+    assert!(m.counters.refused.is_empty());
+    assert_eq!(m.queued(), 0);
     // Reads continue; nothing deleted.
     assert_eq!(m.window(s, T0, T0 + MINUTE).unwrap().count, 1);
     assert_eq!(durable(&m), before);
+    // Once space is free, the same reading goes through and is recorded.
+    m.disk.other_bytes = 0;
+    m.emit(waiting).unwrap();
+    m.commit(None).unwrap();
+    assert_eq!(m.window(s, T0, T0 + MINUTE).unwrap().count, 2);
 }
 
 #[test]
@@ -745,7 +754,7 @@ fn row_24_unit_or_kind_change_is_new_series() {
         new_series
     );
     let t_r = m.now;
-    assert_eq!(m.emit(num(s, t_r, 1.0)), Err(Refusal::Retired));
+    assert_eq!(m.emit(num(s, t_r, 1.0)), Err(Refusal::Retired.into()));
     assert!(
         m.emit(num(s, t_r - 1, 1.0)).is_ok(),
         "earlier facts still accepted"
@@ -761,7 +770,7 @@ fn row_25_series_retired_at_t_r() {
     m.retire(s, t_r).unwrap();
     // Facts before t_r are still accepted; from t_r on they are refused.
     m.ingest(vec![num(s, t_r - 1, 2.0)]).unwrap();
-    assert_eq!(m.emit(num(s, t_r, 3.0)), Err(Refusal::Retired));
+    assert_eq!(m.emit(num(s, t_r, 3.0)), Err(Refusal::Retired.into()));
     assert_eq!(m.counters.refused[&Refusal::Retired], 1);
     assert_eq!(m.registry().unwrap().live().count(), 0, "hidden");
     assert!(m.registry().unwrap().get(s).is_some(), "reachable by id");

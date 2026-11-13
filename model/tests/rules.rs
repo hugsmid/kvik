@@ -4,7 +4,9 @@
 mod common;
 
 use common::*;
-use kvik_model::engine::{Config, Model};
+use kvik_model::engine::{
+    Config, ConsumerDecl, ConsumerId, FileClass, Level, Model, Reason, Selection,
+};
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
@@ -166,4 +168,99 @@ fn s6_windows_exact_to_the_nanosecond() {
     let w = tree.window(T0 + 1, T0 + 7, T0 + HOUR);
     assert_eq!(w.coverage, 6);
     assert_eq!(w, oracle::window(&p, &rs, T0 + 1, T0 + 7, T0 + HOUR));
+}
+
+/// §4 Overflow: catch-up resumes after the last position already queued for the
+/// consumer in this session, not from its confirmed cursor, so nothing repeats.
+#[test]
+fn s4_overflow_catch_up_resumes_after_last_enqueued() {
+    let c = ConsumerId(1);
+    let consumer = ConsumerDecl {
+        id: c,
+        selection: Selection::All,
+        capacity: 2,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let s = m
+        .define(
+            "vehicle/7/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            SECOND,
+        )
+        .unwrap();
+    for i in 0..5 {
+        m.ingest(vec![Reading::num(s, T0 + i * SECOND, 1.0 + i as f64)])
+            .unwrap();
+    }
+    assert_eq!(m.disk.cursors[&c], 0, "nothing confirmed yet");
+    m.drain().unwrap();
+    let ps: Vec<u64> = m.observed[&c].iter().map(|o| o.position).collect();
+    assert_eq!(ps, vec![2, 3, 4, 5, 6], "no repeats, in order");
+}
+
+/// §5.2: coverage applies to every kind, text included.
+#[test]
+fn s5_2_text_nodes_carry_coverage() {
+    let p = Params::new(Kind::Text, None);
+    let rs = vec![
+        (T0, Value::Str("ok".into())),
+        (T0 + SECOND, Value::Str("ok".into())),
+    ];
+    assert_eq!(
+        direct(&p, T0, T0 + MINUTE, &rs).coverage,
+        i128::from(SECOND)
+    );
+}
+
+/// §8 Corrupt block: a sealed log segment that is neither uploaded nor
+/// compacted is the only copy; corruption there loses its range and is
+/// reported as a fatal health condition. It is never repaired in place.
+#[test]
+fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
+    let (mut m, s) = model(10 * SECOND);
+    let now = m.wall;
+    m.ingest(vec![Reading::num(s, now, 1.0)]).unwrap();
+    m.seal_active();
+    let f = *m
+        .disk
+        .hot
+        .iter()
+        .find(|f| m.disk.files[f].class == FileClass::Segment)
+        .unwrap();
+    m.corrupt_hot(f);
+    m.scrub();
+    assert!(!m.restore_file(f));
+    assert!(m.disk.all_facts().is_empty());
+    let h = m.health();
+    assert_eq!(h.level, Level::Fatal);
+    assert!(h.reasons.contains(&Reason::Quarantined(f)));
+}
+
+/// §10 invariant 9: a restore preserves the positions held in sealed,
+/// backed-up files; facts committed after the last upload are lost (§8).
+#[test]
+fn s10_9_restore_preserves_backed_up_positions() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.seal_active();
+    m.upload();
+    let backed_up: Vec<u64> = m.facts().unwrap().iter().map(|f| f.position).collect();
+    m.ingest(vec![Reading::num(s, T0 + SECOND, 2.0)]).unwrap();
+    let r = Model::restore_from(m.config.clone(), vec![], &m.disk.bucket, m.wall, false);
+    let restored: Vec<u64> = r.facts().unwrap().iter().map(|f| f.position).collect();
+    assert_eq!(restored, backed_up);
+    assert_eq!(m.facts().unwrap().len(), 2);
+}
+
+/// §11 Health: statistics counters are persisted on a best-effort basis; the
+/// model keeps them across a restart.
+#[test]
+fn s11_counters_persist_across_restart() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0), Reading::num(s, T0, 1.0)])
+        .unwrap();
+    m.restart();
+    assert_eq!(m.counters.duplicates_dropped, 1);
 }

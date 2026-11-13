@@ -9,7 +9,8 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
-CI runs the same checks on Linux, macOS and Windows, plus longer property-test runs.
+CI checks formatting, lints and documentation on Linux, runs the tests on Linux, macOS and Windows, and runs
+longer property tests on Linux on every change and nightly.
 
 ## Guidelines
 - **Specification first.** A change to behaviour starts as a change to `docs/spec.md`. The reference model then

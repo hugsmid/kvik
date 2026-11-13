@@ -47,9 +47,10 @@ pub struct Config {
     pub disk_bytes: u64,
     /// Bytes one log entry costs on disk (model accounting).
     pub entry_bytes: u64,
-    /// Low mark: compaction and tiering pause, health degraded (§3).
+    /// Low mark: compaction pauses, health degraded (§3). The model also
+    /// pauses tiering (see `OPEN-QUESTIONS.md`).
     pub low_mark: u64,
-    /// Critical mark: ingest refused (§3).
+    /// Critical mark: ingest waits (§3).
     pub critical_mark: u64,
     /// Fill ratio (percent) above which the oldest current detail moves out (§8: 70 %).
     pub fill_threshold_pct: u64,
@@ -298,6 +299,30 @@ pub enum CompactionCrash {
     AfterPublish,
 }
 
+/// Back-pressure (§3): the reading is not refused; the emit waits until it can
+/// enter the queue. The model is synchronous, so it returns the wait to the
+/// caller, which emits the same reading again later. Every wait is counted.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, thiserror::Error)]
+pub enum Wait {
+    /// Free space is below the critical mark.
+    #[error("disk below critical mark")]
+    DiskFull,
+    /// The ingest queue is full.
+    #[error("ingest queue full")]
+    QueueFull,
+}
+
+/// Why an emit did not enter the ingest queue.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EmitError {
+    /// Back-pressure: emit the same reading again later.
+    #[error("wait: {0}")]
+    Wait(#[from] Wait),
+    /// Refused for good.
+    #[error("refused: {0}")]
+    Refused(#[from] Refusal),
+}
+
 /// Why a reading was refused at ingest. Every refusal is counted.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, thiserror::Error)]
 pub enum Refusal {
@@ -307,13 +332,6 @@ pub enum Refusal {
     /// Engine is read-only after a failed write or sync.
     #[error("engine is read-only")]
     ReadOnly,
-    /// Free space is below the critical mark: back-pressure, the adapter
-    /// waits and retries (§3).
-    #[error("disk below critical mark; wait")]
-    DiskFull,
-    /// Ingest queue is full; the adapter must wait.
-    #[error("ingest queue full")]
-    QueueFull,
     /// Unknown series.
     #[error("unknown series")]
     UnknownSeries,
@@ -401,6 +419,8 @@ pub struct Counters {
     pub duplicates_dropped: u64,
     /// Refusals by reason.
     pub refused: BTreeMap<Refusal, u64>,
+    /// Back-pressure waits by reason (§3: the wait is measured).
+    pub waits: BTreeMap<Wait, u64>,
     /// Facts flagged late.
     pub late: u64,
     /// Facts flagged future.
@@ -1021,17 +1041,17 @@ impl Model {
     // ----- ingest -----
 
     /// Emits a reading into the bounded ingest queue.
-    pub fn emit(&mut self, r: Reading) -> Result<(), Refusal> {
+    pub fn emit(&mut self, r: Reading) -> Result<(), EmitError> {
         self.emit_with(r, false)
     }
 
     /// Emits a reading with `revise` intent: it bypasses the duplicate check,
     /// so a deliberate return to an earlier value is recorded (§2.4).
-    pub fn emit_revise(&mut self, r: Reading) -> Result<(), Refusal> {
+    pub fn emit_revise(&mut self, r: Reading) -> Result<(), EmitError> {
         self.emit_with(r, true)
     }
 
-    fn emit_with(&mut self, r: Reading, revise: bool) -> Result<(), Refusal> {
+    fn emit_with(&mut self, r: Reading, revise: bool) -> Result<(), EmitError> {
         let res = self.check(&r);
         match res {
             Ok(()) => {
@@ -1042,36 +1062,40 @@ impl Model {
                     .push_back((r, revise));
                 Ok(())
             }
-            Err(e) => {
+            Err(EmitError::Wait(w)) => {
+                *self.counters.waits.entry(w.clone()).or_insert(0) += 1;
+                Err(w.into())
+            }
+            Err(EmitError::Refused(e)) => {
                 *self.counters.refused.entry(e.clone()).or_insert(0) += 1;
-                Err(e)
+                Err(e.into())
             }
         }
     }
 
-    fn check(&self, r: &Reading) -> Result<(), Refusal> {
+    fn check(&self, r: &Reading) -> Result<(), EmitError> {
         let v = self.vol.as_ref().ok_or(Refusal::Down)?;
         if v.read_only {
-            return Err(Refusal::ReadOnly);
+            return Err(Refusal::ReadOnly.into());
         }
         if self.free_bytes() < self.config.critical_mark {
-            return Err(Refusal::DiskFull);
+            return Err(Wait::DiskFull.into());
         }
         let d = v.registry.get(r.series).ok_or(Refusal::UnknownSeries)?;
         if d.retired_at.is_some_and(|at| r.t >= at) {
-            return Err(Refusal::Retired);
+            return Err(Refusal::Retired.into());
         }
         let non_finite = matches!(r.value, Value::Num(x) if !x.is_finite());
         if !non_finite && !r.value.fits(d.value_type) {
-            return Err(Refusal::WrongType);
+            return Err(Refusal::WrongType.into());
         }
         if let Value::Str(s) = &r.value
             && s.len() > MAX_TEXT_BYTES
         {
-            return Err(Refusal::TextTooLong);
+            return Err(Refusal::TextTooLong.into());
         }
         if v.queue.len() >= self.config.ingest_capacity {
-            return Err(Refusal::QueueFull);
+            return Err(Wait::QueueFull.into());
         }
         Ok(())
     }
@@ -1381,7 +1405,7 @@ impl Model {
                         });
                     } else {
                         // Catch up from the first position not enqueued
-                        // (OPEN-QUESTIONS Q-02).
+                        // in this session (§4 Overflow).
                         c.mode = Mode::CatchUp { next: e.position };
                         self.counters.overflows += 1;
                     }

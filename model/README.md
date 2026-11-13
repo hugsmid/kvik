@@ -23,7 +23,7 @@ it differs, and the open questions in the specification itself.
 
 | File | Covers |
 |---|---|
-| `tests/invariants.rs` | Property tests for specification invariants 1–10, 17 and 18 |
+| `tests/invariants.rs` | Property tests for specification invariants 1–10, 17 and 18, one test per invariant |
 | `tests/edge_cases.rs` | Edge-case rows 1, 2, 2a, 2b, 3–9, 11–14, 17, 17a, 18, 18a, 19, 20, 22–25, 27, 29–32 and 35, one test (or property) each, named after the row |
 | `tests/rules.rs` | Other rules, named after their section |
 | `tests/open_questions.rs` | One test per open question that the model can show |
