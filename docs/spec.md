@@ -421,7 +421,8 @@ gap until they are re-ingested.
 10. No operation removes a durable fact. The only losses short of a disaster are corruption of a log segment, open
     or sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
     `data_lost`, and a tail truncated by §3 Recovery rule 3 after a reboot or with the mark lost, reported as
-    `possible_loss`, which can hold about one mark-sync interval of acknowledged batches.
+    `possible_loss`; after a reboot with a readable mark it can hold about one mark-sync interval of acknowledged
+    batches, and with the mark lost it is unbounded.
 11. No reader or consumer observes a position beyond the durable mark as the writer holds it in memory.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
 13. A cursor or latch on disk is never ahead of the consumer's confirmation.
@@ -443,7 +444,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
 
 Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.
