@@ -169,10 +169,11 @@ nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
 A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when
-more than S has passed since its last commit of a fact that is not bad quality (§2.5), so a forward jump of the
-system clock cannot make a series stale. **Event-time staleness** applies to history only: a series is stale at event time x when
-x > (latest good reading's `t` before x) + S. Coverage stops at that point and time-weighted results exclude the
-gap. Every windowed result carries coverage in seconds and as a fraction of the window.
+more than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still
+awaiting its time (§4), so a forward jump of the system clock cannot make a series stale. **Event-time staleness**
+applies to history only: a series is stale at event time x when x > (`t` of its latest reading before x that is not
+bad quality) + S. Coverage stops at that point and time-weighted results exclude the gap. Every windowed result
+carries coverage in seconds and as a fraction of the window.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).

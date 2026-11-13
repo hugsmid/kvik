@@ -37,9 +37,9 @@ their trailing stretch is measured like live staleness, on the monotonic clock s
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. A series has been silent for 10 minutes and is stale. A late fact for last week is then
 committed. Read literally, "since its last commit of a fact that is not bad quality" makes the series fresh again,
-although live state (the greatest `t ≤ now`) still shows the 10-minute-old reading. A future fact is suspect, not
-bad, so its commit also refreshes staleness, although §4 says future facts are ignored by staleness until due.
-Two further gaps: "bad quality" may mean the adapter-supplied or the engine-assigned quality (§2.2), and the
+although live state (the greatest `t ≤ now`) still shows the 10-minute-old reading. A future fact, by contrast, is
+excluded until due (§4), but once due it is not said whether staleness counts from its commit or from the moment
+it fell due. Two further gaps: "bad quality" may mean the adapter-supplied or the engine-assigned quality (§2.2), and the
 monotonic clock restarts at boot, so after a restart there is no last-commit instant on it to measure from.
 **Model.** Stale-for conditions measure monotonic time since the last arrival of any reading.
 **Proposed.** "…since the commit of the fact that is the series' live state (§2.3), using the engine-assigned
@@ -80,8 +80,9 @@ valid checksums" (§3). If a block in the middle of the open segment has decayed
 acknowledged and possibly delivered, is dropped. Invariant 10 now says the only loss short of a disaster is a
 corrupt sealed log segment with no other copy; the open segment is also a single copy.
 **Model.** Recovery distinguishes only a torn last batch; mid-segment corruption is not modelled.
-**Proposed.** Either list the open segment in invariant 10 and §8 as a single-copy window (closed by the mirror
-path), or keep every later batch whose own checksums are valid and report the damaged range as fatal.
+**Proposed.** Either list the open segment in invariant 10 and §8 as a single-copy window (and extend the mirror path,
+now limited to sealed log segments, to the open segment), or keep every later batch whose own checksums are valid
+and report the damaged range as fatal.
 
 ## Q-21 — Which clock measures lease expiry
 **Scenario.** The retirement grace period is wall-clock time recorded in the manifest (§7). If a lease's expiry
@@ -104,6 +105,15 @@ evaluation either way (§5.7); only the stored node is undefined.
 **Model.** Such days are refused (`tests/model.rs` `unaligned_days_are_refused`).
 **Proposed.** "No calendar node is stored for such a day; its result is evaluated from the 15-minute nodes inside it
 and facts at its edges."
+
+## For the format and interface documents
+The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
+`docs/api.md`:
+- **F-1.** `format.md` A.5: the fact row has one `quality` column, and a `no_value` row is forced to quality bad.
+  Duplicate identity (§2.4) compares the adapter-supplied quality, which §2.2 keeps with the fact. Without it, the
+  duplicate check and the revised-key index cannot be rebuilt from the log (invariants 8, 15).
+- **F-2.** `api.md`: back-pressure is listed as a refusal; §3 says ingest waits. `try_emit` returning `Busy` fits.
+- **F-3.** `api.md`: windowed results need a place for the rate flag (§6).
 
 ## Settled
 | ID | Question | Settled in |
