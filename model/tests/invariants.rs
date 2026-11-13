@@ -289,7 +289,8 @@ proptest! {
         }
     }
 
-    /// 9. Compaction, tiering, backup and restore preserve the multiset of facts.
+    /// 9. Compaction, tiering and backup preserve the set of positions with
+    /// their content; restore preserves the backed-up ones.
     #[test]
     fn inv09_tiering_backup_restore_preserve_facts(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
@@ -314,7 +315,9 @@ proptest! {
                 }
             }
         }
-        // Restore onto an empty disk from the bucket alone.
+        // Restore onto an empty disk from the bucket alone. Everything was
+        // sealed and uploaded above, so the backed-up positions are all of
+        // them (the partial case is `rules.rs` `s10_9_…`).
         let r = kvik_model::engine::Model::restore_from(m.config.clone(), consumers(), &m.disk.bucket, m.wall, false);
         prop_assert_eq!(&durable(&r), &committed);
         prop_assert_eq!(r.current().unwrap(), m.current().unwrap());

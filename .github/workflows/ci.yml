@@ -75,8 +75,9 @@ jobs:
 
   deep:
     # Many more random cases, one job per property-test file, in release mode.
-    # Measured on the runner: 100,000 cases take about 3 minutes for the
-    # slowest file (invariants), well inside the limit.
+    # Measured on the runner: with 100,000 cases the slowest file
+    # (invariants) runs its tests in about 100 s, the whole job in about
+    # 2 minutes, well inside the limit.
     name: deep (${{ matrix.suite }})
     runs-on: ubuntu-latest
     timeout-minutes: 30

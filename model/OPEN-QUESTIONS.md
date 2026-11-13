@@ -9,9 +9,14 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 |---|---|---|
 | Q-14 | §6 Edge stretches | State transition at a window's leading edge |
 | Q-15 | §5.4, §6 | Rolling-window coverage after a forward jump of the system clock |
-| Q-16 | §5.4, §4 | Which commits refresh live staleness |
+| Q-16 | §5.4, §4, §2.5 | Which commits refresh live staleness, and across a restart |
 | Q-17 | §2.4, §2.5 | Duplicate identity of a reading recorded without a value |
 | Q-18 | §6 Aggregates | Rate's elapsed time against a window's coverage |
+| Q-19 | §7, §8 Corrupt block | A corrupt compacted file whose inputs are still local |
+| Q-20 | §3 Recovery, invariant 10 | A corrupt block inside the open segment after a reboot |
+| Q-21 | §7 | Which clock measures lease expiry |
+| Q-22 | §2.5, §5.5, §12 D1 | Negative counter values if D1 changes |
+| Q-23 | §5.1, §5.7 | Stored calendar nodes for days off 15-minute boundaries |
 
 ## Q-14 — Transitions at the leading edge
 **Scenario.** State "idle" before a window and "running" at its first reading inside. §6 credits the counter step
@@ -25,18 +30,21 @@ longer makes a series stale. The window clock `now` still follows the system clo
 rolling window's trailing stretch ends at `last.t + S`. After a one-hour jump, a device-stamped series that reports
 every second has no reading inside `[now − 5 min, now)`: its 5-minute window has coverage 0 and an empty average
 while the series is live and not stale.
-**Model.** As specified (`q15_forward_clock_jump_reduces_window_coverage`).
+**Model.** As specified (`q15_forward_clock_jump_empties_rolling_window`).
 **Proposed.** State whether rolling windows over the present count as "history" (event time, as now), or whether
 their trailing stretch is measured like live staleness, on the monotonic clock since the last commit.
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. A series has been silent for 10 minutes and is stale. A late fact for last week is then
-committed. Read literally, "since its last commit of a good fact" makes the series fresh again, although live state
-(the greatest `t ≤ now`) still shows the 10-minute-old reading. Likewise, §4 says a future fact is ignored by
-staleness until it is due, yet its commit is the series' last commit.
+committed. Read literally, "since its last commit of a fact that is not bad quality" makes the series fresh again,
+although live state (the greatest `t ≤ now`) still shows the 10-minute-old reading. A future fact is suspect, not
+bad, so its commit also refreshes staleness, although §4 says future facts are ignored by staleness until due.
+Two further gaps: "bad quality" may mean the adapter-supplied or the engine-assigned quality (§2.2), and the
+monotonic clock restarts at boot, so after a restart there is no last-commit instant on it to measure from.
 **Model.** Stale-for conditions measure monotonic time since the last arrival of any reading.
-**Proposed.** "…since the commit of the fact that is the series' live state (§2.3)", so late and future facts do not
-refresh it.
+**Proposed.** "…since the commit of the fact that is the series' live state (§2.3), using the engine-assigned
+quality. After a restart, every series is measured from the restart, as if its live-state fact had just been
+committed."
 
 ## Q-17 — Identity of a reading recorded without a value
 **Scenario.** An adapter sends NaN at `t`, then the same NaN again. NaN is recorded as bad quality with no value
@@ -57,20 +65,60 @@ readings bound the increase and the rate is undefined.
 **Proposed.** "…flagged when a step it includes spans more than S", and "rate is empty when no step falls in the
 window".
 
+## Q-19 — A corrupt compacted file whose inputs are still local
+**Scenario.** A compacted file is sealed and verified; before it is uploaded, a block in it fails its checksum.
+Its input log segments are still on the hot tier (§7 keeps them until the file is verified elsewhere), but §8
+Corrupt block only fetches a copy from cold or deep, so queries over the range return an error until the upload
+that can no longer happen.
+**Model.** Restore of a quarantined file needs a verified copy in another tier; there is no re-derivation.
+**Proposed.** "If no other tier holds a copy, the file is compacted again from its kept inputs, verified, and
+swapped in by a manifest record."
+
+## Q-20 — A corrupt block inside the open segment after a reboot
+**Scenario.** After a reboot (different boot id), recovery keeps blocks "up to the last complete commit block with
+valid checksums" (§3). If a block in the middle of the open segment has decayed, every later batch, though synced,
+acknowledged and possibly delivered, is dropped. Invariant 10 now says the only loss short of a disaster is a
+corrupt sealed log segment with no other copy; the open segment is also a single copy.
+**Model.** Recovery distinguishes only a torn last batch; mid-segment corruption is not modelled.
+**Proposed.** Either list the open segment in invariant 10 and §8 as a single-copy window (closed by the mirror
+path), or keep every later batch whose own checksums are valid and report the damaged range as fatal.
+
+## Q-21 — Which clock measures lease expiry
+**Scenario.** The retirement grace period is wall-clock time recorded in the manifest (§7). If a lease's expiry
+("not refreshed for 1 hour") is also wall-clock time, a forward jump of the system clock of more than an hour
+ends the grace period and expires every lease at once, and retired files are removed under a live reader.
+**Model.** Leases are not modelled (see the table below).
+**Proposed.** "A lease is refreshed and expired on the monotonic clock of the machine; leases are void after a
+reboot."
+
+## Q-22 — Negative counter values if D1 changes
+**Scenario.** A negative counter value is recorded like NaN (§2.5), whose treatment is open decision D1. If D1 is
+decided as "refused and counted", it is not stated whether negative counter values are refused too.
+**Model.** Not modelled (see the table below).
+**Proposed.** Name negative counter values in D1, or state that they are recorded as bad quality whatever D1 says.
+
+## Q-23 — Stored calendar nodes for days off 15-minute boundaries
+**Scenario.** §5.1 says calendar nodes are stored, assembled from 15-minute nodes. A day whose edges are not on
+15-minute boundaries (a historical offset such as UTC−0:44:30) cannot be assembled that way. The result is a window
+evaluation either way (§5.7); only the stored node is undefined.
+**Model.** Such days are refused (`tests/model.rs` `unaligned_days_are_refused`).
+**Proposed.** "No calendar node is stored for such a day; its result is evaluated from the 15-minute nodes inside it
+and facts at its edges."
+
 ## Settled
 | ID | Question | Settled in |
 |---|---|---|
-| Q-01 | Corruption before backup | §7 (inputs kept until verified), §8 Corrupt block, invariant 10 |
+| Q-01 | Corruption before backup | §7 (inputs kept until verified), §8 Corrupt block, invariant 10 (gaps remain: Q-19, Q-20) |
 | Q-02 | Catch-up position on overflow | §4 Overflow |
 | Q-03 | Low mark and tiering | §3 Disk space |
 | Q-04 | Day nodes and edge stretches | §5.7 |
 | Q-05 | Rate across a gap | §6 Aggregates |
-| Q-06 | Days outside 92–100 quarter-hours | §5.7 |
+| Q-06 | Days outside 92–100 quarter-hours | §5.7 (stored nodes remain open: Q-23) |
 | Q-07 | Forward clock jumps and staleness | §5.4 (window coverage remains open: Q-15) |
 | Q-08 | Age of a delivery | §4 Replay |
 | Q-09 | Quality and future stamping | §2.2, §2.4 |
 | Q-10 | Coverage for text series | §5.2 |
-| Q-11 | Counters and grace across reboots | §7, §11 |
+| Q-11 | Counters and grace across reboots | §7, §11 (lease clock remains open: Q-21) |
 | Q-12 | Invariant 9 and disaster loss | invariant 9 |
 | Q-13 | Negative counter values | §2.5, §5.5 |
 
@@ -93,6 +141,8 @@ implement:
 | Low disk mark | §3: compaction pauses; tiering continues | Tiering pauses too | `low_mark_pauses_tiering_too` |
 | Routing changes as log entries; new-consumer start; cycles | §4, rows 33–34 | Fixed selections from configuration | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled | — |
+| Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
+| Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it | Any reading passed to the condition refreshes it | — |
 | Latch and `resync` | §4, §6, rows 15–16, invariant 16 | Operator rebuilt from the tree; a true condition counts as fired | `restart_rebuilds_threshold_without_firing_again`, `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Timer deliveries with per-funnel sequence | §4 | Conditions are tested apart from delivery | — |
 | Tree checkpoints, density rule | §5.1 | Tree rebuilt from facts at restart; both levels stored for every series | — |

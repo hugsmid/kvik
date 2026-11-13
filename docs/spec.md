@@ -169,8 +169,8 @@ nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
 A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when
-more than S has passed since its last commit of a good fact, so a forward jump of the system clock cannot make a
-series stale. **Event-time staleness** applies to history only: a series is stale at event time x when
+more than S has passed since its last commit of a fact that is not bad quality (§2.5), so a forward jump of the
+system clock cannot make a series stale. **Event-time staleness** applies to history only: a series is stale at event time x when
 x > (latest good reading's `t` before x) + S. Coverage stops at that point and time-weighted results exclude the
 gap. Every windowed result carries coverage in seconds and as a fraction of the window.
 
@@ -260,7 +260,7 @@ gap. Every windowed result carries coverage in seconds and as a fraction of the 
 | Eviction at 90 days | Revision chunks (age per series, "never" allowed) and sealed log segments leave hot only after they are verified in cold or deep. Current detail and the stored tree stay. |
 | Fill pressure | Above 70 % fill, verified sealed log segments leave first, then the oldest current raw detail (verified first, fetched on demand); the tree, chunk indexes and revised-key index never move (§12 D4). |
 | Behind consumers | A consumer whose cursor is older than the oldest local log segment receives `resync`, not a replay. The engine never downloads from deep for catch-up. |
-| Corrupt block | File quarantined; the engine fetches the copy from cold, else deep, verifies the plaintext hash and swaps it in by a manifest record. Queries over the range return an error until then. Never repaired in place. Because inputs are kept until a file is verified elsewhere (§7), the only single copy is a sealed log segment not yet uploaded and not yet compacted: corruption there loses that range, reported as a fatal health condition for the range. An optional local mirror path closes this window. |
+| Corrupt block | File quarantined; the engine fetches the copy from cold, else deep, verifies the plaintext hash and swaps it in by a manifest record. Queries over the range return an error until then. Never repaired in place. Because inputs are kept until a file is verified elsewhere (§7), the only single copy is a sealed log segment not yet uploaded and not yet compacted: corruption there loses that range, reported as a fatal health condition for the range. An optional local mirror path for sealed log segments (configuration `mirror_path`, off by default) closes this window. |
 | Upload stalled | Files queue locally, health degraded, nothing evicted. |
 | No deletion | Every fact is kept forever in at least the deep tier; the engine has no purge. |
 | Re-ingest | Exported or foreign data goes through the normal ingest path, in batches. |

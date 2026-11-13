@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use kvik_model::engine::{
-    Config, ConsumerDecl, ConsumerId, FileClass, Level, Model, Reason, Selection,
+    Config, ConsumerDecl, ConsumerId, FileClass, Level, Model, Reason, Selection, Wait,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
@@ -263,4 +263,37 @@ fn s11_counters_persist_across_restart() {
         .unwrap();
     m.restart();
     assert_eq!(m.counters.duplicates_dropped, 1);
+}
+
+/// §3 Back-pressure: a full ingest queue makes the emit wait; the reading is not
+/// refused, the wait is counted, and the same reading goes through once the
+/// queue has drained.
+#[test]
+fn s3_full_ingest_queue_waits() {
+    let mut m = Model::new(
+        Config {
+            ingest_capacity: 1,
+            ..Config::default()
+        },
+        vec![],
+        T0 + HOUR,
+    );
+    let s = m
+        .define(
+            "vehicle/7/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    m.emit(Reading::num(s, T0, 1.0)).unwrap();
+    let waiting = Reading::num(s, T0 + SECOND, 2.0);
+    assert_eq!(m.emit(waiting.clone()), Err(Wait::QueueFull.into()));
+    assert_eq!(m.counters.waits[&Wait::QueueFull], 1);
+    assert!(m.counters.refused.is_empty());
+    m.commit(None).unwrap();
+    m.emit(waiting).unwrap();
+    m.commit(None).unwrap();
+    assert_eq!(m.facts().unwrap().len(), 2);
 }

@@ -47,18 +47,26 @@ fn q14_leading_edge_state_transition() {
     assert_eq!(transitions, 1);
 }
 
-/// Q-15: after a forward jump of the system clock, the window clock moves
-/// ahead at once and a rolling window's coverage stops at the last reading's
-/// event time plus S.
+/// Q-15: a device-stamped series reports every second. After a forward jump
+/// of the system clock the window clock moves an hour ahead at once, so the
+/// series' 5-minute rolling window is empty although the series is live.
 #[test]
-fn q15_forward_clock_jump_reduces_window_coverage() {
+fn q15_forward_clock_jump_empties_rolling_window() {
     let (mut m, s) = model(); // S = 10 s
-    let t = m.wall;
-    m.ingest(vec![Reading::num(s, t, 1.0)]).unwrap();
+    let w0 = m.wall;
+    let readings: Vec<Reading> = (1..=300)
+        .map(|i| Reading::num(s, w0 - 300 * SECOND + i * SECOND, 1.0))
+        .collect();
+    m.ingest(readings).unwrap();
+    let before = m.window(s, m.now - 300 * SECOND, m.now).unwrap();
+    assert_eq!(before.coverage, i128::from(299 * SECOND));
     m.jump_wall(HOUR);
-    assert_eq!(m.now, t + HOUR);
-    let w = m.window(s, m.now - 5 * SECOND, m.now).unwrap();
-    assert_eq!(w.coverage, 0);
+    m.advance(SECOND);
+    // The device clock did not jump.
+    m.ingest(vec![Reading::num(s, w0 + SECOND, 1.0)]).unwrap();
+    assert_eq!(m.latest(s).unwrap().unwrap().t, w0 + SECOND);
+    let after = m.window(s, m.now - 300 * SECOND, m.now).unwrap();
+    assert_eq!((after.count, after.coverage), (0, 0));
 }
 
 /// Q-17: the model records a non-finite reading as "no value" and compares
