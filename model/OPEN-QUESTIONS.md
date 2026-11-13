@@ -77,7 +77,10 @@ claims g + 1 and reads the records of g, the highest claimed before its own, whi
 generation, so a second restore reads only the first restore's generation and not the files of the generations before
 it. (c) The first store's generation (0) is never claimed, so "one above the highest claimed" can equal it while that
 store is still writing, and two facts get the same position.
-**Model.** Not yet modelled: positions continue after a restore.
+**Model.** A restore claims one above the highest generation claimed or present in the bucket, so it never takes
+generation 0, and reads every file in the bucket whatever its generation; there is no restore record. So a second
+restore finds the first restore's gap again: with `0:1`–`0:5`, `0:7`, `1:1` and `1:2` backed up, its restored end is
+`0:5` and all of generation 1 is set aside.
 **Needed.** Which records a restore reads, how a restore record carries forward the files it restored, and whether a
 new store claims its generation.
 
@@ -86,7 +89,10 @@ new store claims its generation.
 registry, which may then assign that id again, against "never reused" (§2.1). (b) Nothing keeps them out of
 compaction (§7) or out of step 3's "log segments", where they would re-enter the views. (c) "Quarantined" means
 "queries return an error" in §8 Corrupt block, and it is not said who triggers their re-ingest.
-**Model.** Restore brings back every backed-up file; it has no notion of a gap.
+**Model.** Positions of older generations beyond the restored end are kept and excluded by position from views,
+trees, the registry and delivery, wherever compaction moves them. They are not reported, their series ids are not
+reserved (so (a) applies), reader epochs still read them, and re-ingest is not modelled. A drill sets aside only
+positions of generations below the highest in the bucket.
 **Needed.** How these segments are held, named and reported, which ids they reserve, and how re-ingest is started.
 
 ## Q-39 — Failures during a restore, and when it ends
@@ -268,12 +274,18 @@ The specification wins where the documents differ. These follow from it, for the
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
-catch-up after overflow (§4), and loss of a corrupt log segment with no other copy (§8). It does not yet
-implement:
+catch-up after overflow (§4), loss of a corrupt log segment with no other copy (§8), and generations (§2.2, §8
+Generations, Restore drill, Restore steps 1–2, row 28b): a restore claims the generation one above the highest
+claimed or present in the bucket by a create-if-absent marker, taking the next if the marker exists, and starts it at
+sequence 1; a bucket with nothing backed up is refused; the restored end is the last position before the first gap,
+and later positions of older generations are set aside, outside views, trees, the registry and delivery; a consumer
+whose kept cursor is at or below the restored end catches up to it, flagged `replayed`, and every consumer then
+receives `generation_changed` and `resync`; a drill is read-only and claims nothing; a writer that finds a higher
+generation claimed stops uploading and becomes read-only (`tests/rules.rs` `s8_…`, `tests/invariants.rs`
+`inv01_only_restore_starts_generation`). It does not yet implement:
 
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
-| Generations | §2.2, §8: a restore claims a new generation, starting at sequence 1 | Positions continue after a restore | `restore_onto_empty_disk_current_first` |
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
 | `t_source`, `host_time`, `unsynced_clock` | §2.2, §2.5, row 22a | Not modelled | — |
 | Duplicate identity | §2.4: adapter-supplied quality | Quality after future stamping | `duplicate_check_compares_engine_assigned_quality` |
@@ -303,5 +315,9 @@ implement:
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; `resync` to every consumer after it | §3 Durable mark, §3 Recovery rule 3, §4 Resync, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
-| Restore from a checkpoint | §8 Restore: restore record, restored end before the first gap and quarantine beyond it, checkpoint with registry and latest `t`, cursors and `resync` after a restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
+| Restore record and resuming a restore | §8 Generations, §8 Restore step 1 and the paragraph after step 4, row 28a (see Q-32, Q-37, Q-39) | No restore record; manifest records are not keyed by generation, and a restore reads every file in the bucket whatever its generation, so a second restore finds the first restore's gap again and sets aside the generation that restore started (see Q-37); a restore completes in one call, so a restart has nothing to resume | — |
+| Restore from a checkpoint, step by step | §8 Continuous backup, §8 Restore steps 1–4, row 28: tree checkpoint with registry and latest `t`; queries at ≥ 1 minute flagged `restoring`; detail back-filled and compared with the checkpoint | No checkpoints; restore downloads files (current chunks first, optionally) and rebuilds; no `restoring` flag | `restore_onto_empty_disk_current_first` |
+| Segments beyond the restored end | §8 Restore step 1: quarantined, reported in health like a lost range, available for re-ingest (see Q-38) | Kept and excluded by position from views, trees, the registry and delivery; not reported; their series ids are not reserved; reader epochs (§7) still read them; a drill takes the highest generation in the bucket as its own, so it keeps that generation's positions beyond the gap in its views | `tests/rules.rs` `s8_restored_end_before_first_gap` |
+| Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
+| `duplicates_unchecked` during a restore | §2.4, §8 Restore step 2 | Not modelled: all detail is back before ingest is accepted, so the duplicate check always runs | — |
 | Invariants 12–16 | §10 | Not checked yet | — |

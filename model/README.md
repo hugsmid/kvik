@@ -23,14 +23,14 @@ it differs, and the open questions in the specification itself.
 
 | File | Covers |
 |---|---|
-| `tests/invariants.rs` | Property tests for specification invariants 1–11, 17 and 18, one test per invariant |
-| `tests/edge_cases.rs` | Edge-case rows 1, 2, 2a, 2b, 3–9, 11–14, 17, 17a, 18, 18a, 19, 20, 22–25, 27, 29–32 and 35, one test (or property) each, named after the row |
-| `tests/rules.rs` | Other rules, named after their section |
+| `tests/invariants.rs` | Property tests for specification invariants 1–11, 17 and 18, at least one test per invariant, named after it |
+| `tests/edge_cases.rs` | Edge-case rows 1, 2, 2a, 2b, 3–7, 7a, 8, 9, 11–14, 17, 17a, 18, 18a, 19, 20, 22–25, 27, 29–32 and 35, one test (or property) each, named after the row |
+| `tests/rules.rs` | Other rules, named after their section; the `s8_…` tests cover generations and restore, including row 28b |
 | `tests/open_questions.rs` | One test per open question that the model can show |
 | `tests/model.rs` | Model behaviour where it implements a simpler rule than the specification |
 
-Not yet covered: edge-case rows 10, 15, 16, 21, 22a, 26, 28, 33 and 34, and invariants 12–16 (see
-`OPEN-QUESTIONS.md`).
+Not yet covered: edge-case rows 2c, 2d, 10, 11a, 15, 16, 21, 22a, 26, 28 (beyond the restore steps in
+`tests/rules.rs`), 28a, 33, 34 and 36–42, and invariants 12–16 and 19–22 (see `OPEN-QUESTIONS.md`).
 
 ```bash
 cargo test --release                  # faster

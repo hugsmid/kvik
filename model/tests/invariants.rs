@@ -63,7 +63,8 @@ proptest! {
     }
 
     /// 1. Only a restore starts a generation. After a random history, with all
-    /// or only some sealed files uploaded, a restore claims the next
+    /// or only some sealed files uploaded, and possibly one uploaded file
+    /// missing from the bucket (so the log has a gap), a restore claims the next
     /// generation and starts it at sequence 1, and restarts keep it; a bucket
     /// with nothing backed up is refused. The restored end is the last
     /// position before the first gap. A consumer whose kept cursor is at or
@@ -74,6 +75,7 @@ proptest! {
     fn inv01_only_restore_starts_generation(
         ops in proptest::collection::vec(arb_op(), 1..80),
         upload_all in any::<bool>(),
+        missing in proptest::option::weighted(0.5, any::<proptest::sample::Index>()),
     ) {
         use kvik_model::engine::{Error, Model, Selection, Signal};
         use kvik_model::types::Position;
@@ -83,6 +85,12 @@ proptest! {
             m.seal_active();
             m.disk.bucket.reachable = true;
             m.upload();
+        }
+        if let Some(i) = missing {
+            let files: Vec<_> = m.disk.bucket.objects.keys().copied().collect();
+            if !files.is_empty() {
+                m.disk.bucket.objects.remove(i.get(&files));
+            }
         }
         let mut restored: Vec<Position> = m.disk.bucket.objects.values().flat_map(|(_, f)| f.entries().map(|e| e.position)).collect();
         restored.sort_unstable();
