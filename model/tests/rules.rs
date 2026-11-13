@@ -364,7 +364,7 @@ fn s6_leading_edge_credits_state_transition() {
 /// §6 Windows: every window is evaluated in event time against `now`. After a
 /// forward jump of the system clock, `now` moves an hour ahead at once, so a
 /// device-stamped series' 5-minute rolling window is empty although the series
-/// is live; health reports the offset.
+/// keeps reporting. (The clock offset in health is not modelled.)
 #[test]
 fn s6_rolling_window_in_event_time_after_clock_jump() {
     let (mut m, s) = consumer_model(); // S = 10 s
@@ -385,13 +385,15 @@ fn s6_rolling_window_in_event_time_after_clock_jump() {
 }
 
 /// §2.4: a reading recorded without a value is compared as "no value", so a
-/// repeat of the same NaN reading is dropped as a duplicate.
+/// NaN and then an infinity at the same `t` and quality are one fact. (That a
+/// different supplied quality is not a duplicate is a model difference: see
+/// `duplicate_check_compares_engine_assigned_quality` in `model.rs`.)
 #[test]
 fn s2_4_reading_without_value_compared_as_no_value() {
     let (mut m, s) = consumer_model();
     let t = m.wall;
     m.ingest(vec![Reading::num(s, t, f64::NAN)]).unwrap();
-    let r = m.ingest(vec![Reading::num(s, t, f64::NAN)]).unwrap();
+    let r = m.ingest(vec![Reading::num(s, t, f64::INFINITY)]).unwrap();
     assert!(r.positions.is_empty());
     assert_eq!(m.counters.duplicates_dropped, 1);
     let f = &m.current().unwrap()[&(s, t)];
@@ -399,18 +401,24 @@ fn s2_4_reading_without_value_compared_as_no_value() {
 }
 
 /// §3 Write or sync failure: after a failed sync the batch's fate is unknown;
-/// after a reboot, recovery keeps it if it reached the disk whole.
+/// after a reboot, recovery keeps it if it reached the disk whole. It was never
+/// delivered, and the adapter's replay of it is absorbed as a duplicate.
 #[test]
 fn s3_failed_sync_then_power_loss_may_keep_batch() {
     let (mut m, s) = consumer_model();
-    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    let reading = Reading::num(s, m.wall, 1.0);
+    m.emit(reading.clone()).unwrap();
     assert_eq!(
         m.commit(Some(Fault::SyncError(WriteOutcome::Survived))),
         Err(Error::SyncFailed)
     );
+    assert!(m.observed.get(&C).is_none_or(Vec::is_empty));
     m.power_loss();
     m.restart();
     assert_eq!(m.facts().unwrap().len(), 1);
+    let r = m.ingest(vec![reading]).unwrap();
+    assert!(r.positions.is_empty());
+    assert_eq!(m.counters.duplicates_dropped, 1);
 }
 
 /// §3 Recovery: after a reboot, recovery writes the mark with the new boot id

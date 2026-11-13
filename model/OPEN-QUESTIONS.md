@@ -15,15 +15,23 @@ The specification wins where the documents differ. These follow from it, for the
   duplicate check and the revised-key index cannot be rebuilt from the log (invariants 8, 15).
 - **F-2.** `api.md`: back-pressure is listed as a refusal; §3 says ingest waits. `try_emit` returning `Busy` fits.
 - **F-3.** `api.md`: windowed results need a place for the rate flag (§6).
-- **F-4.** `format.md` A.5 and the engine-assigned quality: the engine only lowers a quality (§2.2). The stored
-  engine quality is bad for a row without a value, else the worse of the supplied quality and suspect for a `future`
-  fact; the forced "a `no_value` row has quality bad" then applies to the engine quality only.
-- **F-5.** `format.md` recovery (§3): scan an unsealed segment to its end, not only to the first invalid block; a
+- **F-4.** `format.md` A.5 and the engine-assigned quality: the engine only lowers a quality (§2.2). The quality
+  column must hold the adapter-supplied quality, or §2.4 identity is lost for rows without a value and `future` rows;
+  the engine quality is then derived from it: bad for a row without a value, else the worse of the supplied quality
+  and suspect for a `future` fact. The forced "a `no_value` row has quality bad" applies to the engine quality only.
+- **F-5.** `format.md` recovery (§3): scan an unsealed segment to its end, not only to the first invalid block, which
+  needs a way to find the next batch after a corrupt region (a batch sync marker, or scanning at 8-byte steps); a
   sealed segment with a lost range counts its surviving entries, and "consecutive" positions allow a recorded lost
   range; the manifest needs a "lost range" record (bytes and positions). A missing, unreadable or half-updated mark
-  is a different boot, and recovery after a reboot writes the mark.
+  is a different boot, and recovery after a reboot writes the mark; A.10's "always truncates" on a platform without
+  a boot identifier yields to that rule when the mark is missing. Part B, where the lost-range record would go, is
+  not yet normative. The lost-range record replaces the file's hash of record with the hash of the file as found; an
+  operator's acknowledgement of `data_lost` is a manifest record. The registry file holds every non-fact entry with
+  its position. The lease file needs a format: epoch, boot id and refresh counter (§7).
 - **F-6.** `api.md`: a fault during `emit` leaves the outcome unknown (§3 Write or sync failure); health reports how
-  far `now` is ahead of the system clock (§6) and lost ranges (§3).
+  far `now` is ahead of the system clock (§6) and lost ranges (§3); `live()` should state how staleness behaves
+  across a restart (§5.4) and that live state holds only due facts; health gains `data_lost` per range with an
+  acknowledgement, and the `undefined_series` counter; an as-of query inside a lost range is flagged `lost_range`.
 
 ## Settled
 | ID | Question | Settled in |
@@ -43,12 +51,12 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-13 | Negative counter values | §2.5, §5.5 |
 | Q-14 | State transition at a window's leading edge | §6 Edge stretches, invariant 17 |
 | Q-15 | Rolling-window coverage after a forward clock jump | §6 Windows (event time against `now`), §11 Health |
-| Q-16 | Which commits refresh live staleness, and across a restart | §5.4, §2.3 Live state |
+| Q-16 | Which commits refresh live staleness, and across a restart | §5.4 (due facts, high-water mark and reference), §2.3 Live state, §4 Future facts |
 | Q-17 | Identity of a reading recorded without a value | §2.4 |
 | Q-18 | Rate flagged in windows without a gap | §6 Aggregates (replaces the Q-05 flag condition) |
 | Q-19 | A corrupt compacted file whose inputs are still local | §8 Corrupt block, row 11 |
-| Q-20 | A corrupt block inside the open segment after a reboot | §3 Recovery, §8 Corrupt block, row 11a, invariant 10 |
-| Q-21 | Which clock measures lease expiry | §7 |
+| Q-20 | A corrupt block inside the open segment after a reboot | §3 Recovery, §2.1 (registry file), §8 Corrupt block, §11 Health (`data_lost`), rows 11 and 11a, invariants 1, 8, 9 and 10 |
+| Q-21 | Which clock measures lease expiry | §7 (lease counter and boot id; grace period on the writer's monotonic clock), row 26 |
 | Q-22 | Negative counter values if D1 changes | §2.5 |
 | Q-23 | Stored calendar nodes for days off 15-minute boundaries | §5.7 |
 | Q-24 | A failed sync followed by a power loss | §3 Write or sync failure, row 12 |
@@ -73,7 +81,7 @@ implement:
 | Routing changes as log entries; new-consumer start; cycles | §4, rows 33–34 | Fixed selections from configuration | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled | — |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Live staleness for stale-for conditions | §5.4: measured from the commit of the live-state fact or when it fell due; late and bad-quality facts do not refresh it; restart rule | Any reading passed to the condition refreshes it | — |
+| Live staleness and due facts | §5.4: a fact is due on the monotonic clock; the staleness clock restarts only when the live state's `t` rises past its high-water mark, not for late facts; restart rule | Live state uses `t ≤ now`; any reading passed to a stale-for condition refreshes it | — |
 | Clock offset in health | §6 Windows, §11 | Not modelled | — |
 | Latch and `resync` | §4, §6, rows 15–16, invariant 16 | Operator rebuilt from the tree; a true condition counts as fired | `restart_rebuilds_threshold_without_firing_again`, `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Timer deliveries with per-funnel sequence | §4 | Conditions are tested apart from delivery | — |
@@ -86,6 +94,7 @@ implement:
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
-| Corruption inside the open segment; lost ranges | §3 Recovery, row 11a, invariant 10 | Only a torn last batch is modelled | — |
+| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled; a corrupt unbacked sealed segment loses its whole range | — |
+| Registry file synced per batch; recovered entries; `undefined_series` | §2.1, §3 Recovery | The registry is rebuilt from the log | — |
 | Restore from a checkpoint | §8 Restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
 | Invariants 12–16 | §10 | Not checked yet | — |
