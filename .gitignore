@@ -1,0 +1,4 @@
+/target
+# Property-test failures are reproduced from CI logs, not committed.
+*.proptest-regressions
+proptest-regressions/

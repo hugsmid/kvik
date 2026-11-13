@@ -1,0 +1,25 @@
+[package]
+name = "kvik-model"
+version = "0.1.0"
+description = "Executable reference model of the kvik time-series store: slow, in-memory, exact"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository = "https://github.com/hugsmid/kvik"
+readme = "README.md"
+keywords = ["time-series", "storage", "embedded", "reference-model"]
+categories = ["database-implementations"]
+
+[dependencies]
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+num-bigint = "0.4"
+num-rational = { version = "0.4", default-features = false, features = ["std", "num-bigint"] }
+num-traits = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
