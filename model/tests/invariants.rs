@@ -63,16 +63,19 @@ proptest! {
     }
 
     /// 1. Only a restore starts a generation. After a random history, with all
-    /// or only some sealed files uploaded, a restore continues at the first
-    /// sequence of the next generation and restarts keep it. A cursor at or
-    /// below the restored end catches up from it; one beyond it gets
-    /// `generation_changed` and `resync` and no replay (§8 Restore step 2).
+    /// or only some sealed files uploaded, a restore claims the next
+    /// generation and starts it at sequence 1, and restarts keep it; a bucket
+    /// with nothing backed up is refused. The restored end is the last
+    /// position before the first gap. A consumer whose kept cursor is at or
+    /// below it catches up to it, flagged `replayed`; one without a cursor, or
+    /// beyond the restored end, gets no replay. Every consumer receives
+    /// `generation_changed` and `resync` (§8 Restore steps 1-2).
     #[test]
     fn inv01_only_restore_starts_generation(
         ops in proptest::collection::vec(arb_op(), 1..80),
         upload_all in any::<bool>(),
     ) {
-        use kvik_model::engine::{Model, Selection, Signal};
+        use kvik_model::engine::{Error, Model, Selection, Signal};
         use kvik_model::types::Position;
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
@@ -81,42 +84,56 @@ proptest! {
             m.disk.bucket.reachable = true;
             m.upload();
         }
-        let end = m.disk.bucket.objects.values().flat_map(|(_, f)| f.entries().map(|e| e.position)).max();
+        let mut restored: Vec<Position> = m.disk.bucket.objects.values().flat_map(|(_, f)| f.entries().map(|e| e.position)).collect();
+        restored.sort_unstable();
+        restored.dedup();
         let cursors = m.disk.cursors.clone();
-        let mut r = Model::restore_with_cursors(m.config.clone(), consumers(), &m.disk.bucket, &cursors, m.wall, false);
+        let r = Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &cursors, m.wall, false, false);
+        if restored.is_empty() {
+            prop_assert_eq!(r.err(), Some(Error::EmptyBucket));
+            return Ok(());
+        }
+        let mut r = r.unwrap();
+        // Positions up to the first gap, in generation 0 from sequence 1.
+        let end = restored
+            .iter()
+            .zip(1u64..)
+            .take_while(|(p, s)| **p == Position::new(0, *s))
+            .last()
+            .map_or(Position::new(0, 0), |(p, _)| *p);
         prop_assert_eq!(r.disk.generation, 1);
-        prop_assert_eq!(r.disk.restored_end, end);
-        let end = end.unwrap_or(Position::ORIGIN);
+        prop_assert!(m.disk.bucket.claims.contains(&1));
+        prop_assert_eq!(r.disk.restored_end, Some(end));
         r.drain().unwrap();
         for d in consumers() {
-            let cursor = cursors[&d.id];
+            let kept = cursors.get(&d.id).copied();
             let got: Vec<(Position, bool)> = r.observed.get(&d.id).map(|o| o.iter().map(|x| (x.position, x.replayed)).collect()).unwrap_or_default();
-            if cursor <= end {
-                prop_assert!(!r.signals.contains_key(&d.id));
-                let want: Vec<(Position, bool)> = r
+            prop_assert_eq!(
+                r.signals[&d.id].clone(),
+                vec![Signal::GenerationChanged { cursor: kept.unwrap_or(Position::ORIGIN), restored_end: end }, Signal::ResyncDue]
+            );
+            let want: Vec<(Position, bool)> = match kept {
+                Some(cursor) if cursor <= end => r
                     .disk
                     .all_facts()
                     .into_iter()
-                    .filter(|f| f.position > cursor)
+                    .filter(|f| f.position > cursor && f.position <= end)
                     .filter(|f| match &d.selection {
                         Selection::All => true,
                         Selection::Series(set) => set.contains(&f.series),
                     })
                     .map(|f| (f.position, true))
-                    .collect();
-                prop_assert_eq!(got, want);
-            } else {
-                prop_assert_eq!(
-                    r.signals[&d.id].clone(),
-                    vec![Signal::GenerationChanged { cursor, restored_end: end }, Signal::ResyncDue]
-                );
-                prop_assert!(got.is_empty());
-            }
+                    .collect(),
+                _ => Vec::new(),
+            };
+            prop_assert_eq!(got, want);
         }
+        // Nothing beyond the restored end is in the views.
+        prop_assert!(r.facts().unwrap().iter().all(|f| f.position <= end));
         r.restart();
         // The first new log entry (a definition) opens the new generation.
         r.define("check/restore/marker", kvik_model::types::Kind::Gauge, kvik_model::types::ValueType::Number, "1", None).unwrap();
-        prop_assert_eq!(r.entries().unwrap().last().map(|e| e.position), Some(Position::new(1, 0)));
+        prop_assert_eq!(r.entries().unwrap().last().map(|e| e.position), Some(Position::new(1, 1)));
         r.crash();
         r.restart();
         prop_assert_eq!(r.disk.generation, 1);
@@ -425,7 +442,7 @@ proptest! {
         // Restore onto an empty disk from the bucket alone. Everything was
         // sealed and uploaded above, so the backed-up positions are all of
         // them (the partial case is `rules.rs` `s10_9_…`).
-        let r = kvik_model::engine::Model::restore_from(m.config.clone(), consumers(), &m.disk.bucket, m.wall, false);
+        let r = kvik_model::engine::Model::restore_from(m.config.clone(), consumers(), &mut m.disk.bucket, m.wall, false).unwrap();
         prop_assert_eq!(&durable(&r), &committed);
         prop_assert_eq!(r.current().unwrap(), m.current().unwrap());
     }

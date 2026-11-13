@@ -249,6 +249,9 @@ pub struct Bucket {
     pub objects: BTreeMap<FileId, (u64, StoredFile)>,
     /// Fault injection: the next upload arrives corrupted.
     pub corrupt_next_upload: bool,
+    /// Generations claimed by restores, each by a create-if-absent marker
+    /// (§8 Generations).
+    pub claims: BTreeSet<u32>,
 }
 
 /// Outcome of a batch that was written but not synced when the machine stopped.
@@ -378,6 +381,10 @@ pub enum Error {
     /// Compaction and tiering paused for low disk.
     #[error("paused: disk below low mark")]
     Paused,
+    /// A restore from a bucket with no backed-up files is refused (§8
+    /// Generations).
+    #[error("nothing to restore")]
+    EmptyBucket,
 }
 
 /// Health level.
@@ -531,9 +538,13 @@ pub struct Disk {
     pub cursors: BTreeMap<ConsumerId, Position>,
     /// Current generation (§2.2): 0 until a restore starts a new one (§8).
     pub generation: u32,
-    /// The last position a restore brought back (§8 Restore step 2), if this
-    /// store was restored.
+    /// The restored end (§8 Restore step 1): the last position before the
+    /// first gap in the restored log, if this store was restored. Positions of
+    /// older generations beyond it are set aside: kept, but outside views,
+    /// trees and delivery.
     pub restored_end: Option<Position>,
+    /// A restore drill: read-only, and it claims no generation (§8).
+    pub drill: bool,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
     pub other_bytes: u64,
     /// Next file id.
@@ -714,6 +725,16 @@ impl Disk {
             }
             Locality::Missing => None,
         }
+    }
+
+    /// Every readable entry except those set aside beyond a restored end
+    /// (§8 Restore step 1).
+    pub fn live_entries(&self) -> BTreeMap<Position, Entry> {
+        let mut entries = self.all_entries();
+        if let Some(end) = self.restored_end {
+            entries.retain(|p, _| p.generation >= self.generation || *p <= end);
+        }
+        entries
     }
 
     /// Every distinct entry readable from any tier, by position.
@@ -923,7 +944,7 @@ impl Model {
             self.clean_up_files();
         }
         // 4. Rebuild volatile state from every readable entry.
-        let entries = self.disk.all_entries();
+        let entries = self.disk.live_entries();
         let mut registry = Registry::default();
         let mut facts = Vec::new();
         for e in entries.values() {
@@ -990,7 +1011,7 @@ impl Model {
             queue: VecDeque::new(),
             next_position,
             consumers,
-            read_only,
+            read_only: read_only || self.disk.drill,
             skew_run: BTreeMap::new(),
         });
     }
@@ -1996,7 +2017,21 @@ impl Model {
 
     /// Uploads queued sealed files to the bucket, verifying hashes (§8).
     pub fn upload(&mut self) -> usize {
-        if !self.disk.bucket.reachable {
+        if !self.disk.bucket.reachable || self.disk.drill {
+            return 0;
+        }
+        // A writer that finds a higher generation claimed stops uploading and
+        // becomes read-only (§8 Generations).
+        if self
+            .disk
+            .bucket
+            .claims
+            .iter()
+            .any(|g| *g > self.disk.generation)
+        {
+            if let Some(v) = self.vol.as_mut() {
+                v.read_only = true;
+            }
             return 0;
         }
         let mut n = 0;
@@ -2109,14 +2144,14 @@ impl Model {
     }
 
     /// A new engine restored from the bucket alone (§8), with consumers that
-    /// start from nothing confirmed. See [`Model::restore_with_cursors`].
+    /// kept no cursor. See [`Model::restore_with_cursors`].
     pub fn restore_from(
         config: Config,
         consumers: Vec<ConsumerDecl>,
-        bucket: &Bucket,
+        bucket: &mut Bucket,
         wall: Nanos,
         current_only: bool,
-    ) -> Model {
+    ) -> Result<Model, Error> {
         Model::restore_with_cursors(
             config,
             consumers,
@@ -2124,59 +2159,80 @@ impl Model {
             &BTreeMap::new(),
             wall,
             current_only,
+            false,
         )
     }
 
-    /// A new engine restored from the bucket alone (§8). Positions continue in
-    /// a new generation, one above any in the bucket, from its first sequence.
-    /// `cursors` are the consumers' cursors from before the restore (a missing
-    /// one is nothing confirmed): a cursor at or below the restored end
-    /// continues; beyond it, the consumer receives `generation_changed` and
-    /// `resync` and continues after the restored end. With `current_only`,
-    /// only current chunks are restored first (partial restore);
-    /// [`Model::restore_rest`] adds the rest.
+    /// A new engine restored from the bucket alone (§8).
+    ///
+    /// The restore claims the generation one above the highest claimed or
+    /// present in the bucket (a drill claims nothing and stays read-only),
+    /// and its positions start at sequence 1. A bucket with nothing backed up
+    /// is refused. The restored end is the last position before the first gap
+    /// in the restored log; later positions of older generations are set
+    /// aside. `cursors` are the positions consumers kept from before the
+    /// restore: a consumer without one counts as beyond the restored end, and
+    /// one at or below it catches up to the restored end, flagged
+    /// `replayed`. Every consumer then receives `generation_changed` and
+    /// `resync`. With `current_only`, only current chunks are restored first
+    /// (partial restore); [`Model::restore_rest`] adds the rest.
     pub fn restore_with_cursors(
         config: Config,
         consumers: Vec<ConsumerDecl>,
-        bucket: &Bucket,
+        bucket: &mut Bucket,
         cursors: &BTreeMap<ConsumerId, Position>,
         wall: Nanos,
         current_only: bool,
-    ) -> Model {
-        let mut m = Model::new(config, consumers, wall);
-        m.disk.bucket = bucket.clone();
-        let restored: Vec<Position> = bucket
+        drill: bool,
+    ) -> Result<Model, Error> {
+        let mut restored: Vec<Position> = bucket
             .objects
             .values()
             .flat_map(|(_, f)| f.entries().map(|e| e.position))
             .collect();
-        let end = restored.iter().max().copied();
-        // A restore always starts a new generation, even from an empty bucket.
-        m.disk.generation = restored
+        if restored.is_empty() {
+            return Err(Error::EmptyBucket);
+        }
+        restored.sort_unstable();
+        restored.dedup();
+        let end = restored_end(&restored);
+        let highest = restored
             .iter()
             .map(|p| p.generation)
+            .chain(bucket.claims.iter().copied())
             .max()
-            .map_or(1, |g| g + 1);
-        m.disk.restored_end = end;
-        let end = end.unwrap_or(Position::ORIGIN);
+            .unwrap_or(0);
+        let generation = if drill {
+            highest
+        } else {
+            // Create-if-absent: if the marker exists, take the next.
+            let mut g = highest + 1;
+            while !bucket.claims.insert(g) {
+                g += 1;
+            }
+            g
+        };
+        let mut m = Model::new(config, consumers, wall);
+        m.disk.bucket = bucket.clone();
+        m.disk.generation = generation;
+        m.disk.restored_end = Some(end);
+        m.disk.drill = drill;
         let ids: Vec<ConsumerId> = m.consumers.iter().map(|c| c.id).collect();
         for id in ids {
-            let cursor = cursors.get(&id).copied().unwrap_or(Position::ORIGIN);
-            if cursor <= end {
-                m.disk.cursors.insert(id, cursor);
-            } else {
-                m.disk.cursors.insert(id, end);
-                m.signals.entry(id).or_default().extend([
-                    Signal::GenerationChanged {
-                        cursor,
-                        restored_end: end,
-                    },
-                    Signal::ResyncDue,
-                ]);
-            }
+            let cursor = cursors.get(&id).copied();
+            m.disk
+                .cursors
+                .insert(id, cursor.filter(|c| *c <= end).unwrap_or(end));
+            m.signals.entry(id).or_default().extend([
+                Signal::GenerationChanged {
+                    cursor: cursor.unwrap_or(Position::ORIGIN),
+                    restored_end: end,
+                },
+                Signal::ResyncDue,
+            ]);
         }
         m.restore_rest(current_only);
-        m
+        Ok(m)
     }
 
     /// Downloads bucket files not yet on the fast disk and restarts.
@@ -2231,4 +2287,20 @@ fn build_trees(
             (d.id, SeriesTree::build(params_of(d), &rs))
         })
         .collect()
+}
+
+/// The last position before the first gap in sorted, distinct positions: the
+/// log starts at sequence 1 of its first generation, a gap is a missing
+/// sequence within a generation, and a later generation starts at sequence 1
+/// (§8 Restore step 1). `(g, 0)` when even the first position is missing.
+fn restored_end(sorted: &[Position]) -> Position {
+    let mut end = Position::new(sorted[0].generation, 0);
+    for p in sorted {
+        let follows = *p == end.next() || (p.generation > end.generation && p.sequence == 1);
+        if !follows {
+            break;
+        }
+        end = *p;
+    }
+    end
 }

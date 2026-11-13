@@ -225,7 +225,8 @@ fn restore_onto_empty_disk_current_first() {
     m.upload();
     let cur = m.current().unwrap().clone();
     let tree = m.tree(s).unwrap().clone();
-    let mut r = Model::restore_from(m.config.clone(), vec![], &m.disk.bucket, m.wall, true);
+    let mut r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, true).unwrap();
     assert_eq!(r.current().unwrap(), &cur, "usable after current facts");
     assert!(r.tree(s).unwrap().same_summaries(&tree));
     assert!(

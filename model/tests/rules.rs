@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::*;
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, Error, Fault, FileClass, Level, Model, Reason,
@@ -254,7 +256,8 @@ fn s10_9_restore_preserves_backed_up_positions() {
     m.upload();
     let backed_up: Vec<Position> = m.facts().unwrap().iter().map(|f| f.position).collect();
     m.ingest(vec![Reading::num(s, T0 + SECOND, 2.0)]).unwrap();
-    let r = Model::restore_from(m.config.clone(), vec![], &m.disk.bucket, m.wall, false);
+    let r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
     let restored: Vec<Position> = r.facts().unwrap().iter().map(|f| f.position).collect();
     assert_eq!(restored, backed_up);
     assert_eq!(m.facts().unwrap().len(), 2);
@@ -488,47 +491,149 @@ fn backed_up_model() -> (Model, SeriesId) {
     (m, s)
 }
 
-/// §2.2, §8 Restore step 1: positions continue at sequence 0 of a new
-/// generation, also when nothing is committed before a restart; a restart never
-/// changes the generation, and a second restore starts another.
+/// §2.2, §8 Restore step 1: a restore claims the next generation and starts it
+/// at sequence 1; a restart keeps the generation, and a restore of the
+/// restored store claims another.
 #[test]
-fn s8_restore_continues_in_new_generation_from_sequence_0() {
-    let (m, s) = backed_up_model();
+fn s8_restore_claims_next_generation_from_sequence_1() {
+    let (mut m, s) = backed_up_model();
     let end = m.disk.all_entries().keys().next_back().copied().unwrap();
     assert_eq!(end, Position::new(0, 5));
-    let mut r = Model::restore_from(m.config.clone(), vec![], &m.disk.bucket, m.wall, false);
-    assert_eq!(r.disk.generation, 1);
-    assert_eq!(r.disk.restored_end, Some(end));
-    r.restart();
+    let mut r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
+    assert_eq!((r.disk.generation, r.disk.restored_end), (1, Some(end)));
+    assert!(m.disk.bucket.claims.contains(&1));
     let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
-    assert_eq!(p.positions, vec![Position::new(1, 0)]);
+    assert_eq!(p.positions, vec![Position::new(1, 1)]);
     r.crash();
     r.restart();
     assert_eq!(r.disk.generation, 1);
     let p = r.ingest(vec![Reading::num(s, T0 + HOUR + 1, 9.0)]).unwrap();
-    assert_eq!(p.positions, vec![Position::new(1, 1)]);
+    assert_eq!(p.positions, vec![Position::new(1, 2)]);
     r.seal_active();
     r.upload();
-    let r2 = Model::restore_from(r.config.clone(), vec![], &r.disk.bucket, r.wall, false);
+    let r2 =
+        Model::restore_from(r.config.clone(), vec![], &mut r.disk.bucket, r.wall, false).unwrap();
     assert_eq!(r2.disk.generation, 2);
-    assert_eq!(r2.disk.restored_end, Some(Position::new(1, 1)));
+    assert_eq!(r2.disk.restored_end, Some(Position::new(1, 2)));
 }
 
-/// §8 Restore step 2: a cursor at or below the restored end continues; the
-/// consumer catches up from it, flagged `replayed`, with no signal.
+/// §8 Generations: two restores from one bucket claim different generations,
+/// so the same position never names two facts.
 #[test]
-fn s8_cursor_at_or_below_restored_end_continues() {
-    let (m, _) = backed_up_model();
+fn s8_two_restores_from_one_bucket_claim_different_generations() {
+    let (m, s) = backed_up_model();
+    let mut bucket = m.disk.bucket.clone();
+    let mut a = Model::restore_from(m.config.clone(), vec![], &mut bucket, m.wall, false).unwrap();
+    let mut b = Model::restore_from(m.config.clone(), vec![], &mut bucket, m.wall, false).unwrap();
+    let pa = a.ingest(vec![Reading::num(s, T0 + HOUR, 2.0)]).unwrap();
+    let pb = b.ingest(vec![Reading::num(s, T0 + HOUR, 3.0)]).unwrap();
+    assert_eq!(pa.positions, vec![Position::new(1, 1)]);
+    assert_eq!(pb.positions, vec![Position::new(2, 1)]);
+}
+
+/// §8 Generations: a restore from a bucket with nothing backed up is refused.
+#[test]
+fn s8_restore_from_empty_bucket_refused() {
+    let (mut m, _) = model(10 * SECOND);
+    let r = Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false);
+    assert_eq!(r.err(), Some(Error::EmptyBucket));
+    assert!(m.disk.bucket.claims.is_empty());
+}
+
+/// §8 Restore drill: a drill restores read-only and claims nothing.
+#[test]
+fn s8_drill_is_read_only_and_claims_nothing() {
+    let (mut m, s) = backed_up_model();
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        vec![],
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(m.disk.bucket.claims.is_empty());
+    assert_eq!(r.facts().unwrap().len(), 4);
+    assert!(r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).is_err());
+    assert_eq!(r.upload(), 0);
+}
+
+/// §8 Generations: a writer that finds a higher generation claimed stops
+/// uploading and becomes read-only.
+#[test]
+fn s8_superseded_writer_stops_uploading() {
+    let (mut m, s) = backed_up_model();
+    let _r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
+    m.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
+    m.seal_active();
+    let before = m.disk.bucket.objects.len();
+    assert_eq!(m.upload(), 0);
+    assert_eq!(m.disk.bucket.objects.len(), before);
+    assert!(m.is_read_only());
+}
+
+/// §8 Restore step 1: the restored end is the last position before the first
+/// gap; later positions are set aside, outside views and delivery, and a
+/// cursor below the gap catches up only to the restored end.
+#[test]
+fn s8_restored_end_before_first_gap() {
+    let (mut m, s) = backed_up_model(); // positions 0:1 to 0:5 backed up
+    m.ingest(vec![Reading::num(s, T0 + 10 * SECOND, 10.0)])
+        .unwrap(); // 0:6
+    m.seal_active();
+    let missing = *m.disk.files.keys().next_back().unwrap();
+    m.ingest(vec![Reading::num(s, T0 + 11 * SECOND, 11.0)])
+        .unwrap(); // 0:7
+    m.seal_active();
+    m.upload();
+    m.disk.bucket.objects.remove(&missing);
     let c = ConsumerId(1);
-    let cursors = [(c, Position::new(0, 3))].into_iter().collect();
+    let cursors = [(c, Position::new(0, 4))].into_iter().collect();
     let mut r = Model::restore_with_cursors(
         m.config.clone(),
         m.consumers.clone(),
-        &m.disk.bucket,
+        &mut m.disk.bucket,
         &cursors,
         m.wall,
         false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(r.disk.restored_end, Some(Position::new(0, 5)));
+    assert!(
+        r.facts()
+            .unwrap()
+            .iter()
+            .all(|f| f.position <= Position::new(0, 5))
     );
+    r.drain().unwrap();
+    let got: Vec<Position> = r.observed[&c].iter().map(|o| o.position).collect();
+    assert_eq!(got, vec![Position::new(0, 5)]);
+}
+
+/// §8 Restore step 2: a cursor at or below the restored end catches up to it,
+/// flagged `replayed`; the consumer then receives `generation_changed` and
+/// `resync` like every other.
+#[test]
+fn s8_cursor_at_or_below_restored_end_continues() {
+    let (mut m, _) = backed_up_model();
+    let c = ConsumerId(1);
+    let cursor = Position::new(0, 3);
+    let cursors = [(c, cursor)].into_iter().collect();
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &cursors,
+        m.wall,
+        false,
+        false,
+    )
+    .unwrap();
     r.drain().unwrap();
     let got: Vec<(Position, bool)> = r.observed[&c]
         .iter()
@@ -538,26 +643,67 @@ fn s8_cursor_at_or_below_restored_end_continues() {
         got,
         vec![(Position::new(0, 4), true), (Position::new(0, 5), true)]
     );
-    assert!(!r.signals.contains_key(&c));
+    assert_eq!(
+        r.signals[&c],
+        vec![
+            Signal::GenerationChanged {
+                cursor,
+                restored_end: Position::new(0, 5)
+            },
+            Signal::ResyncDue
+        ]
+    );
 }
 
-/// §8 Restore step 2: a cursor beyond the restored end (facts the restore could
-/// not bring back) gets `generation_changed` and `resync`, is not replayed the
-/// old generation, and receives the new generation live.
+/// §8 Restore step 2: cursor files are not backed up; a consumer without a
+/// kept cursor counts as beyond the restored end and is not replayed.
+#[test]
+fn s8_missing_cursor_counts_as_beyond_restored_end() {
+    let (mut m, _) = backed_up_model();
+    let c = ConsumerId(1);
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        false,
+        false,
+    )
+    .unwrap();
+    r.drain().unwrap();
+    assert!(r.observed.get(&c).is_none_or(|o| o.is_empty()));
+    assert_eq!(
+        r.signals[&c],
+        vec![
+            Signal::GenerationChanged {
+                cursor: Position::ORIGIN,
+                restored_end: Position::new(0, 5)
+            },
+            Signal::ResyncDue
+        ]
+    );
+}
+
+/// §8 Restore step 2: a cursor beyond the restored end gets
+/// `generation_changed` and `resync`, no replay of the old generation, and the
+/// new generation live from its first position.
 #[test]
 fn s8_cursor_beyond_restored_end_generation_changed() {
-    let (m, s) = backed_up_model();
+    let (mut m, s) = backed_up_model();
     let c = ConsumerId(1);
     let cursor = Position::new(0, 9);
     let cursors = [(c, cursor)].into_iter().collect();
     let mut r = Model::restore_with_cursors(
         m.config.clone(),
         m.consumers.clone(),
-        &m.disk.bucket,
+        &mut m.disk.bucket,
         &cursors,
         m.wall,
         false,
-    );
+        false,
+    )
+    .unwrap();
     assert_eq!(
         r.signals[&c],
         vec![
@@ -576,5 +722,5 @@ fn s8_cursor_beyond_restored_end_generation_changed() {
         .iter()
         .map(|o| (o.position, o.replayed))
         .collect();
-    assert_eq!(got, vec![(Position::new(1, 0), false)]);
+    assert_eq!(got, vec![(Position::new(1, 1), false)]);
 }

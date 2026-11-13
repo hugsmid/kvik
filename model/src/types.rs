@@ -29,10 +29,11 @@ impl Position {
         }
     }
 
-    /// The first position of a generation: sequence 1 in generation 0, and
-    /// sequence 0 in a generation started by a restore (§8 Restore step 1).
+    /// The first position of a generation: every generation starts at
+    /// sequence 1; `(g, 0)` means "before the first entry of generation g"
+    /// (§2.2).
     pub const fn first(generation: u32) -> Self {
-        Position::new(generation, if generation == 0 { 1 } else { 0 })
+        Position::new(generation, 1)
     }
 
     /// The next position in the same generation.
