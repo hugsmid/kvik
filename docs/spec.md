@@ -210,7 +210,7 @@ r₁ … rₙ (in `t` order) inside its span:
 | counter | — | increase += step(vᵢ, vᵢ₊₁) (§5.5), resets, regressions |
 | state | — | time[vᵢ] += hᵢ; transitions += [vᵢ ≠ vᵢ₊₁] |
 | text | — | (count, first, last and coverage only) |
-| interval | sum, min, max; coverage is the total length of the intervals of the readings starting in the span | none (no hold, no S) |
+| interval | sum, min, max; coverage is the total length of the intervals of the readings starting in the span. This node form is used only for spans whose edges no interval crosses (§5.4); any other span, drill-down included, is evaluated as a window (§6) | none (no hold, no S) |
 
 For every kind but interval, the **hold** hᵢ = min(tᵢ₊₁, tᵢ + Sᵢ) − tᵢ, Sᵢ being the staleness limit in force at tᵢ
 (∞ if none). Time is held in nanoseconds and reported in seconds. **Nothing is held past a node's last reading inside
@@ -226,17 +226,17 @@ nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
 A reading is valid for at most S (an interval reading for its interval only). An interval series stores a tree level
-only where d divides the level's node length and the phase is 0, so that no interval crosses a node edge; any other
-level is answered from its facts. For an observed series, **live staleness** is measured on the monotonic clock: a
-series is stale when more than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a
-future fact still awaiting its time or an outranked fact (§4), so a forward jump of the system clock cannot make an
-observed series stale. A scheduled series is stale when `now` is later than the `t` of its live-state fact by more
-than S, or when it has no live-state fact; commits do not refresh it. A forecast series has no live staleness.
-**Event-time staleness** applies to history and to every window evaluation (§6): a series is stale at event time x
-when x > (`t` of its latest reading before x that is not bad quality) + S; for an interval series, x is covered if
-and only if it lies in a reading's interval. Coverage stops at that point and time-weighted results exclude the gap.
-Every windowed result carries coverage in seconds and as a fraction of the window. Live staleness applies only to
-live state and stale-for conditions.
+only where every node edge of that level is a multiple of d from the phase (for the UTC levels: d divides the node
+length and the phase is 0), so that no interval crosses a node edge; any other level is answered from its facts. For
+an observed series, **live staleness** is measured on the monotonic clock: a series is stale when more than S has
+passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still awaiting its time
+or an outranked fact (§4), so a forward jump of the system clock cannot make an observed series stale. A scheduled
+series is stale when `now` is later than the `t` of its live-state fact by more than S, or when it has no live-state
+fact; commits do not refresh it. A forecast series has no live staleness. **Event-time staleness** applies to history
+and to every window evaluation (§6): a series is stale at event time x when x > (`t` of its latest reading before x
+that is not bad quality) + S; for an interval series, x is covered if and only if it lies in a reading's interval.
+Coverage stops at that point and time-weighted results exclude the gap. Every windowed result carries coverage in
+seconds and as a fraction of the window. Live staleness applies only to live state and stale-for conditions.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
