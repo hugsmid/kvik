@@ -15,6 +15,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-37 | §8 Generations, §8 Restore, §2.2 | Which manifest records a restore reads, and how generations begin |
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
 | Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
+| Q-40 | §2.4 Version index, §8 Restore | Ranking facts of versioned series during a restore |
+| Q-41 | §2.2 `future`, §4, §5.4 | Forecasts: values issued now about future times |
+| Q-42 | §5.2, §6 | Readings that cover an interval, not an instant |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -103,6 +106,36 @@ revised-key index, which the deep tier does not list.
 **Model.** Downloads do not fail; a restore completes in one step.
 **Needed.** What each failure does, what a restart clears, and when the store stops being flagged `restoring`.
 
+## Q-40 — Ranking facts of versioned series during a restore
+**Scenario.** Until the version index is back during a restore, the engine cannot tell whether an arriving fact on a
+versioned series outranks the facts already recorded for its key. A rule that holds such facts as "undetermined"
+until a download finishes was withdrawn: its effect would depend on download timing, not on the log (principle 2),
+and live state and windows would differ from a rebuild meanwhile (invariants 7 and 8). The version index is also not
+yet listed in the deep tier.
+**Model.** Not modelled.
+**Proposed.** Each tree checkpoint carries the version index as of its position, like the registry and latest `t`
+(§8), so step 1's replay brings it up to the restored end and the rank is always known.
+
+## Q-41 — Forecasts: values issued now about future times
+**Scenario.** An adapter delivers a weather forecast or published prices: values about times up to 16 days ahead,
+re-issued with each model run. Mapped to a versioned series keyed by valid time with `changed_at` = issue time,
+every value is more than 60 s in the future, so §2.2 flags it `future` and lowers it to suspect; live state,
+staleness and windows ignore it until due; and the as-of views answer "what was known then" only by position, not by
+issue time.
+**Model.** Not modelled.
+**Needed.** Whether forecasts are facts of a versioned series, a series flag that exempts them from `future`, or a
+separate record kind; how quality and live state apply to them; and how accuracy views (forecast against outcome)
+are served.
+
+## Q-42 — Readings that cover an interval, not an instant
+**Scenario.** A source reports half-hourly consumption or hourly precipitation: each value covers an interval and
+is stamped at its start. §5.2 treats readings as point samples held for up to S, so an average or integral of such a
+series has no physical meaning, and a window that cuts an interval cannot apportion it. As a cumulative counter, the
+step to the next reading would be credited to the window containing the later reading, not the interval it covers.
+**Model.** Not modelled; readings are instants.
+**Needed.** Whether interval readings are stamped at the interval's end as counters, carry an interval length, or are
+a series kind of their own, and how windows treat a partly covered interval.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -138,12 +171,14 @@ The specification wins where the documents differ. These follow from it, for the
   drill mode; a consumer can register with its last confirmed position after a restore, so the application must
   persist its confirmed positions; restore returns the restored end; health names a writer superseded by a higher
   generation; re-ingest needs an entry point; a store's identity across restores and drills (§8).
-- **F-9.** `format.md`: a fact row in a versioned series carries `changed_at` (u64); a series definition carries the
-  `versioned` flag and `changed_at kind`; the revised-key index carries `changed_at`; a version index file (highest
-  `changed_at` per key, hot, backed up) is needed; exports carry `changed_at` (§2.1–§2.4, §8).
-- **F-10.** `api.md`: `emit` takes `changed_at`; refusals gain `changed_at` missing, `changed_at` unexpected and
-  `revise` on a versioned series; deliveries gain the flags `outranked` and `rank_unknown`; health gains
-  `outranked_on_arrival` (§2.2, §2.4, §4, §8).
+- **F-9.** `format.md`: a fact row in a versioned series carries `changed_at` (a u64 column with an id, present per
+  series), also in compacted chunks; A's rule that times are i64 needs an exception for a `changed_at` of kind `time`;
+  a series definition carries the `versioned` flag and `changed_at kind`; the revised-key index carries `changed_at`;
+  A.1 needs file kinds for the version index and the revised-key index; exports carry `changed_at` (§2.1–§2.4, §7).
+- **F-10.** `api.md`: `changed_at` belongs on `Reading`; `SeriesSpec` gains `versioned` and `changed_at kind`, and a
+  change of either is an error like a change of unit; refusals gain `changed_at` missing, `changed_at` unexpected and
+  `revise` on a versioned series; fact deliveries and history results carry `changed_at`; deliveries gain the flag
+  `outranked`; `Ack` and health gain an outranked count (§2.2, §2.4, §4, §11).
 
 ## Settled
 | ID | Question | Settled in |
@@ -176,7 +211,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-27 | Where consumer cursors come from after a restore | §8 Continuous backup, §8 Restore step 2, §4 Resync |
 | Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b (open parts: Q-37) |
 | Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (open parts: Q-38, Q-39) |
-| Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore steps 2–3; versioned series (§2.1–§2.4, §4, §5.6, §7, invariants 4, 15 and 19, rows 2c and 2d), so that a replay never reverts a correction |
+| Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction (open part: Q-40) |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
 
@@ -210,7 +245,7 @@ implement:
 | Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments | `compaction_crash_after_publish_resumes_retirement` |
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | Files leave hot after the grace period; old epochs read remotely | `reader_epoch_survives_grace_then_reads_remotely` |
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
-| Versioned series | §2.1–§2.4, §4, §5.6, §7, §8 Restore, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
+| Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |

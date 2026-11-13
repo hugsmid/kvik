@@ -48,8 +48,9 @@ and counted. The old id stays reachable by id.
   starts a new generation (§8). Consumers see only the positions of facts routed to them, so gaps between delivered
   positions are normal.
 - Fact: `(series, t, position, received_at, value, quality, flags)`, and `changed_at` in a versioned series.
-- `changed_at`: a u64 from the source, its revision time or version, higher for each revision of a reading and the
-  same on every replay of one revision (a time taken at replay is not permitted). It is compared as an unsigned
+- `changed_at`: a u64 from the source, its revision time or version. It must not decrease between revisions of a
+  reading and should rise with each, and it is the same on every replay of one revision: the adapter must not take a
+  time at replay. It is compared as an unsigned
   integer and never with `t`, `received_at` or any clock. A reading on a versioned series without it, or with it on
   any other series, is refused and counted. A source whose versions are coarser than its revisions can still have a
   correction with the same `changed_at` reverted (§2.4).
@@ -80,8 +81,8 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
 - An arriving fact is a **duplicate** if its `(series, t, value)` and adapter-supplied quality equal those of *any*
   fact already in the history of `(series, t)`, including facts earlier in the same batch. Flags and quality assigned
   by the engine are not part of identity. Values compare bitwise (`0.0` ≠ `-0.0`). Duplicates are not recorded and
-  consume no position; they are counted per series (`duplicates_dropped`). Adapters may replay freely: a replay can
-  no longer revert a correction.
+  consume no position; they are counted per series (`duplicates_dropped`). Adapters may replay freely: a replay that the
+  check can run on never reverts a correction (for the unchecked case, see below).
 - In a versioned series identity also includes `changed_at`. A fact whose `changed_at` is above that of every fact
   in its key's history is never a duplicate, even when its value returns to an earlier one.
 - A fact submitted with `revise` intent bypasses the check (deliberate return to an earlier value). On a versioned
@@ -92,16 +93,16 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
   value, adapter-supplied quality and `changed_at` of each. For any other key, history holds at most the current
   fact, which is compared directly.
 - **Version index** (hot tier, never moves, backed up): for every key of a versioned series, its highest recorded
-  `changed_at`. The rank of an arriving fact is therefore always known, except during a restore (§8).
+  `changed_at`. The rank of an arriving fact is therefore known whenever the index is local.
 - **Fast path:** a fact with `t` later than the series' latest recorded `t` cannot be a duplicate; no lookup. Other
   facts are checked against the in-memory recent window (§5.1) before any index probe.
 - If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure), the fact is
   recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data. In a versioned
   series an arriving fact whose `changed_at` matches none in its key's history is not a duplicate and needs no
   check; one whose `changed_at` equals that of a fact off every local tier is recorded, counted
-  `duplicates_unchecked` and takes the tie by position. An unchecked repeat therefore never reverts a correction in a
-  versioned series. In any other series it can revert a correction that differs in value, so a source that revises
-  readings must be declared versioned.
+  `duplicates_unchecked` and takes the tie by position. An unchecked repeat therefore never reverts a correction with
+  a higher `changed_at` in a versioned series. In any other series it can revert a correction that differs in value,
+  so a source that revises readings must be declared versioned.
 
 ### 2.5 Quality, invalid values, clock
 - Bad-quality facts stay in views but are ignored by summaries and do not refresh staleness (§12 D6).
@@ -232,7 +233,7 @@ carries coverage in seconds and as a fraction of the window.
   the left-to-right merge of its children. Stored nodes are therefore bitwise reproducible (invariants 5, 8).
   Series with a decimal scale sum in exact `i128`. Results assembled in other orders (windows, coarse queries) are
   compared with direct computation to a relative tolerance of 1e-9 (invariants 6, 7).
-- Each node carries a version, incremented only when its content changes. An outranked fact (§2.3) changes no node.
+- Each node carries a version incremented on change. An outranked fact (§2.3) changes no node.
 - If the facts of an affected minute are on no local tier, the fact is still recorded, the node is flagged
   `summary_stale` and recomputed when the detail is fetched (§8). Chunk indexes always stay hot, so the engine
   knows whether a minute has facts off the machine.
@@ -259,7 +260,7 @@ carries coverage in seconds and as a fraction of the window.
 | Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, now, last.t + S). Time is never credited past `now`. |
 | Old spans | If an edge's raw detail is not local, the edge is evaluated at 1-minute precision and the result is flagged `approximate_edges`. |
 | Cache | The merged middle is cached with the versions of its nodes and invalidated when any changes (late data included). |
-| Cadence | A windowed funnel is evaluated on each routed fact and on a timer every 1 s (configurable per funnel). |
+| Cadence | A windowed funnel is evaluated on each routed fact that is not outranked (§4) and on a timer every 1 s (configurable per funnel). |
 | Conditions | Threshold with a separate clear level, on change (optional dead-band), held for N seconds, stale for N seconds. |
 | Late data | A trigger acts on what is known when it is evaluated and never fires retroactively. |
 | Latch | Each condition funnel persists, with its consumer's cursor, the last emitted state and the position at which it was emitted. |
@@ -331,14 +332,9 @@ carries coverage in seconds and as a fraction of the window.
    `start: position`. A cursor of an older generation at or below the restored end receives the facts after it up to
    the restored end through catch-up, flagged `replayed`, if their segments are local; otherwise §4 Resync applies.
    Every consumer then receives `generation_changed` and `resync`, and resumes at the new generation's first
-   position. Until the version index is back, a fact on a versioned series with `t` at or before the latest `t` known
-   for its series is **undetermined**: recorded, counted `duplicates_unchecked`, delivered flagged `rank_unknown`,
-   treated as outranked for live state and conditions, and its minute flagged `summary_stale`. Derived state may then
-   lack such a fact for a while, but never reverts a correction.
-3. Download the version index and the revised-key index, then current chunks, then revision chunks and log
-   segments. When the version index is back, each undetermined fact is ranked and the nodes of its minute
-   recomputed; funnels whose live state changed receive `resync`. No trigger fires retroactively (§6). A position
-   present in two files is one fact and must have identical content.
+   position.
+3. Download current chunks and the revised-key index, then revision chunks and log segments. A position present in
+   two files is one fact and must have identical content.
 4. When detail for a span is back, recompute its nodes from facts and compare with the checkpoint; any difference
    is reported and the recomputed value wins. The checkpoint label is removed when all detail has been verified.
 
@@ -352,11 +348,11 @@ gap until they are re-ingested.
 ## 9. Edge cases
 | # | Case | Rule | Test |
 |---|---|---|---|
-| 1 | Same `(series, t)`, different value | New fact; becomes current; old one a revision; minute path recomputed | model + property |
+| 1 | Same `(series, t)`, different value | New fact; becomes current unless outranked (row 2d); old one a revision; minute path recomputed | model + property |
 | 2 | Same `(series, t)`, identical to any fact in its history | Dropped and counted (§2.4) | unit |
 | 2a | A, then B, then a replay of A | Replay dropped; B stays current. With `revise`, A is recorded and current | property |
 | 2b | Identical repeat whose current fact is off every local tier | Recorded, `duplicates_unchecked` | unit |
-| 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier or during a restore | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
+| 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
 | 2d | Versioned series: a fact with a lower `changed_at` than the current one and a new value | Recorded, delivered flagged `outranked`, counted; no node, live-state or condition change | property |
 | 3 | Reading for last week arrives now | Flagged `late`; minute path updated; no retroactive trigger | model |
 | 4 | Reading > 60 s in the future | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
@@ -429,8 +425,9 @@ gap until they are re-ingested.
 17. For a counter, increases over adjacent windows sum to the increase over their union; for a state series, so do
     transitions (each step or transition credited once).
 18. No time is credited past `now` or past a reading's staleness limit (counter steps excepted).
-19. Re-submitting readings already recorded on a versioned series never changes the value, adapter-supplied quality
-    or `changed_at` of any current fact, whether or not the duplicate check could run.
+19. For a source whose `changed_at` rises with every revision, re-submitting readings already recorded on a versioned
+    series never changes the value, adapter-supplied quality or `changed_at` of any current fact while the version
+    index is local, whether or not the duplicate check could run.
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
@@ -438,7 +435,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range (§3), which does not make the store read-only |
 
 Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.
@@ -464,6 +461,7 @@ Parquet export schema, API signatures and memory figures follow in separate docu
 | Tree size | Bytes per series-year per level on real data | D7 alternative |
 | Hot disk during 90-day log retention | Log plus compacted bytes per day at expected load | D4 default; earlier move to cold |
 | Restart ≤ 1 s | Start time with 100,000 series and 60 s of log after the checkpoint | Shorter checkpoint interval |
+| Version index size | Bytes per series-year on hot for versioned series at their real reading rates | Keep index entries only for keys that were revised or are recent |
 | Deep object count | Objects per year and restore time from deep | Larger seal size for sealed-log uploads |
 | Bucket SHA-256 checksums | Confirm the bucket provider's S3 API rejects a mismatched single-part SHA-256 | Hash in object metadata plus sampled downloads |
 | Memory per series | Resident bytes per series at the ceiling | Lower ceiling; smaller recent window |
