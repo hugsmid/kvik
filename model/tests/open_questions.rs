@@ -5,7 +5,9 @@
 mod common;
 
 use common::*;
-use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Model, Selection};
+use kvik_model::engine::{
+    Config, ConsumerDecl, ConsumerId, CrashPoint, Error, Fault, Model, Selection, WriteOutcome,
+};
 use kvik_model::oracle;
 use kvik_model::summary::{Body, Params};
 use kvik_model::types::{HOUR, Kind, Nanos, Quality, Reading, SECOND, SeriesId, Value, ValueType};
@@ -81,4 +83,38 @@ fn q17_repeated_non_finite_reading() {
     assert_eq!(m.counters.duplicates_dropped, 1);
     let f = &m.current().unwrap()[&(s, t)];
     assert_eq!((f.value.clone(), f.quality), (Value::Absent, Quality::Bad));
+}
+
+/// Q-24: a sync fails, then the machine loses power before a restart. Recovery
+/// after the reboot cannot know the sync failed; the model applies the boot rule
+/// and keeps a batch that reached the disk whole.
+#[test]
+fn q24_sync_error_then_power_loss_keeps_whole_batch() {
+    let (mut m, s) = model();
+    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    assert_eq!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Survived))),
+        Err(Error::SyncFailed)
+    );
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.facts().unwrap().len(), 1);
+}
+
+/// Q-25: after a reboot, the model's recovery syncs and stamps the mark with
+/// the new boot id even when nothing was past the mark, so a later process
+/// crash on the same boot truncates as row 7 requires.
+#[test]
+fn q25_recovery_stamps_mark_after_reboot() {
+    let (mut m, s) = model();
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.disk.mark.unwrap().boot, m.boot);
+    m.emit(Reading::num(s, m.wall, 1.0)).unwrap();
+    let r = m.commit(Some(Fault::Crash(CrashPoint::AfterWrite(
+        WriteOutcome::Survived,
+    ))));
+    assert_eq!(r, Err(Error::Crashed));
+    m.restart();
+    assert!(m.facts().unwrap().is_empty());
 }

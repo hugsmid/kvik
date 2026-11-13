@@ -14,7 +14,7 @@ computation for exact equality.
 | Summary tree (stored 1-minute and 15-minute levels), calendar days, windows, sliding cache | `tree` |
 | Direct window and calendar oracles | `oracle` |
 | Conditions with an injected monotonic clock | `condition` |
-| Ingest, duplicates, commit with crash points, recovery, delivery, cursors, catch-up, compaction, manifest, tiers, backup, restore | `engine` |
+| Ingest, duplicates, commit with crash points, durable mark, recovery by boot id, delivery, cursors, catch-up, compaction, manifest, tiers, backup, restore | `engine` |
 
 The model does not yet follow every rule of the specification; [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) lists where
 it differs, and the open questions in the specification itself.
@@ -23,13 +23,13 @@ it differs, and the open questions in the specification itself.
 
 | File | Covers |
 |---|---|
-| `tests/invariants.rs` | Property tests for specification invariants 1–10, 17 and 18, one test per invariant |
+| `tests/invariants.rs` | Property tests for specification invariants 1–11, 17 and 18, one test per invariant |
 | `tests/edge_cases.rs` | Edge-case rows 1, 2, 2a, 2b, 3–9, 11–14, 17, 17a, 18, 18a, 19, 20, 22–25, 27, 29–32 and 35, one test (or property) each, named after the row |
 | `tests/rules.rs` | Other rules, named after their section |
 | `tests/open_questions.rs` | One test per open question that the model can show |
 | `tests/model.rs` | Model behaviour where it implements a simpler rule than the specification |
 
-Not yet covered: edge-case rows 10, 15, 16, 21, 22a, 26, 28, 33 and 34, and invariants 11–16 (see
+Not yet covered: edge-case rows 10, 15, 16, 21, 22a, 26, 28, 33 and 34, and invariants 12–16 (see
 `OPEN-QUESTIONS.md`).
 
 ```bash

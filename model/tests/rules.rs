@@ -5,7 +5,8 @@ mod common;
 
 use common::*;
 use kvik_model::engine::{
-    Config, ConsumerDecl, ConsumerId, FileClass, Level, Model, Reason, Selection, Wait,
+    Config, ConsumerDecl, ConsumerId, Error, Fault, FileClass, Level, Model, Reason, Selection,
+    Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
@@ -296,4 +297,29 @@ fn s3_full_ingest_queue_waits() {
     m.emit(waiting).unwrap();
     m.commit(None).unwrap();
     assert_eq!(m.facts().unwrap().len(), 2);
+}
+
+/// §3 Recovery: after a reboot, a batch that reached the disk whole is kept,
+/// but if the recovery sync fails the engine stays read-only with fatal health,
+/// and nothing past the old mark becomes visible. A later restart whose sync
+/// succeeds keeps the batch.
+#[test]
+fn s3_recovery_sync_failure_stays_read_only() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.emit(Reading::num(s, T0 + SECOND, 2.0)).unwrap();
+    let r = m.commit(Some(Fault::PowerLoss(WriteOutcome::Survived)));
+    assert_eq!(r, Err(Error::Crashed));
+    let mark = m.disk.mark;
+    m.restart_with(true);
+    assert!(m.is_read_only());
+    assert_eq!(m.health().level, Level::Fatal);
+    assert_eq!(m.disk.mark, mark, "mark not moved");
+    assert_eq!(m.facts().unwrap().len(), 1);
+    assert_eq!(m.read(&m.open_reader()).unwrap().1.len(), 1);
+    assert_eq!(m.commit(None), Err(Error::ReadOnly));
+    m.restart();
+    assert!(!m.is_read_only());
+    assert_eq!(m.facts().unwrap().len(), 2);
+    assert_eq!(m.disk.mark.unwrap().boot, m.boot);
 }

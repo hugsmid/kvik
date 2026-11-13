@@ -141,6 +141,11 @@ pub enum Op {
     },
     Commit(Option<Fault>),
     Crash,
+    /// The machine loses power (a new boot); with `Some(fails)`, it restarts
+    /// at once, and the recovery sync fails if `fails`.
+    PowerLoss(Option<bool>),
+    /// Restart; with `true`, the sync recovery performs after a reboot fails.
+    Restart(bool),
     Advance(Nanos),
     JumpWall(Nanos),
     Poll {
@@ -175,6 +180,7 @@ pub fn arb_fault() -> impl Strategy<Value = Option<Fault>> {
         12 => Just(None),
         1 => Just(Some(Fault::Crash(CrashPoint::BeforeWrite))),
         1 => outcome.clone().prop_map(|o| Some(Fault::Crash(CrashPoint::AfterWrite(o)))),
+        1 => Just(Some(Fault::Crash(CrashPoint::AfterSyncBeforeMark))),
         1 => Just(Some(Fault::Crash(CrashPoint::AfterSync))),
         1 => (0usize..3).prop_map(|n| Some(Fault::Crash(CrashPoint::DuringDelivery(n)))),
         1 => outcome.clone().prop_map(|o| Some(Fault::PowerLoss(o))),
@@ -202,6 +208,8 @@ pub fn arb_op() -> impl Strategy<Value = Op> {
         20 => emit,
         8 => arb_fault().prop_map(Op::Commit),
         1 => Just(Op::Crash),
+        2 => proptest::option::of(proptest::bool::weighted(0.4)).prop_map(Op::PowerLoss),
+        1 => proptest::bool::weighted(0.3).prop_map(Op::Restart),
         3 => prop_oneof![Just(SECOND / 3), Just(SECOND), Just(MINUTE), Just(2 * 3600 * SECOND)]
             .prop_map(Op::Advance),
         1 => prop_oneof![Just(-3600 * SECOND), Just(3600 * SECOND)].prop_map(Op::JumpWall),
@@ -279,7 +287,12 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
     let before = durable(m);
     let needs_up = !matches!(
         op,
-        Op::Crash | Op::Advance(_) | Op::JumpWall(_) | Op::Bucket(_)
+        Op::Crash
+            | Op::PowerLoss(_)
+            | Op::Restart(_)
+            | Op::Advance(_)
+            | Op::JumpWall(_)
+            | Op::Bucket(_)
     );
     if needs_up && !m.is_up() {
         m.restart();
@@ -303,6 +316,13 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             let _ = m.commit(*f);
         }
         Op::Crash => m.crash(),
+        Op::PowerLoss(restart) => {
+            m.power_loss();
+            if let Some(fails) = restart {
+                m.restart_with(*fails);
+            }
+        }
+        Op::Restart(fails) => m.restart_with(*fails),
         Op::Advance(d) => m.advance(*d),
         Op::JumpWall(d) => m.jump_wall(*d),
         Op::Poll { c, n } => {
@@ -364,10 +384,10 @@ pub fn observed_positions(m: &Model, c: u32) -> BTreeSet<Position> {
         .unwrap_or_default()
 }
 
-/// Restarts the engine if it is down or has an outstanding failed write, so
-/// that what is on disk is settled.
+/// Restarts the engine if it is down, read-only, or has batches past the
+/// durable mark, so that what is on disk is settled.
 pub fn settle(m: &mut Model) {
-    if !m.is_up() || m.disk.unsynced.is_some() {
+    if !m.is_up() || m.is_read_only() || m.disk.tail_len() > 0 {
         m.restart();
     }
 }

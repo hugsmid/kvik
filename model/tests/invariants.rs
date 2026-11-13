@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use jiff::tz::TimeZone;
-use kvik_model::engine::ConsumerId;
+use kvik_model::engine::{ConsumerId, Locality};
 use kvik_model::oracle;
 use kvik_model::summary::{Body, Node, direct, merge};
 use kvik_model::tree::{LEVELS, SeriesTree, SlidingWindow};
@@ -224,6 +224,31 @@ proptest! {
         }
     }
 
+    /// 11. No reader or consumer observes a position beyond the durable mark,
+    /// whether the writer is up or down: a reader gets exactly the listed
+    /// files' content up to the mark.
+    #[test]
+    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_op(), 1..80)) {
+        let (mut m, ids) = machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            let last = m.disk.mark.map_or(0, |k| k.last);
+            let r = m.open_reader();
+            let got: BTreeSet<u64> = m.read(&r).unwrap().1.iter().map(|f| f.position).collect();
+            // The raw content, including batches past the mark.
+            let raw: BTreeSet<u64> = r
+                .files
+                .iter()
+                .filter(|f| m.disk.locality(**f) != Locality::Missing)
+                .flat_map(|f| m.disk.files[f].entries().filter_map(|e| e.fact().map(|x| x.position)))
+                .collect();
+            prop_assert_eq!(&got, &raw.iter().copied().filter(|p| *p <= last).collect::<BTreeSet<u64>>());
+            for obs in m.observed.values() {
+                prop_assert!(obs.iter().all(|o| o.position <= last));
+            }
+        }
+    }
+
     /// 17. For a counter, the increases over adjacent windows that partition a
     /// span add up to the increase over the span: each step is credited once.
     #[test]
@@ -393,11 +418,26 @@ fn generator_coverage() {
     let strat = proptest::collection::vec(arb_op(), 60..80);
     let (mut facts, mut discarded, mut overflows, mut compacted, mut uploaded, mut revisions) =
         (0usize, 0u64, 0u64, 0usize, 0usize, 0usize);
+    let (mut tails, mut kept_after_reboot, mut recovery_failed) = (0usize, 0usize, 0usize);
     for _ in 0..200 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let (mut m, ids) = machine();
         for op in &ops {
+            let tail_before = m.disk.tail_len();
+            let boot = m.disk.mark.map(|k| k.boot);
             apply(&mut m, &ids, op).unwrap();
+            tails += usize::from(m.disk.tail_len() > 0);
+            recovery_failed += usize::from(
+                matches!(op, Op::Restart(true) | Op::PowerLoss(Some(true))) && m.is_read_only(),
+            );
+            // A restart after a reboot that kept a batch past the old mark.
+            if tail_before > 0
+                && m.disk.tail_len() == 0
+                && m.disk.mark.map(|k| k.boot) != boot
+                && m.disk.mark.is_some_and(|k| k.batches > 0)
+            {
+                kept_after_reboot += 1;
+            }
         }
         settle(&mut m);
         facts += durable(&m).len();
@@ -413,8 +453,9 @@ fn generator_coverage() {
         uploaded += m.disk.bucket.objects.len();
     }
     eprintln!(
-        "facts {facts} revisions {revisions} discarded {discarded} overflows {overflows} compacted {compacted} uploaded {uploaded}"
+        "facts {facts} revisions {revisions} discarded {discarded} overflows {overflows} compacted {compacted} uploaded {uploaded} tails {tails} kept-after-reboot {kept_after_reboot} recovery-failed {recovery_failed}"
     );
     assert!(facts > 1000 && revisions > 50 && discarded > 10 && overflows > 10);
     assert!(compacted > 20 && uploaded > 20);
+    assert!(tails > 50 && kept_after_reboot > 5 && recovery_failed > 5);
 }

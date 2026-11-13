@@ -276,15 +276,21 @@ fn row_06_two_readings_in_one_second() {
 #[test]
 fn row_07_process_crash_after_write_before_sync() {
     // Same boot: recovery truncates to the durable mark, whatever reached the
-    // page cache; the batch is never delivered.
-    for outcome in [
-        WriteOutcome::Lost,
-        WriteOutcome::Torn,
-        WriteOutcome::Survived,
+    // page cache, and a batch synced but not yet covered by the mark; the
+    // batch is never delivered.
+    for point in [
+        CrashPoint::AfterWrite(WriteOutcome::Lost),
+        CrashPoint::AfterWrite(WriteOutcome::Torn),
+        CrashPoint::AfterWrite(WriteOutcome::Survived),
+        CrashPoint::AfterSyncBeforeMark,
     ] {
         let (mut m, s) = model();
         m.emit(num(s, T0, 1.0)).unwrap();
-        let r = m.commit(Some(Fault::Crash(CrashPoint::AfterWrite(outcome))));
+        let mark = m.disk.mark;
+        let r = m.commit(Some(Fault::Crash(point)));
+        assert_eq!(m.disk.mark, mark, "mark not moved");
+        // A reader while the writer is down sees nothing past the mark.
+        assert!(m.read(&m.open_reader()).unwrap().1.is_empty());
         assert_eq!(r, Err(Error::Crashed));
         m.restart();
         assert!(m.facts().unwrap().is_empty());
@@ -315,9 +321,17 @@ fn row_07a_power_loss_after_write_before_sync() {
         );
         m.restart();
         assert_eq!(!m.facts().unwrap().is_empty(), kept);
+        assert_eq!(m.disk.mark.unwrap().boot, m.boot, "recovery moved the mark");
         m.drain().unwrap();
         assert_eq!(delivered(&m).len(), usize::from(kept));
     }
+    // A power loss with nothing past the mark loses nothing.
+    let (mut m, s) = model();
+    m.ingest(vec![num(s, T0, 1.0)]).unwrap();
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.facts().unwrap().len(), 1);
+    assert_eq!(m.counters.batches_discarded, 0);
 }
 
 #[test]
@@ -381,7 +395,11 @@ fn row_11_corrupt_sealed_file_quarantined_and_restored_from_tier() {
 
 #[test]
 fn row_12_sync_error_read_only_fatal_restart_truncates() {
-    for outcome in [WriteOutcome::Lost, WriteOutcome::Survived] {
+    for outcome in [
+        WriteOutcome::Lost,
+        WriteOutcome::Torn,
+        WriteOutcome::Survived,
+    ] {
         let (mut m, s) = model();
         m.emit(num(s, T0, 1.0)).unwrap();
         assert_eq!(
@@ -392,6 +410,7 @@ fn row_12_sync_error_read_only_fatal_restart_truncates() {
         assert_eq!(m.emit(num(s, T0 + 1, 1.0)), Err(Refusal::ReadOnly.into()));
         assert_eq!(m.commit(None), Err(Error::ReadOnly), "no retry");
         assert!(delivered(&m).is_empty());
+        assert!(m.read(&m.open_reader()).unwrap().1.is_empty());
         m.restart();
         assert!(
             m.facts().unwrap().is_empty(),

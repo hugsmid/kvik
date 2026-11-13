@@ -269,7 +269,11 @@ pub enum CrashPoint {
     BeforeWrite,
     /// After the write, before the sync completes (§9 row 7).
     AfterWrite(WriteOutcome),
-    /// After the sync, before live state and delivery (§9 row 8).
+    /// After the sync, before the durable mark is updated: the batch is on
+    /// disk but was never acknowledged or delivered.
+    AfterSyncBeforeMark,
+    /// After the sync and the mark update, before live state and delivery
+    /// (§9 row 8).
     AfterSync,
     /// After delivering to the first `n` consumers.
     DuringDelivery(usize),
@@ -282,11 +286,12 @@ pub enum Fault {
     /// truncates to the durable mark (§3), so an unsynced batch is discarded
     /// whatever reached the page cache (§9 row 7).
     Crash(CrashPoint),
-    /// The machine loses power after the write and before the sync (new boot).
+    /// The machine loses power after the write and before the sync: the
+    /// process stops and the boot id changes ([`Model::power_loss`]).
     /// Recovery keeps complete batches with valid checksums (§9 row 7a).
     PowerLoss(WriteOutcome),
     /// The sync call returns an error (§9 row 12). The engine becomes
-    /// read-only; restart truncates to the durable mark.
+    /// read-only; a restart on the same boot truncates to the durable mark.
     SyncError(WriteOutcome),
 }
 
@@ -515,9 +520,13 @@ pub struct Disk {
     pub manifest: Vec<ManifestRecord>,
     /// Active segment.
     pub active: Option<FileId>,
-    /// A batch written to the active segment but not synced: what reached the
-    /// disk, and whether the machine lost power (a new boot) before restart.
-    pub unsynced: Option<(Vec<Entry>, WriteOutcome, bool)>,
+    /// The durable mark (§3): updated after each successful sync. It is
+    /// memory-mapped and survives a process crash; after a power loss its boot
+    /// id no longer matches the machine.
+    pub mark: Option<Mark>,
+    /// What a power loss leaves of the active segment's batches past the mark
+    /// (written, not covered by the mark). `None` when there are none.
+    pub tail_fate: Option<WriteOutcome>,
     /// Durable consumer cursors (last confirmed position).
     pub cursors: BTreeMap<ConsumerId, Position>,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
@@ -526,7 +535,49 @@ pub struct Disk {
     pub next_file: u64,
 }
 
+/// The durable mark (§3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    /// Boot id of the machine when the mark was written.
+    pub boot: u64,
+    /// Segment the mark points into.
+    pub file: FileId,
+    /// Batches of that segment covered by the mark.
+    pub batches: usize,
+    /// Last position covered.
+    pub last: Position,
+}
+
 impl Disk {
+    /// Batches of `f` that readers may see: all of them, except in the active
+    /// segment, where only those up to the durable mark count (§3).
+    pub fn visible_batches(&self, f: FileId) -> &[Vec<Entry>] {
+        let file = &self.files[&f];
+        if self.active != Some(f) {
+            return &file.batches;
+        }
+        let n = match self.mark {
+            Some(m) if m.file == f => m.batches.min(file.batches.len()),
+            _ => 0,
+        };
+        &file.batches[..n]
+    }
+
+    fn visible_entries(&self, f: FileId, file: &StoredFile) -> Vec<Entry> {
+        if self.active == Some(f) {
+            self.visible_batches(f).iter().flatten().cloned().collect()
+        } else {
+            file.entries().cloned().collect()
+        }
+    }
+
+    /// Batches of the active segment past the durable mark.
+    pub fn tail_len(&self) -> usize {
+        self.active.map_or(0, |f| {
+            self.files[&f].batches.len() - self.visible_batches(f).len()
+        })
+    }
+
     /// Next manifest epoch.
     fn epoch(&self) -> u64 {
         self.manifest.last().map_or(1, |r| r.epoch + 1)
@@ -649,8 +700,8 @@ impl Disk {
         let mut out = BTreeMap::new();
         for f in self.published() {
             if let Some(file) = self.readable(f) {
-                for e in file.entries() {
-                    out.entry(e.position).or_insert_with(|| e.clone());
+                for e in self.visible_entries(f, file) {
+                    out.entry(e.position).or_insert(e);
                 }
             }
         }
@@ -670,7 +721,11 @@ impl Disk {
         let mut out = BTreeSet::new();
         for f in self.published() {
             if self.locality(f) == Locality::Hot {
-                out.extend(self.files[&f].entries().map(|e| e.position));
+                out.extend(
+                    self.visible_entries(f, &self.files[&f])
+                        .iter()
+                        .map(|e| e.position),
+                );
             }
         }
         out
@@ -683,11 +738,7 @@ impl Disk {
             .iter()
             .map(|f| self.files[f].bytes(per_entry))
             .sum();
-        let unsynced = self
-            .unsynced
-            .as_ref()
-            .map_or(0, |(b, _, _)| b.len() as u64 * per_entry);
-        files + unsynced + self.other_bytes
+        files + self.other_bytes
     }
 
     /// Sealed, published files whose backup is not yet verified.
@@ -751,6 +802,8 @@ pub struct Model {
     pub mono: Nanos,
     /// Engine UTC clock for window ends: never runs backwards (§6).
     pub now: Nanos,
+    /// Boot id of the machine; a power loss starts a new boot.
+    pub boot: u64,
     vol: Option<Volatile>,
     sessions: BTreeMap<ConsumerId, u32>,
 }
@@ -773,6 +826,7 @@ impl Model {
             wall,
             mono: 0,
             now: wall,
+            boot: 0,
             vol: None,
             sessions: BTreeMap::new(),
         };
@@ -816,26 +870,30 @@ impl Model {
         self.vol = None;
     }
 
+    /// The machine loses power: the process stops and the next start is a new
+    /// boot, so the page cache and the boot id of the mark are gone (§3).
+    pub fn power_loss(&mut self) {
+        self.boot += 1;
+        self.crash();
+    }
+
+    /// Whether the engine is up but read-only after a failed write or sync.
+    pub fn is_read_only(&self) -> bool {
+        self.vol.as_ref().is_some_and(|v| v.read_only)
+    }
+
     /// Starts the engine from the disk alone (§3 "Recovery").
     pub fn restart(&mut self) {
+        self.restart_with(false);
+    }
+
+    /// Starts the engine from the disk alone; with `recovery_sync_fails`, the
+    /// sync that recovery performs after a reboot fails (§3 Recovery: "If that
+    /// sync fails, stay read-only").
+    pub fn restart_with(&mut self, recovery_sync_fails: bool) {
         self.vol = None;
-        // 1. The unsynced tail of the last segment. Same boot: truncate to the
-        //    durable mark. New boot: keep a complete batch with valid
-        //    checksums; truncate a torn or lost one (§3 Recovery).
-        if let Some((batch, outcome, new_boot)) = self.disk.unsynced.take() {
-            match (outcome, new_boot) {
-                (WriteOutcome::Survived, true) => {
-                    let active = self.disk.active.expect("unsynced batch has a segment");
-                    self.disk
-                        .files
-                        .get_mut(&active)
-                        .expect("segment")
-                        .batches
-                        .push(batch);
-                }
-                _ => self.counters.batches_discarded += 1,
-            }
-        }
+        // 1. The active segment past the durable mark (§3 Recovery).
+        let read_only = self.recover_tail(recovery_sync_fails);
         // 2. Unpublished compaction outputs are discarded.
         let published = self.disk.published();
         let orphans: Vec<FileId> = self
@@ -919,9 +977,69 @@ impl Model {
             queue: VecDeque::new(),
             next_position,
             consumers,
-            read_only: false,
+            read_only,
             skew_run: BTreeMap::new(),
         });
+    }
+
+    /// Same boot id as the mark: truncate everything after it. Different boot
+    /// id, or no mark: keep the batches that reached the disk whole (a torn or
+    /// lost batch is truncated), sync, and move the mark. Returns whether the
+    /// engine must stay read-only because that sync failed.
+    fn recover_tail(&mut self, sync_fails: bool) -> bool {
+        let Some(active) = self.disk.active else {
+            self.disk.tail_fate = None;
+            return false;
+        };
+        let visible = self.disk.visible_batches(active).len();
+        let tail = self.disk.files[&active].batches.len() - visible;
+        let same_boot = self.disk.mark.is_some_and(|m| m.boot == self.boot);
+        let keep = if same_boot {
+            false
+        } else {
+            matches!(self.disk.tail_fate, None | Some(WriteOutcome::Survived))
+        };
+        if !keep && tail > 0 {
+            self.disk
+                .files
+                .get_mut(&active)
+                .expect("segment")
+                .batches
+                .truncate(visible);
+            self.counters.batches_discarded += tail as u64;
+        }
+        // What is left on disk is now whole.
+        self.disk.tail_fate = None;
+        if same_boot {
+            return false;
+        }
+        if sync_fails {
+            return true;
+        }
+        self.sync_mark();
+        false
+    }
+
+    /// Moves the durable mark to the end of the active segment, stamped with
+    /// the current boot id (after a successful sync).
+    fn sync_mark(&mut self) {
+        let Some(active) = self.disk.active else {
+            return;
+        };
+        let file = &self.disk.files[&active];
+        let last = file
+            .entries()
+            .last()
+            .map(|e| e.position)
+            .or(self.disk.mark.map(|m| m.last));
+        if let Some(last) = last {
+            self.disk.mark = Some(Mark {
+                boot: self.boot,
+                file: active,
+                batches: file.batches.len(),
+                last,
+            });
+        }
     }
 
     // ----- registry -----
@@ -941,7 +1059,8 @@ impl Model {
             body: EntryBody::Registry(ev),
         };
         v.entries.insert(position, entry.clone());
-        self.append_durable(vec![entry]);
+        self.append_batch(vec![entry]);
+        self.sync_mark();
         self.maybe_seal();
         Ok(position)
     }
@@ -1199,26 +1318,35 @@ impl Model {
             self.crash();
             return Err(Error::Crashed);
         }
-        // Write.
-        self.ensure_active();
-        if let Some(Fault::Crash(CrashPoint::AfterWrite(outcome))) = fault {
-            self.disk.unsynced = Some((batch, outcome, false));
+        // Write: the batch is in the active segment, past the durable mark.
+        self.append_batch(batch.clone());
+        match fault {
+            Some(Fault::Crash(CrashPoint::AfterWrite(outcome))) => {
+                self.disk.tail_fate = Some(outcome);
+                self.crash();
+                return Err(Error::Crashed);
+            }
+            Some(Fault::PowerLoss(outcome)) => {
+                self.disk.tail_fate = Some(outcome);
+                self.power_loss();
+                return Err(Error::Crashed);
+            }
+            Some(Fault::SyncError(outcome)) => {
+                self.disk.tail_fate = Some(outcome);
+                self.vol_mut()?.read_only = true;
+                report.positions.clear();
+                return Err(Error::SyncFailed);
+            }
+            _ => {}
+        }
+        // Sync: the batch is on disk.
+        if fault == Some(Fault::Crash(CrashPoint::AfterSyncBeforeMark)) {
+            self.disk.tail_fate = Some(WriteOutcome::Survived);
             self.crash();
             return Err(Error::Crashed);
         }
-        if let Some(Fault::PowerLoss(outcome)) = fault {
-            self.disk.unsynced = Some((batch, outcome, true));
-            self.crash();
-            return Err(Error::Crashed);
-        }
-        // Sync.
-        if let Some(Fault::SyncError(outcome)) = fault {
-            self.disk.unsynced = Some((batch, outcome, false));
-            self.vol_mut()?.read_only = true;
-            report.positions.clear();
-            return Err(Error::SyncFailed);
-        }
-        self.append_durable(batch.clone());
+        // Durable mark; only now may anything see the batch.
+        self.sync_mark();
         if fault == Some(Fault::Crash(CrashPoint::AfterSync)) {
             self.crash();
             return Err(Error::Crashed);
@@ -1276,7 +1404,7 @@ impl Model {
         }
     }
 
-    fn append_durable(&mut self, batch: Vec<Entry>) {
+    fn append_batch(&mut self, batch: Vec<Entry>) {
         self.ensure_active();
         let id = self.disk.active.expect("active");
         self.disk
@@ -1300,9 +1428,9 @@ impl Model {
 
     /// Seals the active segment now.
     pub fn seal_active(&mut self) {
-        if self.disk.unsynced.is_some() {
-            // A write is outstanding (failed sync): the segment is not sealed
-            // until a restart has decided what reached the disk.
+        if self.disk.tail_len() > 0 {
+            // Batches past the durable mark (failed sync): the segment is not
+            // sealed until a restart has decided what reached the disk.
             return;
         }
         if let Some(id) = self.disk.active.take() {
@@ -1782,7 +1910,8 @@ impl Model {
                 if file.version > FORMAT_VERSION {
                     return Err(Error::NewerFormat(*f, file.version));
                 }
-                for e in file.entries() {
+                // Log segments only up to the durable mark (§3).
+                for e in self.disk.visible_entries(*f, file) {
                     if let Some(fact) = e.fact() {
                         facts.insert(e.position, fact.clone());
                     }

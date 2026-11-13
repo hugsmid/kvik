@@ -17,6 +17,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-21 | §7 | Which clock measures lease expiry |
 | Q-22 | §2.5, §5.5, §12 D1 | Negative counter values if D1 changes |
 | Q-23 | §5.1, §5.7 | Stored calendar nodes for days off 15-minute boundaries |
+| Q-24 | §3 Write or sync failure, §3 Recovery, row 12 | A failed sync followed by a power loss |
+| Q-25 | §3 Durable mark, §3 Recovery | When recovery writes the mark; a missing or invalid mark |
 
 ## Q-14 — Transitions at the leading edge
 **Scenario.** State "idle" before a window and "running" at its first reading inside. §6 credits the counter step
@@ -106,6 +108,26 @@ evaluation either way (§5.7); only the stored node is undefined.
 **Proposed.** "No calendar node is stored for such a day; its result is evaluated from the 15-minute nodes inside it
 and facts at its edges."
 
+## Q-24 — A failed sync followed by a power loss
+**Scenario.** A sync returns an error; the engine is read-only, and "recovery by restart … truncates to the mark"
+(§3, row 12). Before the restart, the machine loses power. On the new boot, Recovery's different-boot rule keeps
+"blocks up to the last complete commit block with valid checksums", which includes the batch whose sync failed if
+it reached the disk whole. Recovery cannot know that the sync failed.
+**Model.** The boot rule applies; the batch is kept and becomes durable (`q24_sync_error_then_power_loss_keeps_whole_batch`).
+**Proposed.** "A batch whose sync failed may be kept by recovery after a reboot; it was never acknowledged, so
+adapters may also replay it, which the duplicate rule absorbs." Or record the failure durably so recovery truncates.
+
+## Q-25 — When recovery writes the mark
+**Scenario.** The mark is updated "after each successful sync" (§3). After a reboot with nothing past the mark,
+recovery syncs; if it did not also write the mark with the new boot id, a later process crash on the same boot
+would find a different boot id in the mark and keep an unsynced batch, against row 7. Also unstated: what recovery
+does when the mark file is missing or unreadable, and whether a failed recovery sync leaves the old mark.
+**Model.** Recovery after a reboot always syncs and writes the mark with the current boot id; a failed recovery
+sync leaves the old mark, so the next restart tries again; a missing mark is treated as a different boot
+(`q25_recovery_stamps_mark_after_reboot`).
+**Proposed.** "Recovery after a reboot ends by writing the mark with the current boot id. A missing or unreadable
+mark is treated as a different boot."
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -134,8 +156,8 @@ The specification wins where the documents differ. These follow from it, for the
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
-flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), recovery after a process crash or a power loss
-(§3), catch-up after overflow (§4), and loss of a corrupt log segment with no other copy (§8). It does not yet
+flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
+catch-up after overflow (§4), and loss of a corrupt log segment with no other copy (§8). It does not yet
 implement:
 
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
@@ -147,7 +169,6 @@ implement:
 | Negative counter values | §2.5, §5.5: bad quality, no value | Reset rule applied | `negative_counter_decrease_counts_as_reset` |
 | Record on change | §2.6, row 17a | Keep-alive facts are ordinary facts from the adapter | `tests/edge_cases.rs` `row_17a_…` |
 | Effective-dated parameters and site zone | §2.1, §5.7, row 21 | One staleness limit per series; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
-| Durable mark file | §3 | Process crash and power loss are distinguished directly | `tests/edge_cases.rs` `row_07_…`, `row_07a_…` |
 | Low disk mark | §3: compaction pauses; tiering continues | Tiering pauses too | `low_mark_pauses_tiering_too` |
 | Routing changes as log entries; new-consumer start; cycles | §4, rows 33–34 | Fixed selections from configuration | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled | — |
@@ -164,4 +185,4 @@ implement:
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Restore from a checkpoint | §8 Restore | Restore downloads files and rebuilds | `restore_onto_empty_disk_current_first` |
-| Invariants 11–16 | §10 | Not checked yet | — |
+| Invariants 12–16 | §10 | Not checked yet | — |
