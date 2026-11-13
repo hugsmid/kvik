@@ -15,8 +15,8 @@ use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Params};
 use kvik_model::tree::{SeriesTree, quarters_in_day};
 use kvik_model::types::{
-    DAY, HOUR, Kind, MINUTE, Nanos, QUARTER, Quality, Reading, SECOND, SeriesId, Value, ValueType,
-    exact, floor_to,
+    DAY, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId, Value,
+    ValueType, exact, floor_to,
 };
 use kvik_model::view;
 use proptest::prelude::*;
@@ -65,7 +65,7 @@ fn leaf_ok(m: &Model, s: SeriesId, t: Nanos) {
     );
 }
 
-fn delivered(m: &Model) -> Vec<u64> {
+fn delivered(m: &Model) -> Vec<Position> {
     m.observed
         .get(&C)
         .map(|o| o.iter().map(|x| x.position).collect())
@@ -539,7 +539,7 @@ fn row_14_consumer_slower_than_stream_catches_up_from_log() {
         }
         got.extend(d);
     }
-    let ps: Vec<u64> = got.iter().map(|d| d.position).collect();
+    let ps = seqs(got.iter().map(|d| d.position));
     assert!(ps.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(ps.len(), 10);
     assert!(got[..2].iter().all(|d| !d.replayed));

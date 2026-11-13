@@ -529,10 +529,31 @@ pub struct Disk {
     pub tail_fate: Option<WriteOutcome>,
     /// Durable consumer cursors (last confirmed position).
     pub cursors: BTreeMap<ConsumerId, Position>,
+    /// Current generation (§2.2): 0 until a restore starts a new one (§8).
+    pub generation: u32,
+    /// The last position a restore brought back (§8 Restore step 2), if this
+    /// store was restored.
+    pub restored_end: Option<Position>,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
     pub other_bytes: u64,
     /// Next file id.
     pub next_file: u64,
+}
+
+/// A consumer event that is not a fact delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// The store was restored and the consumer's cursor lies beyond what the
+    /// restore brought back (§8 Restore step 2).
+    GenerationChanged {
+        /// The consumer's cursor before the restore.
+        cursor: Position,
+        /// The last restored position.
+        restored_end: Position,
+    },
+    /// A `resync` is due (§4). Its contents (live state and condition state)
+    /// are not modelled yet.
+    ResyncDue,
 }
 
 /// The durable mark (§3).
@@ -796,6 +817,8 @@ pub struct Model {
     pub counters: Counters,
     /// What each consumer has received, as observed from outside.
     pub observed: BTreeMap<ConsumerId, Vec<Observed>>,
+    /// Events other than fact deliveries each consumer has received.
+    pub signals: BTreeMap<ConsumerId, Vec<Signal>>,
     /// Host wall clock (may jump).
     pub wall: Nanos,
     /// Monotonic clock (only advances).
@@ -815,7 +838,7 @@ impl Model {
         let mut disk = Disk::default();
         disk.bucket.reachable = true;
         for c in &consumers {
-            disk.cursors.insert(c.id, 0);
+            disk.cursors.insert(c.id, Position::ORIGIN);
         }
         let mut m = Model {
             config,
@@ -823,6 +846,7 @@ impl Model {
             disk,
             counters: Counters::default(),
             observed: BTreeMap::new(),
+            signals: BTreeMap::new(),
             wall,
             mono: 0,
             now: wall,
@@ -920,20 +944,34 @@ impl Model {
             *n = (*n).max(f.t);
         }
         let trees = build_trees(&registry, &current);
-        let next_position = entries.keys().next_back().map_or(1, |p| p + 1);
+        // The next position continues the current generation; a generation
+        // started by a restore begins at its first position (§8).
+        let generation = self.disk.generation;
+        let next_position = entries
+            .keys()
+            .next_back()
+            .filter(|p| p.generation == generation)
+            .map_or(Position::first(generation), |p| p.next());
         let consumers = self
             .consumers
             .iter()
             .map(|d| {
                 let s = self.sessions.entry(d.id).or_insert(0);
                 *s += 1;
-                let cursor = self.disk.cursors.get(&d.id).copied().unwrap_or(0);
+                let cursor = self
+                    .disk
+                    .cursors
+                    .get(&d.id)
+                    .copied()
+                    .unwrap_or(Position::ORIGIN);
                 ConsumerRt {
                     decl: d.clone(),
                     queue: VecDeque::new(),
                     // A consumer that is behind catches up from its cursor.
-                    mode: if cursor + 1 < next_position {
-                        Mode::CatchUp { next: cursor + 1 }
+                    mode: if entries.range(cursor.next()..).next().is_some() {
+                        Mode::CatchUp {
+                            next: cursor.next(),
+                        }
                     } else {
                         Mode::Live
                     },
@@ -1073,7 +1111,7 @@ impl Model {
             return Err(Error::ReadOnly);
         }
         let position = v.next_position;
-        v.next_position += 1;
+        v.next_position = position.next();
         let entry = Entry {
             position,
             received_at: wall,
@@ -1315,7 +1353,7 @@ impl Model {
                     revise,
                 },
             };
-            next += 1;
+            next = next.next();
             let n = batch_newest.entry(r.series).or_insert(r.t);
             *n = (*n).max(r.t);
             batch_history
@@ -1572,28 +1610,32 @@ impl Model {
     /// to live once it reaches the head.
     pub fn catch_up(&mut self, id: ConsumerId, max: usize) -> Result<(), Error> {
         let v = self.vol_mut()?;
-        let head = v.next_position - 1;
         let Some(c) = v.consumers.iter_mut().find(|c| c.decl.id == id) else {
             return Ok(());
         };
         let Mode::CatchUp { mut next } = c.mode else {
             return Ok(());
         };
-        let mut reads = 0;
-        while next <= head && reads < max && c.queue.len() < c.decl.capacity {
-            if let Some(f) = v.entries.get(&next).and_then(Entry::fact)
+        // Entries in position order from `next`, across generations.
+        let mut at_head = true;
+        for (reads, (p, e)) in v.entries.range(next..).enumerate() {
+            if reads >= max || c.queue.len() >= c.decl.capacity {
+                at_head = false;
+                next = *p;
+                break;
+            }
+            if let Some(f) = e.fact()
                 && c.decl.selection.matches(f.series)
             {
                 c.queue.push_back(Delivery {
-                    position: next,
+                    position: *p,
                     fact: f.clone(),
                     replayed: true,
                 });
             }
-            next += 1;
-            reads += 1;
+            next = p.next();
         }
-        c.mode = if next > head {
+        c.mode = if at_head {
             Mode::Live
         } else {
             Mode::CatchUp { next }
@@ -1636,7 +1678,7 @@ impl Model {
         if p > c.last_received {
             return Err(Error::BadConfirm);
         }
-        let cur = self.disk.cursors.entry(id).or_insert(0);
+        let cur = self.disk.cursors.entry(id).or_insert(Position::ORIGIN);
         *cur = (*cur).max(p);
         Ok(())
     }
@@ -1644,14 +1686,21 @@ impl Model {
     /// The consumer process restarted: its queue is dropped and it resumes
     /// from its durable cursor in catch-up mode.
     pub fn reconnect(&mut self, id: ConsumerId) -> Result<(), Error> {
-        let cursor = self.disk.cursors.get(&id).copied().unwrap_or(0);
+        let cursor = self
+            .disk
+            .cursors
+            .get(&id)
+            .copied()
+            .unwrap_or(Position::ORIGIN);
         let s = self.sessions.entry(id).or_insert(0);
         *s += 1;
         let session = *s;
         let v = self.vol_mut()?;
         if let Some(c) = v.consumers.iter_mut().find(|c| c.decl.id == id) {
             c.queue.clear();
-            c.mode = Mode::CatchUp { next: cursor + 1 };
+            c.mode = Mode::CatchUp {
+                next: cursor.next(),
+            };
             c.session = session;
             c.last_received = cursor;
         }
@@ -2059,9 +2108,8 @@ impl Model {
         }
     }
 
-    /// A new engine restored from the bucket alone (§8). With
-    /// `current_only`, only current chunks are restored first (partial
-    /// restore); [`Model::restore_rest`] adds the rest.
+    /// A new engine restored from the bucket alone (§8), with consumers that
+    /// start from nothing confirmed. See [`Model::restore_with_cursors`].
     pub fn restore_from(
         config: Config,
         consumers: Vec<ConsumerDecl>,
@@ -2069,8 +2117,64 @@ impl Model {
         wall: Nanos,
         current_only: bool,
     ) -> Model {
+        Model::restore_with_cursors(
+            config,
+            consumers,
+            bucket,
+            &BTreeMap::new(),
+            wall,
+            current_only,
+        )
+    }
+
+    /// A new engine restored from the bucket alone (§8). Positions continue in
+    /// a new generation, one above any in the bucket, from its first sequence.
+    /// `cursors` are the consumers' cursors from before the restore (a missing
+    /// one is nothing confirmed): a cursor at or below the restored end
+    /// continues; beyond it, the consumer receives `generation_changed` and
+    /// `resync` and continues after the restored end. With `current_only`,
+    /// only current chunks are restored first (partial restore);
+    /// [`Model::restore_rest`] adds the rest.
+    pub fn restore_with_cursors(
+        config: Config,
+        consumers: Vec<ConsumerDecl>,
+        bucket: &Bucket,
+        cursors: &BTreeMap<ConsumerId, Position>,
+        wall: Nanos,
+        current_only: bool,
+    ) -> Model {
         let mut m = Model::new(config, consumers, wall);
         m.disk.bucket = bucket.clone();
+        let restored: Vec<Position> = bucket
+            .objects
+            .values()
+            .flat_map(|(_, f)| f.entries().map(|e| e.position))
+            .collect();
+        let end = restored.iter().max().copied();
+        // A restore always starts a new generation, even from an empty bucket.
+        m.disk.generation = restored
+            .iter()
+            .map(|p| p.generation)
+            .max()
+            .map_or(1, |g| g + 1);
+        m.disk.restored_end = end;
+        let end = end.unwrap_or(Position::ORIGIN);
+        let ids: Vec<ConsumerId> = m.consumers.iter().map(|c| c.id).collect();
+        for id in ids {
+            let cursor = cursors.get(&id).copied().unwrap_or(Position::ORIGIN);
+            if cursor <= end {
+                m.disk.cursors.insert(id, cursor);
+            } else {
+                m.disk.cursors.insert(id, end);
+                m.signals.entry(id).or_default().extend([
+                    Signal::GenerationChanged {
+                        cursor,
+                        restored_end: end,
+                    },
+                    Signal::ResyncDue,
+                ]);
+            }
+        }
         m.restore_rest(current_only);
         m
     }

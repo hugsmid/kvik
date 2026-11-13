@@ -5,8 +5,47 @@ use std::fmt;
 /// Event or wall-clock time: UTC nanoseconds since the Unix epoch.
 pub type Nanos = i64;
 
-/// Commit-order position of a log entry. Positions start at 1.
-pub type Position = u64;
+/// Position of a log entry (§2.2): a generation and a sequence within it,
+/// ordered lexicographically. A restore starts a new generation (§8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Position {
+    /// Generation; 0 for a store that has never been restored.
+    pub generation: u32,
+    /// Sequence within the generation: strictly increasing and gap-free.
+    pub sequence: u64,
+}
+
+impl Position {
+    /// Before every position: the cursor of a consumer that has confirmed
+    /// nothing. Generation 0 starts at sequence 1, so this is never a position
+    /// of an entry.
+    pub const ORIGIN: Position = Position::new(0, 0);
+
+    /// A position.
+    pub const fn new(generation: u32, sequence: u64) -> Self {
+        Position {
+            generation,
+            sequence,
+        }
+    }
+
+    /// The first position of a generation: sequence 1 in generation 0, and
+    /// sequence 0 in a generation started by a restore (§8 Restore step 1).
+    pub const fn first(generation: u32) -> Self {
+        Position::new(generation, if generation == 0 { 1 } else { 0 })
+    }
+
+    /// The next position in the same generation.
+    pub const fn next(self) -> Self {
+        Position::new(self.generation, self.sequence + 1)
+    }
+}
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.generation, self.sequence)
+    }
+}
 
 /// Nanoseconds in one second.
 pub const SECOND: Nanos = 1_000_000_000;

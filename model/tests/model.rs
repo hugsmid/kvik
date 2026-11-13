@@ -97,7 +97,7 @@ fn consumer_down_for_a_day_resumes_from_cursor_replayed() {
     m.drain().unwrap();
     let obs = &m.observed[&C];
     let resumed: Vec<_> = obs.iter().filter(|o| o.session == 2).collect();
-    assert_eq!(resumed[0].position, cursor + 1);
+    assert_eq!(resumed[0].position, cursor.next());
     assert_eq!(resumed.len(), 200);
     assert!(resumed.iter().all(|o| o.replayed));
     // Original times are kept.

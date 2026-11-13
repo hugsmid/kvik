@@ -43,14 +43,14 @@ proptest! {
         let (mut m, ids) = machine();
         for op in &ops {
             apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
-            let keys: Vec<u64> = m.disk.all_entries().keys().copied().collect();
+            let keys = seqs(m.disk.all_entries().keys().copied());
             let expect: Vec<u64> = (1..=keys.len() as u64).collect();
             prop_assert_eq!(&keys, &expect, "durable positions not gap-free after {:?}", op);
             if let Op::Commit(None) = op
                 && m.is_up()
             {
                 // The running engine knows exactly the durable entries.
-                let live: Vec<u64> = m.entries().unwrap().iter().map(|e| e.position).collect();
+                let live = seqs(m.entries().unwrap().iter().map(|e| e.position));
                 prop_assert_eq!(&live, &keys);
             }
         }
@@ -59,7 +59,67 @@ proptest! {
         let n = m.disk.all_entries().len() as u64;
         let _ = m.emit(kvik_model::types::Reading::num(ids[0], T0 + 7, 1.0e9));
         let r = m.commit(None).unwrap();
-        prop_assert_eq!(r.positions, vec![n + 1]);
+        prop_assert_eq!(r.positions, vec![p0(n + 1)]);
+    }
+
+    /// 1. Only a restore starts a generation. After a random history, with all
+    /// or only some sealed files uploaded, a restore continues at the first
+    /// sequence of the next generation and restarts keep it. A cursor at or
+    /// below the restored end catches up from it; one beyond it gets
+    /// `generation_changed` and `resync` and no replay (§8 Restore step 2).
+    #[test]
+    fn inv01_only_restore_starts_generation(
+        ops in proptest::collection::vec(arb_op(), 1..80),
+        upload_all in any::<bool>(),
+    ) {
+        use kvik_model::engine::{Model, Selection, Signal};
+        use kvik_model::types::Position;
+        let (mut m, _) = run(&ops)?;
+        settle(&mut m);
+        if upload_all {
+            m.seal_active();
+            m.disk.bucket.reachable = true;
+            m.upload();
+        }
+        let end = m.disk.bucket.objects.values().flat_map(|(_, f)| f.entries().map(|e| e.position)).max();
+        let cursors = m.disk.cursors.clone();
+        let mut r = Model::restore_with_cursors(m.config.clone(), consumers(), &m.disk.bucket, &cursors, m.wall, false);
+        prop_assert_eq!(r.disk.generation, 1);
+        prop_assert_eq!(r.disk.restored_end, end);
+        let end = end.unwrap_or(Position::ORIGIN);
+        r.drain().unwrap();
+        for d in consumers() {
+            let cursor = cursors[&d.id];
+            let got: Vec<(Position, bool)> = r.observed.get(&d.id).map(|o| o.iter().map(|x| (x.position, x.replayed)).collect()).unwrap_or_default();
+            if cursor <= end {
+                prop_assert!(!r.signals.contains_key(&d.id));
+                let want: Vec<(Position, bool)> = r
+                    .disk
+                    .all_facts()
+                    .into_iter()
+                    .filter(|f| f.position > cursor)
+                    .filter(|f| match &d.selection {
+                        Selection::All => true,
+                        Selection::Series(set) => set.contains(&f.series),
+                    })
+                    .map(|f| (f.position, true))
+                    .collect();
+                prop_assert_eq!(got, want);
+            } else {
+                prop_assert_eq!(
+                    r.signals[&d.id].clone(),
+                    vec![Signal::GenerationChanged { cursor, restored_end: end }, Signal::ResyncDue]
+                );
+                prop_assert!(got.is_empty());
+            }
+        }
+        r.restart();
+        // The first new log entry (a definition) opens the new generation.
+        r.define("check/restore/marker", kvik_model::types::Kind::Gauge, kvik_model::types::ValueType::Number, "1", None).unwrap();
+        prop_assert_eq!(r.entries().unwrap().last().map(|e| e.position), Some(Position::new(1, 0)));
+        r.crash();
+        r.restart();
+        prop_assert_eq!(r.disk.generation, 1);
     }
 
     /// 2. Every delivered position is durable; every durable position is
@@ -93,7 +153,7 @@ proptest! {
         m.drain().unwrap();
         for c in [0u32, 1] {
             let obs = m.observed.get(&ConsumerId(c)).cloned().unwrap_or_default();
-            let mut by_session: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+            let mut by_session: BTreeMap<u32, Vec<kvik_model::types::Position>> = BTreeMap::new();
             for o in obs { by_session.entry(o.session).or_default().push(o.position); }
             for (s, ps) in by_session {
                 prop_assert!(ps.windows(2).all(|w| w[0] < w[1]), "consumer {} session {}: {:?}", c, s, ps);
@@ -232,17 +292,17 @@ proptest! {
         let (mut m, ids) = machine();
         for op in &ops {
             apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
-            let last = m.disk.mark.map_or(0, |k| k.last);
+            let last = m.disk.mark.map_or(kvik_model::types::Position::ORIGIN, |k| k.last);
             let r = m.open_reader();
-            let got: BTreeSet<u64> = m.read(&r).unwrap().1.iter().map(|f| f.position).collect();
+            let got: BTreeSet<kvik_model::types::Position> = m.read(&r).unwrap().1.iter().map(|f| f.position).collect();
             // The raw content, including batches past the mark.
-            let raw: BTreeSet<u64> = r
+            let raw: BTreeSet<kvik_model::types::Position> = r
                 .files
                 .iter()
                 .filter(|f| m.disk.locality(**f) != Locality::Missing)
                 .flat_map(|f| m.disk.files[f].entries().filter_map(|e| e.fact().map(|x| x.position)))
                 .collect();
-            prop_assert_eq!(&got, &raw.iter().copied().filter(|p| *p <= last).collect::<BTreeSet<u64>>());
+            prop_assert_eq!(&got, &raw.iter().copied().filter(|p| *p <= last).collect::<BTreeSet<_>>());
             for obs in m.observed.values() {
                 prop_assert!(obs.iter().all(|o| o.position <= last));
             }

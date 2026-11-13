@@ -6,13 +6,14 @@ mod common;
 use common::*;
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, Error, Fault, FileClass, Level, Model, Reason,
-    Selection, Wait, WriteOutcome,
+    Selection, Signal, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
-    HOUR, Kind, MINUTE, Nanos, Quality, Reading, SECOND, SeriesId, Value, ValueType, exact,
+    HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId, Value, ValueType,
+    exact,
 };
 
 fn model(staleness: Nanos) -> (Model, SeriesId) {
@@ -195,9 +196,13 @@ fn s4_overflow_catch_up_resumes_after_last_enqueued() {
         m.ingest(vec![Reading::num(s, T0 + i * SECOND, 1.0 + i as f64)])
             .unwrap();
     }
-    assert_eq!(m.disk.cursors[&c], 0, "nothing confirmed yet");
+    assert_eq!(
+        m.disk.cursors[&c],
+        Position::ORIGIN,
+        "nothing confirmed yet"
+    );
     m.drain().unwrap();
-    let ps: Vec<u64> = m.observed[&c].iter().map(|o| o.position).collect();
+    let ps = seqs(m.observed[&c].iter().map(|o| o.position));
     assert_eq!(ps, vec![2, 3, 4, 5, 6], "no repeats, in order");
 }
 
@@ -247,10 +252,10 @@ fn s10_9_restore_preserves_backed_up_positions() {
     m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
     m.seal_active();
     m.upload();
-    let backed_up: Vec<u64> = m.facts().unwrap().iter().map(|f| f.position).collect();
+    let backed_up: Vec<Position> = m.facts().unwrap().iter().map(|f| f.position).collect();
     m.ingest(vec![Reading::num(s, T0 + SECOND, 2.0)]).unwrap();
     let r = Model::restore_from(m.config.clone(), vec![], &m.disk.bucket, m.wall, false);
-    let restored: Vec<u64> = r.facts().unwrap().iter().map(|f| f.position).collect();
+    let restored: Vec<Position> = r.facts().unwrap().iter().map(|f| f.position).collect();
     assert_eq!(restored, backed_up);
     assert_eq!(m.facts().unwrap().len(), 2);
 }
@@ -456,4 +461,120 @@ fn s3_missing_mark_counts_as_different_boot() {
     m.restart();
     assert_eq!(m.facts().unwrap().len(), 1);
     assert_eq!(m.disk.mark.unwrap().boot, m.boot);
+}
+
+fn backed_up_model() -> (Model, SeriesId) {
+    let c = ConsumerDecl {
+        id: ConsumerId(1),
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![c], T0 + HOUR);
+    let s = m
+        .define(
+            "plant/line-1/temperature",
+            Kind::Gauge,
+            ValueType::Number,
+            "degC",
+            10 * SECOND,
+        )
+        .unwrap();
+    for i in 0..4 {
+        m.ingest(vec![Reading::num(s, T0 + i * SECOND, i as f64)])
+            .unwrap();
+    }
+    m.seal_active();
+    m.upload();
+    (m, s)
+}
+
+/// §2.2, §8 Restore step 1: positions continue at sequence 0 of a new
+/// generation, also when nothing is committed before a restart; a restart never
+/// changes the generation, and a second restore starts another.
+#[test]
+fn s8_restore_continues_in_new_generation_from_sequence_0() {
+    let (m, s) = backed_up_model();
+    let end = m.disk.all_entries().keys().next_back().copied().unwrap();
+    assert_eq!(end, Position::new(0, 5));
+    let mut r = Model::restore_from(m.config.clone(), vec![], &m.disk.bucket, m.wall, false);
+    assert_eq!(r.disk.generation, 1);
+    assert_eq!(r.disk.restored_end, Some(end));
+    r.restart();
+    let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
+    assert_eq!(p.positions, vec![Position::new(1, 0)]);
+    r.crash();
+    r.restart();
+    assert_eq!(r.disk.generation, 1);
+    let p = r.ingest(vec![Reading::num(s, T0 + HOUR + 1, 9.0)]).unwrap();
+    assert_eq!(p.positions, vec![Position::new(1, 1)]);
+    r.seal_active();
+    r.upload();
+    let r2 = Model::restore_from(r.config.clone(), vec![], &r.disk.bucket, r.wall, false);
+    assert_eq!(r2.disk.generation, 2);
+    assert_eq!(r2.disk.restored_end, Some(Position::new(1, 1)));
+}
+
+/// §8 Restore step 2: a cursor at or below the restored end continues; the
+/// consumer catches up from it, flagged `replayed`, with no signal.
+#[test]
+fn s8_cursor_at_or_below_restored_end_continues() {
+    let (m, _) = backed_up_model();
+    let c = ConsumerId(1);
+    let cursors = [(c, Position::new(0, 3))].into_iter().collect();
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &m.disk.bucket,
+        &cursors,
+        m.wall,
+        false,
+    );
+    r.drain().unwrap();
+    let got: Vec<(Position, bool)> = r.observed[&c]
+        .iter()
+        .map(|o| (o.position, o.replayed))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(Position::new(0, 4), true), (Position::new(0, 5), true)]
+    );
+    assert!(!r.signals.contains_key(&c));
+}
+
+/// §8 Restore step 2: a cursor beyond the restored end (facts the restore could
+/// not bring back) gets `generation_changed` and `resync`, is not replayed the
+/// old generation, and receives the new generation live.
+#[test]
+fn s8_cursor_beyond_restored_end_generation_changed() {
+    let (m, s) = backed_up_model();
+    let c = ConsumerId(1);
+    let cursor = Position::new(0, 9);
+    let cursors = [(c, cursor)].into_iter().collect();
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &m.disk.bucket,
+        &cursors,
+        m.wall,
+        false,
+    );
+    assert_eq!(
+        r.signals[&c],
+        vec![
+            Signal::GenerationChanged {
+                cursor,
+                restored_end: Position::new(0, 5)
+            },
+            Signal::ResyncDue
+        ]
+    );
+    r.drain().unwrap();
+    assert!(r.observed.get(&c).is_none_or(|o| o.is_empty()));
+    r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
+    r.drain().unwrap();
+    let got: Vec<(Position, bool)> = r.observed[&c]
+        .iter()
+        .map(|o| (o.position, o.replayed))
+        .collect();
+    assert_eq!(got, vec![(Position::new(1, 0), false)]);
 }

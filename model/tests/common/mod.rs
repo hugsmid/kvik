@@ -391,3 +391,20 @@ pub fn settle(m: &mut Model) {
         m.restart();
     }
 }
+
+/// A position in generation 0.
+pub fn p0(sequence: u64) -> Position {
+    Position::new(0, sequence)
+}
+
+/// Sequences of positions that must all be in generation 0: a history without
+/// a restore. Panics otherwise, so a generation bug cannot hide behind it.
+pub fn seqs(positions: impl IntoIterator<Item = Position>) -> Vec<u64> {
+    positions
+        .into_iter()
+        .map(|p| {
+            assert_eq!(p.generation, 0, "position {p} outside generation 0");
+            p.sequence
+        })
+        .collect()
+}
