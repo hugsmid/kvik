@@ -33,7 +33,7 @@ in a separate document. Open questions found by modelling are in `model/OPEN-QUE
 Series definitions, parameter changes (with an effective event time), aliases and retirements are log entries.
 A parameter applies to readings with `t` at or after its effective time. A definition entry always has a lower
 position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
-registry file that never leaves the hot tier.
+registry file that stays on the hot tier (tree checkpoints carry a copy, §8).
 
 **Retirement** is effective at `t_r`: facts with `t < t_r` are still accepted; facts with `t ≥ t_r` are refused
 and counted. The old id stays reachable by id.
@@ -317,8 +317,8 @@ carries coverage in seconds and as a fraction of the window.
 4. When detail for a span is back, recompute its nodes from facts and compare with the checkpoint; any difference
    is reported and the recomputed value wins. The checkpoint label is removed when all detail has been verified.
 
-A restart during a restore resumes it in its generation, fetching the files listed by the manifest records it
-restores from that are not yet local.
+A restart after the restore record is written resumes the restore in its generation, fetching the files listed by
+the manifest records it restores from that are not yet local.
 A crash before the record starts the restore again with the next generation.
 
 A disaster loses facts in files not backed up, which may already have been acted upon, and those beyond the first
