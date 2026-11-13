@@ -129,7 +129,9 @@ This bounds the durability decision taken for Q-35 and is for the owner.
 **Scenario.** (a) A forecast feed stops: its series has no live staleness, and lookahead coverage shrinks only as the
 issued horizon runs out, so nothing reports the silence promptly. (b) A newer issue that no longer covers a valid
 time cannot withdraw the older issue's value there, so the current view can mix issues. (c) A wrong value far in the
-future on a scheduled or forecast series is never flagged, since those series are exempt from `future`.
+future on a scheduled or forecast series is never flagged, since those series are exempt from `future`. (d) How forecast
+accuracy is served: comparing each issue with the outcome series, and asking what was known as of an issue time
+rather than as of a position.
 **Model.** Not modelled.
 **Needed.** Whether these are reported by the engine, left to the adapter's health, or accepted and stated.
 
@@ -189,7 +191,11 @@ The specification wins where the documents differ. These follow from it, for the
 - **F-13.** `format.md`: a series definition carries its timing (observed, scheduled or forecast). `api.md`: `SeriesSpec`
   gains timing, fixed for life; window bounds may be relative to `now` with either sign, and calendar windows relative
   to the current one; a fact delivery from a scheduled or forecast series is a notice, not the value in force; live
-  state of a forecast series is none; a stale-for condition on a forecast series is a compile error (§2.1, §4, §6).
+  state of a forecast series is none; a stale-for condition on a forecast series, or any condition over one without a
+  windowed operator, is a compile error; timing joins the list of fields whose change is an error; a forecast series
+  that is not versioned, or whose `changed_at kind` is not `time`, is refused; `Window::rolling` needs offsets from
+  `now`; exports label issue time and valid time. `format.md`'s series definition entry needs the timing field (and the
+  versioned flag and `changed_at kind`, F-9), outside the fields a parameter change may carry (§2.1, §4, §6).
 
 ## Settled
 | ID | Question | Settled in |

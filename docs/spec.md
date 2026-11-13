@@ -171,9 +171,9 @@ a different boot. The rules apply in this order:
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
 | Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), and when it is at or above the start of a tail truncated by §3 Recovery rule 3. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
-| Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. Scheduled and forecast facts are delivered once, at commit, in position order and unflagged: notice of a value for `t`, not the value in force, and a consumer must not act on it as present. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled, and `resync` for a funnel over a forecast series carries condition state only. |
+| Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. Scheduled and forecast facts are delivered once, at commit, in position order, not flagged `future`: the delivery is a notice of a value for `t`, and a consumer acts on live state or a condition, never on the delivery itself. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled (§6 Cadence), and `resync` for a funnel over a forecast series carries condition state only. |
 | Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
-| Timers | Window expiry, "held for N s", staleness and future-fact maturity use the monotonic clock; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. A scheduled value takes effect, and a scheduled series falls stale, by `now` (§6), so a forward correction of the system clock can bring either forward. |
+| Timers | Window expiry, "held for N s" and staleness of an observed series use the monotonic clock; a future fact matures when `now` reaches its `t`; system clock corrections never fire or suppress them. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. A scheduled value takes effect, and a scheduled series falls stale, by `now` (§6), so a forward correction of the system clock can bring either forward. |
 
 ## 5. Summary tree
 ### 5.1 Levels and storage
@@ -219,15 +219,15 @@ model must prove this against direct computation (invariant 6), including empty 
 nodes and late facts inserted between existing readings.
 
 ### 5.4 Staleness and coverage
-A reading is valid for at most S. **Live staleness** is measured on the monotonic clock: a series is stale when more
-than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still awaiting
-its time or an outranked fact (§4), so a forward jump of the system clock cannot make an observed series stale. A
-scheduled series is stale when `now` is later than the `t` of its live-state fact by more than S, or when it has no
-live-state fact; commits do not refresh it. A forecast series has no live staleness. **Event-time
-staleness** applies to history and to every window evaluation (§6): a series is stale at event time x when x > (`t`
-of its latest reading before x that is not bad quality) + S. Coverage stops at that point and time-weighted results
-exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the window. Live staleness
-applies only to live state and stale-for conditions.
+A reading is valid for at most S. For an observed series, **live staleness** is measured on the monotonic clock: a
+series is stale when more than S has passed since its last commit of a fact that is not bad quality (§2.5) and not a
+future fact still awaiting its time or an outranked fact (§4), so a forward jump of the system clock cannot make an
+observed series stale. A scheduled series is stale when `now` is later than the `t` of its live-state fact by more
+than S, or when it has no live-state fact; commits do not refresh it. A forecast series has no live staleness.
+**Event-time staleness** applies to history and to every window evaluation (§6): a series is stale at event time x
+when x > (`t` of its latest reading before x that is not bad quality) + S. Coverage stops at that point and
+time-weighted results exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the
+window. Live staleness applies only to live state and stale-for conditions.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
@@ -266,13 +266,13 @@ applies only to live state and stale-for conditions.
 | Rule | |
 |---|---|
 | Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value: `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). |
-| Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
+| Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone ("since local midnight" and "this month" end at `now`; a named or relative day or month ends at its end); a window wholly after `now` on an observed series is empty, with zero coverage; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
 | `now` | The window clock: an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
-| Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window for the newest edge, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
+| Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window when the edge lies within it, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
 | Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, credit limit, last.t + S). Time is never credited past the **credit limit**: `now` for an observed series, the window end for a scheduled or forecast series, whose values are known in advance. |
 | Old spans | If an edge's raw detail is not local, the edge is evaluated at 1-minute precision and the result is flagged `approximate_edges`. |
 | Cache | The merged middle is cached with the versions of its nodes and invalidated when any changes (late data included). |
-| Cadence | A windowed funnel is evaluated on each routed fact that is not outranked (§4) and on a timer every 1 s (configurable per funnel). |
+| Cadence | A windowed funnel is evaluated on each routed fact that is not outranked (§4) and on a timer every 1 s (configurable per funnel). A fact of a scheduled series is fed to an operator or condition only once `t ≤ now`, and a condition funnel over a scheduled series is also evaluated on the timer, so a value taking effect is seen. A condition over a forecast series needs a windowed operator; any other is rejected when funnels are compiled. |
 | Conditions | Threshold with a separate clear level, on change (optional dead-band), held for N seconds, stale for N seconds. |
 | Late data | A trigger acts on what is known when it is evaluated and never fires retroactively. |
 | Latch | Each condition funnel persists, with its consumer's cursor, the last emitted state and the position at which it was emitted. |
@@ -390,7 +390,7 @@ gap until they are re-ingested.
 | 19 | Correction changes a node's min or max | Minute recomputed from facts, ancestors from children | property |
 | 20 | DST changes | UTC levels unaffected; local days of 92–100 quarter-hours, evaluated as windows over their spans | property |
 | 21 | Site zone changed, or tzdata changes its rules | Calendar nodes rebuilt from the effective time / affected days only; logged | integration |
-| 22 | System clock jumps | Timers monotonic; window `now` never runs backwards; `commit_time` monotonic | unit |
+| 22 | System clock jumps | Timers of observed series monotonic; scheduled values take effect by `now`; window `now` never runs backwards; `commit_time` monotonic | unit |
 | 22a | Host clock not yet synchronised at boot | `unsynced_clock`; host-stamped facts wait | unit |
 | 23 | Series renamed | Alias entry; id and data unchanged | unit |
 | 24 | Unit, kind or scale changes | New series; old one retired | unit |
@@ -449,7 +449,7 @@ gap until they are re-ingested.
     index is local, whether or not the duplicate check could run.
 20. No fact of a scheduled or forecast series carries `future`, or `late` by its first clause (§2.2).
 21. A window result over a scheduled or forecast series is a function of the current view and the window's bounds
-    alone.
+    alone (tolerance §5.6; results flagged `approximate_edges` or `summary_stale` excepted).
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
