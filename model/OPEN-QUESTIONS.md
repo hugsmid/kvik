@@ -49,7 +49,8 @@ invariants 1 and 8 read with lost ranges.
 **Scenario.** (a) §8 Corrupt block says queries over a quarantined range return an error "until then", but a sealed
 log segment with no other copy is never replaced, so the error never ends; its valid batches stay unreadable. (b) A
 fact in a lost range may have superseded an earlier one, which then quietly becomes current again; current-view
-results carry no flag. (c) It is not said whether `data_lost` clears, and how.
+results carry no flag. (c) It is not said whether `data_lost` clears, and how. (d) Manifest records are single
+copies until uploaded, but neither §8 Corrupt block nor invariant 10 lists them.
 **Model.** A corrupt sealed segment with no other copy loses its whole range (`tests/rules.rs`
 `s8_corrupt_log_segment_with_no_other_copy_loses_range`).
 **Needed.** Whether valid batches of such a segment are kept and the quarantine lifted, how results over or after a
@@ -59,6 +60,8 @@ lost range are flagged, and whether the state is latched until acknowledged.
 **Scenario.** The mark is memory-mapped and not synced (§3), so after a power loss the mark on disk may lag
 acknowledged batches. If the tail above it is corrupt, recovery cannot tell it from a torn tail and truncates it: an
 acknowledged fact disappears without a report, against principle 5. A missing or unreadable mark has the same effect.
+Worse, the truncated positions are then reused, while a consumer's cursor (synced up to every second) may already
+name them: the consumer de-duplicates by position and drops the new facts silently, against invariant 2.
 **Model.** A torn tail is truncated; the case is not distinguished.
 **Options.** Report every tail truncated after a reboot (bytes, batches) as a possible loss; sync the mark on a timer
 to bound the window; or sync the mark with every commit, at the cost of a second sync per commit. This bears on the
@@ -89,11 +92,15 @@ The specification wins where the documents differ. These follow from it, for the
   range; the manifest needs a "lost range" record (bytes and positions). A missing, unreadable or half-updated mark
   is a different boot, and recovery after a reboot writes the mark; A.10's "always truncates" on a platform without
   a boot identifier yields to that rule when the mark is missing. Part B, where the lost-range record would go, is
-  not yet normative. A.11 needs golden files with corruption inside a segment. The lease file needs a format and a
+  not yet normative. A.11 needs golden files with corruption inside a segment. A.2 ("the first failure ends the
+  readable part") and A.10 (sealed segments read whole) must allow kept batches after a lost range, and A.4's "a
+  batch's first sequence follows the previous batch's last" needs a lost-range exception. A lease's boot id has no
+  value on a platform without a boot identifier. The lease file needs a format and a
   file kind in A.1: epoch, boot id and refresh counter (§7).
 - **F-6.** `api.md`: a fault during `emit` leaves the outcome unknown (§3 Write or sync failure); health reports the
   size of system clock jumps (§6) and `data_lost` per lost range (§3); readers need an explicit lease refresh, with
-  its counter (§7).
+  its counter, and `Reader::open` a source of boot identity (§7); `WindowResult.value` must allow empty (rate,
+  `min`, `max`, §6).
 
 ## Settled
 | ID | Question | Settled in |

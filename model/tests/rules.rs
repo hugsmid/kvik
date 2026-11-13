@@ -386,9 +386,10 @@ fn s6_rolling_window_in_event_time_after_clock_jump() {
 }
 
 /// §2.4: a reading recorded without a value is compared as "no value", so a
-/// NaN and then an infinity at the same `t` and quality are one fact. (That a
-/// different supplied quality is not a duplicate is a model difference: see
-/// `duplicate_check_compares_engine_assigned_quality` in `model.rs`.)
+/// NaN and then an infinity at the same `t` and quality are one fact. (By the
+/// specification a different supplied quality is not a duplicate; the model
+/// still treats it as one: see `duplicate_check_compares_engine_assigned_quality`
+/// in `model.rs`.)
 #[test]
 fn s2_4_reading_without_value_compared_as_no_value() {
     let (mut m, s) = consumer_model();
