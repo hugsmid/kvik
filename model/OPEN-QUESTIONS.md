@@ -196,7 +196,11 @@ The specification wins where the documents differ. These follow from it, for the
   versioned flag and `changed_at kind`, F-9), outside the fields a parameter change may carry (§2.1, §4, §6).
 - **F-14.** `format.md`: a series definition carries the kind `interval` with its length and phase. `api.md`: `SeriesSpec`
   gains them; a reading off its phase is refused; avg, integral, increase and time-in-state on an interval series are
-  refused; window results gain the flag `apportioned` (§2.1, §6).
+  refused, also when a name pattern later matches an interval series, and so is a calendar integral; window results
+  and buckets gain the flag `apportioned`; refusals gain an off-phase reason, counted per series; `live()` carries the
+  interval end; exports carry d or the interval end. `format.md`: the definition entry gains interval length and phase
+  (i64 nanoseconds), which a parameter change may not carry; record on change is refused for interval series; A.8's
+  `min_t` and `max_t` must allow for a reading's reach of d (§2.1, §6).
 
 ## Settled
 | ID | Question | Settled in |
