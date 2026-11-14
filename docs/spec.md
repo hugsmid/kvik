@@ -294,7 +294,7 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
 | Conditions | Threshold with a separate clear level, on change (optional dead-band), held for N seconds, stale for N seconds. |
 | Late data | A trigger acts on what is known when it is evaluated and never fires retroactively. |
 | Latch | Each condition funnel persists, with its consumer's cursor, the last emitted state and the position at which it was emitted. |
-| Restart and resume | The operator is rebuilt from the tree and recent window as of now; it is never replayed. Facts after the cursor are delivered flagged `replayed`, not fed to the operator. The funnel then sends `resync` with the condition state now; if that differs from the latch it is a transition and is acted on. A condition that became true while the consumer was down is therefore delivered, never suppressed. |
+| Restart and resume | The operator is rebuilt from the tree and recent window as of now; it is never replayed. Facts after the cursor are delivered flagged `replayed`, not fed to the operator; after a §3 Recovery rule 3 recovery this replay stops at the last kept batch, and the one `resync` that follows serves both rules. The funnel then sends `resync` with the condition state now; if that differs from the latch it is a transition and is acted on. A condition that became true while the consumer was down is therefore delivered, never suppressed. |
 | Multi-series | Conditions over several series are composed by the consumer in the first version. |
 
 ## 7. Compaction and files
@@ -437,7 +437,7 @@ gap until they are re-ingested.
 ## 10. Invariants (checked by the reference model and property tests)
 1. Sequences are strictly increasing and gap-free within a generation across restarts, except for lost ranges
    recorded in the manifest (§3); only a restore starts one.
-2. Every delivered position is durable, except in a tail truncated by §3 Recovery rule 3 (invariant 10); every durable position routed to a consumer is delivered to it, or
+2. Every delivered position is durable, except where invariant 10 allows a loss (a lost range under §3 Recovery rule 2, or a tail truncated by rule 3); every durable position routed to a consumer is delivered to it, or
    superseded by a `resync` covering it.
 3. For any consumer, fact deliveries are in position order.
 4. The current view equals "highest rank per `(series, t)`" (§2.2) over all facts in all tiers, quarantined segments
