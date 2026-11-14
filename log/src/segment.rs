@@ -242,7 +242,7 @@ impl SegmentImage {
 /// A state recovery may find an `.open` segment in (A.4, "States recovery may find").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OpenState {
-    /// Its last non-zero bytes are a valid trailer and end marker: finish the seal from step 2; never truncated.
+    /// Its last non-zero bytes are a valid trailer and end marker: sealed again from step 1 (A.4); never truncated.
     SealWritten {
         /// The length was not yet set (step 2 not done).
         length_pending: bool,

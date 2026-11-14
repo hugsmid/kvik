@@ -36,7 +36,8 @@ again; nothing after a gate starts before it is passed.
 - [x] 4.3 Arrival batches: encode, decode, round-trip property tests
 - [x] 4.4 Commit path: group commit, sync, durable mark, positions (the Windows name-durability check of `format.md`
   A.13 moved to 4.8; the 5 % low disk mark waits for a file-system size in the seam, Q-115 (e))
-- [ ] 4.5 Recovery: boot identity rule, torn tail; kill-loop harness; injected sync errors and full disk
+- [x] 4.5 Recovery: boot identity rule, torn tail; kill-loop harness; injected sync errors and full disk (points left
+  to later items in Q-116)
 - [ ] 4.6 Second-process reader and leases
 - [ ] 4.7 Differential tests: engine log against the model on generated histories
 - [ ] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/`

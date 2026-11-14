@@ -31,6 +31,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-110 | `format.md` A.2 Resynchronisation | The residual cost of resynchronising over nested batch images |
 | Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
 | Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
+| Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -412,6 +413,12 @@ sealed: its torn tail is never truncated or reported, and the next batch goes to
 **Needed.** A rule that tells a real seal from bytes inside a batch. Suggested: an `.open` file counts as
 seal-written only if `file_crc32c` verifies and the trailer's batch count and last sequence equal those of the scan;
 otherwise its trailer is part of whatever precedes it (a torn batch or a text value) and rules 1–3 apply.
+**Roadmap 4.5** keeps the question open: A.9 does not verify `file_crc32c` at open, so the suggested rule conflicts
+with the text. It relies instead on A.4's order (a segment is sealed only after the next one is in use and synced, so
+a segment being sealed is never the last in use): a seal found in the last segment in use is treated as tail bytes
+under rules 1 to 3, and only a segment that is not the last in use is sealed again from step 1
+(`log/tests/recovery.rs`, `a_forged_seal_in_the_last_segment_is_a_torn_tail`). A forged seal in a segment that is not
+the last in use is not detected.
 
 ## Q-110 — The residual cost of resynchronising over nested batch images
 Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9.
@@ -480,6 +487,32 @@ write or sync of the seal is a fault.
 **Needed.** A rule for each part; for (e), whether the seam gains the file system's size (an `api.md` change, in
 its own pull request); for (m), the error kinds that count as sharing errors on each platform. To be settled at
 gate 4.9; (k) by the item that wires the engine into the interface.
+
+## Q-116 — Recovery at a start: points `spec.md` §3 and `format.md` A.4, A.10 and A.14 leave open
+Found while building recovery (roadmap 4.5, crate `kvik-log`: `writer::recovery`, `manifest`). Each part names the
+reading implemented for now; tests in `log/tests/recovery.rs` pin it.
+**Scenario.** (a) *A corrupt manifest record.* §7 fetches it from deep or the mirror path, or rebuilds the manifest
+(roadmap 6.3); neither exists yet. (b) *F's sources.* F is above every position named by a local cursor file,
+manifest record or derived file; cursor files (5.2) and derived files (6.x, 7.x) do not exist yet. (c) *Loss
+history.* `api.md` reads loss reports "from the manifest and the recovery entries at every start"; reading every
+earlier recovery entry means reading every segment that holds one. (d) *A first start cut short.* A mark file with
+no valid slot beside an empty log is not named: a crash while the first start wrote the mark. (e) *Rule 1 and later
+segments.* "Rule 1 also zero-fills every later segment in use" does not say whether their headers, which put them in
+use, are zeroed too. (f) *The torn tail's extent.* The tail reported by a recovery entry is not said to include
+bytes in segments after the last in use, which are unused and deleted. (g) *Epochs above leases.* New manifest epochs
+continue above every epoch named by a lease file; leases are roadmap 4.6. (h) *Gaps between sealed segments.* The
+gap rule between a segment's last sequence and the next one's `base_sequence` (A.4) is not said to be checked at
+every start for segments already sealed. (i) *An empty segment in use that is not the last.* A segment taken into
+use with no batch, followed by another in use, is never sealed (an empty segment is not sealed) and is not named in
+A.4's table.
+**Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
+manifest count. (c) A start reports what it found and what the manifest holds; earlier recovery entries are read by
+the item that puts the engine behind the interface. (d) Treated as a first start: the mark is written again in place.
+(e) Their headers stay; the writer resumes in the last segment in use, after its header, whose `base_sequence` is the
+mark's last position + 1. (f) Only the last segment in use. (g) Not done. (h) Only unsealed segments are checked. (i)
+Left as it is.
+**Needed.** A rule for each part; (a) with roadmap 6.3, (b) with 5.2, (c) with the interface wiring, (g) with 4.6.
+To be settled at gate 4.9.
 
 ## Open at v0.2
 

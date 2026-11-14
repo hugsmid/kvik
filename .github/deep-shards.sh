@@ -34,6 +34,8 @@ log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
 log-model       log   model_differential
+log-writer      log   writer
+log-recovery    log   recovery
 '
 
 cd "$(dirname "$0")/.."

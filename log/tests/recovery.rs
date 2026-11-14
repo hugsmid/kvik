@@ -677,6 +677,60 @@ fn a_forged_seal_in_the_last_segment_is_a_torn_tail() {
     r.check_started();
 }
 
+#[test]
+fn a_definition_still_readable_in_the_torn_tail_raises_the_id_floor() {
+    use kvik_log::entries::{Definition, EntriesBlock, Kind, Retention, Timing, Versioning};
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.w = None;
+    let def = Definition {
+        id: 77,
+        name: "s77".into(),
+        kind: Kind::Gauge,
+        value_type: kvik_log::facts::ValueType::F64,
+        scale: None,
+        unit: "u".into(),
+        expected_interval: None,
+        staleness: None,
+        record_on_change: false,
+        counter: None,
+        lateness_bound: 1_000_000_000,
+        state_names: vec![],
+        versioning: Versioning::None,
+        timing: Timing::Observed,
+        interval: None,
+        retention: Retention::LongTerm,
+        excess_precision: None,
+        staleness_set: false,
+    };
+    let body = EntriesBlock {
+        first_sequence: 2,
+        received_at: T0,
+        entries: vec![Entry::Definition(Box::new(def))],
+    }
+    .encode()
+    .unwrap();
+    let mut block = Vec::new();
+    kvik_log::block::encode_block(kvik_log::block::block_type::ENTRIES, 0, &body, &mut block)
+        .unwrap();
+    // The block reached the disk, its commit block did not.
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let end = scan(&bytes, &id, ScanLimit::End).unwrap().batches[0].end();
+    r.fs.poke(&seg, end as usize, &block);
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    assert_eq!(rep.entry.unwrap().entry.id_floor, 77);
+    assert_eq!(r.w().stats().max_series_id, 77);
+    r.check_started();
+}
+
 #[derive(Clone, Debug)]
 enum Crash {
     /// The process is killed (same boot).

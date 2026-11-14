@@ -3,7 +3,7 @@
 //! decides by the mark and the boot identity what is kept, truncates, records losses in the manifest, writes or
 //! adopts a recovery entry, writes the mark, and hands the writer the state it resumes from.
 //!
-//! Decisions are made from what was read before anything is written ([`plan`]); [`start`] then performs them in the
+//! Decisions are made from what was read before anything is written (`plan`); `start` then performs them in the
 //! order of a start. A failed sync at any step leaves the writer read-only and writes nothing more.
 
 use std::collections::{BTreeMap, HashMap};
@@ -153,6 +153,8 @@ struct Seg {
     batches: Vec<B>,
     /// Readable commit blocks in a torn tail: (offset, commit time).
     tail_commits: Vec<(u64, i64)>,
+    /// Series ids defined by entries blocks still readable in a torn tail (`spec.md` §2.1, id floor).
+    tail_ids: Vec<u32>,
     last_nonzero: u64,
 }
 
@@ -219,6 +221,22 @@ fn scan_segment(store: &StoreDir, name: SegmentName, path: PathBuf) -> Result<Se
             .collect(),
         _ => Vec::new(),
     };
+    // Definitions still readable in the torn tail: the valid entries blocks from its start.
+    let mut tail_ids = Vec::new();
+    if let Some(Tail::Torn { start, .. }) = &r.tail {
+        let mut at = *start;
+        while let Ok(b) = crate::block::read_block(&bytes, at, bytes.len() as u64) {
+            if b.header.block_type == crate::block::block_type::ENTRIES
+                && let Ok(e) = crate::entries::EntriesBlock::decode(b.body)
+            {
+                tail_ids.extend(e.entries.iter().filter_map(|x| match x {
+                    Entry::Definition(d) => Some(d.id),
+                    _ => None,
+                }));
+            }
+            at = b.next_offset();
+        }
+    }
     let header = match r.header {
         HeaderState::Valid(h) => Some(h),
         HeaderState::Invalid => None,
@@ -231,6 +249,7 @@ fn scan_segment(store: &StoreDir, name: SegmentName, path: PathBuf) -> Result<Se
         header,
         batches,
         tail_commits,
+        tail_ids,
         last_nonzero,
     })
 }
@@ -798,6 +817,11 @@ pub(super) fn start(
         _ => 0,
     };
     let mut intervals = HashMap::new();
+    if matches!(p.rule, StartRule::Reboot(_)) {
+        for s in &segs {
+            id_floor = s.tail_ids.iter().copied().fold(id_floor, u32::max);
+        }
+    }
     for &i in &in_use_idx {
         for b in segs[i].batches.iter().take(p.kept[i]) {
             for item in &b.content.items {

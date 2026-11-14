@@ -16,13 +16,17 @@ durable mark's slots and segment file names.
 - `writer` is the commit path (`spec.md` §3): group commit bounded by `min_sync_interval`, one sync per batch, the
   durable mark with its timed and forced syncs, positions, segments created ahead of use, rolled and sealed, and a
   read-only store after any write or sync failure. A synchronous core makes every decision from explicit times;
-  `Log` runs it on the `kvik-writer` and `kvik-maint` threads. Opening a log that already holds data is recovery
-  (roadmap 4.5).
+  `Log` runs it on the `kvik-writer` and `kvik-maint` threads.
+- `writer::recovery` is the start (`spec.md` §3 Recovery, Order of a start): rule 1 truncation after the mark on the
+  same boot, rule 2 losses recorded in the manifest, rule 3 recovery entries (written or adopted), the last batch
+  written again when its sync may have failed, segments sealed again, and the mark. `manifest` reads and appends the
+  records a start needs (A.14).
 - `fs` is the file-system seam every file operation goes through (A.13), with an in-memory implementation for tests
   that injects faults, logs operations and keeps a durable image of each file.
 
 Tests: unit tests, behaviour tests (`tests/segment.rs`), batch codec tests (`tests/batches.rs`), a differential test
 against the reference model (`tests/model_differential.rs`), golden files (`tests/golden/`, see its README), property
 tests (`tests/properties.rs`), the commit path driven deterministically (`tests/writer.rs`) and on its threads, with a
-smoke test on the real file system (`tests/threads.rs`) and the fuzz entry point run over generated inputs (`tests/fuzz_inputs.rs`). The
+smoke test on the real file system (`tests/threads.rs`), recovery and a kill loop (`tests/recovery.rs`, with a long
+variant run by `--ignored`) and the fuzz entry point run over generated inputs (`tests/fuzz_inputs.rs`). The
 fuzz targets are in [`fuzz/`](fuzz/).
