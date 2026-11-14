@@ -199,6 +199,10 @@ pub struct ParameterChange {
     pub retention_class: Option<u8>,
     /// 24: retention period; takes effect at the entry's position.
     pub retention_period: Option<i64>,
+    /// 25 and 26: the excess-precision policy of a decimal series; takes effect at the entry's position
+    /// (`spec.md` §2.1). Field 26 is checked against 0 to 18 here; that it is at least the scale in force needs the
+    /// registry.
+    pub excess_precision: Option<ExcessPrecision>,
 }
 
 /// Mark state in a recovery entry (field 45).
@@ -424,6 +428,15 @@ fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
             if let Some(v) = p.retention_period {
                 f.i64(24, v);
             }
+            match p.excess_precision {
+                None => {}
+                Some(ExcessPrecision::Round) => f.u8(25, 0),
+                Some(ExcessPrecision::Refuse) => f.u8(25, 1),
+                Some(ExcessPrecision::AutoRaise { max_scale }) => {
+                    f.u8(25, 2);
+                    f.u8(26, max_scale);
+                }
+            }
             if let Some((_, set)) = p.staleness {
                 f.u8(27, u8::from(set));
             }
@@ -532,10 +545,10 @@ fn allowed(t: u8, id: u16) -> Allowed {
     let ok = match t {
         entry_type::DEFINITION => matches!(id, 1..=19 | 22..=27),
         entry_type::PARAMETER_CHANGE => {
-            if matches!(id, 2..=6 | 13..=19 | 22 | 25 | 26) {
+            if matches!(id, 2..=6 | 13..=19 | 22) {
                 return Forbidden;
             }
-            matches!(id, 1 | 7..=12 | 20 | 23 | 24 | 27)
+            matches!(id, 1 | 7..=12 | 20 | 23..=27)
         }
         entry_type::ALIAS => matches!(id, 1 | 2),
         entry_type::RETIREMENT => matches!(id, 1 | 21),
@@ -971,6 +984,16 @@ fn parameter_change(p: &Parsed<'_>) -> Result<ParameterChange, BodyError> {
         lateness_bound: opt(12).map(|_| p.i64(12)).transpose()?,
         retention_class: opt(23).map(|_| p.u8_in(23, 1)).transpose()?,
         retention_period: opt(24).map(|_| p.i64(24)).transpose()?,
+        excess_precision: match opt(25) {
+            None => p.none(26).map(|_| None)?,
+            Some(_) => Some(match p.u8_in(25, 2)? {
+                0 => p.none(26).map(|_| ExcessPrecision::Round)?,
+                1 => p.none(26).map(|_| ExcessPrecision::Refuse)?,
+                _ => ExcessPrecision::AutoRaise {
+                    max_scale: p.u8_in(26, MAX_SCALE)?,
+                },
+            }),
+        },
     };
     let timed = [7, 8, 9, 10, 11, 12].iter().any(|&id| opt(id).is_some());
     if timed != change.effective.is_some() {

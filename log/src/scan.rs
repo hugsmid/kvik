@@ -456,7 +456,12 @@ fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, Format
 /// long for a batch ends the chain. A candidate `o` goes further only when that commit's `batch_bytes` is the
 /// distance from `o`; then its framing and `batch_crc32c` are checked on headers ([`framing_holds`]); only a
 /// candidate that passes, a batch image for this store, file and offset, is read and checksummed in full (at most
-/// 8 MiB). So block reads and bytes hashed grow linearly with the region, plus 8 MiB per such batch image.
+/// 8 MiB). So block reads grow linearly with the region, and bytes hashed linearly plus the length of each such
+/// batch image. Passing candidates can be as dense as one per 80 bytes (a 16-byte block header whose batch image
+/// nests inside the previous one, each closed by its own 64-byte commit block), so within one 8 MiB window the
+/// bytes hashed can grow with the square of the number of images. Building such images needs the store id, the file
+/// id and the offsets, so only a writer of the file can; the residual cost is an open question (`model/
+/// OPEN-QUESTIONS.md`, Q-110) and is pinned by `nested_batch_images_hash_each_image_once`.
 fn resync<'a>(
     bytes: &'a [u8],
     id: &SegmentIdentity,
@@ -695,6 +700,69 @@ mod tests {
             assert!(
                 hashed <= bound,
                 "{hashed} bytes hashed for {headers_len} bytes of headers"
+            );
+        }
+    }
+
+    /// `n` nested batch images that each pass the header checks: image `i` is one skippable block header at
+    /// `base + 16 i` whose body (with a wrong checksum) runs to its own commit block, the commits laid out in reverse
+    /// after the last header, so every image passes [`framing_holds`] and is read in full.
+    fn nested(n: u64) -> (Vec<u8>, SegmentIdentity) {
+        let id = SegmentIdentity {
+            store_id: [7; 16],
+            file_id: 3,
+            generation: 1,
+        };
+        let base = HEADER_LEN as u64 + 8;
+        let e = base + 16 * n;
+        let mut f = vec![0u8; (e + 64 * n) as usize];
+        f[HEADER_LEN..HEADER_LEN + 8].fill(0xFF);
+        for i in 0..n {
+            let o = base + 16 * i;
+            let ci = e + 64 * (n - 1 - i);
+            let h = crate::block::BlockHeader {
+                block_type: 0x90,
+                flags: FLAG_SKIPPABLE,
+                body_len: (ci - o - 16) as u32,
+                body_crc32c: 0xDEAD_BEEF,
+            }
+            .encode();
+            f[o as usize..o as usize + 16].copy_from_slice(&h);
+            let mut d = Vec::new();
+            d.extend_from_slice(&id.store_id);
+            d.extend_from_slice(&id.file_id.to_le_bytes());
+            d.extend_from_slice(&o.to_le_bytes());
+            d.extend_from_slice(&h);
+            let commit = Commit {
+                generation: id.generation,
+                block_count: 1,
+                first_sequence: 1,
+                last_sequence: 1,
+                commit_time: 0,
+                batch_bytes: ci - o,
+                batch_crc32c: crc32c(&d),
+            };
+            let mut out = Vec::new();
+            encode_block(block_type::COMMIT, 0, &commit.encode(), &mut out).unwrap();
+            f[ci as usize..ci as usize + 64].copy_from_slice(&out);
+        }
+        (f, id)
+    }
+
+    #[test]
+    fn nested_batch_images_hash_each_image_once() {
+        // The residual cost of resynchronisation (Q-110): each passing image is checksummed in full once, so the
+        // bytes hashed grow with the sum of the images' lengths, about 40 n² for n nested images, and no more.
+        for n in [250u64, 500, 1_000] {
+            let (bytes, id) = nested(n);
+            crate::crc::BYTES_HASHED.with(|c| c.set(0));
+            let r = scan(&bytes, &id, ScanLimit::End).unwrap();
+            let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
+            assert!(r.batches.is_empty());
+            let images: u64 = (0..n).map(|i| 80 * (n - i)).sum();
+            assert!(
+                hashed <= images + 64 * bytes.len() as u64,
+                "{hashed} bytes hashed for {n} nested images ({images} bytes of images)"
             );
         }
     }

@@ -23,7 +23,8 @@ use support::*;
 fn value() -> impl Strategy<Value = Value> {
     prop_oneof![
         any::<u64>().prop_map(Value::F64),
-        (any::<i64>(), 0u8..=18).prop_map(|(units, scale)| Value::Decimal { units, scale }),
+        ((i64::MIN + 1)..=i64::MAX, 0u8..=18)
+            .prop_map(|(units, scale)| Value::Decimal { units, scale }),
         any::<u16>().prop_map(Value::State),
         any::<bool>().prop_map(Value::Bool),
         prop_oneof![".{0,40}", "[a-z]{0,3}"].prop_map(|s: String| Value::Text(truncate(s, 255))),
@@ -205,10 +206,18 @@ fn parameter_change() -> impl Strategy<Value = ParameterChange> {
             prop::option::of(any::<u32>()),
             prop::option::of(any::<i64>()),
         ),
-        (prop::option::of(0u8..=1), prop::option::of(any::<i64>())),
+        (
+            prop::option::of(0u8..=1),
+            prop::option::of(any::<i64>()),
+            prop::option::of(prop_oneof![
+                Just(ExcessPrecision::Round),
+                Just(ExcessPrecision::Refuse),
+                (0u8..=18).prop_map(|max_scale| ExcessPrecision::AutoRaise { max_scale }),
+            ]),
+        ),
     )
         .prop_map(
-            |(id, eff, ei, s, (roc, wrap, ppm, late), (class, period))| {
+            |(id, eff, ei, s, (roc, wrap, ppm, late), (class, period, excess))| {
                 // Field 7 is carried only with field 8.
                 let staleness = if ei.is_some() && s.is_none() {
                     Some((None, false))
@@ -226,6 +235,7 @@ fn parameter_change() -> impl Strategy<Value = ParameterChange> {
                     lateness_bound: late,
                     retention_class: class,
                     retention_period: period,
+                    excess_precision: excess,
                 };
                 let timed = p.expected_interval.is_some()
                     || p.staleness.is_some()
@@ -682,6 +692,19 @@ fn facts_checks() {
         })
         .is_ok()
     );
+    // A decimal row holding `i64::MIN` is out of range (`spec.md` §2.1); `i64::MIN + 1` is not.
+    for (units, ok) in [(i64::MIN, false), (i64::MIN + 1, true), (i64::MAX, true)] {
+        let r = with(1, |c| {
+            set(c, 5, 0, vec![2]);
+            set(c, 6, 0, units.to_le_bytes().to_vec());
+            insert(c, 9, 0, vec![4])
+        });
+        if ok {
+            assert!(r.is_ok(), "{units}");
+        } else {
+            assert_eq!(r, invalid(E::Value { column: 6, row: 0 }));
+        }
+    }
     // Payloads outside the body, over the directory, or overlapping.
     let mut b = facts_raw(2, &plain_columns(2));
     b[24 + 4..24 + 8].copy_from_slice(&10_000u32.to_le_bytes());
@@ -784,6 +807,17 @@ fn facts_encode_refuses_what_it_cannot_write() {
         .encode(),
         Err(EncodeError::Content(ContentError::Value {
             column: 9,
+            row: 0
+        }))
+    );
+    assert_eq!(
+        block(vec![row(Value::Decimal {
+            units: i64::MIN,
+            scale: 4
+        })])
+        .encode(),
+        Err(EncodeError::Content(ContentError::Value {
+            column: 6,
             row: 0
         }))
     );
@@ -1151,7 +1185,30 @@ fn other_entry_types() {
         decode_one(2, vec![(1, u32b(1)), (20, i64b(T0)), (23, vec![0])]),
         presence(20)
     );
-    for id in [2u16, 5, 13, 14, 19, 22, 25, 26] {
+    // Fields 25 and 26 take effect at the entry's position (`format.md` A.6, Q-100), with no field 20.
+    assert!(decode_one(2, vec![(1, u32b(1)), (25, vec![2]), (26, vec![6])]).is_ok());
+    assert!(decode_one(2, vec![(1, u32b(1)), (25, vec![0])]).is_ok());
+    assert_eq!(
+        decode_one(2, vec![(1, u32b(1)), (25, vec![2])]),
+        presence(26)
+    );
+    assert_eq!(
+        decode_one(2, vec![(1, u32b(1)), (25, vec![1]), (26, vec![6])]),
+        presence(26)
+    );
+    assert_eq!(
+        decode_one(2, vec![(1, u32b(1)), (26, vec![6])]),
+        presence(26)
+    );
+    assert_eq!(
+        decode_one(2, vec![(1, u32b(1)), (25, vec![2]), (26, vec![19])]),
+        field_err(26)
+    );
+    assert_eq!(
+        decode_one(2, vec![(1, u32b(1)), (20, i64b(T0)), (25, vec![0])]),
+        presence(20)
+    );
+    for id in [2u16, 5, 13, 14, 19, 22] {
         assert_eq!(
             decode_one(2, replace(base.clone(), id, vec![1])),
             Err(BodyError::Invalid(E::FieldNotAllowed {

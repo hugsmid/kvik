@@ -27,7 +27,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
 | Q-108 | §8 Generations, §7 Manifest, §8 Restore step 1 | A restore from a rebuilt manifest only partly uploaded |
-| Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
+| Q-109 | `format.md` A.4 (states recovery may find), A.9 | A forged seal in an `.open` file |
+| Q-110 | `format.md` A.2 Resynchronisation | The residual cost of resynchronising over nested batch images |
+| Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -398,39 +400,39 @@ its closing record is in the bucket (records are uploaded in order, so it is the
 reads the records before its rebuild record, as if the rebuild had not happened, and the uploaded part of the
 rebuilt manifest is not read. To be settled with roadmap 8.3 (restore).
 
-## Q-106 — Decoding batch bodies: points `format.md` A.5 and A.6 leave open
-Found while building the batch codecs (roadmap 4.3, crate `kvik-log`: `facts`, `entries`, `content`). Each part names
-the reading implemented for now; tests in `log/tests/batches.rs` pin it.
-**Scenario.** (a) *Canonical form against the checks.* The common rules require a v1 writer to produce one byte
-sequence for given content, and list the checks a reader applies; they do not say whether a block that passes every
-check but is not canonical (run-length where plain is not larger, an optional column holding only defaults, non-zero
-padding or reserved bytes, bytes after the last payload or entry, readings split over more blocks than A.4 allows) is
-invalid. (b) *The text heap.* Canonical writing names field order, run-length form and block splitting, not the heap
-layout: whether texts are in row order, whether equal texts may share bytes, and where a zero-length text points. (c)
-*"Smaller than plain".* Whether the run-length choice compares payload lengths before or after padding to 8, and
-which wins a tie. (d) *Field presence.* The definition table's "Present" column, field 27 with field 8, field 20 in a
-parameter change and the recovery entry's fields say when a field is carried, but A.6's checks list only overruns,
-order, repetition and ranges; a definition without a name, or with a scale on an `f64` series, is not named as
-invalid. Whether a named-state series may declare no state names, and whether kind and value type must agree (a gauge
-of text), is not said. (e) *Entries block splitting.* A.4 states how readings fill facts blocks, not how entries fill
-entries blocks. (f) *Reserved ids.* Entry type 5 is reserved until roadmap 5.2 and field 41 of a recovery entry is
-reserved; what a reader does on meeting either is not said. (g) *Parameter change.* Whether fields 25 and 26 may be
-carried is open (Q-100); no range is given for fields 11, 12, 24 and 20 or for `wrap_at`; whether a change carrying
-only field 1 is valid is not said. (h) *The recovery entry alone.* "The only entry of its batch" is not among the
-checks, so a batch that breaks it is not named invalid.
-**Implemented.** (a) The reader applies the listed checks only, so a valid but non-canonical block is read;
-`decode_canonical` (facts, entries and whole batches) also requires the canonical bytes, for writer output, golden
-files and a later scrub. (b) Texts in row order, each appended to the heap, none shared; a zero-length text points at
-the heap's length at that row; a no-value text row holds 0. The reader accepts any offsets inside the heap. (c)
-Unpadded payload lengths; plain wins a tie. (d) Presence is checked: a missing applicable field or a present
-non-applicable one is invalid content (`ContentError::FieldPresence`); a named-state series needs at least one name;
-kind and value type are not compared. (e) Consecutive entries share one entries block until the next would take its
-body past 16 MiB, which no batch of at most 8 MiB reaches. (f) Entry type 5 is refused as an unknown critical type
-(`UnsupportedFormat`); field 41 is skipped. (g) Fields 25 and 26 in a parameter change are invalid content ("no other
-field is allowed"); fields without a stated range take any value; a change with only field 1 is accepted. (h) The
-reader treats it as invalid content, and the encoder refuses it.
-**Needed.** A rule for each part; for (a), whether non-canonical blocks are invalid content for a reader. To be
-settled at gate 4.9; (g) with roadmap 5.1 (Q-100), (f) with 5.2.
+## Q-109 — A forged seal in an `.open` file
+Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled by roadmap item 4.5.
+**Scenario.** `format.md` A.4 classes an `.open` file whose last non-zero bytes are a valid trailer and end marker as
+seal-written, and seals it again (since Q-87) without truncating anything. A text value of 96 bytes holds exactly a
+segment index block, a trailer block and an end marker; when it is the last thing written to the open segment before
+a crash, the file's last non-zero bytes are that forged seal. Recovery then classes the last segment in use as
+sealed: its torn tail is never truncated or reported, and the next batch goes to a new segment.
+**Implemented.** The reader classes the file by its last bytes, as written.
+**Needed.** A rule that tells a real seal from bytes inside a batch. Suggested: an `.open` file counts as
+seal-written only if `file_crc32c` verifies and the trailer's batch count and last sequence equal those of the scan;
+otherwise its trailer is part of whatever precedes it (a torn batch or a text value) and rules 1–3 apply.
+
+## Q-110 — The residual cost of resynchronising over nested batch images
+Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9.
+**Scenario.** Resynchronisation (`format.md` A.2) judges candidates on block headers and reads in full only a
+candidate whose framing and `batch_crc32c` hold. Such candidates can be as dense as one per 80 bytes: a 16-byte
+block header whose image nests inside the previous one, each closed by its own 64-byte commit block, all with valid
+`batch_crc32c`. Each is checksummed in full, so within one 8 MiB window the bytes hashed grow with the square of the
+number of images (about 40 n² bytes for n images; `log/src/scan.rs` `nested_batch_images_hash_each_image_once`).
+Building them needs the store id, the file id and the offsets, so only a process that can write the file can.
+**Implemented.** Each passing candidate is checksummed once; the cost is pinned by the test above.
+**Needed.** Whether the cost is accepted (write access is needed to cause it), or bounded, for example by a
+prefix-CRC table over the window so that each candidate's body checksum costs O(1) after one linear pass.
+
+## Q-111 — A full facts block against the batch limit
+Found at the review of roadmap 4.3 (crate `kvik-log`). To be settled at gate 4.9.
+**Scenario.** `format.md` A.4 closes a facts block at a plain-encoded size of 8 MiB and lets one call be up to 8 MiB
+plain-encoded, "so every batch fits an empty segment"; the common rules limit a batch to 8 MiB of data blocks plus its
+commit block. A call that fills one facts block to 8 MiB of plain-encoded rows becomes a block whose body adds the
+24-byte prefix and the column directory, and whose header adds 16 bytes: its data blocks exceed 8 MiB, so the batch
+is over the limit although the call is within its own.
+**Needed.** One of: measure the batch limit in plain-encoded size, as the call and block limits are; or allow a batch
+8 MiB plus the per-block overhead (prefix, directory, header and padding of each data block).
 
 ## Open at v0.2
 
@@ -440,7 +442,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87, Q-100 to Q-104 and Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 was recorded then.
+Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -464,7 +466,9 @@ Q-87 was reopened there. Q-87, Q-100 to Q-104 and Q-107 were settled after gate 
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
-| Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
+| Q-109 | 4.5 | Recovery; recorded at the review of roadmap 4.2 |
+| Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2 |
+| Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
@@ -665,6 +669,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (the wait and acknowledgement: Q-107, settled)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 ((g) the `file_id` floor) and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
 | Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
 | Q-105 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name | `format.md` A.2 ((a) sixteen zero bytes at a block boundary are end of data only if every byte to the reader's limit is zero, else they start an invalid region), A.7 ((b) `block_count`, `batch_bytes` and `batch_crc32c` cover every block before the commit block; a skipped block takes no sequence and carries no `received_at`; a batch of skipped blocks alone is not complete; every block before the seal blocks belongs to a batch; (d) the first batch starts at or above `base_sequence`, higher only after an invalid region or with a recovery entry, checked by recovery at roadmap 4.5), common rules ((c) a version refusal only from a valid position or in an otherwise complete batch at a resynchronisation candidate; any other block image is not a block), A.12 ((e) a header disagreeing with its name is refused, never scanned or deleted). As implemented in `kvik-log`; `log/tests/segment.rs` pins each part |
+| Q-106 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, the parameter change, the recovery entry alone | `format.md` common rules ((a) a reader applies only the listed checks; a canonical check also requires the canonical bytes), A.5 ((b) canonical heap in row order, none shared, a reader accepting any offsets inside the heap, shared bytes included; (c) unpadded payload lengths, plain wins a tie), A.6 ((d) presence checked as invalid content, a named-state series needs a name, kind and value type not compared; (e) entries share a block up to 16 MiB; (f) entry type 5 refused until roadmap 5.2, field 41 skipped; (g) fields 25 and 26 allowed in a parameter change since Q-100, fields without a range take any value, a change with only field 1 valid; (h) a recovery entry not alone in its batch is invalid content), A.11 (nothing allocated from a declared count or length before it is checked; output bounded by the row and entry limits). As implemented in `kvik-log`, with (g) changed for Q-100; `log/tests/batches.rs` pins each part |
 | Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
 
 ## Where the model differs from the specification

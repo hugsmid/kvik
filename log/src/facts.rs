@@ -295,6 +295,10 @@ impl FactsBlock {
                     if *scale > MAX_SCALE {
                         return Err(bad(column::SCALE));
                     }
+                    // Units are limited to ±(2^63 − 1) (`spec.md` §2.1, `format.md` A.5).
+                    if *units == i64::MIN {
+                        return Err(bad(column::VALUE));
+                    }
                     *units as u64
                 }
                 Value::State(s) => u64::from(*s),
@@ -603,6 +607,14 @@ fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
         } else {
             match vt {
                 ValueType::F64 => Value::F64(raw),
+                // Units are limited to ±(2^63 − 1) (`spec.md` §2.1, `format.md` A.5).
+                ValueType::Decimal if raw as i64 == i64::MIN => {
+                    return Err(E::Value {
+                        column: column::VALUE,
+                        row,
+                    }
+                    .into());
+                }
                 ValueType::Decimal => Value::Decimal {
                     units: raw as i64,
                     scale,

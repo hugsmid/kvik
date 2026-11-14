@@ -21,8 +21,11 @@ writes it.
 - **Reserved and padding.** Writers write zero. Readers do not test reserved fields or padding, so a later minor
   version may use them. Padding between blocks is covered only by a sealed file's `file_crc32c` (A.9).
 - **Canonical writing.** For given content a v1 writer produces one byte sequence (field order, run-length form,
-  block splitting, all stated below); decoding and encoding again any writer output gives identical bytes. Golden
-  files rely on it.
+  block splitting, heap layout, all stated below); decoding and encoding again any writer output gives identical
+  bytes. Golden files rely on it. A reader applies only the listed checks, so a block that passes them but is not
+  canonical (run-length where plain is not larger, an optional column of defaults only, non-zero padding or reserved
+  bytes, bytes after the last payload or entry, readings split over more blocks than A.4 allows) is read; a
+  canonical check, for writer output, golden files and a scrub, also requires the canonical bytes.
 - **Critical and ignorable elements.** Every extension point says whether an unknown element may be ignored: a block
   type by its `skippable` flag (A.2); a column id `< 0x80` is critical, `≥ 0x80` ignorable; an entry type `< 0x80`
   critical, `≥ 0x80` ignorable; a field id `< 0x8000` critical, `≥ 0x8000` ignorable; a fact flag bit not defined in
@@ -30,8 +33,8 @@ writes it.
   takes a critical id; `changed_at`, versioning, timing and every v1 id are critical.
 - **An unknown critical element in a checksum-valid block reached from a valid position, or in a batch that is
   otherwise complete at a resynchronisation candidate (A.2),** is a version refusal (`UnsupportedFormat`, naming the
-  file, the offset and the element); a block image at any other candidate is not a block. It is never an invalid region, a torn tail or a lost range, and recovery never
-  truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
+  file, the offset and the element); a block image at any other candidate is not a block. It is never an invalid
+  region, a torn tail or a lost range, and recovery never truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
 
@@ -203,7 +206,9 @@ and ignorable rule.
 - `value` holds the IEEE-754 bit pattern (f64), the two's-complement integer (i64; never `i64::MIN`, which is out of
   range, `spec.md` §2.1), the index or 0/1 in the low
   bytes with zero upper bytes (state, bool), or for text a `u32` offset and a `u32` length relative to the start of
-  the heap payload (at most 255 bytes, UTF-8).
+  the heap payload (at most 255 bytes, UTF-8). Canonically, texts are in row order, each appended to the heap and
+  none shared; a zero-length text points at the heap's length at its row, and a `no_value` text row holds 0. A
+  reader accepts any offset and length inside the heap, shared bytes included.
 - `quality` holds the **adapter-supplied** quality, also on a `no_value` row. The engine's quality is derived, never
   stored: bad for a `no_value` row, else the worse of the supplied quality and suspect when `future` is set.
 - A `no_value` row has `value = 0` and the series' declared `value_type`.
@@ -222,8 +227,8 @@ and ignorable rule.
 - **Encoding 0, plain:** `row_count` fixed-width values.
 - **Encoding 1, run-length:** repeated pairs of a run length and one fixed-width value. A run length is at least 1,
   written as minimal unsigned LEB128 of at most 3 bytes; adjacent runs differ in value; the run lengths sum to
-  `row_count`. A reader rejects anything else. A writer uses run-length for a column exactly when it is smaller than
-  plain.
+  `row_count`. A reader rejects anything else. A writer uses run-length for a column exactly when its unpadded payload
+  is smaller than plain's; plain wins a tie.
 - `value_type` and `scale` let a block be decoded to typed values without the registry (bit pattern, decimal,
   state index, bool, text). State names, kind, versioning and interval length come from definition entries,
   which a reader takes from the registry file and the log.
@@ -285,8 +290,15 @@ Series definition fields, all critical:
 | 26 | maximum scale | u8, 0–18, at least field 5 | field 25 = 2 |
 | 27 | staleness limit set | u8: 1 S was set by the caller, 0 S follows the expected interval | always; also in a parameter change carrying 8 |
 
-**Checks** (a failure makes the block invalid, A.2): `length` or a field overrunning its container; a critical
-field out of order or repeated when not marked repeated; a value outside its range above.
+**Checks** (a failure makes the block invalid, A.2; the presence and recovery checks are invalid content): `length`
+or a field overrunning its container; a critical field out of order or repeated when not marked repeated; a value
+outside its range above; a field missing where the tables say it is present (the "Present" column, field 27 with
+field 8, field 20 in a parameter change, the recovery entry's fields), or present where it does not apply; a
+named-state series with no state name; a recovery entry that is not the only entry of its batch. Kind and value type
+are not compared beyond the tables. Fields without a stated range take any value, and a parameter change carrying
+only field 1 is valid. Entry type 5 is refused as an unknown critical type until roadmap 5.2 lays it out; field 41
+of a recovery entry is reserved, never written and skipped by a reader. **Splitting:** consecutive entries share one
+entries block until the next would take its body past 16 MiB.
 
 ### A.7 Commit block body (48 bytes)
 | Offset | Size | Field | Notes |
@@ -402,7 +414,8 @@ exists; a new file is created only when none exists.
   acknowledged batches after a power loss; a block with an unknown ignorable and an unknown critical element; the
   store descriptor; a manifest with a torn tail and one with a corrupt middle record.
 - A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor and lease decoders
-  included: no input may cause a panic, an out-of-bounds read or an allocation larger than the declared `body_len`.
+  included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
+  length before it is checked against the body, and decoded output is bounded by the row and entry limits.
 - Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
   batches before it.
 
