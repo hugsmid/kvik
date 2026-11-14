@@ -10,7 +10,7 @@ again; nothing after a gate starts before it is passed.
 - [x] 1.3 Model: delivery — latch, resync, catch-up after overflow, run-time routes, timer deliveries
 - [x] 1.4 Model: files — atomic manifest records, reader leases, tiers and eviction, duplicate rule with revise, versioned series
 - [x] 1.5 Model: data rules — lateness, non-finite values, retirement time, record-on-change keep-alive, density rule, counters, rate
-- [ ] 1.6 Model: calendar results as window evaluations; time-zone edge cases in several zones
+- [x] 1.6 Model: calendar results as window evaluations; time-zone edge cases in several zones
 - [ ] 1.7 Every invariant has a property test and every edge-case row has a test; coverage table in `model/README.md`
 - [ ] 1.8 **Gate** — open questions settled and the specification tagged v0.2
 

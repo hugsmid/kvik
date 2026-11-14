@@ -29,6 +29,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
 | Q-73 | §2.6, §2.1 `record on change`, row 17a, §1.5 | Who leaves out the unchanged readings of a record-on-change series |
 | Q-74 | §2.2 `late`, §4 Future facts, row 4 | One reading far ahead makes later on-time readings `late` |
+| Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset, and the zone before the first entry |
+| Q-76 | §5.7, row 21, invariant 8 | Whether a tzdata change is in the log, and calendar results while its rebuild is pending |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -496,6 +498,49 @@ does not lower the latest recorded `t`, as for Q-44 (c).
 **Proposal.** Compare with the greatest `t` among recorded facts of the series that were not flagged `future`
 (a function of the log, so rebuild keeps it); a `future` reading neither raises it nor is judged by it.
 
+## Q-75 — Local days around a site-zone change to another offset
+**Scenario.** (a) The site zone is Asia/Tokyo (+09) and an entry moves it to America/New_York (−04 in June) effective
+2026-06-01T00:00Z. §5.7 says "each local day uses the zone in force at its start". 1 June starts at
+2026-05-31T15:00Z in Tokyo, when Tokyo is in force, and at 2026-06-01T04:00Z in New York, when New York is in force:
+both fit. 31 May (Tokyo) ends at 15:00Z and 1 June (New York) starts at 04:00Z if New York is taken, so 13 hours lie
+in no local day and no month; if Tokyo is taken, 1 June is followed by a second 1 June. The other way round (New York
+to Tokyo at the same instant), 1 June starts at 04:00Z in New York, when Tokyo is in force, and at 05-31T15:00Z in
+Tokyo, when New York is in force: no zone fits, while 2 June (Tokyo, from 06-01T15:00Z) overlaps 1 June (New York, to
+06-02T04:00Z) by 13 hours. Two entries less than a day apart, or with the same effective time, have the same problem,
+and so has "today" for a calendar window when `now` falls in such a gap or overlap. A month spanning the change does
+not tile with its days. (b) The zone in force before the first entry is not said: `api.md` makes `time_zone`
+required at open, and opening with another one would re-take every past day, against D3.
+**Model.** `calendar::Zoning::Site`: a local day is taken in the latest entry's zone under which it starts at or
+after that entry's effective time, else in the configured zone (so in (a) New York for the first case, New York for
+1 June and Tokyo from 2 June in the second); of two entries with the same effective time the later in the log; "today"
+is the latest date whose day starts at or before `now`; a month's result is the window from its first day's start to
+its last day's end; a month node is stored only where its days are contiguous, and a day node that overlaps an
+earlier input is not taken. (b) `Config::site_zone` is in force before the first entry, and a restart with another
+value re-takes those days (`q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap`).
+**Needed.** Which zone a local day takes when its start fits two zones or none, where the hours between the last day
+of the old zone and the first of the new one go, and what is in force before the first entry.
+**Proposal.** A site-zone entry takes effect at a local midnight of its new zone (refused otherwise). The local day in
+progress at the effective time ends there; the new zone starts with its first date whose midnight is at the
+effective time, and a date already begun in the old zone is not taken again. Days then tile, so months do. The zone
+given at open is written as an entry effective at the beginning of time when the store is created, and a later open
+with another zone is refused (a change is an entry).
+
+## Q-76 — Whether a tzdata change is in the log, and calendar results while it is rebuilt
+**Scenario.** (a) §5.7 says a tzdata change "rebuilds the affected days and is logged", and row 21 says "logged". If
+that means a log entry, invariant 8 holds; if it means a message, the calendar nodes depend on the host's tzdata,
+which the log does not hold: a rebuild from the log after an upgrade, or a restore onto a host with another version,
+builds other nodes than the live ones, and the record of which days changed is lost. (b) Between the change and the
+end of the rebuild, §5.7 makes a stored node an input to a named-zone query only when its version is current, but does
+not say so for a site-zone query, whose stored node for a day may then cover the day's old span.
+**Model.** The engine logs the rebuild (`Model::calendar_log`), with no log entry. A changed database is installed
+(`Model::install_tzdb`) and the files keep their version until `Model::rebuild_calendars`, which changes only the
+days and months whose nodes differ and logs them; until then no stored node of the old version is an input, to a
+named-zone or a site-zone query alike, and a build from the log uses the version the live files have. A restart builds
+with the host's version and logs nothing (`q76_tzdata_change_is_not_in_the_log`, `tests/edge_cases.rs`
+`row_21_tzdata_change_rebuilds_the_affected_days`).
+**Needed.** Whether a tzdata change is a log entry, what invariant 8 says while a rebuild is pending, and whether the
+version condition applies to site-zone queries.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -570,6 +615,10 @@ The specification wins where the documents differ. These follow from it, for the
   `min_t` and `max_t` must allow for a reading's reach of d (§2.1, §6).
 - **F-15.** `format.md`: a log segment may follow, or be a copy that omits, a lost range (§8 Corrupt block); the
   lost-range record carries the commit times of the batches on either side (§11 Health).
+- **F-16.** `format.md` A.6 needs an entry type for the site zone (zone name, effective time, §5.7), and the calendar
+  file a format recording its tzdata version and, per stored node, the zone of each day it covers. `api.md`:
+  `calendar` and `calendar_in` take a day or a month, calendar windows (since local midnight, this month, a relative
+  day or month, §6) need a `Window` constructor, and the site zone needs a call that records an entry.
 
 ## Settled
 | ID | Question | Settled in |
@@ -620,7 +669,16 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
 
 ## Where the model differs from the specification
-The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4: identity by value and
+The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
+window evaluation over its span, edge stretches included, in the site zone or a named IANA zone; stored day and month
+nodes, kept only for spans on 15-minute boundaries of a series with a stored 15-minute level, are inputs only where
+every day they cover was taken in the zone of the query, compared after resolving links, their span is the day's and
+their tzdata version is current, and never past the credit limit; days with no quarter-hours, days whose midnight
+does not exist and historical offsets off 15-minute boundaries; the site zone as an effective-dated log entry (see
+Q-75), whose change rebuilds calendar nodes from its effective time only, and tzdata changes, which rebuild only the
+affected days (see Q-76), both logged; calendar windows since local midnight, this month and relative days and
+months; rows 20, 20a, 21 and 21a, invariants 5, 7, 8, 17 and 22 over calendar days; `tests/rules.rs` `s5_7_…` and
+`s6_calendar_…`), the duplicate rule with `revise` (§2.4: identity by value and
 adapter-supplied quality; a fact whose key's current fact is on no local tier, hot or cold, is recorded and counted
 `duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), versioned series (§2.1–§2.4: `changed_at` required on
 every reading of a versioned series and refused on any other, `revise` refused there, rank `(changed_at, position)`
@@ -699,7 +757,10 @@ finds a higher generation claimed stops uploading and stays read-only across res
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
 | Record on change | §2.6, row 17a (see Q-73) | The definition carries the flag, refused on an interval series, and its expected interval is the keep-alive interval; the engine records every reading, so keep-alive facts are ordinary facts from the adapter | `tests/open_questions.rs` `q73_…` |
-| Effective-dated parameters and site zone | §2.1, §5.7, rows 20a and 21 | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so a span in which the expected interval crosses a density threshold (row 20a, Q-60) does not arise; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
+| Effective-dated parameters | §2.1, §5.7, row 20a | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so a span in which the expected interval crosses a density threshold (row 20a, Q-60) does not arise | `calendar_depends_on_zone_utc_levels_do_not` |
+| Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
+| tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
+| Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start (with the host's tzdata, see Q-76), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
 | New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
@@ -711,7 +772,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Condition state on resume | §6 Restart and resume, invariant 16 (see Q-63) | The engine resumes conditions with `Runner::resume`, from the value now, the history rebuilt from the tree (held-for, stale-for) and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
 | Cursor of a consumer after a restore | §4 Consumer state, invariant 13: a cursor is never ahead of the consumer's confirmation | A consumer without a kept cursor, or whose catch-up segments are not local, gets the restored end written as its cursor, which it never confirmed, standing in for "treated as beyond the restored end" (§8 Restore step 2) | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
 | Tree files and their checkpoint | §5.1 | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call) | — |
-| Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours, refused with `NoCalendarNode` for a series without a stored 15-minute level; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
+| Calendar results while restoring | §8 Restore step 2, §6 Old spans | As for windows (see "Window edges over detail that is not local"): a calendar span with an edge inside a minute, such as a day in Africa/Monrovia before 1972, is refused with `Restoring` | — |
 | Compaction of compacted files | §7 Policy: merge when a series' chunks overlapping any 15-minute span exceed 4 | Counts and merges the live current chunks of a series on the fast disk only; revision chunks are never merged | `tests/rules.rs` `s7_merge_publishes_outputs_and_retires_inputs_in_one_record` |
 | Revised-key index, recent window | §2.4, §5.1, §8 Restore step 2: "A key that gains a second fact meanwhile, in the replay or by ingest, has its index entry completed when its chunk is back" | A full in-memory history of every key stands in for the index and the recent window; while restoring, a key revised only after the checkpoint has its entry completed when every current chunk is back, not when its own chunk is | `tests/rules.rs` `s8_index_entry_completed_when_the_current_chunks_are_back` |
 | Age of a compacted file | §8 Eviction at 90 days: no rule for the age of a merged or compacted file | A compacted file takes the seal time of its oldest input, so a revision made today, merged with a 60-day-old chunk, leaves hot after 30 days | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |
@@ -719,7 +780,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
 | Host-stamped readings before clock synchronisation | §2.5: they wait in the ingest queue (back-pressure) | The emit returns `Wait::UnsyncedClock` and the reading takes no queue capacity; the adapter emits it again later, and the wait is counted per attempt, not measured | `tests/edge_cases.rs` `row_22a_…` |
-| Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64), §5.7 | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly; a calendar day of an interval series is the merge of its stored quarter-hours like any other series (roadmap 1.6) | `tests/invariants.rs` `inv22_…` |
+| Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64) | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly, also over the days of a month in a +05:45 zone | `tests/invariants.rs` `inv22_…` |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §4 Resync, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled, so no consumer receives `resync` for a cursor or `start` position below or inside a lost range | — |
