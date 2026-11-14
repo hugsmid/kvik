@@ -2921,3 +2921,44 @@ fn s8_merge_keeps_the_age_of_its_oldest_input() {
         "90 days after its oldest input"
     );
 }
+
+/// §8 Restore step 2: "A key that gains a second fact meanwhile, in the
+/// replay or by ingest, has its index entry completed when its chunk is
+/// back." A key with one fact before the checkpoint, revised after it; a
+/// merge after the checkpoint puts the old fact in a revision chunk. A replay
+/// of the old value is recorded unchecked before the current chunks are back
+/// and dropped once they are, while the revision chunk and the log segment
+/// holding the old fact are still in the bucket.
+#[test]
+fn s8_index_entry_completed_when_the_current_chunks_are_back() {
+    let (mut m, s) = model(10 * SECOND);
+    m.config.merge_threshold = 1;
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.checkpoint().unwrap();
+    m.ingest(vec![Reading::num(s, T0, 2.0)]).unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    let merged = m.merge_chunks(None).unwrap();
+    assert_eq!(merged.len(), 2, "a current and a revision chunk");
+    assert_eq!(m.upload_checkpoints(), 1);
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    let mut early = r.clone();
+    let p = early.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    assert_eq!(
+        (p.positions.len(), early.counters.duplicates_unchecked),
+        (1, 1)
+    );
+    while let Some(f) = r.restore_queue().first().copied() {
+        if r.disk.bucket.objects[&f].1.class != FileClass::Current {
+            break;
+        }
+        r.restore_step().unwrap();
+    }
+    assert!(r.restoring());
+    let p = r.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    assert_eq!((p.positions.len(), p.duplicates), (0, 1));
+    assert_eq!(r.counters.duplicates_unchecked, 0);
+    assert_eq!(r.current().unwrap()[&(s, T0)].value, n(2.0));
+}
