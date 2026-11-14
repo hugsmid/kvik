@@ -64,4 +64,4 @@ pub use error::{Element, EncodeError, FormatError};
 /// The major format version this crate reads and writes.
 pub const FORMAT_MAJOR: u8 = 1;
 /// The minor format version this crate writes.
-pub const FORMAT_MINOR: u8 = 0;
+pub const FORMAT_MINOR: u16 = 0;

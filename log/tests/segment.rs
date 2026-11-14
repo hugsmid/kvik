@@ -93,6 +93,28 @@ fn batch_blocks(batch: &BatchBuilder) -> Vec<(u8, u8, Vec<u8>)> {
 }
 
 #[test]
+fn reserved_header_bytes_are_not_tested() {
+    // A later minor version may use the reserved bytes of a block header; `batch_crc32c` covers them as written.
+    let blocks = vec![(block_type::FACTS, 0, facts_body(1, T0, &[(1, T0, 1.0)]))];
+    let mut s = SegmentImage::create_ahead(ID, T0, 1024).unwrap();
+    s.take_into_use(1).unwrap();
+    let batch = raw_batch_reserved(&ID, 64, &blocks, 1, 1, T0, 0xA55A);
+    put(s.bytes_mut(), 64, &batch);
+    let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();
+    assert_eq!(r.batches.len(), 1);
+    assert_eq!(
+        r.batches[0].blocks[0].block.header_bytes[2..4],
+        [0x5A, 0xA5]
+    );
+    assert_eq!(
+        r.tail,
+        Some(Tail::Clean {
+            offset: 64 + batch.len() as u64
+        })
+    );
+}
+
+#[test]
 fn a_reader_reads_only_below_the_mark() {
     let (s, offsets) = segment(ID, 2048, 1, &three_batches());
     let e = ends(s.bytes(), &offsets);
@@ -385,6 +407,33 @@ fn an_unknown_skippable_block_is_skipped_and_counted() {
     );
     assert_eq!(batch.blocks[1].prefix, None);
     assert_eq!(batch.blocks[1].block.body, &[0xAB; 5]);
+}
+
+#[test]
+fn an_unknown_skippable_block_between_batches_is_an_invalid_region() {
+    // Q-105 (b): with no commit block of its own it is taken as the start of the next batch, which then fails.
+    let (mut s, offsets) = segment(ID, 2048, 1, &three_batches()[..1]);
+    let at = s.write_offset();
+    let mut stray = Vec::new();
+    kvik_log::block::encode_block(0x50, FLAG_SKIPPABLE, b"stray", &mut stray).unwrap();
+    put(s.bytes_mut(), at, &stray);
+    let next = at + stray.len() as u64;
+    put(
+        s.bytes_mut(),
+        next,
+        &facts_batch(2, T0, &[(1, T0, 1.0)])
+            .encode(&ID, next, T0)
+            .unwrap(),
+    );
+    let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();
+    assert_eq!(
+        r.batches.iter().map(|b| b.offset).collect::<Vec<_>>(),
+        [offsets[0], next]
+    );
+    assert_eq!(
+        (r.regions[0].start, r.regions[0].end, r.regions[0].cause),
+        (at, next, LossCause::Corruption)
+    );
 }
 
 #[test]

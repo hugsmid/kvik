@@ -139,7 +139,7 @@ pub(crate) fn read_batch<'a>(
                 None
             }
         };
-        crc.update(&b.header.encode());
+        crc.update(&b.header_bytes);
         blocks.push(DataBlock { block: b, prefix });
         pos = b.next_offset();
     };

@@ -211,6 +211,27 @@ pub fn raw_batch(
     last_sequence: u64,
     commit_time: i64,
 ) -> Vec<u8> {
+    raw_batch_reserved(
+        id,
+        offset,
+        blocks,
+        first_sequence,
+        last_sequence,
+        commit_time,
+        0,
+    )
+}
+
+/// [`raw_batch`] with `reserved` in bytes 2..4 of every block header, as a later minor version might write them.
+pub fn raw_batch_reserved(
+    id: &SegmentIdentity,
+    offset: u64,
+    blocks: &[(u8, u8, Vec<u8>)],
+    first_sequence: u64,
+    last_sequence: u64,
+    commit_time: i64,
+    reserved: u16,
+) -> Vec<u8> {
     use kvik_log::crc::crc32c;
     let mut out = Vec::new();
     let mut covered = Vec::new();
@@ -221,6 +242,7 @@ pub fn raw_batch(
         let mut h = [0u8; 16];
         h[0] = t;
         h[1] = flags;
+        h[2..4].copy_from_slice(&reserved.to_le_bytes());
         h[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
         h[8..12].copy_from_slice(&crc32c(body).to_le_bytes());
         let c = crc32c(&h[..12]);

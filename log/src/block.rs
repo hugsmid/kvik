@@ -118,6 +118,8 @@ pub struct RawBlock<'a> {
     pub offset: u64,
     /// The header.
     pub header: BlockHeader,
+    /// The 16 header bytes as read, reserved bytes included: what `batch_crc32c` covers (A.7).
+    pub header_bytes: [u8; BLOCK_HEADER_LEN],
     /// The `body_len` bytes of the body.
     pub body: &'a [u8],
 }
@@ -134,7 +136,7 @@ impl RawBlock<'_> {
 pub(crate) enum BlockFault {
     /// Sixteen zero bytes.
     Zero,
-    /// The header does not fit below the limit, or its checksum does not match.
+    /// The header does not fit below the limit, its checksum does not match, or its type is 0.
     Header,
     /// `body_len` above 16 MiB, or the body does not fit below the limit.
     Length,
@@ -159,7 +161,10 @@ pub(crate) fn read_block(
     if raw.iter().all(|&b| b == 0) {
         return Err(BlockFault::Zero);
     }
-    let header = BlockHeader::decode(raw).ok_or(BlockFault::Header)?;
+    // Type 0 is never valid (A.2).
+    let header = BlockHeader::decode(raw)
+        .filter(|h| h.block_type != 0)
+        .ok_or(BlockFault::Header)?;
     if header.body_len > MAX_BODY_LEN || header_end + u64::from(header.body_len) > limit {
         return Err(BlockFault::Length);
     }
@@ -171,6 +176,7 @@ pub(crate) fn read_block(
     Ok(RawBlock {
         offset,
         header,
+        header_bytes: *raw,
         body,
     })
 }
@@ -198,6 +204,13 @@ mod tests {
         assert_eq!(read_block(&out, 0, 18), Err(BlockFault::Length));
         assert_eq!(read_block(&out, 0, 15), Err(BlockFault::Header));
         assert_eq!(read_block(&[0; 16], 0, 16), Err(BlockFault::Zero));
+        // Reserved header bytes are not tested, and are kept as read.
+        let mut r = out.clone();
+        r[2] = 0x5A;
+        let crc = crc32c(&r[..12]);
+        r[12..16].copy_from_slice(&crc.to_le_bytes());
+        let b = read_block(&r, 0, 24).unwrap();
+        assert_eq!(b.header_bytes[..], r[..16]);
     }
 
     #[test]
@@ -210,5 +223,11 @@ mod tests {
         h.body_len = MAX_BODY_LEN + 1;
         let b = h.encode();
         assert_eq!(read_block(&b, 0, u64::MAX), Err(BlockFault::Length));
+        // A checksum-valid header of type 0, skippable or not, is not a block.
+        for flags in [0, FLAG_SKIPPABLE] {
+            let mut h = BlockHeader::for_body(1, flags, &[]).unwrap();
+            h.block_type = 0;
+            assert_eq!(read_block(&h.encode(), 0, 16), Err(BlockFault::Header));
+        }
     }
 }

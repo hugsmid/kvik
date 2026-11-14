@@ -1,6 +1,6 @@
 //! The 64-byte file header of every kvik file except the mark (`format.md` A.1).
 
-use crate::bytes::{i64_at, put, u32_at, u64_at};
+use crate::bytes::{i64_at, put, u16_at, u32_at, u64_at};
 use crate::crc::crc32c;
 
 /// Length of the file header.
@@ -22,7 +22,7 @@ pub struct FileHeader {
     /// Major format version.
     pub format_major: u8,
     /// Minor format version of the writer that created the file; diagnostic only (`format.md` A.3).
-    pub format_minor: u8,
+    pub format_minor: u16,
     /// Reserved flags; zero in v1.
     pub flags: u32,
     /// Generation in which the file was created.
@@ -66,7 +66,7 @@ impl FileHeader {
         put(&mut b, 0, &MAGIC);
         b[4] = self.kind;
         b[5] = self.format_major;
-        b[6] = self.format_minor;
+        put(&mut b, 6, &self.format_minor.to_le_bytes());
         put(&mut b, 8, &self.flags.to_le_bytes());
         put(&mut b, 12, &self.generation.to_le_bytes());
         put(&mut b, 16, &self.file_id.to_le_bytes());
@@ -90,7 +90,7 @@ impl FileHeader {
         Some(Self {
             kind: b[4],
             format_major: b[5],
-            format_minor: b[6],
+            format_minor: u16_at(b, 6),
             flags: u32_at(b, 8),
             generation: u32_at(b, 12),
             file_id: u64_at(b, 16),
@@ -109,12 +109,13 @@ mod tests {
     fn layout_and_round_trip() {
         let mut h = FileHeader::new(kind::LOG_SEGMENT, 3, 0x0102_0304_0506_0708, -5, [7; 16]);
         h.base_sequence = 42;
+        h.format_minor = 0x0203;
         let b = h.encode();
         // Offsets from the A.1 table, checked independently of `decode`.
         assert_eq!(&b[0..4], b"KVIK");
         assert_eq!(b[4], 1);
         assert_eq!(b[5], 1);
-        assert_eq!(b[6], 0);
+        assert_eq!(&b[6..8], &0x0203u16.to_le_bytes());
         assert_eq!(&b[12..16], &3u32.to_le_bytes());
         assert_eq!(&b[16..24], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(&b[24..32], &42u64.to_le_bytes());
