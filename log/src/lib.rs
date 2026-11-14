@@ -14,6 +14,9 @@
 //! - [`segment`]: the life cycle of a segment as bytes, and the states recovery may find (A.4).
 //! - [`mark`]: the durable mark's slots (A.10).
 //! - [`name`]: segment file names (A.12).
+//! - [`store`]: the store directory, its descriptor and lock (A.12).
+//! - [`writer`]: the commit path: group commit, sync, the durable mark, positions, segment creation and sealing
+//!   (`spec.md` §3).
 //! - [`fs`]: the file-system seam every file operation goes through (A.13).
 //!
 //! ```
@@ -66,6 +69,8 @@ pub mod name;
 mod rle;
 pub mod scan;
 pub mod segment;
+pub mod store;
+pub mod writer;
 
 pub use content_error::{BodyError, ContentError};
 pub use error::{Element, EncodeError, FormatError};

@@ -337,6 +337,14 @@ impl BatchBuilder {
         n == self.blocks.len()
     }
 
+    /// Bytes of the data blocks when framed: their headers, bodies and padding, without the commit block.
+    pub fn data_len(&self) -> u64 {
+        self.blocks
+            .iter()
+            .map(|(_, _, b)| (BLOCK_HEADER_LEN + b.len().div_ceil(8) * 8) as u64)
+            .sum()
+    }
+
     /// The types of the blocks added so far, in order.
     pub fn block_types(&self) -> impl Iterator<Item = u8> + '_ {
         self.blocks.iter().map(|b| b.0)

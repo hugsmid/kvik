@@ -12,6 +12,10 @@ pub const MAGIC: [u8; 4] = *b"KVIK";
 pub mod kind {
     /// A log segment (`format.md` A.4).
     pub const LOG_SEGMENT: u8 = 1;
+    /// The manifest (A.14).
+    pub const MANIFEST: u8 = 3;
+    /// The store descriptor (A.12).
+    pub const STORE: u8 = 7;
 }
 
 /// A file header. Reserved bytes are written as zero and not read.

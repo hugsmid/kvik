@@ -1,0 +1,1150 @@
+//! The commit path (`spec.md` §3 Commit, Group commit, Durable mark, Segments, Sealing, Write or sync failure, Disk
+//! space; `format.md` A.4, A.10, A.12, A.13).
+//!
+//! The writer is a **synchronous core**, [`LogWriter`], that makes every decision and performs every file operation
+//! of the `kvik-writer` thread, driven by explicit times: [`LogWriter::step`] takes the monotonic time and the wall
+//! clock and returns the completed calls and the next time it needs to run. The `kvik-maint` thread's work is in
+//! [`create_segment`] and [`seal_segment`]; the writer hands it [`SegmentRequest`]s and [`SealJob`]s and takes the
+//! results back. [`Log`] runs both on their named threads; it adds no decisions of its own, so tests drive the core
+//! deterministically with a manual clock and the in-memory file system.
+//!
+//! One batch is one sync: calls queued while a sync is in flight form the next batch. The writer writes a batch only
+//! after the previous batch's sync has returned and the mark has moved (`spec.md` §3 Recovery rule 1).
+
+mod maint;
+mod queue;
+mod threads;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
+pub use maint::{create_segment, seal_segment};
+pub use queue::{CallSource, IngestQueue, QueueFull};
+pub use threads::{Clock, Log, Pending, SubmitError, SystemClock};
+
+use crate::batch::SegmentIdentity;
+use crate::block::{BLOCK_HEADER_LEN, block_type};
+use crate::body::{COMMIT_LEN, IndexRecord};
+use crate::content::{BatchContent, Item};
+use crate::entries::{Entry, IntervalLength};
+use crate::error::EncodeError;
+use crate::fs::{Fs, FsFile, OpenMode};
+use crate::header::{FileHeader, HEADER_LEN, kind};
+use crate::mark::{MARK_LEN, MarkSlot, SLOT_OFFSETS, encode_mark_file};
+use crate::name::SegmentName;
+use crate::scan::{ScanLimit, scan};
+use crate::segment::SealSummary;
+use crate::store::{MARK, StoreDir, StoreError};
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+/// How often the writer checks free space.
+pub const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a blocked seal waits before it is tried again.
+pub const SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// The most entries in one call, whatever the queue's capacity (`api.md` Writing).
+pub const MAX_CALL_ENTRIES: usize = 65_536;
+const DAY_NS: i64 = 86_400_000_000_000;
+
+/// When the mark file is synced (`api.md` `log.mark_sync`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkSync {
+    /// On a timer, `mark_sync_interval` (default 1 s), and at once after a batch holding an entry that is not a fact.
+    Interval(Duration),
+    /// After every mark update, before the batch is acknowledged.
+    EveryCommit,
+}
+
+/// The writer's configuration (`api.md` Configuration, the `log.*` and `limits.*` keys of roadmap section 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriterConfig {
+    /// `log.segment_size`: 16 MiB to 1 GiB, a multiple of 4,096.
+    pub segment_size: u64,
+    /// `log.seal_interval`: a segment in use this long is sealed, if it holds a batch.
+    pub seal_interval: Duration,
+    /// `log.min_sync_interval`: log syncs start at least this far apart; zero disables the bound.
+    pub min_sync_interval: Duration,
+    /// `log.max_batch_bytes`: 64 KiB to 8 MiB.
+    pub max_batch_bytes: u64,
+    /// `log.mark_sync`.
+    pub mark_sync: MarkSync,
+    /// `limits.ingest_queue`: at least 1,024 entries.
+    pub ingest_queue: usize,
+    /// `limits.disk_low`, its fraction, in per cent of the file system.
+    pub disk_low_percent: u8,
+    /// `limits.disk_low`, its bytes.
+    pub disk_low_bytes: u64,
+    /// `limits.disk_critical`.
+    pub disk_critical: u64,
+    /// Lifts the lower limits of the sizes, for tests with small segments: a segment of at least 4,096 bytes, a
+    /// multiple of 8; any batch size and queue capacity of at least 1.
+    #[doc(hidden)]
+    pub relaxed_limits: bool,
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            segment_size: 64 * MIB,
+            seal_interval: Duration::from_secs(300),
+            min_sync_interval: Duration::from_millis(10),
+            max_batch_bytes: MIB,
+            mark_sync: MarkSync::Interval(Duration::from_secs(1)),
+            ingest_queue: 65_536,
+            disk_low_percent: 5,
+            disk_low_bytes: 2 * GIB,
+            disk_critical: 512 * MIB,
+            relaxed_limits: false,
+        }
+    }
+}
+
+/// A configuration value outside its limits.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("configuration key {0} is outside its limits")]
+pub struct ConfigError(pub &'static str);
+
+impl WriterConfig {
+    /// Checks every key against its limits.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let relaxed = self.relaxed_limits;
+        let seg_ok = if relaxed {
+            self.segment_size >= 4096 && self.segment_size.is_multiple_of(8)
+        } else {
+            (16 * MIB..=GIB).contains(&self.segment_size) && self.segment_size.is_multiple_of(4096)
+        };
+        if !seg_ok || self.segment_size > GIB {
+            return Err(ConfigError("log.segment_size"));
+        }
+        if self.seal_interval.is_zero() {
+            return Err(ConfigError("log.seal_interval"));
+        }
+        let min_batch = if relaxed { 1 } else { 64 << 10 };
+        if !(min_batch..=8 * MIB).contains(&self.max_batch_bytes) {
+            return Err(ConfigError("log.max_batch_bytes"));
+        }
+        if matches!(self.mark_sync, MarkSync::Interval(d) if d.is_zero()) {
+            return Err(ConfigError("log.mark_sync"));
+        }
+        if self.ingest_queue < if relaxed { 1 } else { 1024 } {
+            return Err(ConfigError("limits.ingest_queue"));
+        }
+        if self.disk_low_percent > 100 {
+            return Err(ConfigError("limits.disk_low"));
+        }
+        Ok(())
+    }
+
+    /// The most entries in one call: `min(65,536, limits.ingest_queue)`.
+    pub fn call_limit(&self) -> usize {
+        MAX_CALL_ENTRIES.min(self.ingest_queue)
+    }
+}
+
+/// A position in the log: `(generation, sequence)` (`format.md` A, common rules).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Position {
+    /// The generation.
+    pub generation: u32,
+    /// The sequence; 0 means none.
+    pub sequence: u64,
+}
+
+/// One caller's facts and entries, committed in one batch or not at all, in order (`api.md` Writing: one call is
+/// one batch unit).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    pub(crate) id: u64,
+    items: Vec<Item>,
+    data_len: u64,
+    sequences: u64,
+    has_non_fact: bool,
+}
+
+/// Why a call cannot be made.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CallError {
+    /// A call needs at least one entry.
+    #[error("a call needs at least one entry")]
+    Empty,
+    /// More entries than the call limit, or more than 8 MiB of data blocks.
+    #[error("the call is too large; split it")]
+    TooLarge,
+    /// Content that would not form valid blocks.
+    #[error("invalid content: {0}")]
+    Invalid(EncodeError),
+}
+
+impl Call {
+    /// A call of `items`, at most `limit` entries ([`WriterConfig::call_limit`]). Its content is encoded once
+    /// here, so a batch formed from valid calls always encodes.
+    pub fn new(items: Vec<Item>, limit: usize) -> Result<Self, CallError> {
+        if items.is_empty() {
+            return Err(CallError::Empty);
+        }
+        if items.len() > limit.min(MAX_CALL_ENTRIES) {
+            return Err(CallError::TooLarge);
+        }
+        let content = BatchContent {
+            first_sequence: 1,
+            received_at: 0,
+            items,
+        };
+        let builder = content.builder().map_err(|e| match e {
+            EncodeError::TooLarge => CallError::TooLarge,
+            e => CallError::Invalid(e),
+        })?;
+        let items = content.items;
+        let has_non_fact = items.iter().any(|i| matches!(i, Item::Entry(_)));
+        Ok(Self {
+            id: 0,
+            sequences: items.iter().map(Item::sequences).sum(),
+            data_len: builder.data_len(),
+            items,
+            has_non_fact,
+        })
+    }
+
+    /// The id the queue gave it; 0 before it was queued.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Its entries.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether it holds no entry (never, for a call made by [`Call::new`]).
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Bytes of its data blocks alone: what it adds to a batch's size (Q-115 (a)).
+    pub fn data_len(&self) -> u64 {
+        self.data_len
+    }
+
+    /// Whether it holds an entry that is not a fact.
+    pub fn has_non_fact(&self) -> bool {
+        self.has_non_fact
+    }
+}
+
+/// The acknowledgement of a call: the positions of its first and last entries. Its entries hold consecutive
+/// positions in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ack {
+    /// The first entry's position.
+    pub first: Position,
+    /// The last entry's position.
+    pub last: Position,
+}
+
+/// Why a call was not acknowledged.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CommitError {
+    /// Its batch was written but a write or sync failed before its acknowledgement: it may or may not be stored,
+    /// and it is never acknowledged (`spec.md` §3 Write or sync failure).
+    #[error(
+        "the outcome is unknown: the store became read-only while the call was being committed"
+    )]
+    OutcomeUnknown,
+    /// The store was read-only before the call was written: it was not stored.
+    #[error("the store is read-only")]
+    ReadOnly,
+    /// The log was shut down before the call was written: it was not stored.
+    #[error("the log was shut down")]
+    ShutDown,
+}
+
+/// The operation that failed when the store became read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaultOp {
+    /// Creating a file.
+    Create,
+    /// Writing a log segment.
+    Write,
+    /// Syncing a log segment or the log directory.
+    Sync,
+    /// Writing the mark.
+    MarkWrite,
+    /// Syncing the mark.
+    MarkSync,
+    /// Reading or encoding a segment for its seal.
+    Seal,
+}
+
+/// A write or sync failure: the store is read-only until a restart (`spec.md` §3 Write or sync failure).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{op:?} failed on {path:?}: {message}")]
+pub struct Fault {
+    /// What failed.
+    pub op: FaultOp,
+    /// The file or directory.
+    pub path: PathBuf,
+    /// The error's kind.
+    pub kind: io::ErrorKind,
+    /// The error's message.
+    pub message: String,
+}
+
+/// Why ingest waits (`api.md` Writing, back-pressure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Wait {
+    /// The ingest queue is full.
+    QueueFull,
+    /// Free space is below the critical mark, or a segment could not be created for lack of space.
+    DiskCritical {
+        /// Free bytes at the last check; 0 if unknown.
+        free: u64,
+    },
+    /// The batch needs the next segment, which is not created yet.
+    NoSegment,
+}
+
+/// A health reason the log reports (`api.md` Health).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reason {
+    /// Ingest waits.
+    IngestWaiting(Wait),
+    /// Free space below the low mark.
+    DiskLow {
+        /// Free bytes.
+        free: u64,
+    },
+    /// Free space below the critical mark, or a segment creation that failed for lack of space.
+    DiskCritical {
+        /// Free bytes; 0 if unknown.
+        free: u64,
+    },
+    /// A segment's seal is blocked; it is retried.
+    SealBlocked {
+        /// The segment.
+        file_id: u64,
+    },
+}
+
+/// Why the mark is synced at every commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EveryCommitReason {
+    /// Configured.
+    Configured,
+    /// The platform has no boot identity (`format.md` A.10).
+    NoBootId,
+}
+
+/// How the mark is synced (`api.md` `LogStats::mark_sync`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MarkSyncMode {
+    /// On the timer, and at once after a batch holding an entry that is not a fact.
+    Interval(Duration),
+    /// At every commit.
+    EveryCommit {
+        /// Why.
+        reason: EveryCommitReason,
+    },
+}
+
+/// The writer's statistics (`api.md` `LogStats`, `IngestStats`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogStats {
+    /// The last durable position: synced, with the mark moved past it.
+    pub durable: Position,
+    /// The last position the mark file names on stable storage.
+    pub mark_synced: Position,
+    /// How the mark is synced.
+    pub mark_sync: MarkSyncMode,
+    /// The segment batches go to; `None` before the first is taken into use.
+    pub open_file_id: Option<u64>,
+    /// Segments sealed by this writer.
+    pub sealed_segments: u64,
+    /// Bytes of batches written.
+    pub bytes: u64,
+    /// Batches committed.
+    pub batches: u64,
+    /// Log syncs (batch syncs and the syncs that take a segment into use).
+    pub syncs: u64,
+    /// Mark syncs.
+    pub mark_syncs: u64,
+    /// The highest series id assigned.
+    pub max_series_id: u32,
+}
+
+/// A finished call: its id and its result.
+pub type Done = (u64, Result<Ack, CommitError>);
+
+/// What a [`LogWriter::step`] did.
+#[derive(Debug, Default)]
+pub struct Step {
+    /// Calls finished, with their ids.
+    pub done: Vec<Done>,
+    /// When the writer next needs to run, if no call arrives first; `None` when it needs no timer.
+    pub next: Option<Duration>,
+}
+
+/// Why the writer could not open.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum OpenError {
+    /// The store directory.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The configuration.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
+
+#[derive(Debug)]
+struct OpenSegment {
+    file: Box<dyn FsFile>,
+    id: SegmentIdentity,
+    len: u64,
+    write_offset: u64,
+    summary: Option<SealSummary>,
+    has_entries: bool,
+    index: BTreeMap<u32, IndexRecord>,
+    in_use_since: Duration,
+}
+
+#[derive(Debug, Default)]
+struct Disk {
+    free: Option<u64>,
+    checked_at: Option<Duration>,
+    critical: bool,
+    low: bool,
+    /// A creation failed for lack of space; it is requested again when a check passes.
+    creation_waits: bool,
+}
+
+/// The writer's synchronous core. See the module documentation.
+#[derive(Debug)]
+pub struct LogWriter {
+    fs: Arc<dyn Fs>,
+    store: StoreDir,
+    log_dir: PathBuf,
+    cfg: WriterConfig,
+    store_id: [u8; 16],
+    generation: u32,
+    boot_id: [u8; 16],
+    mark_mode: MarkSyncMode,
+    mark: Box<dyn FsFile>,
+    mark_path: PathBuf,
+    mark_slot: MarkSlot,
+    mark_next_slot: usize,
+    mark_dirty: bool,
+    mark_synced: u64,
+    last_mark_sync: Duration,
+    open: Option<OpenSegment>,
+    ahead: Option<AheadSegment>,
+    requested: bool,
+    next_file_id: u64,
+    last_sequence: u64,
+    last_commit_time: i64,
+    max_series_id: u32,
+    intervals: HashMap<u32, IntervalLength>,
+    last_sync_start: Option<Duration>,
+    fault: Option<Fault>,
+    seals: Vec<SealJob>,
+    blocked: Vec<(SealJob, Duration)>,
+    seal_blocked: BTreeSet<u64>,
+    sealing: usize,
+    disk: Disk,
+    waiting: Option<Wait>,
+    stats: LogStats,
+}
+
+fn reach(t: i64, interval: Option<&IntervalLength>) -> i64 {
+    match interval {
+        None => t,
+        Some(IntervalLength::Fixed { length, .. }) => t.saturating_add(*length),
+        Some(IntervalLength::Day { .. }) => t.saturating_add(50 * DAY_NS / 24),
+        Some(IntervalLength::Month { .. }) => t.saturating_add(33 * DAY_NS),
+    }
+}
+
+impl LogWriter {
+    /// Opens the writer on a store: the first start of a new store creates the mark (`spec.md` §3 Recovery, last
+    /// sentence). A log that already holds a mark or a batch needs recovery (roadmap 4.5) and is refused with
+    /// [`StoreError::NeedsRecovery`]. `boot_id` is `None` where the platform has none; the mark is then synced at
+    /// every commit (`format.md` A.10).
+    pub fn open(
+        store: StoreDir,
+        cfg: WriterConfig,
+        boot_id: Option<[u8; 16]>,
+        now: Duration,
+    ) -> Result<Self, OpenError> {
+        cfg.validate()?;
+        let fs = store.fs().clone();
+        let log_dir = store.log_dir();
+        let store_id = store.descriptor().store_id;
+        let generation = 0;
+        Self::first_start_check(&store, &log_dir)?;
+        let mark_path = log_dir.join(MARK);
+        let slot = MarkSlot {
+            generation,
+            store_id,
+            boot_id: boot_id.unwrap_or_default(),
+            counter: 1,
+            file_id: 0,
+            offset: 0,
+            last_sequence: 0,
+            max_series_id: 0,
+        };
+        let mark = fs
+            .open(&mark_path, OpenMode::CreateNew)
+            .map_err(StoreError::Io)?;
+        mark.write_at(&encode_mark_file([Some(slot), None]), 0)
+            .map_err(StoreError::Io)?;
+        debug_assert_eq!(mark.len().ok(), Some(MARK_LEN as u64));
+        mark.sync_data().map_err(StoreError::Io)?;
+        fs.sync_dir(&log_dir).map_err(StoreError::Io)?;
+        let mark_mode = match (boot_id, cfg.mark_sync) {
+            (None, _) => MarkSyncMode::EveryCommit {
+                reason: EveryCommitReason::NoBootId,
+            },
+            (Some(_), MarkSync::EveryCommit) => MarkSyncMode::EveryCommit {
+                reason: EveryCommitReason::Configured,
+            },
+            (Some(_), MarkSync::Interval(d)) => MarkSyncMode::Interval(d),
+        };
+        Ok(Self {
+            stats: LogStats {
+                durable: Position {
+                    generation,
+                    sequence: 0,
+                },
+                mark_synced: Position {
+                    generation,
+                    sequence: 0,
+                },
+                mark_sync: mark_mode,
+                open_file_id: None,
+                sealed_segments: 0,
+                bytes: 0,
+                batches: 0,
+                syncs: 0,
+                mark_syncs: 1,
+                max_series_id: 0,
+            },
+            fs,
+            store,
+            log_dir,
+            cfg,
+            store_id,
+            generation,
+            boot_id: boot_id.unwrap_or_default(),
+            mark_mode,
+            mark,
+            mark_path,
+            mark_slot: slot,
+            mark_next_slot: 1,
+            mark_dirty: false,
+            mark_synced: 0,
+            last_mark_sync: now,
+            open: None,
+            ahead: None,
+            requested: false,
+            next_file_id: 1,
+            last_sequence: 0,
+            last_commit_time: i64::MIN,
+            max_series_id: 0,
+            intervals: HashMap::new(),
+            last_sync_start: None,
+            fault: None,
+            seals: Vec::new(),
+            blocked: Vec::new(),
+            seal_blocked: BTreeSet::new(),
+            sealing: 0,
+            disk: Disk::default(),
+            waiting: None,
+        })
+    }
+
+    /// The first start of a new store needs a log without a mark and without a batch. Segments created ahead by an
+    /// earlier first start that never created the mark hold no batch and are removed.
+    fn first_start_check(store: &StoreDir, log_dir: &Path) -> Result<(), StoreError> {
+        let fs = store.fs();
+        let entries = match fs.read_dir(log_dir) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut unused = Vec::new();
+        for e in entries {
+            if e.name == MARK {
+                return Err(StoreError::NeedsRecovery("the log holds a mark"));
+            }
+            let Some(name) = SegmentName::parse(&e.name) else {
+                continue;
+            };
+            if name.sealed {
+                return Err(StoreError::NeedsRecovery("the log holds a sealed segment"));
+            }
+            let path = log_dir.join(&e.name);
+            let bytes = store.read_file(&path)?;
+            let id = SegmentIdentity {
+                store_id: store.descriptor().store_id,
+                file_id: name.file_id,
+                generation: name.generation,
+            };
+            let in_use = scan(&bytes, &id, ScanLimit::End)
+                .map(|r| r.in_use())
+                .unwrap_or(true);
+            if in_use {
+                return Err(StoreError::NeedsRecovery("the log holds a batch"));
+            }
+            unused.push(path);
+        }
+        for p in unused {
+            fs.remove_file(&p)?;
+        }
+        if !fs.read_dir(log_dir).map(|v| v.is_empty()).unwrap_or(true) {
+            fs.sync_dir(log_dir)?;
+        }
+        Ok(())
+    }
+
+    /// The fault that made the store read-only, if any.
+    pub fn fault(&self) -> Option<&Fault> {
+        self.fault.as_ref()
+    }
+
+    /// The statistics.
+    pub fn stats(&self) -> &LogStats {
+        &self.stats
+    }
+
+    /// The configuration.
+    pub fn config(&self) -> &WriterConfig {
+        &self.cfg
+    }
+
+    /// The store directory.
+    pub fn store(&self) -> &StoreDir {
+        &self.store
+    }
+
+    /// Why ingest waits, if it does.
+    pub fn waiting(&self) -> Option<Wait> {
+        self.waiting
+    }
+
+    /// The health reasons (a fault is reported by [`LogWriter::fault`]).
+    pub fn reasons(&self) -> Vec<Reason> {
+        let mut r = Vec::new();
+        if let Some(w) = self.waiting {
+            r.push(Reason::IngestWaiting(w));
+        }
+        let free = self.disk.free.unwrap_or(0);
+        if self.disk.critical || self.disk.creation_waits {
+            r.push(Reason::DiskCritical { free });
+        } else if self.disk.low {
+            r.push(Reason::DiskLow { free });
+        }
+        r.extend(
+            self.seal_blocked
+                .iter()
+                .map(|&file_id| Reason::SealBlocked { file_id }),
+        );
+        r
+    }
+
+    /// The earliest time the next log sync may start: `min_sync_interval` after the previous one started.
+    pub fn sync_ready_at(&self) -> Duration {
+        self.last_sync_start
+            .map_or(Duration::ZERO, |s| s + self.cfg.min_sync_interval)
+    }
+
+    fn fail(&mut self, op: FaultOp, path: &Path, e: &io::Error) {
+        self.fail_with(Fault {
+            op,
+            path: path.to_path_buf(),
+            kind: e.kind(),
+            message: e.to_string(),
+        });
+    }
+
+    fn fail_with(&mut self, f: Fault) {
+        if self.fault.is_none() {
+            self.fault = Some(f);
+        }
+        self.waiting = None;
+    }
+
+    /// The next segment to create ahead of use, if one is wanted and not already asked for: always one beyond the
+    /// segment in use, except while a creation waits for free space.
+    pub fn segment_request(&mut self, wall: i64) -> Option<SegmentRequest> {
+        if self.fault.is_some()
+            || self.ahead.is_some()
+            || self.requested
+            || self.disk.creation_waits
+        {
+            return None;
+        }
+        self.requested = true;
+        let id = SegmentIdentity {
+            store_id: self.store_id,
+            file_id: self.next_file_id,
+            generation: self.generation,
+        };
+        self.next_file_id += 1;
+        Some(SegmentRequest {
+            id,
+            log_dir: self.log_dir.clone(),
+            len: self.cfg.segment_size,
+            created_at: wall,
+        })
+    }
+
+    /// The result of a [`SegmentRequest`]. A creation that failed for lack of space is asked for again when a
+    /// free-space check passes; any other failure makes the store read-only.
+    pub fn segment_created(&mut self, result: Result<AheadSegment, CreateError>) {
+        self.requested = false;
+        match result {
+            Ok(s) if self.fault.is_none() => {
+                self.ahead = Some(s);
+                if self.waiting == Some(Wait::NoSegment) {
+                    self.waiting = None;
+                }
+            }
+            Ok(_) => {}
+            Err(CreateError::NoSpace) => {
+                // The id is not reused: the next request takes a new one (A.12: never reused).
+                self.disk.creation_waits = true;
+                self.disk.checked_at = None;
+            }
+            Err(CreateError::Fault(f)) => self.fail_with(f),
+        }
+    }
+
+    /// Seal jobs ready to run: segments whose successor is in use and synced, and blocked seals whose retry time
+    /// has come.
+    pub fn take_seal_jobs(&mut self, now: Duration) -> Vec<SealJob> {
+        if self.fault.is_some() {
+            return Vec::new();
+        }
+        let mut out = std::mem::take(&mut self.seals);
+        let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.blocked)
+            .into_iter()
+            .partition(|(_, at)| *at <= now);
+        self.blocked = wait;
+        out.extend(due.into_iter().map(|(j, _)| j));
+        self.sealing += out.len();
+        out
+    }
+
+    /// The result of a seal job.
+    pub fn seal_done(&mut self, job: SealJob, result: Result<(), SealError>, now: Duration) {
+        self.sealing = self.sealing.saturating_sub(1);
+        match result {
+            Ok(()) => {
+                self.seal_blocked.remove(&job.file_id());
+                self.stats.sealed_segments += 1;
+            }
+            Err(SealError::Blocked(_)) => {
+                self.seal_blocked.insert(job.file_id());
+                self.blocked.push((job, now + SEAL_RETRY_INTERVAL));
+            }
+            Err(SealError::Fault(f)) => self.fail_with(f),
+        }
+    }
+
+    /// Whether seal jobs are ready to run or running; blocked seals waiting for their retry are not counted.
+    pub fn seals_running(&self) -> bool {
+        !self.seals.is_empty() || self.sealing > 0
+    }
+
+    fn check_disk(&mut self, now: Duration) {
+        if self
+            .disk
+            .checked_at
+            .is_some_and(|at| now < at + DISK_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.disk.checked_at = Some(now);
+        // Free space unknown (no source on this platform, or the call failed): no mark applies (Q-115 (e)).
+        let free = self.fs.free_space(&self.log_dir).ok();
+        self.disk.free = free;
+        self.disk.critical = free.is_some_and(|f| f < self.cfg.disk_critical);
+        self.disk.low = free.is_some_and(|f| f < self.cfg.disk_low_bytes);
+        if self.disk.creation_waits {
+            let passes = free.is_none_or(|f| f >= self.cfg.disk_critical + self.cfg.segment_size);
+            if passes {
+                self.disk.creation_waits = false;
+            }
+        }
+    }
+
+    fn ingest_blocked_by_disk(&self) -> bool {
+        self.disk.critical || self.disk.creation_waits
+    }
+
+    /// One turn of the writer thread at monotonic time `now` and wall clock `wall`: checks free space, syncs the
+    /// mark when its timer is due, seals a segment by time, and commits one batch from `source` if a log sync may
+    /// start. After a fault, every call in `source` fails with [`CommitError::ReadOnly`].
+    pub fn step(&mut self, now: Duration, wall: i64, source: &mut dyn CallSource) -> Step {
+        let mut step = Step::default();
+        if self.fault.is_none() {
+            self.check_disk(now);
+            self.timed_mark_sync(now);
+        }
+        if self.fault.is_none() {
+            self.timed_seal(now);
+        }
+        if self.fault.is_none() {
+            let disk_wait = self.ingest_blocked_by_disk();
+            if disk_wait && !source.is_empty() {
+                self.waiting = Some(Wait::DiskCritical {
+                    free: self.disk.free.unwrap_or(0),
+                });
+            } else if self
+                .waiting
+                .is_some_and(|w| matches!(w, Wait::DiskCritical { .. }))
+            {
+                self.waiting = None;
+            }
+            if !disk_wait && !source.is_empty() && now >= self.sync_ready_at() {
+                let calls = source.take(self.cfg.max_batch_bytes);
+                match self.commit(calls, now, wall) {
+                    Ok(done) => step.done = done,
+                    Err(calls) => {
+                        source.put_back(calls);
+                        self.waiting = Some(Wait::NoSegment);
+                    }
+                }
+            }
+        }
+        if self.fault.is_some() {
+            let mut rest = Vec::new();
+            while !source.is_empty() {
+                rest.extend(source.take(u64::MAX));
+            }
+            step.done
+                .extend(rest.into_iter().map(|c| (c.id, Err(CommitError::ReadOnly))));
+            return step;
+        }
+        step.next = self.next_deadline(now, !source.is_empty());
+        step
+    }
+
+    fn next_deadline(&self, now: Duration, queued: bool) -> Option<Duration> {
+        let mut next: Option<Duration> = None;
+        let mut at = |t: Duration| next = Some(next.map_or(t, |n| n.min(t)));
+        if queued && self.waiting != Some(Wait::NoSegment) {
+            if self.ingest_blocked_by_disk() {
+                at(self.disk.checked_at.unwrap_or(now) + DISK_CHECK_INTERVAL);
+            } else {
+                at(self.sync_ready_at().max(now));
+            }
+        }
+        if self.disk.creation_waits {
+            at(self.disk.checked_at.unwrap_or(now) + DISK_CHECK_INTERVAL);
+        }
+        if let (true, MarkSyncMode::Interval(d)) = (self.mark_dirty, self.mark_mode) {
+            at(self.last_mark_sync + d);
+        }
+        if let Some(o) = self.open.as_ref().filter(|o| o.summary.is_some()) {
+            at(o.in_use_since + self.cfg.seal_interval);
+        }
+        if let Some(t) = self.blocked.iter().map(|(_, t)| *t).min() {
+            at(t);
+        }
+        next
+    }
+
+    fn timed_mark_sync(&mut self, now: Duration) {
+        if let (true, MarkSyncMode::Interval(d)) = (self.mark_dirty, self.mark_mode)
+            && now >= self.last_mark_sync + d
+        {
+            self.sync_mark(now);
+        }
+    }
+
+    fn sync_mark(&mut self, now: Duration) {
+        if let Err(e) = self.mark.sync_data() {
+            let p = self.mark_path.clone();
+            self.fail(FaultOp::MarkSync, &p, &e);
+            return;
+        }
+        self.mark_dirty = false;
+        self.last_mark_sync = now;
+        self.mark_synced = self.mark_slot.last_sequence;
+        self.stats.mark_synced = Position {
+            generation: self.generation,
+            sequence: self.mark_synced,
+        };
+        self.stats.mark_syncs += 1;
+    }
+
+    /// A segment in use for `seal_interval` with at least one batch is sealed: the segment created ahead is taken
+    /// into use by its header rewrite and its own `sync_data`, and the old one goes to be sealed (`format.md` A.4
+    /// In use). Without a segment created ahead, the seal waits for one.
+    fn timed_seal(&mut self, now: Duration) {
+        let due = self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.summary.is_some() && now >= o.in_use_since + self.cfg.seal_interval);
+        if !due || self.ahead.is_none() {
+            return;
+        }
+        let Some(next) = self.take_into_use(self.last_sequence + 1, now) else {
+            return;
+        };
+        if let Err(e) = next.file.sync_data() {
+            let p = maint::segment_path(&self.log_dir, &next.id, false);
+            self.fail(FaultOp::Sync, &p, &e);
+            return;
+        }
+        self.last_sync_start = Some(now);
+        self.stats.syncs += 1;
+        self.roll_to(next);
+    }
+
+    /// Writes the header of the segment created ahead with its real `base_sequence`; the caller syncs it.
+    fn take_into_use(&mut self, base_sequence: u64, now: Duration) -> Option<OpenSegment> {
+        let a = self.ahead.take()?;
+        let mut h = FileHeader::new(
+            kind::LOG_SEGMENT,
+            a.id.generation,
+            a.id.file_id,
+            a.created_at,
+            a.id.store_id,
+        );
+        h.base_sequence = base_sequence;
+        if let Err(e) = a.file.write_at(&h.encode(), 0) {
+            self.fail(FaultOp::Write, &a.path, &e);
+            return None;
+        }
+        Some(OpenSegment {
+            file: a.file,
+            id: a.id,
+            len: a.len,
+            write_offset: HEADER_LEN as u64,
+            summary: None,
+            has_entries: false,
+            index: BTreeMap::new(),
+            in_use_since: now,
+        })
+    }
+
+    /// Makes `next` the segment in use; the old one, if it holds a batch, goes to be sealed.
+    fn roll_to(&mut self, next: OpenSegment) {
+        self.stats.open_file_id = Some(next.id.file_id);
+        if let Some(old) = self.open.replace(next)
+            && let Some(summary) = old.summary
+        {
+            self.seals.push(SealJob {
+                end: old.write_offset,
+                file: old.file,
+                id: old.id,
+                log_dir: self.log_dir.clone(),
+                summary,
+                records: old.index.into_values().collect(),
+                has_entries: old.has_entries,
+            });
+        }
+    }
+
+    /// Commits one batch of `calls`: write, sync, mark update, the mark sync where required, then the
+    /// acknowledgements. Returns the calls unchanged if the batch needs the next segment and none is created yet.
+    fn commit(
+        &mut self,
+        calls: Vec<Call>,
+        now: Duration,
+        wall: i64,
+    ) -> Result<Vec<Done>, Vec<Call>> {
+        let first = self.last_sequence + 1;
+        let commit_time = wall.max(self.last_commit_time);
+        let content = BatchContent {
+            first_sequence: first,
+            received_at: commit_time,
+            items: calls.iter().flat_map(|c| c.items.iter().cloned()).collect(),
+        };
+        // Valid calls always form a valid batch of at most 8 MiB (each call was encoded when made, and the queue
+        // closes a batch at `max_batch_bytes`); anything else is a defect, not a write failure.
+        let builder = content.builder().expect("a batch of valid calls encodes");
+        let batch_len = builder.data_len() + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64;
+        let fits = self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.len - o.write_offset >= batch_len);
+        let mut next = None;
+        if !fits {
+            if self.ahead.is_none() {
+                return Err(calls);
+            }
+            next = self.take_into_use(first, now);
+            if next.is_none() {
+                return Ok(Self::unknown(&calls));
+            }
+        }
+        let seg = next
+            .as_ref()
+            .or(self.open.as_ref())
+            .expect("a segment in use");
+        let at = seg.write_offset;
+        let bytes = builder
+            .encode(&seg.id, at, commit_time)
+            .expect("a batch of valid calls encodes");
+        let path = maint::segment_path(&self.log_dir, &seg.id, false);
+        if let Err(e) = seg.file.write_at(&bytes, at) {
+            self.fail(FaultOp::Write, &path, &e);
+            return Ok(Self::unknown(&calls));
+        }
+        self.last_sync_start = Some(now);
+        self.stats.syncs += 1;
+        let seg = next
+            .as_ref()
+            .or(self.open.as_ref())
+            .expect("a segment in use");
+        if let Err(e) = seg.file.sync_data() {
+            self.fail(FaultOp::Sync, &path, &e);
+            return Ok(Self::unknown(&calls));
+        }
+        let last = content.last_sequence();
+        // The batch is on stable storage: account for it in the segment's summary and index.
+        let intervals = &mut self.intervals;
+        let max_series_id = &mut self.max_series_id;
+        let seg = next
+            .as_mut()
+            .or(self.open.as_mut())
+            .expect("a segment in use");
+        seg.write_offset += bytes.len() as u64;
+        seg.summary = Some(match seg.summary {
+            None => SealSummary {
+                entry_count: last + 1 - first,
+                first_sequence: first,
+                last_sequence: last,
+                first_commit_time: commit_time,
+                last_commit_time: commit_time,
+                batch_count: 1,
+            },
+            Some(s) => SealSummary {
+                entry_count: s.entry_count + (last + 1 - first),
+                last_sequence: last,
+                last_commit_time: commit_time,
+                batch_count: s.batch_count + 1,
+                ..s
+            },
+        });
+        seg.has_entries |= builder.block_types().any(|t| t == block_type::ENTRIES);
+        let (file_id, offset) = (seg.id.file_id, seg.write_offset);
+        for item in &content.items {
+            match item {
+                Item::Fact(r) => {
+                    let reach = reach(r.t, intervals.get(&r.series_id));
+                    let rec = seg.index.entry(r.series_id).or_insert(IndexRecord {
+                        series_id: r.series_id,
+                        fact_count: 0,
+                        min_t: r.t,
+                        max_t: reach,
+                    });
+                    rec.fact_count += 1;
+                    rec.min_t = rec.min_t.min(r.t);
+                    rec.max_t = rec.max_t.max(reach);
+                }
+                Item::Entry(Entry::Definition(d)) => {
+                    *max_series_id = (*max_series_id).max(d.id);
+                    if let Some(i) = &d.interval {
+                        intervals.insert(d.id, i.clone());
+                    }
+                }
+                Item::Entry(_) => {}
+            }
+        }
+        if let Some(n) = next {
+            self.roll_to(n);
+        }
+        self.last_sequence = last;
+        self.last_commit_time = commit_time;
+        self.stats.bytes += bytes.len() as u64;
+        self.stats.batches += 1;
+        self.stats.max_series_id = self.max_series_id;
+        // The mark moves: one positional write of the slot that does not hold the mark (A.10 Update).
+        let slot = MarkSlot {
+            counter: self.mark_slot.counter + 1,
+            file_id,
+            offset,
+            last_sequence: last,
+            max_series_id: self.max_series_id,
+            boot_id: self.boot_id,
+            ..self.mark_slot
+        };
+        let mp = self.mark_path.clone();
+        if let Err(e) = self
+            .mark
+            .write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64)
+        {
+            self.fail(FaultOp::MarkWrite, &mp, &e);
+            return Ok(Self::unknown(&calls));
+        }
+        self.mark_slot = slot;
+        self.mark_next_slot = 1 - self.mark_next_slot;
+        self.mark_dirty = true;
+        let forced = matches!(self.mark_mode, MarkSyncMode::EveryCommit { .. })
+            || calls.iter().any(Call::has_non_fact);
+        if forced {
+            self.sync_mark(now);
+            if self.fault.is_some() {
+                return Ok(Self::unknown(&calls));
+            }
+        }
+        self.stats.durable = Position {
+            generation: self.generation,
+            sequence: last,
+        };
+        let mut seq = first;
+        Ok(calls
+            .iter()
+            .map(|c| {
+                let ack = Ack {
+                    first: Position {
+                        generation: self.generation,
+                        sequence: seq,
+                    },
+                    last: Position {
+                        generation: self.generation,
+                        sequence: seq + c.sequences - 1,
+                    },
+                };
+                seq += c.sequences;
+                (c.id, Ok(ack))
+            })
+            .collect())
+    }
+
+    fn unknown(calls: &[Call]) -> Vec<Done> {
+        calls
+            .iter()
+            .map(|c| (c.id, Err(CommitError::OutcomeUnknown)))
+            .collect()
+    }
+
+    /// Clean shutdown: syncs the mark if it moved since its last sync. Nothing is written after a fault. Seal jobs
+    /// are the caller's to finish first.
+    pub fn shutdown(&mut self, now: Duration) -> Result<(), Fault> {
+        if let Some(f) = &self.fault {
+            return Err(f.clone());
+        }
+        if self.mark_dirty {
+            self.sync_mark(now);
+        }
+        self.fault.clone().map_or(Ok(()), Err)
+    }
+
+    /// The mark as last written (on stable storage once synced).
+    pub fn mark(&self) -> MarkSlot {
+        self.mark_slot
+    }
+}
