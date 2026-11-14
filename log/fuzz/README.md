@@ -12,7 +12,7 @@ cargo +nightly fuzz run segment
 
 | Target | Feeds arbitrary bytes to |
 |---|---|
-| `segment` | `kvik_log::fuzz::decode_all`: the segment reader to the end and up to several marks, the file header, the mark slots and each body decoder; it also checks that batches and regions are ordered, disjoint and below the limit |
+| `segment` | `kvik_log::fuzz::decode_all`: the segment reader to the end and up to several marks, the content of every batch it accepts, the file header, the mark slots and each body decoder (facts and entries included, plain and canonical); it also checks that batches and regions are ordered, disjoint and below the limit |
 
 Its `Cargo.lock` is committed, so `libfuzzer-sys` is pinned.
 

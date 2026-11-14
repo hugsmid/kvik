@@ -4,6 +4,9 @@ use crate::batch::SegmentIdentity;
 use crate::block::{BLOCK_HEADER_LEN, block_type};
 use crate::body::{Commit, DataPrefix, SegmentIndex, Trailer, decode_end_marker};
 use crate::bytes::{u32_at, u64_at};
+use crate::content::BatchContent;
+use crate::entries::EntriesBlock;
+use crate::facts::FactsBlock;
 use crate::header::{FileHeader, HEADER_LEN};
 use crate::mark::read_mark;
 use crate::scan::{ScanLimit, ScanReport, Tail, scan};
@@ -37,9 +40,20 @@ pub fn decode_all(data: &[u8]) {
     ];
     if let Ok(r) = scan(data, &id, ScanLimit::End) {
         check(&r, len, true);
-        if let Some(s) = &r.seal {
-            assert!(s.end <= len && s.trailer_offset < s.end && s.start <= s.trailer_offset);
-            let _ = s.file_crc_matches(data);
+        for b in &r.batches {
+            // The reader applied the body checks, so the content decodes; canonical content encodes again.
+            assert!(
+                BatchContent::decode(b).is_ok(),
+                "accepted batch at {} does not decode",
+                b.offset
+            );
+            if let Ok(c) = BatchContent::decode_canonical(b) {
+                assert!(
+                    c.encode(&id, b.offset, b.commit.commit_time).is_ok(),
+                    "batch at {}",
+                    b.offset
+                );
+            }
         }
     }
     for m in marks {
@@ -62,6 +76,12 @@ pub fn decode_all(data: &[u8]) {
     let _ = SegmentIndex::decode(body);
     let _ = Trailer::decode(body);
     let _ = decode_end_marker(body);
+    for d in [data, body] {
+        let _ = FactsBlock::decode(d);
+        let _ = FactsBlock::decode_canonical(d);
+        let _ = EntriesBlock::decode(d);
+        let _ = EntriesBlock::decode_canonical(d);
+    }
 }
 
 /// Batches and regions are in file order, do not overlap and lie below `limit`; sequences increase.

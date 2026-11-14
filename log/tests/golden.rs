@@ -115,6 +115,74 @@ fn generate() -> Vec<(&'static str, Vec<u8>)> {
         segment(ID, LEN, 1, &batches).0.into_bytes(),
     ));
 
+    // Unknown elements inside bodies (A, common rules): ignorable ones are skipped; critical ones are refused.
+    let facts = |extra: (u8, u8, Vec<u8>)| {
+        let mut b = facts_raw(
+            1,
+            &[
+                (1, 0, vec![1, 0, 0, 0]),
+                (2, 0, T0.to_le_bytes().to_vec()),
+                (5, 0, vec![1]),
+                (6, 0, 20.5f64.to_bits().to_le_bytes().to_vec()),
+                extra,
+            ],
+        );
+        kvik_log::body::DataPrefix {
+            first_sequence: 2,
+            received_at: r,
+            count: 1,
+        }
+        .write(&mut b);
+        b
+    };
+    let alias_with = |extra: (u16, Vec<u8>)| {
+        let (t, mut fields) = alias(1, "room/temp");
+        fields.push(extra);
+        (t, fields)
+    };
+    let with_blocks = |blocks: Vec<(u8, Vec<u8>)>| {
+        let mut b = BatchBuilder::new();
+        for (t, body) in blocks {
+            b.push(t, body).unwrap();
+        }
+        segment(ID, LEN, 1, &[three_batches().remove(0), (b, r + 1_000)])
+            .0
+            .into_bytes()
+    };
+    let ignorable_entry: support::Entry = (0x90, vec![(1, b"later".to_vec())]);
+    files.push((
+        "unknown-ignorable-content.open",
+        with_blocks(vec![
+            (block_type::FACTS, facts((0x90, 0, b"ignorable".to_vec()))),
+            (
+                block_type::ENTRIES,
+                entries_body(
+                    3,
+                    r,
+                    &[ignorable_entry, alias_with((0x8001, b"ignorable".to_vec()))],
+                ),
+            ),
+        ]),
+    ));
+    files.push((
+        "unknown-critical-column.open",
+        with_blocks(vec![(block_type::FACTS, facts((0x10, 0, vec![])))]),
+    ));
+    files.push((
+        "unknown-critical-entry.open",
+        with_blocks(vec![(
+            block_type::ENTRIES,
+            entries_body(2, r, &[(0x10, vec![])]),
+        )]),
+    ));
+    files.push((
+        "unknown-critical-field.open",
+        with_blocks(vec![(
+            block_type::ENTRIES,
+            entries_body(2, r, &[alias_with((0x0100, vec![]))]),
+        )]),
+    ));
+
     // A mark with one torn slot: slot 0 (counter 7) names the end of the second batch of `in-use.open`; slot 1
     // (counter 8, the third batch) was torn while being written.
     let e = ends_of(&files[1].1);
@@ -254,6 +322,36 @@ fn golden_files_decode_to_what_they_show() {
             ..
         }
     ));
+
+    let b = read("unknown-ignorable-content.open");
+    let r = scan(&b, &ID, ScanLimit::End).unwrap();
+    assert_eq!(seqs(&b), [(1, 1), (2, 4)]);
+    let content = kvik_log::content::BatchContent::decode(&r.batches[1]).unwrap();
+    assert_eq!(content.items.len(), 3);
+    assert!(matches!(
+        content.items[1],
+        kvik_log::content::Item::Entry(kvik_log::entries::Entry::Ignored { entry_type: 0x90 })
+    ));
+    for (name, element) in [
+        ("unknown-critical-column.open", Element::Column(0x10)),
+        ("unknown-critical-entry.open", Element::EntryType(0x10)),
+        (
+            "unknown-critical-field.open",
+            Element::Field {
+                entry_type: 3,
+                field: 0x0100,
+            },
+        ),
+    ] {
+        let b = read(name);
+        let e = scan(&b, &ID, ScanLimit::End)
+            .map(|r| r.batches.len())
+            .unwrap_err();
+        assert!(
+            matches!(e, FormatError::Unsupported { element: el, .. } if el == element),
+            "{name}: {e:?}"
+        );
+    }
 
     // The mark falls back to its older slot; a reader reads `in-use.open` only up to it.
     let (slot, mark) = read_mark(&read("torn-slot.mark"), &STORE).unwrap().unwrap();

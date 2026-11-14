@@ -273,3 +273,30 @@ pub fn raw_batch_reserved(
 pub fn put(image: &mut [u8], offset: u64, bytes: &[u8]) {
     image[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
 }
+
+/// A facts body laid out like the canonical encoder (prefix, directory of 12-byte entries, payloads aligned to 8 in
+/// directory order) but with any columns `(id, encoding, payload)` and any directory values, for tests of the checks.
+pub fn facts_raw(row_count: u32, columns: &[(u8, u8, Vec<u8>)]) -> Vec<u8> {
+    let mut body = vec![0u8; 24];
+    DataPrefix {
+        first_sequence: 1,
+        received_at: T0,
+        count: row_count,
+    }
+    .write(&mut body);
+    body[20] = columns.len() as u8;
+    body[21] = 12;
+    let dir = body.len();
+    body.resize(dir + 12 * columns.len(), 0);
+    for (i, (id, enc, payload)) in columns.iter().enumerate() {
+        pad_to(&mut body, 8);
+        let e = dir + 12 * i;
+        body[e] = *id;
+        body[e + 1] = *enc;
+        let offset = body.len() as u32;
+        body[e + 4..e + 8].copy_from_slice(&offset.to_le_bytes());
+        body[e + 8..e + 12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(payload);
+    }
+    body
+}
