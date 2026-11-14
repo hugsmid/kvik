@@ -227,9 +227,10 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
    per-second data: the own encoding was 8–14 % smaller than Parquet with ALP for decimal readings stored as
    `f64`, but only about 1 % smaller when they are declared as scaled `i64`. On two non-decimal shapes it was 13 %
    smaller than the best Parquet variant on one and 23 % larger than Parquet's dictionary encoding on the other
-   ([results](docs/measurements/2.1-chunk-encodings.md)). Whether compacted data stays in its own format or in
-   Parquet is decided at later gates. Roadmap item 2.2 measured commit and sync latency, group commit, a failed
-   sync and a full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)).
+   ([results](docs/measurements/2.1-chunk-encodings.md)). Gate 2.3 kept the own format for compacted data, with
+   per-value decimal exceptions and a compressed XOR fallback; gate 10.2 confirms it against Parquet at scale, and
+   Parquet is for export only. Roadmap item 2.2 measured commit and sync latency, group commit, a failed sync and a
+   full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)).
 4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) will be
    built behind injectable clock and file-system seams and tested differentially against the model, with crash points,
    failed syncs and full disks injected.
