@@ -16,24 +16,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
 | Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
 | Q-52 | §8 Corrupt block, invariant 10, §3 Recovery | Manifest records as single copies |
-| Q-60 | §5.1 density rule, §5.7, §2.1 parameters, invariant 8 | Calendar nodes when the expected interval changes |
-| Q-61 | §4 Order, At-least-once, Consumer state, §6 Latch | Identity of a condition delivery, and where its sequence is kept |
-| Q-62 | §4 Overflow, Replay, §6 Cadence | Condition transitions while a consumer catches up after overflow |
-| Q-63 | §6 Restart and resume, Conditions, Latch, invariant 16 | Condition state now, for conditions with memory |
-| Q-64 | §4 Routing, §8 Continuous backup, §8 Restore step 1 | Routing changes before a restore's checkpoint |
-| Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
-| Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
-| Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
-| Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset |
-| Q-76 | §5.7, §2.1 interval starts, §5.4 displaced readings, row 21, invariant 8 | Whether a tzdata change is a log entry |
-| Q-77 | §5.7, §2.1 interval starts, row 20 | A day whose midnight occurs twice |
-| Q-78 | §4 Routing, Concurrency, row 33 | How routing compilation knows the series a consumer emits |
 | Q-79 | §3 Recovery rules 2 and 4, §11 Health, row 11a | A lost range found by a recovery whose sync fails |
-| Q-80 | §2.1 `interval zone`, §5.4 displaced readings, §5.7, §8 Restore | An interval zone that the tzdata version in force does not know, or that has become a link |
-| Q-81 | §6 Aggregates (interval series), §5.7 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone |
 | Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
+| Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
+| Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -81,8 +69,9 @@ in force at `t` or at `now` applies is not stated. (5) Already so in the current
 refresh instant, since the writer's monotonic clock is not in the log.
 
 ## Q-33 — Registry entries and derived files after a lost range
-**Scenario.** A lost range (§3 Recovery) holds the definition of a series, a parameter change, an alias or a routing
-change; later complete batches, which are kept, hold facts of that series. The registry file is compacted from the
+**Scenario.** A lost range (§3 Recovery) holds the definition of a series, a parameter change, an alias, a routing
+change, or a site-zone or tzdata entry (registry entries since Q-64 and Q-76, §2.1); later complete batches, which
+are kept, hold facts of that series. The registry file is compacted from the
 log and may not hold the lost entry. Tree files and the revised-key index were built over facts that are now lost,
 so rebuilding from the log no longer equals the live structures (invariant 8). The same holds for a lost range that a
 restore records when the bucket has lost or corrupted a listed file (§8 Restore, Failures and end). A lost log segment
@@ -100,7 +89,7 @@ site-zone entry was not covered.
 **Needed.** What happens to kept facts whose registry entries are lost, how derived files are re-verified, and how
 invariants 1 and 8 read with lost ranges.
 **Proposal.** After a lost range or a truncated tail the kept log is the whole truth: entries in the lost positions
-(definitions, parameter and site-zone changes, aliases, retirements, routing changes) no longer apply and are not
+(definitions, parameter and site-zone changes, tzdata entries, aliases, retirements, routing changes) no longer apply and are not
 appended again. A kept fact whose series has no definition in the kept log is an orphaned fact: kept in the log and
 in compaction, outside views, trees and delivery, counted per id and available for re-ingest. The lost-range record
 carries an id floor (the highest id in the registry file, the checkpoints, the kept log and every earlier floor,
@@ -163,8 +152,9 @@ is corrected by a revision or withdrawn the same way, and per-series statistics 
 **Objections to the proposal.** (b) Under §12 D6 the withdrawing bad reading is ignored and the previous value's hold
 continues up to S, so withdrawing the 14:00 value of a half-hourly price credits the 13:30 price across 14:00 with
 full coverage; "coverage ends where the remaining values' validity ends" holds only at the tail of an issue. On a
-series that is not versioned, a later unchecked replay of the withdrawn value (§12 D5) can revert the withdrawal,
-which is the hazard §2.4 gives for declaring a series versioned. (c) Neither a revision nor a withdrawal lowers the
+series that is not versioned, a later unchecked replay of the withdrawn value (§12 D5) can revert the withdrawal
+where the key's revised-key index entry is incomplete (§2.4, since Q-72), which is the hazard §2.4 gives for
+declaring a series versioned. (c) Neither a revision nor a withdrawal lowers the
 latest recorded `t`, so a wrong value for 2099 disables the duplicate fast path (§2.4) for good, makes every fact
 during §8 Restore step 2 `duplicates_unchecked`, and keeps the latest-`t` statistic wrong. The same holds on an
 observed series: since Q-74 the lateness reference leaves out a `future` fact, but the latest recorded `t` still
@@ -265,216 +255,6 @@ corruption: fetch the record from deep when it has been uploaded, otherwise read
 **Needed.** A way to tell a torn manifest tail from a corrupt record, and what a corrupt record that was never
 uploaded does to the facts and positions it describes.
 
-## Q-60 — Calendar nodes when the expected interval changes
-**Scenario.** A calendar node is stored only where the series' expected interval in force qualifies it for a stored
-15-minute level (§5.1, §5.7). (a) The expected interval changes from 30 s to 5 minutes by a parameter entry effective
-at 14:07, which is not on a 15-minute boundary: the quarter-hour 14:00–14:15 straddles the change, and it is not said
-whether it qualifies, nor so whether that day stores a calendar node. (b) A parameter change with an effective time
-in the past (§2.1) moves the threshold for days whose calendar nodes are already built: it would create nodes for
-spans that had none, or delete nodes already stored, and a rebuild from the log must give the same set (invariant 8).
-**Model.** Every parameter is fixed for the life of a series (no parameter entries), so neither case arises; the
-density rule is applied per series (`tests/rules.rs` `s5_1_density_rule`).
-**Needed.** Whether a quarter-hour qualifies by the expected interval in force at its start, throughout, or by some
-other rule, and how a change with a past effective time rebuilds the calendar nodes it affects.
-**Proposal.** (a) A node of any level is stored only for a span throughout which the expected interval in force
-qualifies; a minute or quarter-hour in which a change crosses the threshold stores no node and is answered from its
-facts (§5.1, §5.7 already say "throughout" for calendar nodes; row 20a for days). (b) A parameter entry with a past
-effective time is applied to the tree like late data (§5.6): every stored node of the series from its effective time
-on is recomputed from facts under the parameters now in force, removed where its span no longer qualifies and created
-where it newly does, with results flagged `summary_stale` until that is complete and the tree file's checkpoint kept
-below the entry's position; nodes over detail that is not local are flagged individually and recomputed when their
-detail is fetched. A new row 20b and an exception in invariant 8 ("once no recompute is pending") would follow.
-**Objections.** (1) While the recompute is pending only results are flagged, not nodes, so invariant 5 fails for nodes
-still computed under the old parameters; invariant 8's "once no recompute is pending" conflicts with counting the
-recompute complete when nodes over non-local detail are only flagged, and a row 20b "equal to a rebuild" fails for
-them. (2) "Created where it newly does" is undefined over detail that is not local: a 120 s gauge corrected to 30 s
-with an effective time six months back, its last year of detail in deep, cannot have its new 15-minute nodes built
-without fetching. (3) Per-span density leaves holes: a quarter-hour with no node whose detail is in deep, between two
-window edges whose detail is local, cannot be evaluated without off-machine data, while §6 Old spans only moves
-edges. (4) Already so in the current text: §5.6's "every higher node is the left-to-right merge of its children" is
-undefined for a quarter-hour whose 1-minute children are stored for only part of its span.
-
-## Q-61 — Identity of a condition delivery, and where its sequence is kept
-**Scenario.** (a) A threshold funnel is evaluated on a routed fact at position 0:7 (§6 Cadence) and fires. §4 Order
-gives an identity only to fact deliveries (the position) and timer deliveries (the last committed position plus a
-per-funnel sequence); `api.md` gives "position, or funnel and sequence for timer deliveries". Identified by 0:7, the
-delivery would share its identity with the fact delivery at 0:7, and two funnels firing on one fact would share one.
-(b) A timer delivery `(F, 5)` is taken but not confirmed, and the engine crashes. The latch (§6) holds the state
-and position, not the sequence, and is never ahead of confirmation (invariant 13), so a sequence restored from it
-starts again at 5: the next, different transition is `(F, 5)`, which a consumer de-duplicating by `(funnel,
-sequence)` (§4 At-least-once) drops. Nothing else on disk is said to hold the sequence. (c) A store is restored
-(§8): cursor files are not backed up, so nothing tells the new store which sequences were issued, and its first
-transition is `(F, 1)` again, which a consumer that kept its de-duplication memory across the restore drops.
-**Model.** Every condition delivery, on a routed fact or on the timer, is identified by `(generation, funnel,
-sequence)`, the generation being the store's at issue, and carries the last committed position at evaluation. The
-sequence is kept on disk when the delivery is issued, so it is never issued twice for a funnel within a generation
-(`q61_condition_delivery_sequence_survives_a_crash`), and a restore, which starts a generation, starts the sequences
-again without repeating an identity (`q61_condition_delivery_identity_includes_the_generation`).
-**Needed.** The identity of a delivery from an evaluation on a fact, where the per-funnel sequence is persisted (with
-the mark, in the cursor file at issue, or a sequence that a consumer forgets on `resync`), and how it continues after
-a restore.
-
-## Q-62 — Condition transitions while a consumer catches up after overflow
-**Scenario.** A consumer has a fact funnel and a threshold funnel; its queue is full, so it is catching up from the
-log (§4 Overflow). Meanwhile a routed fact makes the threshold fire. The transition is not in the log, so catch-up
-cannot deliver it, the queue has no room, and overflow is not among the `resync` triggers (§4 Resync); delivered
-later it would follow facts committed after it. Separately, catch-up reads "from after the last position already
-enqueued"; if that position's segment has left the local tiers meanwhile (§8), §8 Behind consumers ("never downloads
-from deep for catch-up") speaks only of a cursor.
-**Model.** The condition keeps being evaluated on live facts and on the timer, but nothing is sent while the
-consumer is catching up and the last emitted state is unchanged; on re-attaching to live the consumer receives the
-present state as a delivery if it differs from the last state emitted to it
-(`q62_transition_during_overflow_sent_on_reattach`). A transition that finds a live consumer's queue full switches it
-to catch-up in the same way. Catch-up after overflow reads an entry wherever it is held.
-**Needed.** What a consumer receives for transitions during catch-up after overflow, and what catch-up does when its
-position is no longer local.
-
-## Q-63 — Condition state now, for conditions with memory
-**Scenario.** §6 Restart and resume rebuilds the operator "as of now" and compares "the condition state now" with the
-latch. (a) A threshold with activation 50 and clear 40 whose value now is 45: its state depends on the last crossing,
-which the value now does not show, and finding that crossing in the tree means replaying past evaluations, which
-depend on the cadence and on data that arrived late; after a restore there is no latch either. (b) For an on-change
-condition, "differs from the latch" is not said to use the dead-band. (c) A condition funnel added at run time has no
-latch; it is not said whether it announces its present state.
-**Model.** `Runner::resume`: a threshold is true above its activation level, false below its clear level and, between
-them, keeps the latched state (false with no latch) (`q63_threshold_between_levels_resumes_from_the_latch`); an
-on-change condition reports the value now, a transition if it moved beyond the dead-band from the latched value. A
-funnel added at run time starts with a fresh condition and announces nothing until it is first evaluated; a removed
-funnel's latch is dropped, and a latch belongs to one incarnation of a funnel id. Held-for is rebuilt from the tree as
-of now (§6): true when the value was above throughout the last N, judged exactly on the facts and the values they hold
-(`tests/rules.rs` `s6_held_for_true_while_down_delivered_in_resync`, `s6_held_for_rebuilt_exactly_from_the_facts`);
-stale-for follows Q-16.
-**Needed.** How a threshold's state between its levels is determined on resume, the dead-band rule for on-change, and
-whether a new funnel announces its state.
-
-## Q-64 — Routing changes before a restore's checkpoint
-**Scenario.** A route is added at 0:2; a tree checkpoint is taken at 0:5 and the log before it is compacted. A restore
-downloads the checkpoint, with the registry file, and the log segments after 0:5 (§8 Restore step 1), and accepts
-ingest. Routing changes are log entries (§4 Routing), and the checkpoint is not said to carry them, so until the chunk
-holding 0:2 is back (step 3) the route is unknown and new facts are not delivered by it.
-**Model.** Routes are taken from the entries that are local; a route added before the checkpoint is not in force until
-the file holding its entry is downloaded
-(`q64_route_before_checkpoint_not_in_force_until_its_entry_is_back`).
-**Needed.** Whether a tree checkpoint (or the registry file it carries) holds the routing table as of its position.
-
-## Q-70 — Chunk indexes after a restore
-**Scenario.** §5.6 relies on chunk indexes always being on hot, so the engine knows whether a minute has facts off the
-machine. After a restore, step 3 leaves files that the restore record does not place on hot or cold in deep, and the
-tree checkpoint carries no chunk indexes. Once `restoring` ends, a late fact for a minute whose chunk stayed in deep is
-folded from the local facts only, giving a wrong node that is not flagged `summary_stale`; an identical repeat of a
-fact in that chunk is recorded without being counted `duplicates_unchecked`; and §6 Old spans cannot tell that an
-edge's detail is off the machine.
-**Model.** Not modelled; a restore brings every file back.
-**Needed.** Where chunk indexes come from after a restore (carried by the tree checkpoint, listed with the files in
-the restore record, or downloaded in step 1 or step 3), and what holds until they are local.
-
-## Q-71 — A log segment and the chunks compacted from it hold the same positions in one epoch
-**Scenario.** Log segment L holds positions 1–10 and is sealed. Compaction writes a current chunk C and a revision chunk
-R from it and publishes them in one record (§7). Log segments are never retired by compaction (§7) and stay on hot for
-90 days (§8 Tiers, Eviction at 90 days), so the epoch of that record lists L, C and R, and position 3 is held by L and
-by C or R. §7 Manifest and invariant 14 say that an epoch never lists two live files holding the same position. A
-restore installs log segments and chunks compacted from them in the same way (§8 Restore step 3: "A position present
-in two files is one fact").
-**Model.** Invariant 14 is checked among compacted files (current and revision chunks) at every epoch; log segments
-stay listed beside the chunks compacted from them. A sealed segment whose positions live chunks hold, or after a
-restore the chunks it will bring back, is not compacted again (`q71_log_segment_and_its_chunks_listed_in_one_epoch`).
-**Proposal.** §7 Manifest and invariant 14: "No manifest epoch lists two live compacted files holding the same
-position. A log segment holds the same positions as the chunks compacted from it until it leaves (§8)."
-
-## Q-72 — Whether the revised-key index is consulted when the current fact is off the machine
-**Scenario.** (a) A series that is not versioned records A and then a correction B for one `(series, t)`; fill
-pressure moves the detail holding both off every local tier. An adapter replays A. §2.4 says that if the current fact
-for a key is on no local tier the fact is recorded and counted `duplicates_unchecked`, and that such a repeat "can
-revert a correction that differs in value"; so A is recorded and becomes current. But the revised-key index, which
-is hot and never moves, holds A's value and quality, so the check could run and drop A; and §8 Restore step 2 drops a
-fact that matches an entry of the index, so the same replay is dropped during a restore, from the checkpoint's index.
-(b) The versioned twin: A (`changed_at` 1), B (2), both off every local tier; a replay of A matches "a fact off every
-local tier" by `changed_at`, so §2.4 records it unchecked, although the index holds it. Row 2c allows both outcomes.
-**Model.** Outside a restore it follows §2.4 as written: (a) records A unchecked and A becomes current; (b) records A
-unchecked, outranked, and B stays current. During a restore the replay is dropped
-(`q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it`,
-`tests/rules.rs` `s8_checkpoint_carries_the_revised_key_index`).
-**Needed.** Whether the check compares with the revised-key index whenever it holds the key, so that "on no local
-tier" applies only to a key with a single fact, or whether the unchecked rule applies whatever the index holds.
-
-## Q-75 — Local days around a site-zone change to another offset
-**Scenario.** The site zone is Asia/Tokyo (+09) and an entry moves it to America/New_York (−04 in June) effective
-2026-06-01T00:00Z. §5.7 says "each local day uses the zone in force at its start". 1 June starts at
-2026-05-31T15:00Z in Tokyo, when Tokyo is in force, and at 2026-06-01T04:00Z in New York, when New York is in force:
-both fit. 31 May (Tokyo) ends at 15:00Z and 1 June (New York) starts at 04:00Z if New York is taken, so 13 hours lie
-in no local day and no month; if Tokyo is taken, 1 June is followed by a second 1 June. The other way round (New York
-to Tokyo at the same instant), 1 June starts at 04:00Z in New York, when Tokyo is in force, and at 05-31T15:00Z in
-Tokyo, when New York is in force: no zone fits, while 2 June (Tokyo, from 06-01T15:00Z) overlaps 1 June (New York, to
-06-02T04:00Z) by 13 hours. Two entries less than a day apart, or with the same effective time, have the same problem,
-and so has "today" for a calendar window when `now` falls in such a gap or overlap. A month spanning the change does
-not tile with its days.
-**Model.** `calendar::Zoning::Site`: a local day is taken in the latest entry's zone under which it starts at or
-after that entry's effective time, else in the store's zone (so New York for 1 June in the first case; New York for
-1 June and Tokyo from 2 June in the second); of two entries with the same effective time the later in the log;
-"today" is the latest date whose day starts at or before `now`; a month's result is the window from its first day's
-start to its last day's end; a month node is stored only where its days are contiguous, and a day node that overlaps
-an earlier input is not taken (`q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap`). The zone before
-the first entry is not open: §5.7 ("the site zone is a log entry"), D3 and invariant 8 make it the store's, recorded
-at creation; opening or restoring a store configured with a zone other than its zone in force is refused (`tests/rules.rs`
-`s5_7_store_keeps_its_site_zone_and_refuses_another_at_open`).
-**Needed.** Which zone a local day takes when its start fits two zones or none, and where the hours between the last
-day of the old zone and the first of the new one go.
-**Proposal.** A site-zone entry takes effect at a local midnight of its new zone (refused otherwise). The local day in
-progress at the effective time ends there; the new zone starts with its first date whose midnight is at the
-effective time, and a date already begun in the old zone is not taken again. Days then tile, so months do.
-
-## Q-76 — Whether a tzdata change is a log entry
-**Scenario.** §5.7 says a tzdata change "rebuilds the affected days and is logged", and row 21 says "logged". If that
-means a message, the calendar nodes depend on the host's tzdata, which the log does not hold: a restart after an
-upgrade, a rebuild from the log (invariant 8) or a restore onto a host with another version builds other nodes than
-the live ones, and the record of which days changed is lost.
-**Settled by the text.** Until the rebuild, a stored node of the old version is no input to any calendar result,
-named-zone or site-zone: §5.7 makes a result a window evaluation over the day's span, and a node built for the old
-span cannot stand in for it (invariant 7).
-**Model.** The reading that the change is a log entry: installing a new release (`Model::install_tzdb`) writes
-nothing, and calendar files keep the version the log names (the store header's at creation, then the latest tzdata
-entry), also across a restart; `Model::rebuild_calendars` writes a tzdata entry with the new version, rebuilds only
-the days and months whose nodes differ and logs them (`Model::calendar_log`); a build from the log uses the version
-the log names (`q76_tzdata_change_is_a_log_entry_written_by_the_rebuild`, `tests/edge_cases.rs`
-`row_21_tzdata_change_rebuilds_the_affected_days`).
-**Needed.** Whether "is logged" means a log entry.
-**Proposal.** §5.7: "a tzdata change is recorded as a log entry naming the new version; it rebuilds the affected days
-and is reported in health. Calendar files are built with the version the log names." A host whose tzdata is older
-than the logged version keeps the calendar files it has and reports it. Since Q-45 the tzdata version in force also
-places the interval starts of a calendar-length interval series and decides which of its readings are displaced
-(§2.1, §5.4, rows 45 and 46); this question decides only which version that is.
-
-## Q-77 — A day whose midnight occurs twice
-**Scenario.** Havana falls back from 01:00 (−04) to 00:00 (−05) on 1 November 2026, so local midnight of 1 November
-is both 04:00 and 05:00 UTC. §5.7 says where a day starts when its midnight does not exist, not when it exists twice.
-Taking the later instant puts the first hour of 1 November into 31 October.
-**Model.** The earlier instant: 1 November has 25 hours and 31 October ends at 04:00 UTC
-(`q77_day_whose_midnight_occurs_twice_starts_at_the_earlier`). A midnight inside a gap starts the day when the gap
-ends, also when the gap straddles midnight (Toronto, 31 March 1919, 23:30 to 00:30: the day starts at 04:30 UTC,
-`tests/rules.rs` `s5_7_day_spans_pinned`).
-**Needed.** Which instant starts a day whose midnight occurs twice.
-**Proposal.** §5.7: "A day whose local midnight occurs twice starts at the earlier." Since Q-45 the same rule places
-a day start of a `day` interval series that occurs twice (§2.1); its intervals run from start to start, so they tile
-whichever instant is taken.
-
-## Q-78 — How routing compilation knows the series a consumer emits
-**Scenario.** Consumer A routes `plant/*/power` and, from each delivery, emits a smoothed value on
-`plant/line-1/power-smoothed`. The pattern matches its own output, so every reading A emits is routed back to A, which
-emits again: one batch per commit, without end. §4 Routing says "Compilation rejects a cycle where a consumer's
-emitted series routes back to it", and row 33 "cyclic routes rejected", but nothing tells the engine which series a
-consumer emits: `try_emit` is a call on the store (`api.md` Writing), a reading carries no emitter, and a funnel
-declares only what its consumer receives. The cycle can also be indirect (A emits a series routed to B, which emits
-one routed to A), or be closed later by a run-time route or by a definition entry that a pattern matches.
-**Model.** A consumer emits through the store like any adapter; no cycle is detected, and a route from the series a
-consumer emits back to it is accepted (`tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected`).
-**Needed.** How the engine learns the series a consumer emits, and which changes the check runs on (start, route
-changes, definition entries matched by a pattern).
-**Proposal.** A consumer declares the series it may emit (`emits: Select`, ids or name patterns, default none) with
-its other configuration, and emits through its own handle, which refuses and counts a reading on a series outside
-it. Compilation builds the graph from each consumer through its emitted series to the consumers they are routed to,
-and refuses a route change that closes a cycle, naming it. A definition entry that would close one through patterns
-is not routed to the funnel that closes it, and is reported.
-
 ## Q-79 — A lost range found by a recovery whose sync fails
 **Scenario.** After a power loss, recovery finds a corrupt batch below the old boot's mark (rule 2: record a lost
 range in the manifest, report `data_lost`), then the sync of rule 4 fails, so the engine stays read-only and leaves
@@ -491,34 +271,6 @@ sealed segment with no other copy while the engine is read-only or stopped does 
 **Proposal.** §3 Recovery rule 4: "If that sync fails, the engine stays read-only, leaves the old mark and writes
 nothing; lost ranges it found are reported in health as found, and recorded by the next recovery."
 
-## Q-80 — An interval zone that the tzdata version in force does not know, or that has become a link
-**Scenario.** §2.1 refuses a definition naming a zone the tzdata version in force does not know, and compares interval
-zones by canonical name after resolving links. It does not say what happens to an existing calendar-length series when
-that stops holding: a restore onto a host whose tzdata predates the release that added the zone; a release that drops
-the name; or a release that turns the zone into a link to one with different old rules (2022b made Europe/Amsterdam a
-link to Europe/Brussels, whose rules before 1970 differ). Its interval starts, the phase check, displacement (§5.4)
-and every window on it are then undefined, or silently follow other rules.
-**Model.** Not modelled: the model has no calendar-length series.
-**Needed.** What an existing calendar-length series does when its interval zone is unknown to the version in force, or
-resolves to a zone with other rules.
-**Proposal.** Unknown zone: readings are refused off phase and counted, window results are the error
-`interval_zone_unknown`, and health is degraded naming the series and zone, until a version that knows it is in force;
-nothing is displaced. A link: resolved by the version in force like any tzdata change, so starts follow the target's
-rules and readings no longer on a start are displaced (§5.4); the definition keeps the name as given.
-
-## Q-81 — Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone
-**Scenario.** §6 takes count, min, max and last on an interval series over readings whose `t` lies in the window,
-while sum apportions. A `month` series with interval zone Europe/Oslo, queried for March 2026 in Europe/London: the
-window is 1 March 00:00Z to 31 March 23:00Z. Oslo's March reading has `t` = 28 February 23:00Z, outside it; Oslo's
-April reading has `t` = 31 March 22:00Z, inside it. So count is 1 and min, max and last are April's amount, while sum
-is March's amount × 742/743 plus April's × 1/720, flagged `apportioned`.
-**Model.** Not modelled: the model has no calendar-length series.
-**Needed.** Which readings count, min, max and last take on an interval series when an edge cuts an interval: those
-whose `t` lies in the window, those whose whole interval does, or those that overlap it, and whether the result is
-flagged.
-**Proposal.** Readings whose whole interval lies in the window; where an edge cuts an interval, the result is flagged
-`apportioned` as sum is. For fixed-length series this changes only windows whose edges cut an interval.
-
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
 Corrupt block with deep as the failed tier, and the positions no other listed file holds become a lost range, while a
@@ -531,6 +283,29 @@ with no exit, which Q-39 (e) settled against.
 **Needed.** What shows that the bucket has lost or corrupted a file (for example the bucket's reported ciphertext
 hash against the manifest's, §8 Hashes, or a number of failed downloads), and how a wrong key is told apart and
 refused rather than recorded as loss.
+
+## Q-83 — Node contents after a past-effective change of the staleness limit
+**Scenario.** A gauge with an expected interval of 30 s (S = 90 s) stores the 15-minute level and calendar nodes; it
+reports every 30 s but falls silent for 5 minutes every hour. A parameter entry committed today sets S to 10 minutes,
+effective a week ago (§2.1: a parameter applies to readings with `t` at or after its effective time). The hold of
+each reading uses the S in force at its `t` (§5.2): the hold of the reading before each outage grows from 90 s to the
+whole gap, so the coverage and integral of every stored node of that week holding an outage change. Since Q-60 no
+node is created or deleted by a parameter entry, but §5.6 recomputes only the minutes a batch's facts touch, and a
+parameter entry touches no fact: it is not said how the nodes from the effective time are folded again, whether all
+at once at commit (a week of nodes, or years of them, some over detail that is not local) or later, and what nodes
+and results show meanwhile. Until they are, invariant 5 fails for nodes still folded under the old S unless those
+nodes are flagged, and invariant 8 (a rebuild gives the live nodes) fails as well. The same holds for any other
+parameter a node depends on: an expected interval that sets S by default, `wrap_at` and `reset_ceiling` on a counter.
+**Model.** Every parameter is fixed for the life of a series (no parameter entries), so the case does not arise (see
+"Effective-dated parameters" in the table below).
+**Needed.** How stored nodes from a past effective time are brought to the parameters now in force, and what holds
+until they are.
+**Proposal (smallest rule).** Treat the entry as late data (§5.6) for every minute from its effective time on: those
+nodes are recomputed from their facts under the parameters now in force, ancestors from their children, and a node
+whose facts are not local is flagged `summary_stale` and recomputed when they are fetched (row 29).
+**Objection.** As for late data, only results are flagged while the recompute is pending, not nodes, so invariant 5
+fails for nodes not yet recomputed; and counting the recompute complete when nodes over detail that is not local are
+only flagged conflicts with invariant 8. A rule must say which nodes carry the flag, and when invariant 8 is judged.
 
 ## Q-84 — A condition or live state that stays unknown
 **Scenario.** Since Q-49 (b), during a restore a condition whose evaluation has no local detail, and live state of a
@@ -553,11 +328,26 @@ does not apply, and No deletion says nothing of it.
 **Needed.** Whether such a loss is handled as Corrupt block with deep as the failed tier (compacted again from other
 files that hold its positions, the rest a lost range reported as `data_lost`), and how it is reported.
 
+## Q-88 — The grammar of name patterns
+**Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
+compilation refuses a change that closes a cycle where "two patterns that one name could match" (§4 Routing), which
+must be decidable from the two patterns alone. No document defines a pattern: `api.md` shows only `plant/*/power`.
+Whether `*` matches one whole segment of `<instance>/<device>/<metric>`, any run of characters within a segment
+(`plant/line-*/power`), or runs across `/` decides both which series a funnel receives and which selections overlap.
+Q-78's scenario takes `plant/*/power` to match `plant/line-1/power-smoothed`, which it does under none of these
+readings. Overlap is a per-segment comparison for whole-segment wildcards and needs an intersection test for
+wildcards within a segment.
+**Model.** A selection is a list of ids or every series; there are no patterns.
+**Needed.** The pattern grammar and its overlap test.
+**Proposal.** A pattern has the three segments of a name, each a literal or `*`, which matches any one whole segment;
+two patterns overlap when, in each segment, they are equal or either is `*`; an id overlaps a pattern when any name
+of its series matches it.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
 by the roadmap item named here, before that item is done. Until then the model's choice, where a test pins it, is the
-one named in the question. Settling Q-33, Q-34 (c), Q-46 to Q-48, Q-61 or Q-78 may add fields to `docs/format.md` or
+one named in the question. Settling Q-33, Q-34 (c), Q-46 to Q-48 or Q-88 may add fields to `docs/format.md` or
 calls to `docs/api.md` after gate 3.3; such a change is made by the item that settles the question, in its own pull
 request, and noted in the question.
 
@@ -572,24 +362,12 @@ request, and noted in the question.
 | Q-47 | 4.5 | Recovery, with 5.3 (resync) |
 | Q-48 | 4.5 | Recovery |
 | Q-52 | 3.1 | Telling a torn manifest tail from a corrupt record needs a format change |
-| Q-60 | 7.1 | Stored levels |
-| Q-61 | 5.2 | Consumer queues and durable cursors |
-| Q-62 | 5.3 | Catch-up |
-| Q-63 | 5.4 | Windowed operators and conditions |
-| Q-64 | 7.1 | What a tree checkpoint holds |
-| Q-70 | 7.1 | One option puts chunk indexes in the checkpoint |
-| Q-71 | 6.3 | Manifest and publish-and-retire |
-| Q-72 | 6.2 | Revised-key index and compaction |
-| Q-75 | 7.3 | Calendar levels |
-| Q-76 | 3.1 | A log entry kind; it also places interval starts (§2.1) |
-| Q-77 | 7.3 | Calendar levels |
-| Q-78 | 5.2 | Routing table |
 | Q-79 | 4.5 | Recovery |
-| Q-80 | 5.1 | Definition checks, after Q-76 |
-| Q-81 | 5.4 | Windowed operators |
 | Q-82 | 8.3 | Restore |
+| Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
+| Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -666,15 +444,15 @@ The specification wins where the documents differ. These follow from it, for the
   `min_t` and `max_t` must allow for a reading's reach of d, or of one calendar interval (F-17) (§2.1, §6).
 - **F-15.** `format.md`: a log segment may follow, or be a copy that omits, a lost range (§8 Corrupt block); the
   lost-range record carries the commit times of the batches on either side (§11 Health).
-- **F-16.** `format.md` A.6 needs an entry type for the site zone (zone name, effective time, §5.7), and the calendar
-  file a format recording its tzdata version and, per stored node, the zone of each day it covers. `api.md`:
-  `calendar` and `calendar_in` take a day or a month, calendar windows (since local midnight, this month, a relative
-  day or month, §6) need a `Window` constructor, and the site zone needs a call that records an entry. With Q-76 as
-  proposed, A.6 also needs a tzdata entry (version). The engine compares zones by the tzdata link table (`backward`),
-  not by the model's fingerprint of a zone's rules; a calendar file records zones by canonical name, and a release
-  that splits a zone (2022g made America/Ciudad_Juarez from part of America/Ojinaga) or merges one into a link
-  (2022b made Europe/Amsterdam a link to Europe/Brussels) changes which stored nodes match a named-zone query, so the
-  rebuild after a tzdata change re-checks the zones of stored nodes as well as their spans.
+- **F-16.** `format.md` A.6 has the entry types for the site zone (zone name, effective time) and the tzdata version
+  (§5.7, Q-76); the calendar file needs a format recording its tzdata version and, per stored node, the zone of each
+  day it covers. `api.md`: `calendar` and `calendar_in` take a day or a month, calendar windows (since local
+  midnight, this month, a relative day or month, §6) need a `Window` constructor, and the site zone needs a call that
+  records an entry. The engine compares zones by the tzdata link table (`backward`), not by the model's fingerprint
+  of a zone's rules; a calendar file records zones by canonical name, and a release that splits a zone (2022g made
+  America/Ciudad_Juarez from part of America/Ojinaga) or merges one into a link (2022b made Europe/Amsterdam a link
+  to Europe/Brussels) changes which stored nodes match a named-zone query, so the rebuild after a tzdata change
+  re-checks the zones of stored nodes as well as their spans.
 - **F-17.** From Q-45 and Q-74; `api.md` has the minimum (interval kind and length, `interval`, `displaced`,
   `interval_displaced`, `OffPhase`, `SeriesInfo`). `format.md` A.6, when the interval fields of F-14 are given field
   ids: interval length as a `u8` tag (0 fixed, 1 `day`, 2 `month`), with `i64` d and `i64` phase for tag 0; interval
@@ -688,6 +466,14 @@ The specification wins where the documents differ. These follow from it, for the
   needs: a change of interval length, zone or day start is an error like a change of unit; a day start on a fixed or
   `month` length, or a zone the tzdata version in force does not know, is refused at definition; exports and `live()`
   carry the interval end.
+- **F-18.** From Q-60 to Q-81. `format.md`: the tzdata entry (A.6, type 7) and the first site-zone entry are in a
+  store's first batch (§5.7), and `api.md` needs how a store is created with them; the routing-change entry (A.6,
+  type 5) needs its fields, the consumer's `emits` selection among them; the registry file (Part B) holds routing
+  changes, site-zone and tzdata entries with their positions, so that every tree checkpoint carries them (§2.1, §4
+  Routing, F-7); a revised-key index entry needs one bit, incomplete (§2.4; the index's file kind, F-9); a compacted
+  segment's index can be fetched without its chunk data (Part B, §8 Restore step 1). The cursor file is unchanged: a
+  condition delivery's sequence is not persisted (§4 Order). `api.md`: the pattern grammar (Q-88); the `Select` value
+  for `emits` that selects nothing.
 
 ## Settled
 | ID | Question | Settled in |
@@ -725,7 +511,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open part: Q-39 (f)) |
 | Q-34 | What `data_lost` and `possible_loss` mean beyond the report, parts (a) and (b) | §8 Corrupt block (only the damaged region is lost; the valid batches of a sealed segment are copied to a new segment by one manifest record, which ends the error), §11 Health (each report carries what is known of its range; no flag on query results), row 11 (open parts: Q-34 (c), Q-52) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
-| Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (open part: Q-60) |
+| Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (the levels fixed by the definition since Q-60) |
 | Q-37 | Which manifest records a restore reads, and how generations begin | §8 Generations (generation 0 counts as claimed; each generation above 0 begins with a self-contained restore record listing the files it restores from and carrying the earlier restored ends, uploaded before any other file of its generation, after which the claims are read again; a restore reads the highest generation below its own that has records, and keeps the store id), §8 Restore step 1 (a position set aside once stays so) and the paragraph after step 4, invariant 9, row 28b |
 | Q-38 | Segments beyond the restored end | §8 Restore step 1 (positions set aside, a term distinct from Corrupt block's quarantine: excluded by position everywhere, also in reader processes, with no query error; a set-aside definition keeps its id reserved; the set-aside range reported in health from the record at every start; re-ingested only by the operator, through export and Re-ingest), §2.1 `id`, §11 Health, invariants 4 and 9, row 28, `api.md` Backup and restore (open part: Q-34 (c), for clearing the report) |
 | Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart, and later failures are retried with degraded health, except a listed file the bucket has lost or corrupted, part (e); the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed, or since (e) replaced or recorded lost), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (open part: Q-39 (f)) |
@@ -736,27 +522,42 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
 | Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b) and (c)) |
 | Q-44 (d) | Forecast accuracy | Not served by the engine in v1: history keeps every issue with its `changed_at`, so a reader computes "known as of issue X" from `View::History` and compares it with the outcome series; `api.md` Not in v1 (a view as of an issue time, forecast-accuracy operators) (open parts: Q-44 (b) and (c)) |
-| Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (open parts: Q-76 and Q-77 decide only which tzdata version is in force and where a repeated day start lies; Q-80, an interval zone unknown or become a link; Q-81, count, min, max and last when an edge cuts an interval) |
+| Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (the tzdata version in force, a day start that occurs twice, an interval zone unknown or become a link, and count, min, max and last when an edge cuts an interval were settled later by Q-76, Q-77, Q-80 and Q-81) |
 | Q-49 | What a series with no stored level serves during a restore, part (a): queries | §8 Restore step 2 and §6 Old spans (window edges move to where detail is local, the error `detail_not_local` only when no span is left, never an empty result; reads of facts fetch on demand; no priority download), row 28 |
 | Q-49 (b) | Conditions and live state with no local detail during a restore | §6 Conditions (the state is unknown, not false: the evaluation is skipped and counted, `evaluations_unknown`, the condition keeps its latched state, and the first evaluation with detail is delivered as a transition if it differs from the latched state, or there is none), §2.3 Live state (unknown, not none, for a series whose latest recorded `t` no local fact or stored node holds), §4 Resync and §6 Restart and resume (`resync` reports "unknown" for that funnel, no transition), §8 Restore step 2, invariant 16, §11 Health, `api.md` Consuming, Reading and statistics (`ConditionState::Unknown`, `Live::Unknown`) (open part: Q-84, a state that stays unknown) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
+| Q-60 | Calendar nodes when the expected interval changes | §5.1 density rule (the levels a series stores are fixed by the expected interval its definition gives; a later change moves the staleness limit and keep-alive, never the levels), §5.1 table and §5.7 (calendar nodes for a series that stores the 15-minute level), §5.6 Canonical order (1-minute nodes computed for the merge where they are not stored), row 20a (open part: Q-83, node contents after a past-effective change of the staleness limit) |
+| Q-61 | Identity of a condition delivery, and where its sequence is kept | §4 Order (every condition delivery, on a fact or on the timer, is `(funnel, sequence)`; the sequence is in memory, from 1 at every engine start, and a consumer resuming at a start receives none before that start's `resync`), §4 At-least-once (never delivered twice; the identity holds until the consumer's next `resync`), `api.md` Consuming; no field in `format.md` |
+| Q-62 | Condition transitions while a consumer catches up after overflow | §4 Overflow (funnels evaluated but silent; the present state sent on re-attaching where it differs; transitions in between counted, `transitions_not_delivered`; catch-up reads hot and cold only and ends with `resync` where its next entry is on no local tier), §4 Resync, §8 Behind consumers, `api.md` Health and statistics |
+| Q-63 | Condition state now, for conditions with memory | §6 Restart and resume (state now: a threshold between its levels keeps the latched state, false with no latch; on change compared with the latch by the dead-band), §6 Latch (a latch belongs to one incarnation of a funnel; a funnel added at run time has none and sends no `resync`), invariant 16 |
+| Q-64 | Routing changes before a restore's checkpoint | §2.1 (routing changes, site-zone and tzdata entries are kept with their positions in the registry file, which every tree checkpoint carries), §4 Routing (built at start from the registry; a funnel declared in configuration that the registry does not hold, or holds differently, is first written as a routing change), `format.md` Part B Registry |
+| Q-70 | Chunk indexes after a restore | §8 Restore steps 1 and 3 (step 1 downloads the chunk index of every compacted file the restore record lists, before ingest is accepted), §5.6, `format.md` Part B Compacted segment; the loss of such an index in the bucket follows §8 Restore, Failures and end (Q-39 (e)) |
+| Q-71 | A log segment and the chunks compacted from it hold the same positions in one epoch | §7 (sealed segments compacted in position order, each once: a segment at or below the last position of a live compacted file is not compacted again, except to replace a quarantined file), §7 Manifest, invariant 14 (live compacted files) |
+| Q-72 | Whether the revised-key index is consulted when the current fact is off the machine | §2.4 (a match with the key's entry in the revised-key index is a duplicate wherever the facts are; unchecked only for a key with a single fact off the machine and for an incomplete entry), §5.4 Displaced readings, §8 Retention class and Restore step 2, §12 D5, rows 2b, 2c and 40 |
 | Q-73 | Who leaves out the unchanged readings of a record-on-change series | §2.6 (the adapter leaves out unchanged readings between keep-alive facts; the engine records every reading it is given), as §2.4 identity including `t`, principle 5 and §11 already required |
 | Q-74 | One reading far ahead makes later on-time readings `late` | §2.2 `late` and the lateness reference (facts flagged neither `future` nor `unsynced_clock`; a reading up to 60 s ahead still raises it, an accepted limit; the latest recorded `t`, over all facts, stays for the §2.4 fast path, §8 Restore step 2 and statistics), §2.4 Fast path, §4 Future facts, §8 Deep, Continuous backup and Restore step 1 (each tree checkpoint carries both), invariant 24, rows 4 and 4a, `api.md` `SeriesInfo` (open part: Q-44 (c), far-future facts and the latest recorded `t`) |
+| Q-75 | Local days around a site-zone change to another offset | §5.7 (the local date is the date in the zone in force at each instant; the day of D starts at the first instant whose local date is D or later, so days and months tile; "today" is the latest date whose day has started; a change rebuilds from the local day in progress), row 21, `api.md` Reading |
+| Q-76 | Whether a tzdata change is a log entry | §5.7 (the version in force is named by the latest tzdata entry, the first in a store's first batch; the engine reads one release at open, and a writer whose release differs writes a tzdata entry before ingest, newer or older; readers and drills of another release are refused with `tzdata_mismatch`), §2.1, §2.2, invariant 8, row 21, `format.md` A.4 and A.6, `api.md` Opening, Environment seams and Health |
+| Q-77 | A day whose midnight occurs twice | §5.7 (the day starts at the earlier instant), §2.1 `interval length` (a day start that occurs twice likewise; a reading at the later instant is refused off phase) |
+| Q-78 | How routing compilation knows the series a consumer emits | §4 Routing (a consumer declares `emits`, recorded with its routing changes, and emits through its own handle; the cycle test compares selections, at start, on every routing change and on an alias), §4 Concurrency, row 33, `api.md` Consuming, `format.md` A.6 (open part: Q-88, the pattern grammar) |
+| Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
+| Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
 window evaluation over its span, edge stretches included, in the site zone or a named IANA zone; stored day and month
 nodes, kept only for spans on 15-minute boundaries of a series with a stored 15-minute level, are inputs only where
 every day they cover was taken in the zone of the query, compared after resolving links, their span is the day's and
-their tzdata version is current, and never past the credit limit; days with no quarter-hours, days whose midnight
-does not exist and historical offsets off 15-minute boundaries; the site zone as an effective-dated log entry (see
-Q-75), whose change rebuilds calendar nodes from its effective time only, and tzdata changes, recorded as a log entry
-by the rebuild, which rebuilds only the affected days (see Q-76), both logged; a midnight in a gap that straddles it
-and a midnight that occurs twice (see Q-77); calendar windows since local midnight, this month and relative days and
+their tzdata version is the one in force, and never past the credit limit; days with no quarter-hours, days whose midnight
+does not exist and historical offsets off 15-minute boundaries; the site zone as an effective-dated log entry, whose
+change rebuilds calendar nodes (for days around a change to another offset, see the table), and tzdata changes,
+recorded as a log entry, which rebuild only the affected days (for when a release is adopted, see the table); a
+midnight in a gap that straddles it and a midnight that occurs twice (the earlier instant); calendar windows since local midnight, this month and relative days and
 months; rows 20, 20a, 21 and 21a, invariants 5, 7, 8, 17 and 22 over calendar days; `tests/rules.rs` `s5_7_…` and
 `s6_calendar_…`), the duplicate rule with `revise` (§2.4: identity by value and
 adapter-supplied quality; a fact whose key's current fact is on no local tier, hot or cold, is recorded and counted
-`duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), versioned series (§2.1–§2.4: `changed_at` required on
+`duplicates_unchecked`, outside a restore whatever the revised-key index holds (see the table); invariant 15, rows 2,
+2a and 2b), versioned series (§2.1–§2.4: `changed_at` required on
 every reading of a versioned series and refused on any other, `revise` refused there, rank `(changed_at, position)`
 in every view, identity including `changed_at`, the version index and the revised-key index, carried by each tree
 checkpoint, so that during a restore ranks are exact and a replay of an earlier value of a key revised by the
@@ -771,7 +572,7 @@ locally only after the grace period on the writer's monotonic clock since the la
 start, once their replacements are verified in another tier and no live lease names an older epoch, and, for
 invariant 12, once the retired file itself has a verified copy in another tier; reader leases with boot id and
 refresh counter, expired on the writer's monotonic clock, first observed at the writer's start, void on another boot;
-a restore leaves out files retired by a record whose added files are in the bucket; invariant 14 (see Q-71), rows 10
+a restore leaves out files retired by a record whose added files are in the bucket; invariant 14 among compacted files, a sealed log segment compacted once, rows 10
 and 26; `tests/rules.rs` `s7_…`), tiers and eviction (§3 Disk space: tiering and eviction continue at every mark;
 §8: sealed log segments and revision chunks leave hot at 90 days, revision chunks by an age per series that may be
 never; current detail stays except under the retention class, a registry entry in force from its position that
@@ -797,13 +598,16 @@ checkpoint and its verification; row 20a for a series without a stored 15-minute
 contributing 0 and counted; rate as the increase over the elapsed time between the readings that bound its steps,
 empty with no step, flagged when a step spans more than S; row 18a, `tests/rules.rs` `s6_rate_…`), retirement at `t_r` (§2.1, also for a reading that waited in the queue while the
 retirement committed), the durable mark and recovery by boot id (§3),
-delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
-condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
-last committed position and a per-funnel sequence; one latch per condition funnel, moved when the consumer confirms;
+delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up
+(for a route before a restore's checkpoint, see the table); condition funnels evaluated on routed facts and on the
+timer, never on replayed facts, their deliveries carrying the last committed position and a per-funnel sequence (for
+their identity, see the table); condition state now from the latch, a threshold between its levels keeping the latched
+state, and a funnel added at run time with no latch; one latch per condition funnel, moved when the consumer confirms;
 on every resume, after a restart, a recovery on a new boot or a consumer restart, a replay up to the last committed
 position followed by `resync` with the live state and the condition state now, a transition where it differs from
 the latch or there is no latch, or `resync` alone when the cursor is too far behind the local log segments; and
-catch-up after overflow from the last position enqueued in the session; rows 14–16 and 34, invariants 2, 3, 11, 13
+catch-up after overflow from the last position enqueued in the session, condition funnels silent meanwhile and
+the present state sent on re-attaching where it differs (for reads from deep, see the table); rows 14–16 and 34, invariants 2, 3, 11, 13
 and 16; `tests/rules.rs` `s4_…` and `s6_…`), loss of a corrupt log segment with no other copy (§8; the whole range, recorded as a lost range, see the table), lost ranges in the open
 segment found by recovery (§3 Recovery rule 2, row 11a: later batches kept, the range recorded in the manifest and
 reported as `data_lost`, its positions not reused; see the table), and generations, tree checkpoints
@@ -834,12 +638,17 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
-| Effective-dated parameters | §2.1, §5.7, row 20a | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so a span in which the expected interval crosses a density threshold (row 20a, Q-60) does not arise | `calendar_depends_on_zone_utc_levels_do_not` |
+| Effective-dated parameters | §2.1, §5.1 | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so neither a later change of the expected interval, which leaves the stored levels as they are (§5.1), nor a past-effective change of a parameter a node depends on (Q-83) arises | `calendar_depends_on_zone_utc_levels_do_not` |
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
 | Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
-| Entries at store creation | §5.7: the site zone is a log entry; Q-76: the tzdata version | A store header beside the log, written at creation and carried by the bucket, holds the site zone and tzdata version before any entry, so that positions start at `0:1`; a start or restore configured with a zone other than the store's zone in force (its site-zone entry with the latest effective time, else the header's) is refused (`OpenRefused`, `SiteZoneMismatch`), a restore before it claims a generation | `tests/rules.rs` `s5_7_store_keeps_its_site_zone_and_refuses_another_at_open` |
-| New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 (see Q-78) | Consumers are declared when the model is created and start before the first position; a consumer emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected` |
+| Adopting a tzdata release | §5.7: the engine reads one release at open and uses no other while it runs; a writer whose release is not the version in force writes a tzdata entry naming it before it accepts ingest, so a restart is the adoption; a reader or drill of another release is refused with `tzdata_mismatch` | The model holds several releases: installing one (`Model::install_tzdb`) writes nothing, results then follow the new rules before any entry names them, a restart keeps the version the log names, and `Model::rebuild_calendars` writes the tzdata entry and rebuilds when called; nothing is refused | `tests/open_questions.rs` `q76_tzdata_change_is_a_log_entry_written_by_the_rebuild` (its restart step), `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` (results between the install and the rebuild) |
+| Local days around a site-zone change | §5.7: the day of date D starts at the first instant whose local date, in the zone in force at that instant, is D or later, so days and months tile; "today" is the latest date whose day has started | `calendar::Zoning::Site` takes a day in the latest entry's zone under which it starts at or after that entry's effective time, else in the store's zone, so a change to another offset leaves hours in no day or two days overlapping; a month node is stored only where its days are contiguous | `tests/open_questions.rs` `q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap` |
+| Entries at store creation | §5.7: a store's first batch holds its first site-zone entry and a tzdata entry; there is no store header | A store header beside the log, written at creation and carried by the bucket, holds the site zone and tzdata version before any entry, so that positions start at `0:1`; a start or restore configured with a zone other than the store's zone in force (its site-zone entry with the latest effective time, else the header's) is refused (`OpenRefused`, `SiteZoneMismatch`), a restore before it claims a generation | `tests/rules.rs` `s5_7_store_keeps_its_site_zone_and_refuses_another_at_open` |
+| New-consumer start; `emits` and cycles; name patterns | §4 New consumer, Routing (a consumer declares `emits` and emits through its own handle; a change that closes a cycle is refused), row 33; the pattern grammar is open (Q-88) | Consumers are declared when the model is created and start before the first position; a consumer declares no `emits` and emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected` |
+| Routes before a restore's checkpoint | §2.1, §4 Routing: routing changes are kept with their positions in the registry file, which every tree checkpoint carries, so a route is in force from step 1 of a restore, and after its log segment has left hot | Routes are taken from the entries that are local; a route added before the checkpoint is not in force until the file holding its entry is downloaded | `tests/open_questions.rs` `q64_route_before_checkpoint_not_in_force_until_its_entry_is_back` |
+| Identity of a condition delivery | §4 Order, At-least-once: `(funnel, sequence)`, the sequence in memory, from 1 at every engine start, valid until the consumer's next `resync`; nothing persisted | `(generation, funnel, sequence)`, the sequence kept on disk when the delivery is issued, never issued twice for a funnel within a generation | `tests/open_questions.rs` `q61_condition_delivery_sequence_survives_a_crash`, `q61_condition_delivery_identity_includes_the_generation`; `tests/rules.rs` `s4_condition_deliveries_unique_by_funnel_and_sequence` (unique across restarts), `s4_timer_deliveries_carry_last_position_and_funnel_sequence` (the generation in the id) |
+| Catch-up after overflow from deep | §4 Overflow, §8 Behind consumers: catch-up reads hot and cold only; where its next entry is on no local tier it ends with `resync`; transitions not delivered meanwhile are counted (`transitions_not_delivered`) | Catch-up after overflow reads an entry wherever it is held; the transitions in between are not counted | — |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
 | Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |
@@ -848,11 +657,13 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
 | Unknown condition and live state during a restore | §6 Conditions, §2.3 Live state, §4 Resync, §8 Restore step 2, invariant 16 (Q-49 (b)): an evaluation with no local detail is skipped and counted (`evaluations_unknown`), the condition keeps its latched state, `resync` reports "unknown", and the first evaluation with detail is a transition if it differs from the latch or there is none; live state of a series whose latest recorded `t` no local fact or stored node holds is unknown, not none | Not modelled: a series that stores no level answers windows and live state during a restore from its local facts, without a flag; nothing is reported unknown or counted | — |
-| Condition state on resume | §6 Restart and resume, invariant 16 (see Q-63) | The engine resumes conditions with `Runner::resume`, from the value now, the history rebuilt from the tree (held-for, stale-for) and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
+| Condition state on resume | §6 Restart and resume, invariant 16 | The engine resumes conditions with `Runner::resume`, from the value now, the history rebuilt from the tree (held-for, stale-for) and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
 | Cursor of a consumer after a restore | §4 Consumer state, invariant 13: a cursor is never ahead of the consumer's confirmation | A consumer without a kept cursor, or whose catch-up segments are not local, gets the restored end written as its cursor, which it never confirmed, standing in for "treated as beyond the restored end" (§8 Restore step 2) | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
 | Tree files and their checkpoint | §5.1 | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call) | — |
 | Calendar results while restoring | §8 Restore step 2, §6 Old spans | As for windows (see "Window edges over detail that is not local"): a calendar span with an edge inside a minute, such as a day in Africa/Monrovia before 1972, is refused with `Restoring` | — |
 | Compaction of compacted files | §7 Policy: merge when a series' chunks overlapping any 15-minute span exceed 4 | Counts and merges the live current chunks of a series on the fast disk only; revision chunks are never merged | `tests/rules.rs` `s7_merge_publishes_outputs_and_retires_inputs_in_one_record` |
+| Revised-key index outside a restore | §2.4, rows 2b and 2c: a match with the key's entry in the revised-key index is a duplicate wherever the facts are; only a key with a single fact off the machine, or an incomplete entry, is recorded unchecked | Outside a restore, a fact whose key's current fact is on no local tier is recorded unchecked whatever the index holds; during a restore it is dropped | `tests/open_questions.rs` `q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it`; `tests/edge_cases.rs` `row_02c_replay_never_reverts_a_versioned_correction` (its off-tier case) |
+| Chunk indexes after a restore | §8 Restore step 1: the chunk index of every listed compacted file is downloaded before ingest is accepted | A restore brings every file back, so no chunk index is missing | — |
 | Revised-key index, recent window | §2.4, §5.1, §8 Restore step 2: "A key that gains a second fact meanwhile, in the replay or by ingest, has its index entry completed when its chunk is back" | A full in-memory history of every key stands in for the index and the recent window; while restoring, a key revised only after the checkpoint has its entry completed when every current chunk is back, not when its own chunk is | `tests/rules.rs` `s8_index_entry_completed_when_the_current_chunks_are_back` |
 | Age of a compacted file | §8 Eviction at 90 days: no rule for the age of a merged or compacted file | A compacted file takes the seal time of its oldest input, so a revision made today, merged with a 60-day-old chunk, leaves hot after 30 days | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |
 | Clock of the eviction age | §8 Eviction at 90 days: no clock named | The engine clock `now`, as for the retention class, from the seal of a log segment, or of a compacted file's oldest input, so a merge does not reset it | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |
@@ -860,7 +671,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
 | Host-stamped readings before clock synchronisation | §2.5: they wait in the ingest queue (back-pressure) | The emit returns `Wait::UnsyncedClock` and the reading takes no queue capacity; the adapter emits it again later, and the wait is counted per attempt, not measured | `tests/edge_cases.rs` `row_22a_…` |
 | Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64) | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly, also over the days of a month in a +05:45 zone | `tests/invariants.rs` `inv22_…` |
-| Calendar-length interval series | §2.1 `interval zone` and `day start`, §5.4 displaced readings, §5.7, §6, rows 43–46, invariant 23 (Q-45) | Interval series have a fixed length and phase only; calendar lengths, interval zones, day starts and displaced readings are not modelled yet | — |
+| Calendar-length interval series | §2.1 `interval zone` (also unknown or become a link, Q-80) and `day start`, §5.4 displaced readings, §5.7, §6 (count, min, max and last, Q-81), rows 43–46, invariant 23 (Q-45) | Interval series have a fixed length and phase only; calendar lengths, interval zones, day starts and displaced readings are not modelled yet | — |
 | Lateness reference | §2.2, §4 Future facts, §8 tree checkpoints, row 4a, invariant 24 (Q-74) | The first clause of `late` compares with the latest recorded `t`, `future` facts included, and a tree checkpoint carries only the latest recorded `t`; not modelled yet | `tests/open_questions.rs` `q74_…` (expects the model's result) |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
