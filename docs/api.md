@@ -110,8 +110,7 @@ let h: Health = store.health();     // Ok, Degraded { reasons }, ReadOnly { caus
 let s: Stats = store.stats();       // per series and per consumer counters, commit latency, queue depths,
                                     // time behind, disk marks, backup lag
 ```
-Every refusal, drop, repeat and delay the specification says is counted appears here. Per-series statistics include
-the latest recorded `t`, so a value far ahead on a scheduled or forecast series can be seen.
+Every refusal, drop, repeat and delay the specification says is counted appears here.
 
 ## Backup and restore
 ```rust

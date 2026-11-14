@@ -32,7 +32,7 @@ records the choices decided between alternatives. The byte-level format will be 
 | `versioned` | optional, for sources that revise readings they have already published; fixed for the life of the series (a change is a new series, and history may be re-ingested with `changed_at`). Every reading of a versioned series carries `changed_at` (§2.2); readings of other series never do |
 | `changed_at kind` | versioned series only: `time` (UTC nanoseconds) or `version` (an opaque counter); fixed for the life of the series; used to type exports, and must be `time` for a forecast series |
 | `retention class` | `long-term` (default) or `diagnostic` with a retention period (default 30 days), for series kept mainly for short-term diagnosis, such as a machine's own resource metrics. It decides only where raw detail is kept (§8 Retention class), never which facts exist. A change of class is a registry entry that takes effect at its position, not by event time; it moves no detail back |
-| `timing` | `observed` (default), `scheduled` or `forecast`; fixed for the life of the series. **Scheduled:** values known in advance that take effect at their `t`, such as published prices; a scheduled source that revises its values must be versioned. **Forecast:** values about future times, re-issued over time; the series must be versioned with `changed_at kind` `time`, `changed_at` being the issue time and `t` the valid time. The engine sets no horizon and infers no withdrawal: the current view is per key, so it can hold values of different issues, each fact showing its `changed_at`. A source withdraws a value by a reading for that `t` with a higher `changed_at` (on a series that is not versioned, a later reading) and quality bad, carrying the value it withdraws, which is ignored by summaries, windows and live state (§2.5, §2.3), so that a replay of the withdrawal is a duplicate. The engine does not report a silent forecast source: its adapter emits an observed series with an expected interval on each successful fetch, to which stale-for applies |
+| `timing` | `observed` (default), `scheduled` or `forecast`; fixed for the life of the series. **Scheduled:** values known in advance that take effect at their `t`, such as published prices; a scheduled source that revises its values must be versioned. **Forecast:** values about future times, re-issued over time; the series must be versioned with `changed_at kind` `time`, `changed_at` being the issue time and `t` the valid time. The engine does not report a silent forecast source: its adapter emits an observed series with an expected interval on each successful fetch, to which stale-for applies |
 
 Series definitions, parameter changes (with an effective event time, except a change of retention class, which
 takes effect at its position), aliases and retirements are log entries. A parameter other than the retention class
@@ -188,7 +188,7 @@ a different boot. The rules apply in this order:
 | 1 second | **Never.** Computed from facts on demand (window edges, drill-down below 1 minute) | — |
 | 1 minute | Yes, aligned to UTC, only where there is data | per-series tree files on hot; never moves (§12 D7) |
 | 15 minutes | Yes, aligned to UTC, only where there is data | per-series tree files on hot; never moves |
-| Local calendar day/month | Yes, for spans whose edges fall on 15-minute boundaries (§5.7) and inside which every 15-minute span qualifies for a stored node (density rule; interval series §5.4), assembled from 15-minute nodes in the site zone in force; an input to calendar results, not the result (§5.7) | per-series calendar file on hot |
+| Local calendar day/month | Yes, for spans whose edges fall on 15-minute boundaries (§5.7) and throughout which the series' expected interval in force qualifies it for a stored 15-minute level (density rule; interval series §5.4), whether or not a given quarter-hour has data, assembled from 15-minute nodes in the site zone in force; an input to calendar results, not the result (§5.7) | per-series calendar file on hot |
 
 - **Density rule:** a level is stored for a series only where its nodes summarise many facts: the 1-minute
   level only for series whose expected interval is 5 s or shorter, the 15-minute level only for 60 s or shorter.
@@ -232,29 +232,16 @@ A reading is valid for at most S (an interval reading for its interval only). An
 only where every node edge of that level is a multiple of d from the phase (for the UTC levels: d divides the node
 length and the phase is 0), so that no interval crosses a node edge; any other level is answered from its facts. The
 density rule (§5.1) applies as well, so an interval series stores a calendar level only where it stores the
-15-minute level. For an observed series, **live staleness** follows live state (§2.3) and is measured on the
-monotonic clock. The series' **refresh instant** is that of its live-state fact's key: the commit of the
-earliest-recorded fact for that `(series, t)` whose recorded quality (after any lowering by the engine, §2.2, §2.5)
-is not bad and which was not outranked at commit; or, if that fact was committed ahead of `now` (its `t`, for an
-interval reading `t + d`, later than `now`), the instant `now` reached it (§4 Timers). The series is stale when more
-than S has passed since its refresh instant, or when it has no live-state fact (it is then stale for any length of
-time); a series with no S is never stale. A commit that leaves the `t` of the live-state fact unchanged (a late fact
-for an earlier time, a revision of the same `t`, a fact that is bad quality, outranked or not yet due) refreshes
-nothing, whatever its flags. The first good reading of a key that raises it refreshes the series even when flagged
-`late`, however old its `t`: live staleness measures arrival, and the age of the value is event-time staleness
-(below). A device whose clock runs behind, or a backlog arriving in `t` order, is therefore fresh while it reports;
-health reports the skew (§9 row 5). Within a run, a forward jump of the system clock can bring a pending refresh
-forward but cannot make an observed series stale; a jump while the engine is down enters the time taken at start.
-For a refresh instant before the engine's present start, the time passed is taken once, at the first `now` after the
-clock is reported synchronised (§2.5), as `now − max(received_at, t)` of that fact (`t + d` for an interval
-reading), not below zero, and runs on the monotonic clock from there; until it is taken, a stale-for condition keeps
-its latched state. A scheduled series is stale when `now` is later than the `t` of its live-state fact by more than
-S, or when it has no live-state fact; commits do not refresh it. A forecast series has no live staleness.
-**Event-time staleness** applies to history and to every window evaluation (§6): a series is stale at event time x
-when x > (`t` of its latest reading before x that is not bad quality) + S; for an interval series, x is covered if
-and only if it lies in a reading's interval. Coverage stops at that point and time-weighted results exclude the gap.
-Every windowed result carries coverage in seconds and as a fraction of the window. Live staleness applies only to
-live state and stale-for conditions.
+15-minute level. For an observed series, **live staleness** is measured on the monotonic clock: a series is stale
+when more than S has
+passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still awaiting its time
+or an outranked fact (§4), so a forward jump of the system clock cannot make an observed series stale. A scheduled
+series is stale when `now` is later than the `t` of its live-state fact by more than S, or when it has no live-state
+fact; commits do not refresh it. A forecast series has no live staleness. **Event-time staleness** applies to history
+and to every window evaluation (§6): a series is stale at event time x when x > (`t` of its latest reading before x
+that is not bad quality) + S; for an interval series, x is covered if and only if it lies in a reading's interval.
+Coverage stops at that point and time-weighted results exclude the gap. Every windowed result carries coverage in
+seconds and as a fraction of the window. Live staleness applies only to live state and stale-for conditions.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
@@ -293,9 +280,10 @@ live state and stale-for conditions.
 - A local day usually has 92–100 quarter-hours. A day whose local midnight does not exist starts at its first
   instant. Because results are window evaluations, the rule also covers a skipped date (an empty span) and historical
   offsets that are not multiples of 15 minutes.
-- A calendar node is stored only for a span whose edges both fall on 15-minute boundaries and inside which every
-  15-minute span qualifies for a stored node (§5.1). For any other day or month none is stored; its result is
-  evaluated from the stored nodes inside it, the facts at its edges and, where no level is stored, its facts.
+- A calendar node is stored only for a span whose edges both fall on 15-minute boundaries and throughout which the
+  series' expected interval in force qualifies it for a stored 15-minute level (§5.1), whether or not a given
+  quarter-hour has data. For any other day or month none is stored; its result is evaluated from the stored nodes
+  inside it, the facts at its edges and, where no level is stored, its facts.
 
 ## 6. Windowed operators
 | Rule | |
@@ -402,7 +390,7 @@ gap until they are re-ingested.
 | 2b | Identical repeat whose current fact is off every local tier | Recorded, `duplicates_unchecked` | unit |
 | 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
 | 2d | Versioned series: a fact with a lower `changed_at` than the current one and a new value | Recorded, delivered flagged `outranked`, counted; no node, live-state or condition change | property |
-| 3 | Reading for last week arrives now | Flagged `late`; minute path updated; no retroactive trigger; live staleness is not refreshed | model |
+| 3 | Reading for last week arrives now | Flagged `late`; minute path updated; no retroactive trigger | model |
 | 4 | Reading > 60 s in the future, on an observed series | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
@@ -420,8 +408,6 @@ gap until they are re-ingested.
 | 16 | Consumer restarts; a condition became true while it was down | Operator rebuilt as of now, not replayed; `resync` differs from the latch → acted on (equal → no new transition) | model |
 | 17 | Series goes silent | Stale after S; coverage stops; stale-for-N funnels fire | model |
 | 17a | Record-on-change series, value unchanged | Keep-alive fact each expected interval; never stale while healthy | model |
-| 17b | Restart with a series silent since before it | Time passed taken as `now − max(received_at, t)` of the live-state key's first good fact; a series stale before the restart is stale after it, and `resync` equals the latch | model |
-| 17c | Live-state fact revised to bad quality | Live state and the refresh instant fall back to the earlier key; a later good revision of that `t` restores the first good fact's instant | model |
 | 18 | Counter reset | Decrease below `reset_ceiling` × previous counts the new value | property |
 | 18a | Counter wraps, glitches low, or is silent for hours | `wrap_at` rule; regression (0, counted); full step credited after the gap, coverage shows it and rate is flagged | property |
 | 19 | Correction changes a node's min or max | Minute recomputed from facts, ancestors from children | property |
@@ -448,10 +434,8 @@ gap until they are re-ingested.
 | 35 | Window with no new data, or edge inside the open minute | Timer evaluation; edge from the recent window; nothing credited past the credit limit or S | property |
 | 36 | Scheduled value for tomorrow | Recorded unflagged, quality kept; delivered at commit as notice; in live state from its `t`, with no second delivery; stale S after the last value takes effect | model |
 | 37 | Forecast re-issued | The higher `changed_at` is current; earlier issues stay in history; a replay of an old issue is a duplicate or outranked | property |
-| 37a | A newer forecast issue no longer covers a valid time | The older value stays current until the source withdraws it by a bad-quality reading with the new `changed_at`; coverage then ends where the remaining values' validity ends | property |
 | 37b | Forecast source falls silent | No live staleness; reported by stale-for on the adapter's companion series, and later by shrinking lookahead coverage | integration |
 | 38 | Window over tomorrow on a scheduled or forecast series | Credited up to the window end; coverage shows where the values run out | property |
-| 38a | Value far in the future on a scheduled or forecast series | Recorded unflagged (invariant 20); corrected by a revision or withdrawn as in row 37a | unit |
 | 39 | Window ending after `now` on an observed series | Nothing credited past `now` | property |
 | 40 | Interval reading off its phase | Refused and counted | unit |
 | 41 | Window edge inside an interval | That interval's amount credited pro rata by time; result flagged `apportioned` | property |
@@ -498,8 +482,6 @@ gap until they are re-ingested.
     alone (tolerance §5.6; results flagged `approximate_edges` or `summary_stale` excepted).
 22. For an interval series, the sums over adjacent windows add up to the sum over their union (within the §5.6
     tolerance where an interval is apportioned).
-23. The live staleness of an observed series is a function of its live-state key, the history of that key, S and the
-    clocks: a commit that leaves the `t` of the live-state fact unchanged does not change it.
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
@@ -507,7 +489,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each series' latest recorded `t`; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
 
 Every default in this document is a configuration key, with its unit where it is defined; the decided choices D1–D7
 (§12) are rules, not configuration keys. Byte-level format,
