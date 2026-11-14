@@ -54,7 +54,7 @@ pub enum FormatError {
     /// A checksum-valid header whose `store_id` is not the store's (`format.md` A.1).
     #[error("the file belongs to another store")]
     StoreIdMismatch,
-    /// A checksum-valid header that disagrees with the file name (see `model/OPEN-QUESTIONS.md`, Q-104 (e)).
+    /// A checksum-valid header that disagrees with the file name (see `model/OPEN-QUESTIONS.md`, Q-105 (e)).
     #[error("header field {field} is {in_header}, the file name gives {expected}")]
     HeaderMismatch {
         /// The field.

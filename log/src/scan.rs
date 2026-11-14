@@ -196,7 +196,7 @@ pub fn scan<'a>(
             BatchRead::Incomplete { fault } => fault,
         };
         // Sixteen zero bytes at a block boundary are the end of data only if nothing but zeros follows up to the
-        // limit; below the mark or the seal blocks they are never the end (Q-104 (a)).
+        // limit; below the mark or the seal blocks they are never the end (Q-105 (a)).
         if !bounded && all_zero(bytes, pos, area_end) {
             break Tail::Clean { offset: pos };
         }
@@ -204,7 +204,7 @@ pub fn scan<'a>(
             BatchFault::Content => LossCause::InvalidContent,
             _ => LossCause::Corruption,
         };
-        // An invalid region starts at `pos` (zeros below the limit included, Q-104 (a)); resynchronise (A.2).
+        // An invalid region starts at `pos` (zeros below the limit included, Q-105 (a)); resynchronise (A.2).
         match resync(bytes, id, pos, area_end, min_first)? {
             Some(b) => {
                 regions.push(InvalidRegion {

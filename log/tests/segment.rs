@@ -252,7 +252,7 @@ fn sequences_must_rise() {
         r.batches.iter().map(|b| b.offset).collect::<Vec<_>>(),
         offsets
     );
-    // A recovery batch may start higher than `base_sequence` (Q-104 (d)).
+    // A recovery batch may start higher than `base_sequence` (Q-105 (d)).
     let mut s = SegmentImage::create_ahead(ID, T0, 1024).unwrap();
     s.take_into_use(5).unwrap();
     let at = s.write_offset();
@@ -410,7 +410,7 @@ fn an_unknown_critical_block_is_a_version_refusal() {
         scan(s.bytes(), &ID, ScanLimit::Mark(offsets[1])).map(|r| r.batches.len()),
         Ok(1)
     );
-    // Found while resynchronising after damage: refused only when its batch checks out (Q-104 (c)).
+    // Found while resynchronising after damage: refused only when its batch checks out (Q-105 (c)).
     let mut damaged = s.clone();
     damaged.bytes_mut()[70] ^= 1;
     assert_eq!(

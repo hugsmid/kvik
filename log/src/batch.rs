@@ -88,7 +88,7 @@ pub(crate) enum Refusal {
     AtOnce,
     /// At a candidate offset while resynchronising: refused only if the rest of the batch checks out (its commit
     /// block, `block_count`, `batch_bytes`, `batch_crc32c` and generation); otherwise the offset is not a batch
-    /// (Q-104 (c)).
+    /// (Q-105 (c)).
     IfBatchVerifies,
 }
 
@@ -157,7 +157,7 @@ pub(crate) fn read_batch<'a>(
     if let Some(refused) = unknown_critical {
         return BatchRead::Refused(refused);
     }
-    // Sequences are counted from the commit's first sequence; a skipped block takes none (Q-104 (b)).
+    // Sequences are counted from the commit's first sequence; a skipped block takes none (Q-105 (b)).
     if commit.first_sequence < min_first.max(1) {
         return incomplete(BatchFault::Disagreement);
     }
