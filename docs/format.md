@@ -243,7 +243,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | Entry type | Fields |
 |---:|---|
 | 1 series definition | the table below |
-| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life; whether 25 and 26 may change is open, Q-100). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
+| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life; whether 25 and 26 may change is open, Q-100). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
 | 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
@@ -399,6 +399,7 @@ exists; a new file is created only when none exists.
 <dir>/STORE                                  store descriptor, kind 7; written once, never changed
 <dir>/LOCK                                   empty; the writer holds an exclusive OS lock on it
 <dir>/MANIFEST                               kind 3 (A.14)
+<dir>/MANIFEST.new                           a rebuilt manifest before its rename (A.14); removed at start if left by a crash
 <dir>/log/MARK                               A.10
 <dir>/log/<generation:8 hex>-<file_id:16 hex>.open | .kvl
 <dir>/cursors/<consumer name>.cur            kind 4 (A.15)
@@ -420,7 +421,7 @@ exists; a new file is created only when none exists.
   `STORE.tmp`, and the directories `log/`, `cursors/` and `leases/`, empty): a creation that did not finish; remove
   what it left and create again. No `STORE` and any other name, a file under `log/` included: `NotAStore` (never
   created over; a directory part-way
-  through a restore is told apart by its restore record, roadmap 8.3). `STORE` invalid: `Corrupt`. Accepted limit:
+  through a restore is told apart by its restore record, roadmap 8.3). A `MANIFEST.new` beside a valid `STORE` is a rebuild that did not finish and is removed. `STORE` invalid: `Corrupt`. Accepted limit:
   `STORE` is a single local copy until it is uploaded, repaired by an operator from the bucket's copy (`spec.md` §8
   Deep, roadmap 8.2). Every other file's
   `store_id` must equal `STORE`'s.
@@ -465,8 +466,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   + 1, or after a start the next above every epoch named by the last valid record and by any lease file (`spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
-  positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 epoch of the corrupt record, `u64`;
-  2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`), the
+  positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 the corrupt record's epoch as
+  presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`), the
   first record of a rebuilt manifest. Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
   `0x25` restore (8.3), `0x26` quarantine and `0x27` tier move (8.1).
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
@@ -481,8 +482,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
   with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator
   call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
-  (`0x28`), synced, renamed over `MANIFEST`, and the directory synced. The rebuild record is acknowledged by an
-  acknowledgement record carrying its epoch in field 2. What a rebuild cannot recover from local files is open
+  (`0x28`), synced, renamed over `MANIFEST`, and the directory synced; a `MANIFEST.new` left by a crash is removed at
+  the next start. The rebuild record is acknowledged by an acknowledgement record carrying the rebuild record's own
+  epoch in field 2. What a rebuild cannot recover from local files is open
   (Q-103).
 
 ## A.15 Cursor file and lease file

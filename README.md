@@ -31,9 +31,10 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > |---|---|
 > | 1. Specification settled | 8 of 8 done |
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
-> | 3–10. Format and interface, log, delivery, compaction, summary tree, tiers and backup, query, scale | not started |
+> | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
+> | 4–10. Log, delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 11 of 47 roadmap items are done, including 2 of 9 gates.
+> 14 of 47 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -248,8 +249,8 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`docs/spec.md`](docs/spec.md) | The specification (v0.2): the rules an implementation must follow |
 | [`docs/design.md`](docs/design.md) | Design direction, performance budgets, build order |
 | [`docs/roadmap.md`](docs/roadmap.md) | Roadmap and status, one pull request per item |
-| [`docs/format.md`](docs/format.md) | Proposed byte-level format; not yet checked for implementability (roadmap 3.1) |
-| [`docs/api.md`](docs/api.md) | Proposed public interface; not yet checked for implementability (roadmap 3.2) |
+| [`docs/format.md`](docs/format.md) | Byte-level format; Part A accepted at gate 3.3, Part B an outline filled in by later items |
+| [`docs/api.md`](docs/api.md) | Public interface; the parts section 4 builds accepted at gate 3.3 |
 | [`docs/measurements/`](docs/measurements/) | Recorded measurements |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Plan for comparative benchmarks against other tools; not yet run |
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |

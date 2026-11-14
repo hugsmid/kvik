@@ -179,7 +179,7 @@ new batch can still parse as a complete batch whose sequences follow the new one
 takes back a batch that was never acknowledged.
 **Needed:** whether truncation sets the length or zero-fills, whether the zeroing is synced before new batches are
 written, and whether the segment is preallocated again afterwards.
-**Resolved at gate 3.3:** `format.md` A.4 (truncation is zero-filling, synced before any new batch; accepted limit stated).
+**Resolved at gate 3.3:** `format.md` A.4 (truncation is zero-filling and synced; under rule 1 before any new batch, under rule 3 after the recovery batch; accepted limit stated).
 
 ### FC-9 — Redundant fields that may disagree
 **Where:** A.4, A.5, A.6, A.7 · **Severity:** before 4.3 · **Relates to:** §2.2 (`received_at` per batch)
@@ -509,7 +509,7 @@ facts; rebuild-equals-live compares them byte for byte.
 **Deferred at gate 3.3** to roadmap 7.1 and 7.3 (needs the tree).
 
 ### FC-35 — The compacted segment depends on 2.1, and Parquet has no A.1 header
-**Where:** B (compacted segment) · **Severity:** can wait (6.1) · **Relates to:** roadmap 2.1, 10.2, §7, §8 Hashes
+**Where:** B (compacted segment) · **Severity:** can wait (6.1) · **Relates to:** roadmap 2.1, 10.3, §7, §8 Hashes
 **Problem.** The layout and encodings wait for 2.1, as the outline says. If compacted data is stored as Parquet, A.1's
 "every file except the mark" carries a header no longer holds: a Parquet file cannot start with `KVIK`, so the store
 id check, the kind and the format version must live elsewhere (for example in its key-value metadata), and chunk

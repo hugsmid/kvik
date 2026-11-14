@@ -98,7 +98,8 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
   refused with `Refusal::ExcessPrecision { scale_needed }`, or the scale raised up to a maximum. Writers should round
   to the precision they actually need; raw sensor floats belong in an `f64` series, which keeps the value bit-exact.
   `Absent` is "no value" (spec §2.5); NaN and ±∞ are recorded as quality bad with no value, flagged and counted
-  (spec §2.5), on a decimal series as on any other.
+  (spec §2.5), on a decimal series as on any other. A finite value too large for `i64` at the series' scale is open
+  (Q-102 in `model/OPEN-QUESTIONS.md`).
 - Configuration durations are `std::time::Duration`; `Span` is used only where a sign is needed.
 
 ## Errors (accepted at gate 3.3)
@@ -280,7 +281,8 @@ pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: 
 let now = reader.live(id)?;                                   // latest valid value, with staleness; Live::Unknown (spec §2.3)
 let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::Avg)?;   // also Window::between(Span, Span)
 // WindowResult { value, coverage, from, to, flags }
-let series = reader.buckets(id, range, Resolution::Auto { max_points: 2_000 })?;   // chart query
+let series = reader.buckets(id, range, Resolution::Auto { max_points: 2_000 })?;   // chart query: Vec<Bucket>
+// Bucket { from, to, count: u64, min: Option<Value>, max: Option<Value>, mean: Option<f64>, coverage, flags }
 let day = reader.calendar(id, date, Aggregate::Integral)?;   // site time zone
 let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named IANA zone for the whole span
 let (start, end) = reader.interval(id, t)?;                 // the interval of an interval series' reading at t
@@ -290,11 +292,20 @@ pub struct Facts;   /* impl Iterator<Item = Result<FactRow, QueryError>> */   //
 pub enum View { Current, AsOf(Position), AsOfTime(Timestamp), History }
 pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value, pub quality,
                      pub supplied_quality, pub flags: FactFlags, pub changed_at: Option<u64> }
+pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRow>, QueryError>;   // the fact in force at t
 ```
+- `at` returns the fact with the greatest event time ≤ `t` that a window can credit (not bad quality, not displaced),
+  as `view` selects it (for a versioned series, the version the view selects), with its `changed_at`; `None` if there
+  is none. It lets a client show, for example, the issue time of the value a window's leading stretch carries in.
+  The leading-edge credit (spec §6 Edge stretches) uses that fact only while `t` is within its S; `at` returns it
+  regardless, and the caller compares `t` with the fact's `t` + S (S from `series()`).
 - Read calls are synchronous and blocking; an asynchronous caller runs them on its blocking pool. Ranges are
   half-open in event time.
 - `Resolution::Auto` picks the coarsest stored level that yields at most `max_points`, and raw facts when the
-  range is short enough. Every bucket carries count, min, max and coverage so a chart can show gaps and spikes.
+  range is short enough. Every bucket carries count and coverage so a chart can show gaps. `min` and `max` are over
+  the readings in the bucket only (spec §5.2), so they are `None` when no reading starts in it, while `mean` (for a
+  gauge, time-weighted: integral ÷ covered seconds, spec §6 Aggregates) can still be present from a value carried in
+  across the bucket's start.
 - Data is stored in UTC; a zone only defines calendar days and months. `calendar` takes site-zone days as spec §5.7
   defines them, also across a zone change; `calendar_in` and calendar windows that name a zone use that zone
   throughout, evaluated as a window over the UTC data (spec §5.7).
@@ -314,7 +325,7 @@ pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }
 pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64 }, DiskCritical { free: u64 },
-    SealBlocked { file_id: u64 }, ManifestRebuilt { epoch: u64, at: Timestamp } }
+    SealBlocked { file_id: u64 }, ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */ } }
 pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost | PossibleLoss */,
     pub cause: LossCause /* Corruption | TruncatedTail | LostInBucket | InvalidContent */,
     pub first: Option<Position>, pub last: Option<Position>, pub file_id: Option<u64>, pub bytes: u64,
@@ -323,7 +334,7 @@ pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost |
     pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool }
 pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for ever; Store and Reader
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
-pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // spec §7 Manifest
+pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
@@ -338,7 +349,9 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is acknowledged; a
   `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
   a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
-  no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`;
+  no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,
+  which is refused while read-only and in a drill as `acknowledge_losses` is, and whose torn acknowledgement record is
+  given again as for `acknowledge_losses` (spec §7 Manifest);
   while deep cannot be reached to tell whether a copy exists, it is the fault `ManifestCorrupt` (spec §7 Manifest).
   `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
