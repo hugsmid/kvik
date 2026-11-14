@@ -27,6 +27,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
+| Q-97 | §3 Durable mark, `format.md` A.10, `CONTRIBUTING.md` | A memory-mapped mark in a project that forbids unsafe code |
+| Q-98 | §3 Recovery rule 1, invariant 10 | Same boot identity after the page cache was lost |
+| Q-99 | §3 Single writer | An exclusive `flock` on the store directory on Windows |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -385,6 +388,41 @@ deliveries it has seen" on `resync` depends on which.
 middle is not examined. One `resync` delivery carries the state of every funnel in force (`engine::Resync`).
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
+
+## Q-97 — A memory-mapped mark in a project that forbids unsafe code
+**Scenario.** §3 requires a memory-mapped mark file with a sequence lock, read by reader processes; `format.md` A.10
+and `api.md` (`Fs::mmap`) follow it. Every crate of the project forbids unsafe code (`Cargo.toml`,
+`CONTRIBUTING.md`). Mapping a file into memory in Rust needs unsafe code, and reading a sequence lock that another
+process updates through a shared mapping needs atomic accesses to shared memory, which safe Rust cannot express. Writes
+through a mapping are also invisible to the file-system seam, so the tests of roadmap 4.5 cannot drop them at a
+simulated power loss.
+**Model.** Not modelled; the model has no files.
+**Needed.** Whether the mark must be memory-mapped (and the unsafe rule relaxed for it, in one audited place), or §3
+names only what the mark holds and when it is written and read, leaving the mechanism to `format.md`. Found by the
+format check (`docs/format-check.md` FC-21). Settle by gate 3.3, before 4.4.
+
+## Q-98 — Same boot identity after the page cache was lost
+**Scenario.** The store is on a removable or separately mounted disk. Batches are synced and acknowledged; the mark in
+memory covers them, but its last timed sync (§3, `mark_sync_interval`) was up to a second earlier. The process
+crashes, and the file system is unmounted and mounted again, or the disk detached and reattached, without a reboot.
+The page cache for the mark is gone and the mark on disk lags. On restart the boot identity matches the mark's, so
+rule 1 truncates everything after the stale mark, including batches that were synced and acknowledged. Invariant 10
+names no such loss, and the design requires that a crash loses nothing acknowledged.
+**Model.** Not modelled; the model's mark is exact on the same boot.
+**Needed.** Whether rule 1 may trust the boot identity alone (stating that the store's file system must stay mounted
+for the life of a boot), or needs a second identity that changes when the file system is mounted again, or keeps
+complete batches after the mark on the same boot as rule 3 does. Found by the format check (`docs/format-check.md`
+FC-24). Settle by 4.5.
+
+## Q-99 — An exclusive `flock` on the store directory on Windows
+**Scenario.** §3 Single writer requires "exclusive `flock` on the store directory; readers never take it". Roadmap
+items must pass on Windows, which has no `flock`; a lock there is taken on a file handle, and a directory is not opened
+as an ordinary file. The behaviour of such locks on network file systems is not stated either, nor whether a second
+open in the same process is refused.
+**Model.** Not modelled.
+**Needed.** Whether §3 names the mechanism or only the rule (one writer per store directory, enforced by an operating
+system lock released when the process ends; readers never take it), and whether network file systems are supported.
+Found by the format check (`docs/format-check.md` FC-28). Settle by 4.1.
 
 ## Open at v0.2
 
