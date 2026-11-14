@@ -1393,7 +1393,14 @@ fn record_loss(
         rec.last = (0, l.last.1.max(hi));
         rec.extends = true;
     }
-    *epoch += 1;
+    // A lease may name any epoch: with none left above it, the start stays read-only rather than wrapping.
+    *epoch = epoch.checked_add(1).ok_or_else(|| {
+        fault(
+            FaultOp::Write,
+            path,
+            &io::Error::other("no manifest epoch is left above the manifest's and the leases'"),
+        )
+    })?;
     let bytes = encode_record(RECORD_LOST_RANGE, *epoch, 0, wall, Some(&rec));
     let at = f.len().map_err(|e| fault(FaultOp::Write, path, &e))?;
     f.write_at(&bytes, at)

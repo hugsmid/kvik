@@ -13,9 +13,12 @@
 //! - **The last batch it returned, checked again before every refresh.** A writer's restart never changes a
 //!   complete batch below the mark it acts on, but that mark can be older than the one the reader read: a start
 //!   after a page-cache loss on the same boot truncates the batch beyond the mark on disk (`spec.md` §3 Recovery
-//!   rule 1, accepted limit), and a damaged tail is truncated under rule 3. The reader keeps a checksum of each of
-//!   its recent batches, over all its bytes (a commit block alone does not tell two batches apart, Q-119); when the last one no longer reads the same, it voids what it took above the last that
-//!   does ([`VoidCause::Rewritten`], Q-118 (e)).
+//!   rule 1, accepted limit), and a damaged tail is truncated under rule 3. The reader keeps a checksum over all
+//!   the bytes of each of its recent batches (a commit block alone does not tell two batches apart, Q-119); when
+//!   the last one no longer reads the same, it voids what it took above the last that does
+//!   ([`VoidCause::Rewritten`], Q-118 (e)).
+//! - **The mark again after the scan.** If it moved backwards meanwhile, a start may have rewritten what was just
+//!   read: the pass is discarded and returns nothing (Q-118 (l)).
 //! - **Recovery entries.** A reader that reads a recovery entry voids what it took above the entry's `after`
 //!   (`spec.md` §7 Readers). How a position kept beyond the life of a reader is checked against a later truncation
 //!   or restore is open (Q-46): this reader voids only what it took itself.
@@ -72,7 +75,7 @@ use crate::crc::crc32c;
 use crate::entries::Entry;
 use crate::error::FormatError;
 use crate::fs::{Fs, FsFile, OpenMode};
-use crate::header::HEADER_LEN;
+use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::lease::{LEASE_EXPIRY, LEASE_REFRESH, LeaseSlot, SLOT_OFFSET, lease_name};
 use crate::manifest::{LostRange, ManifestError, read_manifest};
 use crate::mark::{MARK_LEN, MarkSlot, read_mark};
@@ -83,6 +86,9 @@ use crate::writer::{Clock, Position};
 
 /// How many times a reader reads the mark again when neither slot is valid (`format.md` A.10).
 pub const MARK_RETRIES: u32 = 8;
+/// The longest segment file a reader reads into memory: the largest `segment_size` (1 GiB, `format.md` A.4) and
+/// room for the seal blocks.
+pub const MAX_SEGMENT_FILE: u64 = (1 << 30) + (32 << 20);
 /// How many recently returned batches the reader keeps a checksum of, to find what a rewrite left.
 const RECENT: usize = 64;
 
@@ -99,7 +105,8 @@ pub struct ReaderConfig {
     pub boot_id: Option<[u8; 16]>,
     /// 16 random bytes per reader handle: the lease's name.
     pub reader_id: [u8; 16],
-    /// The longest time between renewals of the lease; at most 30 minutes (`spec.md` §7 Readers).
+    /// The longest time between renewals of the lease; at most 30 minutes (`spec.md` §7 Readers): a longer value
+    /// is taken as 30 minutes.
     pub lease_refresh: Duration,
 }
 
@@ -151,11 +158,19 @@ pub enum ReaderError {
         /// The failure.
         error: BodyError,
     },
+    /// A segment file longer than [`MAX_SEGMENT_FILE`]: not read.
+    #[error("{path} is {len} bytes, longer than any segment")]
+    TooLong {
+        /// The segment.
+        path: PathBuf,
+        /// Its length.
+        len: u64,
+    },
     /// The manifest cannot be read.
     #[error(transparent)]
     Manifest(ManifestError),
-    /// The segment the mark points into was not found, under either extension.
-    #[error("segment {file_id} named by the mark is missing")]
+    /// A segment the reader must read was not found, under either extension.
+    #[error("segment {file_id} is missing")]
     SegmentMissing {
         /// Its file id.
         file_id: u64,
@@ -313,7 +328,8 @@ impl LogReader {
     /// Opens a reader on the store in `cfg.dir`: reads the descriptor without the lock, reads the mark and the
     /// manifest, and writes the lease naming the manifest's epoch. Reads no segment: the first
     /// [`LogReader::refresh`] returns the log from its start.
-    pub fn open(cfg: ReaderConfig) -> Result<Self, ReaderError> {
+    pub fn open(mut cfg: ReaderConfig) -> Result<Self, ReaderError> {
+        cfg.lease_refresh = cfg.lease_refresh.min(LEASE_REFRESH);
         let store_id = read_descriptor(&*cfg.fs, &cfg.dir)?.store_id;
         let log_dir = cfg.dir.join(LOG_DIR);
         let lease_path = cfg.dir.join(LEASES_DIR).join(lease_name(&cfg.reader_id));
@@ -384,6 +400,16 @@ impl LogReader {
         // The lease was written whatever the log held: keep its state.
         self.commit_lease(renewed);
         read?;
+        // A mark that moved backwards while the files were read: a start may have rewritten what was read under the
+        // first one. Discard the pass; the next refresh checks what it holds and reads again (Q-118 (l)).
+        if let Ok(again) = self.read_mark()
+            && behind(&again, &mark)
+        {
+            return Ok(Update {
+                state: self.state,
+                events: Vec::new(),
+            });
+        }
         self.view = view;
         self.lost = lost;
         self.state.durable = Position {
@@ -464,7 +490,18 @@ impl LogReader {
         let fs = &*self.cfg.fs;
         let path = &self.lease_path;
         match fs.open(path, OpenMode::ReadWrite) {
-            Ok(f) => f.write_at(&slot.encode(), SLOT_OFFSET as u64),
+            // The slot alone, in place, when the header is the lease's own; else the whole file.
+            Ok(f) => {
+                let mut h = [0u8; HEADER_LEN];
+                let ok = read_at_full(&*f, &mut h, 0).is_ok_and(|n| n == HEADER_LEN)
+                    && FileHeader::decode(&h)
+                        .is_some_and(|h| h.kind == kind::LEASE && h.store_id == self.store_id);
+                if ok {
+                    f.write_at(&slot.encode(), SLOT_OFFSET as u64)
+                } else {
+                    f.write_at(&slot.encode_file(self.store_id, generation), 0)
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => fs
                 .open(path, OpenMode::CreateNew)
                 .and_then(|f| f.write_at(&slot.encode_file(self.store_id, generation), 0)),
@@ -598,17 +635,18 @@ impl LogReader {
                 // The mark is behind the point reached in its segment: nothing new is below it.
                 break;
             }
+            // An earlier segment that is gone would leave its positions unread: an error, as for the mark's.
             let Some((n, f)) = self.open_segment(name)? else {
-                if file_id == mark.file_id {
-                    return Err(ReaderError::SegmentMissing { file_id });
-                }
-                continue;
+                return Err(ReaderError::SegmentMissing { file_id });
             };
             let path = self.log_dir.join(n.to_string());
             let len = match limit {
                 ScanLimit::Mark(m) => m,
                 ScanLimit::End => f.len().map_err(io_err(&path))?,
             };
+            if len > MAX_SEGMENT_FILE {
+                return Err(ReaderError::TooLong { path, len });
+            }
             let bytes = read_part(&*f, from.offset, len).map_err(io_err(&path))?;
             let id = SegmentIdentity {
                 store_id: self.store_id,
@@ -762,6 +800,13 @@ impl Drop for LogReader {
             let _ = self.cfg.fs.remove_file(&self.lease_path);
         }
     }
+}
+
+/// Whether mark `b` is behind mark `a`: another generation, a lower last position, or an earlier place.
+fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
+    b.generation != a.generation
+        || b.last_sequence < a.last_sequence
+        || (b.file_id, b.offset) < (a.file_id, a.offset)
 }
 
 /// Reads up to `n` bytes from the start of `f`.

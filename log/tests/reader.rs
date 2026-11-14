@@ -842,9 +842,34 @@ fn an_invalid_lease_and_a_lease_without_boot_id_live_until_expiry() {
     assert!(!seen.contains_key(&[0xc1; 16]) && !seen.contains_key(&[0xc2; 16]));
 }
 
-/// A writer on its threads and a reader on another thread, on the given file system: the reader never holds
-/// anything the files do not, and catches up with every acknowledged entry.
-fn concurrent(fs: Arc<dyn Fs>, root: &Path) {
+/// Runs `f` on its own thread and fails with a message if it does not finish within `limit`, so that a hang is a
+/// failure, never a stalled run.
+fn bounded<T: Send + 'static>(
+    what: &str,
+    limit: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(v) => {
+            h.join().unwrap();
+            v
+        }
+        // The thread panicked: report its panic.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match h.join() {
+            Err(p) => std::panic::resume_unwind(p),
+            Ok(()) => unreachable!("sent nothing and did not panic"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what} did not finish within {} s", limit.as_secs())
+        }
+    }
+}
+
+fn start_log(fs: &Arc<dyn Fs>, root: &Path) -> Log {
     let store = StoreDir::open(fs.clone(), root, Some(&new_store())).unwrap();
     let writer = LogWriter::open(
         store,
@@ -857,12 +882,20 @@ fn concurrent(fs: Arc<dyn Fs>, root: &Path) {
         T0,
     )
     .unwrap();
+    Log::start(writer, Arc::new(kvik_log::writer::SystemClock::default())).unwrap()
+}
+
+/// A writer on its threads and a reader on another thread, on the given file system: the reader never holds
+/// anything the files do not, and catches up with every acknowledged entry. With `restart`, the writer is shut
+/// down half way and opened again while the reader goes on.
+fn concurrent(fs: Arc<dyn Fs>, root: PathBuf, restart: bool) {
+    let mut log = start_log(&fs, &root);
     let clock = Arc::new(kvik_log::writer::SystemClock::default());
-    let log = Log::start(writer, clock.clone()).unwrap();
-    let rc = ReaderConfig::new(root, fs.clone(), clock, Some([1; 16]), [3; 16]);
+    let rc = ReaderConfig::new(&root, fs.clone(), clock, Some([1; 16]), [3; 16]);
     let done = Arc::new(Mutex::new(None::<u64>));
     let d = done.clone();
     let reader = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut reader = LogReader::open(rc).unwrap();
         let mut held = Held::default();
         loop {
@@ -875,32 +908,43 @@ fn concurrent(fs: Arc<dyn Fs>, root: &Path) {
                 reader.close().unwrap();
                 return held.items;
             }
-            std::thread::yield_now();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader did not catch up within 60 s: durable {:?}, waiting for {:?}",
+                u.state.durable,
+                *d.lock().unwrap()
+            );
+            // Leave the file system to the writer between refreshes.
+            std::thread::sleep(Duration::from_millis(1));
         }
     });
     let mut acked = BTreeMap::new();
     let mut pending = Vec::new();
+    let settle = |pending: &mut Vec<(kvik_log::writer::Pending, Vec<Item>)>,
+                  acked: &mut BTreeMap<u64, Item>| {
+        for (p, it) in pending.drain(..) {
+            let a = p.wait().unwrap();
+            for (j, item) in it.into_iter().enumerate() {
+                acked.insert(a.first.sequence + j as u64, item);
+            }
+        }
+    };
     for k in 0..400u32 {
+        if restart && k == 200 {
+            settle(&mut pending, &mut acked);
+            log.shutdown().unwrap();
+            log = start_log(&fs, &root);
+        }
         let mut it = items(1 + (k % 9) as usize, i64::from(k) * 100);
         if k % 50 == 0 {
             it.push(alias(k + 1));
         }
         pending.push((log.submit(it.clone()).unwrap(), it));
         if pending.len() >= 8 {
-            for (p, it) in pending.drain(..) {
-                let a = p.wait().unwrap();
-                for (j, item) in it.into_iter().enumerate() {
-                    acked.insert(a.first.sequence + j as u64, item);
-                }
-            }
+            settle(&mut pending, &mut acked);
         }
     }
-    for (p, it) in pending.drain(..) {
-        let a = p.wait().unwrap();
-        for (j, item) in it.into_iter().enumerate() {
-            acked.insert(a.first.sequence + j as u64, item);
-        }
-    }
+    settle(&mut pending, &mut acked);
     *done.lock().unwrap() = acked.keys().last().copied();
     let held = reader.join().unwrap();
     log.shutdown().unwrap();
@@ -909,14 +953,26 @@ fn concurrent(fs: Arc<dyn Fs>, root: &Path) {
 
 #[test]
 fn a_writer_and_a_reader_on_threads_on_the_in_memory_file_system() {
-    concurrent(Arc::new(MemFs::new()), &dir());
+    bounded("the threaded run", Duration::from_secs(120), || {
+        concurrent(Arc::new(MemFs::new()), dir(), false)
+    });
+}
+
+#[test]
+fn a_writer_restarted_mid_run_and_a_reader_on_threads() {
+    bounded("the threaded run", Duration::from_secs(120), || {
+        concurrent(Arc::new(MemFs::new()), dir(), true)
+    });
 }
 
 #[test]
 fn a_writer_and_a_reader_on_threads_on_the_real_file_system() {
     let root = std::env::temp_dir().join(format!("kvik-log-reader-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    concurrent(Arc::new(StdFs), &root);
+    let r = root.clone();
+    bounded("the threaded run", Duration::from_secs(120), move || {
+        concurrent(Arc::new(StdFs), r, false)
+    });
     // The reader deleted its lease on close.
     assert_eq!(std::fs::read_dir(root.join("leases")).unwrap().count(), 0);
     std::fs::remove_dir_all(&root).unwrap();
@@ -956,8 +1012,8 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 /// Runs the operations, refreshing as told and checking after every refresh; at the end the writer is drained and
-/// the reader must hold exactly the files' positions up to the mark, and every acknowledged entry unless a remount
-/// lost one (the accepted limit of `spec.md` §3 Recovery rule 1).
+/// the reader must hold exactly the files' positions up to the mark, and every acknowledged entry except those above
+/// the mark on disk at a remount (the accepted limit of `spec.md` §3 Recovery rule 1).
 fn interleave(ops: &[Op], every: bool) {
     let mut r = Rig::new(WriterConfig {
         segment_size: 8 << 10,
@@ -970,7 +1026,6 @@ fn interleave(ops: &[Op], every: bool) {
         ..cfg()
     });
     let mut series = 0u32;
-    let mut lossy = false;
     let mut t = 0i64;
     for o in ops {
         match o {
@@ -1002,7 +1057,11 @@ fn interleave(ops: &[Op], every: bool) {
                 r.fs.power_loss_partial(*seed);
                 r.fs.restart();
                 if *same_boot {
-                    lossy |= !every;
+                    // The accepted limit of rule 1: what is above the mark on disk may be truncated. Only those
+                    // positions are exempt from the final check; they count again once acknowledged again.
+                    if let Some(m) = r.mark() {
+                        r.acked.retain(|&k, _| k <= m.last_sequence);
+                    }
                 } else {
                     r.boot = r.boot.wrapping_add(1).max(1);
                 }
@@ -1043,10 +1102,8 @@ fn interleave(ops: &[Op], every: bool) {
     r.refresh().unwrap();
     r.check_held();
     r.check_caught_up();
-    if !lossy {
-        for (k, item) in &r.acked {
-            assert_eq!(r.held.items.get(k), Some(item), "acknowledged position {k}");
-        }
+    for (k, item) in &r.acked {
+        assert_eq!(r.held.items.get(k), Some(item), "acknowledged position {k}");
     }
 }
 
@@ -1088,4 +1145,288 @@ fn a_batch_assigned_again_with_an_identical_commit_block_is_still_voided() {
         ],
         false,
     );
+}
+
+/// Called before each open; `false` reports the file missing for that open.
+type MarkHook = Box<dyn FnMut(&MemFs, &Path) -> bool + Send>;
+
+/// The in-memory file system with a hook on every open.
+struct HookFs {
+    inner: MemFs,
+    hook: Mutex<Option<MarkHook>>,
+}
+
+impl std::fmt::Debug for HookFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookFs").finish_non_exhaustive()
+    }
+}
+
+impl Fs for HookFs {
+    fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<Box<dyn kvik_log::fs::FsFile>> {
+        if let Some(h) = self.hook.lock().unwrap().as_mut()
+            && !h(&self.inner, path)
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "hidden"));
+        }
+        self.inner.open(path, mode)
+    }
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<kvik_log::fs::DirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_dir(path)
+    }
+    fn free_space(&self, path: &Path) -> std::io::Result<u64> {
+        self.inner.free_space(path)
+    }
+}
+
+/// A rig whose reader goes through a [`HookFs`].
+fn hooked_rig() -> (Rig, Arc<HookFs>) {
+    let mut r = Rig::new(cfg());
+    let fs = Arc::new(HookFs {
+        inner: r.fs.clone(),
+        hook: Mutex::new(None),
+    });
+    let mut c = r.reader_cfg();
+    c.fs = fs.clone();
+    r.reader = Some(LogReader::open(c).unwrap());
+    r.held = Held::default();
+    (r, fs)
+}
+
+#[test]
+fn the_mark_is_read_at_most_nine_times_per_call() {
+    for (hidden, ok) in [(8, true), (9, false)] {
+        let (mut r, fs) = hooked_rig();
+        r.submit(items(2, 0));
+        r.drain();
+        let mut left = hidden;
+        let reads = Arc::new(Mutex::new(0));
+        let n = reads.clone();
+        *fs.hook.lock().unwrap() = Some(Box::new(move |_, p: &Path| {
+            if !p.ends_with("MARK") {
+                return true;
+            }
+            *n.lock().unwrap() += 1;
+            if left > 0 {
+                left -= 1;
+                false
+            } else {
+                true
+            }
+        }));
+        let got = r.refresh();
+        if ok {
+            got.unwrap();
+            assert_eq!(r.held.items.len(), 2);
+        } else {
+            assert!(matches!(got, Err(ReaderError::MarkUnreadable)));
+            assert!(r.held.items.is_empty());
+            assert_eq!(*reads.lock().unwrap(), 9);
+        }
+    }
+}
+
+#[test]
+fn a_mark_that_moves_backwards_during_a_refresh_discards_the_pass() {
+    let (mut r, fs) = hooked_rig();
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    let older = r.mark().unwrap();
+    r.submit(items(3, 100));
+    r.drain();
+    let newer = r.mark().unwrap();
+    let before = r.reader.as_ref().unwrap().state();
+    // The second read of the mark in the refresh finds an older position, as after a start's truncation.
+    let mut opens = 0;
+    *fs.hook.lock().unwrap() = Some(Box::new(move |m: &MemFs, p: &Path| {
+        if !p.ends_with("MARK") {
+            return true;
+        }
+        opens += 1;
+        if opens == 2 {
+            let back = MarkSlot {
+                counter: newer.counter + 1,
+                ..older
+            };
+            m.poke(&log_path("MARK"), 0, &encode_mark_file([Some(back), None]));
+        }
+        true
+    }));
+    let u = r.refresh().unwrap();
+    assert!(u.events.is_empty());
+    assert_eq!(u.state.durable, before.durable);
+    assert_eq!(r.held.items.len(), 2);
+    // The mark moves on again: the batches are read then.
+    *fs.hook.lock().unwrap() = None;
+    let ahead = MarkSlot {
+        counter: newer.counter + 2,
+        ..newer
+    };
+    r.fs.poke(&log_path("MARK"), 0, &encode_mark_file([Some(ahead), None]));
+    r.refresh().unwrap();
+    assert_eq!(r.held.items.len(), 5);
+}
+
+#[test]
+fn a_refused_segment_stops_the_reader_before_it_and_changes_nothing() {
+    let mut r = Rig::new(cfg());
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    for k in 1..4 {
+        r.submit(items(2, k * 100));
+        r.drain();
+    }
+    let before = r.reader.as_ref().unwrap().state();
+    // The middle one of the three new batches gets a data block of an unknown critical type, its checksums intact.
+    let m = r.mark().unwrap();
+    let seg = log_path(
+        &SegmentName {
+            generation: 0,
+            file_id: m.file_id,
+            sealed: false,
+        }
+        .to_string(),
+    );
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: m.file_id,
+        generation: 0,
+    };
+    let at = scan(&bytes, &id, ScanLimit::End).unwrap().batches[2].offset as usize;
+    let mut h = bytes[at..at + 16].to_vec();
+    h[0] = 0x70;
+    let crc = kvik_log::crc::crc32c(&h[..12]);
+    h[12..16].copy_from_slice(&crc.to_le_bytes());
+    r.fs.poke(&seg, at, &h);
+    assert!(matches!(r.refresh(), Err(ReaderError::Unsupported { .. })));
+    assert_eq!(r.reader.as_ref().unwrap().state().durable, before.durable);
+    assert_eq!(r.held.items.len(), 2);
+    // Repaired, the rest is read.
+    r.fs.poke(&seg, at, &bytes[at..at + 16]);
+    r.refresh().unwrap();
+    assert_eq!(r.held.items, r.acked);
+}
+
+#[test]
+fn an_earlier_segment_listed_but_gone_when_opened_is_an_error() {
+    let (mut r, fs) = hooked_rig();
+    r.cfg = WriterConfig {
+        segment_size: 8 << 10,
+        max_batch_bytes: 2 << 10,
+        ..cfg()
+    };
+    r.kill();
+    assert!(r.open());
+    for k in 0..60 {
+        r.submit(items(7, k * 10));
+        r.step();
+        r.clock.advance(3 * MS);
+    }
+    r.drain();
+    let m = r.mark().unwrap();
+    assert!(m.file_id > 2);
+    // Segment 2 is listed but cannot be opened under either name, as if removed between the two.
+    *fs.hook.lock().unwrap() = Some(Box::new(|_, p: &Path| {
+        !p.to_string_lossy().contains("-0000000000000002.")
+    }));
+    assert!(matches!(
+        r.refresh(),
+        Err(ReaderError::SegmentMissing { file_id: 2 })
+    ));
+    assert!(r.held.items.is_empty());
+    *fs.hook.lock().unwrap() = None;
+    r.refresh().unwrap();
+    assert_eq!(r.held.items, r.acked);
+}
+
+#[test]
+fn a_lease_whose_header_is_damaged_is_written_whole_and_the_refresh_interval_is_capped() {
+    let mut r = Rig::new(cfg());
+    let mine = dir().join("leases").join(lease_name(&[r.readers; 16]));
+    r.fs.poke(&mine, 0, &[0; 64]);
+    r.refresh().unwrap();
+    let lease = LeaseSlot::decode_file(&r.fs.read(&mine).unwrap(), &STORE_ID).unwrap();
+    assert_eq!(lease.refresh_counter, 2);
+    // A refresh interval above 30 minutes is taken as 30: renewal is due after 15.
+    let mut c = r.reader_cfg();
+    c.lease_refresh = Duration::from_secs(4 * 3_600);
+    let mut reader = LogReader::open(c).unwrap();
+    r.clock.advance(Duration::from_secs(15 * 60));
+    assert!(reader.keep_alive().unwrap());
+}
+
+#[test]
+fn a_lease_naming_the_last_epoch_leaves_a_start_that_must_record_a_loss_read_only() {
+    let mut r = Rig::new(cfg());
+    let max = LeaseSlot {
+        epoch: u64::MAX,
+        refresh_counter: 1,
+        boot_id: r.boot_id(),
+        created_at: T0,
+    };
+    let f =
+        r.fs.open(
+            &dir().join("leases").join(lease_name(&[0xd1; 16])),
+            OpenMode::CreateNew,
+        )
+        .unwrap();
+    f.write_at(&max.encode_file(STORE_ID, 0), 0).unwrap();
+    r.submit(items(2, 0));
+    r.drain();
+    r.kill();
+    let m = r.mark().unwrap();
+    let seg = log_path(
+        &SegmentName {
+            generation: 0,
+            file_id: m.file_id,
+            sealed: false,
+        }
+        .to_string(),
+    );
+    r.fs.poke(&seg, 64 + 8, &[0xee; 8]);
+    let store = StoreDir::open(Arc::new(r.fs.clone()), &dir(), Some(&new_store())).unwrap();
+    let w = LogWriter::open(
+        store,
+        r.cfg.clone(),
+        Some(r.boot_id()),
+        r.now(),
+        r.clock.wall(),
+    )
+    .unwrap();
+    assert!(w.fault().is_some(), "read-only, not a wrapped epoch");
+    let man = read_manifest(&r.fs.read(&dir().join("MANIFEST")).unwrap(), &STORE_ID).unwrap();
+    assert!(man.records.iter().all(|x| x.epoch < u64::MAX));
+}
+
+#[test]
+fn an_unreadable_lease_counts_as_invalid_and_does_not_stop_a_start() {
+    let root = std::env::temp_dir().join(format!("kvik-log-lease-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let store = StoreDir::open(fs.clone(), &root, Some(&new_store())).unwrap();
+    drop(LogWriter::open(store, cfg(), Some([1; 16]), Duration::ZERO, T0).unwrap());
+    // A directory named as a lease.
+    std::fs::create_dir(root.join("leases").join(lease_name(&[0xe1; 16]))).unwrap();
+    let store = StoreDir::open(fs.clone(), &root, Some(&new_store())).unwrap();
+    let w = LogWriter::open(store, cfg(), Some([1; 16]), Duration::ZERO, T0).unwrap();
+    assert!(w.fault().is_none());
+    let seen = w.leases().observed();
+    assert_eq!(seen[&[0xe1; 16]].slot, None);
+    drop(w);
+    std::fs::remove_dir_all(&root).unwrap();
 }

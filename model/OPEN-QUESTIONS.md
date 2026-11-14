@@ -180,6 +180,10 @@ for the entry; the mark (A.10, version 3) has 40 reserved bytes, so a stamp fits
 recovery entry's `after`, and above the last returned batch that still reads the same after a start truncated others
 (Q-118 (e)). No position outlives the handle, so none of the branches above is needed there. The check of a kept
 position, `start: position` and row 7b's rule are not built; they need the stamp fields and a rule from the owner.
+**Decided by the owner (after roadmap 4.6).** A reset stamp, a reset sequence and a random nonce, is added to the
+mark's reserved bytes, to recovery entries and to restore records; a saved point becomes (position, stamp), judged by
+a conservative void rule. The wording and the format change come in their own pull request; until then this stays
+open.
 
 ## Q-52 (b) — Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it
 **Scenario.** Parts (a) and (c) are settled at gate 3.3 (see Settled). §7 Manifest writes the last valid record's
@@ -526,7 +530,8 @@ the item that puts the engine behind the interface. (d) Treated as a first start
 "An empty log" stops being a safe test once segments can leave `log/` (tiering, roadmap 8.1).
 (e) Their headers stay; the writer resumes in the last segment in use, after its header, whose `base_sequence` is the
 mark's last position + 1. (f) Only the last segment in use. (g) Done at roadmap 4.6: a start's first new epoch is above every epoch a valid
-lease file names, a void lease's included (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
+lease file names, a void lease's included; an unreadable lease file counts as invalid; with no epoch left above them
+the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
 (n) Measured by roadmap 4.8.
@@ -536,7 +541,7 @@ To be settled at gate 4.9.
 
 ## Q-118 — The reader process and leases: points `spec.md` §7 and `format.md` A.2, A.10, A.13 and A.15 leave open
 Found while building the reader process (roadmap 4.6, crate `kvik-log`: `reader`, `lease`). Each part names the
-reading implemented for now; tests in `log/tests/reader.rs` pin (a), (c) and (e) to (k); (b) and (d) are not pinned.
+reading implemented for now; tests in `log/tests/reader.rs` pin every part.
 **Scenario.** (a) *No mark.* A.10 names retries when neither slot is valid, not a missing mark file: a store whose
 first start has not written it yet, or a mark an operator removed. (b) *Retry pace.* "Retries 8 times" gives no
 pause. (c) *A new generation.* A restore (roadmap 8.3) sets positions aside "also in reader processes"; a reader that
@@ -552,7 +557,8 @@ lease write.* Whether a reader may read without a renewed lease. (h) *When the w
 from when the writer first observes a counter value, but no cadence is given; nor what "a different boot id" means
 when the writer has no boot identity. (i) *A corrupt manifest record.* A reader cannot take an epoch from it. (j) *The
 lease header.* A.15 says "an A.1 header" without its `file_id` and generation. (k) *What removal must honour.*
-Retired files (§7 Manifest) and tier moves (§8) do not exist yet.
+Retired files (§7 Manifest) and tier moves (§8) do not exist yet. (l) *A start during a refresh.* The mark is read
+before the segments; a start that truncates below it while they are read leaves the reader with bytes of both.
 **Implemented.** (a) Unreadable: `MarkUnreadable` at open and at refresh, which changes nothing the reader holds. (b)
 Back to back. (c) Everything taken is void (`VoidCause::Generation`) and the log is read again from its start. (d) The
 error names the file; nothing at or past it is read until it can be. (e) The reader keeps a CRC32C over all the bytes of
@@ -568,7 +574,14 @@ is for roadmap 6.3. (g) Open and refresh return the error and read nothing. (h) 
 minute, with no timer of its own: a late look only makes an expiry later. A lease is void only when both boot ids are
 non-zero and differ. (i) `ReaderError::Manifest`. (j) `file_id` 0 and the generation at creation; the store id is
 checked, as for every file. (k) `LeaseTable::oldest_live_epoch` is the input for roadmap 6.3 and 8.1; today the writer
-deletes only segments that hold no batch.
+deletes only segments that hold no batch. (l) The mark is read again after the scan; if it moved backwards (another
+generation, a lower last position or an earlier place) the pass is discarded and returns nothing, and the next
+refresh checks what the reader holds. Left: a start that truncates and then writes enough that the mark is past its
+old place before the second read; the next refresh's check of the last batch still finds the rewrite, but corruption
+events from that pass may be wrong. The reset stamp closes it: a changed stamp discards the pass.
+**Decided by the owner (after roadmap 4.6), for (e).** Rule 1 changes the reset stamp (Q-46) whenever it truncates a
+complete batch, so the accepted limit becomes a loss reported as a reset point; the reader then voids by the stamp
+rather than by its own checksums. Recorded here until the format pull request.
 **Needed.** A rule for each part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
 
 ## Q-119 — `batch_crc32c` does not depend on the blocks it is said to cover

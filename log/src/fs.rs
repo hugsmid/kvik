@@ -288,6 +288,10 @@ pub type SyncHook = Arc<dyn Fn(&Path) + Send + Sync>;
 pub struct MemFs {
     state: Arc<Mutex<MemState>>,
     hook: Arc<Mutex<Option<SyncHook>>>,
+    /// Free bytes. A lock of its own, taken last: a write holds its file's lock while it grows the file, and a
+    /// directory listing holds the state's lock while it reads each file's length, so growth must not wait for the
+    /// state's lock (lock order: state, then a file, then this).
+    free: Arc<Mutex<u64>>,
 }
 
 impl fmt::Debug for MemFs {
@@ -313,7 +317,6 @@ enum NameChange {
 struct MemState {
     files: BTreeMap<PathBuf, Arc<Mutex<MemData>>>,
     fail_syncs: bool,
-    free: u64,
     faults: Vec<Fault>,
     ops: Vec<MemOp>,
     /// Operations left before every operation fails.
@@ -406,13 +409,13 @@ impl MemFs {
             state: Arc::new(Mutex::new(MemState {
                 files: BTreeMap::new(),
                 fail_syncs: false,
-                free: 1 << 40,
                 faults: Vec::new(),
                 ops: Vec::new(),
                 crash_in: None,
                 names: Vec::new(),
             })),
             hook: Arc::new(Mutex::new(None)),
+            free: Arc::new(Mutex::new(1 << 40)),
         }
     }
 
@@ -423,7 +426,7 @@ impl MemFs {
 
     /// Sets the free space; growing a file beyond it fails.
     pub fn set_free_space(&self, bytes: u64) {
-        lock(&self.state).free = bytes;
+        *lock(&self.free) = bytes;
     }
 
     /// Fails the operation `op` on a path containing `path_contains`, after `skip` such operations have succeeded,
@@ -554,7 +557,10 @@ impl MemFs {
             d.lost.clear();
             d.locked = false;
         }
-        s.free = (s.free as i128 + freed).max(0) as u64;
+        {
+            let mut f = lock(&self.free);
+            *f = (*f as i128 + freed).max(0) as u64;
+        }
         let names = std::mem::take(&mut s.names);
         if let Some(r) = rng.as_mut() {
             for n in names.into_iter().rev() {
@@ -564,7 +570,7 @@ impl MemFs {
                 match n {
                     NameChange::Created(p) => {
                         if let Some(d) = s.files.remove(&p) {
-                            s.free += lock(&d).bytes.len() as u64;
+                            *lock(&self.free) += lock(&d).bytes.len() as u64;
                         }
                     }
                     NameChange::Renamed { from, to } => {
@@ -576,7 +582,7 @@ impl MemFs {
                         }
                     }
                     NameChange::Removed { path, data } => {
-                        if !s.files.contains_key(&path) {
+                        if let std::collections::btree_map::Entry::Vacant(e) = s.files.entry(path) {
                             let len = {
                                 let mut d = lock(&data);
                                 d.bytes = d.durable.clone();
@@ -585,8 +591,9 @@ impl MemFs {
                                 d.locked = false;
                                 d.bytes.len() as u64
                             };
-                            s.free = s.free.saturating_sub(len);
-                            s.files.insert(path, data);
+                            let mut f = lock(&self.free);
+                            *f = f.saturating_sub(len);
+                            e.insert(data);
                         }
                     }
                 }
@@ -640,15 +647,15 @@ impl MemFs {
     /// Changes the free space by the growth of a file from `old` to `new` bytes; fails without a change if there
     /// is not enough.
     fn resize(&self, old: usize, new: usize) -> io::Result<()> {
-        let mut s = lock(&self.state);
+        let mut free = lock(&self.free);
         if new > old {
             let by = (new - old) as u64;
-            if by > s.free {
+            if by > *free {
                 return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
             }
-            s.free -= by;
+            *free -= by;
         } else {
-            s.free += (old - new) as u64;
+            *free += (old - new) as u64;
         }
         Ok(())
     }
@@ -716,7 +723,7 @@ impl Fs for MemFs {
         let d = s.files.remove(from).ok_or_else(not_found)?;
         lock(&d).path = to.to_path_buf();
         if let Some(old) = s.files.insert(to.to_path_buf(), d) {
-            s.free += lock(&old).bytes.len() as u64;
+            *lock(&self.free) += lock(&old).bytes.len() as u64;
         }
         s.names.push(NameChange::Renamed {
             from: from.to_path_buf(),
@@ -728,7 +735,7 @@ impl Fs for MemFs {
         self.check(FaultOp::Remove, path, 0, 0)?;
         let mut s = lock(&self.state);
         let d = s.files.remove(path).ok_or_else(not_found)?;
-        s.free += lock(&d).bytes.len() as u64;
+        *lock(&self.free) += lock(&d).bytes.len() as u64;
         let created_unsynced = s
             .names
             .iter()
@@ -757,7 +764,7 @@ impl Fs for MemFs {
         Ok(())
     }
     fn free_space(&self, _path: &Path) -> io::Result<u64> {
-        Ok(lock(&self.state).free)
+        Ok(*lock(&self.free))
     }
 }
 
@@ -874,6 +881,41 @@ impl Drop for MemFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file growing on one thread while another lists its directory, removes and renames files: the two lock
+    /// orders (a file's lock while growing it, the state's lock while reading each file's length) must not deadlock.
+    #[test]
+    fn growth_and_listing_on_two_threads_do_not_deadlock() {
+        let fs = MemFs::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = fs.clone();
+        let grow = std::thread::spawn(move || {
+            let f = a.open(Path::new("d/grow"), OpenMode::CreateNew).unwrap();
+            for i in 0..20_000u64 {
+                f.write_at(&[1], i).unwrap();
+                f.set_len(i + 1).unwrap();
+            }
+        });
+        let b = fs.clone();
+        let list = std::thread::spawn(move || {
+            for i in 0..20_000u64 {
+                b.read_dir(Path::new("d")).unwrap();
+                if i % 64 == 0 {
+                    let p = Path::new("d/other");
+                    let _ = b.open(p, OpenMode::CreateNew);
+                    b.rename(p, Path::new("d/moved")).unwrap();
+                    b.remove_file(Path::new("d/moved")).unwrap();
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            grow.join().unwrap();
+            list.join().unwrap();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("growing a file while listing its directory deadlocked");
+    }
 
     fn exercise(fs: &dyn Fs, dir: &Path) {
         let p = dir.join("segment");

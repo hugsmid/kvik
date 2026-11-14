@@ -152,8 +152,8 @@ fn read_lease(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
-/// Every lease file in `dir`: its reader id and its slot, `None` when invalid. A missing directory holds none; a
-/// file removed while listing is left out.
+/// Every lease file in `dir`: its reader id and its slot, `None` when invalid or unreadable. A missing directory
+/// holds none; a file removed while listing is left out.
 pub fn read_leases(
     fs: &dyn Fs,
     dir: &Path,
@@ -169,10 +169,11 @@ pub fn read_leases(
         let Some(id) = parse_lease_name(&e.name) else {
             continue;
         };
+        // A file that cannot be read (permissions, a directory of that name) is an invalid lease.
         match read_lease(fs, &dir.join(&e.name)) {
             Ok(b) => out.push((id, LeaseSlot::decode_file(&b, store_id))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(_) => out.push((id, None)),
         }
     }
     Ok(out)

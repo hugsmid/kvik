@@ -12,8 +12,8 @@ use crate::lease::LeaseSlot;
 use crate::mark::read_mark;
 use crate::scan::{ScanLimit, ScanReport, Tail, scan};
 
-/// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file and each body type, and checks what a
-/// scan reports. Panics only if a check fails (a bug); never for any input.
+/// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file and each body type, and
+/// checks what a scan reports. Panics only if a check fails (a bug); never for any input.
 ///
 /// The segment identity is taken from the bytes where the header would be, so mutated valid segments reach the
 /// batch checks.
