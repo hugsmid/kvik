@@ -623,7 +623,7 @@ size, which need compaction and the tree: roadmap sections 6, 7 and 10), and may
 ## 13. Risks to measure
 | Risk | How measured | If it fails |
 |---|---|---|
-| Sync rate and SSD wear | Syncs/s and bytes written on a representative SSD with N unbatched 1 Hz series (N stated in the benchmark), preallocated segments, `fdatasync`, plus the timed mark sync | Enable linger (≤ 1 ms); a longer `mark_sync_interval` |
+| Sync rate and SSD wear | Syncs/s and bytes written on a representative SSD with N unbatched 1 Hz series (N stated in the benchmark), preallocated segments, `fdatasync`, plus the timed mark sync | A group-commit window of a few milliseconds; a longer `mark_sync_interval` |
 | Funnel budget ≤ 1 µs | Benchmark per-reading routing and a 24 h rolling average with cached middle | Budget excludes windowed conditions; cadence-only evaluation |
 | Batch tree update cost | Backfill at a stated target rate through normal ingest, with late facts | Larger batches for re-ingest |
 | Duplicate check on replay | 1 hour × 100 series replay; probes outside the recent window | Larger recent window |

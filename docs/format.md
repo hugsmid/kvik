@@ -199,8 +199,7 @@ byte. A file is sealed only if these are present and the trailer is valid.
   facts or revisions, each with its position range and a summary, followed by an index and a trailer in the
   style of A.9. Candidate encodings: delta-of-delta timestamps, ALP for decimal values with an XOR fallback,
   run-length for quality, flags and rarely changing values. The layout and encodings are fixed after the
-  encoding measurements; if they do not clearly beat Parquet on size, compacted data is stored as Parquet and
-  this file kind is not used.
+  encoding measurements. Compacted data uses this own format; Parquet is the export format.
 - **Manifest (`kind = 3`).** An append-only sequence of checksummed records; one record publishes a set of
   files and retires another set atomically, with an epoch.
 - **Cursor (`kind = 4`).** Per consumer: last confirmed position and one latch per condition funnel.
