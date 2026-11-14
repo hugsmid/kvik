@@ -10,13 +10,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
 | Q-33 | §3 Recovery, §2.1, invariants 1 and 8 | Registry entries and derived files after a lost range |
 | Q-34 (c) | §11 Health, §3 Recovery | Whether loss reports survive a restart, and whether they are latched until acknowledged |
-| Q-39 (e) | §8 Restore (Failures and end), §8 No deletion, §8 Corrupt block | What ends a restore when the bucket has lost or corrupted a listed object (for the owner) |
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
-| Q-44 (b)–(d) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series; forecast accuracy ((d) for the owner) |
+| Q-44 (b) and (c) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series |
 | Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
 | Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
 | Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
-| Q-49 (b) | §4 Resync, §8 Restore step 2, §6 Old spans, invariant 16 | Conditions and live state with no local detail during a restore (for the owner) |
 | Q-52 | §8 Corrupt block, invariant 10, §3 Recovery | Manifest records as single copies |
 | Q-60 | §5.1 density rule, §5.7, §2.1 parameters, invariant 8 | Calendar nodes when the expected interval changes |
 | Q-61 | §4 Order, At-least-once, Consumer state, §6 Latch | Identity of a condition delivery, and where its sequence is kept |
@@ -26,7 +24,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
 | Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
 | Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
-| Q-73 | §2.6, §2.1 `record on change`, row 17a, §1.5 | Who leaves out the unchanged readings of a record-on-change series |
 | Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset |
 | Q-76 | §5.7, §2.1 interval starts, §5.4 displaced readings, row 21, invariant 8 | Whether a tzdata change is a log entry |
 | Q-77 | §5.7, §2.1 interval starts, row 20 | A day whose midnight occurs twice |
@@ -136,21 +133,6 @@ need an acknowledgement.
 up to F − 1), so a second record with the same lost range is written and `possible_loss` is counted twice for one
 loss.
 
-## Q-39 (e) — What ends a restore when the bucket has lost or corrupted a listed object
-**Scenario.** Parts (a)–(d) are settled (§8 Restore, Failures and end). A restore record lists a file that the bucket
-no longer holds, or whose plaintext hash never verifies. In step 1 the engine stays down with `restore_failed`, and
-every restart fails the same way; after step 1 the file is retried with degraded health and the store stays
-`restoring`, so no tree checkpoint is taken, with no exit. This is a loss in the deep tier, which §8 No deletion
-("kept forever in at least the deep tier") and §8 Corrupt block ("the only single copies are …") assume cannot
-happen, and a definition entry lost with the file is Q-33. A content conflict between two listed files likewise has
-no exit without an operator.
-**Model.** Not modelled; downloads do not fail. A conflicting file keeps the restore in progress
-(`q39_conflicting_file_leaves_restore_in_progress`).
-**Proposal (for the owner).** Treat it as §8 Corrupt block with deep as the failed tier: compact again from the other
-listed files, and positions that no other listed file holds become a lost range, reported as `data_lost`. This needs
-Corrupt block's "the only single copies are …" and No deletion's "kept forever in at least the deep tier" amended,
-and Q-33 for a lost definition.
-
 ## Q-39 (f) — A crash while the restore record is written
 **Scenario.** A restore claims generation g and crashes while writing its restore record locally, leaving a torn
 record file. §8 Restore (Failures and end) says `restore` refuses a directory that holds files and no restore record,
@@ -161,12 +143,11 @@ a restart has no record to resume from) or as a record (which cannot be read).
 **Needed.** How a torn local restore record is recognised, and whether the restore then starts again with the next
 generation or the directory is refused.
 
-## Q-44 (b)–(d) — Withdrawn and far-future values, and forecast accuracy
+## Q-44 (b) and (c) — Withdrawn and far-future values
 **Scenario.** (b) A newer issue that no longer covers a valid time cannot withdraw the older issue's value there, so
 the current view can mix issues. (c) A wrong value far in the future on a scheduled or forecast series is never
-flagged, since those series are exempt from `future`. (d) How forecast accuracy is served: comparing each issue with
-the outcome series, and asking what was known as of an issue time rather than as of a position. Part (a), a silent
-feed, is settled (see Settled).
+flagged, since those series are exempt from `future`. Parts (a), a silent feed, and (d), forecast accuracy, are
+settled (see Settled).
 **Model.** Not modelled.
 **Proposal for (b) and (c).** The engine sets no horizon and infers no withdrawal. A source withdraws a value by a
 reading for that `t` with a higher `changed_at` (on a series that is not versioned, a later reading) and quality bad,
@@ -182,11 +163,6 @@ during §8 Restore step 2 `duplicates_unchecked`, and keeps the latest-`t` stati
 observed series: since Q-74 the lateness reference leaves out a `future` fact, but the latest recorded `t` still
 includes it, so a device glitch to 2099 disables the fast path for good and makes Restore step 2 count every fact of
 the series `duplicates_unchecked`.
-**Proposal for (d) (for the owner).** Not served by the engine in v1. History carries every issue with its
-`changed_at`, so a reader can compute "known as of issue X" (per key, the fact of highest rank with
-`changed_at ≤ X`) from `View::History` and compare it with the outcome series. A view by `changed_at`, or
-forecast-accuracy operators, is new scope. If confirmed, `api.md` Not in v1 gains "a view as of an issue time
-(`changed_at`), and forecast-accuracy operators (computed by the reader from `View::History`)".
 
 ## Q-46 — Positions kept by a reader process, after a truncated tail
 **Scenario.** A reader process (§7) reads position p from the log up to the mark and keeps it, for example in an
@@ -269,21 +245,6 @@ F field counts towards the highest sequence among local manifest records, a repe
 no-second-record rule breaks. (4) Objection 1 of Q-47 applies here too.
 Reviewers judged that this group (Q-33, Q-34 (c), Q-46–Q-48) needs one design round as a whole, best done with the
 log implementation (roadmap 4.5) where recovery is built concretely.
-
-## Q-49 (b) — Conditions and live state with no local detail during a restore
-**Scenario.** Part (a) is settled: a query whose detail is not local is flagged `approximate_edges` or is the error
-`detail_not_local`, never empty (§6 Old spans, §8 Restore step 2). Invariant 16 and §4 Resync promise every
-condition's present state after a restore, and two consumer-facing points remain. (i) A funnel with a rolling window
-over a gauge with a 5-minute expected interval (no stored level), evaluated during step 2 before its detail is back,
-has no local span, so its evaluation is that error: what the funnel delivers, and what its `resync` carries, is not
-said. (ii) A state or text series with no staleness limit and no stored level, whose last fact predates the log
-replayed from the checkpoint, has neither node nor fact: `resync` would report no live state for a valve that is
-open.
-**Model.** Not modelled: a series that stores no level answers windows and live state during a restore from its local
-facts, without a flag (see the table below).
-**Proposal (for the owner).** For both, the state is unknown, not false or none: the evaluation is skipped and
-counted, the condition keeps its state, `resync` says "unknown" for that funnel, and the first evaluation with detail
-is delivered as a transition. This changes what `resync` guarantees (§4 Resync, invariant 16).
 
 ## Q-52 — Manifest records as single copies
 **Scenario.** A manifest record not yet uploaded exists only on the hot tier. §8 Corrupt block names the open log
@@ -429,37 +390,6 @@ unchecked, outranked, and B stays current. During a restore the replay is droppe
 **Needed.** Whether the check compares with the revised-key index whenever it holds the key, so that "on no local
 tier" applies only to a key with a single fact, or whether the unchecked rule applies whatever the index holds.
 
-## Q-73 — Who leaves out the unchanged readings of a record-on-change series
-**Scenario.** A valve position is polled every 2 s and declared record on change with a keep-alive interval of
-20 s as its expected interval (§2.6, so S = 60 s). For ten minutes it reads 5 %, so 300 polls carry the same value.
-§2.6 says the series "records a fact when the value changes **and** at least once per expected interval while it does
-not", and §2.1 makes record on change a field of the definition, which `format.md` stores; but neither says whether
-the engine drops the unchanged polls between keep-alive facts or whether the adapter emits only changes and
-keep-alive facts. If the engine filters, it is not said: (a) what "the value changes" compares with: the fact at the
-series' latest `t`, the latest by position, or the live-state fact; (b) whether a change of supplied quality, a
-reading without a value, a late reading (row 3) or a reading with `revise` counts as a change; (c) whether a keep-alive
-is due by event time (`t` at least the expected interval after the latest recorded `t`) or by `received_at`, and what
-a reading older than the latest recorded `t` does; (d) whether a dropped poll is counted, and under which counter
-(principle 5). If the adapter filters, the field changes nothing the engine does beyond its refusal on an interval
-series (§2.1) and its expected interval being the keep-alive interval.
-**Model.** The engine records every reading it is given; the series' expected interval is the keep-alive interval
-and sets S (§2.1); row 17a is shown with an adapter that emits only changes and keep-alive facts
-(`q73_record_on_change_series_records_every_reading`, `tests/edge_cases.rs` `row_17a_…`).
-**Needed.** Who filters, and, if the engine does, rules (a)–(d).
-**Argument that the text already decides it.** §2.4 identity includes `t`: "the same value one nanosecond later is a
-different fact and is recorded", with no exception for record-on-change series; principle 5 requires anything
-refused or repeated to be counted, and §11 lists no counter for readings left out as unchanged; so an engine that
-dropped unchanged polls would break §2.4 and principle 5 as written. Only a spec change can make it so; until then
-the field only fixes the expected interval as the keep-alive interval (and is refused on an interval series).
-**Proposal.** The adapter filters unchanged readings; the engine records every reading. §2.6 would gain: "The
-adapter leaves out unchanged readings between keep-alive facts; the engine records every reading it is given
-(§2.4)." Open until the specification says so.
-**Alternative, if the engine is to filter instead:**
-compare with the current fact at the series' latest recorded `t` by the duplicate rule's identity (value, compared
-bitwise, and supplied quality, §2.4); record a reading whose `t` is not after that `t`, or that carries `revise`,
-unfiltered; record an unchanged reading once its `t` is at least the expected interval after the latest recorded
-`t`; and count each dropped reading per series (`unchanged_dropped`).
-
 ## Q-75 — Local days around a site-zone change to another offset
 **Scenario.** The site zone is Asia/Tokyo (+09) and an entry moves it to America/New_York (−04 in June) effective
 2026-06-01T00:00Z. §5.7 says "each local day uses the zone in force at its start". 1 June starts at
@@ -595,13 +525,11 @@ request, and noted in the question.
 | Q-16 | 5.4 | Live state and staleness are built there |
 | Q-33 | 4.5 | Recovery with lost ranges |
 | Q-34 (c) | 4.5 | Recovery and health reports |
-| Q-39 (e) | 8.3 | For the owner, before restore is built |
 | Q-39 (f) | 8.3 | Restore |
-| Q-44 (b)–(d) | 5.1 | Series registry and timing; (d) for the owner |
+| Q-44 (b) and (c) | 5.1 | Series registry and timing |
 | Q-46 | 4.5 | One design round with Q-33, Q-34 (c), Q-47 and Q-48 |
 | Q-47 | 4.5 | Recovery, with 5.3 (resync) |
 | Q-48 | 4.5 | Recovery |
-| Q-49 (b) | 5.3 | For the owner; it changes what `resync` promises |
 | Q-52 | 3.1 | Telling a torn manifest tail from a corrupt record needs a format change |
 | Q-60 | 7.1 | Stored levels |
 | Q-61 | 5.2 | Consumer queues and durable cursors |
@@ -611,7 +539,6 @@ request, and noted in the question.
 | Q-70 | 7.1 | One option puts chunk indexes in the checkpoint |
 | Q-71 | 6.3 | Manifest and publish-and-retire |
 | Q-72 | 6.2 | Revised-key index and compaction |
-| Q-73 | 5.1 | Series registry (proposal: the adapter leaves them out) |
 | Q-75 | 7.3 | Calendar levels |
 | Q-76 | 3.1 | A log entry kind; it also places interval starts (§2.1) |
 | Q-77 | 7.3 | Calendar levels |
@@ -748,24 +675,28 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-26 | The first sequence of a generation, and "no position yet" | §2.2, §8 Restore step 1 |
 | Q-27 | Where consumer cursors come from after a restore | §8 Continuous backup, §8 Restore step 2, §4 Resync |
 | Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b |
-| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (open parts: Q-39 (e) and (f)) |
+| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (open part: Q-39 (f)) |
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
-| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-39 (e) and (f)) |
+| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open part: Q-39 (f)) |
 | Q-34 | What `data_lost` and `possible_loss` mean beyond the report, parts (a) and (b) | §8 Corrupt block (only the damaged region is lost; the valid batches of a sealed segment are copied to a new segment by one manifest record, which ends the error), §11 Health (each report carries what is known of its range; no flag on query results), row 11 (open parts: Q-34 (c), Q-52) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
-| Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (open parts: Q-49 (b), Q-60) |
+| Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (open part: Q-60) |
 | Q-37 | Which manifest records a restore reads, and how generations begin | §8 Generations (generation 0 counts as claimed; each generation above 0 begins with a self-contained restore record listing the files it restores from and carrying the earlier restored ends, uploaded before any other file of its generation, after which the claims are read again; a restore reads the highest generation below its own that has records, and keeps the store id), §8 Restore step 1 (a position set aside once stays so) and the paragraph after step 4, invariant 9, row 28b |
 | Q-38 | Segments beyond the restored end | §8 Restore step 1 (positions set aside, a term distinct from Corrupt block's quarantine: excluded by position everywhere, also in reader processes, with no query error; a set-aside definition keeps its id reserved; the set-aside range reported in health from the record at every start; re-ingested only by the operator, through export and Re-ingest), §2.1 `id`, §11 Health, invariants 4 and 9, row 28, `api.md` Backup and restore (open part: Q-34 (c), for clearing the report) |
-| Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart; later failures are retried with degraded health; the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (open parts: Q-39 (e) and (f)) |
+| Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart; later failures are retried with degraded health; the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (open part: Q-39 (f)) |
+| Q-39 (e) | What ends a restore when the bucket has lost or corrupted a listed object | §8 Restore, Failures and end (a listed log segment or chunk that the bucket no longer holds, or whose plaintext hash fails, in step 1 or later, is treated as Corrupt block with deep as the failed tier: compacted again from the other listed files, the positions no other listed file holds becoming a lost range reported as `data_lost`, and the restore completes; `restoring` ends when every file step 3 brings back is installed, replaced or recorded lost), §8 Corrupt block and No deletion (the exception for a restore), invariants 2, 9 and 10, §11 Health (open parts: Q-33, a definition entry lost this way; a content conflict between two listed files still waits for an operator) |
 | Q-40 | Ranking facts of versioned series during a restore | §2.4 Version index, §8 Continuous backup and Deep, §8 Restore steps 1–2 (each tree checkpoint carries the version index, and step 1's replay brings it to the restored end before ingest opens), §13 |
-| Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b)–(d)) |
+| Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b) and (c)) |
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (calendar lengths: Q-45) |
 | Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
-| Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b)–(d)) |
+| Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b) and (c)) |
+| Q-44 (d) | Forecast accuracy | Not served by the engine in v1: history keeps every issue with its `changed_at`, so a reader computes "known as of issue X" from `View::History` and compares it with the outcome series; `api.md` Not in v1 (a view as of an issue time, forecast-accuracy operators) (open parts: Q-44 (b) and (c)) |
 | Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (open parts: Q-76 and Q-77 decide only which tzdata version is in force and where a repeated day start lies; Q-80, an interval zone unknown or become a link; Q-81, count, min, max and last when an edge cuts an interval) |
-| Q-49 | What a series with no stored level serves during a restore, part (a): queries | §8 Restore step 2 and §6 Old spans (window edges move to where detail is local, the error `detail_not_local` only when no span is left, never an empty result; reads of facts fetch on demand; no priority download), row 28 (open part: Q-49 (b)) |
+| Q-49 | What a series with no stored level serves during a restore, part (a): queries | §8 Restore step 2 and §6 Old spans (window edges move to where detail is local, the error `detail_not_local` only when no span is left, never an empty result; reads of facts fetch on demand; no priority download), row 28 |
+| Q-49 (b) | Conditions and live state with no local detail during a restore | §6 Conditions (the state is unknown, not false: the evaluation is skipped and counted, `evaluations_unknown`, the condition keeps its latched state, and the first evaluation with detail is delivered as a transition), §2.3 Live state (unknown, not none, where no local fact gives it), §4 Resync and §6 Restart and resume (`resync` reports "unknown" for that funnel, no transition), §8 Restore step 2, invariant 16, §11 Health, `api.md` Consuming, Reading and statistics (`ConditionState::Unknown`, `Live::Unknown`) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
+| Q-73 | Who leaves out the unchanged readings of a record-on-change series | §2.6 (the adapter leaves out unchanged readings between keep-alive facts; the engine records every reading it is given), as §2.4 identity including `t`, principle 5 and §11 already required |
 | Q-74 | One reading far ahead makes later on-time readings `late` | §2.2 `late` and the lateness reference (facts flagged neither `future` nor `unsynced_clock`; a reading up to 60 s ahead still raises it, an accepted limit; the latest recorded `t`, over all facts, stays for the §2.4 fast path, §8 Restore step 2 and statistics), §2.4 Fast path, §4 Future facts, §8 Deep, Continuous backup and Restore step 1 (each tree checkpoint carries both), invariant 24, rows 4 and 4a, `api.md` `SeriesInfo` (open part: Q-44 (c), far-future facts and the latest recorded `t`) |
 
 ## Where the model differs from the specification
@@ -859,7 +790,6 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
-| Record on change | §2.6, row 17a (see Q-73) | The definition carries the flag, refused on an interval series, and its expected interval is the keep-alive interval; the engine records every reading, so keep-alive facts are ordinary facts from the adapter | `tests/open_questions.rs` `q73_…` |
 | Effective-dated parameters | §2.1, §5.7, row 20a | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so a span in which the expected interval crosses a density threshold (row 20a, Q-60) does not arise | `calendar_depends_on_zone_utc_levels_do_not` |
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
@@ -873,6 +803,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
 | Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
+| Unknown condition and live state during a restore | §6 Conditions, §2.3 Live state, §4 Resync, §8 Restore step 2, invariant 16 (Q-49 (b)): an evaluation with no local detail is skipped and counted (`evaluations_unknown`), the condition keeps its latched state, `resync` reports "unknown", and the first evaluation with detail is a transition; live state that no local fact gives is unknown, not none | Not modelled: conditions and live state are evaluated from what is local during a restore, so `resync` carries true, false or no live state, and nothing is counted | — |
 | Condition state on resume | §6 Restart and resume, invariant 16 (see Q-63) | The engine resumes conditions with `Runner::resume`, from the value now, the history rebuilt from the tree (held-for, stale-for) and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
 | Cursor of a consumer after a restore | §4 Consumer state, invariant 13: a cursor is never ahead of the consumer's confirmation | A consumer without a kept cursor, or whose catch-up segments are not local, gets the restored end written as its cursor, which it never confirmed, standing in for "treated as beyond the restored end" (§8 Restore step 2) | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
 | Tree files and their checkpoint | §5.1 | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call) | — |
@@ -895,8 +826,9 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start; exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, except files retired by a record whose added files are all in the bucket, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |
 | A failed retry of a restore | §8 Restore, the paragraph after step 4: a restart after the record resumes the restore in its generation | In `restart_restore`, a retry after a crash before the record that writes its record and then fails in step 1 is discarded and stays pending, so the next restart claims another generation | `tests/open_questions.rs` `q39_failed_restart_of_a_restore_is_reported` |
-| Failures after step 1 | §8 Restore, Failures and end: a file that cannot be fetched, that the bucket no longer holds or whose hash fails is retried with degraded health naming it; a content conflict is named in health with both files | Downloads do not fail; a conflicting file is not installed and the step returns `Conflict`, with no health reason | `tests/open_questions.rs` `q39_conflicting_file_leaves_restore_in_progress` |
-| End of `restoring` | §8 Restore step 3 and Failures and end: only files the restore record places on hot (and cold where configured) are brought back, and `restoring` ends when they are installed; the label goes when the spans whose detail comes back are verified | Every file the restore restores from comes back, and `restoring` ends when all are local; the label goes when every span the checkpoint covers is verified | `tests/open_questions.rs` `q39_restoring_ends_when_every_file_is_local` |
+| Failures after step 1 | §8 Restore, Failures and end: a file that cannot be fetched is retried with degraded health naming it; a content conflict is named in health with both files | Downloads do not fail; a conflicting file is not installed and the step returns `Conflict`, with no health reason |
+| A listed object lost or corrupted in the bucket | §8 Restore, Failures and end, §8 Corrupt block and No deletion, invariants 9 and 10 (Q-39 (e)): treated as Corrupt block with deep as the failed tier, in step 1 or later; compacted again from the other listed files, the positions no other listed file holds recorded as a lost range and reported as `data_lost`; the restore completes | Not modelled: the bucket never loses or corrupts a file, so no restore records a lost range or ends that way | — | `tests/open_questions.rs` `q39_conflicting_file_leaves_restore_in_progress` |
+| End of `restoring` | §8 Restore step 3 and Failures and end: only files the restore record places on hot (and cold where configured) are brought back, and `restoring` ends when they are installed, replaced or recorded lost (Q-39 (e)); the label goes when the spans whose detail comes back are verified | Every file the restore restores from comes back, and `restoring` ends when all are local; the label goes when every span the checkpoint covers is verified | `tests/open_questions.rs` `q39_restoring_ends_when_every_file_is_local` |
 | Query flags and fact reads | §11 Query; §8 Restore step 2 and Failures and end: every query result carries `restoring` while restoring, and fact reads fetch detail not yet local on demand | Only window results carry flags (`restoring`, `summary_stale`); while restoring, `current`, `facts` and `latest` return the local facts, unflagged, without fetching | — |
 | Window edges over detail that is not local | §6 Old spans, §8 Restore step 2: an edge moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, the error `detail_not_local`; no bound is refused for its resolution | No window is flagged `approximate_edges` and no edge moves; while restoring, a window bound inside a minute is refused with `Restoring`. A series that stores no level, or only the 15-minute level, answers the unstored levels from its local facts: a minute the replay touches inside a quarter-hour the checkpoint holds is flagged `summary_stale`, but a window over part of a quarter-hour whose detail is not yet local is computed from the local facts without a flag (see Q-49 (b)) | `tests/open_questions.rs` `q39_no_sub_minute_query_or_checkpoint_while_restoring` |
 | Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |

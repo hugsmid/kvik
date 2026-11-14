@@ -89,7 +89,14 @@ while let Some(d) = consumer.next().await {
     }
     consumer.confirm(d.id).await?;            // advances the durable cursor
 }
+// Resync { funnels: Vec<FunnelState { funnel, live: Live, condition: Option<ConditionState> }> }
+enum ConditionState { True, False, Unknown }
+enum Live { Value(Fact), None, Unknown }
 ```
+- During a restore a condition evaluation with no local detail, and live state that no local fact gives, are
+  `Unknown` (spec §2.3, §6 Conditions): the evaluation is skipped and counted (`evaluations_unknown`), the latch is
+  unchanged, `Resync` carries `Unknown` for that funnel, and the first evaluation with detail is delivered as a
+  `Trigger`.
 - A delivery carries `id` (position, or funnel and sequence for timer deliveries), `flags` (`replayed`,
   `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
 - `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.
@@ -101,7 +108,7 @@ while let Some(d) = consumer.next().await {
 
 ## Reading
 ```rust
-let now = reader.live(id)?;                                   // latest valid value, with staleness
+let now = reader.live(id)?;                                   // latest valid value, with staleness; Live::Unknown (spec §2.3)
 let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::Avg)?;
 // WindowResult { value, coverage, from, to, flags }
 let series = reader.buckets(id, range, Resolution::Auto { max_points: 2_000 })?;   // chart query
@@ -130,9 +137,10 @@ let s: Stats = store.stats();       // per series and per consumer counters, com
                                     // time behind, disk marks, backup lag
 ```
 Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
-calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4). Health reasons include
-`restore_failed` (naming the file) and the set-aside range of each restore record; statistics include restore
-progress (files and bytes remaining), which is not a health condition (spec §8 Restore).
+calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,
+`evaluations_unknown`, the evaluations skipped during a restore for lack of local detail (spec §6 Conditions). Health
+reasons include `restore_failed` (naming the file) and the set-aside range of each restore record; statistics include
+restore progress (files and bytes remaining), which is not a health condition (spec §8 Restore).
 
 ## Backup and restore
 ```rust
@@ -160,5 +168,6 @@ changed boot identity. The engine is tested against the reference model through 
 
 ## Not in v1
 A network server, SQL, multi-writer access, clustering, percentiles, conditions over several series, interval
-readings whose length is neither fixed nor a local day or month (irregular billing periods), and any form of
+readings whose length is neither fixed nor a local day or month (irregular billing periods), a view as of an issue
+time (`changed_at`), forecast-accuracy operators (computed by the reader from `View::History`), and any form of
 deletion.
