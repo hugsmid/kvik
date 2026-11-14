@@ -20,11 +20,11 @@ records the choices decided between alternatives. The byte-level format will be 
 |---|---|
 | `id` | u32, assigned once by the registry, never reused among the entries the store holds (after a restore, §8 Restore step 1) |
 | `name` | `<instance>/<device>/<metric>`; a rename adds an alias, the id is unchanged; a name maps to its active series |
-| `kind` | `gauge`, `counter` (cumulative), `state` (named or boolean), `text` (UTF-8, ≤ 255 bytes), `interval` (an amount over a fixed interval) |
+| `kind` | `gauge`, `counter` (cumulative), `state` (named or boolean), `text` (UTF-8, ≤ 255 bytes), `interval` (an amount over an interval of fixed or calendar length) |
 | `value type` | gauge/counter/interval: `f64`, or `i64` with a declared `decimal scale` (exact); state: u16 index into declared names or bool |
 | `unit` | fixed for the life of the series; a change of kind, type, scale or unit is a new series |
-| `expected interval` | configuration, never learned. Default: gauge and counter 60 s; interval its interval length; state and text none (valid until next reading) |
-| `interval length`, `interval phase` | interval series only: the length d > 0 and a phase with 0 ≤ phase < d (default 0), both fixed for the life of the series. A reading's `t` is the start of its interval and must satisfy `t ≡ phase (mod d)` (Euclidean, on UTC nanoseconds), or it is refused and counted; its value is the amount over `[t, t + d)`. Record on change (§2.6) does not apply to an interval series |
+| `expected interval` | configuration, never learned. Default: gauge and counter 60 s; interval its interval length (calendar length: 24 h for `day`, 31 days for `month`); state and text none (valid until next reading) |
+| `interval length`, `interval phase`, `interval zone`, `day start` | interval series only, all fixed for the life of the series (a change is a new series). The length is either a duration d > 0 with a phase, 0 ≤ phase < d (default 0), or a **calendar length**, `day` or `month`, with an `interval zone` (an IANA name) and no phase; `day` may declare a **day start**, a local time of day with 00:00 ≤ day start < 24:00 (default 00:00), so that a day from 05:00 to 05:00 local is one interval, and a day start on any other length is a definition error. The interval zone is independent of the site zone, is not effective-dated and is compared by canonical name after resolving IANA links; a definition naming a zone the tzdata version in force does not know is an error. A reading's `t` is the start of its interval. Its **end** is `t + d`, or for a calendar length the next **interval start** after `t`: the starts are, in the interval zone, the instants of the day start on each date (for `month`, the start of the first day of each month, §5.7); a day start that falls in a gap is placed where the gap ends, as §5.7 places a midnight that does not exist, and one that occurs twice as a midnight that occurs twice (open, Q-77). All starts are taken under the **tzdata version in force**, the one version that the phase check at commit, displacement (§5.4) and calendar results (§5.7) all use. Each interval thus runs from one start to the next, whatever the rule for an unusual day start. A reading carries no length: lengths are exact nanoseconds (a local day is usually 23–25 h). `t` must be an interval start (fixed length: `t ≡ phase (mod d)`, Euclidean, on UTC nanoseconds), or the reading is refused and counted; its value is the amount over `[t, end)`. Intervals of current readings that are not displaced (§5.4) therefore never overlap. A source whose periods are neither of one fixed length nor local days (from one day start to the next) or months of one zone, such as irregular billing periods, cannot be an interval series in this version, and the engine never splits an amount into finer intervals. Record on change (§2.6) does not apply to an interval series |
 | `staleness limit` S | `3 × expected interval` unless set; none if no interval |
 | `record on change` | optional; see §2.6 |
 | `wrap_at`, `reset_ceiling` | counters only; §5.5. `reset_ceiling` default 10 % |
@@ -64,12 +64,19 @@ and counted. The old id stays reachable by id.
   it, never raise it (`future` below; invalid values, §2.5). The adapter-supplied quality is kept with the fact for
   the duplicate rule (§2.4).
 - Fact flags (immutable): `future` (observed series only: `t > received_at + 60 s`; quality lowered to suspect if
-  better), `late` (on an observed series, `t` earlier than the series' latest recorded `t` by more than 2 × S; on any
-  series, `received_at − t` above the lateness bound), `revise` (§2.4), `host_time` (`t_source = host`),
-  `unsynced_clock` (§2.5). For a reading of an observed interval series, `t + d` stands for `t` in `future`, in the
-  second clause of `late`, and wherever a reading's readiness against `now` is tested (live state §2.3, future facts
-  §4, live staleness §5.4, cadence §6); a scheduled or forecast interval reading takes effect at `t`. Delivery flags
-  are separate (§4).
+  better), `late` (on an observed series, for a fact not flagged `future`, `t` earlier than the series' lateness
+  reference by more than 2 × S; on any series, `received_at − t` above the lateness bound), `revise` (§2.4),
+  `host_time` (`t_source = host`), `unsynced_clock` (§2.5). For a reading of an observed interval series, its end
+  (§2.1) stands for `t` in `future`, in the second clause of `late`, and wherever a reading's readiness against `now`
+  is tested (live state §2.3, future facts §4, live staleness §5.4, cadence §6); a scheduled or forecast interval
+  reading takes effect at `t`. Delivery flags are separate (§4).
+- **Lateness reference** (observed series): the greatest `t` among the series' recorded facts of lower position that
+  are not flagged `future`, whatever their quality or rank, earlier facts of the same batch included; none until there
+  is such a fact. Only the first clause of `late` uses it. A fact flagged `future` never raises it, neither at commit
+  nor when its time comes, the flag being immutable, and is never `late` by the first clause. It is not the series'
+  **latest recorded `t`**, the greatest `t` over all its recorded facts, which the duplicate fast path (§2.4), Restore
+  step 2 (§8) and per-series statistics keep using. Both are functions of the log (positions set aside, §8 Restore,
+  and lost ranges, §3, excepted).
 
 ### 2.3 Views
 | View | Definition |
@@ -100,8 +107,9 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
   history holds at most the current fact, which is compared directly.
 - **Version index** (hot tier, never moves; carried by each tree checkpoint, §8): for every key of a versioned series,
   its highest recorded `changed_at`. The rank of an arriving fact is therefore known whenever the index is local.
-- **Fast path:** a fact with `t` later than the series' latest recorded `t` cannot be a duplicate; no lookup. Other
-  facts are checked against the in-memory recent window (§5.1) before any index probe.
+- **Fast path:** a fact with `t` later than the series' latest recorded `t` (over all recorded facts, `future` ones
+  included; not the lateness reference, §2.2) cannot be a duplicate; no lookup. Other facts are checked against the
+  in-memory recent window (§5.1) before any index probe.
 - If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure or retention class),
   the fact is recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data. In a
   versioned series an arriving fact whose `changed_at` matches none in its key's history is not a duplicate and needs
@@ -177,7 +185,7 @@ a different boot. The rules apply in this order:
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
 | Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), when it is at or above the start of a tail truncated by §3 Recovery rule 3, and to every consumer after every recovery under §3 Recovery rule 3, whether or not anything was reported, before any position above the last kept batch is delivered to it, since any consumer may have been delivered positions that are now reused. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
-| Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. Scheduled and forecast facts are delivered once, at commit, in position order, not flagged `future`: the delivery is a notice of a value for `t`, and a consumer acts on live state or a condition, never on the delivery itself. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled (§6 Cadence), and `resync` for a funnel over a forecast series carries condition state only. |
+| Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`; it never raises the lateness reference (§2.2). Scheduled and forecast facts are delivered once, at commit, in position order, not flagged `future`: the delivery is a notice of a value for `t`, and a consumer acts on live state or a condition, never on the delivery itself. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled (§6 Cadence), and `resync` for a funnel over a forecast series carries condition state only. |
 | Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
 | Timers | Window expiry, "held for N s" and staleness of an observed series use the monotonic clock; system clock corrections never fire or suppress them. A future fact matures, a scheduled value takes effect and a scheduled series falls stale by `now` (§6), so a forward correction of the system clock can bring any of them forward. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
 
@@ -196,7 +204,8 @@ a different boot. The rules apply in this order:
   data it summarises. Such a series stores no calendar nodes either: its calendar results are window evaluations
   over its facts (§5.7).
 - Memory holds only open nodes per series, a node cache, and a **recent window** of raw facts per series
-  (default 15 minutes, at most 1 024 facts, and for an interval series at least its interval length) for the newest
+  (default 15 minutes, at most 1 024 facts, and for an interval series at least its interval length, for a calendar
+  length its current interval) for the newest
   window edge and the duplicate fast path.
 - Tree files record the position up to which they are complete (the **checkpoint**, written at most every 60 s and
   on clean shutdown). On start the engine loads them and replays log entries after the checkpoint. Tree files are
@@ -230,18 +239,33 @@ nodes and late facts inserted between existing readings.
 ### 5.4 Staleness and coverage
 A reading is valid for at most S (an interval reading for its interval only). An interval series stores a tree level
 only where every node edge of that level is a multiple of d from the phase (for the UTC levels: d divides the node
-length and the phase is 0), so that no interval crosses a node edge; any other level is answered from its facts. The
-density rule (§5.1) applies as well, so an interval series stores a calendar level only where it stores the
-15-minute level. For an observed series, **live staleness** is measured on the monotonic clock: a series is stale
-when more than S has
-passed since its last commit of a fact that is not bad quality (§2.5) and not a future fact still awaiting its time
-or an outranked fact (§4), so a forward jump of the system clock cannot make an observed series stale. A scheduled
+length and the phase is 0), so that no interval crosses a node edge; any other level is answered from its facts. A
+calendar-length interval series stores no level and no calendar node, whatever its expected interval; every result is
+a window evaluation over its facts (§5.1 density rule, row 20a). The density rule (§5.1) applies as well, so an
+interval series stores a calendar level only where it stores the 15-minute level. For an observed series, **live
+staleness** is measured on the monotonic clock: a series is stale when more than S has passed since its last commit of
+a fact that is not bad quality (§2.5) and not a future fact still awaiting its time or an outranked fact (§4), so a
+forward jump of the system clock cannot make an observed series stale. A scheduled
 series is stale when `now` is later than the `t` of its live-state fact by more than S, or when it has no live-state
 fact; commits do not refresh it. A forecast series has no live staleness. **Event-time staleness** applies to history
 and to every window evaluation (§6): a series is stale at event time x when x > (`t` of its latest reading before x
-that is not bad quality) + S; for an interval series, x is covered if and only if it lies in a reading's interval.
-Coverage stops at that point and time-weighted results exclude the gap. Every windowed result carries coverage in
-seconds and as a fraction of the window. Live staleness applies only to live state and stale-for conditions.
+that is not bad quality) + S; for an interval series, x is covered if and only if it lies in the interval `[t, end)`
+of a current reading that is neither bad quality nor displaced (below). Coverage stops at that point and
+time-weighted results exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the
+window. Live staleness applies only to live state and stale-for conditions.
+
+**Displaced readings.** After a tzdata change, a recorded reading of a calendar-length series whose `t` is no longer an
+interval start is **displaced**. It is kept (current, as-of and history views show it), and is ignored by live state,
+staleness and every window, as a bad-quality fact is (§2.5). A window result whose span contains the `t` of a
+displaced current reading is flagged `displaced`; health counts displaced current readings found in local detail per
+series (`interval_displaced`), recounted at each tzdata change. Flag and count stay while the rules displace the
+reading, also after the source has repaired its interval; a window inside the affected interval that does not contain
+the old `t` shows the missing amount only as missing coverage. A reading whose `t` is still a start keeps its place and
+its end follows the version in force. Displacement is a function of `t`, the interval zone, the day start and the
+tzdata version in force, so a later release can undo it. The source repairs by sending the amount at the new start,
+which is a new key; nothing needs withdrawing. A replay or revision at the displaced `t` is refused off its phase (row
+40). A tzdata change invalidates cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there being
+no stored node.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
@@ -284,11 +308,19 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
   series' expected interval in force qualifies it for a stored 15-minute level (§5.1), whether or not a given
   quarter-hour has data. For any other day or month none is stored; its result is evaluated from the stored nodes
   inside it, the facts at its edges and, where no level is stored, its facts.
+- The interval zone and day start of a calendar-length interval series (§2.1) define only its readings' intervals.
+  Calendar windows and results on it are taken in the site zone, or in a zone the window names, as for any series, and
+  their days start at local midnight, never at a day start. Where every edge falls on an interval start (a day or month
+  of a `day` series whose day start is 00:00, or a month of a `month` series, taken in the interval zone) the result is
+  a sum of whole intervals, exact for a decimal scale and not flagged; anywhere else (another zone, a UTC span, a day of
+  a `month` series, any day or month of a `day` series with another day start, so a site-zone day against a day from
+  05:00) an edge lies inside an interval and the result is apportioned (§6). No zones are compared: `apportioned`
+  follows from the edges alone. The amount of one whole interval is its reading.
 
 ## 6. Windowed operators
 | Rule | |
 |---|---|
-| Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value (not for interval series): `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). **Interval series:** sum is the amount in the window; rate is sum ÷ covered seconds; count, min, max and last are over readings whose `t` lies in the window; avg, integral, increase and time-in-state are refused. Edge stretches do not apply: a window edge inside an interval credits that interval's amount pro rata, amount × overlap ÷ d computed in f64, and the result is flagged `apportioned`; sums of whole intervals stay exact for a decimal scale, and apportioned results are compared within the §5.6 tolerance. Edge lookups reach back at least d. On an observed interval series a reading enters live state and windows only once `t + d ≤ now`. |
+| Aggregates | avg (gauge: integral ÷ covered seconds), sum, integral, min, max, count, increase, rate (increase ÷ elapsed seconds between the readings that bound it; the result carries coverage and is flagged when a step it includes spans more than S, in force at the step's earlier reading; empty when no step falls in the window), last, time-in-state. With no reading in the window but a valid held value (not for interval series): `last`, avg, integral and time-in-state use it; `min`, `max`, `count`, `sum` and rate are empty; increase counts only a step credited to the window (Edge stretches). **Interval series:** sum is the amount in the window; rate is sum ÷ covered seconds; count, min, max and last are over readings whose `t` lies in the window; avg, integral, increase and time-in-state are refused. Edge stretches do not apply: a window edge inside an interval credits that interval's amount pro rata, amount × overlap ÷ length (end − `t`, §2.1) computed in f64, and the result is flagged `apportioned`; sums of whole intervals stay exact for a decimal scale, and apportioned results are compared within the §5.6 tolerance. An edge lookup reads the one reading whose interval can contain the edge: the reading at the interval start at or before it (fixed length: at most d back; calendar length: the start of the interval containing the edge). On an observed interval series a reading enters live state and windows only once its end ≤ `now`. A displaced reading (§5.4) is ignored and the result flagged `displaced`. |
 | Windows | Rolling, `[now + a, now + b)` with a < b of either sign, so that a window may lie in the future, and calendar (since local midnight, this month, or relative to the current one, such as the next local day or month) in the site zone, or in an IANA zone the window names (§5.7) ("since local midnight" and "this month" end at `now`; a named or relative day or month ends at its end); a window wholly after `now` on an observed series is empty, with zero coverage; a calendar result is a window over its span (§5.7). Every window, rolling or calendar, is evaluated in event time against `now`: its bounds are event times, and no allowance is made for a jump of the system clock. Health reports such jumps (§11). |
 | `now` | The window clock: an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
 | Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window when the edge lies within it, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
@@ -333,11 +365,11 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
 |---|---|---|
 | Hot | fast local disk | log segments < 90 days, current detail, revised-key index, version index, chunk indexes, registry, the whole stored tree |
 | Cold (optional) | another local path | older revision chunks and sealed log segments; moved current detail |
-| Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints (with the registry, latest `t`, revised-key index and version index), generation claims |
+| Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints (with the registry, latest recorded `t` and lateness reference, revised-key index and version index), generation claims |
 
 | Rule | |
 |---|---|
-| Continuous backup | Each sealed file is queued for upload once; upload never blocks ingest or delivery. After its files, each manifest record is uploaded; a tree checkpoint at least daily, and only after all log up to its position is backed up. Each tree checkpoint carries the registry file, each series' latest recorded `t`, the revised-key index and the version index, as of its position. Cursor files are not backed up. |
+| Continuous backup | Each sealed file is queued for upload once; upload never blocks ingest or delivery. After its files, each manifest record is uploaded; a tree checkpoint at least daily, and only after all log up to its position is backed up. Each tree checkpoint carries the registry file, each series' latest recorded `t` and lateness reference, the revised-key index and the version index, as of its position. Cursor files are not backed up. |
 | Encryption | On the machine before upload, once per file; key supplied by the embedding application. |
 | Hashes | The manifest records SHA-256 of the plaintext at seal (hot and cold verification) and, per upload, SHA-256 of the ciphertext, sent with a single-part upload. The bucket must reject a mismatch and its reported hash must equal the manifest's; only then is the file backed up. Scheduled check: re-read reported hashes; sampled download-decrypt-verify proves key and content. |
 | Bucket | The engine never deletes from it. Versioning or object lock required. |
@@ -362,10 +394,11 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
    generations at or below a recorded restored end were settled by that restore, and a file missing there is a failure
    of this restore (below), not a new restored end. Write and upload the restore record (Generations above) before
    ingest is accepted. Download the latest tree checkpoint at or below the restored end (labelled derived-unverified),
-   with its registry file, latest `t` per series, revised-key index and version index, and the sealed log segments
-   after its position; replay them into the tree, which brings the registry, latest `t` and version index up to the
-   restored end. With no checkpoint, download the whole sealed log. Positions set aside are kept, not served: the log
-   segments holding them are downloaded in this step and are then files like any other (compaction and tiering move
+   with its registry file, latest recorded `t` and lateness reference per series, revised-key index and version
+   index, and the sealed log segments after its position; replay them into the tree, which brings the registry, latest
+   recorded `t`, lateness reference and version index up to the restored end. With no checkpoint, download the whole
+   sealed log. Positions set aside are kept, not served: the log segments holding them are downloaded in this step
+   and are then files like any other (compaction and tiering move
    them losslessly), and they are excluded by position from views, trees, indexes, the registry, delivery, catch-up
    and compaction's ranking (compaction ranks facts and splits current from revision chunks without them, so a
    set-aside fact never makes a restored fact a revision), in the writer and in reader processes, which take the
@@ -432,7 +465,8 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 2c | Versioned series: revision A (`changed_at` 1), correction B (2), then a replay of A, also with A's detail off every tier | Replay is a duplicate or recorded unchecked; B stays current. A later revision (3) with A's value is recorded and current | property |
 | 2d | Versioned series: a fact with a lower `changed_at` than the current one and a new value | Recorded, delivered flagged `outranked`, counted; no node, live-state or condition change | property |
 | 3 | Reading for last week arrives now | Flagged `late`; minute path updated; no retroactive trigger | model |
-| 4 | Reading > 60 s in the future, on an observed series | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due | model |
+| 4 | Reading > 60 s in the future, on an observed series | Recorded, `future`, suspect (or worse if supplied); delivered flagged; ignored by live state, staleness, windows until due; does not raise the lateness reference | model |
+| 4a | Observed series: one reading a day ahead, then on-time readings | The on-time readings are not `late`; the reference follows them; duplicate checks still see the future reading | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
 | 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and reported as `possible_loss` | kill loop |
@@ -453,7 +487,7 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 18a | Counter wraps, glitches low, or is silent for hours | `wrap_at` rule; regression (0, counted); full step credited after the gap, coverage shows it and rate is flagged | property |
 | 19 | Correction changes a node's min or max | Minute recomputed from facts, ancestors from children | property |
 | 20 | DST changes | UTC levels unaffected; local days of 92–100 quarter-hours, evaluated as windows over their spans | property |
-| 20a | Calendar day or month of a series with no stored 15-minute level (expected interval above 60 s; an interval series with d = 30 min), or of a span in which the expected interval crosses the threshold | No calendar node; the result is a window over its facts and any stored nodes inside the span | property |
+| 20a | Calendar day or month of a series with no stored 15-minute level (expected interval above 60 s; an interval series with d = 30 min; a calendar-length interval series), or of a span in which the expected interval crosses the threshold | No calendar node; the result is a window over its facts and any stored nodes inside the span | property |
 | 21 | Site zone changed, or tzdata changes its rules | Calendar nodes rebuilt from the effective time / affected days only; logged | integration |
 | 21a | Calendar query in a named zone whose offset is not a multiple of 15 minutes (historical offsets); or, on an interval series, a multiple of 15 minutes but not of d (+05:45 with d = 30 min) | Days taken in that zone for the whole span; no stored calendar node used; evaluated as a window over the UTC data, with facts at its edges; an interval crossing a day edge is apportioned (§6) | model (roadmap 1.6) |
 | 22 | System clock jumps | Timers of observed series monotonic; future-fact maturity and scheduled values follow `now`; window `now` never runs backwards; `commit_time` monotonic | unit |
@@ -478,9 +512,13 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 37b | Forecast source falls silent | No live staleness; reported by stale-for on the adapter's companion series, and later by shrinking lookahead coverage | integration |
 | 38 | Window over tomorrow on a scheduled or forecast series | Credited up to the window end; coverage shows where the values run out | property |
 | 39 | Window ending after `now` on an observed series | Nothing credited past `now` | property |
-| 40 | Interval reading off its phase | Refused and counted | unit |
+| 40 | Interval reading off its phase; on a calendar-length series, not at an interval start in the interval zone (a day start, or the start of a month), including an irregular period or a day starting at another hour than its day start | Refused and counted | unit |
 | 41 | Window edge inside an interval | That interval's amount credited pro rata by time; result flagged `apportioned` | property |
 | 42 | Interval missing | A gap in coverage; nothing held across it | property |
+| 43 | Daily amount on a clock-change day (`day`, 23 or 25 h), with a day start of 00:00 or another (05:00) | Accepted at the day start; its interval runs to the next day start, a day start in the gap or the repeated hour placed as §2.1 says; with a day start of 00:00, day and month results in the interval zone are exact and unflagged; rate uses the true length | property |
+| 44 | Window edge inside an interval of a calendar-length series (a UTC day, another zone, a day of a `month` series, any calendar day or month of a `day` series whose day start is not 00:00) | Credited pro rata by the reading's exact length; `apportioned` | property |
+| 45 | tzdata change moves a boundary of a calendar-length series | Readings still on a start keep their place, their end following the new rules; a reading no longer on one is displaced: kept in views, ignored by live state and windows, result flagged `displaced`, counted; re-sent at the new start it is a new key | model |
+| 46 | Host tzdata older than the source's rules | Reading at the true start refused off phase and counted until tzdata is updated; the replay is then recorded | integration |
 
 ## 10. Invariants (checked by the reference model and property tests)
 1. Sequences are strictly increasing and gap-free within a generation across restarts, except for lost ranges
@@ -520,9 +558,18 @@ A disaster loses facts in files not backed up, which may already have been acted
     index is local, whether or not the duplicate check could run.
 20. No fact of a scheduled or forecast series carries `future`, or `late` by its first clause (§2.2).
 21. A window result over a scheduled or forecast series is a function of the current view and the window's bounds
-    alone (tolerance §5.6; results flagged `approximate_edges` or `summary_stale` excepted).
+    alone (tolerance §5.6; results flagged `approximate_edges` or `summary_stale` excepted); for a calendar-length
+    interval series also of the tzdata version in force.
 22. For an interval series, the sums over adjacent windows add up to the sum over their union (within the §5.6
-    tolerance where an interval is apportioned; results flagged `approximate_edges` excepted).
+    tolerance where an interval is apportioned; results flagged `approximate_edges` excepted); displaced readings
+    contribute to no window.
+23. On a calendar-length interval series the intervals of current readings that are neither bad quality nor displaced
+    are pairwise disjoint, each running from one interval start to the next under the tzdata version in force; no
+    displaced reading contributes to live state or to any window result.
+24. On an observed series, a fact committed with a synchronised clock is `late` by the first clause if and only if it
+    is not flagged `future` and a fact of its series with a lower position, not flagged `future`, has a `t` greater
+    than its own by more than 2 × S; no fact flagged `future` changes the `late` flag of any other fact (positions set
+    aside and lost ranges excepted).
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |

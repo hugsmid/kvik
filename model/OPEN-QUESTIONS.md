@@ -13,7 +13,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-39 (e) | §8 Restore (Failures and end), §8 No deletion, §8 Corrupt block | What ends a restore when the bucket has lost or corrupted a listed object (for the owner) |
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
 | Q-44 (b)–(d) | §2.1 timing, §2.3 Views, §2.4, §11 | Withdrawn and far-future values on scheduled and forecast series; forecast accuracy ((d) for the owner) |
-| Q-45 | §2.1 interval, §5.7 | Intervals of varying length (for the owner) |
 | Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
 | Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
 | Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
@@ -28,10 +27,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
 | Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
 | Q-73 | §2.6, §2.1 `record on change`, row 17a, §1.5 | Who leaves out the unchanged readings of a record-on-change series |
-| Q-74 | §2.2 `late`, §4 Future facts, row 4 | One reading far ahead makes later on-time readings `late` |
 | Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset |
-| Q-76 | §5.7, row 21, invariant 8 | Whether a tzdata change is a log entry |
-| Q-77 | §5.7, row 20 | A day whose midnight occurs twice |
+| Q-76 | §5.7, §2.1 interval starts, §5.4 displaced readings, row 21, invariant 8 | Whether a tzdata change is a log entry |
+| Q-77 | §5.7, §2.1 interval starts, row 20 | A day whose midnight occurs twice |
 | Q-78 | §4 Routing, Concurrency, row 33 | How routing compilation knows the series a consumer emits |
 | Q-79 | §3 Recovery rules 2 and 4, §11 Health, row 11a | A lost range found by a recovery whose sync fails |
 
@@ -184,38 +182,6 @@ during §8 Restore step 2 `duplicates_unchecked`, and keeps the latest-`t` stati
 `changed_at ≤ X`) from `View::History` and compare it with the outcome series. A view by `changed_at`, or
 forecast-accuracy operators, is new scope. If confirmed, `api.md` Not in v1 gains "a view as of an issue time
 (`changed_at`), and forecast-accuracy operators (computed by the reader from `View::History`)".
-
-## Q-45 — Intervals of varying length
-**Scenario.** An interval series has a fixed length d. A source that reports one amount per local day or per month
-has intervals of 23–25 hours or 28–31 days, which no fixed d and phase describe.
-**Model.** Interval series have a fixed length and phase; a reading off its phase is refused and counted
-(`tests/edge_cases.rs` `row_40_…`).
-**Needed.** Whether a reading may carry its own interval length, or whether such amounts are stored at a fixed finer
-length or as calendar results.
-**Proposal (for the owner).** Keep d fixed and decline such sources in v1. A reading does not carry its own length,
-and the engine never splits an amount into finer intervals, which would invent facts. No existing kind stores such
-amounts faithfully:
-- *Counter* (cumulative, read at the period end): the step is credited to the window holding the later reading
-  (§5.5); a reading at a month's end lies in the next half-open window, so each amount lands one period late, and a
-  revision of one period rewrites every later value.
-- *Gauge* (`t` at the period start, aggregate sum): exact only for windows made of whole periods. A window edge
-  inside a period, or a query in another zone, credits the whole amount to the window holding `t`, with no
-  `apportioned` flag, which is a silent misattribution (principle 5); coverage is hold-based, so a missing day shows
-  only beyond S; avg and integral are meaningless but not refused. It serves only a consumer that queries whole
-  source periods in the source's zone, and would be documented as a workaround with these defects, not as the rule.
-- *A fixed finer d* (the adapter splits the amount): invented values, and one revision becomes many.
-
-If confirmed, §2.1 `interval length` gains: "The length is the same for every reading: a source whose intervals vary
-in length (an amount per local day in a zone with clock changes, or per month) cannot be an interval series in this
-version, and the engine never splits an amount into finer intervals"; and `api.md` Not in v1 gains "interval
-readings of varying length (amounts per local day or month)". A daily amount of 23–25 hours with d = 24 h is then
-refused off its phase after a clock change (row 40), so the limit is visible. Accepting such sources needs a new
-mechanism: a length per reading (in the fact, `format.md` and duplicate identity; a rule for overlapping intervals,
-affecting sum, coverage and invariant 22; a declared maximum length bounding edge lookups and the recent window;
-readiness at `t + d` per reading), or a calendar length (local day or month in a zone fixed for the series), whose
-intervals tile but whose phase check and lengths then depend on tzdata, and which still does not cover irregular
-billing periods. Since Q-36 such a series would store no level, so node edges raise no problem. If wanted, the
-feature is best opened as its own question, starting from the calendar length.
 
 ## Q-46 — Positions kept by a reader process, after a truncated tail
 **Scenario.** A reader process (§7) reads position p from the log up to the mark and keeps it, for example in an
@@ -489,22 +455,6 @@ bitwise, and supplied quality, §2.4); record a reading whose `t` is not after t
 unfiltered; record an unchanged reading once its `t` is at least the expected interval after the latest recorded
 `t`; and count each dropped reading per series (`unchanged_dropped`).
 
-## Q-74 — One reading far ahead makes later on-time readings `late`
-**Scenario.** An observed gauge with S = 10 s reports every second. Once, its device clock glitches a day ahead: a
-reading with `t` = now + 1 day is recorded, flagged `future` and lowered to suspect (§2.2, row 4). The first clause of
-`late` compares a reading with "the series' latest recorded `t`", which is now a day ahead; so every later on-time
-reading, `t` ≈ `received_at`, is more than 2 × S earlier than it and is flagged `late` for a day, although none is
-late. `late` is immutable (§2.2), counted, and row 3's "no retroactive trigger" is about late facts, so consumers and
-health see a day of false lateness from one glitch. A correction of the glitch (a bad-quality reading for its `t`)
-does not lower the latest recorded `t`, as for Q-44 (c).
-**Model.** Follows §2.2 as written: the latest recorded `t` includes the future-flagged reading
-(`q74_one_far_future_reading_makes_later_on_time_readings_late`).
-**Needed.** Whether the first clause should compare with the latest recorded `t` that is not in the future (at most
-`received_at` + 60 s at the reading's commit, or the live-state `t`), or with the latest `t` of facts not flagged
-`future`.
-**Proposal.** Compare with the greatest `t` among recorded facts of the series that were not flagged `future`
-(a function of the log, so rebuild keeps it); a `future` reading neither raises it nor is judged by it.
-
 ## Q-75 — Local days around a site-zone change to another offset
 **Scenario.** The site zone is Asia/Tokyo (+09) and an entry moves it to America/New_York (−04 in June) effective
 2026-06-01T00:00Z. §5.7 says "each local day uses the zone in force at its start". 1 June starts at
@@ -548,7 +498,9 @@ the log names (`q76_tzdata_change_is_a_log_entry_written_by_the_rebuild`, `tests
 **Needed.** Whether "is logged" means a log entry.
 **Proposal.** §5.7: "a tzdata change is recorded as a log entry naming the new version; it rebuilds the affected days
 and is reported in health. Calendar files are built with the version the log names." A host whose tzdata is older
-than the logged version keeps the calendar files it has and reports it.
+than the logged version keeps the calendar files it has and reports it. Since Q-45 the tzdata version in force also
+places the interval starts of a calendar-length interval series and decides which of its readings are displaced
+(§2.1, §5.4, rows 45 and 46); this question decides only which version that is.
 
 ## Q-77 — A day whose midnight occurs twice
 **Scenario.** Havana falls back from 01:00 (−04) to 00:00 (−05) on 1 November 2026, so local midnight of 1 November
@@ -559,7 +511,9 @@ Taking the later instant puts the first hour of 1 November into 31 October.
 ends, also when the gap straddles midnight (Toronto, 31 March 1919, 23:30 to 00:30: the day starts at 04:30 UTC,
 `tests/rules.rs` `s5_7_day_spans_pinned`).
 **Needed.** Which instant starts a day whose midnight occurs twice.
-**Proposal.** §5.7: "A day whose local midnight occurs twice starts at the earlier."
+**Proposal.** §5.7: "A day whose local midnight occurs twice starts at the earlier." Since Q-45 the same rule places
+a day start of a `day` interval series that occurs twice (§2.1); its intervals run from start to start, so they tile
+whichever instant is taken.
 
 ## Q-78 — How routing compilation knows the series a consumer emits
 **Scenario.** Consumer A routes `plant/*/power` and, from each delivery, emits a smoothed value on
@@ -627,7 +581,8 @@ The specification wins where the documents differ. These follow from it, for the
   it read, each with its generation, and every file it restores from, set-aside segments included, each with hash,
   tier and position range), uploaded before any other file of its generation, and manifest records keyed by
   generation; the deep tier holds generation claim markers; a tree checkpoint bundles the registry file, each series'
-  latest `t`, the revised-key index and the version index (§8 Continuous backup, Generations).
+  latest recorded `t` and lateness reference (F-17), the revised-key index and the version index (§8 Continuous
+  backup, Generations).
 - **F-8.** `api.md`: the backup sink needs a create-if-absent write for generation claims, and a list that sees a
   completed put; restore needs a read-only drill mode and refuses a directory that holds files and no restore record;
   a consumer can register with its last confirmed position after a restore, so the application must persist its
@@ -666,7 +621,7 @@ The specification wins where the documents differ. These follow from it, for the
   and buckets gain the flag `apportioned`; refusals gain an off-phase reason, counted per series; `live()` carries the
   interval end; exports carry d or the interval end. `format.md`: the definition entry gains interval length and phase
   (i64 nanoseconds), which a parameter change may not carry; record on change is refused for interval series; A.8's
-  `min_t` and `max_t` must allow for a reading's reach of d (§2.1, §6).
+  `min_t` and `max_t` must allow for a reading's reach of d, or of one calendar interval (F-17) (§2.1, §6).
 - **F-15.** `format.md`: a log segment may follow, or be a copy that omits, a lost range (§8 Corrupt block); the
   lost-range record carries the commit times of the batches on either side (§11 Health).
 - **F-16.** `format.md` A.6 needs an entry type for the site zone (zone name, effective time, §5.7), and the calendar
@@ -678,6 +633,17 @@ The specification wins where the documents differ. These follow from it, for the
   that splits a zone (2022g made America/Ciudad_Juarez from part of America/Ojinaga) or merges one into a link
   (2022b made Europe/Amsterdam a link to Europe/Brussels) changes which stored nodes match a named-zone query, so the
   rebuild after a tzdata change re-checks the zones of stored nodes as well as their spans.
+- **F-17.** From Q-45 and Q-74; `api.md` has the minimum (interval kind and length, `interval`, `displaced`,
+  `interval_displaced`, `OffPhase`, `SeriesInfo`). `format.md` A.6, when the interval fields of F-14 are given field
+  ids: interval length as a `u8` tag (0 fixed, 1 `day`, 2 `month`), with `i64` d and `i64` phase for tag 0; interval
+  zone as a UTF-8 string, as given at definition; day start as a local clock time in `i64` nanoseconds (05:00 is 5 h
+  whatever the offset does before it; 0 ≤ day start < 24 h), tag 1 only. None of them may appear in a parameter-change
+  entry. No change to fact columns or flags: a reading carries no length, and `displaced` is derived, not a fact flag.
+  A.8's reach of a reading on a calendar-length series is its interval under the tzdata version in force. The tree
+  checkpoint (layout not yet in `format.md`, F-7) carries per series the lateness reference (`i64`, absent when none)
+  beside the latest recorded `t`. `api.md` still needs: a change of interval length, zone or day start is an error
+  like a change of unit; a day start on a fixed or `month` length, or a zone the tzdata version in force does not
+  know, is refused at definition; exports and `live()` carry the interval end.
 
 ## Settled
 | ID | Question | Settled in |
@@ -721,11 +687,13 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart; later failures are retried with degraded health; the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (open parts: Q-39 (e) and (f)) |
 | Q-40 | Ranking facts of versioned series during a restore | §2.4 Version index, §8 Continuous backup and Deep, §8 Restore steps 1–2 (each tree checkpoint carries the version index, and step 1's replay brings it to the restored end before ingest opens), §13 |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b)–(d)) |
-| Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (open part: Q-45) |
+| Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (calendar lengths: Q-45) |
 | Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
 | Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b)–(d)) |
+| Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (open parts: Q-76 and Q-77 decide only which tzdata version is in force and where a repeated day start lies) |
 | Q-49 | What a series with no stored level serves during a restore, part (a): queries | §8 Restore step 2 and §6 Old spans (window edges move to where detail is local, the error `detail_not_local` only when no span is left, never an empty result; reads of facts fetch on demand; no priority download), row 28 (open part: Q-49 (b)) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
+| Q-74 | One reading far ahead makes later on-time readings `late` | §2.2 `late` and the lateness reference (facts not flagged `future`; the latest recorded `t`, over all facts, stays for the §2.4 fast path, §8 Restore step 2 and statistics), §2.4 Fast path, §4 Future facts, §8 Deep, Continuous backup and Restore step 1 (each tree checkpoint carries both), invariant 24, rows 4 and 4a, `api.md` `SeriesInfo` |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
@@ -844,6 +812,8 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
 | Host-stamped readings before clock synchronisation | §2.5: they wait in the ingest queue (back-pressure) | The emit returns `Wait::UnsyncedClock` and the reading takes no queue capacity; the adapter emits it again later, and the wait is counted per attempt, not measured | `tests/edge_cases.rs` `row_22a_…` |
 | Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64) | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly, also over the days of a month in a +05:45 zone | `tests/invariants.rs` `inv22_…` |
+| Calendar-length interval series | §2.1 `interval zone` and `day start`, §5.4 displaced readings, §5.7, §6, rows 43–46, invariant 23 (Q-45) | Interval series have a fixed length and phase only; calendar lengths, interval zones, day starts and displaced readings are not modelled yet | — |
+| Lateness reference | §2.2, §4 Future facts, §8 tree checkpoints, row 4a, invariant 24 (Q-74) | The first clause of `late` compares with the latest recorded `t`, `future` facts included, and a tree checkpoint carries only the latest recorded `t`; not modelled yet | `tests/open_questions.rs` `q74_…` (expects the model's result) |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2, §4 Resync, §8 Corrupt block ("recorded when found"), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches; the `resync` for a cursor below or inside it is the one every resume sends | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |

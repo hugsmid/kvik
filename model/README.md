@@ -32,7 +32,7 @@ it differs, and the open questions in the specification itself.
 
 ## Coverage
 
-Every invariant has a property test and every edge-case row a test whose doc comment cites it. Properties over
+Every invariant has a property test and every edge-case row a test whose doc comment cites it, except those whose "Not shown in the model" cell says they are not yet modelled. Properties over
 `arb_op` are guarded by `generator_coverage`; those over `arb_lossy_op` (the properties whose names mention lost
 ranges, kept beside their plain versions) by `lossy_generator_coverage`. "Pins" names the
 open question ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) whose answer a test fixes for now; "Not shown in the model"
@@ -62,8 +62,10 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 18 | `inv18_nothing_credited_past_now_or_staleness`, `inv18_interval_reading_valid_for_its_interval_only` | `invariants.rs` | `params_generator_covers_every_density_level`, `interval_generator_coverage` |  |  |
 | 19 | `inv19_resubmission_never_changes_a_current_fact`, `inv19_resubmission_across_a_restore` | `invariants.rs` | `inv19_generator_coverage`, `dup_generator_coverage` |  |  |
 | 20 | `inv20_scheduled_and_forecast_facts_never_future_or_out_of_order_late` | `invariants.rs` | `timed_generator_coverage` |  |  |
-| 21 | `inv21_scheduled_and_forecast_windows_independent_of_now`, `inv21_tree_windows_independent_of_now` | `invariants.rs` | `timed_generator_coverage`, `params_generator_covers_every_density_level` |  |  |
-| 22 | `inv22_interval_sums_add_over_adjacent_windows`, `inv22_interval_days_add_up_to_their_month` | `invariants.rs` | `interval_generator_coverage`; zones and months by construction |  |  |
+| 21 | `inv21_scheduled_and_forecast_windows_independent_of_now`, `inv21_tree_windows_independent_of_now` | `invariants.rs` | `timed_generator_coverage`, `params_generator_covers_every_density_level` |  | The clause for a calendar-length interval series (Q-45): not yet modelled (follow-up item) |
+| 22 | `inv22_interval_sums_add_over_adjacent_windows`, `inv22_interval_days_add_up_to_their_month` | `invariants.rs` | `interval_generator_coverage`; zones and months by construction |  | Displaced readings (Q-45): not yet modelled (follow-up item) |
+| 23 | — | — | — |  | Calendar-length interval series (Q-45): not yet modelled (follow-up item) |
+| 24 | — | — | — |  | The lateness reference (Q-74): not yet modelled (follow-up item); `q74_…` in `open_questions.rs` expects the model's result |
 
 ### Edge-case rows (spec §9)
 
@@ -76,7 +78,8 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 2c | `row_02c_replay_never_reverts_a_versioned_correction` | `edge_cases.rs` | Q-72 (`q72_…`) |  |
 | 2d | `row_02d_lower_changed_at_is_outranked` | `edge_cases.rs` |  |  |
 | 3 | `row_03_late_reading_flagged_tree_updated_no_retroactive_trigger` | `edge_cases.rs` |  |  |
-| 4 | `row_04_future_reading_recorded_suspect_excluded_until_its_time` | `edge_cases.rs` | Q-74 (`q74_…`) |  |
+| 4 | `row_04_future_reading_recorded_suspect_excluded_until_its_time` | `edge_cases.rs` |  | "Does not raise the lateness reference" (Q-74, settled): not yet modelled (follow-up item); `q74_…` in `open_questions.rs` expects the model's result |
+| 4a | — | — |  | The lateness reference (Q-74): not yet modelled (follow-up item) |
 | 5 | `row_05_stuck_or_past_clock_is_late_and_reported` | `edge_cases.rs` |  |  |
 | 6 | `row_06_two_readings_in_one_second` | `edge_cases.rs` |  |  |
 | 7 | `row_07_process_crash_after_write_before_sync`; `s3_missing_mark_counts_as_different_boot`, `s3_recovery_writes_mark_after_reboot` | `edge_cases.rs`; `rules.rs` |  | `possible_loss` and the timed mark sync: the model's mark is exact (kill loop, roadmap 4.5) |
@@ -122,9 +125,13 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 37b | `row_37b_forecast_source_falls_silent` | `edge_cases.rs` |  |  |
 | 38 | `row_38_window_over_tomorrow_on_scheduled_or_forecast_series` | `edge_cases.rs` |  |  |
 | 39 | `row_39_window_ending_after_now_on_an_observed_series` | `edge_cases.rs` |  |  |
-| 40 | `row_40_interval_reading_off_its_phase` | `edge_cases.rs` |  |  |
+| 40 | `row_40_interval_reading_off_its_phase` | `edge_cases.rs` |  | The calendar-length clauses and the duplicate before the phase check (Q-45): not yet modelled (follow-up item) |
 | 41 | `row_41_window_edge_inside_an_interval` | `edge_cases.rs` |  |  |
 | 42 | `row_42_interval_missing` | `edge_cases.rs` |  |  |
+| 43 | — | — |  | Calendar-length interval series (Q-45): not yet modelled (follow-up item) |
+| 44 | — | — |  | Calendar-length interval series (Q-45): not yet modelled (follow-up item) |
+| 45 | — | — |  | Calendar-length interval series (Q-45): not yet modelled (follow-up item) |
+| 46 | — | — |  | Calendar-length interval series (Q-45): not yet modelled (follow-up item) |
 
 ```bash
 cargo test --release                  # faster

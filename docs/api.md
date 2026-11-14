@@ -47,6 +47,18 @@ let info = store.series(id)?;                 // also by name
 Defining a series that already exists with the same specification returns its id. A different kind, value type,
 scale or unit under the same name is an error; the caller retires and defines anew.
 
+An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
+series; a day may start at a declared local time instead of midnight:
+```rust
+kind: Kind::Interval { value: ValueType::Decimal { scale: 3 }, length: IntervalLength::Calendar {
+    unit: CalendarUnit::Day { start: LocalTime::from_hms(5, 0, 0) },   // default midnight
+    zone: zone_name.into(),                                           // the interval zone
+} },
+enum IntervalLength { Fixed { d: Duration, phase: Duration }, Calendar { unit: CalendarUnit, zone: String } }
+enum CalendarUnit { Day { start: LocalTime }, Month }
+```
+`SeriesInfo` carries `latest_t` and the optional `lateness_reference` (spec §2.2).
+
 ## Writing
 ```rust
 let ack: Ack = store.emit(&[Reading { series: id, t, value, quality, source: TimeSource::Device }]).await?;
@@ -58,6 +70,7 @@ store.emit_with(&readings, Intent::Revise).await?;
 - A batch is all-or-nothing for durability, but individual readings may be refused (invalid series, retired
   series, a non-finite value recorded as bad quality is not a refusal). Refusals are reported per index.
 - Readings in one call keep their order; calls from different tasks are ordered by commit.
+- A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`.
 
 ## Consuming (funnels)
 ```rust
@@ -95,6 +108,7 @@ let series = reader.buckets(id, range, Resolution::Auto { max_points: 2_000 })?;
 let facts = reader.facts(id, range, View::Current)?;         // also View::AsOf(position), View::History
 let day = reader.calendar(id, date, Aggregate::Integral)?;   // site time zone
 let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named IANA zone for the whole span
+let (start, end) = reader.interval(id, t)?;                 // the interval of an interval series' reading at t
 ```
 - `Resolution::Auto` picks the coarsest stored level that yields at most `max_points`, and raw facts when the
   range is short enough. Every bucket carries count, min, max and coverage so a chart can show gaps and spikes.
@@ -103,7 +117,8 @@ let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named
   window over the UTC data (spec §5.7).
 - Every result type carries the flag `restoring` while a restore is bringing detail back (spec §8 Restore);
   `WindowResult.flags` also carries `approximate_edges`, with `from` and `to` giving the span evaluated (spec §6
-  Old spans). A window with no span over local detail is the error `DetailNotLocal`, never an empty result.
+  Old spans). A window with no span over local detail is the error `DetailNotLocal`, never an empty result. On an
+  interval series it also carries `apportioned` and `displaced` (spec §5.4, §6).
   `facts` over detail that is not local, also during a restore, fetches it on demand.
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
@@ -114,7 +129,8 @@ let h: Health = store.health();     // Ok, Degraded { reasons }, ReadOnly { caus
 let s: Stats = store.stats();       // per series and per consumer counters, commit latency, queue depths,
                                     // time behind, disk marks, backup lag
 ```
-Every refusal, drop, repeat and delay the specification says is counted appears here. Health reasons include
+Every refusal, drop, repeat and delay the specification says is counted appears here, including the displaced
+readings of each calendar-length interval series (`interval_displaced`, spec §5.4). Health reasons include
 `restore_failed` (naming the file) and the set-aside range of each restore record; statistics include restore
 progress (files and bytes remaining), which is not a health condition (spec §8 Restore).
 
@@ -143,5 +159,6 @@ The test implementations inject crashes at every write and sync, failed syncs, a
 changed boot identity. The engine is tested against the reference model through these seams.
 
 ## Not in v1
-A network server, SQL, multi-writer access, clustering, percentiles, conditions over several series, and any
-form of deletion.
+A network server, SQL, multi-writer access, clustering, percentiles, conditions over several series, interval
+readings whose length is neither fixed nor a local day or month (irregular billing periods), and any form of
+deletion.
