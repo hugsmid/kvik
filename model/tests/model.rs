@@ -16,8 +16,7 @@ use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
 use kvik_model::types::{
-    DAY, Exact, HOUR, Kind, MINUTE, Nanos, Quality, Reading, SECOND, SeriesId, Value, ValueType,
-    floor_to,
+    DAY, Exact, HOUR, Kind, MINUTE, Nanos, Reading, SECOND, SeriesId, Value, ValueType, floor_to,
 };
 
 const C: ConsumerId = ConsumerId(1);
@@ -295,19 +294,6 @@ fn rate_divides_by_covered_seconds() {
         w.aggregate(&Aggregate::Rate),
         Some(AggValue::Exact(Exact::new(150.into(), 181.into())))
     );
-}
-
-/// §2.4: identity uses the adapter-supplied quality; the model compares the
-/// quality after future stamping, so a resend as good once due is recorded.
-#[test]
-fn duplicate_check_compares_engine_assigned_quality() {
-    let (mut m, s) = model();
-    let t = m.wall + 2 * MINUTE;
-    m.ingest(vec![num(s, t, 5.0)]).unwrap();
-    m.advance(3 * MINUTE);
-    let r = m.ingest(vec![num(s, t, 5.0)]).unwrap();
-    assert_eq!(r.positions.len(), 1);
-    assert_eq!(m.current().unwrap()[&(s, t)].quality, Quality::Good);
 }
 
 /// §5.5: counter values are non-negative and a negative value is recorded as bad

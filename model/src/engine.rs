@@ -1185,11 +1185,22 @@ impl Disk {
             .collect()
     }
 
-    /// Positions of facts that are readable from the fast disk.
+    /// Whether a file has a readable copy on a local tier: hot, or cold
+    /// (§8 Tiers; deep is the only tier off the machine).
+    pub fn is_local(&self, f: FileId) -> bool {
+        self.locality(f) == Locality::Hot || self.cold.contains(&f)
+    }
+
+    /// Whether some published file has no copy on a local tier.
+    pub fn any_detail_off_machine(&self) -> bool {
+        self.published().into_iter().any(|f| !self.is_local(f))
+    }
+
+    /// Positions of entries held by a file on a local tier (hot or cold).
     pub fn local_positions(&self) -> BTreeSet<Position> {
         let mut out = BTreeSet::new();
         for f in self.published() {
-            if self.locality(f) == Locality::Hot {
+            if self.is_local(f) {
                 out.extend(
                     self.visible_entries(f, &self.files[&f])
                         .iter()
@@ -1252,8 +1263,8 @@ struct Volatile {
     entries: BTreeMap<Position, Entry>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
-    /// Every recorded `(value, quality)` per key, for the duplicate rule.
-    history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>>,
+    /// Every recorded fact's identity per key, for the duplicate rule.
+    history: History,
     trees: BTreeMap<SeriesId, SeriesTree>,
     /// Queued readings with their `revise` intent.
     queue: VecDeque<(Reading, bool)>,
@@ -1278,10 +1289,36 @@ struct Derived {
     routes: BTreeMap<Position, RouteChange>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
-    history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>>,
+    history: History,
     trees: BTreeMap<SeriesId, SeriesTree>,
     restore: Option<RestoreRt>,
 }
+
+/// What the duplicate rule compares of a recorded fact (§2.4): its value and
+/// adapter-supplied quality, with its position to tell whether it is local.
+#[derive(Clone, Debug, PartialEq)]
+struct Known {
+    position: Position,
+    value: Value,
+    quality: Quality,
+}
+
+impl Known {
+    fn of(f: &Fact) -> Self {
+        Known {
+            position: f.position,
+            value: f.value.clone(),
+            quality: f.supplied_quality,
+        }
+    }
+
+    fn identical(&self, value: &Value, quality: Quality) -> bool {
+        self.value.identical(value) && self.quality == quality
+    }
+}
+
+/// The recorded facts of each key, as the duplicate rule sees them.
+type History = BTreeMap<(SeriesId, Nanos), Vec<Known>>;
 
 /// What ingest and the tree need while a restore is bringing detail back.
 #[derive(Clone, Debug)]
@@ -1535,12 +1572,12 @@ impl Model {
         }
         let current = view::current(facts.iter());
         let mut newest_t = restoring.map_or_else(BTreeMap::new, |r| r.latest_t.clone());
-        let mut history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>> = BTreeMap::new();
+        let mut history: History = BTreeMap::new();
         for f in &facts {
             history
                 .entry((f.series, f.t))
                 .or_default()
-                .push((f.value.clone(), f.quality));
+                .push(Known::of(f));
             let n = newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
         }
@@ -1557,7 +1594,7 @@ impl Model {
                             history
                                 .entry((f.series, f.t))
                                 .or_default()
-                                .push((f.value.clone(), f.quality));
+                                .push(Known::of(&f));
                         }
                     }
                 }
@@ -1957,15 +1994,24 @@ impl Model {
     pub fn commit(&mut self, fault: Option<Fault>) -> Result<CommitReport, Error> {
         let wall = self.wall;
         let cfg = self.config.clone();
+        // Positions on a local tier, when some detail is not (§2.4); a
+        // restore has its own rule (§8 Restore step 2).
+        let restoring = self.vol.as_ref().is_some_and(|v| v.restore.is_some());
+        let local =
+            (!restoring && self.disk.any_detail_off_machine()).then(|| self.disk.local_positions());
         let v = self.vol.as_mut().ok_or(Error::Crashed)?;
         if v.read_only {
             return Err(Error::ReadOnly);
         }
         // Form the batch: stamp and flag; drop a reading identical to any fact
         // in the history of its key, including earlier facts of this batch,
-        // unless it carries `revise` intent (§2.4).
+        // unless it carries `revise` intent (§2.4). Identity compares the
+        // value and the adapter-supplied quality. The check never reads
+        // off-machine data: if the current fact of the key is on no local
+        // tier, the reading is recorded and counted `duplicates_unchecked`
+        // (§2.4, §12 D5).
         let mut batch: Vec<Entry> = Vec::new();
-        let mut batch_history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>> = BTreeMap::new();
+        let mut batch_history: History = BTreeMap::new();
         let mut batch_newest: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
         let mut duplicates = 0;
         let mut unchecked = 0;
@@ -1973,6 +2019,7 @@ impl Model {
         let mut next = v.next_position;
         let readings: Vec<(Reading, bool)> = v.queue.drain(..).collect();
         for (r, revise) in readings {
+            let supplied = r.quality;
             let (value, mut quality) = match r.value {
                 Value::Num(x) if !x.is_finite() => {
                     non_finite += 1;
@@ -1985,14 +2032,22 @@ impl Model {
                 quality = quality.worst(Quality::Suspect);
             }
             let key = (r.series, r.t);
+            let off_machine = local.as_ref().is_some_and(|local| {
+                !batch_history.contains_key(&key)
+                    && v.current
+                        .get(&key)
+                        .is_some_and(|c| !local.contains(&c.position))
+            });
             let seen = v
                 .history
                 .get(&key)
                 .into_iter()
                 .chain(batch_history.get(&key))
                 .flatten()
-                .any(|(hv, hq)| hv.identical(&value) && *hq == quality);
-            if seen && !revise {
+                .any(|k| k.identical(&value, supplied));
+            if !revise && off_machine {
+                unchecked += 1;
+            } else if seen && !revise {
                 duplicates += 1;
                 continue;
             }
@@ -2026,6 +2081,7 @@ impl Model {
                 received_at: wall,
                 value,
                 quality,
+                supplied_quality: supplied,
                 flags: Flags {
                     future,
                     late,
@@ -2035,10 +2091,7 @@ impl Model {
             next = next.next();
             let n = batch_newest.entry(r.series).or_insert(r.t);
             *n = (*n).max(r.t);
-            batch_history
-                .entry(key)
-                .or_default()
-                .push((fact.value.clone(), fact.quality));
+            batch_history.entry(key).or_default().push(Known::of(&fact));
             batch.push(Entry {
                 position: fact.position,
                 received_at: wall,
@@ -2196,27 +2249,18 @@ impl Model {
     fn publish_live(&mut self, batch: &[Entry]) -> Result<(), Error> {
         let cfg = self.config.clone();
         let restoring = self.vol.as_ref().is_some_and(|v| v.restore.is_some());
-        let local = if !restoring && self.any_current_detail_evicted() {
-            Some(self.disk.local_positions())
-        } else {
-            None
-        };
+        let local =
+            (!restoring && self.disk.any_detail_off_machine()).then(|| self.disk.local_positions());
         let v = self.vol.as_mut().ok_or(Error::Crashed)?;
         let mut touched: BTreeSet<(SeriesId, Nanos)> = BTreeSet::new();
         for e in batch {
             v.entries.insert(e.position, e.clone());
             let Some(f) = e.fact() else { continue };
-            if let Some(local) = &local
-                && let Some(prev) = v.current.get(&(f.series, f.t))
-                && !local.contains(&prev.position)
-            {
-                self.counters.duplicates_unchecked += 1;
-            }
             v.current.insert((f.series, f.t), f.clone());
             v.history
                 .entry((f.series, f.t))
                 .or_default()
-                .push((f.value.clone(), f.quality));
+                .push(Known::of(f));
             let n = v.newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
             touched.insert((f.series, floor_to(f.t, MINUTE)));
@@ -2259,13 +2303,6 @@ impl Model {
             tree.set_stale(minute, missing);
         }
         Ok(())
-    }
-
-    fn any_current_detail_evicted(&self) -> bool {
-        self.disk
-            .published()
-            .iter()
-            .any(|f| self.disk.files[f].class == FileClass::Current && !self.disk.hot.contains(f))
     }
 
     // ----- routing (§4 Routing) -----

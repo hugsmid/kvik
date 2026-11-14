@@ -156,6 +156,8 @@ fn row_02a_replay_of_earlier_value_dropped_unless_revise() {
     assert_eq!(m.facts().unwrap().len(), 3);
 }
 
+/// Row 2b: "Identical repeat whose current fact is off every local tier:
+/// recorded, `duplicates_unchecked`."
 #[test]
 fn row_02b_repeat_whose_current_fact_is_off_every_local_tier() {
     let cfg = Config {
@@ -173,8 +175,18 @@ fn row_02b_repeat_whose_current_fact_is_off_every_local_tier() {
     m.upload();
     m.advance(2 * HOUR);
     m.housekeeping().unwrap();
-    m.ingest(vec![num(s, T0, 2.0)]).unwrap();
+    // An identical repeat is recorded, not dropped: the check never reads
+    // off-machine data (§2.4, §12 D5).
+    let r = m.ingest(vec![num(s, T0 + 1, 1.0)]).unwrap();
+    assert_eq!((r.positions.len(), r.duplicates), (1, 0));
     assert_eq!(m.counters.duplicates_unchecked, 1);
+    // A different value is recorded and counted the same way.
+    m.ingest(vec![num(s, T0, 2.0)]).unwrap();
+    assert_eq!(m.counters.duplicates_unchecked, 2);
+    // Once the repeat is recorded locally, the next one is checked again.
+    let r = m.ingest(vec![num(s, T0 + 1, 1.0)]).unwrap();
+    assert_eq!(r.duplicates, 1);
+    assert_eq!(m.counters.duplicates_unchecked, 2);
 }
 
 #[test]

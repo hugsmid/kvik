@@ -276,6 +276,9 @@ pub struct Fact {
     pub value: Value,
     /// Quality after stamping (a future reading is at least suspect).
     pub quality: Quality,
+    /// Quality as the adapter supplied it, kept for the duplicate rule
+    /// (§2.2, §2.4): the engine may lower `quality`, never this.
+    pub supplied_quality: Quality,
     /// Engine flags.
     pub flags: Flags,
 }

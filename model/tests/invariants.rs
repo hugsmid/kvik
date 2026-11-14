@@ -932,3 +932,173 @@ fn delivery_generator_coverage() {
     assert!(resyncs > 500 && replaced > 10 && equal > 100);
     assert!(overflows > 30 && routes > 400 && latches > 200);
 }
+
+// ----- the duplicate rule (invariant 15) -----
+
+/// One step of the duplicate machine: a reading on a small pool of keys,
+/// values and qualities, committed alone, or a step that moves detail.
+#[derive(Clone, Debug)]
+enum DupOp {
+    Emit {
+        key: usize,
+        value: usize,
+        quality: usize,
+        revise: bool,
+    },
+    Seal,
+    Compact,
+    Upload,
+    CopyCold,
+    /// Advance past the eviction age, then housekeeping (fill pressure too).
+    Evict,
+    Restart,
+}
+
+const DUP_VALUES: [f64; 4] = [1.0, 2.0, -0.0, f64::NAN];
+const DUP_QUALITIES: [kvik_model::types::Quality; 3] = [
+    kvik_model::types::Quality::Good,
+    kvik_model::types::Quality::Estimated,
+    kvik_model::types::Quality::Bad,
+];
+
+fn arb_dup_op() -> impl Strategy<Value = DupOp> {
+    prop_oneof![
+        12 => (0usize..3, 0usize..DUP_VALUES.len(), 0usize..DUP_QUALITIES.len(), proptest::bool::weighted(0.1))
+            .prop_map(|(key, value, quality, revise)| DupOp::Emit { key, value, quality, revise }),
+        2 => Just(DupOp::Seal),
+        2 => Just(DupOp::Compact),
+        2 => Just(DupOp::Upload),
+        1 => Just(DupOp::CopyCold),
+        2 => Just(DupOp::Evict),
+        1 => Just(DupOp::Restart),
+    ]
+}
+
+/// A store whose fast disk is small enough for fill pressure to move current
+/// detail out (§8 Fill pressure).
+fn dup_machine() -> (kvik_model::engine::Model, kvik_model::types::SeriesId) {
+    use kvik_model::engine::{Config, Model};
+    use kvik_model::types::{HOUR, Kind, ValueType};
+    let cfg = Config {
+        disk_bytes: 1_000,
+        entry_bytes: 64,
+        low_mark: 0,
+        critical_mark: 0,
+        seal_after_batches: 4,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], T0 + HOUR);
+    let s = m
+        .define(NAMES[0], Kind::Gauge, ValueType::Number, "1", 5 * SECOND)
+        .unwrap();
+    (m, s)
+}
+
+/// Applies a step that is not an emit.
+fn apply_dup_step(m: &mut kvik_model::engine::Model, op: &DupOp) {
+    match op {
+        DupOp::Emit { .. } => unreachable!("emits are checked by the caller"),
+        DupOp::Seal => m.seal_active(),
+        DupOp::Compact => {
+            let _ = m.compact(None);
+        }
+        DupOp::Upload => {
+            m.upload();
+        }
+        DupOp::CopyCold => {
+            for f in m.disk.hot.clone() {
+                if m.disk.files[&f].sealed {
+                    m.copy_to_cold(f);
+                }
+            }
+        }
+        DupOp::Evict => {
+            m.advance(100 * kvik_model::types::DAY);
+            let _ = m.housekeeping();
+        }
+        DupOp::Restart => m.restart(),
+    }
+}
+
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// 15. An arriving fact is dropped as a duplicate iff it is identical
+    /// (§2.4: value, compared bitwise, "no value" for a non-finite one, and
+    /// adapter-supplied quality) to a fact in the history of its
+    /// `(series, t)` and lacks `revise`, except `duplicates_unchecked`: when
+    /// the current fact of its key is on no local tier, it is recorded and
+    /// counted. The test keeps its own history from the disk.
+    #[test]
+    fn inv15_dropped_iff_identical_without_revise(ops in proptest::collection::vec(arb_dup_op(), 1..80)) {
+        use kvik_model::types::Reading;
+        let (mut m, s) = dup_machine();
+        let keys = [T0, T0 + SECOND, T0 + SECOND + 1];
+        for op in &ops {
+            let DupOp::Emit { key, value, quality, revise } = op else {
+                apply_dup_step(&mut m, op);
+                continue;
+            };
+            let (t, v, q) = (keys[*key], DUP_VALUES[*value], DUP_QUALITIES[*quality]);
+            let identity = if v.is_finite() { Value::Num(v) } else { Value::Absent };
+            let history: Vec<_> = durable(&m).into_values().filter(|f| f.series == s && f.t == t).collect();
+            let local = m.disk.local_positions();
+            let off = history.iter().max_by_key(|f| f.position).is_some_and(|c| !local.contains(&c.position));
+            let identical = history.iter().any(|f| f.value.identical(&identity) && f.supplied_quality == q);
+            let reading = Reading { quality: q, ..Reading::num(s, t, v) };
+            if *revise { m.emit_revise(reading).unwrap() } else { m.emit(reading).unwrap() }
+            let unchecked = m.counters.duplicates_unchecked;
+            let r = m.commit(None).unwrap();
+            let dropped = !*revise && !off && identical;
+            prop_assert_eq!(r.duplicates, usize::from(dropped), "{:?}", op);
+            prop_assert_eq!(r.positions.len(), usize::from(!dropped));
+            prop_assert_eq!(m.counters.duplicates_unchecked - unchecked, u64::from(!*revise && off));
+        }
+    }
+}
+
+/// Guards the duplicate machine: its histories must reach identical repeats,
+/// `revise`, and repeats whose current fact is off every local tier.
+#[test]
+fn dup_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = proptest::collection::vec(arb_dup_op(), 60..80);
+    let (mut dropped, mut unchecked, mut revised) = (0u64, 0u64, 0usize);
+    for _ in 0..200 {
+        let ops = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, s) = dup_machine();
+        for op in &ops {
+            match op {
+                DupOp::Emit {
+                    key,
+                    value,
+                    quality,
+                    revise,
+                } => {
+                    let r = kvik_model::types::Reading {
+                        quality: DUP_QUALITIES[*quality],
+                        ..kvik_model::types::Reading::num(
+                            s,
+                            T0 + *key as i64 * SECOND,
+                            DUP_VALUES[*value],
+                        )
+                    };
+                    if *revise {
+                        m.emit_revise(r).unwrap();
+                        revised += 1;
+                    } else {
+                        m.emit(r).unwrap();
+                    }
+                    m.commit(None).unwrap();
+                }
+                other => apply_dup_step(&mut m, other),
+            }
+        }
+        dropped += m.counters.duplicates_dropped;
+        unchecked += m.counters.duplicates_unchecked;
+    }
+    eprintln!("dropped {dropped} unchecked {unchecked} revised {revised}");
+    assert!(dropped > 500 && unchecked > 100 && revised > 200);
+}

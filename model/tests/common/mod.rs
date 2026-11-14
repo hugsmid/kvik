@@ -141,6 +141,8 @@ pub enum Op {
         t: Nanos,
         value: Value,
         bad: bool,
+        /// Submitted with `revise` intent (§2.4).
+        revise: bool,
     },
     Commit(Option<Fault>),
     Crash,
@@ -199,13 +201,15 @@ pub fn arb_op() -> impl Strategy<Value = Op> {
                 prop_oneof![3 => arb_pool_offset(), 1 => arb_offset()],
                 arb_value(KINDS[s]),
                 proptest::bool::weighted(0.1),
+                proptest::bool::weighted(0.05),
             )
         })
-        .prop_map(|(series, t, value, bad)| Op::Emit {
+        .prop_map(|(series, t, value, bad, revise)| Op::Emit {
             series,
             t: T0 + t,
             value,
             bad,
+            revise,
         });
     prop_oneof![
         20 => emit,
@@ -307,13 +311,15 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             t,
             value,
             bad,
+            revise,
         } => {
-            let _ = m.emit(Reading {
+            let r = Reading {
                 series: ids[*series],
                 t: *t,
                 value: value.clone(),
                 quality: if *bad { Quality::Bad } else { Quality::Good },
-            });
+            };
+            let _ = if *revise { m.emit_revise(r) } else { m.emit(r) };
         }
         Op::Commit(f) => {
             let _ = m.commit(*f);

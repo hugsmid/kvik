@@ -537,7 +537,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
 
 ## Where the model differs from the specification
-The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
+The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4: identity by value and
+adapter-supplied quality; a fact whose key's current fact is on no local tier, hot or cold, is recorded and counted
+`duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
 delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
 condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
@@ -575,7 +577,6 @@ finds a higher generation claimed stops uploading and stays read-only across res
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
 | `t_source`, `host_time`, `unsynced_clock` | §2.2, §2.5, row 22a | Not modelled | — |
-| Duplicate identity | §2.4: adapter-supplied quality | Quality after future stamping | `duplicate_check_compares_engine_assigned_quality` |
 | Negative counter values | §2.5, §5.5: bad quality, no value | Reset rule applied | `negative_counter_decrease_counts_as_reset` |
 | Record on change | §2.6, row 17a | Keep-alive facts are ordinary facts from the adapter | `tests/edge_cases.rs` `row_17a_…` |
 | Effective-dated parameters and site zone | §2.1, §5.7, row 21 | One staleness limit per series; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
@@ -615,4 +616,4 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Window edges over detail that is not local | §6 Old spans, §8 Restore step 2: an edge moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, the error `detail_not_local`; no bound is refused for its resolution | No window is flagged `approximate_edges` and no edge moves; while restoring, a window bound inside a minute is refused with `Restoring` | `tests/open_questions.rs` `q39_no_sub_minute_query_or_checkpoint_while_restoring` |
 | Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
-| Invariants 12, 14 and 15 | §10 | Not checked yet | — |
+| Invariants 12 and 14 | §10 | Not checked yet | — |

@@ -78,6 +78,75 @@ fn s2_4_values_compare_bitwise() {
     assert_eq!(r.positions.len(), 1, "-0.0 is a different value");
 }
 
+/// §2.2: "The adapter-supplied quality is kept with the fact for the
+/// duplicate rule (§2.4)"; §2.4: "Flags and quality assigned by the engine
+/// are not part of identity." A future reading is lowered to suspect; its
+/// resend as good once due is a duplicate.
+#[test]
+fn s2_4_identity_uses_adapter_supplied_quality() {
+    let (mut m, s) = model(10 * SECOND);
+    let t = m.wall + 2 * MINUTE;
+    m.ingest(vec![Reading::num(s, t, 5.0)]).unwrap();
+    let f = m.current().unwrap()[&(s, t)].clone();
+    assert_eq!(
+        (f.quality, f.supplied_quality),
+        (Quality::Suspect, Quality::Good)
+    );
+    m.advance(3 * MINUTE);
+    let r = m.ingest(vec![Reading::num(s, t, 5.0)]).unwrap();
+    assert_eq!((r.positions.len(), r.duplicates), (0, 1));
+    // Supplied as suspect, it differs from the fact supplied as good.
+    let r = m
+        .ingest(vec![Reading {
+            quality: Quality::Suspect,
+            ..Reading::num(s, t, 5.0)
+        }])
+        .unwrap();
+    assert_eq!(r.positions.len(), 1);
+}
+
+/// §2.4: "If the current fact for a key is on no local tier (its detail moved
+/// out under §8 fill pressure or retention class), the fact is recorded and
+/// counted `duplicates_unchecked` (§12 D5). The check never reads off-machine
+/// data." The cold tier is local: a current fact held there is checked.
+#[test]
+fn s2_4_current_fact_in_cold_tier_is_checked() {
+    let cfg = Config {
+        disk_bytes: 400,
+        low_mark: 0,
+        critical_mark: 0,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], T0 + HOUR);
+    let s = m
+        .define(
+            "vehicle/7/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    for i in 0..6 {
+        m.ingest(vec![Reading::num(s, T0 + i, 1.0)]).unwrap();
+    }
+    m.seal_active();
+    m.compact(None).unwrap();
+    for f in m.disk.hot.clone() {
+        if m.disk.files[&f].sealed {
+            m.copy_to_cold(f);
+        }
+    }
+    m.advance(2 * HOUR);
+    assert!(
+        !m.housekeeping().unwrap().is_empty(),
+        "fill pressure moves detail out of hot"
+    );
+    let r = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    assert_eq!((r.positions.len(), r.duplicates), (0, 1));
+    assert_eq!(m.counters.duplicates_unchecked, 0);
+}
+
 #[test]
 fn s4_future_fact_in_tree_not_in_windows_or_live_state() {
     let (mut m, s) = model(10 * SECOND);
