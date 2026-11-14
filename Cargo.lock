@@ -547,6 +547,7 @@ name = "kvik-log"
 version = "0.1.0"
 dependencies = [
  "crc",
+ "kvik-model",
  "proptest",
  "thiserror",
 ]

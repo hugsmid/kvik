@@ -16,6 +16,8 @@ crc = "3.4"
 thiserror = "2"
 
 [dev-dependencies]
+# The reference model: the meaning of facts and entries, for the differential test.
+kvik-model = { path = "../model" }
 proptest = "1"
 
 [lints]
