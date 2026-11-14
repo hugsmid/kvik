@@ -248,12 +248,13 @@ A.10) is treated as a different boot. The rules apply in this order:
    page cache, and a later sync of the file returns success without writing it, so a sync vouches only for bytes
    written by the start that calls it. Where this rule applies and no readable mark shows a different boot (the mark
    is missing, unreadable or stale), the machine may not have rebooted, and the last complete batch may be one whose
-   sync failed. Before the sync of step 3 the start writes the bytes of the last complete batch again, in place and
+   sync failed. The same holds for a recovery entry that is adopted, whatever the mark: the start that wrote it may
+   have failed its sync and left it in the page cache only (Q-117). Before the sync of step 3 the start writes the bytes of the last complete batch again, in place and
    unchanged (no damaged region is overwritten, rule 2), and with them the segment's header when that batch is the
    first of its segment (the header rewrite that takes a segment into use is made durable by the same sync,
    `format.md` A.4). Only these can be in doubt: a batch is written only after the previous batch's sync has
-   returned, and each start writes the last complete batch again before it writes after it, so a recovery entry
-   adopted from a start whose own sync failed is covered too. If that sync succeeds the batch is on disk and is kept
+   returned, and each start writes the last complete batch again before it writes after it, and an adopted entry is
+   written again with it, so a recovery entry adopted from a start whose own sync failed is covered too. If that sync succeeds the batch is on disk and is kept
    (keeping a batch never acknowledged is allowed, row 12); if it fails the engine stays read-only (step 3) and
    nothing is delivered. This rests on the platform fact that the manifest's rewrite of its last record rests on
    (§7 Manifest): that writing identical bytes makes the next sync write them, checked on each platform by roadmap
@@ -263,8 +264,8 @@ A.10) is treated as a different boot. The rules apply in this order:
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
 2. Rule 1: truncate after the mark; sync every segment holding a lost range found (rule 2) and the directory, with
    step 3's rule for a failed sync; go to step 4.
-3. With the mark missing, unreadable or stale, first write the last complete batch again in place, with its
-   segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
+3. With the mark missing, unreadable or stale, or a recovery entry adopted, first write the last complete batch again
+   in place, with its segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
    the manifest as they are and writes nothing more; what it found is reported in health as found and recorded by the
    next start that can write.
 4. Repair the manifest's tail (§7 Manifest): drop a torn last record and truncate the file after the last valid
