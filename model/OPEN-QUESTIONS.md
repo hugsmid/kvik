@@ -478,32 +478,36 @@ then one of bad quality at the same `t` is dropped as a duplicate.
 quality kept for the duplicate rule (one more arm beside NaN and ±∞ in `Model::commit`, `model/src/engine.rs`).
 
 ## Q-105 — Reading a segment: points `format.md` Part A leaves open
-Found while building the segment reader (roadmap 4.2, crate `kvik-log`). Each part names the reading implemented
-for now; tests in `log/tests/segment.rs` pin it.
+Found while building the segment reader (roadmap 4.2, crate `kvik-log`). Each part names the reading implemented for
+now; tests in `log/tests/segment.rs` pin it.
 **Scenario.** (a) *Zeros below the mark.* A.2 says sixteen zero bytes at a block boundary are the end of data for a
 reader. A.4's accepted limit leaves a zeroed hole with kept batches after it (a power loss during a zero-fill); the
 next recovery keeps those batches, records the hole as a lost range and moves the mark past them. A reader process
 that stops at the hole never reads the kept batches below the mark. (b) *An unknown skippable block inside a batch.*
-A.7 counts "data blocks" in `block_count` and hashes "the headers of the batch's data blocks"; whether a skipped block
-of unknown type (A.2) between a batch's data blocks is one of them is not said, nor whether it takes sequences. (c)
-*A refusal while resynchronising.* The common rules make an unknown critical element in any checksum-valid block a
-version refusal. While stepping through an invalid region (A.2), a checksum-valid block image can appear inside a
-text value or other bytes that are not a block; read literally, a crafted value in a damaged region makes the whole
-segment unreadable, although such an image is never accepted as a batch. (d) *The first batch against
-`base_sequence`.* A.7: "the first batch of a file starts at `base_sequence`"; but A.4 lets a recovery batch be the
-first batch of a segment and rewrites the header with F only afterwards, so a crash between the two leaves a first
-batch above `base_sequence`; A.4 Gaps lets a reader accept any gap. (e) *A header that disagrees with its name.*
-Batches are checked against the file id and generation from the file name (needed when the header is invalid, A.4);
-a valid header naming another file id or generation is not covered.
-**Implemented.** (a) Zeros at a block boundary are the end of data only if every byte up to the limit is zero;
-below the mark (and before the seal blocks of a sealed segment) they start an invalid region, and resynchronisation
+A.7 counts "data blocks" in `block_count` and hashes "the headers of the batch's data blocks"; whether a skipped
+block of unknown type (A.2) between a batch's data blocks is one of them is not said, nor whether it takes sequences;
+nor whether a skippable block may stand between batches, outside any batch. (c) *A refusal while resynchronising.*
+The common rules make an unknown critical element in any checksum-valid block a version refusal. While stepping
+through an invalid region (A.2), a checksum-valid block image can appear inside a text value or other bytes that are
+not a block; read literally, a crafted value in a damaged region makes the whole segment unreadable, although such an
+image is never accepted as a batch. (d) *The first batch against `base_sequence`.* A.7: "the first batch of a file
+starts at `base_sequence`"; but A.4 lets a recovery batch be the first batch of a segment and rewrites the header
+with F only afterwards, so a crash between the two leaves a first batch above `base_sequence`; A.4 Gaps lets a reader
+accept any gap. (e) *A header that disagrees with its name.* Batches are checked against the file id and generation
+from the file name (needed when the header is invalid, A.4); a valid header naming another file id or generation is
+not covered.
+**Implemented.** (a) Zeros at a block boundary are the end of data only if every byte up to the limit is zero; below
+the mark (and before the seal blocks of a sealed segment) they start an invalid region, and resynchronisation
 continues, as recovery's scan does. (b) Every block before the commit block is counted in `block_count`,
-`batch_bytes` and `batch_crc32c`; a skipped block takes no sequence (a block that took sequences could not be
-skipped without losing entries) and has no `received_at` to compare. (c) At a block boundary reached from a valid
-position the refusal is immediate, as written; at a candidate offset while resynchronising it applies only if the
-rest of the batch checks out (its commit block, `block_count`, `batch_bytes`, generation and `batch_crc32c`), and
-otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the last kept sequence + 1: the first
-batch may start at or above it, never below. (e) Refused (`FormatError::HeaderMismatch`); the file is not read.
+`batch_bytes` and `batch_crc32c`; a skipped block takes no sequence (a block that took sequences could not be skipped
+without losing entries) and has no `received_at` to compare. A skippable block between batches, with no commit block
+of its own, is taken as the start of the next batch; that batch's `block_count` and `batch_crc32c` then fail, the
+block is reported as an invalid region (corruption) and resynchronisation finds the batch after it. (c) At a block
+boundary reached from a valid position the refusal is immediate, as written; at a candidate offset while
+resynchronising it applies only if the rest of the batch checks out (its commit block, `block_count`, `batch_bytes`,
+generation and `batch_crc32c`), and otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the
+last kept sequence + 1: the first batch may start at or above it, never below. (e) Refused
+(`FormatError::HeaderMismatch`); the file is not read.
 **Needed.** Confirmation of, or a rule for, each part; for (a), whether A.2's end-of-data sentence applies to a
 reader below the mark at all. To be settled by roadmap 4.5 (recovery), (a) and (c) with 4.6 (second-process reader).
 

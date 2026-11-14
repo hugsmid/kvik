@@ -26,4 +26,4 @@ format change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-log --test golden`.
 
 Still to be added by their roadmap items (A.11): recovery entries, a gap before a recovery entry and an adopted
 recovery entry (4.5); unknown ignorable and critical columns, entry types and fields (4.3); a stale mark below
-acknowledged batches (4.5); the store descriptor (4.1); manifests (4.5, 6.3).
+acknowledged batches (4.5); the store descriptor and manifests (by the items that write them).
