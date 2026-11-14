@@ -922,7 +922,10 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
                 let ahead = r.fs.paths().into_iter().rev().find(|p| {
                     p.to_string_lossy().ends_with(".open")
                         && r.fs.read(p).is_some_and(|b| {
-                            b.len() as u64 == r.cfg.segment_size && FileHeaderOf::base(&b) == 0
+                            b.len() as u64 == r.cfg.segment_size
+                                && kvik_log::header::FileHeader::decode(&b)
+                                    .is_some_and(|h| h.base_sequence == 0)
+                                && b[64..].iter().all(|&x| x == 0)
                         })
                 });
                 if let Some(p) = ahead {
