@@ -29,8 +29,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
 | Q-73 | §2.6, §2.1 `record on change`, row 17a, §1.5 | Who leaves out the unchanged readings of a record-on-change series |
 | Q-74 | §2.2 `late`, §4 Future facts, row 4 | One reading far ahead makes later on-time readings `late` |
-| Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset, and the zone before the first entry |
-| Q-76 | §5.7, row 21, invariant 8 | Whether a tzdata change is in the log, and calendar results while its rebuild is pending |
+| Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset |
+| Q-76 | §5.7, row 21, invariant 8 | Whether a tzdata change is a log entry |
+| Q-77 | §5.7, row 20 | A day whose midnight occurs twice |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -499,7 +500,7 @@ does not lower the latest recorded `t`, as for Q-44 (c).
 (a function of the log, so rebuild keeps it); a `future` reading neither raises it nor is judged by it.
 
 ## Q-75 — Local days around a site-zone change to another offset
-**Scenario.** (a) The site zone is Asia/Tokyo (+09) and an entry moves it to America/New_York (−04 in June) effective
+**Scenario.** The site zone is Asia/Tokyo (+09) and an entry moves it to America/New_York (−04 in June) effective
 2026-06-01T00:00Z. §5.7 says "each local day uses the zone in force at its start". 1 June starts at
 2026-05-31T15:00Z in Tokyo, when Tokyo is in force, and at 2026-06-01T04:00Z in New York, when New York is in force:
 both fit. 31 May (Tokyo) ends at 15:00Z and 1 June (New York) starts at 04:00Z if New York is taken, so 13 hours lie
@@ -508,38 +509,51 @@ to Tokyo at the same instant), 1 June starts at 04:00Z in New York, when Tokyo i
 Tokyo, when New York is in force: no zone fits, while 2 June (Tokyo, from 06-01T15:00Z) overlaps 1 June (New York, to
 06-02T04:00Z) by 13 hours. Two entries less than a day apart, or with the same effective time, have the same problem,
 and so has "today" for a calendar window when `now` falls in such a gap or overlap. A month spanning the change does
-not tile with its days. (b) The zone in force before the first entry is not said: `api.md` makes `time_zone`
-required at open, and opening with another one would re-take every past day, against D3.
+not tile with its days.
 **Model.** `calendar::Zoning::Site`: a local day is taken in the latest entry's zone under which it starts at or
-after that entry's effective time, else in the configured zone (so in (a) New York for the first case, New York for
-1 June and Tokyo from 2 June in the second); of two entries with the same effective time the later in the log; "today"
-is the latest date whose day starts at or before `now`; a month's result is the window from its first day's start to
-its last day's end; a month node is stored only where its days are contiguous, and a day node that overlaps an
-earlier input is not taken. (b) `Config::site_zone` is in force before the first entry, and a restart with another
-value re-takes those days (`q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap`).
-**Needed.** Which zone a local day takes when its start fits two zones or none, where the hours between the last day
-of the old zone and the first of the new one go, and what is in force before the first entry.
+after that entry's effective time, else in the store's zone (so New York for 1 June in the first case; New York for
+1 June and Tokyo from 2 June in the second); of two entries with the same effective time the later in the log;
+"today" is the latest date whose day starts at or before `now`; a month's result is the window from its first day's
+start to its last day's end; a month node is stored only where its days are contiguous, and a day node that overlaps
+an earlier input is not taken (`q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap`). The zone before
+the first entry is not open: §5.7 ("the site zone is a log entry"), D3 and invariant 8 make it the store's, recorded
+at creation; opening or restoring a store with another configured zone is refused (`tests/rules.rs`
+`s5_7_store_keeps_its_site_zone_and_refuses_another_at_open`).
+**Needed.** Which zone a local day takes when its start fits two zones or none, and where the hours between the last
+day of the old zone and the first of the new one go.
 **Proposal.** A site-zone entry takes effect at a local midnight of its new zone (refused otherwise). The local day in
 progress at the effective time ends there; the new zone starts with its first date whose midnight is at the
-effective time, and a date already begun in the old zone is not taken again. Days then tile, so months do. The zone
-given at open is written as an entry effective at the beginning of time when the store is created, and a later open
-with another zone is refused (a change is an entry).
+effective time, and a date already begun in the old zone is not taken again. Days then tile, so months do.
 
-## Q-76 — Whether a tzdata change is in the log, and calendar results while it is rebuilt
-**Scenario.** (a) §5.7 says a tzdata change "rebuilds the affected days and is logged", and row 21 says "logged". If
-that means a log entry, invariant 8 holds; if it means a message, the calendar nodes depend on the host's tzdata,
-which the log does not hold: a rebuild from the log after an upgrade, or a restore onto a host with another version,
-builds other nodes than the live ones, and the record of which days changed is lost. (b) Between the change and the
-end of the rebuild, §5.7 makes a stored node an input to a named-zone query only when its version is current, but does
-not say so for a site-zone query, whose stored node for a day may then cover the day's old span.
-**Model.** The engine logs the rebuild (`Model::calendar_log`), with no log entry. A changed database is installed
-(`Model::install_tzdb`) and the files keep their version until `Model::rebuild_calendars`, which changes only the
-days and months whose nodes differ and logs them; until then no stored node of the old version is an input, to a
-named-zone or a site-zone query alike, and a build from the log uses the version the live files have. A restart builds
-with the host's version and logs nothing (`q76_tzdata_change_is_not_in_the_log`, `tests/edge_cases.rs`
+## Q-76 — Whether a tzdata change is a log entry
+**Scenario.** §5.7 says a tzdata change "rebuilds the affected days and is logged", and row 21 says "logged". If that
+means a message, the calendar nodes depend on the host's tzdata, which the log does not hold: a restart after an
+upgrade, a rebuild from the log (invariant 8) or a restore onto a host with another version builds other nodes than
+the live ones, and the record of which days changed is lost.
+**Settled by the text.** Until the rebuild, a stored node of the old version is no input to any calendar result,
+named-zone or site-zone: §5.7 makes a result a window evaluation over the day's span, and a node built for the old
+span cannot stand in for it (invariant 7).
+**Model.** The reading that the change is a log entry: installing a new release (`Model::install_tzdb`) writes
+nothing, and calendar files keep the version the log names (the store header's at creation, then the latest tzdata
+entry), also across a restart; `Model::rebuild_calendars` writes a tzdata entry with the new version, rebuilds only
+the days and months whose nodes differ and logs them (`Model::calendar_log`); a build from the log uses the version
+the log names (`q76_tzdata_change_is_a_log_entry_written_by_the_rebuild`, `tests/edge_cases.rs`
 `row_21_tzdata_change_rebuilds_the_affected_days`).
-**Needed.** Whether a tzdata change is a log entry, what invariant 8 says while a rebuild is pending, and whether the
-version condition applies to site-zone queries.
+**Needed.** Whether "is logged" means a log entry.
+**Proposal.** §5.7: "a tzdata change is recorded as a log entry naming the new version; it rebuilds the affected days
+and is reported in health. Calendar files are built with the version the log names." A host whose tzdata is older
+than the logged version keeps the calendar files it has and reports it.
+
+## Q-77 — A day whose midnight occurs twice
+**Scenario.** Havana falls back from 01:00 (−04) to 00:00 (−05) on 1 November 2026, so local midnight of 1 November
+is both 04:00 and 05:00 UTC. §5.7 says where a day starts when its midnight does not exist, not when it exists twice.
+Taking the later instant puts the first hour of 1 November into 31 October.
+**Model.** The earlier instant: 1 November has 25 hours and 31 October ends at 04:00 UTC
+(`q77_day_whose_midnight_occurs_twice_starts_at_the_earlier`). A midnight inside a gap starts the day when the gap
+ends, also when the gap straddles midnight (Toronto, 31 March 1919, 23:30 to 00:30: the day starts at 04:30 UTC,
+`tests/rules.rs` `s5_7_day_spans_pinned`).
+**Needed.** Which instant starts a day whose midnight occurs twice.
+**Proposal.** §5.7: "A day whose local midnight occurs twice starts at the earlier."
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -618,7 +632,12 @@ The specification wins where the documents differ. These follow from it, for the
 - **F-16.** `format.md` A.6 needs an entry type for the site zone (zone name, effective time, §5.7), and the calendar
   file a format recording its tzdata version and, per stored node, the zone of each day it covers. `api.md`:
   `calendar` and `calendar_in` take a day or a month, calendar windows (since local midnight, this month, a relative
-  day or month, §6) need a `Window` constructor, and the site zone needs a call that records an entry.
+  day or month, §6) need a `Window` constructor, and the site zone needs a call that records an entry. With Q-76 as
+  proposed, A.6 also needs a tzdata entry (version). The engine compares zones by the tzdata link table (`backward`),
+  not by the model's fingerprint of a zone's rules; a calendar file records zones by canonical name, and a release
+  that splits a zone (2022g made America/Ciudad_Juarez from part of America/Ojinaga) or merges one into a link
+  (2022b made Europe/Amsterdam a link to Europe/Brussels) changes which stored nodes match a named-zone query, so the
+  rebuild after a tzdata change re-checks the zones of stored nodes as well as their spans.
 
 ## Settled
 | ID | Question | Settled in |
@@ -675,8 +694,9 @@ nodes, kept only for spans on 15-minute boundaries of a series with a stored 15-
 every day they cover was taken in the zone of the query, compared after resolving links, their span is the day's and
 their tzdata version is current, and never past the credit limit; days with no quarter-hours, days whose midnight
 does not exist and historical offsets off 15-minute boundaries; the site zone as an effective-dated log entry (see
-Q-75), whose change rebuilds calendar nodes from its effective time only, and tzdata changes, which rebuild only the
-affected days (see Q-76), both logged; calendar windows since local midnight, this month and relative days and
+Q-75), whose change rebuilds calendar nodes from its effective time only, and tzdata changes, recorded as a log entry
+by the rebuild, which rebuilds only the affected days (see Q-76), both logged; a midnight in a gap that straddles it
+and a midnight that occurs twice (see Q-77); calendar windows since local midnight, this month and relative days and
 months; rows 20, 20a, 21 and 21a, invariants 5, 7, 8, 17 and 22 over calendar days; `tests/rules.rs` `s5_7_…` and
 `s6_calendar_…`), the duplicate rule with `revise` (§2.4: identity by value and
 adapter-supplied quality; a fact whose key's current fact is on no local tier, hot or cold, is recorded and counted
@@ -760,7 +780,8 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Effective-dated parameters | §2.1, §5.7, row 20a | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so a span in which the expected interval crosses a density threshold (row 20a, Q-60) does not arise | `calendar_depends_on_zone_utc_levels_do_not` |
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
-| Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start (with the host's tzdata, see Q-76), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
+| Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
+| Entries at store creation | §5.7: the site zone is a log entry; Q-76: the tzdata version | A store header beside the log, written at creation and carried by the bucket, holds the site zone and tzdata version before any entry, so that positions start at `0:1`; a start or restore with another configured zone is refused (`OpenRefused`, `SiteZoneMismatch`) | `tests/rules.rs` `s5_7_store_keeps_its_site_zone_and_refuses_another_at_open` |
 | New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
