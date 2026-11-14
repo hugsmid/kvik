@@ -2572,15 +2572,20 @@ impl Model {
             // quality without a value, flagged and counted; the duplicate
             // rule compares them as "no value" with the supplied quality
             // (§2.4).
-            let supplied_absent = matches!(r.value, Value::Absent);
+            // Each is counted when it is recorded, not when it is dropped
+            // as a duplicate.
+            let (mut was_absent, mut was_non_finite, mut was_negative) = (false, false, false);
             let (value, mut quality) = match r.value {
-                Value::Absent => (Value::Absent, Quality::Bad),
+                Value::Absent => {
+                    was_absent = true;
+                    (Value::Absent, Quality::Bad)
+                }
                 Value::Num(x) if !x.is_finite() => {
-                    non_finite += 1;
+                    was_non_finite = true;
                     (Value::Absent, Quality::Bad)
                 }
                 Value::Num(x) if def.kind == Kind::Counter && x < 0.0 => {
-                    negative += 1;
+                    was_negative = true;
                     (Value::Absent, Quality::Bad)
                 }
                 other => (other, r.quality),
@@ -2652,8 +2657,10 @@ impl Model {
                 duplicates += 1;
                 continue;
             }
-            // A supplied `Absent` is counted when it is recorded (§2.5).
-            absent += u64::from(supplied_absent);
+            // Readings recorded without a value are counted now (§2.5).
+            absent += u64::from(was_absent);
+            non_finite += u64::from(was_non_finite);
+            negative += u64::from(was_negative);
             // During a restore the check cannot run against facts that are
             // not yet local (§8 Restore step 2, §2.4).
             if !revise

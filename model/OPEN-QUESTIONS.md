@@ -27,8 +27,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
 | Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
+| Q-108 | §8 Generations, §7 Manifest, §8 Restore step 1 | A restore from a rebuilt manifest only partly uploaded |
 | Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
-| Q-107 | §7 Manifest (Deep unreachable), §3 Write or sync failure, §11 Health, `api.md` Health | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -84,7 +84,12 @@ same holds for a lost range that a restore records when the bucket has lost or c
 Failures and end). A lost log segment whose facts were already compacted loses only its non-fact entries: a scattered
 set of positions, not a range between batches, so the report's bytes and commit times on either side (§11 Health)
 are undefined for it, the batch `commit_time` that as-of-time queries over the surviving facts need (§2.3) is lost
-with it, and which definitions count as lost is not said (a chunk or the registry file may still hold one).
+with it, and which definitions count as lost is not said (a chunk or the registry file may still hold one). Since
+Q-100, each decimal series' largest magnitude and highest stored scale are derived values too, carried by tree
+checkpoints: a checkpoint taken before a lost range may carry a magnitude or scale held only by lost facts, so the
+scale in force (§2.1, which counts kept facts only) and the range check must be brought back to the kept log with
+the other derived values (a carried magnitude only makes the range check stricter; a carried scale would raise the
+scale in force without a kept fact or raise entry behind it).
 **Model.** Not modelled: a lost range comes only from a damaged batch of facts in the open segment (row 11a), and
 `Model::corrupt_open_batch` refuses a batch holding a registry, routing or zone entry
 (`tests/edge_cases.rs` `row_11a_fault_injection_limits`).
@@ -171,12 +176,14 @@ for the entry; the mark (A.10, version 3) has 40 reserved bytes, so a stamp fits
 **Scenario.** Parts (a) and (c) are settled at gate 3.3 (see Settled). §7 Manifest writes the last valid record's
 identical bytes again in place at every start, so that a record kept from the page cache after a failed sync is on
 disk before a successor is appended. Since Q-87, §3 Recovery rule 3 does the same for the last complete log batch
-(and its segment's header) whenever the mark is missing, unreadable or stale. Whether the next sync then writes those
+(and its segment's header) whenever the mark is missing, unreadable or stale, and `format.md` A.4 seals again from
+step 1 an `.open` file whose trailer is found, writing the segment index, trailer and end marker again. Whether the next sync then writes those
 bytes, on each platform, was not measured by the roadmap 2.2 spike.
 **Model.** Not modelled; manifest records are not corrupted and the mark is exact.
 **Needed.** A check, with the page-tracking fault file system and on each platform (on Linux, with a device that
 fails writes on demand), that each rewrite reaches the disk. If it does not, the proposed fallbacks are: for the
-manifest, rewrite it to a new file and rename it; for the log, copy the kept batches to a new segment and rename it.
+manifest, rewrite it to a new file and rename it; for the log, copy the kept batches to a new segment and rename it;
+for a seal, the same copy before the rename to `.kvl`.
 To be settled on each platform with roadmap 4.8.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
@@ -377,23 +384,20 @@ middle is not examined. One `resync` delivery carries the state of every funnel 
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
 
-## Q-107 — The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild
-Recorded when Q-103 (d) was settled. To be settled by roadmap item 6.3.
-**Scenario.** A start finds a corrupt manifest record; the mirror path holds no copy and deep does not answer. The
-store opens read-only (`manifest_corrupt`) and, after `manifest.rebuild_wait`, rebuilds provisionally and continues
-(§7 Manifest). (1) The rule does not say when the wait starts, nor whether a restart starts it again: on a process
-that restarts every ten minutes, a wait counted from each start never ends. (2) Every other read-only state is left
-only by a restart (§3 Write or sync failure; `api.md` Principles: "a fault makes the store read-only"); the
-provisional rebuild leaves `ReadOnly { cause: ManifestCorrupt }` while the store runs, and the same holds when deep
-answers during the wait. (3) Whether `acknowledge_manifest_rebuild` is accepted while the rebuild is provisional,
-and what an acknowledgement given then means when deep later answers with a copy that replaces the reconstruction.
+## Q-108 — A restore from a rebuilt manifest only partly uploaded
+Recorded at the review of the Q-103 ruling. To be settled by roadmap item 8.3.
+**Scenario.** A manifest is rebuilt (§7 Manifest) and becomes final; its records are uploaded in epoch order under
+their new epochs: the rebuild record, the carried records, the restated records, the closing empty record. The
+records of the old manifest, before the rebuild, were all uploaded earlier. A disaster strikes after the rebuild
+record and some carried records are in the bucket, but before the rest. §8 Generations says a restore "starts at the
+last" rebuild record and does not read the records before it, so it restores from a truncated list: files named only
+by old records whose carried copies were not yet uploaded are missing from the restore, and their positions become a
+gap or a set-aside range although the bucket holds both the files and the records naming them.
 **Model.** Not modelled; manifest records are not corrupted.
-**Needed.** (1) The start of the wait (for example the writer's monotonic clock from the first start that found the
-record corrupt with deep unreachable, as the grace period counts from the writer's start, §7 Retired files, or a
-time recorded durably); (2) whether the read-only state of a corrupt manifest record is left without a restart, or
-the store opens writable after the wait only at a later start; (3) whether a provisional rebuild can be
-acknowledged, or the acknowledgement is refused until the rebuild is final.
-
+**Needed.** A rule for which records a restore reads. Suggested: a rebuilt manifest counts for a restore only once
+its closing record is in the bucket (records are uploaded in order, so it is then complete); until then the restore
+reads the records before its rebuild record, as if the rebuild had not happened, and the uploaded part of the
+rebuilt manifest is not read. To be settled with roadmap 8.3 (restore).
 
 ## Q-105 — Reading a segment: points `format.md` Part A leaves open
 Found while building the segment reader (roadmap 4.2, crate `kvik-log`). Each part names the reading implemented for
@@ -474,7 +478,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87 and Q-100 to Q-104 were settled after gate 3.3 by the owner's rulings; Q-107 was recorded then.
+Q-87 was reopened there. Q-87, Q-100 to Q-104 and Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 was recorded then.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -483,7 +487,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-104 were settled after gate 3.3 by 
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
 | Q-46 | 4.5 | With 4.6 (second-process reader): the check of a kept position, `start: position` and row 7b |
-| Q-52 (b) | 4.8 | The in-place rewrites of the manifest and of the log (since Q-87), checked on each platform |
+| Q-52 (b) | 4.8 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
@@ -498,8 +502,8 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-104 were settled after gate 3.3 by 
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
+| Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
 | Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
-| Q-107 | 6.3 | Manifest rebuild; recorded when Q-103 was settled |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
@@ -697,8 +701,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-100 | Where the largest stored magnitude is kept, whether the policy may change, stored nodes across a scale raise, and a lost raise | §2.1 `decimal scale` ((a) the largest magnitude a per-series function of the log, carried by tree checkpoints with the highest stored scale and brought up to date by replay; units limited to ±(2^63 − 1), `i64::MIN` out of range; (d) the scale in force is the highest of the defined scale, the kept raise entries and the highest stored scale among kept facts, and a lost raise is not written again), `excess precision` and the paragraph under the table ((b) the policy and its maximum changed by a parameter change effective at its position), §5.6 ((c) a node records the highest stored scale among the current facts it covers that are not bad; a merge takes the higher), §8 Deep, Continuous backup and Restore step 1 (checkpoint contents), `format.md` A.5 (`i64::MIN`), A.6 (fields 23–26 in a parameter change) and Part B (the scale of a chunk summary and a tree node), `api.md` Series (`set_excess_precision`). Model property tests (the tracked magnitude equals the maximum over the log after any history, restart and restore, a raise refused exactly when a fact would not fit; each value handled by the policy in force at its position; rebuild equals live and merges in any grouping bitwise equal across raises; after any lost range every kept fact rescales exactly to the scale in force) wait for decimal values in the model (before roadmap 5.1; (c) before 7.1); engine: a node spanning a raise, the batch holding a raise corrupted |
 | Q-101 | A replay across a scale raise, rounded or not | §2.4 (decimal values compare by exact numeric value; a fact flagged `rounded` also matches a value that rounds to it at its stored scale; the check runs on the value as submitted, before the excess-precision policy; a correction inside a rounding is dropped as a duplicate unless sent with `revise` or a higher `changed_at`; the revised-key index holds each fact's stored scale and `rounded` flag), `api.md` Core types. Model property test (replaying any recorded history after any raises and policy changes records nothing, writes no raise entry, counts no refusal and changes no current fact) and unit tests (reading, correction, raise, replay; an unflagged 0.1234 then 0.12345 is recorded) wait for decimal values in the model (before roadmap 5.1) |
 | Q-102 | A finite value too large for `i64` at the series' scale | §2.5 (out of range, `i64::MIN` units included: recorded as quality bad with no value whatever the policy, counted `out_of_range`, and reported in the reading's outcome while the call succeeds; `auto-raise` never raises for it), §2.1 `excess precision`, §2.4 (compares as "no value"), row 31, §11 Ingest, `api.md` Core types, Writing (`Outcome::Recorded.out_of_range`) and `series_stats` (`out_of_range`). Model property test (values across the `i64` boundary at every scale 0 to 18: none panics, each recorded exactly or out of range) and a unit test (`auto-raise` does not move the scale for 1e300) wait for decimal values in the model (before roadmap 5.1) |
-| Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (open details: Q-107)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 `file_id` floor and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
+| Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (the wait and acknowledgement: Q-107, settled)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 ((g) the `file_id` floor) and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
 | Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
+| Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

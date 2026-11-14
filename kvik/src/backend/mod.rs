@@ -1822,6 +1822,7 @@ impl Slot {
                     .count() as u64,
                 bytes: self.model.disk.used_bytes(self.model.config.entry_bytes),
                 manifest_rebuilds: 0,
+                loss_identities_rebuilt: 0,
             },
             disk: DiskStats {
                 free: self.model.free_bytes(),

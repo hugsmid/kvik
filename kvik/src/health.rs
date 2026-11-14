@@ -61,8 +61,9 @@ pub enum Reason {
         /// Its epoch.
         epoch: u64,
         /// Rebuilt while deep could not be reached, after
-        /// `manifest.rebuild_wait` (spec §7 Manifest): uploads, evictions and
-        /// removals are held until deep answers.
+        /// `manifest.rebuild_wait` (spec §7 Manifest): all uploads,
+        /// evictions and removals are held until deep answers, and the
+        /// rebuild cannot be acknowledged until it is final.
         provisional: bool,
     },
     /// A series' source clock appears skewed (spec §9 row 5; an addition of
@@ -238,6 +239,10 @@ pub struct LogStats {
     pub bytes: u64,
     /// Manifest records rebuilt from local files.
     pub manifest_rebuilds: u64,
+    /// Losses a manifest rebuild listed under their first missing position,
+    /// because no valid record named their identity (spec §7 Manifest,
+    /// invariant 27).
+    pub loss_identities_rebuilt: u64,
 }
 
 /// Disk statistics.

@@ -95,7 +95,7 @@ value" (§2.5).
 its lower offset is negative and `Duration` is unsigned.
 **Needed:** the definitions, and whether a time library's types appear in the public interface (a semver
 commitment).
-**Resolved at gate 3.3:** `api.md` Core types. Decimal series and excess precision follow the owner's ruling (`spec.md` §2.1; open parts Q-100 and Q-101).
+**Resolved at gate 3.3:** `api.md` Core types. Decimal series and excess precision follow the owner's ruling (`spec.md` §2.1; its open parts, Q-100 and Q-101, were settled later).
 
 ### AC-4 — The error and refusal types are not listed
 **Where:** Principles ("errors are typed"), Writing · **Severity:** blocks (4.1) · **Relates to:** F-2, F-6, F-10,

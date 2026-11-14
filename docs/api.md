@@ -350,7 +350,7 @@ pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
 // LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
-//            open_file_id, sealed_segments, bytes, manifest_rebuilds }   ClockStats { jumps, last: Option<ClockJump> }
+//            open_file_id, sealed_segments, bytes, manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
 pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, duplicates_dropped, duplicates_unchecked,
                                                                    // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts,
                                                                    // rounded, scale_raises, absent_supplied, out_of_range
@@ -364,10 +364,14 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   which is refused while read-only and in a drill as `acknowledge_losses` is, and whose torn acknowledgement record is
   given again as for `acknowledge_losses` (spec §7 Manifest).
   While deep cannot be reached to tell whether a copy exists, it is the fault `ManifestCorrupt` for
-  `manifest.rebuild_wait`; then the manifest is rebuilt provisionally (`ManifestRebuilt { provisional: true }`), and
-  uploads, evictions and removals are held until deep answers (spec §7 Manifest; open details: Q-107 in
-  `model/OPEN-QUESTIONS.md`). A corrupt restore record with no copy stays `ManifestCorrupt`. `LossCause::Unknown` is
-  the cause of a loss that a manifest rebuild found again with no cause given by a valid record or recovery entry.
+  `manifest.rebuild_wait`, counted from each start once deep has been asked and failed. When the wait ends, or deep
+  answers first, the store leaves `ReadOnly` by itself, the one fault that ends without a restart (it comes from no
+  failed write). After the wait the manifest is rebuilt provisionally (`ManifestRebuilt { provisional: true }`), all
+  uploads, evictions and removals are held until deep answers, and `acknowledge_manifest_rebuild` is refused until
+  the rebuild is final (spec §7 Manifest). A corrupt restore record with no copy stays `ManifestCorrupt`.
+  `LossCause::Unknown` is the cause of a loss that a manifest rebuild found again with no cause given by a valid
+  record or recovery entry. Losses that a rebuild lists under their first missing position because no valid record
+  names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
   `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.

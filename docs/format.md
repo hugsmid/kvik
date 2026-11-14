@@ -213,7 +213,8 @@ and ignorable rule.
   kept.
 - **Checks** (a failure makes the block invalid, A.2): a mandatory column missing; a column id twice; a payload
   outside the body or overlapping another; a length that does not match `row_count`; an encoding not allowed for the
-  column; a value out of the range above; the presence rules of columns 7, 8 and 9 broken. A `value_type` that
+  column; a value out of the range above, a decimal row (`value_type = 2`) holding `i64::MIN` included (invalid
+  content, `spec.md` §2.1); the presence rules of columns 7, 8 and 9 broken. A `value_type` that
   contradicts the series definition is not a block check: the fact is treated as an orphaned fact (`spec.md` §2.1) by
   whoever has the registry.
 - **Encoding 0, plain:** `row_count` fixed-width values.
@@ -477,7 +478,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
   missing position because no valid record names their identity, `u32`), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
-  §7 Manifest). Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
+  §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
+  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
   `0x25` restore (8.3), `0x26` quarantine and `0x27` tier move (8.1). A rebuild never reconstructs these two: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
   another tier" is verified again, so their layouts may hold no fact that only they hold.
