@@ -1,5 +1,5 @@
-//! The per-series summary tree (spec §5.1, §5.6), calendar days (§5.7) and
-//! window evaluation (§6).
+//! The per-series summary tree (spec §5.1, §5.6) and window evaluation (§6);
+//! calendar days and months are in [`crate::calendar`].
 //!
 //! Stored levels are 1 minute and 15 minutes, aligned to UTC; the 1-second
 //! level is never stored. A 1-minute node is the fold over its readings; a
@@ -22,7 +22,9 @@ pub const LEVELS: [Nanos; 2] = [MINUTE, QUARTER];
 /// Errors from calendar evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TreeError {
-    /// A local day boundary does not fall on a 15-minute UTC boundary.
+    /// A local day boundary does not fall on a 15-minute UTC boundary, so no
+    /// calendar node is stored for it and it has no whole number of
+    /// quarter-hours; its result is still a window evaluation (§5.7).
     #[error("local day {date} in {zone} starts {offset_ns} ns past a 15-minute boundary")]
     UnalignedDay {
         /// The date.
@@ -39,6 +41,9 @@ pub enum TreeError {
     /// its calendar results are window evaluations over its facts.
     #[error("no calendar node: the series stores no 15-minute level")]
     NoCalendarNode,
+    /// The zone is not in the time-zone database.
+    #[error("unknown time zone {0}")]
+    UnknownZone(String),
 }
 
 /// Summary tree for one series.
@@ -287,14 +292,38 @@ impl SeriesTree {
     /// scheduled or forecast one) are ignored and no time is credited past it;
     /// a window wholly after `now` on an observed series is empty.
     pub fn window(&self, start: Nanos, end: Nanos, now: Nanos) -> Node {
+        self.window_with(start, end, now, &[])
+    }
+
+    /// [`SeriesTree::window`] with `inputs`, nodes over sub-spans of the
+    /// window (stored calendar nodes, §5.7), taken whole in place of the nodes
+    /// and readings they cover. Inputs must be in order, disjoint, and lie
+    /// inside the window before its credit limit; an interval series needs
+    /// them on edges of its finest stored level. With exact sums the result
+    /// is the same with or without them.
+    pub fn window_with(&self, start: Nanos, end: Nanos, now: Nanos, inputs: &[Node]) -> Node {
         if self.params.interval.is_some() {
-            return self.interval_window(start, end, now);
+            return self.interval_window(start, end, now, inputs);
         }
         if self.params.wholly_future(start, now) {
             return Node::empty(self.params.kind, start, end);
         }
         let until = self.params.credit_limit(end, now).max(start);
-        let core = self.core(start, until);
+        let mut parts = Vec::new();
+        let mut t = start;
+        for inp in inputs {
+            assert!(
+                t <= inp.start && inp.end <= until,
+                "input outside the window"
+            );
+            parts.push(self.core(t, inp.start));
+            parts.push(inp.clone());
+            t = inp.end;
+        }
+        parts.push(self.core(t, until));
+        let mut core = merge_all(&self.params, start, parts.iter());
+        core.start = start;
+        core.end = until;
         let mut n = with_stretches(&self.params, core, self.last_before(start).as_ref(), until);
         n.end = end;
         n
@@ -305,7 +334,7 @@ impl SeriesTree {
     /// §5.4), and at each edge the readings whose intervals reach into it,
     /// apportioned; edge lookups reach back d. A reading of an observed
     /// series enters only once `t + d ≤ now`.
-    fn interval_window(&self, start: Nanos, end: Nanos, now: Nanos) -> Node {
+    fn interval_window(&self, start: Nanos, end: Nanos, now: Nanos, inputs: &[Node]) -> Node {
         let p = &self.params;
         let d = p.interval.expect("interval series").length;
         let end = end.max(start);
@@ -325,7 +354,21 @@ impl SeriesTree {
             // readings are all ready.
             let b = floor_to(if observed { end.min(now) } else { end }, w);
             (a < b).then(|| {
-                let nodes: Vec<Node> = (0..(b - a) / w).map(|i| self.node(l, a + i * w)).collect();
+                let mut nodes: Vec<Node> = Vec::new();
+                let mut t = a;
+                for inp in inputs.iter().filter(|i| a <= i.start && i.end <= b) {
+                    while t < inp.start {
+                        nodes.push(self.node(l, t));
+                        t += w;
+                    }
+                    assert_eq!(t, inp.start, "input off the stored level's edges");
+                    nodes.push(inp.clone());
+                    t = inp.end;
+                }
+                while t < b {
+                    nodes.push(self.node(l, t));
+                    t += w;
+                }
                 let mut n = merge_all(p, a, nodes.iter());
                 n.start = a;
                 n.end = b;
@@ -348,14 +391,17 @@ impl SeriesTree {
         }
     }
 
-    /// The stored calendar node for `date` in `zone`: the merge of its
-    /// 15-minute nodes (§5.7). It holds no edge stretches; the specification
-    /// makes the calendar result a window evaluation (see `OPEN-QUESTIONS.md`).
+    /// The calendar node for `date` taken in `zone`: the merge of its
+    /// 15-minute nodes (§5.7), what a stored day node holds. It holds no edge
+    /// stretches and is only an input to the day's result, which is a window
+    /// evaluation ([`crate::calendar`]). Refused for a series without a stored
+    /// 15-minute level and for a day whose edges are off 15-minute boundaries.
     pub fn day(&self, zone: &TimeZone, date: Date) -> Result<Node, TreeError> {
         if !self.params.stores(1) {
             return Err(TreeError::NoCalendarNode);
         }
         let (start, end) = day_span(zone, date)?;
+        unaligned(zone, date, start, end)?;
         let quarters: Vec<Node> = (0..(end - start) / QUARTER)
             .map(|i| self.node(1, start + i * QUARTER))
             .collect();
@@ -365,20 +411,14 @@ impl SeriesTree {
     }
 }
 
-/// UTC span `[start, end)` of local `date` in `zone`. A day whose midnight
-/// does not exist starts at its first instant; a skipped day is empty.
+/// UTC span `[start, end)` of local `date` in `zone`, wherever its edges fall
+/// (§5.7). A day whose midnight does not exist starts at its first instant; a
+/// skipped day is empty.
 pub fn day_span(zone: &TimeZone, date: Date) -> Result<(Nanos, Nanos), TreeError> {
-    let at = |d: Date| -> Result<Nanos, TreeError> {
-        let z = d
-            .to_zoned(zone.clone())
-            .map_err(|e| TreeError::Calendar(e.to_string()))?;
-        Ok(i64::try_from(z.timestamp().as_nanosecond()).expect("in range"))
-    };
-    let start = at(date)?;
-    let next = date
-        .tomorrow()
-        .map_err(|e| TreeError::Calendar(e.to_string()))?;
-    let end = at(next)?;
+    crate::calendar::day_span(zone, date)
+}
+
+fn unaligned(zone: &TimeZone, date: Date, start: Nanos, end: Nanos) -> Result<(), TreeError> {
     for b in [start, end] {
         let off = b - floor_to(b, QUARTER);
         if off != 0 {
@@ -389,12 +429,14 @@ pub fn day_span(zone: &TimeZone, date: Date) -> Result<(Nanos, Nanos), TreeError
             });
         }
     }
-    Ok((start, end.max(start)))
+    Ok(())
 }
 
 /// Number of 15-minute nodes in local `date`.
+/// Refused for a day whose edges are off 15-minute boundaries.
 pub fn quarters_in_day(zone: &TimeZone, date: Date) -> Result<i64, TreeError> {
     let (s, e) = day_span(zone, date)?;
+    unaligned(zone, date, s, e)?;
     Ok((e - s) / QUARTER)
 }
 

@@ -3612,3 +3612,417 @@ fn s8_index_entry_completed_when_the_current_chunks_are_back() {
     assert_eq!(r.counters.duplicates_unchecked, 0);
     assert_eq!(r.current().unwrap()[&(s, T0)].value, n(2.0));
 }
+
+// ----- §5.7 calendar results, §6 calendar windows -----
+
+fn readings_of(m: &Model, s: SeriesId) -> Vec<(Nanos, Value)> {
+    oracle::readings(m.current().unwrap(), s)
+}
+
+/// §5.7: "A calendar day or month result is a window evaluation (§6) over its
+/// span, edge stretches included. Stored day nodes are an input to that
+/// evaluation, not the result." The stored day node holds no stretch before
+/// the day's first or after its last reading; the result does.
+#[test]
+fn s5_7_calendar_day_is_a_window_with_edge_stretches() {
+    let (mut m, s) = calendar_model("Asia/Tokyo", utc("2026-06-03T00:00:00Z"), DAY + 6 * HOUR);
+    let date = jiff::civil::Date::constant(2026, 6, 1);
+    let (ds, de) = (utc("2026-05-31T15:00:00Z"), utc("2026-06-01T15:00:00Z"));
+    feed(
+        &mut m,
+        s,
+        &[(ds - HOUR, 900.0), (ds + HOUR, 100.0), (de - HOUR, 500.0)],
+    );
+    let a = m
+        .calendar(s, kvik_model::calendar::Period::Day(date))
+        .unwrap();
+    assert_eq!((a.from, a.to), (ds, de));
+    assert_eq!(a.inputs, vec![(ds, de)], "the stored day node is an input");
+    let stored = &m.calendar_file(s).unwrap().days[&date];
+    assert_eq!(stored.node.coverage, i128::from(22 * HOUR));
+    assert_eq!(a.node.coverage, i128::from(24 * HOUR));
+    let p = m.tree(s).unwrap().params;
+    assert_eq!(
+        a.node,
+        oracle::window(&p, &readings_of(&m, s), ds, de, m.now)
+    );
+}
+
+/// §5.7: a month result is a window over the month's span, taking the stored
+/// month node as an input; its days, adjacent windows, add up to it. March
+/// 2026 in London has a 23-hour day.
+#[test]
+fn s5_7_month_result_takes_the_stored_month_node() {
+    use kvik_model::calendar::{Month, Period};
+    let (mut m, s) = calendar_model("Europe/London", utc("2026-04-02T00:00:00Z"), 7 * HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-02-28T18:00:00Z"),
+            utc("2026-04-01T07:00:00Z"),
+            6 * HOUR + 7 * MINUTE,
+        ),
+    );
+    let march = Month {
+        year: 2026,
+        month: 3,
+    };
+    let (from, to) = (utc("2026-03-01T00:00:00Z"), utc("2026-03-31T23:00:00Z"));
+    let a = m.calendar(s, Period::Month(march)).unwrap();
+    assert_eq!((a.from, a.to), (from, to));
+    assert_eq!(a.inputs, vec![(from, to)]);
+    let p = m.tree(s).unwrap().params;
+    let rs = readings_of(&m, s);
+    assert_eq!(a.node, oracle::window(&p, &rs, from, to, m.now));
+    let (mut count, mut coverage) = (0, 0);
+    for d in march.dates().unwrap() {
+        let day = m.calendar(s, Period::Day(d)).unwrap();
+        assert_eq!(day.inputs.len(), usize::from(day.node.count > 0));
+        if d == jiff::civil::Date::constant(2026, 3, 29) {
+            assert_eq!(day.to - day.from, 23 * HOUR);
+        }
+        count += day.node.count;
+        coverage += day.node.coverage;
+    }
+    assert_eq!((count, coverage), (a.node.count, a.node.coverage));
+    // The same month in a named zone with the same offsets in 2026 but
+    // another zone: the same span, no stored node as an input.
+    let lisbon = m
+        .calendar_in(s, Period::Month(march), "Europe/Lisbon")
+        .unwrap();
+    assert_eq!((lisbon.from, lisbon.to), (from, to));
+    assert!(lisbon.inputs.is_empty());
+    assert_eq!(lisbon.node, a.node);
+}
+
+/// §5.7: a stored calendar node is an input to a query in a named zone only
+/// when its days were taken in that zone, "zones compared by canonical name,
+/// after resolving IANA links".
+#[test]
+fn s5_7_named_zone_compared_after_resolving_links() {
+    use kvik_model::calendar::Period;
+    let (mut m, s) = calendar_model("Asia/Kolkata", utc("2026-06-03T00:00:00Z"), HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-05-31T12:00:00Z"),
+            utc("2026-06-02T12:00:00Z"),
+            20 * MINUTE,
+        ),
+    );
+    let date = jiff::civil::Date::constant(2026, 6, 1);
+    let span = (utc("2026-05-31T18:30:00Z"), utc("2026-06-01T18:30:00Z"));
+    let site = m.calendar(s, Period::Day(date)).unwrap();
+    let link = m
+        .calendar_in(s, Period::Day(date), "Asia/Calcutta")
+        .unwrap();
+    let other = m.calendar_in(s, Period::Day(date), "Asia/Colombo").unwrap();
+    assert_eq!(site.inputs, vec![span]);
+    assert_eq!(link.inputs, vec![span], "a link names the same zone");
+    assert!(other.inputs.is_empty(), "same offset, another zone");
+    for a in [&link, &other] {
+        assert_eq!((a.from, a.to), span);
+        assert_eq!(a.node, site.node);
+    }
+    assert!(matches!(
+        m.calendar_in(s, Period::Day(date), "Mars/Olympus_Mons"),
+        Err(Error::Tree(kvik_model::tree::TreeError::UnknownZone(_)))
+    ));
+}
+
+/// §5.7: "A day whose local midnight does not exist starts at its first
+/// instant"; "the rule also covers a skipped date (an empty span)".
+#[test]
+fn s5_7_skipped_date_and_missing_midnight() {
+    use kvik_model::calendar::Period;
+    use kvik_model::tree::quarters_in_day;
+    // Samoa skipped 30 December 2011.
+    let (mut m, s) = calendar_model("Pacific/Apia", utc("2012-01-02T00:00:00Z"), 2 * HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2011-12-29T00:00:00Z"),
+            utc("2012-01-01T00:00:00Z"),
+            50 * MINUTE,
+        ),
+    );
+    let p = m.tree(s).unwrap().params;
+    let rs = readings_of(&m, s);
+    let skip = utc("2011-12-30T10:00:00Z");
+    let day = |d| {
+        m.calendar(s, Period::Day(jiff::civil::Date::constant(2011, 12, d)))
+            .unwrap()
+    };
+    let (d29, d30, d31) = (day(29), day(30), day(31));
+    assert_eq!((d29.from, d29.to), (utc("2011-12-29T10:00:00Z"), skip));
+    assert_eq!((d30.from, d30.to), (skip, skip));
+    assert_eq!((d31.from, d31.to), (skip, utc("2011-12-31T10:00:00Z")));
+    assert_eq!((d30.node.count, d30.node.coverage), (0, 0));
+    for a in [&d29, &d30, &d31] {
+        assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, m.now));
+    }
+    let apia = jiff::tz::TimeZone::get("Pacific/Apia").unwrap();
+    assert_eq!(
+        quarters_in_day(&apia, jiff::civil::Date::constant(2011, 12, 30)).unwrap(),
+        0
+    );
+    // Chile: midnight of 6 September 2026 does not exist; the day starts at
+    // 01:00 local (−03), 04:00 UTC.
+    let (mut m, s) = calendar_model("America/Santiago", utc("2026-09-08T00:00:00Z"), HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-09-05T00:00:00Z"),
+            utc("2026-09-08T00:00:00Z"),
+            25 * MINUTE,
+        ),
+    );
+    let a = m
+        .calendar(s, Period::Day(jiff::civil::Date::constant(2026, 9, 6)))
+        .unwrap();
+    assert_eq!(
+        (a.from, a.to),
+        (utc("2026-09-06T04:00:00Z"), utc("2026-09-07T03:00:00Z"))
+    );
+    assert_eq!(a.inputs, vec![(a.from, a.to)]);
+    let p = m.tree(s).unwrap().params;
+    assert_eq!(
+        a.node,
+        oracle::window(&p, &readings_of(&m, s), a.from, a.to, m.now)
+    );
+}
+
+/// §5.7: local day spans, pinned by hand (not by the span function the
+/// oracle shares): DST in both hemispheres, 30- and 45-minute offsets, a
+/// 30-minute DST shift and historical offsets off 15-minute boundaries.
+#[test]
+fn s5_7_day_spans_pinned() {
+    use kvik_model::calendar::{Zoning, aligned};
+    let db = kvik_model::calendar::Tzdb::bundled();
+    let cases = [
+        (
+            "Europe/London",
+            (2026, 3, 29),
+            "2026-03-29T00:00:00Z",
+            "2026-03-29T23:00:00Z",
+        ),
+        (
+            "Europe/London",
+            (2026, 10, 25),
+            "2026-10-24T23:00:00Z",
+            "2026-10-26T00:00:00Z",
+        ),
+        (
+            "America/New_York",
+            (2026, 11, 1),
+            "2026-11-01T04:00:00Z",
+            "2026-11-02T05:00:00Z",
+        ),
+        (
+            "Australia/Sydney",
+            (2026, 10, 4),
+            "2026-10-03T14:00:00Z",
+            "2026-10-04T13:00:00Z",
+        ),
+        (
+            "America/Santiago",
+            (2026, 4, 4),
+            "2026-04-04T03:00:00Z",
+            "2026-04-05T04:00:00Z",
+        ),
+        (
+            "Asia/Kolkata",
+            (2026, 6, 1),
+            "2026-05-31T18:30:00Z",
+            "2026-06-01T18:30:00Z",
+        ),
+        (
+            "Asia/Kathmandu",
+            (2026, 6, 1),
+            "2026-05-31T18:15:00Z",
+            "2026-06-01T18:15:00Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            (2026, 10, 4),
+            "2026-10-03T13:30:00Z",
+            "2026-10-04T13:00:00Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            (2026, 4, 5),
+            "2026-04-04T13:00:00Z",
+            "2026-04-05T13:30:00Z",
+        ),
+        (
+            "Africa/Monrovia",
+            (1970, 6, 1),
+            "1970-06-01T00:44:30Z",
+            "1970-06-02T00:44:30Z",
+        ),
+        (
+            "Europe/Dublin",
+            (1912, 6, 1),
+            "1912-06-01T00:25:21Z",
+            "1912-06-02T00:25:21Z",
+        ),
+        (
+            "Asia/Kolkata",
+            (1900, 6, 1),
+            "1900-05-31T18:38:50Z",
+            "1900-06-01T18:38:50Z",
+        ),
+    ];
+    for (zone, (y, mo, d), from, to) in cases {
+        let day = Zoning::Named(zone.into())
+            .day(&db, jiff::civil::Date::constant(y, mo, d))
+            .unwrap();
+        assert_eq!(
+            (day.start, day.end),
+            (utc(from), utc(to)),
+            "{zone} {y}-{mo}-{d}"
+        );
+        let quarter_edges = !matches!(y, 1900 | 1912 | 1970);
+        assert_eq!(aligned((day.start, day.end)), quarter_edges, "{zone}");
+    }
+}
+
+/// §6 Windows: calendar windows "since local midnight, this month, or
+/// relative to the current one, such as the next local day or month";
+/// "since local midnight" and "this month" end at `now`, a relative day or
+/// month at its end; a window wholly after `now` on an observed series is
+/// empty. Whole days before `now` are taken from their stored nodes; a day
+/// node running past the credit limit is never used whole (§6 Evaluation).
+#[test]
+fn s6_calendar_windows_in_the_site_zone_and_a_named_zone() {
+    use kvik_model::calendar::CalendarWindow as W;
+    let now = utc("2026-11-03T15:20:00Z");
+    let (mut m, s) = calendar_model("America/New_York", now, HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(utc("2026-10-30T00:00:00Z"), now, 30 * MINUTE + 11 * SECOND),
+    );
+    // A reading later today, recorded flagged `future`.
+    feed(&mut m, s, &[(now + 2 * HOUR, 7.0)]);
+    let p = m.tree(s).unwrap().params;
+    let rs = readings_of(&m, s);
+    let check = |w: W, zone: Option<&str>, span: (&str, Nanos), inputs: Vec<(Nanos, Nanos)>| {
+        let a = m.calendar_window(s, w, zone).unwrap();
+        assert_eq!((a.from, a.to), (utc(span.0), span.1), "{w:?}");
+        assert_eq!(a.inputs, inputs, "{w:?}");
+        assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, now), "{w:?}");
+        a
+    };
+    let (nov1, nov2, nov3) = (
+        utc("2026-11-01T04:00:00Z"),
+        utc("2026-11-02T05:00:00Z"),
+        utc("2026-11-03T05:00:00Z"),
+    );
+    let nov4 = utc("2026-11-04T05:00:00Z");
+    check(
+        W::SinceMidnight,
+        None,
+        ("2026-11-03T05:00:00Z", now),
+        vec![],
+    );
+    check(
+        W::ThisMonth,
+        None,
+        ("2026-11-01T04:00:00Z", now),
+        vec![(nov1, nov2), (nov2, nov3)],
+    );
+    check(
+        W::Day(-1),
+        None,
+        ("2026-11-02T05:00:00Z", nov3),
+        vec![(nov2, nov3)],
+    );
+    // Today, whole: its stored node holds the future reading and runs past
+    // `now`, so it is no input.
+    let today = check(W::Day(0), None, ("2026-11-03T05:00:00Z", nov4), vec![]);
+    assert!(
+        m.calendar_file(s).unwrap().days[&jiff::civil::Date::constant(2026, 11, 3)]
+            .node
+            .count
+            > today.node.count
+    );
+    let next = check(
+        W::Day(1),
+        None,
+        ("2026-11-04T05:00:00Z", utc("2026-11-05T05:00:00Z")),
+        vec![],
+    );
+    assert_eq!((next.node.count, next.node.coverage), (0, 0));
+    check(
+        W::Month(-1),
+        None,
+        ("2026-10-01T04:00:00Z", nov1),
+        vec![(utc("2026-10-01T04:00:00Z"), nov1)],
+    );
+    // In Kathmandu it is already 21:05 on 3 November.
+    check(
+        W::SinceMidnight,
+        Some("Asia/Kathmandu"),
+        ("2026-11-02T18:15:00Z", now),
+        vec![],
+    );
+    check(
+        W::Month(1),
+        Some("Asia/Kathmandu"),
+        ("2026-11-30T18:15:00Z", utc("2026-12-31T18:15:00Z")),
+        vec![],
+    );
+}
+
+/// §6 Windows: "since local midnight" ends at `now` and a relative day at its
+/// end; on a scheduled series, whose credit limit is the window end, the
+/// difference shows (§6 Edge stretches).
+#[test]
+fn s6_since_midnight_ends_at_now_on_a_scheduled_series() {
+    use kvik_model::calendar::CalendarWindow as W;
+    let now = utc("2026-06-01T12:00:00Z");
+    let cfg = Config {
+        site_zone: "Europe/Paris".into(),
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], now);
+    let s = m
+        .define_with(
+            "grid/tariff/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "EUR",
+            None,
+            SeriesOptions {
+                expected_interval: Some(MINUTE),
+                ..SeriesOptions::timing(Timing::Scheduled)
+            },
+        )
+        .unwrap();
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-05-31T22:00:00Z"),
+            utc("2026-06-01T22:00:00Z"),
+            HOUR,
+        ),
+    );
+    let p = m.tree(s).unwrap().params;
+    let rs = readings_of(&m, s);
+    let since = m.calendar_window(s, W::SinceMidnight, None).unwrap();
+    let today = m.calendar_window(s, W::Day(0), None).unwrap();
+    assert_eq!((since.from, since.to), (utc("2026-05-31T22:00:00Z"), now));
+    assert_eq!(today.to, utc("2026-06-01T22:00:00Z"));
+    assert_eq!(since.node.count, 14);
+    assert_eq!(today.node.count, 24);
+    assert_eq!(today.inputs, vec![(today.from, today.to)]);
+    for a in [&since, &today] {
+        assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, now));
+    }
+}

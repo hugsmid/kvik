@@ -12,10 +12,9 @@ use kvik_model::condition::{Condition, Event, Runner};
 use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Model, Selection};
 use kvik_model::oracle;
 use kvik_model::registry::SeriesOptions;
-use kvik_model::summary::{Aggregate, Params};
-use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
+use kvik_model::summary::Aggregate;
 use kvik_model::types::{
-    DAY, HOUR, Kind, MINUTE, Nanos, Reading, SECOND, SeriesId, Value, ValueType, floor_to,
+    DAY, HOUR, Kind, MINUTE, Nanos, Reading, SECOND, SeriesId, ValueType, floor_to,
 };
 
 const C: ConsumerId = ConsumerId(1);
@@ -156,46 +155,4 @@ fn calendar_depends_on_zone_utc_levels_do_not() {
             "UTC levels untouched"
         );
     }
-}
-
-/// §5.7: a calendar result is a window evaluation over the day, edge stretches
-/// included. The model's stored day node omits the stretches before the day's
-/// first and after its last reading, so it differs from the window.
-#[test]
-fn day_node_omits_edge_stretches() {
-    let tz = TimeZone::get("Asia/Tokyo").unwrap();
-    let date = Date::constant(2026, 6, 1);
-    let (ds, de) = kvik_model::tree::day_span(&tz, date).unwrap();
-    // A dense series (expected interval 1 s), so a day node is stored.
-    let p = Params {
-        expected_interval: Some(SECOND),
-        ..Params::new(Kind::Gauge, None)
-    };
-    let rs = vec![
-        (ds - HOUR, Value::Num(900.0)),
-        (ds + HOUR, Value::Num(100.0)),
-        (de - HOUR, Value::Num(500.0)),
-    ];
-    let tree = SeriesTree::build(p, &rs);
-    let node = tree.day(&tz, date).unwrap();
-    let window = tree.window(ds, de, de);
-    assert_eq!(node.coverage, i128::from(22 * HOUR));
-    assert_eq!(window.coverage, i128::from(24 * HOUR));
-}
-
-/// §5.7: days whose edges are not on 15-minute boundaries are evaluated as
-/// windows in the specification; the model refuses them.
-#[test]
-fn unaligned_days_are_refused() {
-    let monrovia = TimeZone::get("Africa/Monrovia").unwrap();
-    assert!(matches!(
-        quarters_in_day(&monrovia, Date::constant(1970, 6, 1)),
-        Err(TreeError::UnalignedDay { .. })
-    ));
-    let apia = TimeZone::get("Pacific/Apia").unwrap();
-    assert_eq!(
-        quarters_in_day(&apia, Date::constant(2011, 12, 30)).unwrap(),
-        0,
-        "a skipped date has an empty span"
-    );
 }

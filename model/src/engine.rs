@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::calendar::{self, CalendarFile, CalendarWindow, Month, Period, Tzdb, Zoning};
 use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
 use crate::registry::{
     Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
@@ -69,6 +70,9 @@ pub struct Config {
     /// Fill ratio (percent) above which verified sealed log segments, then
     /// the oldest current detail, leave the fast disk (§8: 70 %).
     pub fill_threshold_pct: u64,
+    /// The site zone in force before the first site-zone entry (§5.7; see
+    /// Q-75 (b)).
+    pub site_zone: String,
 }
 
 impl Default for Config {
@@ -92,6 +96,7 @@ impl Default for Config {
             low_mark: 2 << 30,
             critical_mark: 512 << 20,
             fill_threshold_pct: 70,
+            site_zone: "UTC".into(),
         }
     }
 }
@@ -662,6 +667,54 @@ pub enum Error {
         /// The position.
         position: Position,
     },
+}
+
+/// What caused a calendar rebuild.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CalendarCause {
+    /// A site-zone entry (§5.7, §12 D3).
+    SiteZone {
+        /// Its position.
+        position: Position,
+    },
+    /// A tzdata change (§5.7).
+    Tzdata {
+        /// The version the calendar files were built with.
+        from: String,
+        /// The version now.
+        to: String,
+    },
+}
+
+/// A logged calendar rebuild (§5.7, row 21): the days and months of a series
+/// whose stored nodes it changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalendarRebuild {
+    /// The series.
+    pub series: SeriesId,
+    /// The cause.
+    pub cause: CalendarCause,
+    /// Local dates whose day nodes were rebuilt, added or removed.
+    pub days: Vec<jiff::civil::Date>,
+    /// Months whose nodes were rebuilt, added or removed.
+    pub months: Vec<Month>,
+}
+
+/// A calendar result (§5.7) with its span and flags.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalendarAnswer {
+    /// The window evaluation over the span.
+    pub node: Node,
+    /// Span start.
+    pub from: Nanos,
+    /// Span end.
+    pub to: Nanos,
+    /// Spans of the stored calendar nodes taken as inputs.
+    pub inputs: Vec<(Nanos, Nanos)>,
+    /// A restore is bringing detail back (§8 Restore step 2).
+    pub restoring: bool,
+    /// A minute under the span is flagged `summary_stale` (§5.6).
+    pub summary_stale: bool,
 }
 
 /// Health level.
@@ -1402,6 +1455,12 @@ struct Volatile {
     /// against it as well as against the facts before them.
     cp_versions: Option<(Position, Versions)>,
     trees: BTreeMap<SeriesId, SeriesTree>,
+    /// Calendar files (§5.1, §5.7).
+    calendars: BTreeMap<SeriesId, CalendarFile>,
+    /// The time-zone database the calendar files were built with; it differs
+    /// from [`Model::tzdb`] after a tzdata change until
+    /// [`Model::rebuild_calendars`] has run.
+    calendar_tzdb: Tzdb,
     /// Queued readings with their `revise` intent.
     queue: VecDeque<(Reading, bool)>,
     next_position: Position,
@@ -1437,6 +1496,7 @@ struct Derived {
     versions: Versions,
     cp_versions: Option<(Position, Versions)>,
     trees: BTreeMap<SeriesId, SeriesTree>,
+    calendars: BTreeMap<SeriesId, CalendarFile>,
     restore: Option<RestoreRt>,
 }
 
@@ -1544,6 +1604,11 @@ pub struct Model {
     /// does, batches carry `unsynced_clock`, `future` and `late` are not set
     /// and host-stamped readings wait.
     pub clock_synchronised: bool,
+    /// The host's time-zone database (§5.7); a tzdata change is
+    /// [`Model::install_tzdb`].
+    pub tzdb: Tzdb,
+    /// Calendar rebuilds, logged (§5.7, row 21).
+    pub calendar_log: Vec<CalendarRebuild>,
     vol: Option<Volatile>,
     sessions: BTreeMap<ConsumerId, u32>,
 }
@@ -1571,6 +1636,8 @@ impl Model {
             now: wall,
             boot: 0,
             clock_synchronised: true,
+            tzdb: Tzdb::bundled(),
+            calendar_log: Vec::new(),
             vol: None,
             sessions: BTreeMap::new(),
         };
@@ -1717,6 +1784,8 @@ impl Model {
             versions: d.versions,
             cp_versions: d.cp_versions,
             trees: d.trees,
+            calendars: d.calendars,
+            calendar_tzdb: self.tzdb.clone(),
             queue: VecDeque::new(),
             next_position,
             routes: d.routes,
@@ -1828,6 +1897,7 @@ impl Model {
                 (trees, Some(rt))
             }
         };
+        let calendars = build_calendars(&self.zoning(&registry), &self.tzdb, &trees);
         Derived {
             registry,
             entries,
@@ -1838,6 +1908,7 @@ impl Model {
             versions,
             cp_versions,
             trees,
+            calendars,
             restore,
         }
     }
@@ -1856,6 +1927,8 @@ impl Model {
             v.versions = d.versions;
             v.cp_versions = d.cp_versions;
             v.trees = d.trees;
+            v.calendars = d.calendars;
+            v.calendar_tzdb = self.tzdb.clone();
             v.restore = d.restore;
         }
     }
@@ -2101,7 +2174,10 @@ impl Model {
                 };
                 self.commit_registry(ev)?;
                 let params = self.params(id)?;
-                self.vol_mut()?.trees.insert(id, SeriesTree::new(params));
+                let v = self.vol_mut()?;
+                v.trees.insert(id, SeriesTree::new(params));
+                let file = CalendarFile::new(&v.calendar_tzdb);
+                v.calendars.insert(id, file);
                 Ok(id)
             }
         }
@@ -2680,7 +2756,12 @@ impl Model {
             .iter()
             .map(|s| (*s, v.trees[s].readings()))
             .collect();
-        for (s, minute) in touched {
+        let zoning = Zoning::Site {
+            initial: cfg.site_zone.clone(),
+            entries: v.registry.site_zones().clone(),
+        };
+        for (s, minute) in &touched {
+            let (s, minute) = (*s, *minute);
             if let Some(rt) = &v.restore {
                 let stale = rt.checkpoint_minutes.contains(&(s, minute))
                     && rt.not_back.contains(&(s, floor_to(minute, QUARTER)));
@@ -2707,6 +2788,12 @@ impl Model {
             let tree = v.trees.get_mut(&s).expect("tree for defined series");
             tree.update_minute(minute, &rs);
             tree.set_stale(minute, missing);
+        }
+        // Calendar ancestors of every changed minute (§5.6).
+        for (s, minute) in &touched {
+            if let (Some(tree), Some(file)) = (v.trees.get(s), v.calendars.get_mut(s)) {
+                file.refresh(tree, &zoning, &v.calendar_tzdb, *minute)?;
+            }
         }
         for (s, old) in before {
             let tree = &v.trees[&s];
@@ -3654,6 +3741,7 @@ impl Model {
 
     /// Fetches missing detail for a minute and recomputes its path (§5.6).
     pub fn fetch_detail(&mut self, s: SeriesId, minute: Nanos) -> Result<(), Error> {
+        let initial = self.config.site_zone.clone();
         let v = self.vol_mut()?;
         let rs: Vec<(Nanos, Value)> = v
             .current
@@ -3665,7 +3753,192 @@ impl Model {
         let tree = v.trees.get_mut(&s).ok_or(RegistryError::Unknown(s))?;
         tree.update_minute(minute, &rs);
         tree.set_stale(minute, false);
+        let zoning = Zoning::Site {
+            initial,
+            entries: v.registry.site_zones().clone(),
+        };
+        if let Some(file) = v.calendars.get_mut(&s) {
+            file.refresh(&v.trees[&s], &zoning, &v.calendar_tzdb, minute)?;
+        }
         Ok(())
+    }
+
+    // ----- calendar -----
+
+    fn zoning(&self, registry: &Registry) -> Zoning {
+        Zoning::Site {
+            initial: self.config.site_zone.clone(),
+            entries: registry.site_zones().clone(),
+        }
+    }
+
+    /// How local days are taken in the site zone now.
+    pub fn site_zoning(&self) -> Result<Zoning, Error> {
+        Ok(self.zoning(&self.vol()?.registry))
+    }
+
+    /// Records a site-zone entry (§5.7, §12 D3): from `effective`, local days
+    /// are taken in `zone`. Calendar nodes are rebuilt from its effective
+    /// time only, and the rebuild is logged ([`Model::calendar_log`]). Refused
+    /// for a zone the database does not hold.
+    pub fn set_site_zone(&mut self, zone: &str, effective: Nanos) -> Result<Position, Error> {
+        self.tzdb.zone(zone)?;
+        let position = self.commit_registry(RegistryEvent::SiteZone {
+            zone: zone.to_string(),
+            effective,
+        })?;
+        let db = self.vol()?.calendar_tzdb.clone();
+        self.rebuild_calendars_with(&db, &CalendarCause::SiteZone { position })?;
+        Ok(position)
+    }
+
+    /// The host's time-zone database changes (a tzdata update). Calendar
+    /// files keep the version they were built with, so their nodes are no
+    /// input to calendar results (§5.7), until [`Model::rebuild_calendars`].
+    pub fn install_tzdb(&mut self, db: Tzdb) {
+        self.tzdb = db;
+    }
+
+    /// After a tzdata change, rebuilds the calendar days it affects (§5.7,
+    /// row 21), records the new version in every calendar file and logs the
+    /// rebuild. Returns what it logged.
+    pub fn rebuild_calendars(&mut self) -> Result<Vec<CalendarRebuild>, Error> {
+        let from = self.vol()?.calendar_tzdb.version().to_string();
+        if from == self.tzdb.version() {
+            return Ok(Vec::new());
+        }
+        let db = self.tzdb.clone();
+        let cause = CalendarCause::Tzdata {
+            from,
+            to: db.version().to_string(),
+        };
+        self.rebuild_calendars_with(&db, &cause)
+    }
+
+    fn rebuild_calendars_with(
+        &mut self,
+        db: &Tzdb,
+        cause: &CalendarCause,
+    ) -> Result<Vec<CalendarRebuild>, Error> {
+        let v = self.vol()?;
+        let zoning = self.zoning(&v.registry);
+        let mut log = Vec::new();
+        let mut files = BTreeMap::new();
+        for (s, tree) in &v.trees {
+            let new = CalendarFile::build(tree, &zoning, db)?;
+            let old = v
+                .calendars
+                .get(s)
+                .cloned()
+                .unwrap_or_else(|| CalendarFile::new(db));
+            let days = old.changed_days(&new);
+            let months: Vec<Month> = old
+                .months
+                .keys()
+                .chain(new.months.keys())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|m| old.months.get(m) != new.months.get(m))
+                .copied()
+                .collect();
+            if !days.is_empty() || !months.is_empty() {
+                log.push(CalendarRebuild {
+                    series: *s,
+                    cause: cause.clone(),
+                    days,
+                    months,
+                });
+            }
+            files.insert(*s, new);
+        }
+        let v = self.vol_mut()?;
+        v.calendars = files;
+        v.calendar_tzdb = db.clone();
+        self.calendar_log.extend(log.iter().cloned());
+        Ok(log)
+    }
+
+    /// A series' calendar file.
+    pub fn calendar_file(&self, s: SeriesId) -> Result<&CalendarFile, Error> {
+        self.vol()?
+            .calendars
+            .get(&s)
+            .ok_or(Error::Registry(RegistryError::Unknown(s)))
+    }
+
+    /// Calendar files of all series.
+    pub fn calendars(&self) -> Result<&BTreeMap<SeriesId, CalendarFile>, Error> {
+        Ok(&self.vol()?.calendars)
+    }
+
+    /// Rebuilds every calendar file from the log alone, with the database
+    /// the live files were built with (invariant 8). Does not change the
+    /// running engine.
+    pub fn rebuilt_calendars(&self) -> Result<BTreeMap<SeriesId, CalendarFile>, Error> {
+        let v = self.vol()?;
+        let trees = self.rebuild_trees()?;
+        let zoning = self.zoning(&v.registry);
+        Ok(trees
+            .iter()
+            .map(|(s, t)| CalendarFile::build(t, &zoning, &v.calendar_tzdb).map(|f| (*s, f)))
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// A calendar day or month in the site zone (§5.7): a window evaluation
+    /// over its span, edge stretches included.
+    pub fn calendar(&self, s: SeriesId, period: Period) -> Result<CalendarAnswer, Error> {
+        self.calendar_window(s, CalendarWindow::Period(period), None)
+    }
+
+    /// A calendar day or month in a named IANA zone for the whole span (§5.7).
+    pub fn calendar_in(
+        &self,
+        s: SeriesId,
+        period: Period,
+        zone: &str,
+    ) -> Result<CalendarAnswer, Error> {
+        self.calendar_window(s, CalendarWindow::Period(period), Some(zone))
+    }
+
+    /// A calendar window (§6 Windows) at `now`, in the site zone or in the
+    /// named zone: a window evaluation over its span. Stored calendar nodes
+    /// are an input only where every day they cover was taken in the zone of
+    /// the query (compared after resolving links), their span is the day's
+    /// and their file's tzdata version is the current one (§5.7). While a
+    /// restore brings detail back, a span with an edge inside a minute is
+    /// refused, as for [`Model::query_window`].
+    pub fn calendar_window(
+        &self,
+        s: SeriesId,
+        w: CalendarWindow,
+        zone: Option<&str>,
+    ) -> Result<CalendarAnswer, Error> {
+        let v = self.vol()?;
+        let zoning = match zone {
+            Some(z) => Zoning::Named(z.to_string()),
+            None => self.zoning(&v.registry),
+        };
+        let (from, to, days) = calendar::window_span(&zoning, &self.tzdb, w, self.now)?;
+        let restoring = self.restoring();
+        if restoring && !calendar::on_minutes(from, to) {
+            return Err(Error::Restoring);
+        }
+        let tree = self.tree(s)?;
+        let limit = tree.params.credit_limit(to, self.now).max(from);
+        let month = match w {
+            CalendarWindow::Period(Period::Month(m)) => Some(m),
+            CalendarWindow::Month(_) => Some(Month::of(days[0].date)),
+            _ => None,
+        };
+        let inputs = calendar::inputs(v.calendars.get(&s), &self.tzdb, &days, month, from, limit);
+        Ok(CalendarAnswer {
+            node: calendar::evaluate(tree, from, to, self.now, &inputs),
+            from,
+            to,
+            inputs: inputs.iter().map(|n| (n.start, n.end)).collect(),
+            restoring,
+            summary_stale: tree.any_stale(from, limit),
+        })
     }
 
     // ----- health -----
@@ -5058,6 +5331,20 @@ fn routed(decl: &ConsumerDecl, routes: &BTreeMap<Position, RouteChange>, f: &Fac
     routes_in_force(decl, routes, Some(f.position))
         .values()
         .any(|x| x.condition.is_none() && x.selection.matches(f.series))
+}
+
+fn build_calendars(
+    zoning: &Zoning,
+    db: &Tzdb,
+    trees: &BTreeMap<SeriesId, SeriesTree>,
+) -> BTreeMap<SeriesId, CalendarFile> {
+    trees
+        .iter()
+        .map(|(s, t)| {
+            let file = CalendarFile::build(t, zoning, db).expect("site zones are in the database");
+            (*s, file)
+        })
+        .collect()
 }
 
 fn build_trees(

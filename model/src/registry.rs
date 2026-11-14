@@ -157,6 +157,14 @@ pub enum RegistryEvent {
         /// Effective event time `t_r`.
         at: Nanos,
     },
+    /// The site zone from an effective time (§5.7, §12 D3): each local day
+    /// that starts at or after it is taken in this zone.
+    SiteZone {
+        /// IANA zone name.
+        zone: String,
+        /// Effective time.
+        effective: Nanos,
+    },
 }
 
 /// A series definition.
@@ -254,6 +262,7 @@ pub enum RegistryError {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Registry {
     series: BTreeMap<SeriesId, SeriesDef>,
+    site_zones: BTreeMap<Nanos, String>,
 }
 
 impl Registry {
@@ -301,7 +310,16 @@ impl Registry {
                     d.retired_at = Some(*at);
                 }
             }
+            RegistryEvent::SiteZone { zone, effective } => {
+                self.site_zones.insert(*effective, zone.clone());
+            }
         }
+    }
+
+    /// The site-zone entries by effective time; of two with the same
+    /// effective time the later in the log.
+    pub fn site_zones(&self) -> &BTreeMap<Nanos, String> {
+        &self.site_zones
     }
 
     /// The next unused identifier. Identifiers are never reused because

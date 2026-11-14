@@ -1260,3 +1260,50 @@ pub fn arb_interval_instant(p: Params) -> impl Strategy<Value = Nanos> {
     )
         .prop_map(move |(j, off)| T0 + iv.phase + j * iv.length + off)
 }
+
+// ----- calendar -----
+
+/// The UTC instant of an RFC 3339 timestamp, in nanoseconds.
+pub fn utc(s: &str) -> Nanos {
+    i64::try_from(s.parse::<jiff::Timestamp>().unwrap().as_nanosecond()).unwrap()
+}
+
+/// A store whose site zone is `zone`, started at wall time `wall`, with a
+/// gauge whose expected interval is 1 s, so that the 15-minute level and
+/// calendar nodes are stored (§5.1), and staleness limit `staleness`.
+pub fn calendar_model(zone: &str, wall: Nanos, staleness: Nanos) -> (Model, SeriesId) {
+    let cfg = Config {
+        site_zone: zone.into(),
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], wall);
+    let s = m
+        .define_with(
+            "line-1/meter/power",
+            Kind::Gauge,
+            ValueType::Number,
+            "W",
+            staleness,
+            SeriesOptions::expected(SECOND),
+        )
+        .unwrap();
+    (m, s)
+}
+
+/// Ingests numeric readings in batches the ingest queue holds.
+pub fn feed(m: &mut Model, s: SeriesId, rs: &[(Nanos, f64)]) {
+    for chunk in rs.chunks(500) {
+        m.ingest(chunk.iter().map(|(t, v)| Reading::num(s, *t, *v)).collect())
+            .unwrap();
+    }
+}
+
+/// Readings every `step` in `[from, to)`, valued by their index.
+pub fn every(from: Nanos, to: Nanos, step: Nanos) -> Vec<(Nanos, f64)> {
+    (0..)
+        .map(|k| from + k * step)
+        .take_while(|t| *t < to)
+        .enumerate()
+        .map(|(i, t)| (t, f64::from(u16::try_from(i % 1000).unwrap())))
+        .collect()
+}

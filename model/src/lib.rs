@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod calendar;
 pub mod condition;
 pub mod engine;
 pub mod oracle;
