@@ -327,6 +327,9 @@ fn restart_replays_then_resyncs() {
     assert_eq!(funnels, vec![facts, cond]);
     let fs = &resync.funnels[1];
     assert_eq!(fs.condition, Some(ConditionState::True));
+    // The true transition was delivered but never confirmed, so the latch
+    // does not hold it: the resync is a transition, to be acted on.
+    assert!(fs.transition);
     match &fs.live[0].1 {
         Live::Value(v) => assert_eq!(v.fact.number(), Some(20.0)),
         other => panic!("{other:?}"),
@@ -342,6 +345,18 @@ fn restart_replays_then_resyncs() {
     drop(s);
     let s = block_on(Store::open(config("restart", &clock))).unwrap();
     assert_eq!(s.series(g).unwrap().latest_t, Some(at(2)));
+    // Everything was confirmed, the resync included, so the latch holds
+    // true: the resync after this restart is no transition.
+    let mut c = block_on(s.consumer("alarms", Start::Now, Select::None)).unwrap();
+    let resync = drain(&mut c)
+        .into_iter()
+        .find_map(|d| match d.kind {
+            DeliveryKind::Resync(r) => Some(r),
+            _ => None,
+        })
+        .expect("a resync");
+    assert_eq!(resync.funnels[1].condition, Some(ConditionState::True));
+    assert!(!resync.funnels[1].transition);
 }
 
 #[test]
@@ -732,4 +747,227 @@ fn consumer_before_any_series() {
         s.series("site/b/power"),
         Err(Error::UnknownSeries(_))
     ));
+}
+
+fn facts_of(ds: &[Delivery]) -> Vec<(kvik::Fact, kvik::DeliveryFlags)> {
+    ds.iter()
+        .filter_map(|d| match &d.kind {
+            DeliveryKind::Fact(f) => Some((f.clone(), d.flags)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn auto_resolution_counts_from_the_aligned_floor() {
+    let (s, _clock) = store("auto-aligned");
+    let g = block_on(s.define_series(gauge("a/b/c", 60))).unwrap();
+    let minutes: Vec<_> = (0..=60).map(|m| num(g, -3_600 + 60 * m, 1.0)).collect();
+    block_on(s.emit(&minutes)).unwrap();
+    let r = s.reader();
+    // 11:00:30 to 12:00:30: quarter-hours from 11:00 would be five buckets.
+    match r
+        .buckets(g, at(-3_570)..at(30), Resolution::Auto { max_points: 4 })
+        .unwrap()
+    {
+        ChartData::Buckets { step, buckets } => {
+            assert!(buckets.len() <= 4, "{} buckets", buckets.len());
+            assert_eq!(step, Duration::from_secs(1_800));
+            assert_eq!(buckets[0].from, at(-3_570));
+        }
+        other => panic!("{other:?}"),
+    }
+    match r
+        .buckets(
+            g,
+            at(-3_600)..at(0),
+            Resolution::Step(Duration::from_secs(600)),
+        )
+        .unwrap()
+    {
+        ChartData::Buckets { step, buckets } => {
+            assert_eq!(step, Duration::from_secs(600));
+            assert_eq!(buckets.len(), 6);
+            assert!(buckets.iter().all(|b| b.count == 10));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A waker that reads the store when woken and when dropped: it deadlocks if
+/// the store wakes or drops it under its own lock.
+struct ReadingWaker(kvik::Reader, kvik::SeriesId, Arc<Flag>);
+
+impl std::task::Wake for ReadingWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.series(self.1).unwrap();
+        std::task::Wake::wake(self.2.clone());
+    }
+}
+
+impl Drop for ReadingWaker {
+    fn drop(&mut self) {
+        self.0.series(self.1).unwrap();
+    }
+}
+
+#[test]
+fn wakers_run_outside_the_store_lock() {
+    let (s, _clock) = store("waker-lock");
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    let woken = Arc::new(Flag::default());
+    {
+        let waker = std::task::Waker::from(Arc::new(ReadingWaker(s.reader(), g, woken.clone())));
+        let mut next = std::pin::pin!(c.next());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+    }
+    // The store now holds the only reference to the waker.
+    let s = Arc::new(s);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = s.clone();
+    std::thread::spawn(move || {
+        let r = block_on(writer.emit(&[num(g, 0, 1.0)]));
+        tx.send(r.is_ok()).unwrap();
+    });
+    if rx.recv_timeout(Duration::from_secs(5)) != Ok(true) {
+        // The store is deadlocked: dropping the handles would block too.
+        std::mem::forget(c);
+        std::mem::forget(s);
+        panic!("the emit did not complete: a waker ran under the store lock");
+    }
+    assert!(woken.take());
+}
+
+#[test]
+fn versioned_series_and_outranked_facts() {
+    let (s, clock) = store("versioned");
+    let v = block_on(s.define_series(SeriesSpec {
+        versioned: Some(kvik::ChangedAtKind::Version),
+        ..gauge("grid/area/price", 1)
+    }))
+    .unwrap();
+    let mut c = block_on(s.consumer("prices", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![v])))).unwrap();
+    let ack = block_on(s.emit(&[
+        num(v, 0, 1.0),
+        num(v, 0, 10.0).changed_at(2),
+        num(v, 0, 5.0).changed_at(1),
+    ]))
+    .unwrap();
+    assert_eq!(ack.refused, vec![(0, Refusal::ChangedAtMissing)]);
+    assert_eq!(ack.recorded, 2);
+    assert_eq!(
+        block_on(s.emit_with(&[num(v, 0, 1.0).changed_at(3)], Intent::Revise))
+            .unwrap()
+            .refused,
+        vec![(0, Refusal::ReviseOnVersioned)]
+    );
+    clock.advance(Duration::from_secs(1));
+    let fs = facts_of(&drain(&mut c));
+    assert_eq!(fs.len(), 2);
+    assert!(!fs[0].1.outranked);
+    assert!(
+        fs[1].1.outranked,
+        "a lower changed_at than the current fact"
+    );
+    let cur = s.reader().facts(v, at(0)..at(1), View::Current).unwrap();
+    assert_eq!(cur[0].number(), Some(10.0));
+    assert_eq!(cur[0].changed_at, Some(2));
+    assert_eq!(s.stats().outranked_on_arrival, 1);
+}
+
+#[test]
+fn future_facts_are_flagged() {
+    let (s, _clock) = store("future");
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    block_on(s.emit(&[num(g, 120, 1.0)])).unwrap();
+    let fs = facts_of(&drain(&mut c));
+    assert!(fs[0].0.flags.future);
+    assert!(fs[0].1.future);
+    assert_eq!(fs[0].0.quality, Quality::Suspect);
+    // Ignored by live state until its time comes.
+    assert!(matches!(s.reader().live(g).unwrap(), Live::None));
+}
+
+#[test]
+fn overflow_catches_up_without_gap_or_repeat() {
+    let clock = ManualClock::new(start());
+    let mut cfg = config("overflow", &clock);
+    cfg.limits.consumer_queue = 4;
+    let s = block_on(Store::open(cfg)).unwrap();
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    let mut c = block_on(s.consumer("slow", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    let mut positions = Vec::new();
+    for i in 0..10 {
+        positions.push(
+            block_on(s.emit(&[num(g, i, i as f64)]))
+                .unwrap()
+                .last
+                .unwrap(),
+        );
+    }
+    let fs = facts_of(&drain(&mut c));
+    let got: Vec<_> = fs.iter().map(|(f, _)| f.position).collect();
+    assert_eq!(got, positions);
+    assert!(
+        fs.iter().any(|(_, fl)| fl.replayed),
+        "some came from catch-up"
+    );
+    assert!(s.stats().overflows >= 1);
+}
+
+#[test]
+fn a_consumer_taken_again_replays_then_resyncs() {
+    let (s, _clock) = store("reconnect");
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
+    let first = c.try_next().unwrap().unwrap();
+    assert!(!first.flags.replayed);
+    // Not confirmed; the consumer process restarts.
+    drop(c);
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let ds = drain(&mut c);
+    assert!(matches!(&ds[0].kind, DeliveryKind::Fact(f) if f.number() == Some(1.0)));
+    assert!(ds[0].flags.replayed);
+    assert!(matches!(ds[1].kind, DeliveryKind::Resync(_)));
+}
+
+#[test]
+fn alias_reroutes_patterns_and_unroute_stops_delivery() {
+    let (s, clock) = store("alias-unroute");
+    let e = block_on(s.define_series(gauge("site/a/energy", 1))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let f = block_on(c.route(Funnel::facts(Select::Names("site/*/power".into())))).unwrap();
+    block_on(s.emit(&[num(e, 0, 1.0)])).unwrap();
+    assert!(facts_of(&drain(&mut c)).is_empty());
+    block_on(s.alias(e, "site/a/power")).unwrap();
+    block_on(s.emit(&[num(e, 1, 2.0)])).unwrap();
+    assert_eq!(facts_of(&drain(&mut c)).len(), 1);
+    block_on(c.unroute(f)).unwrap();
+    assert!(c.routes().unwrap().is_empty());
+    clock.advance(Duration::from_secs(1));
+    block_on(s.emit(&[num(e, 2, 3.0)])).unwrap();
+    assert!(facts_of(&drain(&mut c)).is_empty());
+}
+
+#[test]
+fn consumer_emits() {
+    let (s, _clock) = store("emits");
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    assert!(matches!(
+        block_on(s.consumer("writer", Start::Now, Select::Ids(vec![g]))),
+        Err(Error::NotSupportedYet { .. })
+    ));
+    let c = block_on(s.consumer("quiet", Start::Now, Select::None)).unwrap();
+    let accepted = c.try_emit(&[num(g, 0, 1.0)]).unwrap();
+    assert_eq!(accepted.refused, vec![(0, Refusal::NotDeclared)]);
+    assert_eq!(s.stats().refused[&Refusal::NotDeclared], 1);
 }
