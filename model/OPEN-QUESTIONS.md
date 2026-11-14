@@ -20,11 +20,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-49 (b) | §4 Resync, §8 Restore step 2, §6 Old spans, invariant 16 | Conditions and live state with no local detail during a restore (for the owner) |
 | Q-52 | §8 Corrupt block, invariant 10, §3 Recovery | Manifest records as single copies |
 | Q-60 | §5.1 density rule, §5.7, §2.1 parameters, invariant 8 | Calendar nodes when the expected interval changes |
-| Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
 | Q-61 | §4 Order, At-least-once, Consumer state, §6 Latch | Identity of a condition delivery, and where its sequence is kept |
 | Q-62 | §4 Overflow, Replay, §6 Cadence | Condition transitions while a consumer catches up after overflow |
 | Q-63 | §6 Restart and resume, Conditions, Latch, invariant 16 | Condition state now, for conditions with memory |
 | Q-64 | §4 Routing, §8 Continuous backup, §8 Restore step 1 | Routing changes before a restore's checkpoint |
+| Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -36,8 +36,11 @@ forward clock jump moves) or the monotonic clock (§4 Timers). (d) The monotonic
 restart there is no last-commit instant to measure from. (e) "Bad quality" may mean the supplied or the engine
 quality.
 **Model.** Stale-for conditions measure monotonic time since the last arrival of any reading. A resume, which has no
-monotonic instant from before it, rebuilds that time from the last reading's `received_at` against `now`, so a
-stale-for condition true now is reported true in `resync` (`q16_stale_for_true_now_reported_true_on_resync`).
+monotonic instant from before it, rebuilds that time on the host clock: the wall clock now less the `received_at` of
+the last reading committed, not below zero. A stale-for condition true now is reported true in `resync`
+(`q16_stale_for_true_now_reported_true_on_resync`), and a backward correction of the clock neither fires nor
+suppresses it (`q16_backward_clock_correction_neither_fires_nor_suppresses_stale_for`); a forward correction while
+the engine is down still makes the last reading look older.
 **Tried and rejected.** Counting from a staleness reference that restarts only when the live state's `t` rises past
 a high-water mark, for facts not flagged `late`, with "due" on the monotonic clock. Review found that this breaks
 principle 2 (when a fact fell due depends on a clock the log does not hold, so replay cannot rebuild it), that one
@@ -336,17 +339,6 @@ window edges whose detail is local, cannot be evaluated without off-machine data
 edges. (4) Already so in the current text: §5.6's "every higher node is the left-to-right merge of its children" is
 undefined for a quarter-hour whose 1-minute children are stored for only part of its span.
 
-## Q-70 — Chunk indexes after a restore
-**Scenario.** §5.6 relies on chunk indexes always being on hot, so the engine knows whether a minute has facts off the
-machine. After a restore, step 3 leaves files that the restore record does not place on hot or cold in deep, and the
-tree checkpoint carries no chunk indexes. Once `restoring` ends, a late fact for a minute whose chunk stayed in deep is
-folded from the local facts only, giving a wrong node that is not flagged `summary_stale`; an identical repeat of a
-fact in that chunk is recorded without being counted `duplicates_unchecked`; and §6 Old spans cannot tell that an
-edge's detail is off the machine.
-**Model.** Not modelled; a restore brings every file back.
-**Needed.** Where chunk indexes come from after a restore (carried by the tree checkpoint, listed with the files in
-the restore record, or downloaded in step 1 or step 3), and what holds until they are local.
-
 ## Q-61 — Identity of a condition delivery, and where its sequence is kept
 **Scenario.** (a) A threshold funnel is evaluated on a routed fact at position 0:7 (§6 Cadence) and fires. §4 Order
 gives an identity only to fact deliveries (the position) and timer deliveries (the last committed position plus a
@@ -394,8 +386,9 @@ them, keeps the latched state (false with no latch) (`q63_threshold_between_leve
 on-change condition reports the value now, a transition if it moved beyond the dead-band from the latched value. A
 funnel added at run time starts with a fresh condition and announces nothing until it is first evaluated; a removed
 funnel's latch is dropped, and a latch belongs to one incarnation of a funnel id. Held-for is rebuilt from the tree as
-of now (§6): true when the value is above at every timer-cadence instant over the hold (`tests/rules.rs`
-`s6_held_for_true_while_down_delivered_in_resync`); stale-for follows Q-16.
+of now (§6): true when the value was above throughout the last N, judged exactly on the facts and the values they hold
+(`tests/rules.rs` `s6_held_for_true_while_down_delivered_in_resync`, `s6_held_for_rebuilt_exactly_from_the_facts`);
+stale-for follows Q-16.
 **Needed.** How a threshold's state between its levels is determined on resume, the dead-band rule for on-change, and
 whether a new funnel announces its state.
 
@@ -408,6 +401,17 @@ holding 0:2 is back (step 3) the route is unknown and new facts are not delivere
 the file holding its entry is downloaded
 (`q64_route_before_checkpoint_not_in_force_until_its_entry_is_back`).
 **Needed.** Whether a tree checkpoint (or the registry file it carries) holds the routing table as of its position.
+
+## Q-70 — Chunk indexes after a restore
+**Scenario.** §5.6 relies on chunk indexes always being on hot, so the engine knows whether a minute has facts off the
+machine. After a restore, step 3 leaves files that the restore record does not place on hot or cold in deep, and the
+tree checkpoint carries no chunk indexes. Once `restoring` ends, a late fact for a minute whose chunk stayed in deep is
+folded from the local facts only, giving a wrong node that is not flagged `summary_stale`; an identical repeat of a
+fact in that chunk is recorded without being counted `duplicates_unchecked`; and §6 Old spans cannot tell that an
+edge's detail is off the machine.
+**Model.** Not modelled; a restore brings every file back.
+**Needed.** Where chunk indexes come from after a restore (carried by the tree checkpoint, listed with the files in
+the restore record, or downloaded in step 1 or step 3), and what holds until they are local.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -577,7 +581,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Effective-dated parameters and site zone | §2.1, §5.7, row 21 | One staleness limit per series; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
 | Low disk mark | §3: compaction pauses; tiering continues | Tiering pauses too | `low_mark_pauses_tiering_too` |
 | New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
-| Funnels with an operator and no condition; conditions over a selection of several series | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer) | — |
+| Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
 | Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |

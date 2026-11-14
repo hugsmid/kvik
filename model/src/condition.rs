@@ -98,12 +98,11 @@ impl Condition {
 /// window as of now (§6 Restart and resume).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResumeHistory {
-    /// How long the operator's value has been continuously above a held-for
-    /// level, evaluated at the timer cadence back from now (0 if not above
-    /// now), up to the hold duration.
+    /// How long the value has been continuously above a held-for level, up
+    /// to now (0 if not above now).
     pub above_for: Nanos,
-    /// Time since the last reading of the series arrived (its `received_at`),
-    /// or `None` if none has.
+    /// Time since the last reading of the series arrived, on the clock that
+    /// stamped its `received_at`, or `None` if none has.
     pub since_arrival: Option<Nanos>,
 }
 

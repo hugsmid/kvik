@@ -243,9 +243,6 @@ pub enum FileClass {
     Revision,
 }
 
-/// Default timer cadence of a windowed funnel (§6 Cadence).
-pub const TIMER_CADENCE: Nanos = SECOND;
-
 /// Format version this model writes and reads (§9 row 32).
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -757,6 +754,10 @@ pub struct Resync {
     /// when the cursor was too far behind for catch-up from local log
     /// segments (§4 Resync, §8 Behind consumers).
     pub replaced: Option<(Position, Position)>,
+    /// How many `resync`s were issued to this consumer before this one (a
+    /// stamp of the model, so tests can tell which state of the store it was
+    /// issued in).
+    pub issued: usize,
 }
 
 /// What a delivery carries.
@@ -2295,7 +2296,12 @@ impl Model {
                     "an operator without a condition is not modelled",
                 ));
             }
-            (_, Some(_)) => {
+            (op, Some(cond)) => {
+                if op.is_some() && matches!(cond, Condition::HeldFor { .. }) {
+                    return Err(Error::BadRoute(
+                        "a held-for condition over a windowed operator is not modelled",
+                    ));
+                }
                 let s = spec
                     .series()
                     .ok_or(Error::BadRoute("a condition funnel selects one series"))?;
@@ -2455,65 +2461,47 @@ impl Model {
         }
     }
 
-    /// The value a condition funnel's condition saw at an earlier instant
-    /// `x`, rebuilt from the tree and the facts known now (§6 Restart and
-    /// resume): the operator over its window ending at `x`, or the live-state
-    /// value at `x`.
-    fn funnel_value_at(&self, f: &Funnel, x: Nanos) -> Option<f64> {
-        let s = f.series()?;
-        match &f.operator {
-            Some(op) => self
-                .tree(s)
-                .ok()?
-                .window(x - op.width, x, x)
-                .aggregate(&op.aggregate)?
-                .to_f64(),
-            None => self
-                .vol
-                .as_ref()?
-                .current
-                .range((s, Nanos::MIN)..=(s, x))
-                .rev()
-                .map(|(_, f)| f)
-                .find(|f| f.summarised())
-                .and_then(|f| match f.value {
-                    Value::Num(v) => Some(v),
-                    _ => None,
-                }),
-        }
-    }
-
     /// What a resume rebuilds of a condition's past (§6 Restart and resume,
-    /// "rebuilt from the tree and recent window as of now"): for held-for,
-    /// how long the value has been above its level, evaluated at the timer
-    /// cadence back from now, up to the hold; for stale-for, the time since
-    /// the series' last reading arrived (its `received_at`).
+    /// "rebuilt from the tree and recent window as of now"). Held for: how
+    /// long the live-state value has been above its level without a break,
+    /// judged exactly on the facts and the values they hold until the next
+    /// fact. Stale for: the time since the series' last reading arrived,
+    /// measured on the host clock that stamped its `received_at`, never
+    /// against `now`, which a backward correction leaves ahead (§4 Timers;
+    /// the measure itself is Q-16).
     fn resume_history(&self, f: &Funnel, cond: &Condition) -> ResumeHistory {
         let mut h = ResumeHistory::default();
+        let (Some(s), Some(v)) = (f.series(), self.vol.as_ref()) else {
+            return h;
+        };
         match cond {
-            Condition::HeldFor { above, n } => {
-                let mut held = 0;
-                while held < *n
-                    && self
-                        .funnel_value_at(f, self.now - held - TIMER_CADENCE)
-                        .is_some_and(|v| v > *above)
-                {
-                    held += TIMER_CADENCE;
+            Condition::HeldFor { above, .. } => {
+                // Facts that set the live-state value, latest first: the run
+                // of values above the level starts at the earliest fact of
+                // the unbroken run that reaches now.
+                let mut start = None;
+                for (_, x) in v.current.range((s, Nanos::MIN)..=(s, self.now)).rev() {
+                    if !x.summarised() {
+                        continue;
+                    }
+                    if matches!(x.value, Value::Num(y) if y > *above) {
+                        start = Some(x.t);
+                    } else {
+                        break;
+                    }
                 }
-                let above_now = self.funnel_value(f).is_some_and(|v| v > *above);
-                h.above_for = if above_now { held } else { 0 };
+                h.above_for = start.map_or(0, |t| self.now - t);
             }
             Condition::StaleFor { .. } => {
-                let s = f.series();
-                h.since_arrival = self.vol.as_ref().and_then(|v| {
-                    v.entries
-                        .values()
-                        .filter_map(Entry::fact)
-                        .filter(|x| Some(x.series) == s)
-                        .map(|x| x.received_at)
-                        .max()
-                        .map(|r| (self.now - r).max(0))
-                });
+                // The last arrival is the last committed reading, whose
+                // stamp a backward correction may have put below earlier
+                // ones.
+                h.since_arrival = v
+                    .entries
+                    .values()
+                    .filter_map(Entry::fact)
+                    .rfind(|x| x.series == s)
+                    .map(|x| (self.wall - x.received_at).max(0));
             }
             Condition::Threshold { .. } | Condition::OnChange { .. } => {}
         }
@@ -2722,6 +2710,10 @@ impl Model {
         // Owed until the consumer confirms it.
         let gc = self.disk.generation_changed.get(&decl.id).copied();
         let signals = self.signals.entry(decl.id).or_default();
+        let issued = signals
+            .iter()
+            .filter(|x| matches!(x, Signal::ResyncDue))
+            .count();
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
         if let Some((cursor, restored_end)) = gc {
@@ -2744,6 +2736,7 @@ impl Model {
             kind: DeliveryKind::Resync(Resync {
                 funnels: states,
                 replaced,
+                issued,
             }),
         });
         signals.push(Signal::ResyncDue);

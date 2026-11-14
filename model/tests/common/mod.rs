@@ -417,19 +417,61 @@ pub fn local_segment_positions(m: &Model) -> BTreeSet<Position> {
         .collect()
 }
 
+/// Positions held in local log segments when each `resync` was issued, by
+/// consumer and issue number (`Resync::issued`).
+pub type ResyncBasis = BTreeMap<(ConsumerId, usize), BTreeSet<Position>>;
+
+fn resyncs_issued(m: &Model, c: ConsumerId) -> usize {
+    m.signals.get(&c).map_or(0, |v| {
+        v.iter()
+            .filter(|x| matches!(x, kvik_model::engine::Signal::ResyncDue))
+            .count()
+    })
+}
+
+/// Runs `f` on `m`, recording for every `resync` issued meanwhile the
+/// positions held in local log segments at the time. No operation that issues
+/// a `resync` moves a segment between tiers, so the state before it is the
+/// state at issue.
+pub fn track_resyncs<R>(
+    m: &mut Model,
+    basis: &mut ResyncBasis,
+    f: impl FnOnce(&mut Model) -> R,
+) -> R {
+    let ids: Vec<ConsumerId> = m.consumers.iter().map(|c| c.id).collect();
+    let before: Vec<usize> = ids.iter().map(|c| resyncs_issued(m, *c)).collect();
+    let local = local_segment_positions(m);
+    let out = f(m);
+    for (c, b) in ids.iter().zip(before) {
+        for k in b..resyncs_issued(m, *c) {
+            basis.insert((*c, k), local.clone());
+        }
+    }
+    out
+}
+
 /// The ranges `(after, up_to]` a `resync` replaced for consumer `c` where the
 /// specification sends one: the cursor was older than the oldest local log
-/// segment, so some entry in the range is not in a local log segment. Local
-/// segments only ever leave in these histories, so checking now suffices.
-pub fn resync_replaced_justified(m: &Model, c: u32) -> Vec<(Position, Position)> {
-    let local = local_segment_positions(m);
+/// segment when the `resync` was issued, so some entry in the range was not in
+/// a local log segment then.
+pub fn resync_replaced_justified(
+    m: &Model,
+    basis: &ResyncBasis,
+    c: u32,
+) -> Vec<(Position, Position)> {
     let entries: Vec<Position> = m.disk.all_entries().into_keys().collect();
-    resync_replaced(m, c)
+    m.received
+        .get(&ConsumerId(c))
         .into_iter()
-        .filter(|(a, b)| {
+        .flatten()
+        .filter_map(|r| r.delivery.resync())
+        .filter_map(|x| {
+            let (a, b) = x.replaced?;
+            let local = basis.get(&(ConsumerId(c), x.issued))?;
             entries
                 .iter()
-                .any(|p| a < p && p <= b && !local.contains(p))
+                .any(|p| a < *p && *p <= b && !local.contains(p))
+                .then_some((a, b))
         })
         .collect()
 }
@@ -565,6 +607,7 @@ pub enum DOp {
         fault: Option<Fault>,
     },
     Advance(Nanos),
+    JumpWall(Nanos),
     Tick,
     Crash,
     PowerLoss,
@@ -639,6 +682,7 @@ pub fn arb_delivery_op() -> impl Strategy<Value = DOp> {
             1 => Just(91 * DAY),
         ]
         .prop_map(DOp::Advance),
+        1 => prop_oneof![Just(-HOUR), Just(HOUR)].prop_map(DOp::JumpWall),
         8 => Just(DOp::Tick),
         1 => Just(DOp::Crash),
         1 => Just(DOp::PowerLoss),
@@ -740,7 +784,7 @@ pub fn delivery_machine() -> (Model, Vec<SeriesId>) {
 pub fn apply_delivery(m: &mut Model, ids: &[SeriesId], op: &DOp) -> Result<(), String> {
     let needs_up = !matches!(
         op,
-        DOp::Crash | DOp::PowerLoss | DOp::Restart | DOp::Advance(_)
+        DOp::Crash | DOp::PowerLoss | DOp::Restart | DOp::Advance(_) | DOp::JumpWall(_)
     );
     if needs_up && !m.is_up() {
         m.restart();
@@ -757,6 +801,7 @@ pub fn apply_delivery(m: &mut Model, ids: &[SeriesId], op: &DOp) -> Result<(), S
             let _ = m.commit(*fault);
         }
         DOp::Advance(d) => m.advance(*d),
+        DOp::JumpWall(d) => m.jump_wall(*d),
         DOp::Tick => m.tick().map_err(|e| e.to_string())?,
         DOp::Crash => m.crash(),
         DOp::PowerLoss => m.power_loss(),
@@ -876,9 +921,9 @@ pub fn oracle_funnel_value(m: &Model, f: &Funnel) -> Option<f64> {
 
 /// The condition state now, as invariant 16 needs it, computed directly: a
 /// threshold by its levels, between them by the latch (Q-63); on change, the
-/// value now; held for, true when the value is above at every timer-cadence
-/// instant from now back over the hold; stale for, true when no reading of
-/// the series has arrived for S + N (Q-16: measured by `received_at`).
+/// value now; held for, true when the value is above throughout the last N;
+/// stale for, true when no reading of the series has arrived for S + N on the
+/// host clock (Q-16: measured by `received_at`).
 pub fn condition_now(m: &Model, f: &Funnel, latch: Option<&ConditionState>) -> ConditionState {
     let cond = f.condition.as_ref().expect("a condition funnel");
     let value = oracle_funnel_value(m, f);
@@ -891,24 +936,43 @@ pub fn condition_now(m: &Model, f: &Funnel, latch: Option<&ConditionState>) -> C
         }),
         Condition::OnChange { .. } => ConditionState::Value(value),
         Condition::HeldFor { above, n } => {
-            let steps = n / SECOND;
-            ConditionState::Active((0..=steps).all(|k| {
-                oracle_funnel_value_at(m, f, m.now - k * SECOND).is_some_and(|v| v > *above)
-            }))
+            // Above throughout [now − N, now]: the value held at now − N and
+            // every reading after it, up to now.
+            let Selection::Series(set) = &f.selection else {
+                unreachable!()
+            };
+            let s = *set.iter().next().unwrap();
+            let after: Vec<f64> = m
+                .current()
+                .unwrap()
+                .range((s, m.now - n + 1)..=(s, m.now))
+                .map(|(_, x)| x)
+                .filter(|x| x.summarised())
+                .map(|x| match x.value {
+                    Value::Num(v) => v,
+                    _ => f64::NAN,
+                })
+                .collect();
+            ConditionState::Active(
+                oracle_funnel_value_at(m, f, m.now - n).is_some_and(|v| v > *above)
+                    && after.iter().all(|v| *v > *above),
+            )
         }
         Condition::StaleFor { staleness, n } => {
             let Selection::Series(set) = &f.selection else {
                 unreachable!()
             };
             let s = *set.iter().next().unwrap();
+            // The last reading committed, by position.
             let last = m
                 .disk
                 .all_facts()
                 .into_iter()
                 .filter(|x| x.series == s)
-                .map(|x| x.received_at)
-                .max();
-            ConditionState::Active(last.is_some_and(|r| m.now - r >= staleness + n))
+                .max_by_key(|x| x.position)
+                .map(|x| x.received_at);
+            // On the host clock that stamped `received_at` (Q-16).
+            ConditionState::Active(last.is_some_and(|r| m.wall - r >= staleness + n))
         }
     }
 }

@@ -327,6 +327,44 @@ fn q16_stale_for_true_now_reported_true_on_resync() {
     );
 }
 
+/// Q-16 and §4 Timers ("system clock corrections never fire or suppress
+/// them"): on resume the time since the last arrival is taken on the host
+/// clock that stamped `received_at`, from the last reading committed, not
+/// against `now`, which a backward correction leaves ahead, nor from the
+/// highest stamp, which it leaves behind. A reading just after a correction
+/// of an hour back does not look an hour old, and one followed by silence
+/// past S + N is stale.
+#[test]
+fn q16_backward_clock_correction_neither_fires_nor_suppresses_stale_for() {
+    let stale = Condition::StaleFor {
+        staleness: 10 * SECOND,
+        n: 5 * SECOND,
+    };
+    for (before, silent, want) in [
+        (false, SECOND, false),
+        (true, SECOND, false),
+        (true, 30 * SECOND, true),
+    ] {
+        let (mut m, s) = condition_model(stale.clone(), 100);
+        if before {
+            put(&mut m, s, 1.0);
+        }
+        m.jump_wall(-HOUR);
+        m.advance(SECOND);
+        put(&mut m, s, 2.0);
+        m.drain().unwrap();
+        m.crash();
+        m.advance(silent);
+        m.restart();
+        m.drain().unwrap();
+        assert_eq!(
+            resync_condition(&m).0,
+            ConditionState::Active(want),
+            "reading before the correction: {before}, silent {silent}"
+        );
+    }
+}
+
 /// Q-61: every condition delivery, on a routed fact or on the timer, is
 /// identified by `(funnel, sequence)`, and the sequence is kept on disk when
 /// it is issued. A delivery taken but not confirmed before a crash does not

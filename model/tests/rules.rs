@@ -1737,6 +1737,38 @@ fn s6_held_for_true_while_down_delivered_in_resync() {
     );
 }
 
+/// §6 Restart and resume: the operator is rebuilt "from the tree and recent
+/// window as of now", exactly: a held-for condition is true on resume only if
+/// the value was above its level throughout the last N, judged on the facts
+/// and the values they hold, so a dip shorter than a second counts and N need
+/// not be whole seconds.
+#[test]
+fn s6_held_for_rebuilt_exactly_from_the_facts() {
+    let held = Condition::HeldFor {
+        above: 5.0,
+        n: 3 * SECOND / 2,
+    };
+    let ms = |k: i64| k * SECOND / 1000;
+    // (value, wait after it): above for 1.6 s; above for 2 s with a dip of
+    // 0.3 s; above for 1.4 s.
+    for (steps, want) in [
+        (vec![(1.0, ms(100)), (9.0, ms(1600))], true),
+        (vec![(9.0, ms(300)), (1.0, ms(300)), (9.0, ms(1400))], false),
+        (vec![(1.0, ms(100)), (9.0, ms(1400))], false),
+    ] {
+        let (mut m, a, _) = routed_model(100);
+        m.add_route(C, F, Funnel::condition(a, None, held.clone()))
+            .unwrap();
+        for (v, wait) in steps {
+            put(&mut m, a, v);
+            m.advance(wait);
+        }
+        m.reconnect(C).unwrap();
+        m.drain().unwrap();
+        assert_eq!(last_resync_condition(&m).0, ConditionState::Active(want));
+    }
+}
+
 /// §6 Latch: each condition funnel persists its own latch. A transition of
 /// a funnel that is removed and added again with another condition before
 /// the consumer confirms it does not become the new funnel's latch.

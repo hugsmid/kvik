@@ -164,13 +164,17 @@ proptest! {
     /// because its cursor was older than the oldest local log segment.
     #[test]
     fn inv02_delivered_iff_durable(ops in proptest::collection::vec(arb_op(), 1..80)) {
-        let (mut m, ids) = run(&ops)?;
-        settle(&mut m);
-        m.drain().unwrap();
+        let (mut m, ids) = machine();
+        let mut basis = ResyncBasis::new();
+        for op in &ops {
+            track_resyncs(&mut m, &mut basis, |m| apply(m, &ids, op)).map_err(TestCaseError::fail)?;
+        }
+        track_resyncs(&mut m, &mut basis, settle);
+        track_resyncs(&mut m, &mut basis, |m| m.drain()).unwrap();
         let dur = durable(&m);
         for (c, sel) in [(0u32, None), (1u32, Some(ids[0]))] {
             let seen = observed_positions(&m, c);
-            let replaced = resync_replaced_justified(&m, c);
+            let replaced = resync_replaced_justified(&m, &basis, c);
             for p in &seen {
                 prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", c, p);
             }
@@ -209,15 +213,16 @@ proptest! {
     #[test]
     fn inv02_routed_positions_delivered_or_resynced(ops in proptest::collection::vec(arb_delivery_op(), 1..100)) {
         let (mut m, ids) = delivery_machine();
+        let mut basis = ResyncBasis::new();
         for op in &ops {
-            apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            track_resyncs(&mut m, &mut basis, |m| apply_delivery(m, &ids, op)).map_err(TestCaseError::fail)?;
         }
-        settle(&mut m);
-        m.drain().unwrap();
+        track_resyncs(&mut m, &mut basis, settle);
+        track_resyncs(&mut m, &mut basis, |m| m.drain()).unwrap();
         let dur = durable(&m);
         for d in delivery_consumers() {
             let seen = observed_positions(&m, d.id.0);
-            let replaced = resync_replaced_justified(&m, d.id.0);
+            let replaced = resync_replaced_justified(&m, &basis, d.id.0);
             for p in &seen {
                 prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", d.id.0, p);
             }
@@ -831,6 +836,41 @@ fn generator_coverage() {
     assert!(facts > 1000 && revisions > 50 && discarded > 10 && overflows > 10);
     assert!(compacted > 20 && uploaded > 20);
     assert!(tails > 50 && kept_after_reboot > 15 && recovery_failed > 5);
+}
+
+/// Guards invariant 2's exception: a `resync` in place of a replay is
+/// excused only if, when it was issued, some position it replaced was not in
+/// a local log segment. Segments that leave the fast disk later do not excuse
+/// it.
+#[test]
+fn inv02_resync_excused_by_locality_when_issued() {
+    use kvik_model::types::{DAY, Reading, SECOND};
+    let (mut m, ids) = delivery_machine();
+    let c = ConsumerId(0);
+    let mut basis = ResyncBasis::new();
+    m.ingest(vec![Reading::num(ids[0], m.wall, 1.0)]).unwrap();
+    m.drain().unwrap();
+    m.advance(SECOND);
+    m.ingest(vec![Reading::num(ids[0], m.wall, 2.0)]).unwrap();
+    m.seal_active();
+    m.upload();
+    m.advance(91 * DAY);
+    m.housekeeping().unwrap();
+    track_resyncs(&mut m, &mut basis, |m| m.reconnect(c)).unwrap();
+    m.drain().unwrap();
+    let justified = resync_replaced_justified(&m, &basis, 0);
+    assert_eq!(
+        justified.len(),
+        1,
+        "the segment was gone when it was issued"
+    );
+    // The same `resync`, had it been issued while every position was in a
+    // local log segment, is not excused by the segment's later departure.
+    let all: BTreeSet<_> = m.disk.all_entries().into_keys().collect();
+    for v in basis.values_mut() {
+        *v = all.clone();
+    }
+    assert!(resync_replaced_justified(&m, &basis, 0).is_empty());
 }
 
 /// Guards the delivery generator: the random histories must actually
