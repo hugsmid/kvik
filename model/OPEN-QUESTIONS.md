@@ -12,13 +12,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
 | Q-44 (b) and (c) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series |
 | Q-46 | §7 Readers, §4 Resync (`start: position`), §8 Restore, row 7b | Checking a kept position against a later truncation or restore |
-| Q-52 (b) | §7 Manifest, §3 Order of a start step 4 | Whether writing the last manifest record again in place makes the next sync write it |
+| Q-52 (b) | §7 Manifest, §3 Recovery rule 3, Order of a start steps 3 and 4 | Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it |
 | Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
 | Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
 | Q-86 (b) | §3 Write or sync failure, Disk space | No space at a log write before any sync, checked on a file system that tracks pages |
-| Q-87 | §3 Recovery rules 1 and 3, Order of a start, steps 3 and 6, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
 | Q-90 | §8 Restore step 1, §8 Acknowledging a loss, §11 Health | Whether a restore record's set-aside report holds health degraded |
 | Q-91 | §4 Funnel, Routing, §6 Latch, `api.md` Consuming, row 16 | Funnel identity across configuration, run-time routes and restarts |
@@ -171,15 +170,17 @@ named by the mark has been lost. Then the reader call, `start: position` (with w
 and whether the mark and the recovery entry carry a reset stamp and nonce. Only `format.md` A.6 field 41 is reserved
 for the entry; the mark (A.10, version 3) has 40 reserved bytes, so a stamp fits there without a new version.
 
-## Q-52 (b) — Whether writing the last manifest record again in place makes the next sync write it
+## Q-52 (b) — Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it
 **Scenario.** Parts (a) and (c) are settled at gate 3.3 (see Settled). §7 Manifest writes the last valid record's
 identical bytes again in place at every start, so that a record kept from the page cache after a failed sync is on
-disk before a successor is appended. Whether the next sync then writes those bytes, on each platform, was not
-measured by the roadmap 2.2 spike.
-**Model.** Not modelled; manifest records are not corrupted.
-**Needed.** A check, with the page-tracking fault file system and on each platform, that the rewrite reaches the
-disk; if it does not, the fallback is to rewrite the manifest to a new file and rename it. To be settled on each
-platform with roadmap 4.8.
+disk before a successor is appended. Since Q-87, §3 Recovery rule 3 does the same for the last complete log batch
+(and its segment's header) whenever the mark is missing, unreadable or stale. Whether the next sync then writes those
+bytes, on each platform, was not measured by the roadmap 2.2 spike.
+**Model.** Not modelled; manifest records are not corrupted and the mark is exact.
+**Needed.** A check, with the page-tracking fault file system and on each platform (on Linux, with a device that
+fails writes on demand), that each rewrite reaches the disk. If it does not, the proposed fallbacks are: for the
+manifest, rewrite it to a new file and rename it; for the log, copy the kept batches to a new segment and rename it.
+To be settled on each platform with roadmap 4.8.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -260,24 +261,6 @@ header.
 may find. (b) stays a write failure (`spec.md` §3 Segments); what remains is to confirm with the page-tracking fault
 file system of roadmap 4.5 that no acknowledged byte or dirty page is lost.
 
-## Q-87 — A mark lost on the same boot after a failed sync
-Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
-**Scenario.** On Linux, the sync of batch b fails; the writer becomes read-only and the mark still covers b − 1
-(§3). After a failed writeback Linux (ext4, XFS) marks the pages clean without writing them: the page cache holds b
-complete, the disk does not, and a later sync of the file returns success without writing it. Before the restart,
-and without a reboot, the mark file is lost or unreadable. Rule 3 treats a missing mark as a different boot: b is
-complete in the cache and kept, the sync of the kept segments (§3 Order of a start, step 3) succeeds without
-writing it, and b is delivered as durable although it is not on disk (principle 3). A later power loss removes it;
-nothing reports it as `possible_loss`, since it was never acknowledged and the next recovery has no record of it.
-**Spike.** `spikes/commit/tests/faults.rs`
-`with_the_mark_lost_after_a_failed_sync_recovery_keeps_a_batch_that_is_not_on_disk`, on a simulated file system
-with the Linux behaviour.
-**Needed.** Whether this is accepted as outside damage (the writer never touches the mark after a failed sync, so a
-half-updated mark cannot arise this way; only a deleted or damaged mark file can), or recovery must tell it apart.
-**Owner (gate 3.3).** Not accepted as outside damage: a mechanism is wanted by which recovery keeps only what the
-disk holds, or tells this case apart and reports it. A candidate: rule 3 on Linux reads an unsealed segment's tail
-from the disk rather than the page cache (for example by evicting its clean pages first). To be settled by roadmap
-4.5, with its fault tests.
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
 compilation refuses a change that closes a cycle where "two patterns that one name could match" (§4 Routing), which
@@ -543,7 +526,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-104 was settled after gate 3.3 by the owner's ruling.
+Q-87 was reopened there. Q-87 and Q-104 were settled after gate 3.3 by the owner's rulings.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -552,13 +535,12 @@ Q-87 was reopened there. Q-104 was settled after gate 3.3 by the owner's ruling.
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
 | Q-46 | 4.5 | With 4.6 (second-process reader): the check of a kept position, `start: position` and row 7b |
-| Q-52 (b) | 4.8 | The in-place rewrite, checked on each platform |
+| Q-52 (b) | 4.8 | The in-place rewrites of the manifest and of the log (since Q-87), checked on each platform |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
 | Q-86 (b) | 4.5 | Injected sync errors and full disk |
-| Q-87 | 4.5 | Fault tests; the owner declined the accepted limit at gate 3.3, so a mechanism is wanted |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
@@ -762,6 +744,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 | Q-86 (a) | No space when a log segment is created | §3 Segments (the partial file deleted, health critical, ingest waits, creation retried), `format.md` A.4 (open part: Q-86 (b)) |
+| Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3, Last batch written again (with the mark missing, unreadable or stale, the start writes the last complete batch, and its segment's header when it is the segment's first, again in place before the sync of step 3; kept only if that sync succeeds, else read-only; rests on the Q-52 (b) check at roadmap 4.8), Order of a start step 3, row 12a, `format.md` A.10 (No usable mark) and A.4 (a valid trailer found in an `.open` file is sealed again from step 1, the same hole after a failed seal sync), `api.md` Environment seams (the test file system reports per page whether a sync wrote it). Engine fault tests (roadmap 4.5, page-tracking file system): after a failed sync and a lost mark every position delivered after the restart is on disk at a power loss; the rewrite's sync fails; the same with an adopted recovery entry whose sync failed; a kill-loop property for invariant 2 over failed syncs, mark damage, restarts and power losses; the seal state found with a trailer after a failed `sync_all` |
 | Q-93 (a) | A store nobody can open after the host's tzdata changes | §5.7 (readers and drills never refuse; calendar results computed with the reader's own release; a stored calendar node used only where its recorded release is the reader's; the writer checks the host release about once a minute and at each local midnight and adopts a new one without a restart, by a tzdata entry and a rebuild of the affected days), `api.md` Opening and Environment seams (open part: Q-93 (b), (c)) |
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
 | Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |

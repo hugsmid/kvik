@@ -147,7 +147,7 @@ one row:
 
 | State of an `.open` file | Action |
 |---|---|
-| its last non-zero bytes are a valid trailer and end marker (wherever the mark points; the file may still be longer than the end marker, after a crash between seal steps 1 and 2) | finish the seal from step 2; never truncated |
+| its last non-zero bytes are a valid trailer and end marker (wherever the mark points; the file may still be longer than the end marker, after a crash between seal steps 1 and 2) | seal again from step 1: after a failed `sync_all` on the same boot the trailer and end marker may be in the page cache only, and a repeated sync would not write them (`spec.md` §3 Recovery rule 3); never truncated |
 | in use, not the last in use, no valid trailer | whatever follows its last complete batch is seal blocks or damage, never a torn batch: seal again from step 1 |
 | in use, the last in use | `spec.md` §3 Recovery rules 1–3 (a torn first batch included); then appended to while a batch fits; if its first batch is then a recovery batch, the header is rewritten with F |
 | header invalid or `base_sequence = 0`, but a complete batch is found | rewrite the header from the file name, the store descriptor and the first batch; then one of the two rows above |
@@ -378,6 +378,9 @@ exists; a new file is created only when none exists.
   update, a current mark has at most one complete batch beyond it; two or more on the same boot mean the mark is
   stale and rule 3 applies (`spec.md` §3 Recovery rule 1, with its accepted limit). The recovery entry records mark
   state 3.
+- **No usable mark.** With the mark missing, unreadable or stale, recovery cannot rule out the same boot, so it
+  writes the last complete batch again before its first sync (`spec.md` §3 Recovery rule 3), with the segment's
+  header when that batch is the segment's first.
 - Readers of an unsealed segment never read past `offset`; they open the mark by path for each read of it. Sealed
   segments are read whole.
 - Recovery follows `spec.md` §3; the order of a start (§3) says when the mark is written and synced.

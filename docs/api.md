@@ -416,7 +416,9 @@ pub trait FsFile: Send + Sync {
 }
 ```
 - There is no memory mapping: every byte the engine persists passes a seam call, so the test file system can drop
-  unsynced writes (the mark's included) at a simulated power loss and model Linux's failed writeback per page.
+  unsynced writes (the mark's included) at a simulated power loss and model Linux's failed writeback per page. It
+  reports, per page, whether a sync wrote it, so that a test can assert that a rewrite reached the disk (spec §3
+  Recovery rule 3, §7 Manifest).
 - `TzSource::current` returns one release as a whole, so a computation never mixes two releases. The writer calls
   it at open, about once a minute and at each local midnight (spec §5.7); a reader calls it only at open, so a
   long-lived `Reader` sees a host tzdata update only when it is opened again (accepted).

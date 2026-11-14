@@ -231,15 +231,27 @@ A.10) is treated as a different boot. The rules apply in this order:
    detected, and the entry is adopted. Such a batch was never synced, so it was never acknowledged or delivered (a
    synced batch survives as a complete batch, and the entry is then not the last kept batch), and the consumers that
    had confirmed the entry's reset point received nothing above it from that write; at worst one `possible_loss` goes
-   unreported. On Linux a page whose writeback failed is marked clean and kept in the page cache, so if the mark file
-   is deleted, or damaged in both slots, on the same boot after a failed sync, this rule keeps the batch whose sync
-   failed although the disk may not hold it; how recovery tells this apart is open (Q-87). The first start of a new store (no mark file and an empty log) writes no entry and creates the mark.
+   unreported. **Last batch written again:** on Linux a page whose writeback failed is marked clean and kept in the
+   page cache, and a later sync of the file returns success without writing it, so a sync vouches only for bytes
+   written by the start that calls it. Where this rule applies and no readable mark shows a different boot (the mark
+   is missing, unreadable or stale), the machine may not have rebooted, and the last complete batch may be one whose
+   sync failed. Before the sync of step 3 the start writes the bytes of the last complete batch again, in place and
+   unchanged (no damaged region is overwritten, rule 2), and with them the segment's header when that batch is the
+   first of its segment (the header rewrite that takes a segment into use is made durable by the same sync,
+   `format.md` A.4). Only these can be in doubt: a batch is written only after the previous batch's sync has
+   returned, and each start writes the last complete batch again before it writes after it, so a recovery entry
+   adopted from a start whose own sync failed is covered too. If that sync succeeds the batch is on disk and is kept
+   (keeping a batch never acknowledged is allowed, row 12); if it fails the engine stays read-only (step 3) and
+   nothing is delivered. This rests on the platform fact that the manifest's rewrite of its last record rests on
+   (§7 Manifest): that writing identical bytes makes the next sync write them, checked on each platform by roadmap
+   4.8 (Q-52 (b)). The first start of a new store (no mark file and an empty log) writes no entry and creates the mark.
 
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
 2. Rule 1: truncate after the mark; sync every segment holding a lost range found (rule 2) and the directory, with
    step 3's rule for a failed sync; go to step 4.
-3. Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
+3. With the mark missing, unreadable or stale, first write the last complete batch again in place, with its
+   segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
    the manifest as they are and writes nothing; what it found is reported in health as found and recorded by the
    next start that can write.
 4. Repair the manifest's tail (§7 Manifest): drop a torn last record and truncate the file after the last valid
@@ -665,6 +677,7 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 11 | Torn or corrupt block in a sealed file | Quarantine; fetch from cold/deep, else compact again from kept inputs; verify, swap by manifest; errors meanwhile. Log segment with no other copy: valid batches copied to a new segment, the damaged region recorded as lost, `data_lost` | fault injection |
 | 11a | Corrupt block inside the open segment, or below an old boot's mark after a power loss | Later complete batches kept; range recorded as lost, `data_lost`; positions not reused; a reset point (§4 Resync) for cursors below its end | fault injection |
 | 12 | Sync returns an error | Read-only, fatal; a restart on the same boot truncates to the durable mark; after a reboot the batch may be kept (never acknowledged) | fault injection |
+| 12a | Mark deleted or damaged on the same boot after a failed sync | Rule 3; the last complete batch is written again and synced before use; kept only if that sync succeeds, else read-only; reported as `possible_loss` with the mark's state | fault injection |
 | 13 | Disk fills | Degrade, then ingest waits; compaction ENOSPC abandons the job; nothing deleted | fault injection |
 | 14 | Consumer slower than the stream | Catch-up from the log after the last position enqueued, hand-over to live without gap or repeat | load test |
 | 15 | Consumer down for a day | Resumes from cursor; deliveries `replayed`; then `resync`. Cursor older than the oldest local log segment: `resync` only | model |
