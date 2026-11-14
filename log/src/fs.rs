@@ -239,6 +239,8 @@ pub enum FaultOp {
     Rename,
     /// [`Fs::sync_dir`].
     SyncDir,
+    /// [`Fs::remove_file`].
+    Remove,
 }
 
 /// A recorded operation of [`MemFs`].
@@ -268,13 +270,20 @@ struct Fault {
 /// fails as planned. Tests use it to act while a sync is in flight.
 pub type SyncHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
-/// An in-memory file system for tests, with injected faults. Clones share the same files.
+/// An in-memory file system for tests, with injected faults and crashes. Clones share the same files.
 ///
 /// Every write is visible at once to every handle. Each file also has a **durable image**, its contents as of its
-/// last successful sync; [`MemFs::power_loss`] puts every file back to it. Directory entries are not modelled:
-/// names survive a power loss. Faults: [`MemFs::fail_syncs`] makes every sync fail, [`MemFs::fail_nth`] fails one
-/// chosen operation, and growth beyond [`MemFs::set_free_space`] fails with [`io::ErrorKind::StorageFull`].
-/// Directories exist implicitly.
+/// last successful sync, and the list of writes and length changes made since. Crashes:
+/// - [`MemFs::power_loss`] puts every file back to its durable image; [`MemFs::power_loss_partial`] also applies a
+///   seeded subset of the unsynced changes, one of them cut short at an 8-byte boundary, and may undo creations and
+///   renames not yet made durable by a directory sync;
+/// - [`MemFs::crash_after`] makes every operation fail after a number of further operations, as if the process
+///   stopped there.
+///
+/// Faults: [`MemFs::fail_syncs`] makes every sync fail, [`MemFs::fail_nth`] fails one chosen operation, and growth
+/// beyond [`MemFs::set_free_space`] fails with [`io::ErrorKind::StorageFull`]. A failed sync models Linux's
+/// write-back: the unsynced bytes stay visible but are no longer dirty, so a later sync does not make them durable
+/// unless they are written again. Directories exist implicitly.
 #[derive(Clone)]
 pub struct MemFs {
     state: Arc<Mutex<MemState>>,
@@ -288,12 +297,28 @@ impl fmt::Debug for MemFs {
 }
 
 #[derive(Debug)]
+enum NameChange {
+    Created(PathBuf),
+    Renamed { from: PathBuf, to: PathBuf },
+}
+
+#[derive(Debug)]
 struct MemState {
     files: BTreeMap<PathBuf, Arc<Mutex<MemData>>>,
     fail_syncs: bool,
     free: u64,
     faults: Vec<Fault>,
     ops: Vec<MemOp>,
+    /// Operations left before every operation fails.
+    crash_in: Option<usize>,
+    /// Creations and renames not yet made durable by a directory sync, oldest first.
+    names: Vec<NameChange>,
+}
+
+#[derive(Debug)]
+enum Change {
+    Write(usize, Vec<u8>),
+    Len(usize),
 }
 
 #[derive(Debug, Default)]
@@ -302,6 +327,29 @@ struct MemData {
     bytes: Vec<u8>,
     durable: Vec<u8>,
     locked: bool,
+    /// Changes since the last successful sync, oldest first.
+    pending: Vec<Change>,
+    /// Byte ranges whose write-back failed: clean but not durable until written again.
+    lost: Vec<(usize, usize)>,
+}
+
+impl MemData {
+    fn forget_lost(&mut self, start: usize, end: usize) {
+        let mut out = Vec::new();
+        for &(a, b) in &self.lost {
+            if b <= start || a >= end {
+                out.push((a, b));
+            } else {
+                if a < start {
+                    out.push((a, start));
+                }
+                if b > end {
+                    out.push((end, b));
+                }
+            }
+        }
+        self.lost = out;
+    }
 }
 
 #[derive(Debug)]
@@ -311,9 +359,36 @@ struct MemFile {
     holds_lock: Mutex<bool>,
 }
 
+/// Why a [`MemFs`] operation failed.
+struct Failure {
+    err: io::Error,
+    /// The file system has crashed: the operation never happened.
+    crashed: bool,
+}
+
+impl From<Failure> for io::Error {
+    fn from(f: Failure) -> Self {
+        f.err
+    }
+}
+
 impl Default for MemFs {
     fn default() -> Self {
         MemFs::new()
+    }
+}
+
+/// A small deterministic generator for seeded crashes.
+struct Rng(u64);
+
+impl Rng {
+    /// splitmix64.
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
 }
 
@@ -327,6 +402,8 @@ impl MemFs {
                 free: 1 << 40,
                 faults: Vec::new(),
                 ops: Vec::new(),
+                crash_in: None,
+                names: Vec::new(),
             })),
             hook: Arc::new(Mutex::new(None)),
         }
@@ -351,6 +428,27 @@ impl MemFs {
             skip,
             kind,
         });
+    }
+
+    /// Lets `n` more operations (creations, writes, syncs, length changes, renames, removals, directory syncs)
+    /// happen, then fails every operation, as if the process stopped there. [`MemFs::restart`] or a power loss
+    /// ends it.
+    pub fn crash_after(&self, n: usize) {
+        lock(&self.state).crash_in = Some(n);
+    }
+
+    /// Whether a crash planned by [`MemFs::crash_after`] has happened.
+    pub fn crashed(&self) -> bool {
+        lock(&self.state).crash_in == Some(0)
+    }
+
+    /// The process is started again after a crash without a power loss: what it wrote stays, as in the page
+    /// cache; planned faults and the crash countdown are cleared.
+    pub fn restart(&self) {
+        let mut s = lock(&self.state);
+        s.crash_in = None;
+        s.faults.clear();
+        s.fail_syncs = false;
     }
 
     /// Sets or clears the hook run before each file sync completes.
@@ -380,34 +478,117 @@ impl MemFs {
         s.files.get(path).map(|d| lock(d).durable.clone())
     }
 
+    /// Writes a file's bytes directly, bypassing faults and the operation log, durable at once: for damaging
+    /// files in tests.
+    pub fn poke(&self, path: &Path, offset: usize, bytes: &[u8]) {
+        let s = lock(&self.state);
+        if let Some(d) = s.files.get(path) {
+            let mut g = lock(d);
+            let d = &mut *g;
+            for img in [&mut d.bytes, &mut d.durable] {
+                if img.len() < offset + bytes.len() {
+                    img.resize(offset + bytes.len(), 0);
+                }
+                img[offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+    }
+
     /// Every file's path, sorted.
     pub fn paths(&self) -> Vec<PathBuf> {
         lock(&self.state).files.keys().cloned().collect()
     }
 
-    /// A simulated power loss: every file goes back to its durable image and every lock is released. Handles
-    /// still open stay usable, so a test drops them first.
+    /// A simulated power loss: every file goes back to its durable image and every lock is released. Names stay.
+    /// Handles still open stay usable, so a test drops them first.
     pub fn power_loss(&self) {
-        let mut s = lock(&self.state);
-        let mut freed = 0u64;
-        for d in s.files.values() {
-            let mut d = lock(d);
-            let durable = d.durable.clone();
-            freed = freed
-                .wrapping_add(d.bytes.len() as u64)
-                .wrapping_sub(durable.len() as u64);
-            d.bytes = durable;
-            d.locked = false;
-        }
-        s.free = s.free.wrapping_add(freed);
+        self.crash(None);
     }
 
-    /// Records `op` and fails it if a planned fault matches.
-    fn check(&self, op: FaultOp, path: &Path, offset: u64, len: u64) -> io::Result<()> {
+    /// A simulated power loss that lets part of the unsynced work reach the disk, chosen by `seed`: each unsynced
+    /// change of each file is applied or not, in order, and one applied write may be cut short at an 8-byte
+    /// boundary; each creation or rename not yet made durable by a directory sync may be undone.
+    pub fn power_loss_partial(&self, seed: u64) {
+        self.crash(Some(Rng(seed)));
+    }
+
+    fn crash(&self, mut rng: Option<Rng>) {
+        let mut s = lock(&self.state);
+        let mut freed: i128 = 0;
+        for d in s.files.values() {
+            let mut d = lock(d);
+            let mut img = d.durable.clone();
+            if let Some(r) = rng.as_mut() {
+                let cut = r.next() % (d.pending.len() as u64 + 1);
+                for (i, c) in d.pending.iter().enumerate() {
+                    if r.next() % 2 == 0 {
+                        continue;
+                    }
+                    match c {
+                        Change::Len(n) => img.resize(*n, 0),
+                        Change::Write(at, b) => {
+                            let n = if i as u64 == cut {
+                                (r.next() as usize % (b.len() / 8 + 1)) * 8
+                            } else {
+                                b.len()
+                            };
+                            if img.len() < at + n {
+                                img.resize(at + n, 0);
+                            }
+                            img[*at..at + n].copy_from_slice(&b[..n]);
+                        }
+                    }
+                }
+            }
+            freed += d.bytes.len() as i128 - img.len() as i128;
+            d.bytes = img.clone();
+            d.durable = img;
+            d.pending.clear();
+            d.lost.clear();
+            d.locked = false;
+        }
+        s.free = (s.free as i128 + freed).max(0) as u64;
+        let names = std::mem::take(&mut s.names);
+        if let Some(r) = rng.as_mut() {
+            for n in names.into_iter().rev() {
+                if r.next() % 2 == 0 {
+                    continue;
+                }
+                match n {
+                    NameChange::Created(p) => {
+                        if let Some(d) = s.files.remove(&p) {
+                            s.free += lock(&d).bytes.len() as u64;
+                        }
+                    }
+                    NameChange::Renamed { from, to } => {
+                        if !s.files.contains_key(&from)
+                            && let Some(d) = s.files.remove(&to)
+                        {
+                            lock(&d).path = from.clone();
+                            s.files.insert(from, d);
+                        }
+                    }
+                }
+            }
+        }
+        s.crash_in = None;
+    }
+
+    /// Records `op` and fails it if the file system has crashed or a planned fault matches.
+    fn check(&self, op: FaultOp, path: &Path, offset: u64, len: u64) -> Result<(), Failure> {
         let mut s = lock(&self.state);
         let name = path.to_string_lossy();
         let mut err = None;
-        if op == FaultOp::Sync && s.fail_syncs {
+        let mut crashed = false;
+        match s.crash_in {
+            Some(0) => {
+                crashed = true;
+                err = Some(io::Error::other("the process has stopped"));
+            }
+            Some(n) => s.crash_in = Some(n - 1),
+            None => {}
+        }
+        if err.is_none() && matches!(op, FaultOp::Sync | FaultOp::SyncDir) && s.fail_syncs {
             err = Some(io::Error::other("injected sync failure"));
         }
         if err.is_none()
@@ -423,14 +604,16 @@ impl MemFs {
                 s.faults[i].skip -= 1;
             }
         }
-        s.ops.push(MemOp {
-            op,
-            path: path.to_path_buf(),
-            offset,
-            len,
-            ok: err.is_none(),
-        });
-        err.map_or(Ok(()), Err)
+        if !crashed {
+            s.ops.push(MemOp {
+                op,
+                path: path.to_path_buf(),
+                offset,
+                len,
+                ok: err.is_none(),
+            });
+        }
+        err.map_or(Ok(()), |err| Err(Failure { err, crashed }))
     }
 
     /// Changes the free space by the growth of a file from `old` to `new` bytes; fails without a change if there
@@ -470,6 +653,7 @@ impl Fs for MemFs {
                     ..MemData::default()
                 }));
                 s.files.insert(path.to_path_buf(), d.clone());
+                s.names.push(NameChange::Created(path.to_path_buf()));
                 d
             }
             (_, Some(d)) => d.clone(),
@@ -513,19 +697,30 @@ impl Fs for MemFs {
         if let Some(old) = s.files.insert(to.to_path_buf(), d) {
             s.free += lock(&old).bytes.len() as u64;
         }
+        s.names.push(NameChange::Renamed {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        });
         Ok(())
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.check(FaultOp::Remove, path, 0, 0)?;
         let mut s = lock(&self.state);
         let d = s.files.remove(path).ok_or_else(not_found)?;
         s.free += lock(&d).bytes.len() as u64;
+        s.names
+            .retain(|n| !matches!(n, NameChange::Created(p) if p == path));
         Ok(())
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.check(FaultOp::SyncDir, path, 0, 0)?;
-        if lock(&self.state).fail_syncs {
-            return Err(io::Error::other("injected sync failure"));
-        }
+        lock(&self.state).names.retain(|n| {
+            let p = match n {
+                NameChange::Created(p) => p,
+                NameChange::Renamed { to, .. } => to,
+            };
+            p.parent() != Some(path)
+        });
         Ok(())
     }
     fn free_space(&self, _path: &Path) -> io::Result<u64> {
@@ -544,10 +739,35 @@ impl MemFile {
         if let Some(h) = hook {
             h(&path);
         }
-        self.fs.check(FaultOp::Sync, &path, 0, 0)?;
+        let mut r = self.fs.check(FaultOp::Sync, &path, 0, 0);
         let mut d = lock(&self.data);
-        d.durable = d.bytes.clone();
-        Ok(())
+        match &mut r {
+            Ok(()) => {
+                let mut durable = d.bytes.clone();
+                for &(a, b) in &d.lost {
+                    for i in a..b.min(durable.len()) {
+                        durable[i] = d.durable.get(i).copied().unwrap_or(0);
+                    }
+                }
+                d.durable = durable;
+                d.pending.clear();
+            }
+            // A failed write-back: the pages are clean but not on disk (Linux).
+            Err(f) if !f.crashed => {
+                let ranges: Vec<_> = d
+                    .pending
+                    .iter()
+                    .filter_map(|c| match c {
+                        Change::Write(at, b) => Some((*at, at + b.len())),
+                        Change::Len(_) => None,
+                    })
+                    .collect();
+                d.lost.extend(ranges);
+                d.pending.clear();
+            }
+            Err(_) => {}
+        }
+        r.map_err(io::Error::from)
     }
 }
 
@@ -573,6 +793,8 @@ impl FsFile for MemFile {
             d.bytes.resize(end, 0);
         }
         d.bytes[start..end].copy_from_slice(buf);
+        d.pending.push(Change::Write(start, buf.to_vec()));
+        d.forget_lost(start, end);
         Ok(())
     }
     fn sync_data(&self) -> io::Result<()> {
@@ -587,6 +809,7 @@ impl FsFile for MemFile {
         let len = usize::try_from(len).map_err(io::Error::other)?;
         self.fs.resize(d.bytes.len(), len)?;
         d.bytes.resize(len, 0);
+        d.pending.push(Change::Len(len));
         Ok(())
     }
     fn len(&self) -> io::Result<u64> {
@@ -717,7 +940,12 @@ mod tests {
                 .count(),
             1
         );
+        // The byte whose write-back failed is not made durable by the later sync (Linux), until written again.
+        assert_eq!(fs.read_durable(p).unwrap(), b"abcd\0");
         let g = fs.open(p, OpenMode::ReadWrite).unwrap();
+        g.write_at(b"e", 4).unwrap();
+        g.sync_data().unwrap();
+        assert_eq!(fs.read_durable(p).unwrap(), b"abcde");
         g.write_at(b"zz", 0).unwrap();
         drop(g);
         fs.power_loss();
@@ -729,5 +957,41 @@ mod tests {
         })));
         fs.open(p, OpenMode::Read).unwrap().sync_all().unwrap();
         assert_eq!(*lock(&seen), vec![p.to_path_buf()]);
+    }
+
+    #[test]
+    fn mem_fs_crashes() {
+        let fs = MemFs::new();
+        let p = Path::new("d/f");
+        let f = fs.open(p, OpenMode::CreateNew).unwrap();
+        f.write_at(&[1; 16], 0).unwrap();
+        f.sync_all().unwrap();
+        fs.sync_dir(Path::new("d")).unwrap();
+        fs.crash_after(1);
+        f.write_at(&[2; 16], 0).unwrap();
+        assert!(f.write_at(&[3; 16], 0).is_err());
+        assert!(fs.crashed());
+        assert_eq!(fs.read(p).unwrap(), vec![2; 16]);
+        fs.restart();
+        f.write_at(&[4; 16], 0).unwrap();
+        drop(f);
+        // A partial power loss keeps some unsynced writes, perhaps cut short at an 8-byte boundary.
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            let fs2 = MemFs::new();
+            let q = Path::new("d/g");
+            let g = fs2.open(q, OpenMode::CreateNew).unwrap();
+            g.write_at(&[1; 16], 0).unwrap();
+            g.sync_all().unwrap();
+            g.write_at(&[2; 16], 0).unwrap();
+            drop(g);
+            fs2.power_loss_partial(seed);
+            // The creation was never made durable by a directory sync: it may be undone.
+            seen.insert(fs2.read(q));
+        }
+        assert!(seen.contains(&None));
+        assert!(seen.contains(&Some(vec![1; 16])));
+        assert!(seen.contains(&Some(vec![2; 16])));
+        assert!(seen.contains(&Some([vec![2; 8], vec![1; 8]].concat())));
     }
 }
