@@ -33,6 +33,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
 | Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
 | Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
+| Q-119 | `format.md` A.7, A.2 Resynchronisation | `batch_crc32c` does not depend on the blocks it is said to cover |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -535,7 +536,7 @@ To be settled at gate 4.9.
 
 ## Q-118 — The reader process and leases: points `spec.md` §7 and `format.md` A.2, A.10, A.13 and A.15 leave open
 Found while building the reader process (roadmap 4.6, crate `kvik-log`: `reader`, `lease`). Each part names the
-reading implemented for now; tests in `log/tests/reader.rs` pin it.
+reading implemented for now; tests in `log/tests/reader.rs` pin (a), (c) and (e) to (k); (b) and (d) are not pinned.
 **Scenario.** (a) *No mark.* A.10 names retries when neither slot is valid, not a missing mark file: a store whose
 first start has not written it yet, or a mark an operator removed. (b) *Retry pace.* "Retries 8 times" gives no
 pause. (c) *A new generation.* A restore (roadmap 8.3) sets positions aside "also in reader processes"; a reader that
@@ -554,10 +555,12 @@ lease header.* A.15 says "an A.1 header" without its `file_id` and generation. (
 Retired files (§7 Manifest) and tier moves (§8) do not exist yet.
 **Implemented.** (a) Unreadable: `MarkUnreadable` at open and at refresh, which changes nothing the reader holds. (b)
 Back to back. (c) Everything taken is void (`VoidCause::Generation`) and the log is read again from its start. (d) The
-error names the file; nothing at or past it is read until it can be. (e) The reader keeps the commit blocks of its
-last 64 batches and reads the last one again before each refresh; if it differs, it voids what it took above the last
+error names the file; nothing at or past it is read until it can be. (e) The reader keeps a CRC32C over all the bytes of
+each of its last 64 batches (the commit block alone does not identify a batch, Q-119) and reads the last one again
+before each refresh; if it differs, it voids what it took above the last
 that still reads the same (`VoidCause::Rewritten`) and reads on from there; with none left, above the position before
-the oldest, reading again from that segment's start, where the recovery entry voids the rest. A batch the reader
+the oldest, reading again from that segment's start, where every recovery entry is applied again: the new one voids
+the rest, and an earlier one may void intact batches, which are then returned again. A batch the reader
 holds that is damaged later in the middle of the log is a loss for the writer's next start to record, not voided. (f)
 A refresh takes the current epoch; `keep_alive` keeps the epoch unless the lease may have expired. With no files to
 retire this is safe; once tree and compacted files exist, whether a refresh may move the epoch under an open iteration
@@ -568,6 +571,23 @@ checked, as for every file. (k) `LeaseTable::oldest_live_epoch` is the input for
 deletes only segments that hold no batch.
 **Needed.** A rule for each part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
 
+## Q-119 — `batch_crc32c` does not depend on the blocks it is said to cover
+Found while building the reader process (roadmap 4.6), by its property test.
+**Scenario.** A.7: `batch_crc32c` is the CRC32C over `store_id`, `file_id`, `o`, "then the 16-byte headers of every
+block before the commit block". Each header ends with `header_crc32c`, the CRC32C of its first 12 bytes. A CRC
+register fed a message and then that message's own CRC returns to a fixed state, so for a given `store_id`,
+`file_id`, `o` and block count every set of valid headers gives the same `batch_crc32c`: it does not depend on any
+block's type, flags, length or body checksum. In the test, after a remount, positions 4 to 10 were assigned again to
+other facts in a batch of the same size at the same offset with the same commit time; the new commit block was byte
+for byte the old one. A.2's claim still holds for a batch image at another offset (`o` is covered), but the field
+adds nothing that ties the commit block to its data blocks, and bytes that imitate a batch at its own offset need
+only valid block checksums (compare Q-110).
+**Implemented.** Nothing in the format changes. The reader identifies a batch by a CRC32C over all its bytes
+(Q-118 (e)); recovery and the scan are unchanged.
+**Needed.** Whether `batch_crc32c` should cover the headers without their `header_crc32c` (bytes 0..12 of each), or
+the bodies' checksums some other way; that is a new major format version or a reading of A.7 before the first
+release. To be settled at gate 4.9.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -576,7 +596,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 was recorded by roadmap 4.6.
+Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|

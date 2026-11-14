@@ -543,19 +543,27 @@ fn a_damaged_tail_truncated_under_rule_3_is_voided_and_the_entry_is_taken() {
     r.check_caught_up();
 }
 
-#[test]
-fn a_truncation_longer_than_what_the_reader_remembers_is_voided_by_the_recovery_entry() {
+/// A start truncates every batch from position `from` on, more than the reader remembers; the log starts with a
+/// recovery entry the reader has read, so with `from` 1 the new entry lands at that entry's offset.
+fn long_truncation(from: u64) {
     let mut r = Rig::new(WriterConfig {
         segment_size: 64 << 10,
         ..cfg()
     });
-    for k in 0..90 {
+    // A reboot first: its recovery entry, at position 1, is read before the batches.
+    r.w = None;
+    r.fs.power_loss();
+    r.fs.restart();
+    r.boot += 1;
+    assert!(r.open());
+    for k in 0..89 {
         r.submit(items(1, k * 10));
         r.drain();
     }
     r.refresh().unwrap();
     assert_eq!(r.held.items.len(), 90);
-    // Every batch from position 11 on is damaged and the mark is lost: the start truncates them all.
+    assert!(matches!(r.held.items[&1], Item::Entry(Entry::Recovery(_))));
+    // Every batch from position `from` on is damaged and the mark is lost: the start truncates them all.
     r.kill();
     let m = r.mark().unwrap();
     r.fs.remove_file(&log_path("MARK")).unwrap();
@@ -578,7 +586,7 @@ fn a_truncation_longer_than_what_the_reader_remembers_is_voided_by_the_recovery_
     for b in found
         .batches
         .iter()
-        .filter(|b| b.commit.first_sequence > 10)
+        .filter(|b| b.commit.first_sequence >= from)
     {
         r.fs.poke(&seg, b.commit_offset() as usize, &[0xee; 16]);
     }
@@ -592,17 +600,31 @@ fn a_truncation_longer_than_what_the_reader_remembers_is_voided_by_the_recovery_
             .unwrap()
             .entry
             .after,
-        10
+        from - 1
     );
     r.refresh().unwrap();
-    // None of the remembered batches reads the same: the first void stops at the oldest of them, and the
-    // recovery entry voids the rest.
-    assert_eq!(r.held.voids.len(), 2);
+    // None of the remembered batches reads the same: the first void stops at the oldest of them; the log is read
+    // again from the segment's start, where the recovery entries void the rest.
     assert_eq!(r.held.voids[0], VoidCause::Rewritten);
-    assert!(matches!(r.held.voids[1], VoidCause::Recovery { entry } if entry.sequence == 11));
+    assert!(r.held.voids.len() >= 2);
+    assert!(
+        r.held.voids[1..]
+            .iter()
+            .all(|v| matches!(v, VoidCause::Recovery { .. }))
+    );
     r.check_held();
     r.check_caught_up();
-    assert_eq!(r.held.items.len(), 11);
+    assert_eq!(r.held.items.len() as u64, from);
+}
+
+#[test]
+fn a_truncation_longer_than_what_the_reader_remembers_is_voided_by_the_recovery_entry() {
+    long_truncation(11);
+}
+
+#[test]
+fn a_recovery_entry_written_where_an_earlier_one_was_read_is_read_as_new() {
+    long_truncation(1);
 }
 
 #[test]
@@ -632,6 +654,42 @@ fn a_missing_or_unreadable_mark_is_mark_unreadable_and_changes_nothing() {
     assert!(r.open());
     r.submit(items(1, 50));
     r.drain();
+    r.refresh().unwrap();
+    r.check_caught_up();
+}
+
+#[test]
+fn a_failed_lease_write_or_a_corrupt_manifest_record_fails_the_refresh_and_changes_nothing() {
+    let mut r = Rig::new(cfg());
+    r.submit(items(2, 0));
+    r.drain();
+    let before = r.reader.as_ref().unwrap().state();
+    r.fs.fail_nth(
+        kvik_log::fs::FaultOp::Write,
+        ".lease",
+        0,
+        std::io::ErrorKind::Other,
+    );
+    assert!(matches!(r.refresh(), Err(ReaderError::Io { .. })));
+    assert_eq!(r.reader.as_ref().unwrap().state(), before);
+    assert!(r.held.items.is_empty());
+    r.fs.restart();
+    // A record followed by a valid one with a higher epoch is corrupt: no epoch can be taken.
+    let path = dir().join("MANIFEST");
+    let man = r.fs.read(&path).unwrap();
+    let last = read_manifest(&man, &STORE_ID).unwrap();
+    let next = kvik_log::manifest::encode_record(
+        kvik_log::manifest::RECORD_EMPTY,
+        last.last_epoch() + 1,
+        0,
+        T0,
+        None,
+    );
+    r.fs.poke(&path, man.len(), &next);
+    r.fs.poke(&path, last.records[0].offset as usize + 20, &[0xee; 4]);
+    assert!(matches!(r.refresh(), Err(ReaderError::Manifest(_))));
+    assert_eq!(r.reader.as_ref().unwrap().state(), before);
+    r.fs.poke(&path, 0, &man);
     r.refresh().unwrap();
     r.check_caught_up();
 }
@@ -993,8 +1051,6 @@ fn interleave(ops: &[Op], every: bool) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: ProptestConfig::default().cases / 8, ..ProptestConfig::default() })]
-
     /// Writer steps, crashes, restarts and reader refreshes in any order: the reader never takes a batch above the
     /// mark, never keeps one the files no longer hold without voiding it, and catches up after a refresh.
     #[test]
@@ -1004,4 +1060,32 @@ proptest! {
     ) {
         interleave(&ops, every);
     }
+}
+
+/// Found by the property test: after a remount, positions 4 to 10 are assigned again to other facts in a batch of the
+/// same size at the same offset with the same commit time, so its commit block is byte for byte the old one (Q-119).
+#[test]
+fn a_batch_assigned_again_with_an_identical_commit_block_is_still_voided() {
+    use Op::*;
+    interleave(
+        &[
+            Submit(1, false),
+            Submit(1, false),
+            Submit(1, false),
+            Submit(7, false),
+            Advance(2),
+            Refresh,
+            Power(6_786_131_029_947_831_036, true),
+            Submit(7, false),
+        ],
+        false,
+    );
+    interleave(
+        &[
+            Submit(1, false),
+            Refresh,
+            Power(11_450_480_047_445_383_222, true),
+        ],
+        false,
+    );
 }

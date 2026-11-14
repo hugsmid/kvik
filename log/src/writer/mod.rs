@@ -854,6 +854,9 @@ impl LogWriter {
         }
         if self.fault.is_none() {
             self.timed_seal(now);
+        }
+        // A read-only store starts no file operation, the deletion of a lease included.
+        if self.fault.is_none() {
             self.scan_leases(now);
         }
         if self.fault.is_none() {

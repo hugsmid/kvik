@@ -13,8 +13,8 @@
 //! - **The last batch it returned, checked again before every refresh.** A writer's restart never changes a
 //!   complete batch below the mark it acts on, but that mark can be older than the one the reader read: a start
 //!   after a page-cache loss on the same boot truncates the batch beyond the mark on disk (`spec.md` §3 Recovery
-//!   rule 1, accepted limit), and a damaged tail is truncated under rule 3. The reader keeps the commit blocks of
-//!   its recent batches; when the last one no longer reads the same, it voids what it took above the last that
+//!   rule 1, accepted limit), and a damaged tail is truncated under rule 3. The reader keeps a checksum of each of
+//!   its recent batches, over all its bytes (a commit block alone does not tell two batches apart, Q-119); when the last one no longer reads the same, it voids what it took above the last that
 //!   does ([`VoidCause::Rewritten`], Q-118 (e)).
 //! - **Recovery entries.** A reader that reads a recovery entry voids what it took above the entry's `after`
 //!   (`spec.md` §7 Readers). How a position kept beyond the life of a reader is checked against a later truncation
@@ -66,10 +66,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::batch::SegmentIdentity;
-use crate::block::BLOCK_HEADER_LEN;
-use crate::body::COMMIT_LEN;
 use crate::content::{BatchContent, Item};
 use crate::content_error::BodyError;
+use crate::crc::crc32c;
 use crate::entries::Entry;
 use crate::error::FormatError;
 use crate::fs::{Fs, FsFile, OpenMode};
@@ -84,9 +83,8 @@ use crate::writer::{Clock, Position};
 
 /// How many times a reader reads the mark again when neither slot is valid (`format.md` A.10).
 pub const MARK_RETRIES: u32 = 8;
-/// How many recently returned batches the reader keeps the commit blocks of, to find what a rewrite left.
+/// How many recently returned batches the reader keeps a checksum of, to find what a rewrite left.
 const RECENT: usize = 64;
-const COMMIT_BLOCK_LEN: usize = BLOCK_HEADER_LEN + COMMIT_LEN;
 
 /// How a reader is opened (`api.md` `ReaderConfig`).
 #[derive(Clone, Debug)]
@@ -272,9 +270,11 @@ pub struct Update {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Fingerprint {
     file_id: u64,
-    /// The commit block's offset.
-    at: u64,
-    commit: [u8; COMMIT_BLOCK_LEN],
+    /// The batch's offset and end.
+    offset: u64,
+    end: u64,
+    /// CRC32C over the batch's bytes, commit block included.
+    crc: u32,
     first: Position,
     last: Position,
 }
@@ -288,7 +288,6 @@ struct View {
     resume: Option<Resume>,
     taken: Position,
     recent: VecDeque<Fingerprint>,
-    entries: BTreeSet<(u64, u64)>,
     regions: BTreeSet<(u64, u64)>,
 }
 
@@ -521,18 +520,20 @@ impl LogReader {
         Ok(self.segments()?.into_iter().find(|n| n.file_id == file_id))
     }
 
-    /// The commit block at `fp` as the file now holds it; `None` if the segment is gone or shorter.
-    fn read_commit(&self, fp: &Fingerprint) -> Result<Option<[u8; COMMIT_BLOCK_LEN]>, ReaderError> {
+    /// Whether the batch at `fp` still reads the same: the same bytes at the same place.
+    fn still_reads(&self, fp: &Fingerprint) -> Result<bool, ReaderError> {
         let Some(name) = self.find_segment(fp.file_id)? else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some((n, f)) = self.open_segment(name)? else {
-            return Ok(None);
+            return Ok(false);
         };
-        let mut b = [0u8; COMMIT_BLOCK_LEN];
         let path = self.log_dir.join(n.to_string());
-        let got = read_at_full(&*f, &mut b, fp.at).map_err(io_err(&path))?;
-        Ok((got == COMMIT_BLOCK_LEN).then_some(b))
+        let len =
+            usize::try_from(fp.end - fp.offset).map_err(|e| io_err(&path)(io::Error::other(e)))?;
+        let mut b = vec![0u8; len];
+        let got = read_at_full(&*f, &mut b, fp.offset).map_err(io_err(&path))?;
+        Ok(got == len && crc32c(&b) == fp.crc)
     }
 
     fn read_log(
@@ -647,9 +648,7 @@ impl LogReader {
                                 offset: b.offset,
                                 error,
                             })?;
-                        let at = b.commit_offset();
-                        let mut commit = [0u8; COMMIT_BLOCK_LEN];
-                        commit.copy_from_slice(&bytes[at as usize..at as usize + COMMIT_BLOCK_LEN]);
+                        let crc = crc32c(&bytes[b.offset as usize..b.end() as usize]);
                         let rb = ReadBatch {
                             file_id,
                             offset: b.offset,
@@ -661,9 +660,10 @@ impl LogReader {
                             commit_time: b.commit.commit_time,
                             content,
                         };
-                        if let Some(r) = rb.recovery()
-                            && view.entries.insert((file_id, b.offset))
-                        {
+                        // Reading only moves forward past batches not read before, or past the last batch that
+                        // still reads the same, so every entry met is applied: one written again at the offset
+                        // of an earlier one (adopted, Q-117) still removed what followed.
+                        if let Some(r) = rb.recovery() {
                             let after = Position {
                                 generation: g,
                                 sequence: r.after,
@@ -681,8 +681,9 @@ impl LogReader {
                             view.taken = last;
                             view.recent.push_back(Fingerprint {
                                 file_id,
-                                at,
-                                commit,
+                                offset: b.offset,
+                                end: b.end(),
+                                crc,
                                 first: rb.first,
                                 last,
                             });
@@ -701,7 +702,9 @@ impl LogReader {
 
     /// Checks that the last batch returned still reads the same. If not, voids what was taken above the last
     /// remembered batch that does, and reads again from there; with none left, from the start of the oldest
-    /// remembered batch's segment, where a recovery entry voids the rest (Q-118 (e)).
+    /// remembered batch's segment, where every recovery entry is applied again: the one the truncating start wrote
+    /// voids the rest, and an earlier one may void batches that are intact, which are then returned again
+    /// (Q-118 (e)).
     fn check_recent(
         &self,
         view: &mut View,
@@ -710,12 +713,12 @@ impl LogReader {
         let Some(last) = view.recent.back() else {
             return Ok(());
         };
-        if self.read_commit(last)? == Some(last.commit) {
+        if self.still_reads(last)? {
             return Ok(());
         }
         let mut keep = 0;
         for fp in &view.recent {
-            if self.read_commit(fp)? != Some(fp.commit) {
+            if !self.still_reads(fp)? {
                 break;
             }
             keep += 1;
@@ -740,7 +743,7 @@ impl LogReader {
             Some(fp) => {
                 view.file_id = fp.file_id;
                 view.resume = Some(Resume {
-                    offset: fp.at + COMMIT_BLOCK_LEN as u64,
+                    offset: fp.end,
                     last_sequence: Some(fp.last.sequence),
                 });
             }
