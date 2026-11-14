@@ -10,7 +10,8 @@ log and are synced to disk before anything reacts to them; the same library then
 consumers, keeps per-series summaries for drill-down from years to seconds, and moves old files to cheaper storage
 and an off-site bucket; the engine itself never deletes a fact. Typical uses are home and building automation, energy
 monitoring, small industrial or laboratory installations and edge devices: places where per-second data from many
-sources must be acted on quickly, kept for years and restored to a known, recorded point after a failure.
+sources must be acted on quickly, kept for years and restored to a known, recorded point after a failure
+([who it is for](#who-it-is-for)).
 
 > [!IMPORTANT]
 > **Status: design stage. The engine does not exist yet.**
@@ -47,8 +48,45 @@ From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
   mixed in. Facts in files that were never backed up are lost.
 - **One writer process, any number of readers**, including readers in other processes while the writer runs.
 
-**Not planned for v1:** a network server, SQL, multiple writers, clustering, or any form of deletion
-([`docs/api.md`](docs/api.md#not-in-v1)).
+## Who it is for
+kvik is meant for places where the [principles](#principles) above are requirements rather than preferences. The
+engine does not exist yet, so each item below says what it is designed to do, not what has been shown.
+
+- **Regulated data that needs a complete change history**, such as pharmaceutical and food production, water
+  treatment or energy metering. Besides keeping every fact and every correction, the store answers as-of queries:
+  the data as it held it at a given time, so what the system showed then. Losses found at recovery or restore are
+  recorded and reported as `data_lost`. kvik makes no claim of regulatory compliance or certification.
+- **Unattended, power-fragile edge sites**, such as pumping stations, telecom cabinets, wind turbines, remote
+  substations and vessels. kvik is a library inside the application, so there is no database service to install or
+  keep alive. After a power loss, recovery follows fixed, ordered rules and reports a truncated tail as
+  `possible_loss` and a corrupt range as `data_lost`. Sealed files are encrypted and uploaded to a bucket whenever
+  the link allows and queue locally while it is down; nothing is evicted meanwhile, so local disk must cover the
+  outage.
+- **Alarms that must not be missed.** Conditions (a threshold with a separate clear level, held for N seconds, stale
+  for N seconds) are evaluated by the store itself. A condition that became true while a consumer was down, and
+  still holds, is delivered when the consumer resumes, never suppressed (during a restore, once its detail is local
+  again); history replayed during catch-up is flagged `replayed`, so a consumer can tell it from live data and not
+  act on it. The log, delivery and conditions form one system, rather than a database and a message broker joined
+  by hand.
+- **Energy and settlement data.** Interval series hold half-hourly, daily or monthly amounts, including days that
+  start at a fixed local time, such as a gas day, and 23- or 25-hour days at clock changes; sums of whole intervals
+  are exact for a decimal scale. Scheduled series hold values known in advance, such as published prices, which
+  take effect at their time; forecast series keep every issue with its issue time, so a reader can compare them
+  with what was later observed.
+- **Small industrial and laboratory installations**: per-second data from many sources, kept for years, with
+  drill-down from years to seconds ([budgets](docs/design.md#budgets-to-be-measured), still to be measured).
+
+### What it is not
+kvik is a storage engine, not a complete system. **Not planned for v1:** a network server, SQL, multiple writers,
+clustering, conditions over several series, interval readings over irregular billing periods, or any form of
+deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export is planned for other tools. An application
+built on it would add:
+
+- adapters for the protocols its devices speak, such as OPC UA, Modbus or MQTT;
+- user accounts, access control and the record of who made a change;
+- validation documentation, if it is used for regulated data.
+
+The file format is a proposal and may change before a first release ([`docs/format.md`](docs/format.md)).
 
 ## How it works
 The intended shape, from [`docs/design.md`](docs/design.md) and the [specification](docs/spec.md):
