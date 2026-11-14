@@ -60,7 +60,7 @@ pub fn window(p: &Params, all: &[(Nanos, Value)], start: Nanos, end: Nanos, now:
         let to = p.valid_until(*t, next);
         fresh.hold(v, i128::from(to) - i128::from(from));
         if i > 0 && is_inside {
-            fresh.step(p, &seq[i - 1].0.1, v);
+            fresh.step(p, seq[i - 1].0, seq[i].0);
         }
     }
     if inside.is_empty()
@@ -82,4 +82,44 @@ pub fn day(
 ) -> Result<Node, TreeError> {
     let (s, e) = day_span(zone, date)?;
     Ok(node(p, all, s, e))
+}
+
+/// Rate over a counter window `[start, end)` at `now`, by its definition
+/// (§6): the increase credited to the window divided by the elapsed seconds
+/// between the readings that bound its steps (the last reading before the
+/// start, when a reading lies inside, and the last reading inside), and
+/// whether any of those steps spans more than S. `None` when no step falls
+/// in the window.
+pub fn rate(
+    p: &Params,
+    all: &[(Nanos, Value)],
+    start: Nanos,
+    end: Nanos,
+    now: Nanos,
+) -> Option<(crate::types::Exact, bool)> {
+    use crate::summary::Body;
+    use crate::types::{SECOND, exact_ns};
+    let until = end.min(now).max(start);
+    let inside: Vec<Nanos> = all
+        .iter()
+        .map(|(t, _)| *t)
+        .filter(|t| start <= *t && *t < until)
+        .collect();
+    let prior = all.iter().rev().map(|(t, _)| *t).find(|t| *t < start);
+    let mut bounds: Vec<Nanos> = prior.filter(|_| !inside.is_empty()).into_iter().collect();
+    bounds.extend(&inside);
+    if bounds.len() < 2 {
+        return None;
+    }
+    let elapsed = bounds[bounds.len() - 1] - bounds[0];
+    let long = bounds
+        .windows(2)
+        .any(|w| p.staleness.is_some_and(|s| w[1] - w[0] > s));
+    let Body::Counter { increase, .. } = window(p, all, start, end, now).body else {
+        return None;
+    };
+    Some((
+        increase * exact_ns(i128::from(SECOND)) / exact_ns(i128::from(elapsed)),
+        long,
+    ))
 }

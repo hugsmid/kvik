@@ -1102,6 +1102,11 @@ fn row_18a_counter_wraps_glitches_low_or_is_silent_for_hours() {
         Some(AggValue::Exact(exact(300.0)))
     );
     assert_eq!(w.coverage, i128::from(MINUTE + SECOND));
+    assert!(w.rate_flagged(), "rate is flagged");
+    assert_eq!(
+        w.aggregate(&Aggregate::Rate),
+        Some(AggValue::Exact(exact(300.0) / exact(5.0 * 3600.0)))
+    );
     // The tree agrees.
     let tree = SeriesTree::build(p, &rs);
     assert_eq!(

@@ -597,7 +597,9 @@ manifest record; invariant 12; `tests/rules.rs` `s3_low_mark_…` and `s8_evicti
 flags by timing and per-series lateness bound (§2.2), `t_source` and the clock (§2.2, §2.5: `host_time`; before
 synchronisation, `unsynced_clock`, no `future` or `late`, and a host-stamped emit waits as back-pressure, counted;
 row 22a), invalid values (§2.5: NaN, ±∞ and a negative counter value recorded as bad quality without a value,
-flagged `no_value` and counted), retirement at `t_r` (§2.1, also for a reading that waited in the queue while the
+flagged `no_value` and counted), counters and rate (§5.5, §6: resets, wraps and regressions, each regression
+contributing 0 and counted; rate as the increase over the elapsed time between the readings that bound its steps,
+empty with no step, flagged when a step spans more than S; row 18a, `tests/rules.rs` `s6_rate_…`), retirement at `t_r` (§2.1, also for a reading that waited in the queue while the
 retirement committed), the durable mark and recovery by boot id (§3),
 delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
 condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
@@ -648,7 +650,6 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Cursor of a consumer after a restore | §4 Consumer state, invariant 13: a cursor is never ahead of the consumer's confirmation | A consumer without a kept cursor, or whose catch-up segments are not local, gets the restored end written as its cursor, which it never confirmed, standing in for "treated as beyond the restored end" (§8 Restore step 2) | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
 | Tree files and their checkpoint, density rule | §5.1, row 20a | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call); both levels, and calendar nodes, stored for every series | — |
 | Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
-| Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
 | Compaction of compacted files | §7 Policy: merge when a series' chunks overlapping any 15-minute span exceed 4 | Counts and merges the live current chunks of a series on the fast disk only; revision chunks are never merged | `tests/rules.rs` `s7_merge_publishes_outputs_and_retires_inputs_in_one_record` |
 | Revised-key index, recent window | §2.4, §5.1, §8 Restore step 2: "A key that gains a second fact meanwhile, in the replay or by ingest, has its index entry completed when its chunk is back" | A full in-memory history of every key stands in for the index and the recent window; while restoring, a key revised only after the checkpoint has its entry completed when every current chunk is back, not when its own chunk is | `tests/rules.rs` `s8_index_entry_completed_when_the_current_chunks_are_back` |
 | Age of a compacted file | §8 Eviction at 90 days: no rule for the age of a merged or compacted file | A compacted file takes the seal time of its oldest input, so a revision made today, merged with a 60-day-old chunk, leaves hot after 30 days | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |

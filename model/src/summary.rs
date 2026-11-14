@@ -84,8 +84,17 @@ pub enum Body {
         increase: Exact,
         /// Decreases counted as resets.
         resets: u64,
-        /// Decreases counted as regressions (contribute 0).
+        /// Decreases counted as regressions (contribute 0, §12 D2).
         regressions: u64,
+        /// Steps credited.
+        steps: u64,
+        /// Steps spanning more than S in force at their earlier reading:
+        /// a rate including one is flagged (§6).
+        long_steps: u64,
+        /// Nanoseconds between the readings of every step credited. Steps are
+        /// consecutive, so this is the time between the readings that bound
+        /// them: the divisor of rate (§6).
+        elapsed: i128,
     },
     /// State fields.
     State {
@@ -111,6 +120,9 @@ impl Body {
                 increase: exact(0.0),
                 resets: 0,
                 regressions: 0,
+                steps: 0,
+                long_steps: 0,
+                elapsed: 0,
             },
             Kind::State => Body::State {
                 time: BTreeMap::new(),
@@ -178,15 +190,24 @@ impl Node {
     }
 
     /// Credits the event terms of a pair: counter step, state transition.
-    pub(crate) fn step(&mut self, p: &Params, prev: &Value, cur: &Value) {
+    pub(crate) fn step(&mut self, p: &Params, prev: &(Nanos, Value), cur: &(Nanos, Value)) {
         match &mut self.body {
             Body::Counter {
                 increase,
                 resets,
                 regressions,
+                steps,
+                long_steps,
+                elapsed,
             } => {
-                let a = prev.as_f64().expect("counter value");
-                let b = cur.as_f64().expect("counter value");
+                let span = cur.0 - prev.0;
+                *steps += 1;
+                *elapsed += i128::from(span);
+                if p.staleness.is_some_and(|s| span > s) {
+                    *long_steps += 1;
+                }
+                let a = prev.1.as_f64().expect("counter value");
+                let b = cur.1.as_f64().expect("counter value");
                 if b >= a {
                     *increase += exact(b) - exact(a);
                 } else if let Some(w) = p.counter.wrap_at {
@@ -199,7 +220,7 @@ impl Node {
                 }
             }
             Body::State { transitions, .. } => {
-                if prev.state_key() != cur.state_key() {
+                if prev.1.state_key() != cur.1.state_key() {
                     *transitions += 1;
                 }
             }
@@ -211,7 +232,7 @@ impl Node {
     fn pair(&mut self, p: &Params, a: &(Nanos, Value), b: &(Nanos, Value)) {
         let to = p.valid_until(a.0, b.0);
         self.hold(&a.1, i128::from(to) - i128::from(a.0));
-        self.step(p, &a.1, &b.1);
+        self.step(p, a, b);
     }
 
     /// Credits the per-reading fields of a reading inside the span.
@@ -289,16 +310,25 @@ pub fn merge(p: &Params, l: &Node, r: &Node) -> Node {
                 increase: l_inc,
                 resets: l_resets,
                 regressions: l_reg,
+                steps: l_steps,
+                long_steps: l_long,
+                elapsed: l_el,
             },
             Body::Counter {
                 increase: r_inc,
                 resets: r_resets,
                 regressions: r_reg,
+                steps: r_steps,
+                long_steps: r_long,
+                elapsed: r_el,
             },
         ) => Body::Counter {
             increase: l_inc + r_inc,
             resets: l_resets + r_resets,
             regressions: l_reg + r_reg,
+            steps: l_steps + r_steps,
+            long_steps: l_long + r_long,
+            elapsed: l_el + r_el,
         },
         (
             Body::State {
@@ -374,8 +404,8 @@ pub fn with_stretches(
         let lead_to = core.first.as_ref().map_or(until, |(t, _)| *t);
         let to = p.valid_until(pr.0, lead_to);
         core.hold(&pr.1, i128::from(to) - i128::from(start));
-        if let Some((_, fv)) = core.first.clone() {
-            core.step(p, &pr.1, &fv);
+        if let Some(first) = core.first.clone() {
+            core.step(p, pr, &first);
         } else if p.valid_until(pr.0, Nanos::MAX) > start {
             core.last = Some(pr.clone());
         }
@@ -414,8 +444,9 @@ pub enum Aggregate {
     Count,
     /// Counter increase.
     Increase,
-    /// Counter increase ÷ covered seconds. The specification divides by the
-    /// elapsed time between bounding readings (see `OPEN-QUESTIONS.md`).
+    /// Counter increase ÷ the elapsed seconds between the readings that
+    /// bound the steps credited; empty when no step is credited, flagged
+    /// ([`Node::rate_flagged`]) when a step spans more than S (§6).
     Rate,
     /// Last value (a held value if there is no reading inside).
     Last,
@@ -444,6 +475,12 @@ impl AggValue {
 }
 
 impl Node {
+    /// Whether a rate over this node is flagged: a step it includes spans
+    /// more than S in force at the step's earlier reading (§6).
+    pub fn rate_flagged(&self) -> bool {
+        matches!(self.body, Body::Counter { long_steps, .. } if long_steps > 0)
+    }
+
     /// Evaluates an aggregate. `None` when empty or not applicable to the kind.
     pub fn aggregate(&self, agg: &Aggregate) -> Option<AggValue> {
         let ns_per_s = exact_ns(i128::from(SECOND));
@@ -464,9 +501,12 @@ impl Node {
             (Aggregate::Increase, Body::Counter { increase, .. }) => {
                 Some(AggValue::Exact(increase.clone()))
             }
-            (Aggregate::Rate, Body::Counter { increase, .. }) => {
-                covered.map(|c| AggValue::Exact(increase * ns_per_s / c))
-            }
+            (
+                Aggregate::Rate,
+                Body::Counter {
+                    increase, elapsed, ..
+                },
+            ) => (*elapsed > 0).then(|| AggValue::Exact(increase * ns_per_s / exact_ns(*elapsed))),
             (Aggregate::Last, _) => self.last.as_ref().map(|(_, v)| AggValue::Value(v.clone())),
             (Aggregate::TimeInState(k), Body::State { time, .. }) => Some(AggValue::Exact(
                 exact_ns(time.get(k).copied().unwrap_or(0)) / ns_per_s,

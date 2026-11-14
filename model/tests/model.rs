@@ -11,10 +11,10 @@ use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, Event, Runner};
 use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Model, Selection};
 use kvik_model::oracle;
-use kvik_model::summary::{AggValue, Aggregate, Params};
+use kvik_model::summary::{Aggregate, Params};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
 use kvik_model::types::{
-    DAY, Exact, HOUR, Kind, MINUTE, Nanos, Reading, SECOND, SeriesId, Value, ValueType, floor_to,
+    DAY, HOUR, Kind, MINUTE, Nanos, Reading, SECOND, SeriesId, Value, ValueType, floor_to,
 };
 
 const C: ConsumerId = ConsumerId(1);
@@ -191,20 +191,5 @@ fn unaligned_days_are_refused() {
         quarters_in_day(&apia, Date::constant(2011, 12, 30)).unwrap(),
         0,
         "a skipped date has an empty span"
-    );
-}
-
-/// §6: rate is the increase over the elapsed time between the readings that
-/// bound it; the model still divides by covered seconds.
-#[test]
-fn rate_divides_by_covered_seconds() {
-    let p = Params::new(Kind::Counter, 3 * MINUTE);
-    let rs = vec![(T0, Value::Num(100.0)), (T0 + HOUR, Value::Num(250.0))];
-    let w = oracle::window(&p, &rs, T0, T0 + HOUR + SECOND, T0 + HOUR + SECOND);
-    // 150 over 181 covered seconds (180 s held, 1 s trailing); the
-    // specification gives 150 over 3600 s, flagged.
-    assert_eq!(
-        w.aggregate(&Aggregate::Rate),
-        Some(AggValue::Exact(Exact::new(150.into(), 181.into())))
     );
 }

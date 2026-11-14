@@ -485,7 +485,15 @@ proptest! {
                 let (start, end) = (T0 + (*a).min(*b), T0 + (*a).max(*b));
                 let now = T0 + n;
                 let want = oracle::window(&p, &all, start, end, now);
-                prop_assert_eq!(tree.window(start, end, now), want);
+                let got = tree.window(start, end, now);
+                if p.kind == kvik_model::types::Kind::Counter {
+                    let rate = got.aggregate(&kvik_model::summary::Aggregate::Rate).map(|v| match v {
+                        kvik_model::summary::AggValue::Exact(x) => (x, got.rate_flagged()),
+                        kvik_model::summary::AggValue::Value(_) => unreachable!(),
+                    });
+                    prop_assert_eq!(rate, oracle::rate(&p, &all, start, end, now));
+                }
+                prop_assert_eq!(got, want);
                 let len = (end - start).max(1);
                 let sw = sliding.entry(len).or_insert_with(|| SlidingWindow::new(len));
                 prop_assert_eq!(sw.evaluate(&tree, now), oracle::window(&p, &all, now - len, now, now));

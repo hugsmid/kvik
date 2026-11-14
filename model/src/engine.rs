@@ -3501,6 +3501,21 @@ impl Model {
         })
     }
 
+    /// Decreases of a counter counted as regressions over its current view
+    /// (§5.5, §12 D2: each contributes 0 and is counted, `counter_regressions`).
+    pub fn counter_regressions(&self, s: SeriesId) -> Result<u64, Error> {
+        let tree = self.tree(s)?;
+        let rs = tree.readings();
+        let (Some(first), Some(last)) = (rs.first(), rs.last()) else {
+            return Ok(0);
+        };
+        let node = crate::summary::direct(&tree.params, first.0, last.0 + 1, &rs);
+        Ok(match node.body {
+            crate::summary::Body::Counter { regressions, .. } => regressions,
+            _ => 0,
+        })
+    }
+
     /// Fetches missing detail for a minute and recomputes its path (§5.6).
     pub fn fetch_detail(&mut self, s: SeriesId, minute: Nanos) -> Result<(), Error> {
         let v = self.vol_mut()?;

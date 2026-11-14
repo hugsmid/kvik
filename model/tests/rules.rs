@@ -17,8 +17,8 @@ use kvik_model::registry::{ChangedAtKind, RegistryError, RetentionClass, SeriesO
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
-    DAY, Fact, HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId, Value,
-    ValueType, exact,
+    DAY, Exact, Fact, HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId,
+    Value, ValueType, exact,
 };
 use kvik_model::view;
 
@@ -328,6 +328,73 @@ fn s6_edge_stretches() {
         w.aggregate(&Aggregate::Increase),
         Some(AggValue::Exact(exact(10.0)))
     );
+}
+
+/// §6 Aggregates: rate is the increase over the elapsed seconds between the
+/// readings that bound it; the result carries coverage and is flagged when a
+/// step it includes spans more than S, in force at the step's earlier
+/// reading; it is empty when no step falls in the window.
+#[test]
+fn s6_rate_over_elapsed_time_between_bounding_readings() {
+    let p = Params::new(Kind::Counter, 3 * MINUTE);
+    let rate = |rs: &[(Nanos, Value)], a: Nanos, b: Nanos| {
+        let tree = SeriesTree::build(p, rs);
+        let w = tree.window(a, b, b);
+        assert_eq!(w, oracle::window(&p, rs, a, b, b));
+        let got = w.aggregate(&Aggregate::Rate).map(|v| match v {
+            AggValue::Exact(x) => x,
+            AggValue::Value(_) => unreachable!(),
+        });
+        let want = oracle::rate(&p, rs, a, b, b);
+        assert_eq!(got.clone().zip(Some(w.rate_flagged())), want);
+        (got, w.rate_flagged(), w.coverage)
+    };
+    let q = |a: i64, b: i64| Some(Exact::new(a.into(), b.into()));
+    // Silent for an hour: 150 over 3600 s, flagged; coverage shows the gap.
+    let rs = vec![(T0, n(100.0)), (T0 + HOUR, n(250.0))];
+    let (r, flagged, coverage) = rate(&rs, T0, T0 + HOUR + SECOND);
+    assert_eq!(r, q(150, 3600));
+    assert!(flagged);
+    assert_eq!(coverage, i128::from(3 * MINUTE + SECOND));
+    // Steps within S: unflagged; the leading step from the reading before the
+    // start is included, so the elapsed time runs from that reading.
+    let rs = vec![
+        (T0, n(0.0)),
+        (T0 + MINUTE, n(30.0)),
+        (T0 + 2 * MINUTE, n(90.0)),
+    ];
+    assert_eq!(rate(&rs, T0 + 30 * SECOND, T0 + 3 * MINUTE).0, q(90, 120));
+    assert!(!rate(&rs, T0 + 30 * SECOND, T0 + 3 * MINUTE).1);
+    assert_eq!(rate(&rs, T0 + 90 * SECOND, T0 + 3 * MINUTE).0, q(60, 60));
+    // No step in the window: empty, also with a valid held value.
+    assert_eq!(rate(&rs, T0 + 2 * MINUTE + SECOND, T0 + 3 * MINUTE).0, None);
+    assert_eq!(rate(&rs[..1], T0, T0 + MINUTE).0, None);
+    // A reset step counts its new value; a regression contributes 0, is
+    // counted and the next step is measured from it (§5.5, §12 D2).
+    let rs = vec![
+        (T0, n(1000.0)),
+        (T0 + MINUTE, n(5.0)),
+        (T0 + 2 * MINUTE, n(4.0)),
+        (T0 + 3 * MINUTE, n(10.0)),
+    ];
+    assert_eq!(rate(&rs, T0, T0 + 4 * MINUTE).0, q(11, 180));
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let c = m
+        .define(
+            "site/meter-1/energy",
+            Kind::Counter,
+            ValueType::Number,
+            "kWh",
+            3 * MINUTE,
+        )
+        .unwrap();
+    m.ingest(
+        rs.iter()
+            .map(|(t, v)| Reading::num(c, *t, v.as_f64().unwrap()))
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(m.counter_regressions(c).unwrap(), 1);
 }
 
 #[test]
