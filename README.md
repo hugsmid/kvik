@@ -33,7 +33,7 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3–10. Format and interface, log, delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 11 of 46 roadmap items are done, including 2 of 9 gates.
+> 11 of 47 roadmap items are done, including 2 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -230,7 +230,7 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
    `f64`, but only about 1 % smaller when they are declared as scaled `i64`. On two non-decimal shapes it was 13 %
    smaller than the best Parquet variant on one and 23 % larger than Parquet's dictionary encoding on the other
    ([results](docs/measurements/2.1-chunk-encodings.md)). Gate 2.3 kept the own format for compacted data, with
-   per-value decimal exceptions and a compressed XOR fallback; gate 10.2 confirms it against Parquet at scale, and
+   per-value decimal exceptions and a compressed XOR fallback; gate 10.3 confirms it against Parquet at scale, and
    Parquet is for export only. Roadmap item 2.2 measured commit and sync latency, group commit, a failed sync and a
    full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)).
 4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) will be
@@ -251,6 +251,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`docs/format.md`](docs/format.md) | Proposed byte-level format; not yet checked for implementability (roadmap 3.1) |
 | [`docs/api.md`](docs/api.md) | Proposed public interface; not yet checked for implementability (roadmap 3.2) |
 | [`docs/measurements/`](docs/measurements/) | Recorded measurements |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Plan for comparative benchmarks against other tools; not yet run |
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |
 | [`model/OPEN-QUESTIONS.md`](model/OPEN-QUESTIONS.md) | Open questions in the specification, and where the model still differs from it |
 | [`spikes/encodings/`](spikes/encodings/) | The encoding spike behind roadmap item 2.1; not part of the engine |

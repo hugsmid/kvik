@@ -62,7 +62,7 @@ a caller who needs lower latency at high rates sets it lower or to 0.
 
 **Size.** [Roadmap 2.1](measurements/2.1-chunk-encodings.md) measured the own encoding 8–14 % smaller than Parquet
 with ALP for decimal `f64` data, about 1 % for the same series declared as scaled `i64`, and larger than Parquet's
-dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.2
+dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.3
 confirms the format against Parquet.
 
 ## Build order

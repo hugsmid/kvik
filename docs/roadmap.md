@@ -71,4 +71,5 @@ again; nothing after a gate starts before it is passed.
 
 ## 10. Scale
 - [ ] 10.1 Scale test with billions of rows: size, drill-down and delivery latency
-- [ ] 10.2 **Gate** — confirm the own format against Parquet on size, per-file overhead, recovery from a damaged file, binary size and decode speed at scale; Parquet stays for export
+- [ ] 10.2 Comparative benchmarks against other tools on the target workloads (plan: [`docs/benchmarks.md`](benchmarks.md)); results in `docs/measurements/`
+- [ ] 10.3 **Gate** — confirm the own format against Parquet on size, per-file overhead, recovery from a damaged file, binary size and decode speed at scale; Parquet stays for export
