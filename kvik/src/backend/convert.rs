@@ -2,30 +2,34 @@
 
 use std::time::Duration;
 
-use jiff::Timestamp;
 use kvik_model as km;
 
+use super::error::Error;
 use crate::consume::{ConditionState, TriggerCause};
-use crate::error::{BusyReason, Error, Refusal};
+use crate::error::{Refusal, Wait};
 use crate::read::{Aggregate, Aggregated};
 use crate::series::{
     ChangedAtKind, IntervalLength, Kind, RetentionClass, SeriesSpec, StateValues, Timing, ValueType,
 };
+use crate::time::Timestamp;
 use crate::types::{Fact, FactFlags, Position, Quality, SeriesId, Value};
 
 /// UTC nanoseconds of a timestamp.
-pub(crate) fn nanos(t: Timestamp) -> Result<i64, Error> {
-    i64::try_from(t.as_nanosecond()).map_err(|_| Error::TimeOutOfRange)
+pub(crate) fn nanos(t: Timestamp) -> i64 {
+    t.0
 }
 
-/// The timestamp of UTC nanoseconds; every `i64` is in range.
+/// The timestamp of UTC nanoseconds.
 pub(crate) fn ts(n: i64) -> Timestamp {
-    Timestamp::from_nanosecond(i128::from(n)).unwrap_or(Timestamp::MAX)
+    Timestamp(n)
 }
 
 /// Nanoseconds of a duration.
 pub(crate) fn dur_nanos(d: Duration) -> Result<i64, Error> {
-    i64::try_from(d.as_nanos()).map_err(|_| Error::TimeOutOfRange)
+    i64::try_from(d.as_nanos()).map_err(|_| Error::Invalid {
+        field: "duration",
+        reason: "too long".into(),
+    })
 }
 
 /// The duration of a non-negative count of nanoseconds (negative counts as
@@ -43,11 +47,11 @@ pub(crate) fn mpos(p: Position) -> km::types::Position {
 }
 
 pub(crate) fn sid(s: km::types::SeriesId) -> SeriesId {
-    SeriesId::from_raw(s.0)
+    SeriesId(s.0)
 }
 
 pub(crate) fn msid(s: SeriesId) -> km::types::SeriesId {
-    km::types::SeriesId(s.get())
+    km::types::SeriesId(s.0)
 }
 
 pub(crate) fn quality(q: km::types::Quality) -> Quality {
@@ -69,10 +73,10 @@ pub(crate) fn mquality(q: Quality) -> km::types::Quality {
 }
 
 /// A model value as the interface shows it, given the series' definition.
-pub(crate) fn value_out(v: &km::types::Value, spec: Option<&SeriesSpec>) -> Option<Value> {
+pub(crate) fn value_out(v: &km::types::Value, spec: Option<&SeriesSpec>) -> Value {
     match v {
-        km::types::Value::Num(x) => Some(Value::F64(*x)),
-        km::types::Value::Bool(b) => Some(Value::Bool(*b)),
+        km::types::Value::Num(x) => Value::F64(*x),
+        km::types::Value::Bool(b) => Value::Bool(*b),
         km::types::Value::Str(s) => match spec.map(|s| &s.kind) {
             Some(Kind::State {
                 values: StateValues::Named(names),
@@ -80,10 +84,10 @@ pub(crate) fn value_out(v: &km::types::Value, spec: Option<&SeriesSpec>) -> Opti
                 .iter()
                 .position(|n| n == s)
                 .and_then(|i| u16::try_from(i).ok())
-                .map(Value::State),
-            _ => Some(Value::Text(s.clone())),
+                .map_or(Value::Absent, Value::State),
+            _ => Value::Text(s.clone()),
         },
-        km::types::Value::Absent => None,
+        km::types::Value::Absent => Value::Absent,
     }
 }
 
@@ -105,6 +109,7 @@ pub(crate) fn fact_out(f: &km::types::Fact, spec: Option<&SeriesSpec>) -> Fact {
             host_time: fl.host_time,
             unsynced_clock: fl.unsynced_clock,
             no_value: fl.no_value,
+            rounded: false,
         },
     }
 }
@@ -125,19 +130,19 @@ pub(crate) fn refusal(r: &km::engine::Refusal) -> Option<Refusal> {
     })
 }
 
-pub(crate) fn wait(w: &km::engine::Wait) -> BusyReason {
+pub(crate) fn wait(w: &km::engine::Wait) -> Wait {
     match w {
-        km::engine::Wait::DiskFull => BusyReason::DiskFull,
-        km::engine::Wait::QueueFull => BusyReason::QueueFull,
-        km::engine::Wait::UnsyncedClock => BusyReason::UnsyncedClock,
+        km::engine::Wait::DiskFull => Wait::DiskFull,
+        km::engine::Wait::QueueFull => Wait::QueueFull,
+        km::engine::Wait::UnsyncedClock => Wait::UnsyncedClock,
     }
 }
 
-pub(crate) fn mwait(b: BusyReason) -> km::engine::Wait {
+pub(crate) fn mwait(b: Wait) -> km::engine::Wait {
     match b {
-        BusyReason::DiskFull => km::engine::Wait::DiskFull,
-        BusyReason::QueueFull => km::engine::Wait::QueueFull,
-        BusyReason::UnsyncedClock => km::engine::Wait::UnsyncedClock,
+        Wait::DiskFull => km::engine::Wait::DiskFull,
+        Wait::QueueFull => km::engine::Wait::QueueFull,
+        Wait::UnsyncedClock => km::engine::Wait::UnsyncedClock,
     }
 }
 
@@ -147,22 +152,26 @@ pub(crate) fn error(e: km::engine::Error) -> Error {
     use km::registry::RegistryError as R;
     match e {
         E::Crashed => Error::Closed,
-        E::ReadOnly => Error::ReadOnly {
-            cause: "a write or sync failed earlier".into(),
-        },
-        E::SyncFailed => Error::Fault("sync failed; the store is read-only".into()),
-        E::Registry(R::Ceiling(n)) => Error::SeriesCeiling(n),
+        E::ReadOnly => Error::ReadOnly("a write or sync failed earlier".into()),
+        E::SyncFailed => Error::SyncFailed,
+        E::Registry(R::Ceiling(n)) => Error::Ceiling(n),
         E::Registry(R::NameInUse(n)) => Error::NameInUse(n),
         E::Registry(R::Unknown(s)) => Error::UnknownSeries(sid(s).to_string()),
         E::Registry(R::Retired(s)) => Error::Retired(sid(s)),
-        E::Registry(other) => Error::InvalidDefinition(other.to_string()),
+        E::Registry(other) => Error::Invalid {
+            field: "definition",
+            reason: other.to_string(),
+        },
         E::Tree(km::tree::TreeError::UnknownZone(z)) => Error::UnknownZone(z),
         E::BadConfirm => Error::BadConfirm,
         E::Restoring => Error::Restoring,
         // What the model does not support is refused before it is called
         // (`Slot::route`); every other refusal is the specification's.
         E::BadRoute(msg) => Error::Route(msg.to_string()),
-        E::SiteZoneMismatch { store, configured } => Error::SiteZoneMismatch { store, configured },
+        E::SiteZoneMismatch { store, configured } => Error::SiteZoneMismatch {
+            in_force: store,
+            configured,
+        },
         other => Error::Internal(other.to_string()),
     }
 }
@@ -170,9 +179,9 @@ pub(crate) fn error(e: km::engine::Error) -> Error {
 fn number_type(v: ValueType) -> Result<km::types::ValueType, Error> {
     match v {
         ValueType::F64 => Ok(km::types::ValueType::Number),
-        ValueType::Decimal { .. } => Err(Error::NotSupportedYet {
-            what: "decimal value types (exact i64 with a scale)",
-        }),
+        ValueType::Decimal { .. } => Err(Error::NotSupportedYet(
+            "decimal series (ValueType::Decimal): the reference model has no exact decimal values",
+        )),
     }
 }
 
@@ -198,17 +207,19 @@ pub(crate) fn definition(spec: &SeriesSpec) -> Result<ModelDefinition, Error> {
             values: StateValues::Named(names),
         } => {
             if names.is_empty() || names.len() > usize::from(u16::MAX) + 1 {
-                return Err(Error::InvalidDefinition(
-                    "a named state series declares between 1 and 65,536 names".into(),
-                ));
+                return Err(Error::Invalid {
+                    field: "kind",
+                    reason: "a named state series declares between 1 and 65,536 names".into(),
+                });
             }
             let mut sorted: Vec<&String> = names.iter().collect();
             sorted.sort();
             sorted.dedup();
             if sorted.len() != names.len() {
-                return Err(Error::InvalidDefinition(
-                    "state names must be distinct".into(),
-                ));
+                return Err(Error::Invalid {
+                    field: "kind",
+                    reason: "state names must be distinct".into(),
+                });
             }
             (K::State, V::Name)
         }
@@ -223,9 +234,9 @@ pub(crate) fn definition(spec: &SeriesSpec) -> Result<ModelDefinition, Error> {
                     });
                 }
                 IntervalLength::Calendar { .. } => {
-                    return Err(Error::NotSupportedYet {
-                        what: "calendar-length interval series (a local day or month)",
-                    });
+                    return Err(Error::NotSupportedYet(
+                        "calendar-length interval series (a local day or month)",
+                    ));
                 }
             }
             (K::Interval, vt)
@@ -269,9 +280,10 @@ pub(crate) fn retention(r: RetentionClass) -> Result<km::registry::RetentionClas
     Ok(match r {
         RetentionClass::LongTerm => km::registry::RetentionClass::LongTerm,
         RetentionClass::Diagnostic { period } if period.is_zero() => {
-            return Err(Error::InvalidDefinition(
-                "a retention period must be positive".into(),
-            ));
+            return Err(Error::Invalid {
+                field: "retention",
+                reason: "a retention period must be positive".into(),
+            });
         }
         RetentionClass::Diagnostic { period } => km::registry::RetentionClass::Diagnostic {
             period: dur_nanos(period)?,
@@ -317,7 +329,11 @@ pub(crate) fn aggregate(
                         })?
                         .clone(),
                 ),
-                _ => return Err(Error::AggregateNotApplicable),
+                _ => {
+                    return Err(Error::AggregateRefused(
+                        "time in state needs a state value of the series".into(),
+                    ));
+                }
             };
             A::TimeInState(key)
         }

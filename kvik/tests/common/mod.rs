@@ -11,8 +11,7 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use kvik::env::{Env, ManualClock};
-use kvik::jiff::Timestamp;
-use kvik::{Store, StoreConfig};
+use kvik::{Span, Store, StoreConfig, Timestamp};
 
 struct ThreadWaker(Thread);
 
@@ -70,11 +69,12 @@ pub fn start() -> Timestamp {
     "2026-01-05T12:00:00Z".parse().unwrap()
 }
 
-/// A configuration for a store unique to the test, on a manual clock.
+/// A configuration for a store unique to the test, on a manual clock,
+/// created if missing.
 pub fn config(name: &str, clock: &ManualClock) -> StoreConfig {
-    let mut c = StoreConfig::new(format!("kvik-test/{name}"), "Europe/London");
-    c.env = Env::test(clock.clone());
-    c
+    StoreConfig::new(format!("kvik-test/{name}"), "Europe/London")
+        .create_if_missing(true)
+        .env(Env::test(clock.clone()))
 }
 
 /// A new store unique to the test, on a manual clock at [`start`].
@@ -86,7 +86,5 @@ pub fn store(name: &str) -> (Store, ManualClock) {
 
 /// Seconds after [`start`].
 pub fn at(secs: i64) -> Timestamp {
-    start()
-        .checked_add(kvik::jiff::SignedDuration::from_secs(secs))
-        .unwrap()
+    start() + Span::from_secs(secs)
 }

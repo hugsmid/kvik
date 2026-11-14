@@ -11,11 +11,9 @@ use std::thread::{self, Thread};
 use std::time::Duration;
 
 use kvik::env::{Env, ManualClock};
-use kvik::jiff::civil::date;
-use kvik::jiff::{SignedDuration, Timestamp};
 use kvik::{
-    Aggregate, Condition, DeliveryKind, Funnel, Kind, Reading, Select, SeriesSpec, Start, Store,
-    StoreConfig, Value, ValueType, Window,
+    Aggregate, Condition, DeliveryKind, Funnel, Kind, LocalDate, Reading, Select, SeriesSpec, Span,
+    Start, Store, StoreConfig, Timestamp, Value, ValueType, Window,
 };
 
 /// A minimal executor: any async runtime works, as the store starts no
@@ -38,41 +36,44 @@ fn block_on<F: Future>(f: F) -> F::Output {
     }
 }
 
-fn main() -> kvik::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     block_on(run())
 }
 
-async fn run() -> kvik::Result<()> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // A manual clock keeps the example deterministic; `Env::system()` (the
     // default) uses the system clocks.
     let start: Timestamp = "2026-03-02T10:00:00Z".parse().expect("a timestamp");
     let clock = ManualClock::new(start);
-    let mut config = StoreConfig::new("quickstart-store", "Europe/London");
-    config.env = Env::test(clock.clone());
+    let config = StoreConfig::new("quickstart-store", "Europe/London")
+        .create_if_missing(true)
+        .env(Env::test(clock.clone()));
     let store = Store::open(config).await?;
     println!("store opened; durable: {}", store.is_durable());
 
     let power = store
-        .define_series(SeriesSpec {
-            name: "plant/line-1/power".into(),
-            kind: Kind::Gauge {
-                value: ValueType::F64,
-            },
-            unit: "W".into(),
-            expected_interval: Some(Duration::from_secs(1)),
-            ..Default::default()
-        })
+        .define_series(
+            SeriesSpec::new(
+                "plant/line-1/power",
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+            .expected_interval(Duration::from_secs(1)),
+        )
         .await?;
     let energy = store
-        .define_series(SeriesSpec {
-            name: "plant/line-1/energy".into(),
-            kind: Kind::Counter {
-                value: ValueType::F64,
-            },
-            unit: "Wh".into(),
-            expected_interval: Some(Duration::from_secs(1)),
-            ..Default::default()
-        })
+        .define_series(
+            SeriesSpec::new(
+                "plant/line-1/energy",
+                Kind::Counter {
+                    value: ValueType::F64,
+                },
+                "Wh",
+            )
+            .expected_interval(Duration::from_secs(1)),
+        )
         .await?;
 
     // A consumer with a threshold condition: true above 3 kW, false again
@@ -91,7 +92,7 @@ async fn run() -> kvik::Result<()> {
     // One reading a second for a minute; the load rises past 3 kW at 40 s.
     let mut meter = 0.0;
     for s in 0..60 {
-        let t = start + SignedDuration::from_secs(s);
+        let t = start + Span::from_secs(s);
         let watts = if s < 40 { 2_000.0 } else { 3_200.0 };
         meter += watts / 3_600.0;
         let ack = store
@@ -100,7 +101,7 @@ async fn run() -> kvik::Result<()> {
                 Reading::new(energy, t, Value::F64(meter)),
             ])
             .await?;
-        assert!(ack.refused.is_empty());
+        assert_eq!(ack.refused().count(), 0);
         clock.advance(Duration::from_secs(1));
         while let Some(d) = alarms.try_next()? {
             if let DeliveryKind::Trigger(trigger) = &d.kind {
@@ -130,14 +131,16 @@ async fn run() -> kvik::Result<()> {
         "energy used in the last minute: {:.2} Wh",
         used.number().unwrap_or(0.0)
     );
-    let day = reader.calendar(energy, date(2026, 3, 2), Aggregate::Increase)?;
+    let date = LocalDate::new(2026, 3, 2);
+    let day = reader.calendar(energy, date, Aggregate::Increase)?;
     println!(
         "energy on {} (London): {:.2} Wh, from {} to {}",
-        date(2026, 3, 2),
+        date,
         day.number().unwrap_or(0.0),
         day.from,
         day.to
     );
 
-    store.shutdown().await
+    store.shutdown().await?;
+    Ok(())
 }

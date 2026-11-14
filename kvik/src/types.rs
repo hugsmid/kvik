@@ -1,26 +1,17 @@
-//! Identifiers, positions, readings and facts (spec §2.2).
+//! Identifiers, positions, readings, acknowledgements and facts (spec §2.2;
+//! `docs/api.md` Core types, Writing).
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use jiff::Timestamp;
-
-use crate::error::Refusal;
+use crate::error::{EmitError, Refusal};
+use crate::time::Timestamp;
 
 /// Series identifier: assigned once by the registry, never reused (spec §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SeriesId(u32);
-
-impl SeriesId {
-    /// The identifier with this number, as [`SeriesId::get`] returns it.
-    pub const fn from_raw(n: u32) -> Self {
-        SeriesId(n)
-    }
-
-    /// Its number.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
+pub struct SeriesId(pub u32);
 
 impl fmt::Display for SeriesId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,24 +57,31 @@ impl fmt::Display for Position {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Value {
-    /// A 64-bit float (gauge, counter or interval series of value type
-    /// [`ValueType::F64`](crate::ValueType::F64)). NaN and ±∞ are recorded as
-    /// bad quality without a value (spec §2.5).
+    /// A 64-bit float. NaN and ±∞ are recorded as quality bad with no value
+    /// (spec §2.5). A decimal series takes it too, converted to its shortest
+    /// decimal representation.
     F64(f64),
-    /// An exact integer in units of the series' decimal scale (value type
-    /// [`ValueType::Decimal`](crate::ValueType::Decimal)).
-    Decimal(i64),
-    /// A boolean state.
-    Bool(bool),
+    /// `units × 10^−scale`, for a decimal series.
+    Decimal {
+        /// Units.
+        units: i64,
+        /// Decimal scale.
+        scale: u8,
+    },
     /// A named state: an index into the series' declared names.
     State(u16),
+    /// A boolean state.
+    Bool(bool),
     /// Text, at most 255 bytes of UTF-8.
     Text(String),
+    /// No value (spec §2.5).
+    Absent,
 }
 
 /// Quality of a reading, from best to worst (spec §2.2). The engine may lower
 /// it, never raise it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Quality {
     /// Good.
     #[default]
@@ -98,6 +96,7 @@ pub enum Quality {
 
 /// Which clock stamped a reading's `t` (spec §2.2 `t_source`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum TimeSource {
     /// The device's own clock.
     #[default]
@@ -112,7 +111,7 @@ pub enum TimeSource {
 pub struct Reading {
     /// Series.
     pub series: SeriesId,
-    /// Event time, UTC. For an interval series, the start of its interval.
+    /// Event time. For an interval series, the start of its interval.
     pub t: Timestamp,
     /// Value.
     pub value: Value,
@@ -162,46 +161,118 @@ impl Reading {
 
 /// How a batch is submitted (spec §2.4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Intent {
     /// Normal: identical repeats are dropped as duplicates.
     #[default]
     Normal,
-    /// Revise: bypasses the duplicate check, for a deliberate return to an
-    /// earlier value; refused on a versioned series.
+    /// Revise: bypasses the duplicate check; refused on a versioned series.
     Revise,
 }
 
-/// The result of [`Store::emit`](crate::Store::emit): returned once the batch
-/// is committed (synced in the durable engine; held in memory only with the
-/// model backend).
+/// What happened to one reading, decided at commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Outcome {
+    /// Recorded as a fact.
+    Recorded {
+        /// Its position.
+        position: Position,
+        /// Outranked when committed (spec §4 Outranked facts).
+        outranked: bool,
+        /// Recorded although the duplicate check could not run (spec §2.4).
+        unchecked: bool,
+        /// A decimal value rounded to the series' scale.
+        rounded: bool,
+    },
+    /// An identical repeat, dropped (spec §2.4).
+    Duplicate,
+    /// Refused.
+    Refused(Refusal),
+}
+
+/// The acknowledgement of a call: one outcome per reading, by index. Returned
+/// once the batch is committed (synced in the durable engine; held in memory
+/// only with the model backend).
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Ack {
-    /// Position of the first fact recorded, if any.
-    pub first: Option<Position>,
-    /// Position of the last fact recorded, if any.
-    pub last: Option<Position>,
+    /// One outcome per reading of the call, in order.
+    pub outcomes: Vec<Outcome>,
+}
+
+impl Ack {
+    pub(crate) fn new(outcomes: Vec<Outcome>) -> Self {
+        Ack { outcomes }
+    }
+
+    fn positions(&self) -> impl Iterator<Item = Position> + '_ {
+        self.outcomes.iter().filter_map(|o| match o {
+            Outcome::Recorded { position, .. } => Some(*position),
+            _ => None,
+        })
+    }
+
+    /// The first position recorded, if any.
+    pub fn first(&self) -> Option<Position> {
+        self.positions().min()
+    }
+
+    /// The last position recorded, if any.
+    pub fn last(&self) -> Option<Position> {
+        self.positions().max()
+    }
+
+    /// Readings dropped as identical repeats.
+    pub fn duplicates_dropped(&self) -> u32 {
+        let n = self
+            .outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Duplicate))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// The refused readings, by index.
+    pub fn refused(&self) -> impl Iterator<Item = (usize, Refusal)> + '_ {
+        self.outcomes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o {
+                Outcome::Refused(r) => Some((i, *r)),
+                _ => None,
+            })
+    }
+
     /// Facts recorded.
-    pub recorded: u32,
-    /// Readings dropped as identical repeats (spec §2.4).
-    pub duplicates_dropped: u32,
-    /// Readings refused, by index in the batch.
-    pub refused: Vec<(usize, Refusal)>,
+    pub fn recorded(&self) -> usize {
+        self.positions().count()
+    }
 }
 
-/// What a non-waiting emit knows when it returns: the batch entered the
-/// ingest queue, except the readings refused at once. Positions, duplicates
-/// and durability are known only after the commit (spec §3).
-#[derive(Clone, Debug, Default, PartialEq)]
-#[non_exhaustive]
-pub struct Accepted {
-    /// Readings refused, by index in the batch.
-    pub refused: Vec<(usize, Refusal)>,
+/// A batch accepted by [`Store::try_emit`](crate::Store::try_emit): a future
+/// of its [`Ack`], runtime-neutral, that may be dropped (dropping cancels
+/// nothing). With the model backend it is ready at once.
+#[derive(Debug)]
+#[must_use = "awaiting a Pending gives the outcomes; dropping it cancels nothing"]
+pub struct Pending {
+    result: Option<Result<Ack, EmitError>>,
 }
 
-impl Accepted {
-    pub(crate) fn new(refused: Vec<(usize, Refusal)>) -> Self {
-        Accepted { refused }
+impl Pending {
+    pub(crate) fn ready(result: Result<Ack, EmitError>) -> Self {
+        Pending {
+            result: Some(result),
+        }
+    }
+}
+
+impl Future for Pending {
+    type Output = Result<Ack, EmitError>;
+    /// # Panics
+    /// Panics if polled after it completed.
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(self.result.take().expect("Pending polled after completion"))
     }
 }
 
@@ -209,7 +280,8 @@ impl Accepted {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct FactFlags {
-    /// Observed series: `t` more than 60 s after `received_at`.
+    /// Observed series: `t` more than the future tolerance after
+    /// `received_at`.
     pub future: bool,
     /// Late by either clause of spec §2.2.
     pub late: bool,
@@ -219,8 +291,11 @@ pub struct FactFlags {
     pub host_time: bool,
     /// Committed before the clock was synchronised (spec §2.5).
     pub unsynced_clock: bool,
-    /// Recorded without a value: NaN, ±∞ or a negative counter value.
+    /// Recorded without a value: NaN, ±∞, `Absent` or a negative counter
+    /// value.
     pub no_value: bool,
+    /// A decimal value rounded to the series' scale.
+    pub rounded: bool,
 }
 
 /// A recorded fact (spec §2.2). Facts are immutable.
@@ -235,23 +310,26 @@ pub struct Fact {
     pub position: Position,
     /// Host clock at commit.
     pub received_at: Timestamp,
-    /// Value; `None` when recorded without one.
-    pub value: Option<Value>,
+    /// Value; [`Value::Absent`] when recorded without one.
+    pub value: Value,
     /// Quality after stamping.
     pub quality: Quality,
     /// Quality as the adapter supplied it.
     pub supplied_quality: Quality,
-    /// The source's revision time or version, in a versioned series.
-    pub changed_at: Option<u64>,
     /// Engine flags.
     pub flags: FactFlags,
+    /// The source's revision time or version, in a versioned series.
+    pub changed_at: Option<u64>,
 }
+
+/// A fact as [`Reader::facts`](crate::Reader::facts) returns it.
+pub type FactRow = Fact;
 
 impl Fact {
     /// The numeric value, for a value of type `F64`.
     pub fn number(&self) -> Option<f64> {
         match self.value {
-            Some(Value::F64(v)) => Some(v),
+            Value::F64(v) => Some(v),
             _ => None,
         }
     }

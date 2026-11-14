@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use jiff::civil::Date;
-use jiff::{SignedDuration, Timestamp};
+use crate::error::QueryError;
+use crate::time::{LocalDate, Span, TimeRange, Timestamp, ZoneName};
 
 use crate::types::{Fact, Position, Value};
 
@@ -40,33 +40,35 @@ pub enum Aggregate {
 pub enum Aggregated {
     /// A number.
     Number(f64),
-    /// A reading's value ([`Aggregate::Last`]); `None` for a reading recorded
-    /// without one.
-    Value(Option<Value>),
+    /// A reading's value ([`Aggregate::Last`]); [`Value::Absent`] for a
+    /// reading recorded without one.
+    Value(Value),
 }
 
 /// A calendar period (spec §5.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CalendarPeriod {
     /// A local day.
-    Day(Date),
+    Day(LocalDate),
     /// A local month.
     Month {
         /// Year.
         year: i16,
         /// Month, 1–12.
-        month: i8,
+        month: u8,
     },
 }
 
-impl From<Date> for CalendarPeriod {
-    fn from(d: Date) -> Self {
+impl From<LocalDate> for CalendarPeriod {
+    fn from(d: LocalDate) -> Self {
         CalendarPeriod::Day(d)
     }
 }
 
 /// A calendar window (spec §6 Windows), taken at `now`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CalendarWindow {
     /// From local midnight to `now`.
     SinceMidnight,
@@ -84,28 +86,24 @@ pub enum CalendarWindow {
 /// A window (spec §6 Windows). Bounds are event times, evaluated against the
 /// store's `now`.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Window {
     /// `[now + start, now + end)`, `start < end`, of either sign.
     Relative {
         /// Start offset from `now`.
-        start: SignedDuration,
+        start: Span,
         /// End offset from `now`.
-        end: SignedDuration,
+        end: Span,
     },
-    /// `[from, to)`.
-    Between {
-        /// Start.
-        from: Timestamp,
-        /// End.
-        to: Timestamp,
-    },
+    /// A fixed range of event time.
+    Absolute(TimeRange),
     /// A calendar window in the site zone, or in the named IANA zone for its
     /// whole span.
     Calendar {
         /// The window.
         window: CalendarWindow,
         /// A named zone instead of the site zone.
-        zone: Option<String>,
+        zone: Option<ZoneName>,
     },
 }
 
@@ -113,18 +111,23 @@ impl Window {
     /// The last `width` up to `now`: `[now − width, now)`.
     ///
     /// # Panics
-    /// Panics if `width` exceeds the range of [`SignedDuration`].
+    /// Panics if `width` exceeds the range of [`Span`].
     pub fn rolling(width: Duration) -> Self {
-        let w = SignedDuration::try_from(width).expect("width within range");
+        let w = Span::try_from(width).expect("width within range");
         Window::Relative {
             start: -w,
-            end: SignedDuration::ZERO,
+            end: Span::ZERO,
         }
     }
 
-    /// `[from, to)`.
-    pub fn between(from: Timestamp, to: Timestamp) -> Self {
-        Window::Between { from, to }
+    /// `[now + start, now + end)`.
+    pub fn between(start: Span, end: Span) -> Self {
+        Window::Relative { start, end }
+    }
+
+    /// `[from, to)` in event time.
+    pub fn absolute(range: impl Into<TimeRange>) -> Self {
+        Window::Absolute(range.into())
     }
 
     /// A calendar window in the site zone.
@@ -177,7 +180,7 @@ impl WindowResult {
     pub fn number(&self) -> Option<f64> {
         match &self.value {
             Some(Aggregated::Number(x)) => Some(*x),
-            Some(Aggregated::Value(Some(Value::F64(x)))) => Some(*x),
+            Some(Aggregated::Value(Value::F64(x))) => Some(*x),
             _ => None,
         }
     }
@@ -199,6 +202,7 @@ pub enum View {
 
 /// The resolution of a chart query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Resolution {
     /// Raw facts when they number at most `max_points`; otherwise the finest
     /// of 1 minute, 15 minutes and whole multiples of 15 minutes that yields
@@ -221,12 +225,15 @@ pub struct Bucket {
     pub to: Timestamp,
     /// Readings.
     pub count: u64,
-    /// Smallest reading, for a numeric series.
+    /// Smallest reading starting in the bucket, for a numeric series; `None`
+    /// when no reading starts in it.
     pub min: Option<f64>,
-    /// Largest reading, for a numeric series.
+    /// Largest reading starting in the bucket, for a numeric series; `None`
+    /// when no reading starts in it.
     pub max: Option<f64>,
-    /// Time-weighted average of a gauge.
-    pub avg: Option<f64>,
+    /// Time-weighted mean of a gauge, which a value carried in from before
+    /// the bucket can give with no reading in it.
+    pub mean: Option<f64>,
     /// Time with a valid value.
     pub coverage: Duration,
 }
@@ -267,4 +274,43 @@ pub enum Live {
     /// During a restore, the fact may not be local yet. Never produced by the
     /// model backend.
     Unknown,
+}
+
+/// The facts of a query, streamed (`docs/api.md` Reading). The model backend
+/// holds them in memory already; the engine streams them block by block.
+#[derive(Debug)]
+pub struct Facts {
+    inner: std::vec::IntoIter<Fact>,
+}
+
+impl Facts {
+    pub(crate) fn new(facts: Vec<Fact>) -> Self {
+        Facts {
+            inner: facts.into_iter(),
+        }
+    }
+}
+
+impl Iterator for Facts {
+    type Item = Result<Fact, QueryError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// What a reader sees after [`Reader::refresh`](crate::Reader::refresh).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReaderState {
+    /// The durable mark's position.
+    pub durable: Position,
+    /// The manifest epoch held.
+    pub epoch: u64,
+    /// The generation.
+    pub generation: u32,
+    /// When the lease was last renewed.
+    pub lease_renewed_at: Timestamp,
 }

@@ -10,35 +10,47 @@
 //! configured funnel that selects nothing, and binds consumer names to slots.
 
 mod convert;
+mod error;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
-use std::time::Instant;
 
-use jiff::Timestamp;
 use km::engine::{ConsumerDecl, ConsumerId, EmitError, Model, Selection};
 use kvik_model as km;
+
+pub(crate) use error::Error;
+use error::Result;
 
 use crate::config::StoreConfig;
 use crate::consume::{
     Condition, Delivery, DeliveryFlags, DeliveryId, DeliveryKind, Funnel, FunnelId, FunnelState,
-    Resync, Select, Start, Trigger,
+    RESYNC_PART_FUNNELS, ResyncCause, ResyncPart, Select, Start, Trigger,
 };
-use crate::env::Clock;
-use crate::error::{BusyReason, Error, Refusal, Result};
-use crate::health::{ConsumerStats, Health, HealthReason, SeriesStats, Stats};
+use crate::env::{Clock, Monotonic};
+use crate::error::{Fault, Refusal, Wait};
+use crate::health::{
+    ClockJump, ClockStats, ConsumerStats, DiskStats, Health, IngestStats, LogStats, LossCause,
+    LossKind, LossReport, MarkState, Reason, SeriesStats, Stats,
+};
 use crate::read::{
-    Aggregate, Bucket, CalendarPeriod, CalendarWindow, ChartData, Live, LiveValue, Resolution,
-    ResultFlags, View, Window, WindowResult,
+    Aggregate, Bucket, CalendarPeriod, CalendarWindow, ChartData, Facts, Live, LiveValue,
+    ReaderState, Resolution, ResultFlags, View, Window, WindowResult,
 };
 use crate::series::{
     IntervalLength, Kind, ParameterChange, RetentionClass, SeriesInfo, SeriesKey, SeriesSpec,
     StateValues, Timing,
 };
-use crate::types::{Accepted, Ack, Fact, Intent, Position, Reading, SeriesId, TimeSource, Value};
+use crate::time::{Span, TimeRange, Timestamp};
+use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
 use convert::{dur, dur_nanos, fact_out, mpos, mquality, msid, mwait, nanos, pos, sid, ts};
+
+/// The most readings in one call, whatever the ingest queue
+/// (`docs/api.md` Writing).
+const CALL_READINGS: usize = 65_536;
+/// The most plain-encoded bytes in one call.
+const CALL_BYTES: usize = 8 << 20;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -76,17 +88,16 @@ impl Shared {
 
 /// Finds the in-memory store of a directory, for a reader.
 pub(crate) fn find(dir: &Path) -> Result<Arc<Shared>> {
-    lock(&STORES)
-        .get(dir)
-        .cloned()
-        .ok_or_else(|| Error::NotFound {
-            dir: dir.to_path_buf(),
-        })
+    lock(&STORES).get(dir).cloned().ok_or(Error::NotAStore)
 }
 
 /// Opens (creates, or restarts) the in-memory store of a directory. Returns
 /// it with the store session's epoch.
 pub(crate) fn open(config: &StoreConfig) -> Result<(Arc<Shared>, u64)> {
+    config.validate().map_err(|e| match e {
+        crate::error::OpenError::Config { key, reason } => Error::Config { key, reason },
+        other => Error::Internal(other.to_string()),
+    })?;
     jiff::tz::TimeZone::get(&config.time_zone)
         .map_err(|_| Error::UnknownZone(config.time_zone.clone()))?;
     let mut stores = lock(&STORES);
@@ -94,6 +105,9 @@ pub(crate) fn open(config: &StoreConfig) -> Result<(Arc<Shared>, u64)> {
         drop(stores);
         let epoch = shared.with(|s| s.restart(config))?;
         return Ok((shared, epoch));
+    }
+    if !config.create_if_missing {
+        return Err(Error::NotAStore);
     }
     let slot = Slot::create(config)?;
     let shared = Arc::new(Shared {
@@ -117,6 +131,11 @@ struct ConsumerSlot {
     /// has been re-routed).
     to_api: BTreeMap<u32, FunnelId>,
     next_funnel: u32,
+    /// Parts of a resync not yet handed out.
+    parts: VecDeque<Delivery>,
+    /// The last part of a resync was handed out and not yet confirmed:
+    /// nothing further is delivered until it is.
+    awaiting_resync: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -130,13 +149,15 @@ struct FunnelEntry {
 /// The state behind a store.
 #[derive(Debug)]
 pub(crate) struct Slot {
+    dir: PathBuf,
+    mark_sync: crate::health::MarkSyncMode,
     model: Model,
     /// A writer handle is open.
     open: bool,
     /// Store session, raised at every open.
     epoch: u64,
     clock: Arc<dyn Clock>,
-    last_mono: Instant,
+    last_mono: Monotonic,
     specs: BTreeMap<SeriesId, SeriesSpec>,
     consumers: BTreeMap<String, ConsumerSlot>,
     max_consumers: usize,
@@ -146,17 +167,38 @@ pub(crate) struct Slot {
     /// Model monotonic time of each series' last commit of a fact that counts
     /// for live staleness (spec §5.4).
     committed_mono: BTreeMap<SeriesId, i64>,
-    /// Refusals decided before a reading reaches the model.
-    refused: BTreeMap<Refusal, u64>,
+    /// Per-series statistics kept by the backend from outcomes.
+    series_stats: BTreeMap<SeriesId, SeriesStats>,
+    /// Emits waiting now, by a token of each waiting call.
+    waiting: BTreeMap<u64, Wait>,
+    next_wait_token: u64,
+    /// Waits by reason.
+    waits: BTreeMap<Wait, u64>,
+    batches: u64,
+    clock_jumps: u64,
+    last_jump: Option<ClockJump>,
+    /// Loss identities acknowledged.
+    acknowledged: BTreeSet<Position>,
+}
+
+fn mark_sync_mode(config: &StoreConfig) -> crate::health::MarkSyncMode {
+    match config.log.mark_sync {
+        crate::config::MarkSync::EveryCommit => crate::health::MarkSyncMode::EveryCommit {
+            reason: "configured".into(),
+        },
+        _ => crate::health::MarkSyncMode::Interval,
+    }
 }
 
 fn model_config(config: &StoreConfig) -> Result<km::engine::Config> {
     Ok(km::engine::Config {
         ingest_capacity: config.limits.ingest_queue,
-        series_ceiling: config.limits.series_ceiling,
-        low_mark: config.limits.low_mark,
-        critical_mark: config.limits.critical_mark,
+        series_ceiling: config.limits.series_ceiling as usize,
+        low_mark: config.limits.disk_low.bytes,
+        critical_mark: config.limits.disk_critical,
         seal_interval: dur_nanos(config.log.seal_interval)?,
+        future_tolerance: dur_nanos(config.limits.future_tolerance)?,
+        lateness_bound: dur_nanos(config.limits.default_lateness_bound)?,
         site_zone: config.time_zone.clone(),
         ..km::engine::Config::default()
     })
@@ -189,7 +231,7 @@ fn without_name(spec: &SeriesSpec) -> SeriesSpec {
 impl Slot {
     fn create(config: &StoreConfig) -> Result<Slot> {
         let clock = config.env.clock.clone();
-        let wall = nanos(clock.wall())?;
+        let wall = nanos(clock.wall());
         let max = config.limits.max_consumers;
         let slots = (0..max)
             .map(|i| {
@@ -203,6 +245,8 @@ impl Slot {
         let mut model = Model::new(model_config(config)?, slots, wall);
         model.clock_synchronised = clock.synchronised();
         Ok(Slot {
+            dir: config.dir.clone(),
+            mark_sync: mark_sync_mode(config),
             model,
             open: true,
             epoch: 1,
@@ -214,26 +258,34 @@ impl Slot {
             wakers: Vec::new(),
             to_wake: Vec::new(),
             committed_mono: BTreeMap::new(),
-            refused: BTreeMap::new(),
+            series_stats: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+            next_wait_token: 0,
+            waits: BTreeMap::new(),
+            batches: 0,
+            clock_jumps: 0,
+            last_jump: None,
+            acknowledged: BTreeSet::new(),
         })
     }
 
     fn restart(&mut self, config: &StoreConfig) -> Result<u64> {
         if self.open {
-            return Err(Error::Locked {
-                dir: config.dir.clone(),
-            });
+            return Err(Error::Locked);
         }
         self.clock = config.env.clock.clone();
         self.last_mono = self.clock.monotonic();
-        let ceiling = config.limits.series_ceiling;
+        let fresh = model_config(config)?;
         let cfg = &mut self.model.config;
-        cfg.ingest_capacity = config.limits.ingest_queue;
-        cfg.series_ceiling = ceiling;
-        cfg.low_mark = config.limits.low_mark;
-        cfg.critical_mark = config.limits.critical_mark;
-        cfg.seal_interval = dur_nanos(config.log.seal_interval)?;
-        cfg.site_zone = config.time_zone.clone();
+        cfg.ingest_capacity = fresh.ingest_capacity;
+        cfg.series_ceiling = fresh.series_ceiling;
+        cfg.low_mark = fresh.low_mark;
+        cfg.critical_mark = fresh.critical_mark;
+        cfg.seal_interval = fresh.seal_interval;
+        cfg.future_tolerance = fresh.future_tolerance;
+        cfg.lateness_bound = fresh.lateness_bound;
+        cfg.site_zone = fresh.site_zone;
+        self.mark_sync = mark_sync_mode(config);
         self.sync_clock();
         self.model.restart();
         if !self.model.is_up() {
@@ -250,7 +302,10 @@ impl Slot {
         for c in self.consumers.values_mut() {
             c.handle = false;
             c.attached = None;
+            c.parts.clear();
+            c.awaiting_resync = None;
         }
+        self.waiting.clear();
         Ok(self.epoch)
     }
 
@@ -267,19 +322,24 @@ impl Slot {
 
     /// Brings the model's clocks to the injected clock's: the monotonic
     /// delta advances both, the remaining wall difference is a jump.
+    /// Wall-clock jumps are counted as statistics (`docs/api.md` Health and
+    /// statistics).
     fn sync_clock(&mut self) {
         let mono = self.clock.monotonic();
-        let d = mono.saturating_duration_since(self.last_mono);
+        let dn = i64::try_from(mono.0.saturating_sub(self.last_mono.0)).unwrap_or(i64::MAX);
         self.last_mono = mono;
-        let dn = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
         if dn > 0 {
             self.model.advance(dn);
         }
-        if let Ok(w) = nanos(self.clock.wall()) {
-            let dw = w - self.model.wall;
-            if dw != 0 {
-                self.model.jump_wall(dw);
-            }
+        let w = nanos(self.clock.wall());
+        let dw = w - self.model.wall;
+        if dw != 0 {
+            self.model.jump_wall(dw);
+            self.clock_jumps += 1;
+            self.last_jump = Some(ClockJump {
+                at: ts(w),
+                by: Span(dw),
+            });
         }
         self.model.clock_synchronised = self.clock.synchronised();
     }
@@ -310,9 +370,7 @@ impl Slot {
         }
         self.up()?;
         if self.model.is_read_only() {
-            return Err(Error::ReadOnly {
-                cause: self.read_only_cause(),
-            });
+            return Err(Error::ReadOnly(self.read_only_cause()));
         }
         Ok(())
     }
@@ -331,16 +389,9 @@ impl Slot {
     }
 
     fn read_only_cause(&mut self) -> String {
-        let reasons: Vec<String> = match self.health() {
-            Health::ReadOnly { reasons, .. } | Health::Degraded { reasons } => {
-                reasons.iter().map(ToString::to_string).collect()
-            }
-            _ => Vec::new(),
-        };
-        if reasons.is_empty() {
-            "a write or sync failed".into()
-        } else {
-            reasons.join("; ")
+        match self.health() {
+            Health::ReadOnly { cause, .. } => cause.to_string(),
+            _ => "a write or sync failed".into(),
         }
     }
 
@@ -363,22 +414,26 @@ impl Slot {
     pub(crate) fn define(&mut self, epoch: u64, spec: SeriesSpec) -> Result<SeriesId> {
         self.writable(epoch)?;
         let d = convert::definition(&spec)?;
-        let id = sid(self
-            .model
-            .define_with(
-                &spec.name,
-                d.kind,
-                d.value_type,
-                &spec.unit,
-                d.staleness,
-                d.options,
-            )
-            .map_err(convert::error)?);
+        let defined = self.model.define_with(
+            &spec.name,
+            d.kind,
+            d.value_type,
+            &spec.unit,
+            d.staleness,
+            d.options,
+        );
+        let id = match defined {
+            Ok(id) => sid(id),
+            Err(km::engine::Error::Registry(km::registry::RegistryError::NameInUse(_))) => {
+                return Err(Error::Conflict(self.conflict(&spec)));
+            }
+            Err(e) => return Err(convert::error(e)),
+        };
         if let Some(existing) = self.specs.get(&id) {
             if without_name(existing) == without_name(&spec) {
                 return Ok(id);
             }
-            return Err(Error::NameInUse(spec.name));
+            return Err(Error::Conflict(self.conflict(&spec)));
         }
         if spec.retention != RetentionClass::LongTerm {
             self.model
@@ -389,6 +444,58 @@ impl Slot {
         self.reroute_patterns()?;
         self.wake_all();
         Ok(id)
+    }
+
+    /// The first field in which `spec` differs from the live series of its
+    /// name.
+    fn conflict(&self, spec: &SeriesSpec) -> &'static str {
+        let existing = self
+            .model
+            .registry()
+            .ok()
+            .and_then(|r| r.resolve(&spec.name))
+            .and_then(|d| self.specs.get(&sid(d.id)));
+        let Some(e) = existing else {
+            return "definition";
+        };
+        if e.kind != spec.kind {
+            "kind"
+        } else if e.unit != spec.unit {
+            "unit"
+        } else if e.expected_interval != spec.expected_interval {
+            "expected_interval"
+        } else if e.staleness != spec.staleness {
+            "staleness"
+        } else if e.versioned != spec.versioned {
+            "versioned"
+        } else if e.timing != spec.timing {
+            "timing"
+        } else {
+            "definition"
+        }
+    }
+
+    pub(crate) fn set_site_zone(
+        &mut self,
+        epoch: u64,
+        zone: &str,
+        effective_from: Timestamp,
+    ) -> Result<Position> {
+        self.writable(epoch)?;
+        jiff::tz::TimeZone::get(zone).map_err(|_| Error::UnknownZone(zone.into()))?;
+        let p = self
+            .model
+            .set_site_zone(zone, nanos(effective_from))
+            .map_err(convert::error)?;
+        Ok(pos(p))
+    }
+
+    pub(crate) fn raise_scale(&mut self, epoch: u64, id: SeriesId, _scale: u8) -> Result<()> {
+        self.writable(epoch)?;
+        self.spec(id)?;
+        Err(Error::NotSupportedYet(
+            "decimal series and scale raises: the reference model has no exact decimal values",
+        ))
     }
 
     pub(crate) fn set_parameters(
@@ -405,9 +512,9 @@ impl Slot {
             || change.lateness_bound.is_some()
             || change.counter.is_some()
         {
-            return Err(Error::NotSupportedYet {
-                what: "parameter changes other than the retention class",
-            });
+            return Err(Error::NotSupportedYet(
+                "parameter changes other than the retention class",
+            ));
         }
         if let Some(r) = change.retention {
             self.model
@@ -430,7 +537,7 @@ impl Slot {
         self.writable(epoch)?;
         self.spec(id)?;
         self.model
-            .retire(msid(id), nanos(t_r)?)
+            .retire(msid(id), nanos(t_r))
             .map_err(convert::error)
     }
 
@@ -525,11 +632,11 @@ impl Slot {
 
     // ----- writing -----
 
-    fn model_reading(&self, r: &Reading) -> Result<km::types::Reading, Refusal> {
-        let t = nanos(r.t).map_err(|_| Refusal::TimeOutOfRange)?;
+    fn model_reading(&self, r: &Reading) -> std::result::Result<km::types::Reading, Refusal> {
         let spec = self.specs.get(&r.series).ok_or(Refusal::UnknownSeries)?;
         use km::types::Value as V;
         let value = match (&spec.kind, &r.value) {
+            (_, Value::Absent) => V::Absent,
             (Kind::Gauge { .. } | Kind::Counter { .. } | Kind::Interval { .. }, Value::F64(x)) => {
                 V::Num(*x)
             }
@@ -547,17 +654,25 @@ impl Slot {
             ) => V::Str(
                 names
                     .get(usize::from(*i))
-                    .ok_or(Refusal::UnknownState)?
+                    .ok_or(Refusal::StateOutOfRange)?
                     .clone(),
             ),
             (Kind::Text, Value::Text(s)) => V::Str(s.clone()),
             _ => return Err(Refusal::WrongType),
         };
+        // The reference model summarises a value-less reading only when it
+        // is bad quality, so an `Absent` is submitted as bad (its supplied
+        // quality is not kept).
+        let quality = if matches!(value, V::Absent) {
+            km::types::Quality::Bad
+        } else {
+            mquality(r.quality)
+        };
         Ok(km::types::Reading {
             series: msid(r.series),
-            t,
+            t: nanos(r.t),
             value,
-            quality: mquality(r.quality),
+            quality,
             changed_at: r.changed_at,
             t_source: match r.source {
                 TimeSource::Device => km::types::TSource::Device,
@@ -566,85 +681,181 @@ impl Slot {
         })
     }
 
-    /// Emits a batch and commits it. `Ok(Err(_))` is back-pressure: nothing
-    /// of the batch was accepted; the wait is counted when `count_wait`.
+    /// A token for one waiting emit call.
+    pub(crate) fn wait_token(&mut self) -> u64 {
+        self.next_wait_token += 1;
+        self.next_wait_token
+    }
+
+    /// Records that a call waits (counted once per call, `first`).
+    pub(crate) fn note_wait(&mut self, token: Option<u64>, w: Wait, first: bool) {
+        if first {
+            *self.waits.entry(w).or_insert(0) += 1;
+            *self.model.counters.waits.entry(mwait(w)).or_insert(0) += 1;
+        }
+        if let Some(t) = token {
+            self.waiting.insert(t, w);
+        }
+    }
+
+    /// A call no longer waits (it completed or was dropped).
+    pub(crate) fn clear_wait(&mut self, token: u64) {
+        self.waiting.remove(&token);
+    }
+
+    fn stats_of(&mut self, id: SeriesId) -> &mut SeriesStats {
+        self.series_stats.entry(id).or_default()
+    }
+
+    /// The entries of the batch that ends at `last`.
+    fn batch_ending(&self, last: km::types::Position) -> Vec<km::engine::Entry> {
+        self.model
+            .disk
+            .files
+            .values()
+            .rev()
+            .find_map(|f| {
+                f.batches
+                    .last()
+                    .filter(|b| b.last().is_some_and(|e| e.position == last))
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Emits a call's readings as one batch and commits it. `Ok(Err(_))` is
+    /// back-pressure: nothing of the call was queued.
     pub(crate) fn emit(
         &mut self,
         epoch: u64,
         readings: &[Reading],
         intent: Intent,
-        count_wait: bool,
-    ) -> Result<Result<Ack, BusyReason>> {
+    ) -> Result<std::result::Result<Ack, Wait>> {
         self.writable(epoch)?;
+        let bytes: usize = readings
+            .iter()
+            .map(|r| {
+                32 + match &r.value {
+                    Value::Text(t) => t.len(),
+                    _ => 8,
+                }
+            })
+            .sum();
+        let limit = CALL_READINGS.min(self.model.config.ingest_capacity);
+        if readings.len() > limit || bytes > CALL_BYTES {
+            return Err(Error::TooLarge {
+                readings: readings.len(),
+                bytes,
+            });
+        }
         let m = &mut self.model;
         // The model queues reading by reading and cannot take one back, so
         // every cause of a wait is checked before anything is queued.
         let busy = if m.free_bytes() < m.config.critical_mark {
-            Some(BusyReason::DiskFull)
+            Some(Wait::DiskFull)
         } else if !m.clock_synchronised && readings.iter().any(|r| r.source == TimeSource::Host) {
-            Some(BusyReason::UnsyncedClock)
+            Some(Wait::UnsyncedClock)
         } else if m.queued() + readings.len() > m.config.ingest_capacity {
-            Some(BusyReason::QueueFull)
+            Some(Wait::QueueFull)
         } else {
             None
         };
         if let Some(b) = busy {
-            if count_wait {
-                *m.counters.waits.entry(mwait(b)).or_insert(0) += 1;
-            }
             return Ok(Err(b));
         }
         m.tick().map_err(convert::error)?;
-        let mut refused = Vec::new();
-        let mut keys = Vec::new();
+        let mut outcomes: Vec<Option<Outcome>> = vec![None; readings.len()];
+        let mut emitted = Vec::new();
         for (i, r) in readings.iter().enumerate() {
             let mr = match self.model_reading(r) {
                 Ok(mr) => mr,
                 Err(x) => {
-                    *self.refused.entry(x).or_insert(0) += 1;
-                    refused.push((i, x));
+                    outcomes[i] = Some(Outcome::Refused(x));
                     continue;
                 }
             };
-            let key = (mr.series, mr.t);
             let res = match intent {
-                Intent::Normal => self.model.emit(mr),
-                Intent::Revise => self.model.emit_revise(mr),
+                Intent::Revise => self.model.emit_revise(mr.clone()),
+                _ => self.model.emit(mr.clone()),
             };
             match res {
-                Ok(()) => keys.push(key),
+                Ok(()) => emitted.push((i, mr)),
                 Err(EmitError::Refused(x)) => match convert::refusal(&x) {
-                    Some(x) => refused.push((i, x)),
-                    None => return Err(Error::Internal(format!("refused mid-batch: {x}"))),
+                    Some(x) => outcomes[i] = Some(Outcome::Refused(x)),
+                    None => return Err(Error::Internal(format!("refused mid-call: {x}"))),
                 },
                 Err(EmitError::Wait(w)) => {
                     return Err(Error::Internal(format!(
-                        "unexpected wait mid-batch: {}",
+                        "unexpected wait mid-call: {}",
                         convert::wait(&w)
                     )));
                 }
             }
         }
         let report = self.model.commit(None).map_err(convert::error)?;
-        let recorded: BTreeSet<_> = report.positions.iter().copied().collect();
-        let current = self.model.current().map_err(convert::error)?;
-        for (s, t) in keys {
-            if let Some(f) = current.get(&(s, t))
-                && recorded.contains(&f.position)
-                && f.summarised()
-                && !f.flags.future
-            {
-                self.committed_mono.insert(sid(s), self.model.mono);
+        self.batches += 1;
+        // The batch holds the recorded readings in order; a reading with no
+        // entry was dropped as a duplicate.
+        let entries = report
+            .positions
+            .last()
+            .map(|p| self.batch_ending(*p))
+            .unwrap_or_default();
+        let facts: Vec<km::types::Fact> =
+            entries.iter().filter_map(|e| e.fact().cloned()).collect();
+        let mut next = facts.iter().peekable();
+        let versioned: BTreeSet<SeriesId> = self
+            .specs
+            .iter()
+            .filter(|(_, s)| s.versioned.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for (i, mr) in emitted {
+            let matched = next.peek().is_some_and(|f| {
+                f.series == mr.series
+                    && f.t == mr.t
+                    && f.supplied_quality == mr.quality
+                    && f.changed_at == mr.changed_at
+                    && (f.value.identical(&mr.value) || f.flags.no_value)
+            });
+            if !matched {
+                outcomes[i] = Some(Outcome::Duplicate);
+                continue;
+            }
+            let f = next.next().expect("peeked");
+            let current = self.model.current().map_err(convert::error)?;
+            let outranked = versioned.contains(&sid(f.series))
+                && current
+                    .get(&(f.series, f.t))
+                    .is_some_and(|c| c.position < f.position);
+            if !outranked && f.summarised() && !f.flags.future {
+                self.committed_mono.insert(sid(f.series), self.model.mono);
+            }
+            let st = self.stats_of(sid(f.series));
+            st.late += u64::from(f.flags.late);
+            st.future += u64::from(f.flags.future);
+            st.outranked_on_arrival += u64::from(outranked);
+            outcomes[i] = Some(Outcome::Recorded {
+                position: pos(f.position),
+                outranked,
+                unchecked: false,
+                rounded: false,
+            });
+        }
+        let outcomes: Vec<Outcome> = outcomes
+            .into_iter()
+            .map(|o| o.expect("every reading has an outcome"))
+            .collect();
+        for (r, o) in readings.iter().zip(&outcomes) {
+            let st = self.stats_of(r.series);
+            match o {
+                Outcome::Recorded { .. } => st.recorded += 1,
+                Outcome::Duplicate => st.duplicates_dropped += 1,
+                Outcome::Refused(x) => *st.refused.entry(*x).or_insert(0) += 1,
             }
         }
         self.wake_all();
-        Ok(Ok(Ack {
-            first: report.positions.first().copied().map(pos),
-            last: report.positions.last().copied().map(pos),
-            recorded: u32::try_from(report.positions.len()).unwrap_or(u32::MAX),
-            duplicates_dropped: u32::try_from(report.duplicates).unwrap_or(u32::MAX),
-            refused,
-        }))
+        Ok(Ok(Ack::new(outcomes)))
     }
 
     /// Runs the timer evaluations due by the clock now (spec §4 Timers).
@@ -672,10 +883,10 @@ impl Slot {
         }
         self.up()?;
         if *emits != Select::None {
-            return Err(Error::NotSupportedYet {
-                what: "a consumer that emits readings (emits other than Select::None): the model \
+            return Err(Error::NotSupportedYet(
+                "a consumer that emits readings (emits other than Select::None): the model \
                        has no routing-cycle check",
-            });
+            ));
         }
         if let Some(c) = self.consumers.get_mut(name) {
             if c.handle {
@@ -695,14 +906,12 @@ impl Slot {
         match start {
             Start::Now => {}
             Start::Position(_) => {
-                return Err(Error::NotSupportedYet {
-                    what: "a new consumer starting at a position",
-                });
+                return Err(Error::NotSupportedYet(
+                    "a new consumer starting at a position",
+                ));
             }
             Start::Time(_) => {
-                return Err(Error::NotSupportedYet {
-                    what: "a new consumer starting at a time",
-                });
+                return Err(Error::NotSupportedYet("a new consumer starting at a time"));
             }
         }
         let used: BTreeSet<ConsumerId> = self.consumers.values().map(|c| c.id).collect();
@@ -732,6 +941,8 @@ impl Slot {
                 funnels: BTreeMap::new(),
                 to_api: BTreeMap::new(),
                 next_funnel: 1,
+                parts: VecDeque::new(),
+                awaiting_resync: None,
             },
         );
         Ok(())
@@ -753,14 +964,22 @@ impl Slot {
         epoch: u64,
         name: &str,
         readings: &[Reading],
-    ) -> Result<Accepted> {
+    ) -> Result<Ack> {
         self.bound(epoch, name)?;
         self.writable(epoch)?;
-        let refused: Vec<(usize, Refusal)> = (0..readings.len())
-            .map(|i| (i, Refusal::NotDeclared))
-            .collect();
-        *self.refused.entry(Refusal::NotDeclared).or_insert(0) += refused.len() as u64;
-        Ok(Accepted::new(refused))
+        for r in readings {
+            *self
+                .stats_of(r.series)
+                .refused
+                .entry(Refusal::NotDeclared)
+                .or_insert(0) += 1;
+        }
+        Ok(Ack::new(
+            readings
+                .iter()
+                .map(|_| Outcome::Refused(Refusal::NotDeclared))
+                .collect(),
+        ))
     }
 
     pub(crate) fn release(&mut self, epoch: u64, name: &str) {
@@ -774,9 +993,7 @@ impl Slot {
     pub(crate) fn route(&mut self, epoch: u64, name: &str, funnel: Funnel) -> Result<FunnelId> {
         let cid = self.bound(epoch, name)?;
         if self.model.is_read_only() {
-            return Err(Error::ReadOnly {
-                cause: "routing changes are log entries".into(),
-            });
+            return Err(Error::ReadOnly("routing changes are log entries".into()));
         }
         let registry = self.model.registry().map_err(convert::error)?;
         let (selection, pattern_set) = match &funnel.series {
@@ -800,14 +1017,14 @@ impl Slot {
         // What the model does not support, before anything is recorded.
         match (&funnel.operator, &funnel.condition) {
             (Some(_), None) => {
-                return Err(Error::NotSupportedYet {
-                    what: "a funnel with an operator but no condition",
-                });
+                return Err(Error::NotSupportedYet(
+                    "a funnel with an operator but no condition",
+                ));
             }
             (Some(_), Some(Condition::HeldFor { .. })) => {
-                return Err(Error::NotSupportedYet {
-                    what: "a held-for condition over an operator",
-                });
+                return Err(Error::NotSupportedYet(
+                    "a held-for condition over an operator",
+                ));
             }
             _ => {}
         }
@@ -919,15 +1136,43 @@ impl Slot {
 
     /// Takes the next delivery, if one is ready: runs due timers and
     /// catch-up first.
+    /// Takes the next delivery, if one is ready: the next part of a resync
+    /// being handed out, else, unless a resync awaits confirmation, a
+    /// delivery from the model after running due timers and catch-up.
     pub(crate) fn poll_delivery(&mut self, epoch: u64, name: &str) -> Result<Option<Delivery>> {
         let cid = self.bound(epoch, name)?;
+        let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
+        if let Some(d) = c.parts.pop_front() {
+            if let DeliveryKind::Resync(p) = &d.kind
+                && p.last
+            {
+                c.awaiting_resync = Some(p.part);
+            }
+            return Ok(Some(d));
+        }
+        if c.awaiting_resync.is_some() {
+            return Ok(None);
+        }
         self.model.tick().map_err(convert::error)?;
         self.model
             .catch_up(cid, usize::MAX)
             .map_err(convert::error)?;
         let mut got = self.model.receive(cid, 1).map_err(convert::error)?;
         self.forget_observations();
-        Ok(got.pop().map(|e| self.delivery(name, e)))
+        let Some(e) = got.pop() else { return Ok(None) };
+        let parts = self.deliveries(name, e);
+        let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
+        c.parts.extend(parts);
+        let d = c.parts.pop_front();
+        if let Some(Delivery {
+            kind: DeliveryKind::Resync(p),
+            ..
+        }) = &d
+            && p.last
+        {
+            c.awaiting_resync = Some(p.part);
+        }
+        Ok(d)
     }
 
     fn api_funnel(&self, name: &str, model: km::engine::FunnelId) -> FunnelId {
@@ -937,75 +1182,113 @@ impl Slot {
             .unwrap_or(FunnelId(model.0))
     }
 
-    fn delivery(&self, name: &str, e: km::engine::Envelope) -> Delivery {
+    /// The deliveries of one model envelope: one, or the parts of a resync.
+    fn deliveries(&self, name: &str, e: km::engine::Envelope) -> Vec<Delivery> {
         use km::engine::DeliveryKind as K;
-        let id = match e.id() {
-            km::engine::DeliveryId::Fact(p) => DeliveryId::Fact(pos(p)),
-            km::engine::DeliveryId::Timer {
-                generation,
-                funnel,
-                sequence,
-            } => DeliveryId::Condition {
-                generation,
-                funnel: self.api_funnel(name, funnel),
-                sequence,
-            },
-            km::engine::DeliveryId::GenerationChanged => DeliveryId::GenerationChanged,
-            km::engine::DeliveryId::Resync => DeliveryId::Resync,
-        };
         let mut flags = DeliveryFlags {
             replayed: e.replayed,
             outranked: e.outranked,
             restoring: self.model.restoring(),
             ..DeliveryFlags::default()
         };
-        let kind = match e.kind {
+        let position = pos(e.position);
+        let delivered_at = ts(self.model.now);
+        let one = |id, kind, flags| {
+            vec![Delivery {
+                id,
+                position,
+                kind,
+                flags,
+                delivered_at,
+            }]
+        };
+        match e.kind {
             K::Fact(f) => {
                 flags.future = f.flags.future;
-                DeliveryKind::Fact(fact_out(&f, self.specs.get(&sid(f.series))))
+                one(
+                    DeliveryId::Fact(pos(f.position)),
+                    DeliveryKind::Fact(fact_out(&f, self.specs.get(&sid(f.series)))),
+                    flags,
+                )
             }
-            K::Trigger(t) => DeliveryKind::Trigger(Trigger {
-                funnel: self.api_funnel(name, t.funnel),
-                state: convert::condition_state(&t.state),
-                value: None,
-                coverage: None,
-                cause: convert::trigger_cause(t.cause),
-            }),
-            K::Resync(r) => DeliveryKind::Resync(Resync {
-                funnels: r
+            K::Trigger(t) => one(
+                DeliveryId::Condition {
+                    funnel: self.api_funnel(name, t.funnel),
+                    sequence: t.sequence,
+                },
+                DeliveryKind::Trigger(Trigger {
+                    funnel: self.api_funnel(name, t.funnel),
+                    state: convert::condition_state(&t.state),
+                    value: None,
+                    coverage: None,
+                    cause: convert::trigger_cause(t.cause),
+                }),
+                flags,
+            ),
+            K::GenerationChanged { restored_end, .. } => one(
+                DeliveryId::GenerationChanged,
+                DeliveryKind::GenerationChanged {
+                    from: restored_end.generation,
+                    to: self.model.disk.generation,
+                },
+                flags,
+            ),
+            K::Resync(r) => {
+                let cause = if r.replaced.is_some() {
+                    ResyncCause::CursorBehindLog
+                } else {
+                    ResyncCause::Resume
+                };
+                let states: Vec<FunnelState> = r
                     .funnels
                     .iter()
                     .filter(|f| f.funnel != km::engine::FunnelId::CONFIGURED)
-                    .map(|f| FunnelState {
-                        funnel: self.api_funnel(name, f.funnel),
-                        live: f
-                            .live
-                            .iter()
-                            .map(|(s, fact)| (sid(*s), self.live_of(sid(*s), fact.as_ref())))
-                            .collect(),
-                        condition: f
+                    .flat_map(|f| {
+                        let funnel = self.api_funnel(name, f.funnel);
+                        let condition = f
                             .condition
                             .as_ref()
-                            .map(|c| convert::condition_state(&c.state)),
-                        transition: f.condition.as_ref().is_some_and(|c| c.transition),
+                            .map(|c| convert::condition_state(&c.state));
+                        let transition = f.condition.as_ref().is_some_and(|c| c.transition);
+                        f.live.iter().map(move |(s, fact)| FunnelState {
+                            funnel,
+                            series: sid(*s),
+                            live: self.live_of(sid(*s), fact.as_ref()),
+                            condition: condition.clone(),
+                            transition,
+                        })
                     })
-                    .collect(),
-                replaced: r.replaced.map(|(a, b)| (pos(a), pos(b))),
-            }),
-            K::GenerationChanged {
-                cursor,
-                restored_end,
-            } => DeliveryKind::GenerationChanged {
-                cursor: cursor.map(pos),
-                restored_end: pos(restored_end),
-            },
-        };
-        Delivery {
-            id,
-            position: pos(e.position),
-            kind,
-            flags,
-            delivered_at: ts(self.model.now),
+                    .collect();
+                let chunks: Vec<Vec<FunnelState>> = if states.is_empty() {
+                    vec![Vec::new()]
+                } else {
+                    states
+                        .chunks(RESYNC_PART_FUNNELS)
+                        .map(<[FunnelState]>::to_vec)
+                        .collect()
+                };
+                let n = chunks.len();
+                chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, funnels)| {
+                        let part = u32::try_from(k + 1).unwrap_or(u32::MAX);
+                        Delivery {
+                            id: DeliveryId::Resync { part },
+                            position,
+                            kind: DeliveryKind::Resync(ResyncPart {
+                                cause,
+                                forget_above: None,
+                                part,
+                                last: k + 1 == n,
+                                funnels,
+                            }),
+                            flags,
+                            delivered_at,
+                        }
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -1015,17 +1298,22 @@ impl Slot {
             DeliveryId::Fact(p) => km::engine::DeliveryId::Fact(mpos(p)),
             // Condition funnels are never re-routed: their ids are the
             // model's.
-            DeliveryId::Condition {
-                generation,
-                funnel,
-                sequence,
-            } => km::engine::DeliveryId::Timer {
-                generation,
+            DeliveryId::Condition { funnel, sequence } => km::engine::DeliveryId::Timer {
+                generation: self.model.disk.generation,
                 funnel: km::engine::FunnelId(funnel.0),
                 sequence,
             },
             DeliveryId::GenerationChanged => km::engine::DeliveryId::GenerationChanged,
-            DeliveryId::Resync => km::engine::DeliveryId::Resync,
+            DeliveryId::Resync { part } => {
+                // Only the last part confirms the resync; an earlier part
+                // does nothing.
+                let c = self.consumers.get_mut(name).ok_or(Error::Closed)?;
+                if c.awaiting_resync != Some(part) {
+                    return Ok(());
+                }
+                c.awaiting_resync = None;
+                km::engine::DeliveryId::Resync
+            }
         };
         self.model
             .confirm_delivery(cid, mid)
@@ -1120,7 +1408,10 @@ impl Slot {
             .map(|d| d.kind)
             .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
         if km::summary::refused(kind, &a) {
-            return Err(Error::AggregateNotApplicable);
+            return Err(Error::AggregateRefused(
+                "avg, integral, increase and time-in-state are refused on an interval series"
+                    .into(),
+            ));
         }
         Ok(a)
     }
@@ -1136,16 +1427,13 @@ impl Slot {
         let now = self.model.now;
         let span = match window {
             Window::Relative { start, end } => {
-                let off = |d: &jiff::SignedDuration| {
-                    i64::try_from(d.as_nanos()).map_err(|_| Error::TimeOutOfRange)
+                let at = |d: Span| {
+                    now.checked_add(d.0)
+                        .ok_or_else(|| Error::InvalidQuery("window outside the time range".into()))
                 };
-                let (a, b) = (off(start)?, off(end)?);
-                (
-                    now.checked_add(a).ok_or(Error::TimeOutOfRange)?,
-                    now.checked_add(b).ok_or(Error::TimeOutOfRange)?,
-                )
+                (at(*start)?, at(*end)?)
             }
-            Window::Between { from, to } => (nanos(*from)?, nanos(*to)?),
+            Window::Absolute(r) => (nanos(r.from), nanos(r.to)),
             Window::Calendar { window, zone } => {
                 let cw = match window {
                     CalendarWindow::SinceMidnight => km::calendar::CalendarWindow::SinceMidnight,
@@ -1158,7 +1446,7 @@ impl Slot {
                 };
                 let ans = self
                     .model
-                    .calendar_window(msid(id), cw, zone.as_deref())
+                    .calendar_window(msid(id), cw, zone.as_ref().map(|z| z.as_str()))
                     .map_err(convert::error)?;
                 return Ok(self.window_result(
                     id,
@@ -1185,12 +1473,12 @@ impl Slot {
     pub(crate) fn buckets(
         &mut self,
         id: SeriesId,
-        range: (Timestamp, Timestamp),
+        range: TimeRange,
         resolution: Resolution,
     ) -> Result<ChartData> {
         self.readable()?;
         let spec = self.spec(id)?.clone();
-        let (a, b) = (nanos(range.0)?, nanos(range.1)?);
+        let (a, b) = (nanos(range.from), nanos(range.to));
         if a >= b {
             return Err(Error::InvalidQuery(
                 "a range's start must be before its end".into(),
@@ -1247,13 +1535,16 @@ impl Slot {
             let node = self.model.window(s, lo, hi).map_err(convert::error)?;
             let num = |agg: km::summary::Aggregate| node.aggregate(&agg).and_then(|v| v.to_f64());
             let numeric = !matches!(spec.kind, Kind::State { .. } | Kind::Text);
+            // Min and max are over readings that start in the bucket only;
+            // the mean can come from a value carried in.
+            let readings = numeric && node.count > 0;
             buckets.push(Bucket {
                 from: ts(lo),
                 to: ts(hi),
                 count: node.count,
-                min: numeric.then(|| num(km::summary::Aggregate::Min)).flatten(),
-                max: numeric.then(|| num(km::summary::Aggregate::Max)).flatten(),
-                avg: matches!(spec.kind, Kind::Gauge { .. })
+                min: readings.then(|| num(km::summary::Aggregate::Min)).flatten(),
+                max: readings.then(|| num(km::summary::Aggregate::Max)).flatten(),
+                mean: matches!(spec.kind, Kind::Gauge { .. })
                     .then(|| num(km::summary::Aggregate::Avg))
                     .flatten(),
                 coverage: dur(node.coverage),
@@ -1266,24 +1557,39 @@ impl Slot {
         })
     }
 
-    pub(crate) fn facts(
-        &mut self,
-        id: SeriesId,
-        range: (Timestamp, Timestamp),
-        view: View,
-    ) -> Result<Vec<Fact>> {
-        self.readable()?;
-        let spec = self.spec(id)?.clone();
-        let (a, b) = (nanos(range.0)?, nanos(range.1)?);
-        let s = msid(id);
-        let out = |f: &km::types::Fact| fact_out(f, Some(&spec));
+    /// The last position whose batch commit time, max(`received_at`,
+    /// previous commit time), is at or before `at` (spec §2.3).
+    fn position_at(&self, at: i64) -> Result<km::types::Position> {
+        let mut commit_time = i64::MIN;
+        let mut last = km::types::Position::ORIGIN;
+        for e in self.model.entries().map_err(convert::error)? {
+            commit_time = commit_time.max(e.received_at);
+            if commit_time > at {
+                break;
+            }
+            last = e.position;
+        }
+        Ok(last)
+    }
+
+    /// The facts of a series in a view, in `t` then position order: one per
+    /// key, or every fact for [`View::History`].
+    fn view_facts(&self, s: km::types::SeriesId, view: View) -> Result<Vec<km::types::Fact>> {
+        let as_of = |p| -> Result<Vec<km::types::Fact>> {
+            let facts = self.model.facts().map_err(convert::error)?;
+            Ok(
+                km::view::as_of_position(facts.iter().filter(|f| f.series == s), p)
+                    .into_values()
+                    .collect(),
+            )
+        };
         Ok(match view {
             View::Current => self
                 .model
                 .current()
                 .map_err(convert::error)?
-                .range((s, a)..(s, b.max(a)))
-                .map(|(_, f)| out(f))
+                .range((s, i64::MIN)..=(s, i64::MAX))
+                .map(|(_, f)| f.clone())
                 .collect(),
             View::History => {
                 let mut all: Vec<km::types::Fact> = self
@@ -1291,46 +1597,45 @@ impl Slot {
                     .facts()
                     .map_err(convert::error)?
                     .into_iter()
-                    .filter(|f| f.series == s && (a..b).contains(&f.t))
+                    .filter(|f| f.series == s)
                     .collect();
                 all.sort_by_key(|f| (f.t, f.position));
-                all.iter().map(out).collect()
+                all
             }
-            View::AsOf(p) => self.as_of(s, a, b, mpos(p), &out)?,
-            View::AsOfTime(at) => {
-                // As-of time T: the last position whose batch commit_time,
-                // max(received_at, previous commit_time), is at or before T
-                // (spec §2.3).
-                let at = nanos(at)?;
-                let mut commit_time = i64::MIN;
-                let mut last = km::types::Position::ORIGIN;
-                for e in self.model.entries().map_err(convert::error)? {
-                    commit_time = commit_time.max(e.received_at);
-                    if commit_time > at {
-                        break;
-                    }
-                    last = e.position;
-                }
-                self.as_of(s, a, b, last, &out)?
-            }
+            View::AsOf(p) => as_of(mpos(p))?,
+            View::AsOfTime(at) => as_of(self.position_at(nanos(at))?)?,
         })
     }
 
-    fn as_of(
-        &self,
-        s: km::types::SeriesId,
-        a: i64,
-        b: i64,
-        p: km::types::Position,
-        out: &dyn Fn(&km::types::Fact) -> Fact,
-    ) -> Result<Vec<Fact>> {
-        let facts = self.model.facts().map_err(convert::error)?;
-        Ok(
-            km::view::as_of_position(facts.iter().filter(|f| f.series == s), p)
-                .range((s, a)..(s, b.max(a)))
-                .map(|(_, f)| out(f))
+    pub(crate) fn facts(&mut self, id: SeriesId, range: TimeRange, view: View) -> Result<Facts> {
+        self.readable()?;
+        let spec = self.spec(id)?.clone();
+        let (a, b) = (nanos(range.from), nanos(range.to));
+        Ok(Facts::new(
+            self.view_facts(msid(id), view)?
+                .iter()
+                .filter(|f| (a..b).contains(&f.t))
+                .map(|f| fact_out(f, Some(&spec)))
                 .collect(),
-        )
+        ))
+    }
+
+    /// The latest fact at or before `t` that a window can credit (not bad
+    /// quality; the model has no displaced readings), in a view, ignoring
+    /// the staleness limit.
+    pub(crate) fn at(&mut self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<Fact>> {
+        self.readable()?;
+        let spec = self.spec(id)?.clone();
+        let t = nanos(t);
+        let facts = self.view_facts(msid(id), view)?;
+        Ok(facts
+            .iter()
+            .rev()
+            .filter(|f| f.t <= t && f.summarised())
+            // In the history view, the latest recorded fact at the greatest
+            // such `t`.
+            .max_by_key(|f| (f.t, f.position))
+            .map(|f| fact_out(f, Some(&spec))))
     }
 
     pub(crate) fn interval(
@@ -1344,74 +1649,125 @@ impl Slot {
                 length: IntervalLength::Fixed { d, phase },
                 ..
             } => {
-                let (d, phase, t) = (dur_nanos(*d)?, dur_nanos(*phase)?, nanos(t)?);
+                let (d, phase, t) = (dur_nanos(*d)?, dur_nanos(*phase)?, nanos(t));
                 let start = (t - phase).div_euclid(d) * d + phase;
-                Ok((
-                    ts(start),
-                    ts(start.checked_add(d).ok_or(Error::TimeOutOfRange)?),
-                ))
+                let end = start
+                    .checked_add(d)
+                    .ok_or_else(|| Error::InvalidQuery("interval outside the time range".into()))?;
+                Ok((ts(start), ts(end)))
             }
-            Kind::Interval { .. } => Err(Error::NotSupportedYet {
-                what: "calendar-length interval series (a local day or month)",
-            }),
+            Kind::Interval { .. } => Err(Error::NotSupportedYet(
+                "calendar-length interval series (a local day or month)",
+            )),
             _ => Err(Error::InvalidQuery("not an interval series".into())),
         }
     }
 
     // ----- health and statistics -----
 
+    /// The last committed position.
+    fn head(&self) -> Position {
+        self.model
+            .disk
+            .files
+            .values()
+            .rev()
+            .find_map(|f| {
+                f.batches
+                    .last()
+                    .and_then(|b| b.last())
+                    .map(|e| pos(e.position))
+            })
+            .unwrap_or(Position::ORIGIN)
+    }
+
+    pub(crate) fn losses(&self) -> Vec<LossReport> {
+        self.model
+            .disk
+            .lost_ranges()
+            .into_iter()
+            .map(|(a, b)| LossReport {
+                identity: pos(a),
+                kind: LossKind::DataLost,
+                cause: LossCause::Corruption,
+                first: Some(pos(a)),
+                last: Some(pos(b)),
+                file_id: None,
+                bytes: 0,
+                readable_commit_blocks: 0,
+                mark_state: MarkState::Readable,
+                boot_id: None,
+                commit_time_before: None,
+                commit_time_after: None,
+                cursors_missing: Vec::new(),
+                recorded: true,
+                acknowledged: self.acknowledged.contains(&pos(a)),
+            })
+            .collect()
+    }
+
+    pub(crate) fn acknowledge_losses(&mut self, epoch: u64, ids: &[Position]) -> Result<()> {
+        self.writable(epoch)?;
+        self.acknowledged.extend(ids.iter().copied());
+        Ok(())
+    }
+
+    /// No manifest record is ever rebuilt by the model backend, so there is
+    /// nothing to acknowledge.
+    pub(crate) fn acknowledge_manifest_rebuild(
+        &mut self,
+        epoch: u64,
+        _epoch_id: u64,
+    ) -> Result<()> {
+        self.writable(epoch)
+    }
+
     pub(crate) fn health(&mut self) -> Health {
         if !self.open {
-            return Health::ReadOnly {
-                cause: HealthReason::Closed,
-                reasons: vec![HealthReason::Closed],
-            };
+            return Health::Closed;
         }
         self.sync_clock();
         let h = self.model.health();
+        let free = self.model.free_bytes();
+        let path = self.dir.clone();
+        let losses = self.losses();
         use km::engine::Reason as R;
-        let reasons: Vec<HealthReason> = h
-            .reasons
-            .iter()
-            .map(|r| match r {
-                R::SyncFailed => HealthReason::SyncFailed,
-                R::Superseded => HealthReason::Superseded,
-                R::RestoreFailed => HealthReason::RestoreFailed { file: None },
-                R::OpenRefused => HealthReason::OpenRefused,
-                R::Quarantined(f) => HealthReason::Quarantined {
-                    file: format!("{}", f.0),
-                },
-                R::LowDisk => HealthReason::LowDisk,
-                R::CriticalDisk => HealthReason::CriticalDisk,
-                R::UploadStalled => HealthReason::UploadStalled,
-                R::ClockSkew(s) => HealthReason::ClockSkew(sid(*s)),
-                R::DataLost(a, b) => HealthReason::DataLost {
-                    from: pos(*a),
-                    to: pos(*b),
-                },
-            })
-            .collect();
-        match h.level {
-            km::engine::Level::Ok if reasons.is_empty() && !self.model.is_read_only() => Health::Ok,
-            km::engine::Level::Fatal => Health::ReadOnly {
-                cause: reasons
-                    .iter()
-                    .find(|r| {
-                        matches!(
-                            r,
-                            HealthReason::SyncFailed
-                                | HealthReason::Superseded
-                                | HealthReason::RestoreFailed { .. }
-                                | HealthReason::OpenRefused
-                                | HealthReason::Quarantined { .. }
-                        )
-                    })
-                    .or(reasons.first())
-                    .cloned()
-                    .unwrap_or(HealthReason::Closed),
-                reasons,
-            },
-            _ => Health::Degraded { reasons },
+        let mut fault = None;
+        let mut reasons = Vec::new();
+        for r in &h.reasons {
+            match r {
+                R::SyncFailed => {
+                    fault.get_or_insert(Fault::SyncFailed { path: path.clone() });
+                }
+                R::Superseded | R::RestoreFailed | R::OpenRefused | R::Quarantined(_) => {
+                    fault.get_or_insert(Fault::Io {
+                        op: "start",
+                        path: path.clone(),
+                        kind: std::io::ErrorKind::Other,
+                    });
+                }
+                R::LowDisk => reasons.push(Reason::DiskLow { free }),
+                R::CriticalDisk => reasons.push(Reason::DiskCritical { free }),
+                R::UploadStalled => {}
+                R::ClockSkew(s) => reasons.push(Reason::ClockSkew(sid(*s))),
+                R::DataLost(a, _) => {
+                    if let Some(l) = losses.iter().find(|l| l.identity == pos(*a))
+                        && !l.acknowledged
+                    {
+                        reasons.push(Reason::DataLost(l.clone()));
+                    }
+                }
+            }
+        }
+        let waiting: BTreeSet<Wait> = self.waiting.values().copied().collect();
+        reasons.extend(waiting.into_iter().map(Reason::IngestWaiting));
+        if fault.is_none() && self.model.is_read_only() {
+            fault = Some(Fault::SyncFailed { path });
+        }
+        match (fault, reasons.is_empty()) {
+            (Some(cause), _) => Health::ReadOnly { cause, reasons },
+            (None, true) => Health::Ok,
+            (None, false) => Health::Degraded { reasons },
         }
     }
 
@@ -1419,78 +1775,77 @@ impl Slot {
         if self.open {
             self.sync_clock();
         }
-        let c = &self.model.counters;
-        let mut refused = self.refused.clone();
-        for (r, n) in &c.refused {
-            if let Some(r) = convert::refusal(r) {
-                *refused.entry(r).or_insert(0) += n;
-            }
-        }
-        let facts = self.model.facts().unwrap_or_default();
-        let mut series: BTreeMap<SeriesId, SeriesStats> = self
-            .specs
-            .keys()
-            .map(|id| {
-                (
-                    *id,
-                    SeriesStats {
-                        counter_regressions: self.model.counter_regressions(msid(*id)),
-                        ..SeriesStats::default()
-                    },
-                )
-            })
-            .collect();
-        for f in &facts {
-            if let Some(st) = series.get_mut(&sid(f.series)) {
-                st.facts += 1;
-                let t = ts(f.t);
-                if st.latest_t.is_none_or(|l| t > l) {
-                    st.latest_t = Some(t);
-                }
-            }
-        }
+        let head = self.head();
         Stats {
-            duplicates_dropped: c.duplicates_dropped,
-            duplicates_unchecked: c.duplicates_unchecked,
-            refused,
-            waits: c
-                .waits
-                .iter()
-                .map(|(w, n)| (convert::wait(w), *n))
-                .collect(),
-            late: c.late,
-            future: c.future,
-            non_finite: c.non_finite,
-            negative_counter: c.negative_counter,
-            outranked_on_arrival: c.outranked_on_arrival,
-            overflows: c.overflows,
-            batches_discarded: c.batches_discarded,
-            series,
-            consumers: self
-                .consumers
-                .iter()
-                .map(|(name, s)| {
-                    (
-                        name.clone(),
-                        ConsumerStats {
-                            cursor: self
-                                .model
-                                .disk
-                                .cursors
-                                .get(&s.id)
-                                .copied()
-                                .map_or(Position::ORIGIN, pos),
-                            catching_up: self.model.in_catch_up(s.id),
-                            funnels: s.funnels.len(),
-                            evaluations_unknown: 0,
-                        },
-                    )
-                })
-                .collect(),
-            commit_latency: None,
-            backup_lag: None,
-            restore_remaining: None,
+            ingest: IngestStats {
+                queue_depth: self.model.queued(),
+                waiting: self.waiting.values().next().copied(),
+                waits: self.waits.clone(),
+                batches: self.batches,
+                syncs: self.batches,
+                ..IngestStats::default()
+            },
+            log: LogStats {
+                durable: head,
+                mark_synced: head,
+                mark_sync: self.mark_sync.clone(),
+                open_file_id: self.model.disk.active.map(|f| f.0),
+                sealed_segments: self
+                    .model
+                    .disk
+                    .files
+                    .values()
+                    .filter(|f| f.sealed && f.class == km::engine::FileClass::Segment)
+                    .count() as u64,
+                bytes: self.model.disk.used_bytes(self.model.config.entry_bytes),
+                manifest_rebuilds: 0,
+            },
+            disk: DiskStats {
+                free: self.model.free_bytes(),
+            },
+            clock: ClockStats {
+                jumps: self.clock_jumps,
+                last: self.last_jump,
+            },
         }
+    }
+
+    pub(crate) fn series_stats(&mut self, id: SeriesId) -> Option<SeriesStats> {
+        self.specs.get(&id)?;
+        let mut st = self.series_stats.get(&id).cloned().unwrap_or_default();
+        st.counter_regressions = self.model.counter_regressions(msid(id));
+        st.latest_t = self.model.facts().ok().and_then(|fs| {
+            fs.iter()
+                .filter(|f| f.series == msid(id))
+                .map(|f| ts(f.t))
+                .max()
+        });
+        Some(st)
+    }
+
+    pub(crate) fn consumer_stats(&self, name: &str) -> Option<ConsumerStats> {
+        let c = self.consumers.get(name)?;
+        Some(ConsumerStats {
+            cursor: self
+                .model
+                .disk
+                .cursors
+                .get(&c.id)
+                .copied()
+                .map_or(Position::ORIGIN, pos),
+            catching_up: self.model.in_catch_up(c.id),
+            funnels: c.funnels.len(),
+        })
+    }
+
+    pub(crate) fn refresh(&mut self) -> Result<ReaderState> {
+        self.readable()?;
+        Ok(ReaderState {
+            durable: self.head(),
+            epoch: self.model.disk.latest_epoch(),
+            generation: self.model.disk.generation,
+            lease_renewed_at: ts(self.model.now),
+        })
     }
 
     /// The clock's wall time as the store last saw it.
@@ -1504,11 +1859,15 @@ impl Slot {
 
 fn model_period(p: CalendarPeriod) -> Result<km::calendar::Period> {
     Ok(match p {
-        CalendarPeriod::Day(d) => km::calendar::Period::Day(d),
+        CalendarPeriod::Day(d) => km::calendar::Period::Day(
+            d.to_jiff()
+                .ok_or_else(|| Error::InvalidQuery(format!("no date {d}")))?,
+        ),
         CalendarPeriod::Month { year, month } => {
-            if !(1..=12).contains(&month) {
-                return Err(Error::InvalidQuery("a month is 1 to 12".into()));
-            }
+            let month = i8::try_from(month)
+                .ok()
+                .filter(|m| (1..=12).contains(m))
+                .ok_or_else(|| Error::InvalidQuery("a month is 1 to 12".into()))?;
             km::calendar::Period::Month(km::calendar::Month { year, month })
         }
     })

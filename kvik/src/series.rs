@@ -2,13 +2,13 @@
 
 use std::time::Duration;
 
-use jiff::Timestamp;
-use jiff::civil::Time;
-
+use crate::time::{LocalTime, Timestamp, ZoneName};
 use crate::types::SeriesId;
 
-/// Value type of a numeric series, fixed for its life.
+/// Value type of a numeric series, fixed for its life (the scale of a
+/// decimal series can only be raised).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ValueType {
     /// A 64-bit float.
     #[default]
@@ -21,8 +21,34 @@ pub enum ValueType {
     },
 }
 
+impl ValueType {
+    /// A decimal type with the default scale of 4.
+    pub const fn decimal() -> Self {
+        ValueType::Decimal { scale: 4 }
+    }
+}
+
+/// What a decimal series does with a value that has more decimal places than
+/// its scale (spec §2.1 `excess precision`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExcessPrecision {
+    /// Rounded half to even and flagged `rounded`.
+    #[default]
+    Round,
+    /// Refused with `Refusal::ExcessPrecision`.
+    Refuse,
+    /// The scale raised as far as needed, up to `max_scale`; beyond it
+    /// rounded.
+    AutoRaise {
+        /// Highest scale raised to.
+        max_scale: u8,
+    },
+}
+
 /// The values of a state series.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum StateValues {
     /// A boolean state.
     Bool,
@@ -32,11 +58,12 @@ pub enum StateValues {
 
 /// The calendar unit of a calendar-length interval series (spec §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CalendarUnit {
     /// A local day from one day start to the next (default midnight).
     Day {
-        /// Local time at which each day starts, 00:00 ≤ start < 24:00.
-        start: Time,
+        /// Local time at which each day starts.
+        start: LocalTime,
     },
     /// A local month.
     Month,
@@ -44,6 +71,7 @@ pub enum CalendarUnit {
 
 /// The length of an interval series' intervals (spec §2.1).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum IntervalLength {
     /// A fixed length `d > 0` with a phase, `0 ≤ phase < d`: readings are at
     /// `t ≡ phase (mod d)` on UTC nanoseconds.
@@ -58,13 +86,14 @@ pub enum IntervalLength {
     Calendar {
         /// Day or month.
         unit: CalendarUnit,
-        /// The interval zone: an IANA name, independent of the site zone.
-        zone: String,
+        /// The interval zone, independent of the site zone.
+        zone: ZoneName,
     },
 }
 
 /// The kind of a series (spec §2.1), with its value type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Kind {
     /// An instantaneous value.
     Gauge {
@@ -102,6 +131,7 @@ impl Default for Kind {
 
 /// When a series' values apply (spec §2.1 `timing`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Timing {
     /// Values observed at their `t`.
     #[default]
@@ -115,6 +145,7 @@ pub enum Timing {
 
 /// What `changed_at` holds in a versioned series (spec §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ChangedAtKind {
     /// UTC nanoseconds: the revision or issue time.
     Time,
@@ -124,6 +155,7 @@ pub enum ChangedAtKind {
 
 /// Where a series' raw detail is kept (spec §2.1, §8 Retention class).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum RetentionClass {
     /// Kept under the general tier rules.
     #[default]
@@ -138,6 +170,7 @@ pub enum RetentionClass {
 
 /// Counter rules (spec §5.5).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CounterRules {
     /// The value at which the counter wraps to zero, if it does.
     pub wrap_at: Option<f64>,
@@ -155,9 +188,21 @@ impl Default for CounterRules {
     }
 }
 
+impl CounterRules {
+    /// Counter rules.
+    pub fn new(wrap_at: Option<f64>, reset_ceiling: f64) -> Self {
+        CounterRules {
+            wrap_at,
+            reset_ceiling,
+        }
+    }
+}
+
 /// A series definition (spec §2.1). Defining a series that already exists
-/// with the same definition returns its id.
+/// with the same definition returns its id. Build it with
+/// [`SeriesSpec::new`] and the setters, or set fields on `default()`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SeriesSpec {
     /// Name, `<instance>/<device>/<metric>`.
     pub name: String,
@@ -182,11 +227,86 @@ pub struct SeriesSpec {
     pub timing: Timing,
     /// Retention class.
     pub retention: RetentionClass,
+    /// Excess-precision policy of a decimal series.
+    pub excess_precision: ExcessPrecision,
+}
+
+impl SeriesSpec {
+    /// A definition with every other field at its default.
+    pub fn new(name: impl Into<String>, kind: Kind, unit: impl Into<String>) -> Self {
+        SeriesSpec {
+            name: name.into(),
+            kind,
+            unit: unit.into(),
+            ..SeriesSpec::default()
+        }
+    }
+
+    /// Sets the name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Sets the expected interval.
+    pub fn expected_interval(mut self, d: Duration) -> Self {
+        self.expected_interval = Some(d);
+        self
+    }
+
+    /// Sets the staleness limit.
+    pub fn staleness(mut self, d: Duration) -> Self {
+        self.staleness = Some(d);
+        self
+    }
+
+    /// Sets record on change.
+    pub fn record_on_change(mut self, on: bool) -> Self {
+        self.record_on_change = on;
+        self
+    }
+
+    /// Sets the counter rules.
+    pub fn counter(mut self, rules: CounterRules) -> Self {
+        self.counter = Some(rules);
+        self
+    }
+
+    /// Sets the lateness bound.
+    pub fn lateness_bound(mut self, d: Duration) -> Self {
+        self.lateness_bound = Some(d);
+        self
+    }
+
+    /// Makes the series versioned.
+    pub fn versioned(mut self, kind: ChangedAtKind) -> Self {
+        self.versioned = Some(kind);
+        self
+    }
+
+    /// Sets the timing.
+    pub fn timing(mut self, timing: Timing) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    /// Sets the retention class.
+    pub fn retention(mut self, retention: RetentionClass) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// Sets the excess-precision policy.
+    pub fn excess_precision(mut self, policy: ExcessPrecision) -> Self {
+        self.excess_precision = policy;
+        self
+    }
 }
 
 /// A change of a series' parameters from an effective time (spec §2.1).
 /// Fields left `None` are unchanged.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ParameterChange {
     /// New expected interval.
     pub expected_interval: Option<Duration>,
@@ -201,8 +321,41 @@ pub struct ParameterChange {
     pub retention: Option<RetentionClass>,
 }
 
+impl ParameterChange {
+    /// Sets the new expected interval.
+    pub fn expected_interval(mut self, d: Duration) -> Self {
+        self.expected_interval = Some(d);
+        self
+    }
+
+    /// Sets the new staleness limit.
+    pub fn staleness(mut self, d: Duration) -> Self {
+        self.staleness = Some(d);
+        self
+    }
+
+    /// Sets the new lateness bound.
+    pub fn lateness_bound(mut self, d: Duration) -> Self {
+        self.lateness_bound = Some(d);
+        self
+    }
+
+    /// Sets the new counter rules.
+    pub fn counter(mut self, rules: CounterRules) -> Self {
+        self.counter = Some(rules);
+        self
+    }
+
+    /// Sets the new retention class.
+    pub fn retention(mut self, retention: RetentionClass) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+}
+
 /// A series named by id or by name (a name or alias of a live series).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SeriesKey {
     /// By id; retired series stay reachable this way.
     Id(SeriesId),

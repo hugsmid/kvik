@@ -19,6 +19,8 @@ model-backend = ["dep:kvik-model"]
 # Embeds the IANA time-zone database in the binary instead of reading the
 # system's. The model backend embeds it in any case.
 bundled-tzdb = ["jiff/tzdb-bundle-always"]
+# Conversions between the interface's time types and jiff 0.2's.
+jiff = []
 
 [dependencies]
 jiff = { version = "0.2", default-features = false, features = ["std"] }

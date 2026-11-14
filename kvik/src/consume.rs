@@ -2,13 +2,13 @@
 
 use std::time::Duration;
 
-use jiff::Timestamp;
-
 use crate::read::{Aggregate, Live};
+use crate::time::Timestamp;
 use crate::types::{Fact, Position, SeriesId};
 
 /// Where a new consumer starts (spec §4 New consumer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Start {
     /// After the last committed position.
     #[default]
@@ -22,6 +22,7 @@ pub enum Start {
 
 /// Which series a funnel selects.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Select {
     /// The listed series.
     Ids(Vec<SeriesId>),
@@ -174,17 +175,19 @@ pub enum DeliveryId {
     /// A condition delivery, caused by a routed fact or by the funnel's
     /// timer.
     Condition {
-        /// Generation in which it was issued.
-        generation: u32,
         /// Funnel.
         funnel: FunnelId,
-        /// Per-funnel sequence.
+        /// Per-funnel sequence, valid until the next resync.
         sequence: u64,
     },
-    /// `generation_changed` (at most one per consumer session).
+    /// `generation_changed`.
     GenerationChanged,
-    /// `resync` (at most one per consumer session).
-    Resync,
+    /// A part of a resync; confirming the last part confirms the resync,
+    /// confirming an earlier one does nothing.
+    Resync {
+        /// The part, from 1.
+        part: u32,
+    },
 }
 
 /// What produced a condition delivery.
@@ -215,32 +218,59 @@ pub struct Trigger {
     pub cause: TriggerCause,
 }
 
-/// One funnel's part of a `resync`.
+/// The state of one funnel and series in the resync that ends a resume.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct FunnelState {
     /// Funnel.
     pub funnel: FunnelId,
-    /// Live state of each series the funnel selects.
-    pub live: Vec<(SeriesId, Live)>,
+    /// Series.
+    pub series: SeriesId,
+    /// Its live state.
+    pub live: Live,
     /// Condition state now, for a condition funnel.
     pub condition: Option<ConditionState>,
     /// Whether the condition state differs from the latch, or there is no
-    /// latch: a transition, to be acted on (spec §6 Restart and resume).
+    /// latch: a transition, to be acted on (spec §6 Restart and resume). An
+    /// addition of the model backend.
     pub transition: bool,
 }
 
-/// Live and condition state now (spec §4 Resync). On receiving it, a
-/// consumer forgets every position it has seen above its durable cursor.
+/// Why a resync is sent (spec §4 Resync).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResyncCause {
+    /// At the end of a resume, after a restart or reconnect.
+    Resume,
+    /// At a reset point: positions above `forget_above` may name other facts.
+    ResetPoint,
+    /// After a restore started a new generation.
+    GenerationChanged,
+    /// The cursor is older than the oldest local log segment.
+    CursorBehindLog,
+}
+
+/// One part of a resync: a resync is 1..n deliveries, all evaluated at one
+/// position and carrying the same `cause` and `forget_above`. Confirm the
+/// `last` part; nothing further is delivered until then.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct Resync {
-    /// Every funnel in force, in funnel order.
+pub struct ResyncPart {
+    /// Why it is sent.
+    pub cause: ResyncCause,
+    /// At a reset point, the position above which the consumer must forget
+    /// every position it has seen, durably, before confirming.
+    pub forget_above: Option<Position>,
+    /// The part, from 1.
+    pub part: u32,
+    /// Whether this is the last part.
+    pub last: bool,
+    /// At most 256 funnel states; empty unless the resync ends a resume.
     pub funnels: Vec<FunnelState>,
-    /// The positions `(after, up_to]` it replaces, when the cursor was too far
-    /// behind for catch-up.
-    pub replaced: Option<(Position, Position)>,
 }
+
+/// Funnel states per resync part (`docs/api.md` Consuming).
+pub const RESYNC_PART_FUNNELS: usize = 256;
 
 /// What a delivery carries.
 #[derive(Clone, Debug, PartialEq)]
@@ -250,14 +280,14 @@ pub enum DeliveryKind {
     Fact(Fact),
     /// A condition transition.
     Trigger(Trigger),
-    /// Live and condition state now.
-    Resync(Resync),
-    /// The store was restored and started a new generation (spec §8).
+    /// A part of a resync: live and condition state now.
+    Resync(ResyncPart),
+    /// A restore started a new generation (spec §8).
     GenerationChanged {
-        /// The cursor kept from before the restore.
-        cursor: Option<Position>,
-        /// The last restored position.
-        restored_end: Position,
+        /// The generation before.
+        from: u32,
+        /// The new generation.
+        to: u32,
     },
 }
 
