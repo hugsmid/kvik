@@ -21,7 +21,7 @@ use kvik_log::scan::{ScanLimit, SealState, scan};
 use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
     Ack, Call, CallSource, CommitError, EveryCommitReason, FaultOp, IngestQueue, LogWriter,
-    MarkSync, MarkSyncMode, OpenError, Position, Reason, SealJob, Wait, WriterConfig,
+    MarkSync, MarkSyncMode, Position, Reason, SealJob, StartRule, Wait, WriterConfig,
     create_segment, seal_segment,
 };
 use proptest::prelude::*;
@@ -143,7 +143,7 @@ impl H {
 
     fn with(cfg: WriterConfig, boot: Option<[u8; 16]>, fs: MemFs) -> Self {
         let store = StoreDir::open(Arc::new(fs.clone()), &dir(), Some(&new_store())).unwrap();
-        let w = LogWriter::open(store, cfg.clone(), boot, Duration::ZERO).unwrap();
+        let w = LogWriter::open(store, cfg.clone(), boot, Duration::ZERO, T0).unwrap();
         let mut h = Self {
             fs,
             w,
@@ -428,7 +428,8 @@ fn store_creation_layout_and_open_rules() {
         StoreDir::open(afs.clone(), &dir(), None),
         Err(StoreError::Locked)
     ));
-    let w = LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO).unwrap();
+    let w = LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO, T0).unwrap();
+    assert_eq!(w.start_report().rule, StartRule::FirstStart);
     let m = durable_mark(&fs);
     assert_eq!(
         (m.counter, m.file_id, m.offset, m.last_sequence),
@@ -437,12 +438,12 @@ fn store_creation_layout_and_open_rules() {
     assert_names_durable(&fs.ops());
     assert_eq!(m.boot_id, BOOT);
     drop(w);
-    // Reopening a log that holds a mark is recovery (roadmap 4.5).
+    // Opening it again on the same boot keeps everything up to the mark and writes no entry.
     let store = StoreDir::open(afs.clone(), &dir(), None).unwrap();
-    assert!(matches!(
-        LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO),
-        Err(OpenError::Store(StoreError::NeedsRecovery(_)))
-    ));
+    let w = LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO, T0).unwrap();
+    assert_eq!(w.start_report().rule, StartRule::SameBoot);
+    assert!(w.start_report().entry.is_none());
+    drop(w);
 
     // A creation that did not finish is created again; anything else is not a store.
     let fs = MemFs::new();

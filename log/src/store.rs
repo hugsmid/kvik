@@ -1,8 +1,7 @@
 //! The store directory (`format.md` A.12): the store descriptor, the lock, the layout, and creating or opening a
 //! store through the file-system seam.
 //!
-//! Opening a store whose log already holds a mark or a batch needs recovery (roadmap 4.5); until then
-//! [`StoreDir::open`] refuses it with [`StoreError::NeedsRecovery`].
+//! The log inside is opened, and recovered if it needs to be, by [`crate::writer::LogWriter::open`].
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,8 +25,6 @@ pub const MARK: &str = "MARK";
 const STORE_TMP: &str = "STORE.tmp";
 const MANIFEST_NEW: &str = "MANIFEST.new";
 const DIRS: [&str; 3] = [LOG_DIR, "cursors", "leases"];
-/// Manifest record type of an empty record (A.14).
-const RECORD_EMPTY: u8 = 0x20;
 
 /// Why a store directory cannot be opened or created.
 #[derive(Debug, thiserror::Error)]
@@ -45,9 +42,9 @@ pub enum StoreError {
     /// A version refusal in the store descriptor or the mark.
     #[error(transparent)]
     Unsupported(FormatError),
-    /// The log already holds a mark or a batch: opening it needs recovery (roadmap 4.5).
-    #[error("the log needs recovery, which this version does not do yet: {0}")]
-    NeedsRecovery(&'static str),
+    /// A manifest record is corrupt: fetching it again or rebuilding the manifest is roadmap 6.3 (Q-116 (a)).
+    #[error("a manifest record is corrupt")]
+    ManifestCorrupt,
     /// A file operation failed.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -168,21 +165,6 @@ impl StoreDescriptor {
     }
 }
 
-/// A manifest holding its header and one empty record (A.12 creation, A.14).
-pub fn encode_initial_manifest(store_id: [u8; 16], created_at: i64) -> Vec<u8> {
-    let mut out = FileHeader::new(kind::MANIFEST, 0, 0, created_at, store_id)
-        .encode()
-        .to_vec();
-    let mut body = Vec::with_capacity(24);
-    body.extend_from_slice(&1u64.to_le_bytes()); // epoch (Q-115 (g))
-    body.extend_from_slice(&0u32.to_le_bytes()); // generation
-    body.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    body.extend_from_slice(&created_at.to_le_bytes()); // written_at
-    // A record body this short always encodes.
-    let _ = encode_block(RECORD_EMPTY, 0, &body, &mut out);
-    out
-}
-
 /// An open store directory whose lock this handle holds.
 #[derive(Debug)]
 pub struct StoreDir {
@@ -287,7 +269,10 @@ impl StoreDir {
             fs.create_dir_all(&dir.join(d))?;
         }
         let m = fs.open(&dir.join(MANIFEST), OpenMode::CreateNew)?;
-        m.write_at(&encode_initial_manifest(new.store_id, new.created_at), 0)?;
+        m.write_at(
+            &crate::manifest::encode_initial(new.store_id, new.created_at),
+            0,
+        )?;
         m.sync_all()?;
         drop(m);
         for d in DIRS {

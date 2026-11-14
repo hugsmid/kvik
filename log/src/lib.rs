@@ -13,6 +13,7 @@
 //!   the tail and the seal (A.2, A.4, A.9).
 //! - [`segment`]: the life cycle of a segment as bytes, and the states recovery may find (A.4).
 //! - [`mark`]: the durable mark's slots (A.10).
+//! - [`manifest`]: the manifest's records as far as the log's start needs them (A.14).
 //! - [`name`]: segment file names (A.12).
 //! - [`store`]: the store directory, its descriptor and lock (A.12).
 //! - [`writer`]: the commit path: group commit, sync, the durable mark, positions, segment creation and sealing
@@ -64,6 +65,7 @@ pub mod fs;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod header;
+pub mod manifest;
 pub mod mark;
 pub mod name;
 mod rle;

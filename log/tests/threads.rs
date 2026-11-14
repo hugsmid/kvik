@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use kvik_log::batch::SegmentIdentity;
 use kvik_log::content::{BatchContent, Item};
-use kvik_log::entries::Entry;
+use kvik_log::entries::{Entry, MarkState};
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{FaultOp, Fs, MemFs, StdFs};
 use kvik_log::mark::read_mark;
@@ -21,7 +21,7 @@ use kvik_log::name::SegmentName;
 use kvik_log::scan::{ScanLimit, SealState, scan};
 use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
-    Ack, CommitError, Log, LogWriter, SubmitError, SystemClock, Wait, WriterConfig,
+    Ack, CommitError, Log, LogWriter, StartRule, SubmitError, SystemClock, Wait, WriterConfig,
 };
 
 const STORE_ID: [u8; 16] = [3; 16];
@@ -61,7 +61,7 @@ fn fact(series: u32, i: i64) -> Item {
 
 fn start(fs: Arc<dyn Fs>, dir: &Path, cfg: WriterConfig) -> Log {
     let store = StoreDir::open(fs, dir, Some(&new_store())).unwrap();
-    let w = LogWriter::open(store, cfg, Some([5; 16]), Duration::ZERO).unwrap();
+    let w = LogWriter::open(store, cfg, Some([5; 16]), Duration::ZERO, T0).unwrap();
     Log::start(w, Arc::new(SystemClock::default())).unwrap()
 }
 
@@ -450,8 +450,21 @@ fn smoke_on_the_real_file_system() {
         .unwrap()
         .1;
     assert_eq!(mark.last_sequence, last);
-    // The store is closed: its lock is free again, and its log needs recovery to be opened (roadmap 4.5).
+    // The store is closed and its lock free again. On the same boot it opens up to the mark; after a reboot a
+    // recovery entry follows the last batch.
+    let store = StoreDir::open(fs.clone(), &dir, None).unwrap();
+    let w = LogWriter::open(store, cfg(), Some([5; 16]), Duration::ZERO, T0).unwrap();
+    assert_eq!(w.start_report().rule, StartRule::SameBoot);
+    assert_eq!(w.stats().durable.sequence, last);
+    drop(w);
     let store = StoreDir::open(fs, &dir, None).unwrap();
-    assert!(LogWriter::open(store, cfg(), Some([5; 16]), Duration::ZERO).is_err());
+    let w = LogWriter::open(store, cfg(), Some([6; 16]), Duration::ZERO, T0).unwrap();
+    assert_eq!(
+        w.start_report().rule,
+        StartRule::Reboot(MarkState::Readable)
+    );
+    assert_eq!(w.start_report().entry.as_ref().unwrap().sequence, last + 1);
+    assert_eq!(w.stats().durable.sequence, last + 1);
+    drop(w);
     std::fs::remove_dir_all(&dir).unwrap();
 }

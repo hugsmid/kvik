@@ -29,7 +29,7 @@
 //!     software: "example".into(),
 //! };
 //! let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("store"), Some(&new)).unwrap();
-//! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO).unwrap();
+//! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO, 0).unwrap();
 //! let log = Log::start(writer, Arc::new(SystemClock::default())).unwrap();
 //! let alias = Item::Entry(Entry::Alias { id: 1, name: "hall".into() });
 //! // Acknowledged after the batch's sync and, as it holds an entry that is not a fact, the mark's sync.
@@ -40,6 +40,7 @@
 
 mod maint;
 mod queue;
+pub mod recovery;
 mod threads;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -52,6 +53,7 @@ use std::time::Duration;
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
 pub use maint::{create_segment, seal_segment};
 pub use queue::{CallSource, IngestQueue, QueueFull};
+pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
 pub use threads::{Clock, Log, Pending, SubmitError, SystemClock};
 
 use crate::batch::SegmentIdentity;
@@ -60,11 +62,9 @@ use crate::body::{COMMIT_LEN, IndexRecord};
 use crate::content::{BatchContent, Item};
 use crate::entries::{Entry, IntervalLength};
 use crate::error::EncodeError;
-use crate::fs::{Fs, FsFile, OpenMode};
+use crate::fs::{Fs, FsFile};
 use crate::header::{FileHeader, HEADER_LEN, kind};
-use crate::mark::{MARK_LEN, MarkSlot, SLOT_OFFSETS, encode_mark_file};
-use crate::name::SegmentName;
-use crate::scan::{ScanLimit, scan};
+use crate::mark::{MarkSlot, SLOT_OFFSETS};
 use crate::segment::SealSummary;
 use crate::store::{MARK, StoreDir, StoreError};
 
@@ -510,7 +510,7 @@ pub struct LogWriter {
     generation: u32,
     boot_id: [u8; 16],
     mark_mode: MarkSyncMode,
-    mark: Box<dyn FsFile>,
+    mark: Option<Box<dyn FsFile>>,
     mark_path: PathBuf,
     mark_slot: MarkSlot,
     mark_next_slot: usize,
@@ -535,6 +535,7 @@ pub struct LogWriter {
     disk: Disk,
     waiting: Option<Wait>,
     stats: LogStats,
+    report: StartReport,
 }
 
 fn reach(t: i64, interval: Option<&IntervalLength>) -> i64 {
@@ -547,42 +548,25 @@ fn reach(t: i64, interval: Option<&IntervalLength>) -> i64 {
 }
 
 impl LogWriter {
-    /// Opens the writer on a store: the first start of a new store creates the mark (`spec.md` §3 Recovery, last
-    /// sentence). A log that already holds a mark or a batch needs recovery (roadmap 4.5) and is refused with
-    /// [`StoreError::NeedsRecovery`]. `boot_id` is `None` where the platform has none; the mark is then synced at
-    /// every commit (`format.md` A.10).
+    /// Opens the writer on a store (`spec.md` §3 Order of a start): the first start of a new store creates the
+    /// mark; any other start recovers the log ([`recovery`]) and resumes after what it kept. `boot_id` is `None`
+    /// where the platform has none; the mark is then synced at every commit (`format.md` A.10). `now` and `wall` are
+    /// the monotonic time and the wall clock. A start whose write or sync fails returns a read-only writer
+    /// ([`LogWriter::fault`]) holding what it found ([`LogWriter::start_report`]).
     pub fn open(
         store: StoreDir,
         cfg: WriterConfig,
         boot_id: Option<[u8; 16]>,
         now: Duration,
+        wall: i64,
     ) -> Result<Self, OpenError> {
         cfg.validate()?;
+        let halt = Arc::new(Halt::default());
+        let r = recovery::start(&store, &cfg, boot_id, now, wall, &halt)?;
         let fs = store.fs().clone();
         let log_dir = store.log_dir();
         let store_id = store.descriptor().store_id;
         let generation = 0;
-        Self::first_start_check(&store, &log_dir)?;
-        let mark_path = log_dir.join(MARK);
-        let slot = MarkSlot {
-            generation,
-            store_id,
-            boot_id: boot_id.unwrap_or_default(),
-            counter: 1,
-            file_id: 0,
-            offset: 0,
-            last_sequence: 0,
-            max_series_id: 0,
-        };
-        let mark = fs
-            .open(&mark_path, OpenMode::CreateNew)
-            .map_err(StoreError::Io)?;
-        mark.write_at(&encode_mark_file([Some(slot), None]), 0)
-            .map_err(StoreError::Io)?;
-        debug_assert_eq!(mark.len().ok(), Some(MARK_LEN as u64));
-        // A new file: `sync_all`, then the directory (A.13).
-        mark.sync_all().map_err(StoreError::Io)?;
-        fs.sync_dir(&log_dir).map_err(StoreError::Io)?;
         let mark_mode = match (boot_id, cfg.mark_sync) {
             (None, _) => MarkSyncMode::EveryCommit {
                 reason: EveryCommitReason::NoBootId,
@@ -592,102 +576,67 @@ impl LogWriter {
             },
             (Some(_), MarkSync::Interval(d)) => MarkSyncMode::Interval(d),
         };
+        let at = |sequence| Position {
+            generation,
+            sequence,
+        };
+        let synced = if r.mark_dirty {
+            0
+        } else {
+            r.mark_slot.last_sequence
+        };
         Ok(Self {
             stats: LogStats {
-                durable: Position {
-                    generation,
-                    sequence: 0,
-                },
-                mark_synced: Position {
-                    generation,
-                    sequence: 0,
-                },
+                durable: at(r.last_sequence),
+                mark_synced: at(synced),
                 mark_sync: mark_mode,
-                open_file_id: None,
+                open_file_id: r.open.as_ref().map(|o| o.id.file_id),
                 sealed_segments: 0,
                 bytes: 0,
                 batches: 0,
                 syncs: 0,
-                mark_syncs: 1,
-                max_series_id: 0,
+                mark_syncs: 0,
+                max_series_id: r.max_series_id,
             },
             fs,
             store,
+            mark_path: log_dir.join(MARK),
             log_dir,
             cfg,
             store_id,
             generation,
             boot_id: boot_id.unwrap_or_default(),
             mark_mode,
-            mark,
-            mark_path,
-            mark_slot: slot,
-            mark_next_slot: 1,
-            mark_dirty: false,
-            mark_synced: 0,
+            mark: r.mark,
+            mark_slot: r.mark_slot,
+            mark_next_slot: r.mark_next_slot,
+            mark_dirty: r.mark_dirty,
+            mark_synced: synced,
             last_mark_sync: now,
-            open: None,
-            ahead: None,
+            open: r.open,
+            ahead: r.ahead,
             requested: false,
-            next_file_id: 1,
-            last_sequence: 0,
-            last_commit_time: i64::MIN,
-            max_series_id: 0,
-            intervals: HashMap::new(),
+            next_file_id: r.next_file_id,
+            last_sequence: r.last_sequence,
+            last_commit_time: r.last_commit_time,
+            max_series_id: r.max_series_id,
+            intervals: r.intervals,
             last_sync_start: None,
-            fault: None,
-            halt: Arc::new(Halt::default()),
-            seals: Vec::new(),
+            fault: r.fault,
+            halt,
+            seals: r.seals,
             blocked: Vec::new(),
             seal_blocked: BTreeSet::new(),
             sealing: 0,
             disk: Disk::default(),
             waiting: None,
+            report: r.report,
         })
     }
 
-    /// The first start of a new store needs a log without a mark and without a batch. Segments created ahead by an
-    /// earlier first start that never created the mark hold no batch and are removed.
-    fn first_start_check(store: &StoreDir, log_dir: &Path) -> Result<(), StoreError> {
-        let fs = store.fs();
-        let entries = match fs.read_dir(log_dir) {
-            Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let mut unused = Vec::new();
-        for e in entries {
-            if e.name == MARK {
-                return Err(StoreError::NeedsRecovery("the log holds a mark"));
-            }
-            let Some(name) = SegmentName::parse(&e.name) else {
-                continue;
-            };
-            if name.sealed {
-                return Err(StoreError::NeedsRecovery("the log holds a sealed segment"));
-            }
-            let path = log_dir.join(&e.name);
-            let bytes = store.read_file(&path)?;
-            let id = SegmentIdentity {
-                store_id: store.descriptor().store_id,
-                file_id: name.file_id,
-                generation: name.generation,
-            };
-            let in_use = scan(&bytes, &id, ScanLimit::End)
-                .map(|r| r.in_use())
-                .unwrap_or(true);
-            if in_use {
-                return Err(StoreError::NeedsRecovery("the log holds a batch"));
-            }
-            unused.push(path);
-        }
-        for p in unused {
-            fs.remove_file(&p)?;
-        }
-        if !fs.read_dir(log_dir).map(|v| v.is_empty()).unwrap_or(true) {
-            fs.sync_dir(log_dir)?;
-        }
-        Ok(())
+    /// What the start found and did (`spec.md` §3 Recovery).
+    pub fn start_report(&self) -> &StartReport {
+        &self.report
     }
 
     /// The fault that made the store read-only, if any.
@@ -984,7 +933,11 @@ impl LogWriter {
         if self.halted() {
             return;
         }
-        if let Err(e) = self.mark.sync_data() {
+        // A writer that is not read-only holds the mark file.
+        let Some(mark) = self.mark.as_ref() else {
+            return;
+        };
+        if let Err(e) = mark.sync_data() {
             let p = self.mark_path.clone();
             self.fail(FaultOp::MarkSync, &p, &e);
             return;
@@ -1224,10 +1177,11 @@ impl LogWriter {
         if self.halted() {
             return Some(Self::unknown(&calls));
         }
-        if let Err(e) = self
-            .mark
-            .write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64)
-        {
+        let written = match self.mark.as_ref() {
+            Some(m) => m.write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        };
+        if let Err(e) = written {
             self.fail(FaultOp::MarkWrite, &mp, &e);
             return Some(Self::unknown(&calls));
         }
