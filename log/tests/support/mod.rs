@@ -156,15 +156,15 @@ pub fn entries_batch(first_sequence: u64, received_at: i64, entries: &[Entry]) -
     b
 }
 
-/// The three batches most segment tests hold: a definition (sequence 1), two readings (2 and 3), and two facts
-/// blocks of one reading each (4 and 5).
+/// The three batches most segment tests hold: a definition (sequence 1), two readings (2 and 3), and an alias with
+/// a reading (4 and 5) in two blocks.
 pub fn three_batches() -> Vec<(BatchBuilder, i64)> {
     let r0 = T0 + SECOND;
-    let mut third = facts_batch(4, r0 + 20 * SECOND, &[(1, T0 + 20 * SECOND, 21.25)]);
+    let mut third = entries_batch(4, r0 + 20 * SECOND, &[alias(1, "room/temp")]);
     third
         .push(
             block_type::FACTS,
-            facts_body(5, r0 + 20 * SECOND, &[(1, T0 + 30 * SECOND, 21.0)]),
+            facts_body(5, r0 + 20 * SECOND, &[(1, T0 + 20 * SECOND, 21.25)]),
         )
         .unwrap();
     vec![
