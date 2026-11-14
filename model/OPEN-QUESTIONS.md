@@ -34,6 +34,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
+| Q-86 | §3 Write or sync failure, Disk space, Segments; `format.md` A.4 | No space when a log segment is created, or at a log write before any sync |
+| Q-87 | §3 Recovery rules 1, 3 and 4, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -553,6 +555,44 @@ does not apply, and No deletion says nothing of it.
 **Needed.** Whether such a loss is handled as Corrupt block with deep as the failed tier (compacted again from other
 files that hold its positions, the rest a lost range reported as `data_lost`), and how it is reported.
 
+## Q-86 — No space when a log segment is created, or at a log write before any sync
+Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
+**Scenario.** (a) Free space is above the critical mark at the last check; another process then fills the file
+system, and creating the next preallocated segment (§3 Segments) fails with `ENOSPC`, leaving a partial `.open`
+file. Every acknowledged batch is durable and nothing has been written to the new file. (b) On a copy-on-write file
+system, a write of a batch into preallocated space returns `ENOSPC` before any sync; no acknowledged byte and no
+dirty page is lost. Both are write failures on the log (§3 Write or sync failure: read-only, fatal, recovery by
+restart), and both are the disk being full (§3 Disk space: ingest waits).
+**Spike.** Follows Write or sync failure (`spikes/commit/tests/faults.rs`
+`no_space_when_preallocating_the_next_segment_is_fatal_although_nothing_is_lost`,
+`no_space_on_a_log_write_is_fatal_and_nothing_is_acknowledged`).
+**Needed.** Which rule applies to each case, and what recovery does with a partial `.open` segment that holds no
+batch (`format.md` A.4 does not say).
+**Proposal.** (a) is Disk space: the partial file is deleted, health is critical, ingest waits, and the creation is
+retried when a free-space check passes. (b) stays fatal, as now: on a copy-on-write file system the same shortage can
+as well surface at the sync, where the batch's fate is unknown, and the critical mark makes either rare. Recovery
+deletes an `.open` segment that holds no complete batch and is shorter than the preallocation or has an invalid
+header.
+
+## Q-87 — A mark lost on the same boot after a failed sync
+Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
+**Scenario.** On Linux, the sync of batch b fails; the writer becomes read-only and the mark still covers b − 1
+(§3). After a failed writeback Linux marks the pages clean without writing them: the page cache holds b complete,
+the disk does not, and a later sync of the file returns success without writing it. Before the restart, and without
+a reboot, the mark file is lost or unreadable. Rule 3 treats a missing mark as a different boot: b is complete in
+the cache and kept, rule 4's sync succeeds without writing it, and b is delivered as durable although it is not on
+disk (principle 3). A later power loss removes it; nothing reports it as `possible_loss`, since it was never
+acknowledged and the next recovery has no record of it.
+**Spike.** `spikes/commit/tests/faults.rs`
+`with_the_mark_lost_after_a_failed_sync_recovery_keeps_a_batch_that_is_not_on_disk`, on a simulated file system
+with the Linux behaviour.
+**Needed.** Whether this is accepted as outside damage (the writer never touches the mark after a failed sync, so a
+half-updated mark cannot arise this way; only a deleted or damaged mark file can), or recovery must tell it apart.
+**Proposal.** For the owner. If accepted, §3 Recovery says that a mark lost on the same boot after a failed sync can
+let an unsynced batch through, like corruption outside the engine. If not, rule 3 on Linux reads an unsealed
+segment's tail from the disk rather than the page cache (for example by evicting its clean pages first), so that it
+keeps only what the disk holds.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -590,6 +630,8 @@ request, and noted in the question.
 | Q-82 | 8.3 | Restore |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
+| Q-86 | 4.5 | Injected sync errors and full disk |
+| Q-87 | 4.5 | Recovery |
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
