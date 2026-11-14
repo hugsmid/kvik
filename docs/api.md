@@ -104,6 +104,7 @@ let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named
 - Every result type carries the flag `restoring` while a restore is bringing detail back (spec §8 Restore);
   `WindowResult.flags` also carries `approximate_edges`, with `from` and `to` giving the span evaluated (spec §6
   Old spans). A window with no span over local detail is the error `DetailNotLocal`, never an empty result.
+  `facts` over detail that is not local, also during a restore, fetches it on demand.
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 
