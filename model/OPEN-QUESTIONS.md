@@ -585,8 +585,10 @@ flagged.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
-by the roadmap item named here, before that item is done. Until then the model's choice, where it has one, is the
-one pinned in `tests/open_questions.rs`.
+by the roadmap item named here, before that item is done. Until then the model's choice, where a test pins it, is the
+one named in the question. Settling Q-33, Q-34 (c), Q-46 to Q-48, Q-61 or Q-78 may add fields to `docs/format.md` or
+calls to `docs/api.md` after gate 3.3; such a change is made by the item that settles the question, in its own pull
+request, and noted in the question.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -596,26 +598,26 @@ one pinned in `tests/open_questions.rs`.
 | Q-39 (e) | 8.3 | For the owner, before restore is built |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b)–(d) | 5.1 | Series registry and timing; (d) for the owner |
-| Q-46 | 4.6 | Second-process reader |
+| Q-46 | 4.5 | One design round with Q-33, Q-34 (c), Q-47 and Q-48 |
 | Q-47 | 4.5 | Recovery, with 5.3 (resync) |
 | Q-48 | 4.5 | Recovery |
-| Q-49 (b) | 8.3 | For the owner, before restore is built |
-| Q-52 | 4.5 | Recovery, with 6.3 (manifest) |
+| Q-49 (b) | 5.3 | For the owner; it changes what `resync` promises |
+| Q-52 | 3.1 | Telling a torn manifest tail from a corrupt record needs a format change |
 | Q-60 | 7.1 | Stored levels |
 | Q-61 | 5.2 | Consumer queues and durable cursors |
 | Q-62 | 5.3 | Catch-up |
 | Q-63 | 5.4 | Windowed operators and conditions |
-| Q-64 | 8.3 | Restore |
-| Q-70 | 8.3 | Restore |
+| Q-64 | 7.1 | What a tree checkpoint holds |
+| Q-70 | 7.1 | One option puts chunk indexes in the checkpoint |
 | Q-71 | 6.3 | Manifest and publish-and-retire |
 | Q-72 | 6.2 | Revised-key index and compaction |
 | Q-73 | 5.1 | Series registry (proposal: the adapter leaves them out) |
 | Q-75 | 7.3 | Calendar levels |
-| Q-76 | 7.3 | Calendar levels |
+| Q-76 | 3.1 | A log entry kind; it also places interval starts (§2.1) |
 | Q-77 | 7.3 | Calendar levels |
 | Q-78 | 5.2 | Routing table |
 | Q-79 | 4.5 | Recovery |
-| Q-80 | 7.3 | Calendar levels, with 5.1 |
+| Q-80 | 5.1 | Definition checks, after Q-76 |
 | Q-81 | 5.4 | Windowed operators |
 
 ## For the format and interface documents
