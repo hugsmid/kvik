@@ -736,3 +736,39 @@ fn a_batch_above_8_mib_of_data_blocks_or_without_a_sequence_is_not_complete() {
     b.push_unknown(0x50, FLAG_SKIPPABLE, vec![]).unwrap();
     assert!(b.encode(&ID, 64, T0).is_err());
 }
+
+/// `batch_crc32c` covers bytes 0..12 of each block header (`format.md` A.7, Q-119): two batches at the same offset
+/// whose blocks differ only in one header field have different sums, and neither commit block completes the other's
+/// blocks. With whole headers, each followed by its own CRC32C, the sums were equal.
+#[test]
+fn batch_crc_tells_apart_blocks_that_differ_only_in_a_header() {
+    let encode = |t: u8| {
+        let mut b = BatchBuilder::new();
+        b.push(block_type::FACTS, facts_body(1, T0, &[(1, T0, 1.0)]))
+            .unwrap();
+        b.push_unknown(t, FLAG_SKIPPABLE, vec![7; 8]).unwrap();
+        b.encode(&ID, 64, T0).unwrap()
+    };
+    let (a, b) = (encode(0x50), encode(0x51));
+    assert_eq!(a.len(), b.len());
+    let crc_at = a.len() - 64 + 16 + 40;
+    assert_ne!(a[crc_at..crc_at + 4], b[crc_at..crc_at + 4]);
+    // The same for a body length: one more byte of padding-free body.
+    let mut c = BatchBuilder::new();
+    c.push(block_type::FACTS, facts_body(1, T0, &[(1, T0, 1.0)]))
+        .unwrap();
+    c.push_unknown(0x50, FLAG_SKIPPABLE, vec![7; 7]).unwrap();
+    let c = c.encode(&ID, 64, T0).unwrap();
+    assert_eq!(c.len(), a.len());
+    assert_ne!(a[crc_at..crc_at + 4], c[crc_at..crc_at + 4]);
+    // Each is complete; `b`'s blocks under `a`'s commit block are not.
+    let mut spliced = b.clone();
+    spliced[a.len() - 64..].copy_from_slice(&a[a.len() - 64..]);
+    for (bytes, complete) in [(&a, true), (&b, true), (&spliced, false)] {
+        let mut s = SegmentImage::create_ahead(ID, T0, 4096).unwrap();
+        s.take_into_use(1).unwrap();
+        put(s.bytes_mut(), 64, bytes);
+        let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();
+        assert_eq!(r.batches.len(), usize::from(complete));
+    }
+}

@@ -79,8 +79,9 @@ else starts an **invalid region**. Outside a log segment, an invalid region ends
 **Resynchronisation** (log segments). From an invalid region the reader steps forward 8 bytes at a time (all-zero
 words are passed without a checksum) and accepts an offset `o` only if a **complete batch** (A.7) starts there: every
 block valid, `block_count` and `batch_bytes` match, the commit block's `generation` is the file header's, its
-`first_sequence` is above the last kept sequence, and `batch_crc32c` matches. `batch_crc32c` covers `o` (A.7), so a
-batch image at any other offset, or bytes inside a text value that imitate a batch, are not accepted. A reader
+`first_sequence` is above the last kept sequence, and `batch_crc32c` matches. `batch_crc32c` covers `o` and, through
+each data block's `body_crc32c`, every body (A.7), so a batch image at any other offset, or bytes inside a text value
+that imitate a batch without its exact blocks, are not accepted. A reader
 process applies the same rule below the mark's `offset` and never above it. A structural failure inside a
 checksum-valid block (the checks of A.5 and A.6) makes the block invalid; the region is handled as corruption
 (`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14).
@@ -311,7 +312,7 @@ entries block until the next would take its body past 16 MiB.
 | 16 | 8 | `last_sequence` | inclusive; the last counted |
 | 24 | 8 | `commit_time` | non-decreasing within a generation by construction; a reader does not test it |
 | 32 | 8 | `batch_bytes` | from the first byte of the batch's first block header up to, not including, this block's header, padding included; so this header is at `o + batch_bytes`, where `o` is the batch's offset |
-| 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then the 16-byte headers of every block before the commit block, in order |
+| 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then bytes 0..12 of the header of every block before the commit block, in order: each header without its `header_crc32c`, so that the bodies are reached through their `body_crc32c` (a header followed by its own CRC32C would cancel out of the sum, Q-119) |
 | 44 | 4 | reserved | |
 
 A batch is **complete** when every data block is valid, the commit block is valid, `block_count` and `batch_bytes`

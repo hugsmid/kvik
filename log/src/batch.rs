@@ -179,7 +179,8 @@ pub(crate) fn read_batch<'a>(
                 None
             }
         };
-        crc.update(&b.header_bytes);
+        // Bytes 0..12: without `header_crc32c`, which would cancel them out of the sum (Q-119).
+        crc.update(&b.header_bytes[..12]);
         blocks.push(DataBlock { block: b, prefix });
         pos = b.next_offset();
     };
@@ -265,7 +266,7 @@ pub(crate) fn framing_holds(bytes: &[u8], id: &SegmentIdentity, o: u64, limit: u
                 if pos - o + h.block_len() > MAX_BATCH_DATA {
                     return false;
                 }
-                crc.update(&raw);
+                crc.update(&raw[..12]);
                 count += 1;
                 pos += h.block_len();
             }
@@ -397,7 +398,7 @@ impl BatchBuilder {
         crc.update(&offset.to_le_bytes());
         for (t, flags, body) in &self.blocks {
             let h: BlockHeader = encode_block(*t, *flags, body, &mut out)?;
-            crc.update(&h.encode());
+            crc.update(&h.encode()[..12]);
         }
         // A batch holds at most 8 MiB of data blocks (A, common rules: sizes).
         if out.len() as u64 > MAX_BATCH_DATA {

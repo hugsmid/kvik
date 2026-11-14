@@ -254,7 +254,7 @@ pub fn raw_batch_reserved(
     };
     for (t, flags, body) in blocks {
         let h = block(*t, *flags, body, &mut out);
-        covered.extend_from_slice(&h);
+        covered.extend_from_slice(&h[..12]);
     }
     let mut commit = Vec::new();
     commit.extend_from_slice(&id.generation.to_le_bytes());

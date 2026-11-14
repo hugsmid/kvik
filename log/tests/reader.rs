@@ -1120,7 +1120,7 @@ proptest! {
 }
 
 /// Found by the property test: after a remount, positions 4 to 10 are assigned again to other facts in a batch of the
-/// same size at the same offset with the same commit time, so its commit block is byte for byte the old one (Q-119).
+/// same size at the same offset with the same commit time; before Q-119 its commit block was byte for byte the old one.
 #[test]
 fn a_batch_assigned_again_with_an_identical_commit_block_is_still_voided() {
     use Op::*;

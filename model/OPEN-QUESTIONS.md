@@ -33,7 +33,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
 | Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
 | Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
-| Q-119 | `format.md` A.7, A.2 Resynchronisation | `batch_crc32c` does not depend on the blocks it is said to cover |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -562,7 +561,7 @@ before the segments; a start that truncates below it while they are read leaves 
 **Implemented.** (a) Unreadable: `MarkUnreadable` at open and at refresh, which changes nothing the reader holds. (b)
 Back to back. (c) Everything taken is void (`VoidCause::Generation`) and the log is read again from its start. (d) The
 error names the file; nothing at or past it is read until it can be. (e) The reader keeps a CRC32C over all the bytes of
-each of its last 64 batches (the commit block alone does not identify a batch, Q-119) and reads the last one again
+each of its last 64 batches (before the Q-119 ruling the commit block alone did not identify a batch) and reads the last one again
 before each refresh; if it differs, it voids what it took above the last
 that still reads the same (`VoidCause::Rewritten`) and reads on from there; with none left, above the position before
 the oldest, reading again from that segment's start, where every recovery entry is applied again: the new one voids
@@ -584,23 +583,6 @@ complete batch, so the accepted limit becomes a loss reported as a reset point; 
 rather than by its own checksums. Recorded here until the format pull request.
 **Needed.** A rule for each part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
 
-## Q-119 — `batch_crc32c` does not depend on the blocks it is said to cover
-Found while building the reader process (roadmap 4.6), by its property test.
-**Scenario.** A.7: `batch_crc32c` is the CRC32C over `store_id`, `file_id`, `o`, "then the 16-byte headers of every
-block before the commit block". Each header ends with `header_crc32c`, the CRC32C of its first 12 bytes. A CRC
-register fed a message and then that message's own CRC returns to a fixed state, so for a given `store_id`,
-`file_id`, `o` and block count every set of valid headers gives the same `batch_crc32c`: it does not depend on any
-block's type, flags, length or body checksum. In the test, after a remount, positions 4 to 10 were assigned again to
-other facts in a batch of the same size at the same offset with the same commit time; the new commit block was byte
-for byte the old one. A.2's claim still holds for a batch image at another offset (`o` is covered), but the field
-adds nothing that ties the commit block to its data blocks, and bytes that imitate a batch at its own offset need
-only valid block checksums (compare Q-110).
-**Implemented.** Nothing in the format changes. The reader identifies a batch by a CRC32C over all its bytes
-(Q-118 (e)); recovery and the scan are unchanged.
-**Needed.** Whether `batch_crc32c` should cover the headers without their `header_crc32c` (bytes 0..12 of each), or
-the bodies' checksums some other way; that is a new major format version or a reading of A.7 before the first
-release. To be settled at gate 4.9.
-
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -609,7 +591,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6.
+Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119 was settled after it by the owner's ruling.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -839,6 +821,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-106 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, the parameter change, the recovery entry alone | `format.md` common rules ((a) a reader applies only the listed checks; a canonical check also requires the canonical bytes), A.5 ((b) canonical heap in row order, none shared, a reader accepting any offsets inside the heap, shared bytes included; (c) unpadded payload lengths, plain wins a tie), A.6 ((d) presence checked as invalid content, a named-state series needs a name, kind and value type not compared; (e) entries share a block up to 16 MiB; (f) entry type 5 refused until roadmap 5.2, field 41 skipped; (g) fields 25 and 26 allowed in a parameter change since Q-100, fields without a range take any value, a change with only field 1 valid; (h) a recovery entry not alone in its batch is invalid content), A.11 (nothing allocated from a declared count or length before it is checked; output bounded by the row and entry limits). As implemented in `kvik-log`, with (g) changed for Q-100; `log/tests/batches.rs` pins each part |
 | Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
 | Q-117 | A recovery entry adopted after its own sync failed | §3 Recovery rule 3, Last batch written again, and Order of a start step 3 (an adopted entry is written again in place before the sync of step 3, whatever the mark; extends the Q-87 ruling). Scenario: a readable mark of the old boot; the start's sync of its recovery entry fails, so the entry is in the page cache only; the next start on the same boot adopts it, and its sync writes nothing; the mark then names F, a batch is acknowledged at F + 1, and a power loss removes the entry, which the following start reports as `data_lost` with nothing damaged (`log/tests/recovery.rs`, `an_adopted_entry_whose_own_sync_failed_is_written_again`) |
+| Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

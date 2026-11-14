@@ -14,7 +14,8 @@
 //!   complete batch below the mark it acts on, but that mark can be older than the one the reader read: a start
 //!   after a page-cache loss on the same boot truncates the batch beyond the mark on disk (`spec.md` §3 Recovery
 //!   rule 1, accepted limit), and a damaged tail is truncated under rule 3. The reader keeps a checksum over all
-//!   the bytes of each of its recent batches (a commit block alone does not tell two batches apart, Q-119); when
+//!   the bytes of each of its recent batches (the commit block's `batch_crc32c` reaches the bodies since Q-119;
+//!   the whole-batch sum stays until the reset stamp decides, Q-118 (e)); when
 //!   the last one no longer reads the same, it voids what it took above the last that does
 //!   ([`VoidCause::Rewritten`], Q-118 (e)).
 //! - **The mark again after the scan.** If it moved backwards meanwhile, a start may have rewritten what was just

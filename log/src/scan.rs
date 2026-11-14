@@ -732,7 +732,7 @@ mod tests {
             d.extend_from_slice(&id.store_id);
             d.extend_from_slice(&id.file_id.to_le_bytes());
             d.extend_from_slice(&o.to_le_bytes());
-            d.extend_from_slice(&h);
+            d.extend_from_slice(&h[..12]);
             let commit = Commit {
                 generation: id.generation,
                 block_count: 1,
