@@ -114,7 +114,7 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 23 | `row_23_series_renamed_alias_fact` | `edge_cases.rs` |  |  |
 | 24 | `row_24_unit_or_kind_change_is_new_series` | `edge_cases.rs` |  |  |
 | 25 | `row_25_series_retired_at_t_r` | `edge_cases.rs` |  |  |
-| 26 | `row_26_reader_holds_an_old_epoch` | `edge_cases.rs` |  | A reader in a second process (roadmap 4.6) |
+| 26 | `row_26_reader_holds_an_old_epoch` | `edge_cases.rs` |  | A reader in a second process: its lease, renewal, expiry and void leases are in `log/tests/reader.rs` (roadmap 4.6); files kept for an old epoch need retired files (roadmap 6.3) |
 | 27 | `row_27_bucket_unreachable_for_days` | `edge_cases.rs` |  | A real bucket (roadmap 8.2) |
 | 28 | `s8_restore_claims_next_generation_from_sequence_1`, `s8_restore_from_latest_checkpoint_at_or_below_restored_end`, `s8_restoring_queries_at_one_minute_resolution`, `s8_restored_end_before_first_gap`, `s8_detail_back_verifies_checkpoint_and_removes_label` | `rules.rs` |  | Positions set aside are not reported and their ids not reserved; fact reads do not fetch on demand (restore drill, roadmap 8.3) |
 | 28a | `s8_restart_after_record_resumes_in_its_generation`, `s8_crash_before_record_restarts_with_next_generation`, `s8_crash_during_step_1_finishes_it_before_ingest`; `inv09_stepwise_restore_from_checkpoint` | `rules.rs`; `invariants.rs` |  | A crash inside a download: a download is atomic in the model (kill loop, roadmap 8.3) |

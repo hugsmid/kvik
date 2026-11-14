@@ -36,6 +36,7 @@ log-batches     log   batches
 log-model       log   model_differential
 log-writer      log   writer
 log-recovery    log   recovery
+log-reader      log   reader
 '
 
 cd "$(dirname "$0")/.."

@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
 | Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
 | Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
+| Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -174,6 +175,10 @@ one lower bound; that is not defeated by a stamp reset at restore; and that answ
 named by the mark has been lost. Then the reader call, `start: position` (with what it forgets) and row 7b's rule,
 and whether the mark and the recovery entry carry a reset stamp and nonce. Only `format.md` A.6 field 41 is reserved
 for the entry; the mark (A.10, version 3) has 40 reserved bytes, so a stamp fits there without a new version.
+**Roadmap 4.6 so far.** The log's reader process (`kvik-log` `reader`) voids only what one handle took itself: above a
+recovery entry's `after`, and above the last returned batch that still reads the same after a start truncated others
+(Q-118 (e)). No position outlives the handle, so none of the branches above is needed there. The check of a kept
+position, `start: position` and row 7b's rule are not built; they need the stamp fields and a rule from the owner.
 
 ## Q-52 (b) — Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it
 **Scenario.** Parts (a) and (c) are settled at gate 3.3 (see Settled). §7 Manifest writes the last valid record's
@@ -502,7 +507,7 @@ no valid slot beside an empty log is not named: a crash while the first start wr
 segments.* "Rule 1 also zero-fills every later segment in use" does not say whether their headers, which put them in
 use, are zeroed too. (f) *The torn tail's extent.* The tail reported by a recovery entry is not said to include
 bytes in segments after the last in use, which are unused and deleted. (g) *Epochs above leases.* New manifest epochs
-continue above every epoch named by a lease file; leases are roadmap 4.6. (h) *Gaps between sealed segments.* The
+continue above every epoch named by a lease file; leases were roadmap 4.6. (h) *Gaps between sealed segments.* The
 gap rule between a segment's last sequence and the next one's `base_sequence` (A.4) is not said to be checked at
 every start for segments already sealed. (i) *An empty segment in use that is not the last.* A segment taken into
 use with no batch, followed by another in use, is never sealed (an empty segment is not sealed) and is not named in
@@ -519,13 +524,49 @@ manifest count. (c) A start reports what it found and what the manifest holds; e
 the item that puts the engine behind the interface. (d) Treated as a first start, if the manifest names no position either: the mark is written again in place.
 "An empty log" stops being a safe test once segments can leave `log/` (tiering, roadmap 8.1).
 (e) Their headers stay; the writer resumes in the last segment in use, after its header, whose `base_sequence` is the
-mark's last position + 1. (f) Only the last segment in use. (g) Not done. (h) Only unsealed segments are checked. (i)
+mark's last position + 1. (f) Only the last segment in use. (g) Done at roadmap 4.6: a start's first new epoch is above every epoch a valid
+lease file names, a void lease's included (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
 (n) Measured by roadmap 4.8.
-**Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (g)
-with 4.6, (n) with 4.8.
+**Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (n) with
+4.8.
 To be settled at gate 4.9.
+
+## Q-118 — The reader process and leases: points `spec.md` §7 and `format.md` A.2, A.10, A.13 and A.15 leave open
+Found while building the reader process (roadmap 4.6, crate `kvik-log`: `reader`, `lease`). Each part names the
+reading implemented for now; tests in `log/tests/reader.rs` pin it.
+**Scenario.** (a) *No mark.* A.10 names retries when neither slot is valid, not a missing mark file: a store whose
+first start has not written it yet, or a mark an operator removed. (b) *Retry pace.* "Retries 8 times" gives no
+pause. (c) *A new generation.* A restore (roadmap 8.3) sets positions aside "also in reader processes"; a reader that
+sees the mark's generation change has no restore record to read yet. (d) *A refused file.* "A reader process returns
+the error for that file only": positions are read in order, so reading past a refused segment would skip positions.
+(e) *Truncation without a reset point.* §7 voids what a reader took above a recovery entry's `after`. A start after a
+page-cache loss on the same boot truncates the batch beyond the mark on disk (§3 Recovery rule 1, accepted limit)
+and writes no entry, though a reader read that batch under the newer mark the page cache held; positions are then
+assigned again. A start under rule 3 over a tail damaged after a reader read it writes its entry below where the
+reader had reached. (f) *Which epoch a refresh takes.* "Readers take an epoch ... and refresh both": whether a
+refresh moves to the manifest's current epoch, and whether a read that only renews keeps the old one. (g) *A failed
+lease write.* Whether a reader may read without a renewed lease. (h) *When the writer looks at leases.* Expiry runs
+from when the writer first observes a counter value, but no cadence is given; nor what "a different boot id" means
+when the writer has no boot identity. (i) *A corrupt manifest record.* A reader cannot take an epoch from it. (j) *The
+lease header.* A.15 says "an A.1 header" without its `file_id` and generation. (k) *What removal must honour.*
+Retired files (§7 Manifest) and tier moves (§8) do not exist yet.
+**Implemented.** (a) Unreadable: `MarkUnreadable` at open and at refresh, which changes nothing the reader holds. (b)
+Back to back. (c) Everything taken is void (`VoidCause::Generation`) and the log is read again from its start. (d) The
+error names the file; nothing at or past it is read until it can be. (e) The reader keeps the commit blocks of its
+last 64 batches and reads the last one again before each refresh; if it differs, it voids what it took above the last
+that still reads the same (`VoidCause::Rewritten`) and reads on from there; with none left, above the position before
+the oldest, reading again from that segment's start, where the recovery entry voids the rest. A batch the reader
+holds that is damaged later in the middle of the log is a loss for the writer's next start to record, not voided. (f)
+A refresh takes the current epoch; `keep_alive` keeps the epoch unless the lease may have expired. With no files to
+retire this is safe; once tree and compacted files exist, whether a refresh may move the epoch under an open iteration
+is for roadmap 6.3. (g) Open and refresh return the error and read nothing. (h) At the writer's turns, at most once a
+minute, with no timer of its own: a late look only makes an expiry later. A lease is void only when both boot ids are
+non-zero and differ. (i) `ReaderError::Manifest`. (j) `file_id` 0 and the generation at creation; the store id is
+checked, as for every file. (k) `LeaseTable::oldest_live_epoch` is the input for roadmap 6.3 and 8.1; today the writer
+deletes only segments that hold no batch.
+**Needed.** A rule for each part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
 
 ## Open at v0.2
 
@@ -535,7 +576,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling.
+Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 was recorded by roadmap 4.6.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|

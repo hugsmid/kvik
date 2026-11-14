@@ -21,6 +21,10 @@ durable mark's slots and segment file names.
   same boot, rule 2 losses recorded in the manifest, rule 3 recovery entries (written or adopted), the last batch
   written again when its sync may have failed, segments sealed again, and the mark. `manifest` reads and appends the
   records a start needs (A.14).
+- `reader` is a reader process (`spec.md` §7 Readers): no lock, no thread; it reads the mark by path at every
+  refresh, takes batches below the mark's offset only, follows segment rolls, seals, writer restarts and recovery
+  entries, and voids what it took when a start truncated it. `lease` is the lease file it renews and the writer's
+  view of the lease files: first observation, expiry, void leases, and epochs above every lease at a start (A.15).
 - `fs` is the file-system seam every file operation goes through (A.13), with an in-memory implementation for tests
   that injects faults, logs operations and keeps a durable image of each file.
 
@@ -28,5 +32,6 @@ Tests: unit tests, behaviour tests (`tests/segment.rs`), batch codec tests (`tes
 against the reference model (`tests/model_differential.rs`), golden files (`tests/golden/`, see its README), property
 tests (`tests/properties.rs`), the commit path driven deterministically (`tests/writer.rs`) and on its threads, with a
 smoke test on the real file system (`tests/threads.rs`), recovery and a kill loop (`tests/recovery.rs`, with a long
-variant run by `--ignored`) and the fuzz entry point run over generated inputs (`tests/fuzz_inputs.rs`). The
+variant run by `--ignored`), the reader process and leases, on threads and on both file systems, with a property test
+interleaving writer steps, crashes and refreshes (`tests/reader.rs`) and the fuzz entry point run over generated inputs (`tests/fuzz_inputs.rs`). The
 fuzz targets are in [`fuzz/`](fuzz/).
