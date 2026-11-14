@@ -322,7 +322,8 @@ pub fn arb_op() -> impl Strategy<Value = Op> {
 }
 
 /// [`arb_op`] with damage to the open segment (row 11a), for the
-/// invariants read with lost ranges (1, 2, 9 and 10).
+/// invariants read with lost ranges (1, 2, 9 and 10) and those that must
+/// hold across them (3, 4, 5, 8 and 11).
 pub fn arb_lossy_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         12 => arb_op(),
@@ -613,10 +614,10 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             };
             if let Some(b) = chosen {
                 m.corrupt_open_batch(b).map_err(|e| e.to_string())?;
+                // The loss is the one invariant 10 allows; the lost-range
+                // properties check that it is recorded and reported.
+                return Ok(());
             }
-            // The loss is the one invariant 10 allows; the lost-range
-            // properties check that it is recorded and reported.
-            return Ok(());
         }
     }
     let after = durable(m);

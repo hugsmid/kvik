@@ -394,9 +394,10 @@ pub enum ManifestOp {
         /// The restored end.
         restored_end: Position,
     },
-    /// A lost range (§3 Recovery rule 2): positions from `from` to `to`
-    /// whose batch in the open segment was found corrupt by recovery, with no
-    /// other copy. Reported as `data_lost`; its positions are not reused.
+    /// A lost range (§3 Recovery rule 2, §8 Corrupt block): positions from
+    /// `from` to `to` of a log segment found corrupt with no other copy, a
+    /// batch of the open segment by recovery or a sealed segment by a scrub.
+    /// Reported as `data_lost`; its positions are not reused.
     LostRange {
         /// First lost position.
         from: Position,
@@ -1295,6 +1296,26 @@ impl Disk {
                 ManifestOp::LostRange { from, to } => Some((from, to)),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Runs of adjacent damaged batches of one segment, as first and last
+    /// position: the lost ranges recovery finds (§3 Recovery rule 2).
+    pub fn damaged_runs(&self) -> Vec<(Position, Position)> {
+        self.damaged
+            .iter()
+            .fold(
+                Vec::<(FileId, Position, Position)>::new(),
+                |mut runs, ((f, _), (from, to))| {
+                    match runs.last_mut() {
+                        Some((g, _, end)) if g == f && end.next() == *from => *end = *to,
+                        _ => runs.push((*f, *from, *to)),
+                    }
+                    runs
+                },
+            )
+            .into_iter()
+            .map(|(_, from, to)| (from, to))
             .collect()
     }
 
@@ -2200,29 +2221,12 @@ impl Model {
     /// batch or, with none, to the mark's last position; the model keeps the
     /// positions each damaged batch held, which give the same range when its
     /// neighbours are valid, and do not repeat an earlier lost range next to it.
-    /// A recovery whose sync fails records nothing; damage it leaves is
-    /// recorded by the next recovery that can write, even if a read-only
-    /// engine sealed the segment meanwhile.
+    /// A recovery whose sync fails writes no record (Q-79), but reports the
+    /// ranges it found as `data_lost` (§8 "recorded when found"); the next
+    /// recovery that can write records them.
     fn record_lost_ranges(&mut self) {
-        let runs: Vec<(Position, Position)> = self
-            .disk
-            .damaged
-            .iter()
-            .fold(
-                Vec::<(FileId, Position, Position)>::new(),
-                |mut runs, ((f, _), (from, to))| {
-                    match runs.last_mut() {
-                        Some((g, _, end)) if g == f && end.next() == *from => *end = *to,
-                        _ => runs.push((*f, *from, *to)),
-                    }
-                    runs
-                },
-            )
-            .into_iter()
-            .map(|(_, from, to)| (from, to))
-            .collect();
         let at = self.wall;
-        for (from, to) in runs {
+        for (from, to) in self.disk.damaged_runs() {
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
                 epoch,
@@ -2837,6 +2841,10 @@ impl Model {
 
     /// Seals the active segment now.
     pub fn seal_active(&mut self) {
+        // A read-only engine accepts no writes (§3 Write or sync failure).
+        if self.is_read_only() {
+            return;
+        }
         if self.disk.tail_len() > 0 {
             // Batches past the durable mark (failed sync): the segment is not
             // sealed until a restart has decided what reached the disk.
@@ -4149,8 +4157,15 @@ impl Model {
         for f in &self.disk.quarantined {
             raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
         }
-        // Not read-only (§3 Recovery rule 2).
-        for (from, to) in self.disk.lost_ranges() {
+        // Not read-only (§3 Recovery rule 2). Damage still pending while the
+        // engine is up was found by a recovery whose sync failed: reported as
+        // found, not yet recorded (Q-79).
+        let pending = if self.vol.is_some() {
+            self.disk.damaged_runs()
+        } else {
+            Vec::new()
+        };
+        for (from, to) in self.disk.lost_ranges().into_iter().chain(pending) {
             raise(Level::Degraded, Reason::DataLost(from, to), &mut reasons);
         }
         let free = self.free_bytes();
@@ -4797,6 +4812,38 @@ impl Model {
             .collect();
         for f in &bad {
             self.disk.quarantined.insert(*f);
+        }
+        // §8 Corrupt block: a sealed log segment with no other copy loses
+        // its positions that no other file holds, recorded as lost ranges
+        // and reported as `data_lost`, so they are not issued again. The
+        // model damages a whole file, so the whole segment is lost.
+        let held: BTreeSet<Position> = self.disk.all_entries().into_keys().collect();
+        let at = self.wall;
+        for f in &bad {
+            let file = &self.disk.files[f];
+            if file.class != FileClass::Segment || !file.sealed {
+                continue;
+            }
+            let lost: Vec<Position> = file
+                .entries()
+                .map(|e| e.position)
+                .filter(|p| !held.contains(p) && !self.disk.is_lost(*p))
+                .collect();
+            let mut runs: Vec<(Position, Position)> = Vec::new();
+            for p in lost {
+                match runs.last_mut() {
+                    Some((_, end)) if end.next() == p => *end = p,
+                    _ => runs.push((p, p)),
+                }
+            }
+            for (from, to) in runs {
+                let epoch = self.disk.epoch();
+                self.disk.manifest.push(ManifestRecord {
+                    epoch,
+                    at,
+                    op: ManifestOp::LostRange { from, to },
+                });
+            }
         }
         bad
     }

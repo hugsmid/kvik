@@ -716,28 +716,46 @@ fn s5_2_text_nodes_carry_coverage() {
     );
 }
 
-/// §8 Corrupt block: a sealed log segment that is neither uploaded nor
-/// compacted is the only copy; corruption there loses its range and is
-/// reported as a fatal health condition. It is never repaired in place.
+/// §8 Corrupt block, row 11: a sealed log segment that is neither uploaded
+/// nor compacted is the only copy; corruption there loses its range, which is
+/// recorded as a lost range and reported as `data_lost`, so its positions are
+/// not issued again (§3 Recovery rule 2, invariant 1). It is never repaired in
+/// place. The model loses the whole segment, not only the damaged region, and
+/// its quarantine stays fatal (see `OPEN-QUESTIONS.md`).
 #[test]
 fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     let (mut m, s) = model(10 * SECOND);
+    // The definition in a segment of its own, so that only facts are lost.
+    m.seal_active();
     let now = m.wall;
-    m.ingest(vec![Reading::num(s, now, 1.0)]).unwrap();
+    let p = m.ingest(vec![Reading::num(s, now, 1.0)]).unwrap().positions[0];
     m.seal_active();
     let f = *m
         .disk
         .hot
         .iter()
-        .find(|f| m.disk.files[f].class == FileClass::Segment)
+        .find(|f| {
+            m.disk.files[f].class == FileClass::Segment
+                && m.disk.files[f].entries().any(|e| e.position == p)
+        })
         .unwrap();
     m.corrupt_hot(f);
     m.scrub();
     assert!(!m.restore_file(f));
     assert!(m.disk.all_facts().is_empty());
+    assert_eq!(m.disk.lost_ranges(), vec![(p, p)], "the range is recorded");
     let h = m.health();
     assert_eq!(h.level, Level::Fatal);
     assert!(h.reasons.contains(&Reason::Quarantined(f)));
+    assert!(h.reasons.contains(&Reason::DataLost(p, p)));
+    // Its positions are not issued again, also after a restart.
+    m.restart();
+    let next = m
+        .ingest(vec![Reading::num(s, now + SECOND, 2.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(next, p.next());
+    assert!(m.health().reasons.contains(&Reason::DataLost(p, p)));
 }
 
 /// §10 invariant 9: a restore preserves the positions held in sealed,

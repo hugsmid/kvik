@@ -189,9 +189,9 @@ proptest! {
 
     /// 3. For any consumer, deliveries are in position order (strictly
     /// increasing within a session; a new session resumes at or before the
-    /// cursor + 1).
+    /// cursor + 1), also with lost ranges in the open segment (row 11a).
     #[test]
-    fn inv03_delivery_in_position_order(ops in proptest::collection::vec(arb_op(), 1..80)) {
+    fn inv03_delivery_in_position_order(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
         m.drain().unwrap();
@@ -364,10 +364,10 @@ proptest! {
 
     /// 4. The current view equals "highest rank per `(series, t)`" (§2.2:
     /// the position, or in a versioned series `(changed_at, position)`) over
-    /// all facts in all tiers. Checked against the view module and against a
-    /// naive maximum computed here.
+    /// all facts in all tiers, also with lost ranges (row 11a). Checked
+    /// against the view module and against a naive maximum computed here.
     #[test]
-    fn inv04_current_view_over_all_tiers(ops in proptest::collection::vec(arb_op(), 1..80)) {
+    fn inv04_current_view_over_all_tiers(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
         let (mut m, ids) = run(&ops)?;
         settle(&mut m);
         let all = m.disk.all_facts();
@@ -391,9 +391,9 @@ proptest! {
     }
 
     /// 5. Every tree node equals the direct computation over the current view
-    /// of its span.
+    /// of its span, also after a lost range (row 11a).
     #[test]
-    fn inv05_tree_nodes_equal_direct(ops in proptest::collection::vec(arb_op(), 1..80)) {
+    fn inv05_tree_nodes_equal_direct(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
         let cur = m.current().unwrap().clone();
@@ -536,9 +536,9 @@ proptest! {
 
     /// 11. No reader or consumer observes a position beyond the durable mark,
     /// whether the writer is up or down: a reader gets exactly the listed
-    /// files' content up to the mark.
+    /// files' content up to the mark, also with lost ranges (row 11a).
     #[test]
-    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_op(), 1..80)) {
+    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
         let (mut m, ids) = machine();
         for op in &ops {
             apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
@@ -627,9 +627,9 @@ proptest! {
     }
 
     /// 8. Rebuilding derived structures from facts yields exactly the live
-    /// structures.
+    /// structures, also after a lost range of facts (row 11a).
     #[test]
-    fn inv08_rebuild_equals_live(ops in proptest::collection::vec(arb_op(), 1..80)) {
+    fn inv08_rebuild_equals_live(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
         let rebuilt = m.rebuild_trees().unwrap();
@@ -2322,10 +2322,11 @@ proptest! {
     }
 }
 
-/// Guards `arb_lossy_op`: its histories must record lost ranges after a
-/// process crash and after a power loss, ranges with kept batches after
-/// them and ranges at the end of the log, and consumers whose cursor is
-/// below or inside a range.
+/// Guards `arb_lossy_op`, the input of the properties for invariants 1, 2,
+/// 3, 4, 5, 8, 9, 10 and 11 with lost ranges: its histories must record
+/// lost ranges after a process crash and after a power loss, ranges with
+/// kept batches after them and ranges at the end of the log, and consumers
+/// whose cursor is below or inside a range.
 #[test]
 fn lossy_generator_coverage() {
     use proptest::strategy::ValueTree;

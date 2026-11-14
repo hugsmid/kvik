@@ -570,7 +570,7 @@ consumer emits: `try_emit` is a call on the store (`api.md` Writing), a reading 
 declares only what its consumer receives. The cycle can also be indirect (A emits a series routed to B, which emits
 one routed to A), or be closed later by a run-time route or by a definition entry that a pattern matches.
 **Model.** A consumer emits through the store like any adapter; no cycle is detected, and a route from the series a
-consumer emits back to it is accepted (`tests/edge_cases.rs` `row_33_consumer_emits_readings_from_a_delivery`).
+consumer emits back to it is accepted (`tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected`).
 **Needed.** How the engine learns the series a consumer emits, and which changes the check runs on (start, route
 changes, definition entries matched by a pattern).
 **Proposal.** A consumer declares the series it may emit (`emits: Select`, ids or name patterns, default none) with
@@ -582,13 +582,14 @@ is not routed to the funnel that closes it, and is reported.
 ## Q-79 — A lost range found by a recovery whose sync fails
 **Scenario.** After a power loss, recovery finds a corrupt batch below the old boot's mark (rule 2: record a lost
 range in the manifest, report `data_lost`), then the sync of rule 4 fails, so the engine stays read-only and leaves
-the old mark. Rule 2 does not say whether the lost-range record is still written (a manifest write on an engine that
-has just failed a sync) and `data_lost` reported, or whether both wait for a recovery that can write; meanwhile a
-read-only engine serves views without the lost positions.
-**Model.** Nothing is recorded or reported while read-only; the next recovery that can write records the range once,
-also if the segment was sealed in between (the model lets a read-only engine seal), and new positions continue above
-it (`tests/edge_cases.rs` `row_11a_failed_recovery_sync_records_the_range_later`).
-**Needed.** Whether a recovery whose sync fails records and reports the lost ranges it found.
+the old mark. The rules apply in order and §8 records a loss "when found", so `data_lost` is reported at once; but
+rule 2 does not say whether the lost-range record is still written to the manifest (a write on an engine that has
+just failed a sync, against §3 Write or sync failure), or waits for a recovery that can write.
+**Settled by the text.** `data_lost` is reported in health as found, while read-only.
+**Model.** It reports `data_lost` as found, writes no record while read-only (a read-only engine writes nothing, not
+even a seal), and the next recovery that can write records the range once; new positions continue above it
+(`tests/edge_cases.rs` `row_11a_failed_recovery_sync_reports_the_range_as_found`).
+**Needed.** Whether a recovery whose sync fails writes the lost-range record.
 **Proposal.** §3 Recovery rule 4: "If that sync fails, the engine stays read-only, leaves the old mark and writes
 nothing; lost ranges it found are reported in health as found, and recorded by the next recovery."
 
@@ -785,7 +786,7 @@ on every resume, after a restart, a recovery on a new boot or a consumer restart
 position followed by `resync` with the live state and the condition state now, a transition where it differs from
 the latch or there is no latch, or `resync` alone when the cursor is too far behind the local log segments; and
 catch-up after overflow from the last position enqueued in the session; rows 14–16 and 34, invariants 2, 3, 11, 13
-and 16; `tests/rules.rs` `s4_…` and `s6_…`), loss of a corrupt log segment with no other copy (§8; the whole range, see the table), lost ranges in the open
+and 16; `tests/rules.rs` `s4_…` and `s6_…`), loss of a corrupt log segment with no other copy (§8; the whole range, recorded as a lost range, see the table), lost ranges in the open
 segment found by recovery (§3 Recovery rule 2, row 11a: later batches kept, the range recorded in the manifest and
 reported as `data_lost`, its positions not reused; see the table), and generations, tree checkpoints
 and restore (§2.2, §8 Continuous backup, Generations, Restore drill, Restore steps 1–4 and the paragraph after them,
@@ -821,7 +822,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
 | Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
 | Entries at store creation | §5.7: the site zone is a log entry; Q-76: the tzdata version | A store header beside the log, written at creation and carried by the bucket, holds the site zone and tzdata version before any entry, so that positions start at `0:1`; a start or restore configured with a zone other than the store's zone in force (its site-zone entry with the latest effective time, else the header's) is refused (`OpenRefused`, `SiteZoneMismatch`), a restore before it claims a generation | `tests/rules.rs` `s5_7_store_keeps_its_site_zone_and_refuses_another_at_open` |
-| New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 (see Q-78) | Consumers are declared when the model is created and start before the first position; a consumer emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_consumer_emits_readings_from_a_delivery` |
+| New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 (see Q-78) | Consumers are declared when the model is created and start before the first position; a consumer emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected` |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
 | Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |
@@ -843,8 +844,8 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64) | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly, also over the days of a month in a +05:45 zone | `tests/invariants.rs` `inv22_…` |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
-| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2, §4 Resync, §8 Corrupt block ("recorded when found"), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), and found by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches; the `resync` for a cursor below or inside it is the one every resume sends | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
-| A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost and the quarantine stays | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
+| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2, §4 Resync, §8 Corrupt block ("recorded when found"), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches; the `resync` for a cursor below or inside it is the one every resume sends | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
+| A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost, recorded as a lost range and reported as `data_lost`, so its positions are not issued again; the quarantine stays, with fatal health | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; forgetting positions above the recovered cursor | §3 Durable mark, §3 Recovery rule 3, §4 At-least-once, Resync, row 7a | The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail; a truncation after a reboot is not reported. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
 | Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start; exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, except files retired by a record whose added files are all in the bucket, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |

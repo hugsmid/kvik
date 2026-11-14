@@ -79,6 +79,8 @@ fn delivered(m: &Model) -> Vec<Position> {
         .unwrap_or_default()
 }
 
+/// Row 1: "Same `(series, t)`, different value: new fact; becomes current,
+/// the old one becomes a revision and the minute path is recomputed."
 #[test]
 fn row_01_same_t_different_value_becomes_current() {
     let (mut m, s) = model();
@@ -1245,12 +1247,13 @@ fn row_11a_corrupt_block_below_an_old_boots_mark() {
 
 /// Row 11a with a failed recovery sync (§3 Recovery rule 4): after a power
 /// loss, the recovery that finds a damaged batch cannot sync, so the engine
-/// stays read-only. Whether the lost range is recorded and `data_lost`
-/// reported then is Q-79; the model records nothing until a recovery that can
-/// write, even if the read-only engine sealed the segment meanwhile, and then
-/// records the range once and continues above it.
+/// stays read-only. Rule 2 applies before rule 4, and §8 records a loss "when
+/// found", so `data_lost` is reported at once; whether the manifest record is
+/// written then is Q-79, and the model writes it at the next recovery that can
+/// write. A read-only engine does not seal (§3 Write or sync failure). The
+/// range is then recorded once, and new positions continue above it.
 #[test]
-fn row_11a_failed_recovery_sync_records_the_range_later() {
+fn row_11a_failed_recovery_sync_reports_the_range_as_found() {
     let (mut m, s, b) = open_segment_model();
     m.crash();
     let damaged = batch_holding(&m, b[3][0]);
@@ -1258,24 +1261,24 @@ fn row_11a_failed_recovery_sync_records_the_range_later() {
     m.power_loss();
     m.restart_with(true);
     assert!(m.is_read_only());
+    let lost = Reason::DataLost(b[3][0], b[3][1]);
+    assert!(m.health().reasons.contains(&lost), "reported as found");
     assert!(
         m.disk.lost_ranges().is_empty(),
-        "nothing recorded while read-only"
+        "no record while read-only (Q-79)"
     );
-    assert!(
-        !m.health()
-            .reasons
-            .iter()
-            .any(|r| matches!(r, Reason::DataLost(..)))
-    );
+    let active = m.disk.active;
+    let records = m.disk.manifest.len();
     m.seal_active();
-    assert!(
-        m.disk.active.is_none(),
-        "the read-only engine sealed the segment"
+    assert_eq!(
+        (m.disk.active, m.disk.manifest.len()),
+        (active, records),
+        "a read-only engine writes nothing"
     );
     m.restart();
     assert!(!m.is_read_only());
     assert_eq!(m.disk.lost_ranges(), vec![(b[3][0], b[3][1])]);
+    assert!(m.health().reasons.contains(&lost));
     m.restart();
     assert_eq!(m.disk.lost_ranges().len(), 1, "recorded once");
     let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
@@ -1594,11 +1597,12 @@ fn row_34_route_added_while_catching_up() {
 /// and waits only as back-pressure (`Wait::QueueFull`), never for a commit;
 /// nothing is delivered until that batch commits, and then at a later position.
 /// The model is synchronous, so "off the writer thread" is shown by the engine
-/// (roadmap 5.2). Rejecting a cycle is Q-78: nothing tells the engine which
-/// series a consumer emits, and here a route from the emitted series back to
-/// the consumer is accepted; each emitted reading reaches it once.
+/// (roadmap 5.2). Rejecting a cycle is not shown: nothing tells the engine
+/// which series a consumer emits (Q-78), so this test pins the model's gap,
+/// not the rule: a route from the emitted series back to the consumer is
+/// accepted, and each emitted reading reaches it once.
 #[test]
-fn row_33_consumer_emits_readings_from_a_delivery() {
+fn row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected() {
     let consumer = ConsumerDecl {
         id: C,
         selection: Selection::Series(Default::default()),
@@ -1992,6 +1996,8 @@ fn row_20a_no_calendar_node_without_a_stored_15_minute_level() {
     }
 }
 
+/// Row 20: "DST changes: UTC levels unaffected; local days of 92–100
+/// quarter-hours", on the transition days of named zones, by hand.
 #[test]
 fn row_20_dst_transition_days_explicit() {
     let cases = [
