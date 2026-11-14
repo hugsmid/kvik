@@ -288,6 +288,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "parquet",
+ "proptest",
  "zstd",
 ]
 

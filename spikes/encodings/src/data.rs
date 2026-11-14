@@ -7,9 +7,12 @@
 //! series. Each span is then compacted per series into a chunk of current facts
 //! and a chunk of revisions, as `docs/spec.md` §7 describes.
 //!
-//! Series `i` has shape `SHAPES[i % 5]`. Values are quantised to a device
-//! resolution by dividing an integer by a power of ten, which gives the same
-//! `f64` as parsing the decimal text a device sends.
+//! Series `i` has shape `shapes[i % shapes.len()]`, from [`DECIMAL_SHAPES`]
+//! or [`NON_DECIMAL_SHAPES`]. Values are quantised to a device resolution by
+//! dividing an integer by a power of ten, which gives the same `f64` as
+//! parsing the decimal text a device sends; the non-decimal shapes then
+//! compute from such values. With [`Generator::integers`], the decimal shapes
+//! that have a fixed scale are emitted as `i64` with that scale instead.
 
 use crate::{
     Chunk, FLAG_HOST_TIME, FLAG_LATE, FLAG_NO_VALUE, ValueKind,
@@ -40,16 +43,36 @@ pub enum Shape {
     /// Dense integer-valued gauge with occasional corrections of an earlier
     /// second (revisions) arriving 5 s to 15 min later.
     Revised,
+    /// Temperature read in °F at 0.1 resolution and converted to °C: almost
+    /// no value is decimal.
+    Converted,
+    /// As `Temperature`, but about 0.1 % of values are computed (the mean of
+    /// the last three readings) and so not decimal.
+    Mixed,
 }
 
-/// Shapes in series order.
-pub const SHAPES: [Shape; 5] = [
+/// Every shape, in table order.
+pub const SHAPES: [Shape; 7] = [
+    Shape::Temperature,
+    Shape::Energy,
+    Shape::Switch,
+    Shape::Gappy,
+    Shape::Revised,
+    Shape::Converted,
+    Shape::Mixed,
+];
+
+/// Shapes whose values are all decimal.
+pub const DECIMAL_SHAPES: [Shape; 5] = [
     Shape::Temperature,
     Shape::Energy,
     Shape::Switch,
     Shape::Gappy,
     Shape::Revised,
 ];
+
+/// Shapes with values that are not decimal.
+pub const NON_DECIMAL_SHAPES: [Shape; 2] = [Shape::Converted, Shape::Mixed];
 
 impl Shape {
     /// Short name for tables.
@@ -60,6 +83,18 @@ impl Shape {
             Shape::Switch => "boolean",
             Shape::Gappy => "gappy gauge",
             Shape::Revised => "dense with revisions",
+            Shape::Converted => "°F→°C",
+            Shape::Mixed => "0.1 % computed",
+        }
+    }
+
+    /// The decimal scale of a shape emitted as `i64`, if it has one.
+    pub fn integer_scale(self) -> Option<i32> {
+        match self {
+            Shape::Temperature => Some(2),
+            Shape::Energy => Some(3),
+            Shape::Revised => Some(0),
+            _ => None,
         }
     }
 }
@@ -137,6 +172,7 @@ struct SeriesGen {
     state: bool,
     gap_left: u32,
     suspect_left: u32,
+    last: [f64; 3],
 }
 
 impl SeriesGen {
@@ -166,6 +202,7 @@ impl SeriesGen {
             state: false,
             gap_left: 0,
             suspect_left: 0,
+            last: [0.0; 3],
         }
     }
 
@@ -175,12 +212,21 @@ impl SeriesGen {
         let t = START + s * SECOND;
         let r = &mut self.rng;
         match self.shape {
-            Shape::Temperature => {
+            Shape::Temperature | Shape::Mixed | Shape::Converted => {
                 self.walk = 0.9995 * self.walk + 0.003 * r.normal();
                 let day = std::f64::consts::TAU * (s as f64) / DAY_SECONDS as f64;
                 let x =
                     self.base + self.amp * (day + self.phase).sin() + self.walk + 0.01 * r.normal();
-                let v = quantise(x, 100.0);
+                let v = match self.shape {
+                    Shape::Converted => (quantise(x * 1.8 + 32.0, 10.0) - 32.0) * 5.0 / 9.0,
+                    _ => quantise(x, 100.0),
+                };
+                self.last = [self.last[1], self.last[2], v];
+                let v = if self.shape == Shape::Mixed && s > 2 && r.chance(0.001) {
+                    (self.last[0] + self.last[1] + self.last[2]) / 3.0
+                } else {
+                    v
+                };
                 (Some(good(t, v.to_bits(), 0)), None)
             }
             Shape::Energy => {
@@ -285,6 +331,7 @@ pub struct SeriesSpan {
 /// Generates spans of synthetic log data for `n` series.
 pub struct Generator {
     series: Vec<SeriesGen>,
+    integers: bool,
     arrival: Rng,
     next_sequence: u64,
     span_seconds: i64,
@@ -298,23 +345,37 @@ struct Arrival {
 }
 
 impl Generator {
-    /// A generator for `n` series with spans of `span_seconds`.
+    /// A generator for `n` series of the decimal shapes with spans of
+    /// `span_seconds`.
     pub fn new(seed: u64, n: usize, span_seconds: i64) -> Self {
+        Self::with_shapes(seed, n, span_seconds, &DECIMAL_SHAPES)
+    }
+
+    /// A generator for `n` series cycling through `shapes`.
+    pub fn with_shapes(seed: u64, n: usize, span_seconds: i64, shapes: &[Shape]) -> Self {
         let series = (0..n)
             .map(|i| {
                 let s = seed
                     .wrapping_mul(0x2545_f491_4f6c_dd1d)
                     .wrapping_add(i as u64 + 1);
-                SeriesGen::new(SHAPES[i % SHAPES.len()], s)
+                SeriesGen::new(shapes[i % shapes.len()], s)
             })
             .collect();
         Generator {
             series,
+            integers: false,
             arrival: Rng::new(seed ^ 0x5eed),
             next_sequence: 1,
             span_seconds,
             span_index: 0,
         }
+    }
+
+    /// Emits the shapes with an [`Shape::integer_scale`] as `i64` values
+    /// with that scale (`round(v × 10^scale)`), instead of `f64`.
+    pub fn integers(mut self) -> Self {
+        self.integers = true;
+        self
     }
 
     /// Start of span `index` in nanoseconds.
@@ -397,10 +458,28 @@ impl Generator {
                 self.next_sequence += 1;
             }
         }
+        let integers = self.integers;
         logs.into_iter()
             .zip(&self.series)
-            .map(|((log, recv), g)| compact(g.shape, log, recv))
+            .map(|((log, recv), g)| {
+                let mut span = compact(g.shape, log, recv);
+                if let (true, Some(scale)) = (integers, g.shape.integer_scale()) {
+                    to_integers(&mut span.current, scale);
+                    to_integers(&mut span.revisions, scale);
+                }
+                span
+            })
             .collect()
+    }
+}
+
+fn to_integers(c: &mut Chunk, scale: i32) {
+    c.kind = ValueKind::I64;
+    let p = 10f64.powi(scale);
+    for (v, &f) in c.value.iter_mut().zip(&c.flags) {
+        if f & FLAG_NO_VALUE == 0 {
+            *v = (f64::from_bits(*v) * p).round() as i64 as u64;
+        }
     }
 }
 

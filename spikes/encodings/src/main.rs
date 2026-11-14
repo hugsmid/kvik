@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use encodings::data::DAY_SECONDS;
+use encodings::data::NON_DECIMAL_SHAPES;
 use encodings::measure::{DatasetSpec, candidates, report, run};
 
 fn main() {
@@ -26,28 +26,20 @@ fn main() {
     }
     assert!(reps > 0, "--reps takes a positive number");
     let datasets = if quick {
-        vec![DatasetSpec {
-            name: "1 day × 10 series (quick)",
-            seed: 1,
-            series: 10,
-            spans: 1,
-            span_seconds: DAY_SECONDS,
-        }]
+        vec![DatasetSpec::decimal("1 day × 10 series (quick)", 1, 10, 1)]
     } else {
         vec![
+            DatasetSpec::decimal("1 day × 100 series", 1, 100, 1),
+            DatasetSpec::decimal("30 days × 10 series", 2, 10, 30),
             DatasetSpec {
-                name: "1 day × 100 series",
-                seed: 1,
-                series: 100,
-                spans: 1,
-                span_seconds: DAY_SECONDS,
+                name: "30 days × 10 series, fixed-scale shapes as i64",
+                integers: true,
+                ..DatasetSpec::decimal("", 2, 10, 30)
             },
             DatasetSpec {
-                name: "30 days × 10 series",
-                seed: 2,
-                series: 10,
-                spans: 30,
-                span_seconds: DAY_SECONDS,
+                name: "30 days × 4 series, non-decimal shapes",
+                shapes: &NON_DECIMAL_SHAPES,
+                ..DatasetSpec::decimal("", 3, 4, 30)
             },
         ]
     };

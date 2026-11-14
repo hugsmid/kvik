@@ -61,8 +61,11 @@ pub enum ValueKind {
     /// IEEE-754 bit patterns.
     #[default]
     F64,
-    /// A state index (0 or 1 for a boolean).
+    /// A state index (0 or 1 for a boolean; at most `u16::MAX`).
     State,
+    /// A two's-complement integer with a declared decimal scale
+    /// (`docs/spec.md` §2.1); the scale is in the series definition.
+    I64,
 }
 
 /// One per-series chunk in column form: either the current facts of a time

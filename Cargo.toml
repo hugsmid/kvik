@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["model", "spikes/encodings"]
+# The spike is built and tested in its own CI job (`cargo test -p encodings`).
+default-members = ["model"]
 
 [workspace.package]
 edition = "2024"

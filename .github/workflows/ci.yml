@@ -73,6 +73,26 @@ jobs:
           PROPTEST_CASES: "1024"
       - run: cargo run --locked --example basic
 
+  spike:
+    # The encoding spike (roadmap 2.1) is outside the default members; its
+    # round-trip and property tests run here, on one OS. The measurement
+    # itself (`cargo run --release -p encodings`) is never run in CI.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: spike
+      - run: cargo clippy -p encodings --all-targets --locked
+      - run: cargo doc -p encodings --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test -p encodings --locked
+        env:
+          PROPTEST_CASES: "1024"
+
   deep-shards:
     # The deep job's matrix, generated from the table in .github/deep-shards.sh.
     runs-on: ubuntu-latest

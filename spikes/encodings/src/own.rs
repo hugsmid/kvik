@@ -19,7 +19,8 @@
 //! | Column | `Plain` | `Xor` | `Decimal` |
 //! |---|---|---|---|
 //! | `t`, position | little-endian | [`Ints::Dod`] or [`Ints::Delta`] | as `Xor` |
-//! | value (f64) | little-endian bits | XOR with the previous value | scaled integer, deltas bit-packed per 128; XOR fallback |
+//! | value (f64) | little-endian bits | XOR with the previous value | scaled integer, deltas bit-packed per 128, per-value exceptions; XOR fallback, zstd if smaller |
+//! | value (i64) | little-endian | as [`Ints::Delta`] | as [`Ints::Delta`] |
 //! | value (state) | little-endian | run-length | run-length |
 //! | quality, flags | little-endian | run-length | run-length |
 
@@ -342,35 +343,122 @@ fn read_varbits(r: &mut BitReader<'_>) -> u64 {
     r.read(len)
 }
 
-/// Scaled-decimal encoding: if every value is `n / 10^e` for an integer `n`
-/// (bit-exact, same `e` for the block), a tag byte `1`, then `e`, the first
-/// `n` and the deltas, frame-of-reference bit-packed per 128. Otherwise a tag
-/// byte `0` and [`xor_encode`].
+/// Values sampled from a block to choose candidate exponents.
+const SAMPLE: usize = 32;
+/// Estimated cost in bits of one exception (value and position).
+const EXCEPTION_BITS: f64 = 80.0;
+
+fn min_exponent(bits: u64) -> Option<usize> {
+    (0..POW10.len()).find(|&e| scaled(bits, e).is_some())
+}
+
+fn position_width(n: usize) -> u32 {
+    64 - (n.max(1) as u64 - 1).leading_zeros()
+}
+
+/// Scaled-decimal encoding with per-value exceptions, after ALP.
+///
+/// Candidate exponents `e` are the smallest exact exponents of up to 32
+/// sampled values; for each, the block's cost is estimated as
+/// `3.32 × e` bits per value that is exactly `n / 10^e` plus 80 bits per value
+/// that is not (an exception), and the cheapest is taken. The output is a tag
+/// byte `1`, `e`, the exception count, each exception's index and raw bits,
+/// then the `n` (an exception takes the previous `n`) as packed deltas. If no
+/// sampled value is decimal, or the exceptions make it larger than XOR, the
+/// output is a tag byte `0` and [`xor_encode`], or, when zstd makes that
+/// smaller, a tag byte `2` and the XOR stream as a zstd payload.
 pub fn decimal_encode(vs: &[u64]) -> Vec<u8> {
-    let found = (0..POW10.len()).find_map(|e| {
-        let ns: Option<Vec<i64>> = vs.iter().map(|&b| scaled(b, e)).collect();
-        ns.map(|ns| (e, ns))
-    });
-    let Some((e, ns)) = found else {
+    let xor = || {
+        let raw = xor_encode(vs);
+        let mut z = vec![2u8];
+        compress(&raw, &mut z);
+        if z.len() < raw.len() {
+            return z;
+        }
         let mut out = vec![0u8];
-        out.extend(xor_encode(vs));
-        return out;
+        out.extend(raw);
+        out
     };
+    let step = vs.len().div_ceil(SAMPLE).max(1);
+    let mut candidates: Vec<usize> = vs
+        .iter()
+        .step_by(step)
+        .filter_map(|&b| min_exponent(b))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let best = candidates
+        .into_iter()
+        .map(|e| {
+            let fits = vs.iter().filter(|&&b| scaled(b, e).is_some()).count();
+            let cost = fits as f64 * 3.32 * e as f64 + (vs.len() - fits) as f64 * EXCEPTION_BITS;
+            (cost, e)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    let Some((_, e)) = best else {
+        return xor();
+    };
+    let mut ns = Vec::with_capacity(vs.len());
+    let mut exceptions = Vec::new();
+    let mut prev = 0i64;
+    for (i, &b) in vs.iter().enumerate() {
+        match scaled(b, e) {
+            Some(n) => {
+                ns.push(n);
+                prev = n;
+            }
+            None => {
+                ns.push(prev);
+                exceptions.push((i, b));
+            }
+        }
+    }
     let mut w = BitWriter::new();
     w.write(1, 8);
     w.write(e as u64, 8);
+    write_varbits(&mut w, exceptions.len() as u64);
+    let pw = position_width(vs.len());
+    for &(i, b) in &exceptions {
+        w.write(i as u64, pw);
+        w.write(b, 64);
+    }
     pack_deltas(&mut w, &ns);
-    w.finish()
+    let out = w.finish();
+    if exceptions.len() * 8 > vs.len() {
+        let x = xor();
+        if x.len() < out.len() {
+            return x;
+        }
+    }
+    out
 }
 
 /// Reverses [`decimal_encode`], appending `n` values to `out`.
 pub fn decimal_decode(buf: &[u8], n: usize, out: &mut Vec<u64>) {
-    if buf[0] == 0 {
-        return xor_decode(&buf[1..], n, out);
+    match buf[0] {
+        0 => return xor_decode(&buf[1..], n, out),
+        2 => {
+            let mut raw = Vec::new();
+            decompress(&buf[1..], &mut raw);
+            return xor_decode(&raw, n, out);
+        }
+        _ => {}
     }
     let mut r = BitReader::new(&buf[1..]);
     let p = POW10[r.read(8) as usize];
+    let count = read_varbits(&mut r) as usize;
+    let pw = position_width(n);
+    let exceptions: Vec<(usize, u64)> = (0..count)
+        .map(|_| {
+            let i = r.read(pw) as usize;
+            (i, r.read(64))
+        })
+        .collect();
+    let start = out.len();
     unpack_deltas(&mut r, n, |v| out.push((v as f64 / p).to_bits()));
+    for (i, b) in exceptions {
+        out[start + i] = b;
+    }
 }
 
 /// Writes the first value, then the deltas frame-of-reference bit-packed per
@@ -470,6 +558,7 @@ impl Own {
         match (self.scheme, kind) {
             (Scheme::Plain, _) => vs.iter().flat_map(|x| x.to_le_bytes()).collect(),
             (_, ValueKind::State) => rle_encode(vs.iter().copied()),
+            (_, ValueKind::I64) => delta_encode(&vs.iter().map(|&v| v as i64).collect::<Vec<_>>()),
             (Scheme::Xor, ValueKind::F64) => xor_encode(vs),
             (Scheme::Decimal, ValueKind::F64) => decimal_encode(vs),
         }
@@ -484,6 +573,10 @@ impl Own {
                     .map(|b| u64::from_le_bytes(*b)),
             ),
             (_, ValueKind::State) => rle_decode(buf, n, |v, run| out.extend((0..run).map(|_| v))),
+            (_, ValueKind::I64) => {
+                let mut r = BitReader::new(buf);
+                unpack_deltas(&mut r, n, |v| out.push(v as u64));
+            }
             (Scheme::Xor, ValueKind::F64) => xor_decode(buf, n, out),
             (Scheme::Decimal, ValueKind::F64) => decimal_decode(buf, n, out),
         }
@@ -544,6 +637,7 @@ impl Own {
         out.push(match c.kind {
             ValueKind::F64 => 0,
             ValueKind::State => 1,
+            ValueKind::I64 => 2,
         });
         out.extend_from_slice(&(blocks as u32).to_le_bytes());
         let dir = out.len();
@@ -622,10 +716,10 @@ impl Own {
 
     fn header(buf: &[u8]) -> (usize, ValueKind, usize) {
         let n = u32_at(buf, 0) as usize;
-        let kind = if buf[4] == 1 {
-            ValueKind::State
-        } else {
-            ValueKind::F64
+        let kind = match buf[4] {
+            1 => ValueKind::State,
+            2 => ValueKind::I64,
+            _ => ValueKind::F64,
         };
         (n, kind, u32_at(buf, 5) as usize)
     }
@@ -763,6 +857,35 @@ mod tests {
         let mut out = Vec::new();
         decimal_decode(&enc, dec.len(), &mut out);
         assert_eq!(out, dec);
+
+        // Few distinct non-decimal values: XOR, then zstd.
+        let ninths: Vec<u64> = (0..2000)
+            .map(|i| (f64::from(i % 5) / 9.0 + 1.0).to_bits())
+            .collect();
+        let enc = decimal_encode(&ninths);
+        assert_eq!(enc[0], 2, "XOR fallback with zstd");
+        let mut out = Vec::new();
+        decimal_decode(&enc, ninths.len(), &mut out);
+        assert_eq!(out, ninths);
+        // A few non-decimal values: exceptions, not the fallback.
+        let mut mixed = dec.clone();
+        mixed[10] = (1.0f64 / 3.0).to_bits();
+        mixed[500] = (-0.0f64).to_bits();
+        let enc = decimal_encode(&mixed);
+        assert_eq!(enc[0], 1, "decimal with exceptions");
+        assert!(enc.len() < xor_encode(&mixed).len() / 2);
+        let mut out = Vec::new();
+        decimal_decode(&enc, mixed.len(), &mut out);
+        assert_eq!(out, mixed);
+        // Nothing decimal (random mantissas need 17 digits): the XOR fallback.
+        let thirds: Vec<u64> = (1..1000u64)
+            .map(|i| 0x4000_0000_0000_0000 | (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 12))
+            .collect();
+        let enc = decimal_encode(&thirds);
+        assert_ne!(enc[0], 1, "XOR fallback");
+        let mut out = Vec::new();
+        decimal_decode(&enc, thirds.len(), &mut out);
+        assert_eq!(out, thirds);
 
         let mut out = Vec::new();
         let rle = [3u64, 3, 3, 0, 9, 9];

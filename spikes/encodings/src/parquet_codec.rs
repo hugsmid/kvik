@@ -1,15 +1,18 @@
 //! Candidate (c): the same chunks written as Parquet.
 //!
-//! One file per span, one row group per chunk. Columns:
+//! One file per span, one row group per chunk. Columns, in this order; the
+//! three value columns appear only when a chunk of their kind is in the file,
+//! and are null in rows without a value and in chunks of another kind:
 //!
 //! | Column | Type | Encoding |
 //! |---|---|---|
 //! | `t` | INT64 | DELTA_BINARY_PACKED |
-//! | `value` | DOUBLE, nullable (null for a row without a value, and for state series) | BYTE_STREAM_SPLIT, or ALP |
-//! | `state` | INT32 (u16), nullable (null for f64 series) | dictionary (RLE_DICTIONARY) |
-//! | `quality` | INT32 (u8) | dictionary |
+//! | `quality` | INT32 (u8) | dictionary (RLE_DICTIONARY) |
 //! | `flags` | INT32 (u16) | dictionary |
 //! | `position` | INT64 (u64) | DELTA_BINARY_PACKED |
+//! | `value` | DOUBLE, nullable | BYTE_STREAM_SPLIT, or ALP |
+//! | `state` | INT32 (u16), nullable | dictionary |
+//! | `integer` | INT64, nullable | DELTA_BINARY_PACKED |
 //!
 //! Every column is compressed with zstd at [`ZSTD_LEVEL`]; data pages hold at
 //! most [`BLOCK_ROWS`] rows; page statistics and the page index are written.
@@ -17,7 +20,7 @@
 //! the page index of `t` to select whole pages, reads them with a row
 //! selection and trims the rows outside the range.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type, UInt8Type, UInt16Type, UInt64Type};
@@ -61,11 +64,14 @@ impl ParquetCodec {
     };
 }
 
-/// One Parquet file holding a set of chunks, with its cached metadata.
+/// One Parquet file holding a set of chunks. Its footer and page index are
+/// parsed on first use and then cached, outside the timed encode.
 pub struct ParquetFile {
     bytes: Bytes,
-    meta: ArrowReaderMetadata,
+    meta: OnceLock<ArrowReaderMetadata>,
     kinds: Vec<ValueKind>,
+    /// Column index of the value column for each kind (F64, State, I64).
+    value_columns: [Option<usize>; 3],
 }
 
 impl ParquetFile {
@@ -73,17 +79,49 @@ impl ParquetFile {
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
     }
+
+    fn meta(&self) -> &ArrowReaderMetadata {
+        self.meta
+            .get_or_init(|| ArrowReaderMetadata::load(&self.bytes, options()).expect("metadata"))
+    }
+
+    fn value_column(&self, kind: ValueKind) -> usize {
+        self.value_columns[kind_index(kind)].expect("value column for the kind")
+    }
 }
 
-fn schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+const KINDS: [ValueKind; 3] = [ValueKind::F64, ValueKind::State, ValueKind::I64];
+
+fn kind_index(kind: ValueKind) -> usize {
+    match kind {
+        ValueKind::F64 => 0,
+        ValueKind::State => 1,
+        ValueKind::I64 => 2,
+    }
+}
+
+const COL_T: usize = 0;
+const COL_QUALITY: usize = 1;
+const COL_FLAGS: usize = 2;
+const COL_POSITION: usize = 3;
+
+fn schema(value_columns: &[Option<usize>; 3]) -> SchemaRef {
+    let mut fields = vec![
         Field::new("t", DataType::Int64, false),
-        Field::new("value", DataType::Float64, true),
-        Field::new("state", DataType::UInt16, true),
         Field::new("quality", DataType::UInt8, false),
         Field::new("flags", DataType::UInt16, false),
         Field::new("position", DataType::UInt64, false),
-    ]))
+    ];
+    for (k, col) in value_columns.iter().enumerate() {
+        if col.is_some() {
+            fields.push(match KINDS[k] {
+                ValueKind::F64 => Field::new("value", DataType::Float64, true),
+                ValueKind::State => Field::new("state", DataType::UInt16, true),
+                ValueKind::I64 => Field::new("integer", DataType::Int64, true),
+            });
+        }
+    }
+    Arc::new(Schema::new(fields))
 }
 
 fn properties(columns: &[(&str, Encoding)]) -> WriterProperties {
@@ -105,39 +143,54 @@ fn properties(columns: &[(&str, Encoding)]) -> WriterProperties {
     b.build()
 }
 
-fn batch(schema: &SchemaRef, c: &Chunk) -> RecordBatch {
+fn batch(schema: &SchemaRef, value_columns: &[Option<usize>; 3], c: &Chunk) -> RecordBatch {
     let n = c.len();
-    let (value, state): (ArrayRef, ArrayRef) = match c.kind {
-        ValueKind::F64 => {
-            let v: Float64Array = (0..n)
-                .map(|i| (c.flags[i] & FLAG_NO_VALUE == 0).then(|| f64::from_bits(c.value[i])))
-                .collect();
-            (Arc::new(v), Arc::new(UInt16Array::new_null(n)))
-        }
-        ValueKind::State => {
-            let s: UInt16Array = (0..n)
-                .map(|i| (c.flags[i] & FLAG_NO_VALUE == 0).then_some(c.value[i] as u16))
-                .collect();
-            (Arc::new(Float64Array::new_null(n)), Arc::new(s))
-        }
-    };
-    let columns: Vec<ArrayRef> = vec![
+    let has = |i: usize| c.flags[i] & FLAG_NO_VALUE == 0;
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(c.t.clone())),
-        value,
-        state,
         Arc::new(UInt8Array::from(c.quality.clone())),
         Arc::new(UInt16Array::from(c.flags.clone())),
         Arc::new(UInt64Array::from(c.position.clone())),
     ];
+    for (k, col) in value_columns.iter().enumerate() {
+        if col.is_none() {
+            continue;
+        }
+        let kind = KINDS[k];
+        let own = kind == c.kind;
+        columns.push(match kind {
+            ValueKind::F64 if own => Arc::new(
+                (0..n)
+                    .map(|i| has(i).then(|| f64::from_bits(c.value[i])))
+                    .collect::<Float64Array>(),
+            ),
+            ValueKind::F64 => Arc::new(Float64Array::new_null(n)),
+            ValueKind::State if own => Arc::new(
+                (0..n)
+                    .map(|i| {
+                        has(i).then(|| u16::try_from(c.value[i]).expect("state index fits u16"))
+                    })
+                    .collect::<UInt16Array>(),
+            ),
+            ValueKind::State => Arc::new(UInt16Array::new_null(n)),
+            ValueKind::I64 if own => Arc::new(
+                (0..n)
+                    .map(|i| has(i).then_some(c.value[i] as i64))
+                    .collect::<Int64Array>(),
+            ),
+            ValueKind::I64 => Arc::new(Int64Array::new_null(n)),
+        });
+    }
     RecordBatch::try_new(schema.clone(), columns).expect("record batch")
 }
 
-fn append(batch: &RecordBatch, kind: ValueKind, out: &mut Chunk) {
+fn append(batch: &RecordBatch, kind: ValueKind, value_col: usize, out: &mut Chunk) {
     out.t
-        .extend_from_slice(batch.column(0).as_primitive::<Int64Type>().values());
+        .extend_from_slice(batch.column(COL_T).as_primitive::<Int64Type>().values());
+    let v = batch.column(value_col);
     match kind {
         ValueKind::F64 => {
-            let v = batch.column(1).as_primitive::<Float64Type>();
+            let v = v.as_primitive::<Float64Type>();
             if v.null_count() == 0 {
                 out.value.extend(v.values().iter().map(|x| x.to_bits()));
             } else {
@@ -146,16 +199,37 @@ fn append(batch: &RecordBatch, kind: ValueKind, out: &mut Chunk) {
             }
         }
         ValueKind::State => {
-            let v = batch.column(2).as_primitive::<UInt16Type>();
+            let v = v.as_primitive::<UInt16Type>();
             out.value.extend(v.iter().map(|x| x.map_or(0, u64::from)));
         }
+        ValueKind::I64 => {
+            let v = v.as_primitive::<Int64Type>();
+            if v.null_count() == 0 {
+                out.value.extend(v.values().iter().map(|&x| x as u64));
+            } else {
+                out.value
+                    .extend(v.iter().map(|x| x.map_or(0, |x| x as u64)));
+            }
+        }
     }
-    out.quality
-        .extend_from_slice(batch.column(3).as_primitive::<UInt8Type>().values());
-    out.flags
-        .extend_from_slice(batch.column(4).as_primitive::<UInt16Type>().values());
-    out.position
-        .extend_from_slice(batch.column(5).as_primitive::<UInt64Type>().values());
+    out.quality.extend_from_slice(
+        batch
+            .column(COL_QUALITY)
+            .as_primitive::<UInt8Type>()
+            .values(),
+    );
+    out.flags.extend_from_slice(
+        batch
+            .column(COL_FLAGS)
+            .as_primitive::<UInt16Type>()
+            .values(),
+    );
+    out.position.extend_from_slice(
+        batch
+            .column(COL_POSITION)
+            .as_primitive::<UInt64Type>()
+            .values(),
+    );
 }
 
 fn options() -> ArrowReaderOptions {
@@ -166,16 +240,30 @@ impl ParquetCodec {
     /// Checks that the writer used the intended encodings and page size.
     /// Panics otherwise.
     pub fn check_layout(&self, file: &ParquetFile) {
-        let md = file.meta.metadata();
+        let md = file.meta().metadata();
         assert_eq!(md.num_row_groups(), file.kinds.len());
-        for (rg, kind) in md.row_groups().iter().zip(&file.kinds) {
+        for (rg, &kind) in md.row_groups().iter().zip(&file.kinds) {
             let has = |col: usize, e: Encoding| rg.column(col).encodings().any(|x| x == e);
-            assert!(has(0, Encoding::DELTA_BINARY_PACKED), "t encoding");
-            assert!(has(5, Encoding::DELTA_BINARY_PACKED), "position encoding");
-            assert!(has(3, Encoding::RLE_DICTIONARY), "quality encoding");
-            assert!(has(4, Encoding::RLE_DICTIONARY), "flags encoding");
-            if *kind == ValueKind::F64 {
-                assert!(has(1, self.value), "value encoding");
+            assert!(has(COL_T, Encoding::DELTA_BINARY_PACKED), "t encoding");
+            assert!(
+                has(COL_POSITION, Encoding::DELTA_BINARY_PACKED),
+                "position encoding"
+            );
+            assert!(
+                has(COL_QUALITY, Encoding::RLE_DICTIONARY),
+                "quality encoding"
+            );
+            assert!(has(COL_FLAGS, Encoding::RLE_DICTIONARY), "flags encoding");
+            let col = file.value_column(kind);
+            let all_null = rg.column(col).statistics().and_then(|s| s.null_count_opt())
+                == Some(rg.num_rows() as u64);
+            if !all_null {
+                let expected = match kind {
+                    ValueKind::F64 => self.value,
+                    ValueKind::State => Encoding::RLE_DICTIONARY,
+                    ValueKind::I64 => Encoding::DELTA_BINARY_PACKED,
+                };
+                assert!(has(col, expected), "value encoding");
             }
         }
         for i in 0..md.num_row_groups() {
@@ -205,39 +293,47 @@ impl Codec for ParquetCodec {
     }
 
     fn encode(&self, chunks: &[&Chunk]) -> ParquetFile {
-        let schema = schema();
+        let mut value_columns = [None; 3];
+        let mut next = COL_POSITION + 1;
+        for (k, slot) in value_columns.iter_mut().enumerate() {
+            if chunks.iter().any(|c| c.kind == KINDS[k]) {
+                *slot = Some(next);
+                next += 1;
+            }
+        }
+        let schema = schema(&value_columns);
         let props = properties(&[
             ("t", Encoding::DELTA_BINARY_PACKED),
             ("value", self.value),
+            ("integer", Encoding::DELTA_BINARY_PACKED),
             ("position", Encoding::DELTA_BINARY_PACKED),
         ]);
         let mut w = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props)).expect("writer");
         for c in chunks {
             assert!(!c.is_empty(), "empty chunks are not written");
-            w.write(&batch(&schema, c)).expect("write");
+            w.write(&batch(&schema, &value_columns, c)).expect("write");
             w.flush().expect("flush");
         }
-        let bytes = Bytes::from(w.into_inner().expect("close"));
-        let meta = ArrowReaderMetadata::load(&bytes, options()).expect("metadata");
         ParquetFile {
-            bytes,
-            meta,
+            bytes: Bytes::from(w.into_inner().expect("close")),
+            meta: OnceLock::new(),
             kinds: chunks.iter().map(|c| c.kind).collect(),
+            value_columns,
         }
     }
 
     fn sizes(&self, f: &ParquetFile) -> Vec<ColumnSizes> {
-        let md = f.meta.metadata();
+        let md = f.meta().metadata();
         let mut out: Vec<ColumnSizes> = md
             .row_groups()
             .iter()
             .map(|rg| {
                 let c = |i: usize| rg.column(i).compressed_size() as u64;
                 ColumnSizes {
-                    t: c(0),
-                    value: c(1) + c(2),
-                    quality_flags: c(3) + c(4),
-                    position: c(5),
+                    t: c(COL_T),
+                    value: f.value_columns.iter().flatten().map(|&i| c(i)).sum(),
+                    quality_flags: c(COL_QUALITY) + c(COL_FLAGS),
+                    position: c(COL_POSITION),
                     overhead: 0,
                 }
             })
@@ -261,27 +357,31 @@ impl Codec for ParquetCodec {
 
     fn decode(&self, f: &ParquetFile, index: usize) -> Chunk {
         let reader =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(f.bytes.clone(), f.meta.clone())
+            ParquetRecordBatchReaderBuilder::new_with_metadata(f.bytes.clone(), f.meta().clone())
                 .with_row_groups(vec![index])
                 .with_batch_size(READ_BATCH)
                 .build()
                 .expect("reader");
         let kind = f.kinds[index];
+        let col = f.value_column(kind);
         let mut out = Chunk::new(kind);
         for b in reader {
-            append(&b.expect("batch"), kind, &mut out);
+            append(&b.expect("batch"), kind, col, &mut out);
         }
         out
     }
 
     fn decode_range(&self, f: &ParquetFile, index: usize, from: i64, to: i64) -> Chunk {
-        let md = f.meta.metadata();
+        let md = f.meta().metadata();
         let rows = md.row_group(index).num_rows() as usize;
         let pi = md.page_index_for_row_group(index);
-        let Some(ColumnIndexMetaData::INT64(ci)) = pi.column_index(0) else {
+        let Some(ColumnIndexMetaData::INT64(ci)) = pi.column_index(COL_T) else {
             panic!("no column index for t");
         };
-        let locations = pi.offset_index(0).expect("offset index").page_locations();
+        let locations = pi
+            .offset_index(COL_T)
+            .expect("offset index")
+            .page_locations();
         let ranges = (0..locations.len()).filter_map(|p| {
             let min = *ci.min_value(p).expect("min");
             let max = *ci.max_value(p).expect("max");
@@ -295,16 +395,17 @@ impl Codec for ParquetCodec {
         });
         let selection = RowSelection::from_consecutive_ranges(ranges, rows);
         let reader =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(f.bytes.clone(), f.meta.clone())
+            ParquetRecordBatchReaderBuilder::new_with_metadata(f.bytes.clone(), f.meta().clone())
                 .with_row_groups(vec![index])
                 .with_row_selection(selection)
                 .with_batch_size(READ_BATCH)
                 .build()
                 .expect("reader");
         let kind = f.kinds[index];
+        let col = f.value_column(kind);
         let mut tmp = Chunk::new(kind);
         for b in reader {
-            append(&b.expect("batch"), kind, &mut tmp);
+            append(&b.expect("batch"), kind, col, &mut tmp);
         }
         tmp.slice_t(from, to)
     }
