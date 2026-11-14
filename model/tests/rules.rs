@@ -4118,8 +4118,47 @@ fn s5_7_store_keeps_its_site_zone_and_refuses_another_at_open() {
         Model::restore_from(cfg, vec![], &mut m.disk.bucket, m.wall, false),
         Err(Error::SiteZoneMismatch { .. })
     ));
+    assert!(
+        m.disk.bucket.claims.is_empty(),
+        "a refused restore claims nothing"
+    );
     m.config.site_zone = "America/New_York".into();
     m.restart();
     assert!(m.is_up() && m.disk.open_refused.is_none());
     assert_eq!(m.calendar(s, may30).unwrap(), before);
+    // The store still writes and uploads, and is not superseded.
+    feed(&mut m, s, &[(utc("2026-06-03T06:00:00Z"), 1.0)]);
+    m.seal_active();
+    assert!(m.upload() > 0);
+    assert!(!m.disk.superseded && !m.is_read_only());
+    // After a site-zone change, the zone in force is the one to configure; an
+    // older one is refused.
+    m.set_site_zone("Asia/Tokyo", utc("2026-06-03T15:00:00Z"))
+        .unwrap();
+    m.seal_active();
+    m.upload();
+    m.restart();
+    assert!(matches!(
+        m.disk.open_refused,
+        Some(Error::SiteZoneMismatch { ref store, .. }) if store == "Asia/Tokyo"
+    ));
+    m.config.site_zone = "Asia/Tokyo".into();
+    m.restart();
+    assert!(m.is_up());
+    assert_eq!(
+        m.calendar(s, may30).unwrap(),
+        before,
+        "past days keep their zone"
+    );
+    let mut copy = m.disk.bucket.clone();
+    assert!(Model::restore_from(m.config.clone(), vec![], &mut copy, m.wall, false).is_ok());
+    let old = Config {
+        site_zone: "America/New_York".into(),
+        ..m.config.clone()
+    };
+    assert!(matches!(
+        Model::restore_from(old, vec![], &mut m.disk.bucket, m.wall, false),
+        Err(Error::SiteZoneMismatch { .. })
+    ));
+    assert!(m.disk.bucket.claims.is_empty());
 }

@@ -71,9 +71,11 @@ pub struct Config {
     /// the oldest current detail, leave the fast disk (§8: 70 %).
     pub fill_threshold_pct: u64,
     /// The site zone (`api.md` `time_zone`). A new store records it in its
-    /// header as its zone before any site-zone entry; opening a store with
-    /// another zone is refused (§5.7, §12 D3: past days keep their zone), as
-    /// is restoring one; a change is [`Model::set_site_zone`].
+    /// header as its zone before any site-zone entry. Opening or restoring a
+    /// store is refused unless this is the store's zone in force: that of
+    /// its site-zone entry with the latest effective time, or the header's
+    /// with none (§5.7, §12 D3: past days keep their zone); a change is
+    /// [`Model::set_site_zone`].
     pub site_zone: String,
 }
 
@@ -1744,14 +1746,6 @@ impl Model {
     /// sync fails, stay read-only").
     pub fn restart_with(&mut self, recovery_sync_fails: bool) {
         self.vol = None;
-        if self.config.site_zone != self.disk.header.site_zone {
-            self.disk.open_refused = Some(Error::SiteZoneMismatch {
-                store: self.disk.header.site_zone.clone(),
-                configured: self.config.site_zone.clone(),
-            });
-            return;
-        }
-        self.disk.open_refused = None;
         // A restore that stopped before its record starts again with the
         // next generation (§8 Restore).
         if self.disk.restore.is_none()
@@ -1769,6 +1763,28 @@ impl Model {
             }
             self.disk.restore_failed = None;
         }
+        // The configured site zone must be the store's zone in force, from
+        // the restore's checkpoint and the local entries (§5.7, §12 D3).
+        let seed = self
+            .disk
+            .restore
+            .as_ref()
+            .and_then(|r| r.checkpoint.as_ref())
+            .map(|c| c.registry.site_zones().clone())
+            .unwrap_or_default();
+        let store_zone = zone_in_force(
+            &self.disk.header.site_zone,
+            seed,
+            self.disk.live_entries().values(),
+        );
+        if self.config.site_zone != store_zone {
+            self.disk.open_refused = Some(Error::SiteZoneMismatch {
+                store: store_zone,
+                configured: self.config.site_zone.clone(),
+            });
+            return;
+        }
+        self.disk.open_refused = None;
         // 1. The active segment past the durable mark (§3 Recovery).
         let sync_failed = self.recover_tail(recovery_sync_fails);
         // Read-only after a failed recovery sync: nothing more is written.
@@ -4874,6 +4890,23 @@ impl Model {
         if restored.is_empty() {
             return Err(Error::EmptyBucket);
         }
+        // Refused before anything is claimed, so a refusal leaves the bucket
+        // as it was.
+        if let Some(h) = &bucket.header {
+            let mut entries: Vec<&Entry> = bucket
+                .objects
+                .values()
+                .flat_map(|(_, f)| f.entries())
+                .collect();
+            entries.sort_by_key(|e| e.position);
+            let store_zone = zone_in_force(&h.site_zone, BTreeMap::new(), entries.into_iter());
+            if store_zone != config.site_zone {
+                return Err(Error::SiteZoneMismatch {
+                    store: store_zone,
+                    configured: config.site_zone.clone(),
+                });
+            }
+        }
         restored.sort_unstable();
         restored.dedup();
         let end = restored_end(&restored);
@@ -4895,14 +4928,6 @@ impl Model {
             }
             g
         };
-        if let Some(h) = &bucket.header
-            && h.site_zone != config.site_zone
-        {
-            return Err(Error::SiteZoneMismatch {
-                store: h.site_zone.clone(),
-                configured: config.site_zone.clone(),
-            });
-        }
         let mut m = Model::new(config, consumers, wall);
         m.disk.bucket = bucket.clone();
         if let Some(h) = &bucket.header {
@@ -5411,6 +5436,26 @@ fn routed(decl: &ConsumerDecl, routes: &BTreeMap<Position, RouteChange>, f: &Fac
     routes_in_force(decl, routes, Some(f.position))
         .values()
         .any(|x| x.condition.is_none() && x.selection.matches(f.series))
+}
+
+/// The site zone a store is opened with: that of the site-zone entry with the
+/// latest effective time (of two with the same, the later in the log), or the
+/// store header's with none. `zones` holds the entries before `entries` (a
+/// checkpoint's registry); `entries` are in position order.
+fn zone_in_force<'a>(
+    header: &str,
+    mut zones: BTreeMap<Nanos, String>,
+    entries: impl Iterator<Item = &'a Entry>,
+) -> String {
+    for e in entries {
+        if let EntryBody::Registry(RegistryEvent::SiteZone { zone, effective }) = &e.body {
+            zones.insert(*effective, zone.clone());
+        }
+    }
+    zones
+        .into_values()
+        .next_back()
+        .unwrap_or_else(|| header.to_string())
 }
 
 fn build_calendars(

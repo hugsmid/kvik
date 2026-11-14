@@ -2299,8 +2299,10 @@ fn row_21_site_zone_change_rebuilds_from_its_effective_time() {
     }
     // The rebuild equals a build from the log alone (invariant 8), also after
     // a restart, and after compaction, a tree checkpoint and a restore, which
-    // carry the site-zone entry as a registry entry.
+    // carry the site-zone entry as a registry entry. The store is opened with
+    // the zone now in force.
     assert_eq!(m.calendars().unwrap(), &m.rebuilt_calendars().unwrap());
+    m.config.site_zone = "Europe/Berlin".into();
     m.restart();
     assert_eq!(m.calendar_file(s).unwrap(), &after);
     m.seal_active();

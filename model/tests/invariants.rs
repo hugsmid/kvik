@@ -1832,7 +1832,12 @@ proptest! {
         let (mut m, _, _) = cal_model(&c);
         let live = m.calendars().unwrap().clone();
         prop_assert_eq!(&live, &m.rebuilt_calendars().unwrap());
+        // Opened with the zone in force (§5.7).
+        if let kvik_model::calendar::Zoning::Site { initial, entries } = m.site_zoning().unwrap() {
+            m.config.site_zone = entries.values().next_back().cloned().unwrap_or(initial);
+        }
         m.restart();
+        prop_assert!(m.is_up());
         prop_assert_eq!(&live, m.calendars().unwrap());
     }
 
