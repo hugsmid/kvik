@@ -7,37 +7,19 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 
 | ID | Section | Question |
 |---|---|---|
-| Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
 | Q-33 | §3 Recovery, §2.1, invariants 1 and 8 | Registry entries and derived files after a lost range |
 | Q-34 | §3, §8 Corrupt block, §11 | What `data_lost` and `possible_loss` mean beyond the report |
-| Q-36 | §5.1, §5.6, §5.7 | Calendar nodes for a series without a stored 15-minute level |
 | Q-37 | §8 Generations, §8 Restore, §2.2 | Which manifest records a restore reads, and how generations begin |
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
 | Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
 | Q-40 | §2.4 Version index, §8 Restore | Ranking facts of versioned series during a restore |
-| Q-44 | §2.1 timing, §4, §11 | Gaps left by scheduled and forecast series |
-| Q-45 | §2.1 interval, §5.7 | Intervals of varying length |
+| Q-44 (d) | §2.3 Views, §2.1 timing | Forecast accuracy, and what was known as of an issue time (for the owner) |
+| Q-45 | §2.1 interval, §5.7 | Intervals of varying length (for the owner) |
 | Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
 | Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
 | Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
-
-## Q-16 — Which commits refresh live staleness
-**Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
-committed. Read literally, "since its last commit of a fact that is not bad quality" makes the series fresh again,
-although live state still shows the 10-minute-old reading. (b) A revision for the same `t` as the live-state fact,
-committed after S of silence, likewise refreshes it. (c) A future fact is excluded until due (§4), but it is not
-said whether staleness counts from its commit or from when it fell due, nor whether "due" follows `now` (which a
-forward clock jump moves) or the monotonic clock (§4 Timers). (d) The monotonic clock restarts at boot, so after a
-restart there is no last-commit instant to measure from. (e) "Bad quality" may mean the supplied or the engine
-quality.
-**Model.** Stale-for conditions measure monotonic time since the last arrival of any reading.
-**Tried and rejected.** Counting from a staleness reference that restarts only when the live state's `t` rises past
-a high-water mark, for facts not flagged `late`, with "due" on the monotonic clock. Review found that this breaks
-principle 2 (when a fact fell due depends on a clock the log does not hold, so replay cannot rebuild it), that one
-reading far in the future flags every later reading `late` and keeps the series stale, and that a device always
-more than the lateness bound behind would never be fresh.
-**Needed.** A rule that is a function of the log, ignores late facts and same-`t` revisions, survives a restart and
-a clock jump, and says whether a skewed device counts as stale.
+| Q-49 | §8 Restore step 2, §5.1 density rule | What a series with no stored level serves during a restore |
+| Q-50 | §6 Old spans, §5.1 density rule, §12 D7 | Window edges over moved detail of a series with no stored 1-minute level |
 
 ## Q-33 — Registry entries and derived files after a lost range
 **Scenario.** A lost range (§3 Recovery) holds the definition of a series, a parameter change, an alias or a routing
@@ -63,13 +45,6 @@ copies until uploaded, but neither §8 Corrupt block nor invariant 10 lists them
 `s8_corrupt_log_segment_with_no_other_copy_loses_range`).
 **Needed.** Whether valid batches of such a segment are kept and the quarantine lifted, how results over or after a
 lost range are flagged, and whether the state is latched until acknowledged.
-
-## Q-36 — Calendar nodes for a series without a stored 15-minute level
-**Scenario.** §5.1 stores calendar nodes "assembled from 15-minute nodes", and §5.6 builds every higher node from its
-children; the density rule stores no 15-minute level for a series whose expected interval is longer than 60 s.
-**Model.** Both levels are stored for every series.
-**Needed.** Whether such a series stores calendar nodes (built from facts), or answers calendar results from its facts
-directly.
 
 ## Q-37 — Which manifest records a restore reads, and how generations begin
 **Scenario.** (a) A restore claims generation g and crashes before writing its restore record. The next restore
@@ -113,15 +88,16 @@ yet listed in the deep tier.
 **Proposed.** Each tree checkpoint carries the version index as of its position, like the registry and latest `t`
 (§8), so step 1's replay brings it up to the restored end and the rank is always known.
 
-## Q-44 — Gaps left by scheduled and forecast series
-**Scenario.** (a) A forecast feed stops: its series has no live staleness, and lookahead coverage shrinks only as the
-issued horizon runs out, so nothing reports the silence promptly. (b) A newer issue that no longer covers a valid
-time cannot withdraw the older issue's value there, so the current view can mix issues. (c) A wrong value far in the
-future on a scheduled or forecast series is never flagged, since those series are exempt from `future`. (d) How forecast
-accuracy is served: comparing each issue with the outcome series, and asking what was known as of an issue time
-rather than as of a position.
+## Q-44 (d) — Forecast accuracy, and what was known as of an issue time
+**Scenario.** How forecast accuracy is served: comparing each issue with the outcome series, and asking what was
+known as of an issue time rather than as of a position. Parts (a)–(c), on gaps left by scheduled and forecast
+series, are settled (see Settled).
 **Model.** Not modelled.
-**Needed.** Whether these are reported by the engine, left to the adapter's health, or accepted and stated.
+**Proposal (for the owner).** Not served by the engine in v1. History carries every issue with its `changed_at`, so
+a reader can compute "known as of issue X" (per key, the fact of highest rank with `changed_at ≤ X`) from
+`View::History` and compare it with the outcome series. A view by `changed_at`, or forecast-accuracy operators, is
+new scope. If confirmed, `api.md` Not in v1 gains "a view as of an issue time (`changed_at`), and forecast-accuracy
+operators (computed by the reader from `View::History`)".
 
 ## Q-45 — Intervals of varying length
 **Scenario.** An interval series has a fixed length d. A source that reports one amount per local day or per month
@@ -129,6 +105,30 @@ has intervals of 23–25 hours or 28–31 days, which no fixed d and phase descr
 **Model.** Not modelled.
 **Needed.** Whether a reading may carry its own interval length, or whether such amounts are stored at a fixed finer
 length or as calendar results.
+**Proposal (for the owner).** Keep d fixed and decline such sources in v1. A reading does not carry its own length,
+and the engine never splits an amount into finer intervals, which would invent facts. No existing kind stores such
+amounts faithfully:
+- *Counter* (cumulative, read at the period end): the step is credited to the window holding the later reading
+  (§5.5); a reading at a month's end lies in the next half-open window, so each amount lands one period late, and a
+  revision of one period rewrites every later value.
+- *Gauge* (`t` at the period start, aggregate sum): exact only for windows made of whole periods. A window edge
+  inside a period, or a query in another zone, credits the whole amount to the window holding `t`, with no
+  `apportioned` flag, which is a silent misattribution (principle 5); coverage is hold-based, so a missing day shows
+  only beyond S; avg and integral are meaningless but not refused. It serves only a consumer that queries whole
+  source periods in the source's zone, and would be documented as a workaround with these defects, not as the rule.
+- *A fixed finer d* (the adapter splits the amount): invented values, and one revision becomes many.
+
+If confirmed, §2.1 `interval length` gains: "The length is the same for every reading: a source whose intervals vary
+in length (an amount per local day in a zone with clock changes, or per month) cannot be an interval series in this
+version, and the engine never splits an amount into finer intervals"; and `api.md` Not in v1 gains "interval
+readings of varying length (amounts per local day or month)". A daily amount of 23–25 hours with d = 24 h is then
+refused off its phase after a clock change (row 40), so the limit is visible. Accepting such sources needs a new
+mechanism: a length per reading (in the fact, `format.md` and duplicate identity; a rule for overlapping intervals,
+affecting sum, coverage and invariant 22; a declared maximum length bounding edge lookups and the recent window;
+readiness at `t + d` per reading), or a calendar length (local day or month in a zone fixed for the series), whose
+intervals tile but whose phase check and lengths then depend on tzdata, and which still does not cover irregular
+billing periods. Since Q-36 such a series would store no level, so node edges raise no problem. If wanted, the
+feature is best opened as its own question, starting from the calendar length.
 
 ## Q-46 — Positions kept by a reader process, after a truncated tail
 **Scenario.** A reader process (§7) reads position p from the log up to the mark and keeps it, for example in an
@@ -162,6 +162,28 @@ a truncated tail is sent, and §6 Restart and resume delivers the facts after C'
 **Model.** Not modelled; the mark is always exact.
 **Proposed.** Persist a "resync owed" flag, or a reuse floor, with the mark until each consumer has confirmed its
 `resync`.
+
+## Q-49 — What a series with no stored level serves during a restore
+**Scenario.** A gauge has an expected interval of 5 minutes, so the density rule (§5.1) stores no 1-minute or
+15-minute level and, since Q-36, no calendar node; the tree checkpoint holds nothing for it. After a restore onto an
+empty disk, §8 Restore step 2 serves queries "at ≥ 1-minute resolution" from the checkpoint, flagged `restoring`,
+while its facts come back only in step 3. A query for yesterday's daily mean of this series during step 2 has
+neither a node nor a fact to answer from, and row 28 ("queries at ≥ 1 min from the checkpoint") does not say what it
+returns.
+**Model.** Not modelled; a restore completes in one step (see Q-39).
+**Needed.** What such a series serves during step 2 (empty with zero coverage, an error, or a result that waits for
+its detail), how the result is flagged, and whether the detail of series with no stored level is downloaded first.
+
+## Q-50 — Window edges over moved detail of a series with no stored 1-minute level
+**Scenario.** §6 Old spans evaluates an edge whose raw detail is not local "at 1-minute precision", flagged
+`approximate_edges`, and §12 D7 keeps the 1-minute level hot for that purpose. The density rule (§5.1) stores the
+1-minute level only for series whose expected interval is 5 s or shorter. A gauge with a 60 s expected interval has
+only the 15-minute level; one with a 5-minute expected interval has none. When their detail has moved off the machine
+(§8 Fill pressure, or a diagnostic retention class), a rolling 24-hour window whose start falls in that span has no
+1-minute node to evaluate its edge from.
+**Model.** Not modelled; both levels are stored for every series, and detail is read from whichever tier holds it.
+**Needed.** Whether such an edge is evaluated at the finest stored level (and with no level, how), or its detail is
+fetched on demand as for other reads of moved detail (§8), and how the result is flagged in each case.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -250,6 +272,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-13 | Negative counter values | §2.5, §5.5 |
 | Q-14 | State transition at a window's leading edge | §6 Edge stretches, invariant 17 |
 | Q-15 | Rolling-window coverage after a forward clock jump | §6 Windows (event time against `now`), §11 Health (clock jumps) |
+| Q-16 | Which commits refresh live staleness, when a fact falls due, and across a restart | §5.4 (the refresh instant of the live-state key; nothing else refreshes it; seeded from `received_at` and `t` after a restart), rows 3, 17b and 17c, invariant 23 |
 | Q-17 | Identity of a reading recorded without a value | §2.4 |
 | Q-18 | Rate flagged in windows without a gap | §6 Aggregates (replaces the Q-05 flag condition) |
 | Q-19 | A corrupt compacted file whose inputs are still local | §8 Corrupt block, row 11 |
@@ -267,9 +290,11 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
-| Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44) |
+| Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (open parts: Q-49, Q-50) |
+| Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (d)) |
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (open part: Q-45) |
 | Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
+| Q-44 | Gaps left by scheduled and forecast series, parts (a)–(c) | §2.1 `timing` (no horizon and no inferred withdrawal; a source withdraws a value by a bad-quality reading; a silent source is reported by stale-for on the adapter's companion series), §11 Health and `api.md` Health and statistics (each series' latest recorded `t`), rows 37a, 37b and 38a (open part: Q-44 (d)) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
@@ -297,19 +322,19 @@ uploading and stays read-only across restarts, with fatal health (`tests/rules.r
 | Routing changes as log entries; new-consumer start; cycles | §4, rows 33–34 | Fixed selections from configuration | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled | — |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any reading passed to the condition refreshes it | — |
+| Live staleness for stale-for conditions | §2.5, §5.4, rows 17b and 17c, invariant 23: only the refresh instant of the live-state key counts, so late, same-`t`, bad-quality, outranked and not-yet-due facts refresh nothing; after a restart the time passed is `now − max(received_at, t)` and the latch holds until it is taken | Any reading passed to the condition refreshes it; a rebuilt condition counts from the restart and starts unfired | `tests/edge_cases.rs` `row_17_series_goes_silent` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
 | Latch and `resync` | §4, §6, rows 15–16, invariant 16 | Operator rebuilt from the tree; a true condition counts as fired | `restart_rebuilds_threshold_without_firing_again`, `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Timer deliveries with per-funnel sequence | §4 | Conditions are tested apart from delivery | — |
-| Tree checkpoints, density rule | §5.1 | Tree rebuilt from facts at restart; both levels stored for every series | — |
-| Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries; row 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
+| Tree checkpoints, density rule | §5.1, row 20a | Tree rebuilt from facts at restart; both levels, and calendar nodes, stored for every series | — |
+| Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
 | Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
 | Atomic manifest records | §7, row 10, invariant 14 | Publish and retirement are two records | `compaction_crash_after_publish_resumes_retirement` |
 | Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments | `compaction_crash_after_publish_resumes_retirement` |
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | Files leave hot after the grace period; old epochs read remotely | `reader_epoch_survives_grace_then_reads_remotely` |
 | Revised-key index, recent window | §2.4, §5.1 | A full in-memory history | — |
 | Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
-| Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Not modelled; every series is observed | — |
+| Series timing: scheduled and forecast series, credit limit, withdrawal | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21, rows 37a and 38a | Not modelled; every series is observed | — |
 | Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
 | Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
