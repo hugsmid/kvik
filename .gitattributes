@@ -1,0 +1,4 @@
+# Golden files are compared byte for byte.
+log/tests/golden/*.open binary
+log/tests/golden/*.kvl binary
+log/tests/golden/*.mark binary
