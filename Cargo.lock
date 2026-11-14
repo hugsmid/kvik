@@ -534,6 +534,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvik"
+version = "0.1.0"
+dependencies = [
+ "jiff",
+ "kvik-model",
+ "thiserror",
+]
+
+[[package]]
 name = "kvik-model"
 version = "0.1.0"
 dependencies = [

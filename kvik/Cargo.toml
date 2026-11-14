@@ -1,0 +1,26 @@
+[package]
+name = "kvik"
+version = "0.1.0"
+description = "Embedded time-series store for device and sensor data (public interface; in-memory backend for now)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository = "https://github.com/hugsmid/kvik"
+readme = "README.md"
+keywords = ["time-series", "storage", "embedded"]
+categories = ["database-implementations"]
+
+[features]
+default = ["model-backend"]
+# In-memory backend on the reference model: not durable, for development and
+# tests. The durable log engine replaces it from roadmap item 4.2.
+model-backend = ["dep:kvik-model"]
+
+[dependencies]
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+kvik-model = { path = "../model", optional = true }
+thiserror = "2"
+
+[lints]
+workspace = true

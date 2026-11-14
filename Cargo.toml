@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["model", "spikes/encodings", "spikes/commit"]
+members = ["model", "kvik", "spikes/encodings", "spikes/commit"]
 # The spikes are built and tested in their own CI job (`cargo test -p encodings`, `cargo test -p commit`).
-default-members = ["model"]
+default-members = ["model", "kvik"]
 
 [workspace.package]
 edition = "2024"

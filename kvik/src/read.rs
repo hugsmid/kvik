@@ -1,0 +1,263 @@
+//! Query types (spec §2.3, §5.7, §6; `docs/api.md` Reading).
+
+use std::time::Duration;
+
+use jiff::civil::Date;
+use jiff::{SignedDuration, Timestamp};
+
+use crate::types::{Fact, Position, Value};
+
+/// An aggregate over a window (spec §6 Aggregates).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Aggregate {
+    /// Gauge: integral ÷ covered seconds.
+    Avg,
+    /// Sum of reading values; for an interval series, the amount in the
+    /// window.
+    Sum,
+    /// Integral in value × seconds.
+    Integral,
+    /// Smallest reading.
+    Min,
+    /// Largest reading.
+    Max,
+    /// Number of readings.
+    Count,
+    /// Counter increase.
+    Increase,
+    /// Counter increase per second; interval series: sum ÷ covered seconds.
+    Rate,
+    /// Last value, or the held value with no reading inside.
+    Last,
+    /// Seconds in a state ([`Value::Bool`] or [`Value::State`]).
+    TimeInState(Value),
+}
+
+/// The value of an aggregate.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum Aggregated {
+    /// A number.
+    Number(f64),
+    /// A reading's value ([`Aggregate::Last`]); `None` for a reading recorded
+    /// without one.
+    Value(Option<Value>),
+}
+
+/// A calendar period (spec §5.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CalendarPeriod {
+    /// A local day.
+    Day(Date),
+    /// A local month.
+    Month {
+        /// Year.
+        year: i16,
+        /// Month, 1–12.
+        month: i8,
+    },
+}
+
+impl From<Date> for CalendarPeriod {
+    fn from(d: Date) -> Self {
+        CalendarPeriod::Day(d)
+    }
+}
+
+/// A calendar window (spec §6 Windows), taken at `now`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CalendarWindow {
+    /// From local midnight to `now`.
+    SinceMidnight,
+    /// From the start of the month to `now`.
+    ThisMonth,
+    /// The local day `k` days after today (before it for negative `k`),
+    /// whole.
+    Day(i32),
+    /// The month `k` months after this one, whole.
+    Month(i32),
+    /// A named period, whole.
+    Period(CalendarPeriod),
+}
+
+/// A window (spec §6 Windows). Bounds are event times, evaluated against the
+/// store's `now`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Window {
+    /// `[now + start, now + end)`, `start < end`, of either sign.
+    Relative {
+        /// Start offset from `now`.
+        start: SignedDuration,
+        /// End offset from `now`.
+        end: SignedDuration,
+    },
+    /// `[from, to)`.
+    Between {
+        /// Start.
+        from: Timestamp,
+        /// End.
+        to: Timestamp,
+    },
+    /// A calendar window in the site zone, or in the named IANA zone for its
+    /// whole span.
+    Calendar {
+        /// The window.
+        window: CalendarWindow,
+        /// A named zone instead of the site zone.
+        zone: Option<String>,
+    },
+}
+
+impl Window {
+    /// The last `width` up to `now`: `[now − width, now)`.
+    ///
+    /// # Panics
+    /// Panics if `width` exceeds the range of [`SignedDuration`].
+    pub fn rolling(width: Duration) -> Self {
+        let w = SignedDuration::try_from(width).expect("width within range");
+        Window::Relative {
+            start: -w,
+            end: SignedDuration::ZERO,
+        }
+    }
+
+    /// `[from, to)`.
+    pub fn between(from: Timestamp, to: Timestamp) -> Self {
+        Window::Between { from, to }
+    }
+
+    /// A calendar window in the site zone.
+    pub fn calendar(window: CalendarWindow) -> Self {
+        Window::Calendar { window, zone: None }
+    }
+}
+
+/// Flags of a query result (spec §6, §8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ResultFlags {
+    /// Served while a restore is bringing detail back.
+    pub restoring: bool,
+    /// An edge moved inward to where detail is local; `from` and `to` give
+    /// the span evaluated.
+    pub approximate_edges: bool,
+    /// An interval series' amount was credited pro rata at an edge.
+    pub apportioned: bool,
+    /// A displaced interval reading lies in the span (spec §5.4).
+    pub displaced: bool,
+    /// A minute in the span awaits detail not on the machine (spec §5.6).
+    pub summary_stale: bool,
+    /// A counter step in a rate spans more than the staleness limit.
+    pub rate_flagged: bool,
+}
+
+/// A window result (spec §6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowResult {
+    /// The aggregate's value; `None` when empty.
+    pub value: Option<Aggregated>,
+    /// Readings in the span.
+    pub count: u64,
+    /// Time with a valid value.
+    pub coverage: Duration,
+    /// Coverage as a fraction of the span (0 for an empty span).
+    pub coverage_fraction: f64,
+    /// Start of the span evaluated.
+    pub from: Timestamp,
+    /// End of the span evaluated.
+    pub to: Timestamp,
+    /// Flags.
+    pub flags: ResultFlags,
+}
+
+impl WindowResult {
+    /// The value as a number, if it is one.
+    pub fn number(&self) -> Option<f64> {
+        match &self.value {
+            Some(Aggregated::Number(x)) => Some(*x),
+            Some(Aggregated::Value(Some(Value::F64(x)))) => Some(*x),
+            _ => None,
+        }
+    }
+}
+
+/// A view of the facts (spec §2.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// For each `(series, t)`, the fact of highest rank.
+    Current,
+    /// The current view over facts with position ≤ P.
+    AsOf(Position),
+    /// As-of P, where P is the last position whose batch `commit_time` ≤ T.
+    AsOfTime(Timestamp),
+    /// Every fact, in `t` then position order.
+    History,
+}
+
+/// The resolution of a chart query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// Raw facts when they number at most `max_points`; otherwise the finest
+    /// of 1 minute, 15 minutes and whole multiples of 15 minutes that yields
+    /// at most `max_points` buckets.
+    Auto {
+        /// Most points wanted.
+        max_points: usize,
+    },
+    /// Buckets of a fixed width, aligned to UTC.
+    Step(Duration),
+}
+
+/// One chart bucket: enough to show gaps and spikes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bucket {
+    /// Start.
+    pub from: Timestamp,
+    /// End.
+    pub to: Timestamp,
+    /// Readings.
+    pub count: u64,
+    /// Smallest reading, for a numeric series.
+    pub min: Option<f64>,
+    /// Largest reading, for a numeric series.
+    pub max: Option<f64>,
+    /// Time-weighted average of a gauge.
+    pub avg: Option<f64>,
+    /// Time with a valid value.
+    pub coverage: Duration,
+}
+
+/// The result of a chart query.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ChartData {
+    /// Raw facts of the current view.
+    Facts(Vec<Fact>),
+    /// Buckets of one width.
+    Buckets {
+        /// Bucket width.
+        step: Duration,
+        /// Buckets in time order.
+        buckets: Vec<Bucket>,
+    },
+}
+
+/// A series' live value (spec §2.3).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveValue {
+    /// The live-state fact.
+    pub fact: Fact,
+    /// Whether the series is stale (spec §5.4 live staleness).
+    pub stale: bool,
+}
+
+/// Live state (spec §2.3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Live {
+    /// The latest valid value.
+    Value(LiveValue),
+    /// No live state (no valid fact yet, or a forecast series).
+    None,
+    /// During a restore, the fact may not be local yet. Never produced by the
+    /// model backend.
+    Unknown,
+}
