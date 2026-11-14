@@ -538,6 +538,7 @@ name = "kvik"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "kvik-log",
  "kvik-model",
  "thiserror",
 ]
@@ -549,6 +550,7 @@ dependencies = [
  "crc",
  "kvik-model",
  "proptest",
+ "rustix",
  "thiserror",
 ]
 

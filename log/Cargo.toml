@@ -15,6 +15,10 @@ categories = ["database-implementations"]
 crc = "3.4"
 thiserror = "2"
 
+[target.'cfg(unix)'.dependencies]
+# Free space through `statvfs` without unsafe code (`format.md` A.13).
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+
 [dev-dependencies]
 # The reference model: the meaning of facts and entries, for the differential test.
 kvik-model = { path = "../model" }

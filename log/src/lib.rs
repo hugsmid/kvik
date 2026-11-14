@@ -14,8 +14,7 @@
 //! - [`segment`]: the life cycle of a segment as bytes, and the states recovery may find (A.4).
 //! - [`mark`]: the durable mark's slots (A.10).
 //! - [`name`]: segment file names (A.12).
-//!
-//! File operations go through the file-system seam (roadmap 4.4).
+//! - [`fs`]: the file-system seam every file operation goes through (A.13).
 //!
 //! ```
 //! use kvik_log::batch::{BatchBuilder, SegmentIdentity};
@@ -58,6 +57,7 @@ pub mod crc;
 pub mod entries;
 mod error;
 pub mod facts;
+pub mod fs;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod header;

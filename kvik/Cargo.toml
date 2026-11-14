@@ -24,6 +24,7 @@ jiff = []
 
 [dependencies]
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+kvik-log = { path = "../log" }
 kvik-model = { path = "../model", optional = true }
 thiserror = "2"
 
