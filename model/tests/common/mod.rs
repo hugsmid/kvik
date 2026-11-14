@@ -9,7 +9,7 @@ use kvik_model::engine::{
     Envelope, Fault, Funnel, FunnelId, Model, Operator, RouteChange, Selection, WriteOutcome,
 };
 use kvik_model::oracle;
-use kvik_model::registry::{ChangedAtKind, RetentionClass, SeriesOptions};
+use kvik_model::registry::{ChangedAtKind, RetentionClass, SeriesOptions, Timing};
 use kvik_model::summary::Aggregate;
 use kvik_model::summary::Params;
 use kvik_model::types::{
@@ -108,11 +108,17 @@ pub fn arb_params() -> impl Strategy<Value = Params> {
         proptest::option::weighted(0.85, arb_staleness()),
         proptest::option::weighted(0.2, Just(400.0f64)),
         prop_oneof![Just(0.1f64), Just(0.5), Just(1.0)],
+        prop_oneof![
+            3 => Just(Timing::Observed),
+            1 => Just(Timing::Scheduled),
+            1 => Just(Timing::Forecast),
+        ],
     )
-        .prop_map(|(k, s, wrap, ceiling)| {
+        .prop_map(|(k, s, wrap, ceiling, timing)| {
             let mut p = Params::new(k, s);
             p.counter.wrap_at = wrap;
             p.counter.reset_ceiling = ceiling;
+            p.timing = timing;
             p
         })
 }

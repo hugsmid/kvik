@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::registry::Timing;
 use crate::types::{Exact, Kind, Nanos, SECOND, StateKey, Value, exact, exact_ns};
 
 /// Counter rules (§5.5).
@@ -43,6 +44,8 @@ pub struct Params {
     /// Expected interval (§2.1); it decides which levels are stored
     /// ([`Params::stores`]).
     pub expected_interval: Option<Nanos>,
+    /// Timing (§2.1); it decides the credit limit ([`Params::credit_limit`]).
+    pub timing: Timing,
 }
 
 /// The longest expected interval for which each stored level is kept
@@ -65,7 +68,25 @@ impl Params {
             staleness,
             counter: CounterRules::default(),
             expected_interval: staleness.map(|s| s / 3),
+            timing: Timing::Observed,
         }
+    }
+
+    /// The end of the time a window `[_, end)` evaluated at `now` may credit
+    /// (§6 credit limit): `now` for an observed series, the window end for a
+    /// scheduled or forecast series, whose values are known in advance.
+    /// Readings after it are ignored.
+    pub fn credit_limit(&self, end: Nanos, now: Nanos) -> Nanos {
+        match self.timing {
+            Timing::Observed => end.min(now),
+            Timing::Scheduled | Timing::Forecast => end,
+        }
+    }
+
+    /// Whether a window `[start, _)` at `now` lies wholly after `now` on an
+    /// observed series, and so is empty with zero coverage (§6 Windows).
+    pub fn wholly_future(&self, start: Nanos, now: Nanos) -> bool {
+        self.timing == Timing::Observed && start > now
     }
 
     /// Whether the stored level `level` (0: 1 minute, 1: 15 minutes) is kept

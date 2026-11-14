@@ -282,9 +282,14 @@ impl SeriesTree {
     }
 
     /// Evaluates the window `[start, end)` at time `now` (§6): readings after
-    /// `now` are ignored and no time is credited past `now`.
+    /// the credit limit (`now` for an observed series, the window end for a
+    /// scheduled or forecast one) are ignored and no time is credited past it;
+    /// a window wholly after `now` on an observed series is empty.
     pub fn window(&self, start: Nanos, end: Nanos, now: Nanos) -> Node {
-        let until = end.min(now).max(start);
+        if self.params.wholly_future(start, now) {
+            return Node::empty(self.params.kind, start, end);
+        }
+        let until = self.params.credit_limit(end, now).max(start);
         let core = self.core(start, until);
         let mut n = with_stretches(&self.params, core, self.last_before(start).as_ref(), until);
         n.end = end;

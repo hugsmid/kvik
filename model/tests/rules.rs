@@ -1698,6 +1698,120 @@ fn last_resync_condition(m: &Model) -> (ConditionState, bool) {
     (c.state, c.transition)
 }
 
+/// §4 Future facts and §6 Cadence: a stale-for condition on a forecast
+/// series, and any condition over one without a windowed operator, are
+/// rejected when funnels are compiled; `resync` for a funnel over a forecast
+/// series carries condition state only. A stale-for condition on a scheduled
+/// series is not modelled and refused.
+#[test]
+fn s4_funnels_over_scheduled_and_forecast_series() {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::Series(BTreeSet::new()),
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let def = |m: &mut Model, name: &str, options| {
+        m.define_with(
+            name,
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            10 * MINUTE,
+            options,
+        )
+        .unwrap()
+    };
+    let f = def(
+        &mut m,
+        "site/weather-1/irradiance",
+        SeriesOptions {
+            versioned: Some(ChangedAtKind::Time),
+            ..SeriesOptions::timing(Timing::Forecast)
+        },
+    );
+    let sched = def(
+        &mut m,
+        "site/tariff-1/price",
+        SeriesOptions::timing(Timing::Scheduled),
+    );
+    let stale = Condition::StaleFor {
+        staleness: 10 * MINUTE,
+        n: 0,
+    };
+    let above = Condition::Threshold {
+        on: 5.0,
+        clear: 4.0,
+    };
+    let avg = Operator {
+        aggregate: Aggregate::Avg,
+        width: HOUR,
+    };
+    for (s, op, cond) in [
+        (f, None, stale.clone()),
+        (f, Some(avg.clone()), stale.clone()),
+        (f, None, above.clone()),
+        (sched, None, stale),
+    ] {
+        assert!(matches!(
+            m.add_route(C, FunnelId(1), Funnel::condition(s, op, cond)),
+            Err(Error::BadRoute(_))
+        ));
+    }
+    m.add_route(
+        C,
+        FunnelId(1),
+        Funnel::condition(f, Some(avg), above.clone()),
+    )
+    .unwrap();
+    m.add_route(C, FunnelId(2), Funnel::condition(sched, None, above))
+        .unwrap();
+    let now = m.wall;
+    let at = u64::try_from(now).unwrap();
+    m.ingest(vec![
+        Reading::versioned(f, now - 30 * MINUTE, 9.0, at),
+        Reading::versioned(f, now + HOUR, 9.0, at),
+        Reading::num(sched, now - MINUTE, 1.0),
+        Reading::num(sched, now + 10 * MINUTE, 9.0),
+    ])
+    .unwrap();
+    m.drain().unwrap();
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let r = m.received[&C]
+        .iter()
+        .rev()
+        .find_map(|r| r.delivery.resync().cloned())
+        .unwrap();
+    let state = |id| r.funnels.iter().find(|x| x.funnel == id).unwrap().clone();
+    assert_eq!(
+        state(FunnelId(1)).live,
+        vec![(f, None)],
+        "condition state only"
+    );
+    assert_eq!(
+        state(FunnelId(1)).condition.unwrap().state,
+        ConditionState::Active(true)
+    );
+    // The scheduled value for later takes effect at its `t`, seen through
+    // the condition funnel's timer evaluation.
+    assert_eq!(
+        state(FunnelId(2)).condition.unwrap().state,
+        ConditionState::Active(false)
+    );
+    m.advance(10 * MINUTE);
+    m.tick().unwrap();
+    m.drain().unwrap();
+    let fired = m.received[&C].iter().any(|r| {
+        r.delivery.trigger().is_some_and(|t| {
+            t.funnel == FunnelId(2)
+                && t.state == ConditionState::Active(true)
+                && t.cause == TriggerCause::Timer
+        })
+    });
+    assert!(fired);
+}
+
 /// §4 Routing: "Changes are log entries and take effect at their position;
 /// catch-up applies the routes in force at each position." A route added at
 /// run time routes only later facts, a removed one none after its removal,

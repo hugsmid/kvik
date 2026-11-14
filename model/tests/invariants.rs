@@ -603,9 +603,11 @@ proptest! {
         prop_assert_eq!(whole, transitions(&oracle::window(&p, &rs, start, end, now)));
     }
 
-    /// 18. No time is credited past `now`, nor past a reading's staleness limit:
-    /// coverage never exceeds the part of `[start, min(end, now))` that lies
-    /// within S after some reading at or before `now`.
+    /// 18. No time is credited past the credit limit (`now` for an observed
+    /// series, the window end for a scheduled or forecast one), nor past a
+    /// reading's staleness limit: coverage never exceeds the part of
+    /// `[start, credit limit)` that lies within S after some reading at or
+    /// before the credit limit.
     #[test]
     fn inv18_nothing_credited_past_now_or_staleness(
         (p, rs) in arb_params().prop_flat_map(|p| (Just(p), arb_readings(p.kind, 16))),
@@ -614,11 +616,11 @@ proptest! {
         let (start, end, now) = (T0 + a.min(b), T0 + a.max(b), T0 + n);
         let tree = SeriesTree::build(p, &rs);
         let w = tree.window(start, end, now);
-        let until = end.min(now);
+        let until = p.credit_limit(end, now);
         prop_assert!(w.coverage <= i128::from((until - start).max(0)));
         let valid: Vec<(Nanos, Nanos)> = rs
             .iter()
-            .filter(|(t, _)| *t <= now)
+            .filter(|(t, _)| *t <= until)
             .map(|(t, _)| (*t, p.staleness.map_or(Nanos::MAX, |s| t.saturating_add(s))))
             .collect();
         prop_assert!(w.coverage <= union_within(&valid, start, until));
@@ -1502,6 +1504,55 @@ fn emit_timed(
 
 proptest! {
     #![proptest_config(cases(256))]
+
+    /// 21. A window result over a scheduled or forecast series is a function
+    /// of the current view and the window's bounds alone: through the engine,
+    /// the same windows evaluated as the clocks advance, with no ingest in
+    /// between, give the same results, equal to the direct computation over
+    /// the current view.
+    #[test]
+    fn inv21_scheduled_and_forecast_windows_independent_of_now(
+        readings in arb_timed_readings(),
+        windows in proptest::collection::vec((-(2 * kvik_model::types::DAY)..(3 * kvik_model::types::DAY), 1..(2 * kvik_model::types::DAY)), 1..5),
+        advances in proptest::collection::vec(prop_oneof![Just(SECOND), 0..(2 * kvik_model::types::DAY)], 1..4),
+    ) {
+        let (mut m, ids) = timed_machine();
+        emit_timed(&mut m, ids, &readings);
+        let base = m.wall;
+        let eval = |m: &kvik_model::engine::Model| -> Vec<Node> {
+            ids[..2].iter().flat_map(|s| windows.iter().map(move |(a, len)| m.window(*s, base + a, base + a + len).unwrap())).collect()
+        };
+        let first = eval(&m);
+        for (k, s) in ids[..2].iter().enumerate() {
+            let p = m.tree(*s).unwrap().params;
+            let rs = oracle::readings(m.current().unwrap(), *s);
+            for (j, (a, len)) in windows.iter().enumerate() {
+                let want = oracle::window(&p, &rs, base + a, base + a + len, m.now);
+                prop_assert_eq!(&first[k * windows.len() + j], &want);
+            }
+        }
+        for d in &advances {
+            m.advance(*d);
+            prop_assert_eq!(&eval(&m), &first);
+        }
+    }
+
+    /// 21 over the tree alone, with random parameters: the window at any two
+    /// values of `now` is the same.
+    #[test]
+    fn inv21_tree_windows_independent_of_now(
+        (p, rs) in (arb_params(), prop_oneof![
+            Just(kvik_model::registry::Timing::Scheduled),
+            Just(kvik_model::registry::Timing::Forecast),
+        ]).prop_map(|(mut p, timing)| { p.timing = timing; p }).prop_flat_map(|p| (Just(p), arb_readings(p.kind, 16))),
+        (a, b, n1, n2) in (arb_offset(), arb_offset(), arb_offset(), arb_offset()),
+    ) {
+        let (start, end) = (T0 + a.min(b), T0 + a.max(b));
+        let tree = SeriesTree::build(p, &rs);
+        let w = tree.window(start, end, T0 + n1);
+        prop_assert_eq!(&w, &tree.window(start, end, T0 + n2));
+        prop_assert_eq!(w, oracle::window(&p, &rs, start, end, T0 + n2));
+    }
 
     /// 20. No fact of a scheduled or forecast series carries `future`, or
     /// `late` by its first clause. The readings stay within the lateness

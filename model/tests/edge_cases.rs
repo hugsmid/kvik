@@ -334,6 +334,192 @@ proptest! {
     }
 }
 
+/// A store with consumer `C` (every series) and a gauge of the given
+/// timing with S = 30 minutes; a forecast series is versioned with
+/// `changed_at` kind `time`.
+fn timed_model(timing: Timing) -> (Model, SeriesId) {
+    let (mut m, _) = model();
+    let versioned = (timing == Timing::Forecast).then_some(ChangedAtKind::Time);
+    let s = m
+        .define_with(
+            "site/tariff-1/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "c/kWh",
+            30 * MINUTE,
+            SeriesOptions {
+                versioned,
+                ..SeriesOptions::timing(timing)
+            },
+        )
+        .unwrap();
+    (m, s)
+}
+
+fn timed_reading(m: &Model, s: SeriesId, t: Nanos, v: f64) -> Reading {
+    let forecast = m.registry().unwrap().get(s).unwrap().options.timing == Timing::Forecast;
+    if forecast {
+        Reading::versioned(s, t, v, u64::try_from(m.wall).unwrap())
+    } else {
+        Reading::num(s, t, v)
+    }
+}
+
+/// Row 36: "Scheduled value for tomorrow: recorded unflagged, quality kept;
+/// delivered at commit as notice; in live state from its `t`, with no second
+/// delivery; stale S after the last value takes effect."
+#[test]
+fn row_36_scheduled_value_for_tomorrow() {
+    let (mut m, s) = timed_model(Timing::Scheduled);
+    let now = m.wall;
+    let today = Reading {
+        quality: Quality::Estimated,
+        ..Reading::num(s, now - MINUTE, 10.0)
+    };
+    let tomorrow = now + DAY;
+    let p = m
+        .ingest(vec![today, Reading::num(s, tomorrow, 20.0)])
+        .unwrap()
+        .positions[1];
+    let f = m.current().unwrap()[&(s, tomorrow)].clone();
+    assert!(!f.flags.future && !f.flags.late);
+    assert_eq!(f.quality, Quality::Good);
+    m.drain().unwrap();
+    assert_eq!(
+        delivered(&m).iter().filter(|q| **q == p).count(),
+        1,
+        "a notice at commit"
+    );
+    let notice = m.received[&C]
+        .iter()
+        .find(|r| r.delivery.position == p)
+        .unwrap();
+    assert!(!notice.delivery.fact().unwrap().flags.future);
+    // Live state keeps today's value until tomorrow's takes effect.
+    assert_eq!(m.latest(s).unwrap().unwrap().value, Value::Num(10.0));
+    assert_eq!(m.scheduled_stale(s).unwrap(), Some(false));
+    // Today's value falls stale S after it took effect.
+    m.advance(30 * MINUTE);
+    assert_eq!(m.scheduled_stale(s).unwrap(), Some(true));
+    m.advance(DAY - 30 * MINUTE);
+    assert_eq!(m.latest(s).unwrap().unwrap().value, Value::Num(20.0));
+    assert_eq!(
+        m.scheduled_stale(s).unwrap(),
+        Some(false),
+        "commits do not refresh it; t does"
+    );
+    m.drain().unwrap();
+    assert_eq!(
+        delivered(&m).iter().filter(|q| **q == p).count(),
+        1,
+        "no second delivery"
+    );
+    m.advance(30 * MINUTE + 1);
+    assert_eq!(m.scheduled_stale(s).unwrap(), Some(true));
+}
+
+/// Row 37b: "Forecast source falls silent: no live staleness; reported by
+/// stale-for on the adapter's companion series, and later by shrinking
+/// lookahead coverage."
+#[test]
+fn row_37b_forecast_source_falls_silent() {
+    let (mut m, f) = timed_model(Timing::Forecast);
+    // The adapter's companion series: one reading per successful fetch.
+    let fetch = m
+        .define(
+            "site/weather-adapter/fetch",
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            10 * MINUTE,
+        )
+        .unwrap();
+    m.add_route(
+        C,
+        FunnelId(1),
+        Funnel::condition(
+            fetch,
+            None,
+            Condition::StaleFor {
+                staleness: 10 * MINUTE,
+                n: 0,
+            },
+        ),
+    )
+    .unwrap();
+    let issue = |m: &mut Model| {
+        let now = m.wall;
+        // Half-hourly values for the next 24 hours.
+        let rs: Vec<Reading> = (0..48)
+            .map(|k| timed_reading(m, f, now + k * 30 * MINUTE, 1.0))
+            .collect();
+        m.ingest(rs).unwrap();
+        m.ingest(vec![Reading::num(fetch, now, 1.0)]).unwrap();
+    };
+    issue(&mut m);
+    let lookahead = |m: &Model| m.window(f, m.now, m.now + DAY).unwrap().coverage;
+    let full = lookahead(&m);
+    assert_eq!(full, i128::from(DAY));
+    // Silent for two hours: the forecast series has no live state and no live
+    // staleness; the companion's stale-for fires; the lookahead shrinks.
+    m.drain().unwrap();
+    for _ in 0..12 {
+        m.advance(10 * MINUTE);
+        m.tick().unwrap();
+    }
+    assert_eq!(m.latest(f).unwrap(), None);
+    assert_eq!(m.scheduled_stale(f).unwrap(), None);
+    m.drain().unwrap();
+    let fired = m.received[&C].iter().any(|r| {
+        r.delivery
+            .trigger()
+            .is_some_and(|t| t.funnel == FunnelId(1) && t.state == ConditionState::Active(true))
+    });
+    assert!(fired, "stale-for on the companion series");
+    assert_eq!(lookahead(&m), full - i128::from(2 * HOUR));
+}
+
+/// Row 38: "Window over tomorrow on a scheduled or forecast series: credited
+/// up to the window end; coverage shows where the values run out."
+#[test]
+fn row_38_window_over_tomorrow_on_scheduled_or_forecast_series() {
+    for timing in [Timing::Scheduled, Timing::Forecast] {
+        let (mut m, s) = timed_model(timing);
+        let start = floor_to(m.wall, DAY) + DAY;
+        // Half-hourly values from tomorrow 00:00 to 06:00 (exclusive).
+        let rs: Vec<Reading> = (0..12)
+            .map(|k| timed_reading(&m, s, start + k * 30 * MINUTE, f64::from(k as i32)))
+            .collect();
+        m.ingest(rs).unwrap();
+        let w = m.window(s, start, start + DAY).unwrap();
+        assert_eq!(w.count, 12);
+        // Credited to 06:00, the last value's validity (S = 30 minutes).
+        assert_eq!(w.coverage, i128::from(6 * HOUR), "{timing:?}");
+        let p = m.tree(s).unwrap().params;
+        let rs = oracle::readings(m.current().unwrap(), s);
+        assert_eq!(w, oracle::window(&p, &rs, start, start + DAY, m.now));
+    }
+}
+
+/// Row 39: "Window ending after `now` on an observed series: nothing credited
+/// past `now`." A window wholly after `now` is empty (§6 Windows), even with
+/// a future fact before it.
+#[test]
+fn row_39_window_ending_after_now_on_an_observed_series() {
+    let (mut m, s) = model(); // S = 10 s
+    let now = m.wall;
+    m.ingest(vec![
+        num(s, now - 5 * SECOND, 1.0),
+        num(s, now + 2 * MINUTE, 2.0),
+    ])
+    .unwrap();
+    let w = m.window(s, now - 5 * SECOND, now + HOUR).unwrap();
+    assert_eq!(w.coverage, i128::from(5 * SECOND));
+    assert_eq!(w.count, 1);
+    let w = m.window(s, now + 3 * MINUTE, now + HOUR).unwrap();
+    assert_eq!((w.count, w.coverage, w.last.clone()), (0, 0, None));
+}
+
 #[test]
 fn row_03_late_reading_flagged_tree_updated_no_retroactive_trigger() {
     let (mut m, s) = model();

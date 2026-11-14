@@ -31,14 +31,23 @@ pub fn node(p: &Params, all: &[(Nanos, Value)], start: Nanos, end: Nanos) -> Nod
 }
 
 /// A window `[start, end)` evaluated at `now`, by definition (§6): every
-/// reading is held until the next reading, its staleness limit, or
-/// `min(end, now)`; only the part inside the window is credited. Readings
-/// after `now` are ignored. Count, sum, min, max, first and last are over
+/// reading is held until the next reading, its staleness limit, or the
+/// credit limit (`min(end, now)` for an observed series, `end` for a
+/// scheduled or forecast one); only the part inside the window is credited.
+/// Readings after the credit limit are ignored, and a window wholly after
+/// `now` on an observed series is empty. Count, sum, min, max, first and last are over
 /// readings inside; counter steps and state transitions are credited to the
 /// window holding the later reading. With no reading inside, `last` is the
 /// value held at the window start, if valid.
 pub fn window(p: &Params, all: &[(Nanos, Value)], start: Nanos, end: Nanos, now: Nanos) -> Node {
-    let until = end.min(now).max(start);
+    if p.timing == crate::registry::Timing::Observed && start > now {
+        return Node::empty(p.kind, start, end);
+    }
+    let until = match p.timing {
+        crate::registry::Timing::Observed => end.min(now),
+        _ => end,
+    }
+    .max(start);
     let prior = all.iter().rev().find(|(t, _)| *t < start);
     let inside: Vec<&(Nanos, Value)> = all
         .iter()
@@ -99,7 +108,14 @@ pub fn rate(
 ) -> Option<(crate::types::Exact, bool)> {
     use crate::summary::Body;
     use crate::types::{SECOND, exact_ns};
-    let until = end.min(now).max(start);
+    if p.timing == crate::registry::Timing::Observed && start > now {
+        return None;
+    }
+    let until = match p.timing {
+        crate::registry::Timing::Observed => end.min(now),
+        _ => end,
+    }
+    .max(start);
     let inside: Vec<Nanos> = all
         .iter()
         .map(|(t, _)| *t)

@@ -2713,8 +2713,27 @@ impl Model {
                 let s = spec
                     .series()
                     .ok_or(Error::BadRoute("a condition funnel selects one series"))?;
-                if v.registry.get(s).is_none() {
+                let Some(d) = v.registry.get(s) else {
                     return Err(Error::BadRoute("unknown series"));
+                };
+                // §4 Future facts, §6 Cadence.
+                match (d.options.timing, cond) {
+                    (Timing::Forecast, Condition::StaleFor { .. }) => {
+                        return Err(Error::BadRoute(
+                            "a stale-for condition on a forecast series is rejected",
+                        ));
+                    }
+                    (Timing::Forecast, _) if op.is_none() => {
+                        return Err(Error::BadRoute(
+                            "a condition over a forecast series needs a windowed operator",
+                        ));
+                    }
+                    (Timing::Scheduled, Condition::StaleFor { .. }) => {
+                        return Err(Error::BadRoute(
+                            "a stale-for condition on a scheduled series is not modelled",
+                        ));
+                    }
+                    _ => {}
                 }
             }
             (None, None) => {}
@@ -3447,11 +3466,16 @@ impl Model {
     }
 
     /// Live state (§2.3): the current fact with the greatest `t ≤ now` and
-    /// quality not bad.
+    /// quality not bad; a forecast series has none.
     pub fn latest(&self, s: SeriesId) -> Result<Option<Fact>, Error> {
-        Ok(self
-            .vol()?
-            .current
+        let v = self.vol()?;
+        if v.registry
+            .get(s)
+            .is_some_and(|d| d.options.timing == Timing::Forecast)
+        {
+            return Ok(None);
+        }
+        Ok(v.current
             .range((s, Nanos::MIN)..=(s, self.now))
             .rev()
             .map(|(_, f)| f)
@@ -3501,13 +3525,34 @@ impl Model {
         if restoring && (floor_to(start, MINUTE) != start || floor_to(end, MINUTE) != end) {
             return Err(Error::Restoring);
         }
-        let until = end.min(self.now).max(start);
         let tree = self.tree(s)?;
+        let until = tree.params.credit_limit(end, self.now).max(start);
         Ok(Answer {
             node: tree.window(start, end, self.now),
             restoring,
             summary_stale: tree.any_stale(start, until),
         })
+    }
+
+    /// Live staleness of a scheduled series (§5.4): stale when `now` is later
+    /// than the `t` of its live-state fact by more than S, or when it has no
+    /// live-state fact; commits do not refresh it. `None` for any other
+    /// series: a forecast series has no live staleness, and an observed
+    /// series is measured on the monotonic clock by stale-for conditions
+    /// (see Q-16).
+    pub fn scheduled_stale(&self, s: SeriesId) -> Result<Option<bool>, Error> {
+        let d = self
+            .vol()?
+            .registry
+            .get(s)
+            .ok_or(RegistryError::Unknown(s))?;
+        if d.options.timing != Timing::Scheduled {
+            return Ok(None);
+        }
+        let staleness = d.staleness;
+        Ok(Some(self.latest(s)?.is_none_or(|f| {
+            staleness.is_some_and(|limit| self.now - f.t > limit)
+        })))
     }
 
     /// Decreases of a counter counted as regressions over its current view
@@ -4864,6 +4909,7 @@ fn params_of(d: &SeriesDef) -> Params {
     Params {
         counter: d.options.counter,
         expected_interval: d.expected_interval(),
+        timing: d.options.timing,
         ..Params::new(d.kind, d.staleness)
     }
 }

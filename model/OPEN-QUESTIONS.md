@@ -597,7 +597,11 @@ manifest record; invariant 12; `tests/rules.rs` `s3_low_mark_…` and `s8_evicti
 flags by timing and per-series lateness bound (§2.2), `t_source` and the clock (§2.2, §2.5: `host_time`; before
 synchronisation, `unsynced_clock`, no `future` or `late`, and a host-stamped emit waits as back-pressure, counted;
 row 22a), invalid values (§2.5: NaN, ±∞ and a negative counter value recorded as bad quality without a value,
-flagged `no_value` and counted), the density rule (§5.1, §5.7: the 1-minute level stored only for an expected interval of 5 s or shorter, the
+flagged `no_value` and counted), series timing (§2.1, §2.2, §2.3, §4, §5.4, §6: no `future`, and no `late` by its first clause, on a scheduled or
+forecast series; no live state for a forecast series; the credit limit `now` for an observed series and the window
+end for a scheduled or forecast one, a window wholly after `now` on an observed series being empty; scheduled live
+staleness; a stale-for condition over a forecast series, or any condition over one without a windowed operator,
+refused when routed; rows 36, 37b, 38 and 39, invariants 18, 20 and 21), the density rule (§5.1, §5.7: the 1-minute level stored only for an expected interval of 5 s or shorter, the
 15-minute level and calendar nodes only for 60 s or shorter, other levels answered from facts, also in a tree
 checkpoint and its verification; row 20a for a series without a stored 15-minute level), counters and rate (§5.5, §6: resets, wraps and regressions, each regression
 contributing 0 and counted; rate as the increase over the elapsed time between the readings that bound its steps,
@@ -659,7 +663,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Clock of the eviction age | §8 Eviction at 90 days: no clock named | The engine clock `now`, as for the retention class, from the seal of a log segment, or of a compacted file's oldest input, so a merge does not reset it | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |
 | Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
-| Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Timing is recorded with the definition, and a forecast series must be versioned with `changed_at` kind `time`; otherwise every series is treated as observed (`future` and `late` flags, live state, staleness, delivery, cadence and the credit limit `now`) | — |
+| Stale-for conditions on a scheduled series | §5.4: stale when `now` is later than the live-state fact's `t` by more than S, or with no live-state fact; §4 Timers | `Model::scheduled_stale` reports that staleness; a stale-for condition over a scheduled series is refused when routed | `tests/rules.rs` `s4_funnels_over_scheduled_and_forecast_series` |
 | Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
