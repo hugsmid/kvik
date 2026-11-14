@@ -248,9 +248,9 @@ impl StoreDir {
             });
         }
         // No descriptor: only what creation makes may be present, with its directories empty.
-        let unfinished = top
-            .iter()
-            .all(|n| [LOCK, MANIFEST, STORE_TMP].contains(&n.as_str()));
+        let unfinished = top.iter().all(|n| {
+            [LOCK, MANIFEST, STORE_TMP].contains(&n.as_str()) || DIRS.contains(&n.as_str())
+        });
         let mut empty_dirs = true;
         for d in DIRS {
             empty_dirs &= names(&*fs, &dir.join(d))?.is_empty();
@@ -277,7 +277,10 @@ impl StoreDir {
         let store_bytes = descriptor.encode()?;
         fs.create_dir_all(dir)?;
         let lock = take_lock(&*fs, dir)?;
-        for n in left.iter().filter(|n| *n != LOCK) {
+        for n in left
+            .iter()
+            .filter(|n| *n != LOCK && !DIRS.contains(&n.as_str()))
+        {
             fs.remove_file(&dir.join(n))?;
         }
         for d in DIRS {
@@ -285,7 +288,7 @@ impl StoreDir {
         }
         let m = fs.open(&dir.join(MANIFEST), OpenMode::CreateNew)?;
         m.write_at(&encode_initial_manifest(new.store_id, new.created_at), 0)?;
-        m.sync_data()?;
+        m.sync_all()?;
         drop(m);
         for d in DIRS {
             fs.sync_dir(&dir.join(d))?;
@@ -293,7 +296,7 @@ impl StoreDir {
         fs.sync_dir(dir)?;
         let t = fs.open(&dir.join(STORE_TMP), OpenMode::CreateNew)?;
         t.write_at(&store_bytes, 0)?;
-        t.sync_data()?;
+        t.sync_all()?;
         drop(t);
         fs.rename(&dir.join(STORE_TMP), &dir.join(STORE))?;
         fs.sync_dir(dir)?;

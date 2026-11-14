@@ -30,6 +30,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-109 | `format.md` A.4 (states recovery may find), A.9 | A forged seal in an `.open` file |
 | Q-110 | `format.md` A.2 Resynchronisation | The residual cost of resynchronising over nested batch images |
 | Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
+| Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -441,7 +442,8 @@ Found while building the log writer (roadmap 4.4, crate `kvik-log`: `store`, `wr
 reading implemented for now; tests in `log/tests/writer.rs` pin it.
 **Scenario.** (a) *Closing a batch.* A.4 closes a batch "when the next call would take its data blocks past
 `max_batch_bytes`", but consecutive calls share blocks, so a batch's data blocks are only known once it is encoded.
-(b) *The seal clock.* "At 64 MiB or 5 minutes" does not say from when the 5 minutes run. (c) *The first mark.* The
+(b) *The seal clock.* "At 64 MiB or 5 minutes" does not say from when the 5 minutes run, nor whether the
+`sync_data` that takes the next segment into use at a timed seal, a log sync, is bound by `min_sync_interval`. (c) *The first mark.* The
 first start of a new store creates the mark before any segment is in use; its `file_id`, `offset` and
 `last_sequence` are not given. (d) *Retrying a creation.* After a creation fails for lack of space it is "retried when
 a free-space check passes", but no threshold is named. (e) *The low mark.* "5 % of the filesystem" needs the file
@@ -450,21 +452,34 @@ free-space source (Windows, A.13) neither mark can be judged. (f) *The segment i
 interval series needs the series' interval length, which the writer knows only for definitions it committed itself;
 the registry (roadmap 5.1) holds the rest. (g) *The first manifest record.* A.12 creates `MANIFEST` with one empty
 record; A.14 does not say which epoch the first record takes. (h) *Failures while creating ahead.* Only lack of space
-is named; a failed sync or another write error during creation is not. (i) *The receive time.* A batch's blocks
+is named; a failed sync or another write error during creation is not, nor lack of space reported by the creation's
+`sync_all` or directory sync. (i) *The receive time.* A batch's blocks
 carry one `received_at`; whether it may differ from the commit time, and what either is when the wall clock steps
-back, is not said. (j) *Windows name durability.* A.13 assigns to roadmap 4.4 the check that a name made durable by
-flushing the file survives a power loss on Windows; it needs a Windows machine and power-loss trials.
+back, is not said. (j) *Windows name durability.* A.13 assigned to roadmap 4.4 the check that a name made durable by
+flushing the file survives a power loss on Windows; it needs a Windows machine and power-loss trials. (k) *The
+interface.* `api.md` names the waits `QueueFull`, `DiskFull` and `UnsyncedClock` and lists `IngestStats.waited` and
+commit latency; the log writer reports `QueueFull`, `DiskCritical` and `NoSegment` (a roll waiting for the segment
+created ahead) and measures neither. (l) *Memory at seal.* `file_crc32c` covers the whole segment up to its trailer;
+the sealer reads it into memory at once, up to `segment_size` (1 GiB at most); `design.md` sets no memory budget. (m)
+*A blocked seal.* A.13 retries a seal whose rename or length change fails with a sharing error; which errors count
+as sharing errors is not said.
 **Implemented.** (a) A call's own data-block bytes are measured when it is made; a batch takes whole calls while
-their sum stays within `max_batch_bytes`, at least one call. (b) From the moment the segment is taken into use. (c)
+their sum stays within `max_batch_bytes`, at least one call. (b) From the moment the segment is taken into use; the sync that takes the next one into use is not bound
+by `min_sync_interval` (it carries no batch, and at most one runs per `seal_interval`). (c)
 Slot 0, counter 1, `file_id` 0, `offset` 0, `last_sequence` 0, `max_series_id` 0 and the current boot id; nothing is
 read below it. (d) Free space at least `disk_critical` + `segment_size`, checked every second; an unknown free space
 passes. (e) The low mark uses the byte floor alone (`disk_low_bytes`); an unknown free space applies neither mark, so
 ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other series
 takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (g) Epoch 1. (h) A write or sync failure
-on the log: read-only. (i) Both are the wall clock at commit, raised to the previous batch's commit time if it went
-back. (j) Not done; nothing in the writer depends on it.
-**Needed.** A rule for each part; for (e), whether the seam gains the file system's size; for (j), where the check is
-done. To be settled at gate 4.9.
+on the log: read-only; lack of space at the creation's syncs too, as a failed sync is never retried. (i) Both are the wall clock at commit, raised to the previous batch's commit time if it went
+back. (j) Not done; deferred to roadmap 4.8 with the device-cache check (A.13); nothing in the writer depends on
+it. (k) Mapping the log's waits and statistics onto the interface's is left to the item that puts the engine behind
+the `kvik` interface. (l) Read whole; streaming the checksum is the change if a memory budget needs it. (m) Every
+failed rename or length change is retried every 10 seconds, for ever, with health degraded (`SealBlocked`); a failed
+write or sync of the seal is a fault.
+**Needed.** A rule for each part; for (e), whether the seam gains the file system's size (an `api.md` change, in
+its own pull request); for (m), the error kinds that count as sharing errors on each platform. To be settled at
+gate 4.9; (k) by the item that wires the engine into the interface.
 
 ## Open at v0.2
 

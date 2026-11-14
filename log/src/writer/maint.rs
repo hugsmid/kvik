@@ -12,7 +12,7 @@ use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::name::SegmentName;
 use crate::segment::{SealSummary, encode_seal};
 
-use super::{Fault, FaultOp};
+use super::{Fault, FaultOp, Halt};
 
 /// Bytes written per call while zero-filling a new segment.
 const FILL_CHUNK: usize = 1 << 20;
@@ -74,6 +74,8 @@ pub enum CreateError {
     NoSpace,
     /// Any other failure, a failed sync included: a write or sync failure on the log (`spec.md` §3).
     Fault(Fault),
+    /// Stopped before its next file operation because the store became read-only.
+    Halted,
 }
 
 fn fault(op: FaultOp, path: &Path, e: &io::Error) -> Fault {
@@ -87,7 +89,30 @@ fn fault(op: FaultOp, path: &Path, e: &io::Error) -> Fault {
 
 /// Creates the segment `req` names (`format.md` A.4 Creation): created new under its `.open` name, zero-filled to
 /// its length by ordinary writes, header written with `base_sequence = 0`, then `sync_all` and a directory sync.
-pub fn create_segment(fs: &dyn Fs, req: &SegmentRequest) -> Result<AheadSegment, CreateError> {
+///
+/// `halt` is the writer's read-only flag ([`super::LogWriter::halt`]): checked before every file operation,
+/// and set here on a write or sync failure, so no file operation follows a fault on either thread.
+pub fn create_segment(
+    fs: &dyn Fs,
+    req: &SegmentRequest,
+    halt: &Halt,
+) -> Result<AheadSegment, CreateError> {
+    let r = create_inner(fs, req, halt);
+    if let Err(CreateError::Fault(f)) = &r {
+        halt.set(f.clone());
+    }
+    r
+}
+
+fn create_inner(
+    fs: &dyn Fs,
+    req: &SegmentRequest,
+    halt: &Halt,
+) -> Result<AheadSegment, CreateError> {
+    let halted = || halt.is_set();
+    if halted() {
+        return Err(CreateError::Halted);
+    }
     let path = req.path();
     let no_space = |e: &io::Error| e.kind() == io::ErrorKind::StorageFull;
     let file = match fs.open(&path, OpenMode::CreateNew) {
@@ -107,6 +132,9 @@ pub fn create_segment(fs: &dyn Fs, req: &SegmentRequest) -> Result<AheadSegment,
     chunk[..HEADER_LEN].copy_from_slice(&header);
     let mut at = 0u64;
     while at < req.len {
+        if halted() {
+            return Err(CreateError::Halted);
+        }
         let n = (req.len - at).min(chunk.len() as u64) as usize;
         if let Err(e) = file.write_at(&chunk[..n], at) {
             if no_space(&e) {
@@ -122,8 +150,14 @@ pub fn create_segment(fs: &dyn Fs, req: &SegmentRequest) -> Result<AheadSegment,
         }
         at += n as u64;
     }
+    if halted() {
+        return Err(CreateError::Halted);
+    }
     if let Err(e) = file.sync_all() {
         return Err(CreateError::Fault(fault(FaultOp::Sync, &path, &e)));
+    }
+    if halted() {
+        return Err(CreateError::Halted);
     }
     if let Err(e) = fs.sync_dir(&req.log_dir) {
         return Err(CreateError::Fault(fault(FaultOp::Sync, &req.log_dir, &e)));
@@ -165,14 +199,34 @@ pub enum SealError {
     Blocked(io::ErrorKind),
     /// A write or sync failed: a write or sync failure on the log (`spec.md` §3).
     Fault(Fault),
+    /// Stopped before its next file operation because the store became read-only.
+    Halted,
 }
 
 /// Seals a segment (`format.md` A.4 Sealing): (1) writes the segment index, the trailer and the end marker just
 /// past the last complete batch; (2) sets the length to the end marker's end; (3) `sync_all`; (4) renames `.open`
-/// to `.kvl`; (5) syncs the directory. Run again from step 1 after [`SealError::Blocked`].
-pub fn seal_segment(fs: &dyn Fs, job: &SealJob) -> Result<(), SealError> {
+/// to `.kvl`; (5) syncs the directory. Run again from step 1 after [`SealError::Blocked`]. `halt` is checked before
+/// every step and set on a write or sync failure, as for [`create_segment`].
+pub fn seal_segment(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
+    let r = seal_inner(fs, job, halt);
+    if let Err(SealError::Fault(f)) = &r {
+        halt.set(f.clone());
+    }
+    r
+}
+
+fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
+    let go = || {
+        if halt.is_set() {
+            Err(SealError::Halted)
+        } else {
+            Ok(())
+        }
+    };
+    go()?;
     let path = segment_path(&job.log_dir, &job.id, false);
     let f = |op, e: &io::Error| SealError::Fault(fault(op, &path, e));
+    // The whole segment up to its last batch is read for `file_crc32c` (Q-115 (l)).
     let mut before = vec![0u8; job.end as usize];
     let mut at = 0usize;
     while at < before.len() {
@@ -201,15 +255,21 @@ pub fn seal_segment(fs: &dyn Fs, job: &SealJob) -> Result<(), SealError> {
             message: e.to_string(),
         })
     })?;
+    go()?;
     job.file
         .write_at(&seal, job.end)
         .map_err(|e| f(FaultOp::Write, &e))?;
+    go()?;
+    // A length change or rename that fails is retried later, whatever the error (Q-115 (m)).
     job.file
         .set_len(job.end + seal.len() as u64)
         .map_err(|e| SealError::Blocked(e.kind()))?;
+    go()?;
     job.file.sync_all().map_err(|e| f(FaultOp::Sync, &e))?;
+    go()?;
     fs.rename(&path, &segment_path(&job.log_dir, &job.id, true))
         .map_err(|e| SealError::Blocked(e.kind()))?;
+    go()?;
     fs.sync_dir(&job.log_dir)
         .map_err(|e| SealError::Fault(fault(FaultOp::Sync, &job.log_dir, &e)))?;
     Ok(())

@@ -13,7 +13,7 @@ use kvik_log::entries::{
     Definition, Entry, IntervalLength, Kind, MarkState, Recovery, Retention, Timing, Versioning,
 };
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value, ValueType};
-use kvik_log::fs::{FaultOp as MemOp, Fs, MemFs, OpenMode};
+use kvik_log::fs::{FaultOp as MemOp, Fs, MemFs, MemOp as OpRecord, OpenMode};
 use kvik_log::header::FileHeader;
 use kvik_log::mark::{MarkSlot, read_mark};
 use kvik_log::name::SegmentName;
@@ -21,8 +21,8 @@ use kvik_log::scan::{ScanLimit, SealState, scan};
 use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
     Ack, Call, CallSource, CommitError, EveryCommitReason, FaultOp, IngestQueue, LogWriter,
-    MarkSync, MarkSyncMode, OpenError, Position, Reason, Wait, WriterConfig, create_segment,
-    seal_segment,
+    MarkSync, MarkSyncMode, OpenError, Position, Reason, SealJob, Wait, WriterConfig,
+    create_segment, seal_segment,
 };
 use proptest::prelude::*;
 
@@ -130,6 +130,10 @@ struct H {
     done: BTreeMap<u64, Result<Ack, CommitError>>,
     /// Run the maintenance work in place after each step.
     maint: bool,
+    /// Calls acknowledged so far, shared with sync hooks.
+    acked_n: Arc<Mutex<usize>>,
+    /// Seal jobs taken but not yet run.
+    inflight: Vec<SealJob>,
 }
 
 impl H {
@@ -149,6 +153,8 @@ impl H {
             calls: BTreeMap::new(),
             done: BTreeMap::new(),
             maint: true,
+            acked_n: Arc::new(Mutex::new(0)),
+            inflight: Vec::new(),
         };
         h.run_maint();
         h
@@ -161,21 +167,34 @@ impl H {
         id
     }
 
-    fn run_maint(&mut self) {
-        let fs = self.fs.clone();
+    /// Creates the segment the writer asks for, if any.
+    fn create(&mut self) {
         if let Some(req) = self.w.segment_request(self.wall) {
-            let r = create_segment(&fs, &req);
+            let r = create_segment(&self.fs, &req, &self.w.halt());
             self.w.segment_created(r);
         }
-        for job in self.w.take_seal_jobs(self.now) {
-            let r = seal_segment(&fs, &job);
+    }
+
+    /// Takes the seal jobs that are ready, without running them.
+    fn seal_take(&mut self) {
+        let jobs = self.w.take_seal_jobs(self.now);
+        self.inflight.extend(jobs);
+    }
+
+    /// Runs the seal jobs taken.
+    fn seal_run(&mut self) {
+        for job in std::mem::take(&mut self.inflight) {
+            let r = seal_segment(&self.fs, &job, &self.w.halt());
             self.w.seal_done(job, r, self.now);
         }
+    }
+
+    fn run_maint(&mut self) {
+        self.create();
+        self.seal_take();
+        self.seal_run();
         // A creation asked for after a seal or a roll.
-        if let Some(req) = self.w.segment_request(self.wall) {
-            let r = create_segment(&fs, &req);
-            self.w.segment_created(r);
-        }
+        self.create();
     }
 
     fn step(&mut self) -> Option<Duration> {
@@ -187,6 +206,7 @@ impl H {
                 "call {id} finished twice"
             );
         }
+        *self.acked_n.lock().unwrap() = self.done.values().filter(|r| r.is_ok()).count();
         if self.maint {
             self.run_maint();
         }
@@ -268,6 +288,71 @@ fn batches(fs: &MemFs, durable: bool) -> Vec<(u64, u64, BatchContent)> {
     out
 }
 
+/// A crash image: every segment's and the mark's bytes as a power loss at one moment leaves them.
+struct Image {
+    segments: BTreeMap<u64, (SegmentName, Vec<u8>)>,
+    mark: Vec<u8>,
+}
+
+fn image(fs: &MemFs) -> Image {
+    Image {
+        segments: segments(fs, true),
+        mark: fs.read_durable(&mark_path()).unwrap(),
+    }
+}
+
+fn image_batches(img: &Image) -> Vec<(u64, u64, BatchContent)> {
+    let mut out = Vec::new();
+    for (id, (name, bytes)) in &img.segments {
+        let r = scan(bytes, &ident(name), ScanLimit::End).unwrap();
+        for b in &r.batches {
+            out.push((*id, b.end(), BatchContent::decode(b).unwrap()));
+        }
+    }
+    out
+}
+
+/// Checks a crash image against the first `acked` acknowledged calls: their entries are the image's first entries,
+/// in order; at most `extra` batches lie beyond them; the mark names the end of a batch in the image, or nothing.
+fn check_image(img: &Image, calls: &BTreeMap<u64, Vec<Item>>, acked: usize, extra: usize) {
+    let durable = image_batches(img);
+    let mut items: Vec<Item> = Vec::new();
+    let mut expect_first = 1;
+    for (_, _, c) in &durable {
+        assert_eq!(c.first_sequence, expect_first, "dense sequences on disk");
+        expect_first = c.last_sequence() + 1;
+        items.extend(c.items.iter().cloned());
+    }
+    let acked_items: Vec<Item> = (1..=acked as u64)
+        .flat_map(|id| calls[&id].iter().cloned())
+        .collect();
+    assert!(
+        items.len() >= acked_items.len(),
+        "an acknowledged call is not on stable storage"
+    );
+    assert_eq!(&items[..acked_items.len()], &acked_items[..]);
+    let next = acked_items.len() as u64 + 1;
+    let beyond = durable
+        .iter()
+        .filter(|(_, _, c)| c.last_sequence() >= next)
+        .count();
+    assert!(
+        beyond <= extra,
+        "{beyond} synced batches are not acknowledged"
+    );
+    let m = read_mark(&img.mark, &STORE_ID).unwrap().unwrap().1;
+    if m.last_sequence == 0 {
+        assert_eq!((m.file_id, m.offset), (0, 0));
+    } else {
+        let b = durable
+            .iter()
+            .find(|(_, _, c)| c.last_sequence() == m.last_sequence)
+            .expect("the mark names a synced batch");
+        assert_eq!((b.0, b.1), (m.file_id, m.offset));
+    }
+    assert!(m.last_sequence < expect_first);
+}
+
 /// The checks every history must pass: acknowledged calls hold dense, increasing positions in call order and are
 /// exactly the synced batches (apart from at most one batch synced before a fault, never acknowledged); the synced
 /// mark is never ahead of synced data.
@@ -282,57 +367,44 @@ fn check(h: &H) {
         assert_eq!(ack.last.sequence, next + n - 1);
         next += n;
     }
-    // The durable batches, as a power loss would leave them.
-    let durable = batches(&h.fs, true);
-    let mut items: Vec<Item> = Vec::new();
-    let mut expect_first = 1;
-    for (_, _, c) in &durable {
-        assert_eq!(c.first_sequence, expect_first, "dense sequences on disk");
-        expect_first = c.last_sequence() + 1;
-        items.extend(c.items.iter().cloned());
-    }
-    let acked_items: Vec<Item> = acked
-        .iter()
-        .flat_map(|(id, _)| h.calls[id].iter().cloned())
-        .collect();
-    assert!(
-        items.len() >= acked_items.len(),
-        "an acknowledged call is not synced"
-    );
-    assert_eq!(&items[..acked_items.len()], &acked_items[..]);
-    if h.w.fault().is_none() {
-        assert_eq!(
-            items.len(),
-            acked_items.len(),
-            "a synced batch is not acknowledged"
-        );
-    } else {
-        let extra = durable
-            .iter()
-            .filter(|(_, _, c)| c.last_sequence() >= next)
-            .count();
-        assert!(
-            extra <= 1,
-            "more than one batch beyond the acknowledgements"
-        );
-        for (id, r) in &h.done {
-            if r.is_err() {
-                assert!(acked.iter().all(|(a, _)| a < id));
-            }
+    for (id, r) in &h.done {
+        if r.is_err() {
+            assert!(acked.iter().all(|(a, _)| a < id));
         }
     }
-    // The synced mark names the end of a synced batch, or nothing.
-    let m = durable_mark(&h.fs);
-    if m.last_sequence == 0 {
-        assert_eq!((m.file_id, m.offset), (0, 0));
-    } else {
-        let b = durable
-            .iter()
-            .find(|(_, _, c)| c.last_sequence() == m.last_sequence)
-            .expect("the mark names a synced batch");
-        assert_eq!((b.0, b.1), (m.file_id, m.offset));
+    let extra = usize::from(h.w.fault().is_some() || h.w.halt().is_set());
+    check_image(&image(&h.fs), &h.calls, acked.len(), extra);
+}
+
+/// Every created file (but the empty lock file) is synced and then its directory synced; every rename is followed
+/// by a directory sync (`format.md` A.4, A.12, A.13).
+fn assert_names_durable(ops: &[OpRecord]) {
+    for (i, o) in ops.iter().enumerate() {
+        let parent = o.path.parent().unwrap();
+        let later = |op: MemOp, path: &Path, from: usize| {
+            ops[from..]
+                .iter()
+                .position(|x| x.op == op && x.ok && x.path == path)
+                .map(|p| p + from)
+        };
+        match o.op {
+            MemOp::Create if o.ok && !o.path.ends_with("LOCK") => {
+                let synced = later(MemOp::Sync, &o.path, i)
+                    .unwrap_or_else(|| panic!("{:?} never synced", o.path));
+                assert!(
+                    later(MemOp::SyncDir, parent, synced).is_some(),
+                    "no directory sync after creating {:?}",
+                    o.path
+                );
+            }
+            MemOp::Rename if o.ok => assert!(
+                later(MemOp::SyncDir, parent, i).is_some(),
+                "no directory sync after renaming to {:?}",
+                o.path
+            ),
+            _ => {}
+        }
     }
-    assert!(m.last_sequence < expect_first);
 }
 
 #[test]
@@ -362,6 +434,7 @@ fn store_creation_layout_and_open_rules() {
         (m.counter, m.file_id, m.offset, m.last_sequence),
         (1, 0, 0, 0)
     );
+    assert_names_durable(&fs.ops());
     assert_eq!(m.boot_id, BOOT);
     drop(w);
     // Reopening a log that holds a mark is recovery (roadmap 4.5).
@@ -385,6 +458,15 @@ fn store_creation_layout_and_open_rules() {
     let fs = MemFs::new();
     let afs: Arc<dyn Fs> = Arc::new(fs.clone());
     fs.open(&dir().join("log").join("x"), OpenMode::CreateNew)
+        .unwrap();
+    assert!(matches!(
+        StoreDir::open(afs.clone(), &dir(), Some(&new_store())),
+        Err(StoreError::NotAStore)
+    ));
+    // A foreign sub-directory, even an empty-looking one, makes it not a store.
+    let fs = MemFs::new();
+    let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+    fs.open(&dir().join("photos").join("a"), OpenMode::CreateNew)
         .unwrap();
     assert!(matches!(
         StoreDir::open(afs.clone(), &dir(), Some(&new_store())),
@@ -714,6 +796,7 @@ fn segments_roll_and_seal_into_files_the_scanner_reads_back_completely() {
         }
     }
     assert_eq!(total, 202);
+    assert_names_durable(&h.fs.ops());
     assert_eq!(
         h.w.stats().sealed_segments as usize,
         segs.values().filter(|s| s.0.sealed).count()
@@ -729,6 +812,8 @@ fn a_timed_seal_takes_the_next_segment_into_use_without_moving_the_mark() {
         ..cfg()
     });
     h.submit(vec![fact(1, T0, 0)]);
+    h.step();
+    // The seal time is armed once the next segment is created ahead.
     let next = h.step();
     assert_eq!(next, Some(Duration::from_secs(1)));
     let before = durable_mark(&h.fs);
@@ -933,47 +1018,82 @@ enum Op {
     },
     Advance(u64),
     Step,
+    /// kvik-maint creates the segment asked for: late, whenever this runs.
+    Create,
+    /// kvik-maint takes the seal jobs; they stay in flight until [`Op::SealRun`].
+    SealTake,
+    /// kvik-maint runs the seal jobs in flight.
+    SealRun,
 }
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         4 => (1..40usize, 0..60usize, prop::bool::weighted(0.15))
             .prop_map(|(facts, text, entry)| Op::Submit { facts, text, entry }),
-        2 => (0..30u64).prop_map(Op::Advance),
+        2 => (0..60u64).prop_map(Op::Advance),
         4 => Just(Op::Step),
+        2 => Just(Op::Create),
+        1 => Just(Op::SealTake),
+        1 => Just(Op::SealRun),
     ]
 }
 
-fn fault() -> impl Strategy<Value = Option<(MemOp, &'static str, usize)>> {
+type Planned = Option<(MemOp, &'static str, usize, io::ErrorKind)>;
+
+fn fault() -> impl Strategy<Value = Planned> {
+    let kind = prop_oneof![Just(io::ErrorKind::Other), Just(io::ErrorKind::StorageFull)];
     prop_oneof![
-        2 => Just(None),
-        1 => (0..40usize).prop_map(|k| Some((MemOp::Sync, ".open", k))),
-        1 => (0..400usize).prop_map(|k| Some((MemOp::Write, ".open", k))),
-        1 => (0..40usize).prop_map(|k| Some((MemOp::Write, "MARK", k))),
-        1 => (0..10usize).prop_map(|k| Some((MemOp::Sync, "MARK", k))),
+        4 => Just(None),
+        2 => (0..40usize, kind.clone()).prop_map(|(k, e)| Some((MemOp::Sync, ".open", k, e))),
+        2 => (0..300usize, kind).prop_map(|(k, e)| Some((MemOp::Write, ".open", k, e))),
+        1 => (0..40usize).prop_map(|k| Some((MemOp::Write, "MARK", k, io::ErrorKind::Other))),
+        1 => (0..10usize).prop_map(|k| Some((MemOp::Sync, "MARK", k, io::ErrorKind::Other))),
+        1 => (0..6usize).prop_map(|k| Some((MemOp::Create, ".open", k, io::ErrorKind::Other))),
+        1 => (0..4usize).prop_map(|k| Some((MemOp::SetLen, ".open", k, io::ErrorKind::Other))),
+        1 => (0..4usize).prop_map(|k| Some((MemOp::Rename, ".kvl", k, io::ErrorKind::PermissionDenied))),
+        1 => (0..10usize).prop_map(|k| Some((MemOp::SyncDir, "log", k, io::ErrorKind::Other))),
     ]
 }
 
 proptest! {
-    /// Generated histories with an optional injected fault: acknowledged batches are exactly the synced ones,
-    /// positions are dense and increasing, nothing happens after a fault, and the synced mark never names more
-    /// than synced data.
+    /// Generated histories with the maintenance work interleaved (late creations, seals in flight), an optional
+    /// injected fault and a crash image taken at one sync: acknowledged batches are exactly the synced ones and
+    /// survive a power loss at any sync, positions are dense and increasing, no file operation follows a fault on
+    /// either side, the synced mark never names more than synced data, and the writer never asks to run again at
+    /// once with nothing to do.
     #[test]
-    fn histories(ops in prop::collection::vec(op(), 1..80), fault in fault(), every in any::<bool>()) {
+    fn histories(
+        ops in prop::collection::vec(op(), 1..100),
+        fault in fault(),
+        every in any::<bool>(),
+        crash_at in 0..80usize,
+    ) {
         let fs = MemFs::new();
         let mut h = H::with(
             WriterConfig {
                 segment_size: 16 << 10,
                 max_batch_bytes: 4 << 10,
+                seal_interval: Duration::from_millis(100),
                 mark_sync: if every { MarkSync::EveryCommit } else { MarkSync::Interval(Duration::from_millis(50)) },
                 ..cfg()
             },
             Some(BOOT),
             fs.clone(),
         );
-        if let Some((op, path, k)) = fault {
-            fs.fail_nth(op, path, k, io::ErrorKind::Other);
+        h.maint = false;
+        if let Some((op, path, k, kind)) = fault {
+            fs.fail_nth(op, path, k, kind);
         }
+        // The crash image at the `crash_at`-th sync, with the calls acknowledged by then.
+        let crash: Arc<Mutex<Option<(usize, Image)>>> = Arc::new(Mutex::new(None));
+        let (count, c2, f2, n2) = (Arc::new(Mutex::new(0usize)), crash.clone(), fs.clone(), h.acked_n.clone());
+        fs.set_sync_hook(Some(Arc::new(move |_: &Path| {
+            let mut n = count.lock().unwrap();
+            if *n == crash_at {
+                *c2.lock().unwrap() = Some((*n2.lock().unwrap(), image(&f2)));
+            }
+            *n += 1;
+        })));
         let mut series = 0u32;
         let mut frozen: Option<usize> = None;
         for o in ops {
@@ -987,21 +1107,39 @@ proptest! {
                     h.submit(items);
                 }
                 Op::Advance(ms) => h.advance(MS * ms as u32),
-                Op::Step => { h.step(); }
+                Op::Step => {
+                    // A turn that asks to run again at once makes progress: within two more turns at the same
+                    // time, the writer has nothing left to do now.
+                    let mut next = h.step();
+                    for _ in 0..2 {
+                        if next.is_some_and(|t| t <= h.now) {
+                            next = h.step();
+                        }
+                    }
+                    let idle_ok = h.w.fault().is_some()
+                        || h.w.reasons().iter().any(|r| matches!(r, Reason::SealBlocked { .. }));
+                    prop_assert!(idle_ok || next.is_none_or(|t| t > h.now), "asks to run again at once: {:?}", next);
+                }
+                Op::Create => h.create(),
+                Op::SealTake => h.seal_take(),
+                Op::SealRun => h.seal_run(),
             }
             if let Some(n) = frozen {
-                prop_assert_eq!(fs.ops().len(), n);
-            } else if h.w.fault().is_some() {
+                prop_assert_eq!(fs.ops().len(), n, "a file operation after a fault");
+            } else if h.w.halt().is_set() {
                 frozen = Some(fs.ops().len());
             }
             check(&h);
         }
+        h.maint = true;
+        h.seal_run();
         h.drain();
-        if h.w.fault().is_none() {
+        if !h.w.halt().is_set() {
             prop_assert!(h.q.is_empty());
             prop_assert_eq!(h.done.len(), h.calls.len());
         }
         let _ = h.w.shutdown(h.now);
+        fs.set_sync_hook(None);
         if let Some(n) = frozen {
             prop_assert_eq!(fs.ops().len(), n);
         } else if h.w.fault().is_none() {
@@ -1009,7 +1147,24 @@ proptest! {
             let last = h.acked().last().map_or(0, |(_, a)| a.last.sequence);
             prop_assert_eq!(durable_mark(&fs).last_sequence, last);
             prop_assert_eq!(h.w.stats().durable, Position { generation: 0, sequence: last });
+            if fault.is_none() {
+                assert_names_durable(&fs.ops());
+            }
         }
         check(&h);
+        if let Some((acked, img)) = crash.lock().unwrap().take() {
+            // A sync in flight may cover one batch not yet acknowledged.
+            check_image(&img, &h.calls, acked, 1);
+        }
+        // A power loss now: the files hold every acknowledged call.
+        let (calls, acked) = (h.calls.clone(), h.acked().len());
+        let extra = usize::from(h.w.halt().is_set());
+        drop(h);
+        fs.power_loss();
+        let after = Image {
+            segments: segments(&fs, false),
+            mark: fs.read(&mark_path()).unwrap(),
+        };
+        check_image(&after, &calls, acked, extra);
     }
 }

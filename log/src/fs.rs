@@ -58,7 +58,7 @@ pub trait Fs: Send + Sync + fmt::Debug {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>>;
     /// Creates a directory and its parents.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
-    /// The files of a directory, sorted by name.
+    /// The entries of a directory, files and sub-directories, sorted by name; a sub-directory's length is 0.
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
     /// Renames a file, replacing `to` if it exists.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
@@ -128,12 +128,10 @@ impl Fs for StdFs {
         for e in std::fs::read_dir(path)? {
             let e = e?;
             let meta = e.metadata()?;
-            if meta.is_file() {
-                out.push(DirEntry {
-                    name: e.file_name().to_string_lossy().into_owned(),
-                    len: meta.len(),
-                });
-            }
+            out.push(DirEntry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                len: if meta.is_file() { meta.len() } else { 0 },
+            });
         }
         out.sort();
         Ok(out)
@@ -487,18 +485,25 @@ impl Fs for MemFs {
         Ok(())
     }
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        Ok(lock(&self.state)
-            .files
-            .iter()
-            .filter(|(p, _)| p.parent() == Some(path))
-            .map(|(p, d)| DirEntry {
-                name: p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                len: lock(d).bytes.len() as u64,
-            })
-            .collect())
+        // Directories exist implicitly: a file deeper below `path` makes its first component a sub-directory.
+        let mut out = BTreeMap::new();
+        for (p, d) in &lock(&self.state).files {
+            let Ok(rest) = p.strip_prefix(path) else {
+                continue;
+            };
+            let mut parts = rest.components();
+            let (Some(first), deeper) = (parts.next(), parts.next().is_some()) else {
+                continue;
+            };
+            let name = first.as_os_str().to_string_lossy().into_owned();
+            let len = if deeper {
+                0
+            } else {
+                lock(d).bytes.len() as u64
+            };
+            out.entry(name.clone()).or_insert(DirEntry { name, len });
+        }
+        Ok(out.into_values().collect())
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.check(FaultOp::Rename, to, 0, 0)?;
@@ -653,6 +658,21 @@ mod tests {
             assert!(StdFs.free_space(&dir).unwrap() > 0);
         }
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn directories_are_listed() {
+        let fs = MemFs::new();
+        drop(fs.open(Path::new("d/sub/f"), OpenMode::CreateNew).unwrap());
+        drop(fs.open(Path::new("d/g"), OpenMode::CreateNew).unwrap());
+        assert_eq!(
+            fs.read_dir(Path::new("d")).unwrap(),
+            vec![DirEntry::new("g", 0), DirEntry::new("sub", 0)]
+        );
+        let dir = std::env::temp_dir().join(format!("kvik-dirs-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(StdFs.read_dir(&dir).unwrap(), vec![DirEntry::new("sub", 0)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

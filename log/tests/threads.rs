@@ -229,6 +229,32 @@ fn a_failed_sync_fails_the_calls_it_covered_and_the_store_turns_read_only() {
 }
 
 #[test]
+fn a_panic_on_the_writer_thread_fails_pending_calls_and_turns_the_store_read_only() {
+    let fs = MemFs::new();
+    let log = start(Arc::new(fs.clone()), Path::new("store"), cfg());
+    log.submit(vec![fact(1, 0)]).unwrap().wait().unwrap();
+    fs.set_sync_hook(Some(Arc::new(|p: &Path| {
+        if std::thread::current().name() == Some("kvik-writer")
+            && p.to_string_lossy().ends_with(".open")
+        {
+            panic!("injected panic");
+        }
+    })));
+    let r = log.submit(vec![fact(1, 1)]).unwrap().wait();
+    assert_eq!(r, Err(CommitError::OutcomeUnknown));
+    assert!(matches!(
+        log.submit(vec![fact(1, 2)]),
+        Err(SubmitError::ReadOnly)
+    ));
+    assert!(log.fault().is_some());
+    let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.shutdown()));
+    assert!(
+        joined.is_err(),
+        "the panic is passed on once both threads are joined"
+    );
+}
+
+#[test]
 fn smoke_on_the_real_file_system() {
     let dir = std::env::temp_dir().join(format!("kvik-log-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

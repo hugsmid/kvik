@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
 use super::{
-    Ack, Call, CallError, CallSource, CommitError, Done, Fault, IngestQueue, LogStats, LogWriter,
-    Reason, Wait, create_segment, seal_segment,
+    Ack, Call, CallError, CallSource, CommitError, Done, Fault, FaultOp, Halt, IngestQueue,
+    LogStats, LogWriter, Reason, Wait, create_segment, seal_segment,
 };
 use crate::content::Item;
 use crate::fs::Fs;
@@ -166,6 +166,7 @@ struct Shared {
     maint: Mutex<Maint>,
     maint_cv: Condvar,
     info: Mutex<Info>,
+    halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
 }
@@ -224,6 +225,7 @@ impl Log {
                 reasons: Vec::new(),
                 fault: None,
             }),
+            halt: writer.halt(),
             fs: writer.store().fs().clone(),
             clock,
         });
@@ -332,16 +334,19 @@ impl Log {
         }
         self.shared.writer_cv.notify_one();
         self.shared.room_cv.notify_all();
-        let r = match self.writer.take().map(JoinHandle::join) {
-            Some(Ok(r)) => r,
-            Some(Err(p)) => std::panic::resume_unwind(p),
-            None => Ok(()),
-        };
+        let w = self.writer.take().map(JoinHandle::join);
         {
             lock(&self.shared.maint).stop = true;
         }
         self.shared.maint_cv.notify_all();
-        if let Some(Err(p)) = self.maint.take().map(JoinHandle::join) {
+        let m = self.maint.take().map(JoinHandle::join);
+        // Both threads are joined before a panic of either is passed on.
+        let r = match w {
+            Some(Ok(r)) => r,
+            Some(Err(p)) => std::panic::resume_unwind(p),
+            None => Ok(()),
+        };
+        if let Some(Err(p)) = m {
             std::panic::resume_unwind(p);
         }
         r
@@ -407,7 +412,41 @@ fn publish(s: &Shared, w: &LogWriter) {
     f.waiting = w.waiting();
 }
 
+/// If `kvik-writer` panics: the store turns read-only, every queued or pending call fails with
+/// [`CommitError::OutcomeUnknown`], and `kvik-maint` is told to stop.
+struct PanicGuard<'a>(&'a Shared);
+
+impl Drop for PanicGuard<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let s = self.0;
+        let fault = Fault {
+            op: FaultOp::Panic,
+            path: Default::default(),
+            kind: io::ErrorKind::Other,
+            message: "the writer thread panicked".into(),
+        };
+        s.halt.set(fault.clone());
+        lock(&s.info).fault = s.halt.fault();
+        let slots: Vec<_> = {
+            let mut f = lock(&s.front);
+            f.read_only = true;
+            f.queue.drain();
+            f.slots.drain().map(|(_, slot)| slot).collect()
+        };
+        for slot in slots {
+            slot.complete(Err(CommitError::OutcomeUnknown));
+        }
+        s.room_cv.notify_all();
+        lock(&s.maint).stop = true;
+        s.maint_cv.notify_all();
+    }
+}
+
 fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
+    let _guard = PanicGuard(s);
     loop {
         lock(&s.front).wake = false;
         exchange(s, &mut w);
@@ -438,7 +477,7 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         let now = s.clock.monotonic();
         match step.next {
             Some(t) if t <= now => continue,
-            _ if f.wake || f.shutdown => continue,
+            _ if f.wake => continue,
             Some(t) => {
                 drop(
                     s.writer_cv
@@ -478,7 +517,7 @@ fn maint_loop(s: &Shared) {
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
         }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
-        if lock(&s.front).read_only {
+        if s.halt.is_set() {
             m.request = None;
             m.jobs.clear();
             if m.stop {
@@ -490,11 +529,11 @@ fn maint_loop(s: &Shared) {
         }
         if let Some(req) = m.request.take() {
             drop(m);
-            let r = create_segment(&*s.fs, &req);
+            let r = create_segment(&*s.fs, &req, &s.halt);
             lock(&s.maint).created = Some(r);
         } else if let Some(job) = m.jobs.pop_front() {
             drop(m);
-            let r = seal_segment(&*s.fs, &job);
+            let r = seal_segment(&*s.fs, &job, &s.halt);
             lock(&s.maint).results.push((job, r));
         } else {
             return;

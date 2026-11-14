@@ -45,7 +45,8 @@ mod threads;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
@@ -320,6 +321,8 @@ pub enum FaultOp {
     MarkSync,
     /// Reading or encoding a segment for its seal.
     Seal,
+    /// The writer thread panicked.
+    Panic,
 }
 
 /// A write or sync failure: the store is read-only until a restart (`spec.md` §3 Write or sync failure).
@@ -334,6 +337,38 @@ pub struct Fault {
     pub kind: io::ErrorKind,
     /// The error's message.
     pub message: String,
+}
+
+/// The read-only flag shared by the writer and the maintenance work: set at the site of the first write or sync
+/// failure, on either thread, and checked before every file operation, so none starts after a fault is known.
+#[derive(Debug, Default)]
+pub struct Halt {
+    set: AtomicBool,
+    fault: Mutex<Option<Fault>>,
+}
+
+impl Halt {
+    /// Whether the store is read-only.
+    pub fn is_set(&self) -> bool {
+        self.set.load(Ordering::SeqCst)
+    }
+
+    /// The first fault.
+    pub fn fault(&self) -> Option<Fault> {
+        self.fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records `f` unless a fault is already recorded, and sets the flag.
+    pub fn set(&self, f: Fault) {
+        let mut g = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.is_none() {
+            *g = Some(f);
+        }
+        self.set.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Why ingest waits (`api.md` Writing, back-pressure).
@@ -492,6 +527,7 @@ pub struct LogWriter {
     intervals: HashMap<u32, IntervalLength>,
     last_sync_start: Option<Duration>,
     fault: Option<Fault>,
+    halt: Arc<Halt>,
     seals: Vec<SealJob>,
     blocked: Vec<(SealJob, Duration)>,
     seal_blocked: BTreeSet<u64>,
@@ -544,7 +580,8 @@ impl LogWriter {
         mark.write_at(&encode_mark_file([Some(slot), None]), 0)
             .map_err(StoreError::Io)?;
         debug_assert_eq!(mark.len().ok(), Some(MARK_LEN as u64));
-        mark.sync_data().map_err(StoreError::Io)?;
+        // A new file: `sync_all`, then the directory (A.13).
+        mark.sync_all().map_err(StoreError::Io)?;
         fs.sync_dir(&log_dir).map_err(StoreError::Io)?;
         let mark_mode = match (boot_id, cfg.mark_sync) {
             (None, _) => MarkSyncMode::EveryCommit {
@@ -599,6 +636,7 @@ impl LogWriter {
             intervals: HashMap::new(),
             last_sync_start: None,
             fault: None,
+            halt: Arc::new(Halt::default()),
             seals: Vec::new(),
             blocked: Vec::new(),
             seal_blocked: BTreeSet::new(),
@@ -657,6 +695,19 @@ impl LogWriter {
         self.fault.as_ref()
     }
 
+    /// The read-only flag to pass to [`create_segment`] and [`seal_segment`].
+    pub fn halt(&self) -> Arc<Halt> {
+        self.halt.clone()
+    }
+
+    /// Takes over a fault recorded by the maintenance work.
+    fn sync_halt(&mut self) {
+        if self.fault.is_none() && self.halt.is_set() {
+            self.fault = self.halt.fault();
+            self.waiting = None;
+        }
+    }
+
     /// The statistics.
     pub fn stats(&self) -> &LogStats {
         &self.stats
@@ -713,8 +764,9 @@ impl LogWriter {
     }
 
     fn fail_with(&mut self, f: Fault) {
+        self.halt.set(f);
         if self.fault.is_none() {
-            self.fault = Some(f);
+            self.fault = self.halt.fault();
         }
         self.waiting = None;
     }
@@ -722,6 +774,7 @@ impl LogWriter {
     /// The next segment to create ahead of use, if one is wanted and not already asked for: always one beyond the
     /// segment in use, except while a creation waits for free space.
     pub fn segment_request(&mut self, wall: i64) -> Option<SegmentRequest> {
+        self.sync_halt();
         if self.fault.is_some()
             || self.ahead.is_some()
             || self.requested
@@ -762,12 +815,14 @@ impl LogWriter {
                 self.disk.checked_at = None;
             }
             Err(CreateError::Fault(f)) => self.fail_with(f),
+            Err(CreateError::Halted) => self.sync_halt(),
         }
     }
 
     /// Seal jobs ready to run: segments whose successor is in use and synced, and blocked seals whose retry time
     /// has come.
     pub fn take_seal_jobs(&mut self, now: Duration) -> Vec<SealJob> {
+        self.sync_halt();
         if self.fault.is_some() {
             return Vec::new();
         }
@@ -794,6 +849,7 @@ impl LogWriter {
                 self.blocked.push((job, now + SEAL_RETRY_INTERVAL));
             }
             Err(SealError::Fault(f)) => self.fail_with(f),
+            Err(SealError::Halted) => self.sync_halt(),
         }
     }
 
@@ -833,6 +889,7 @@ impl LogWriter {
     /// start. After a fault, every call in `source` fails with [`CommitError::ReadOnly`].
     pub fn step(&mut self, now: Duration, wall: i64, source: &mut dyn CallSource) -> Step {
         let mut step = Step::default();
+        self.sync_halt();
         if self.fault.is_none() {
             self.check_disk(now);
             self.timed_mark_sync(now);
@@ -893,7 +950,13 @@ impl LogWriter {
         if let (true, MarkSyncMode::Interval(d)) = (self.mark_dirty, self.mark_mode) {
             at(self.last_mark_sync + d);
         }
-        if let Some(o) = self.open.as_ref().filter(|o| o.summary.is_some()) {
+        // A timed seal needs the segment created ahead; without it the writer waits for the creation, which
+        // wakes it, rather than for the seal time.
+        if let Some(o) = self
+            .open
+            .as_ref()
+            .filter(|o| o.summary.is_some() && self.ahead.is_some())
+        {
             at(o.in_use_since + self.cfg.seal_interval);
         }
         if let Some(t) = self.blocked.iter().map(|(_, t)| *t).min() {
@@ -1189,6 +1252,7 @@ impl LogWriter {
     /// Clean shutdown: syncs the mark if it moved since its last sync. Nothing is written after a fault. Seal jobs
     /// are the caller's to finish first.
     pub fn shutdown(&mut self, now: Duration) -> Result<(), Fault> {
+        self.sync_halt();
         if let Some(f) = &self.fault {
             return Err(f.clone());
         }
