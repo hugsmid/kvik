@@ -607,6 +607,9 @@ pub enum Refusal {
     /// value there is a fact with a higher `changed_at`.
     #[error("revise on a versioned series")]
     ReviseOnVersioned,
+    /// A reading of an interval series whose `t` is off its phase (§2.1).
+    #[error("t off the interval phase")]
+    OffPhase,
 }
 
 /// Engine errors.
@@ -2226,6 +2229,9 @@ impl Model {
         if d.retired_at.is_some_and(|at| r.t >= at) {
             return Err(Refusal::Retired.into());
         }
+        if d.options.interval.is_some_and(|iv| !iv.on_phase(r.t)) {
+            return Err(Refusal::OffPhase.into());
+        }
         match (d.options.versioned.is_some(), r.changed_at.is_some()) {
             (true, false) => return Err(Refusal::ChangedAtMissing.into()),
             (false, true) => return Err(Refusal::ChangedAtUnexpected.into()),
@@ -2322,9 +2328,15 @@ impl Model {
             };
             let no_value = matches!(value, Value::Absent);
             let observed = def.options.timing == Timing::Observed;
+            // For a reading of an observed interval series `t + d` stands
+            // for `t` in `future` and in the second clause of `late` (§2.2).
+            let reach = match (observed, def.options.interval) {
+                (true, Some(iv)) => r.t.saturating_add(iv.length),
+                _ => r.t,
+            };
             // `future` (§2.2): observed series only, and not before the
             // clock is synchronised (§2.5).
-            let future = synced && observed && r.t > wall.saturating_add(cfg.future_tolerance);
+            let future = synced && observed && reach > wall.saturating_add(cfg.future_tolerance);
             if future {
                 quality = quality.worst(Quality::Suspect);
             }
@@ -2396,10 +2408,11 @@ impl Model {
             {
                 unchecked += 1;
             }
+            // The latest recorded `t`: earlier batches and this one.
             let newest = batch_newest
                 .get(&r.series)
-                .or_else(|| v.newest_t.get(&r.series))
-                .copied();
+                .copied()
+                .max(v.newest_t.get(&r.series).copied());
             // `late` (§2.2): on an observed series, earlier than the latest
             // recorded `t` by more than 2 × S; on any series, older than the
             // lateness bound. Neither before the clock is synchronised (§2.5).
@@ -2409,7 +2422,7 @@ impl Model {
                 _ => false,
             };
             let bound = def.options.lateness_bound.unwrap_or(cfg.lateness_bound);
-            let late = synced && (out_of_order || wall.saturating_sub(r.t) > bound);
+            let late = synced && (out_of_order || wall.saturating_sub(reach) > bound);
             let fact = Fact {
                 series: r.series,
                 t: r.t,
@@ -2716,6 +2729,14 @@ impl Model {
                 let Some(d) = v.registry.get(s) else {
                     return Err(Error::BadRoute("unknown series"));
                 };
+                if op
+                    .as_ref()
+                    .is_some_and(|o| crate::summary::refused(d.kind, &o.aggregate))
+                {
+                    return Err(Error::BadRoute(
+                        "avg, integral, increase and time-in-state are refused on an interval series",
+                    ));
+                }
                 // §4 Future facts, §6 Cadence.
                 match (d.options.timing, cond) {
                     (Timing::Forecast, Condition::StaleFor { .. }) => {
@@ -3466,20 +3487,22 @@ impl Model {
     }
 
     /// Live state (§2.3): the current fact with the greatest `t ≤ now` and
-    /// quality not bad; a forecast series has none.
+    /// quality not bad, `t + d ≤ now` for an observed interval series (§2.2);
+    /// a forecast series has none.
     pub fn latest(&self, s: SeriesId) -> Result<Option<Fact>, Error> {
         let v = self.vol()?;
-        if v.registry
-            .get(s)
-            .is_some_and(|d| d.options.timing == Timing::Forecast)
-        {
+        let Some(d) = v.registry.get(s) else {
+            return Ok(None);
+        };
+        if d.options.timing == Timing::Forecast {
             return Ok(None);
         }
+        let params = params_of(d);
         Ok(v.current
             .range((s, Nanos::MIN)..=(s, self.now))
             .rev()
             .map(|(_, f)| f)
-            .find(|f| f.summarised())
+            .find(|f| f.summarised() && params.ready_at(f.t) <= self.now)
             .cloned())
     }
 
@@ -4910,6 +4933,7 @@ fn params_of(d: &SeriesDef) -> Params {
         counter: d.options.counter,
         expected_interval: d.expected_interval(),
         timing: d.options.timing,
+        interval: d.options.interval,
         ..Params::new(d.kind, d.staleness)
     }
 }

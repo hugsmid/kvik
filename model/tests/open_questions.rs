@@ -646,3 +646,30 @@ fn q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it() {
         "outranked"
     );
 }
+
+/// Q-73: the model does not filter readings of a record-on-change series:
+/// an unchanged poll within the keep-alive interval is recorded like any
+/// other reading. Only an identical repeat of the same `t` is dropped
+/// (§2.4).
+#[test]
+fn q73_record_on_change_series_records_every_reading() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let s = m
+        .define_with(
+            "plant/line-1/valve",
+            Kind::Gauge,
+            ValueType::Number,
+            "%",
+            None,
+            kvik_model::registry::SeriesOptions {
+                record_on_change: true,
+                ..kvik_model::registry::SeriesOptions::expected(MINUTE)
+            },
+        )
+        .unwrap();
+    let now = m.wall;
+    let polls: Vec<Reading> = (0..10)
+        .map(|k| Reading::num(s, now + k * SECOND, 5.0))
+        .collect();
+    assert_eq!(m.ingest(polls).unwrap().positions.len(), 10);
+}

@@ -27,6 +27,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
 | Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
 | Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
+| Q-73 | §2.6, §2.1 `record on change`, row 17a, §1.5 | Who leaves out the unchanged readings of a record-on-change series |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -177,7 +178,8 @@ forecast-accuracy operators, is new scope. If confirmed, `api.md` Not in v1 gain
 ## Q-45 — Intervals of varying length
 **Scenario.** An interval series has a fixed length d. A source that reports one amount per local day or per month
 has intervals of 23–25 hours or 28–31 days, which no fixed d and phase describe.
-**Model.** Not modelled.
+**Model.** Interval series have a fixed length and phase; a reading off its phase is refused and counted
+(`tests/edge_cases.rs` `row_40_…`).
 **Needed.** Whether a reading may carry its own interval length, or whether such amounts are stored at a fixed finer
 length or as calendar results.
 **Proposal (for the owner).** Keep d fixed and decline such sources in v1. A reading does not carry its own length,
@@ -296,7 +298,8 @@ has no local span, so its evaluation is that error: what the funnel delivers, an
 said. (ii) A state or text series with no staleness limit and no stored level, whose last fact predates the log
 replayed from the checkpoint, has neither node nor fact: `resync` would report no live state for a valve that is
 open.
-**Model.** Not modelled; both levels are stored for every series.
+**Model.** Not modelled: a series that stores no level answers windows and live state during a restore from its local
+facts, without a flag (see the table below).
 **Proposal (for the owner).** For both, the state is unknown, not false or none: the evaluation is skipped and
 counted, the condition keeps its state, `resync` says "unknown" for that funnel, and the first evaluation with detail
 is delivered as a transition. This changes what `resync` guarantees (§4 Resync, invariant 16).
@@ -320,7 +323,8 @@ at 14:07, which is not on a 15-minute boundary: the quarter-hour 14:00–14:15 s
 whether it qualifies, nor so whether that day stores a calendar node. (b) A parameter change with an effective time
 in the past (§2.1) moves the threshold for days whose calendar nodes are already built: it would create nodes for
 spans that had none, or delete nodes already stored, and a rebuild from the log must give the same set (invariant 8).
-**Model.** Not modelled; both levels and calendar nodes are stored for every series.
+**Model.** Every parameter is fixed for the life of a series (no parameter entries), so neither case arises; the
+density rule is applied per series (`tests/rules.rs` `s5_1_density_rule`).
 **Needed.** Whether a quarter-hour qualifies by the expected interval in force at its start, throughout, or by some
 other rule, and how a change with a past effective time rebuilds the calendar nodes it affects.
 **Proposal.** (a) A node of any level is stored only for a span throughout which the expected interval in force
@@ -443,6 +447,31 @@ unchecked, outranked, and B stays current. During a restore the replay is droppe
 `tests/rules.rs` `s8_checkpoint_carries_the_revised_key_index`).
 **Needed.** Whether the check compares with the revised-key index whenever it holds the key, so that "on no local
 tier" applies only to a key with a single fact, or whether the unchecked rule applies whatever the index holds.
+
+## Q-73 — Who leaves out the unchanged readings of a record-on-change series
+**Scenario.** A valve position is polled every 2 s and declared record on change with a keep-alive interval of
+20 s as its expected interval (§2.6, so S = 60 s). For ten minutes it reads 5 %, so 300 polls carry the same value.
+§2.6 says the series "records a fact when the value changes **and** at least once per expected interval while it does
+not", and §2.1 makes record on change a field of the definition, which `format.md` stores; but neither says whether
+the engine drops the unchanged polls between keep-alive facts or whether the adapter emits only changes and
+keep-alive facts. If the engine filters, it is not said: (a) what "the value changes" compares with: the fact at the
+series' latest `t`, the latest by position, or the live-state fact; (b) whether a change of supplied quality, a
+reading without a value, a late reading (row 3) or a reading with `revise` counts as a change; (c) whether a keep-alive
+is due by event time (`t` at least the expected interval after the latest recorded `t`) or by `received_at`, and what
+a reading older than the latest recorded `t` does; (d) whether a dropped poll is counted, and under which counter
+(principle 5). If the adapter filters, the field changes nothing the engine does beyond its refusal on an interval
+series (§2.1) and its expected interval being the keep-alive interval.
+**Model.** The engine records every reading it is given; the series' expected interval is the keep-alive interval
+and sets S (§2.1); row 17a is shown with an adapter that emits only changes and keep-alive facts
+(`q73_record_on_change_series_records_every_reading`, `tests/edge_cases.rs` `row_17a_…`).
+**Needed.** Who filters, and, if the engine does, rules (a)–(d).
+**Proposal.** The adapter filters, and the engine records what it is given, so that every recorded fact is one the
+source meant (principle 1) and no reading is dropped silently; record on change in the definition states the
+source's contract and that its expected interval is the keep-alive interval. If the engine is to filter instead:
+compare with the current fact at the series' latest recorded `t` by the duplicate rule's identity (value, compared
+bitwise, and supplied quality, §2.4); record a reading whose `t` is not after that `t`, or that carries `revise`,
+unfiltered; record an unchanged reading once its `t` is at least the expected interval after the latest recorded
+`t`; and count each dropped reading per series (`unchanged_dropped`).
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -597,7 +626,11 @@ manifest record; invariant 12; `tests/rules.rs` `s3_low_mark_…` and `s8_evicti
 flags by timing and per-series lateness bound (§2.2), `t_source` and the clock (§2.2, §2.5: `host_time`; before
 synchronisation, `unsynced_clock`, no `future` or `late`, and a host-stamped emit waits as back-pressure, counted;
 row 22a), invalid values (§2.5: NaN, ±∞ and a negative counter value recorded as bad quality without a value,
-flagged `no_value` and counted), series timing (§2.1, §2.2, §2.3, §4, §5.4, §6: no `future`, and no `late` by its first clause, on a scheduled or
+flagged `no_value` and counted), interval series (§2.1, §2.2, §5.2, §5.4, §6: length and phase fixed by the definition, a reading off its phase
+refused and counted, `t + d` standing for `t` in `future`, in the second clause of `late`, in live state and in
+windows of an observed series, the node form only for levels whose edges no interval crosses, windows from stored
+nodes in the middle and apportioned edges flagged `apportioned`, sum and rate over covered seconds, avg, integral,
+increase and time-in-state refused; rows 20a, 40–42, invariants 5, 18 and 22), series timing (§2.1, §2.2, §2.3, §4, §5.4, §6: no `future`, and no `late` by its first clause, on a scheduled or
 forecast series; no live state for a forecast series; the credit limit `now` for an observed series and the window
 end for a scheduled or forecast one, a window wholly after `now` on an observed series being empty; scheduled live
 staleness; a stale-for condition over a forecast series, or any condition over one without a windowed operator,
@@ -642,7 +675,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
-| Record on change | §2.6, row 17a | Keep-alive facts are ordinary facts from the adapter | `tests/edge_cases.rs` `row_17a_…` |
+| Record on change | §2.6, row 17a (see Q-73) | The definition carries the flag, refused on an interval series, and its expected interval is the keep-alive interval; the engine records every reading, so keep-alive facts are ordinary facts from the adapter | `tests/open_questions.rs` `q73_…` |
 | Effective-dated parameters and site zone | §2.1, §5.7, rows 20a and 21 | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so a span in which the expected interval crosses a density threshold (row 20a, Q-60) does not arise; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
 | New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
@@ -664,7 +697,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
 | Stale-for conditions on a scheduled series | §5.4: stale when `now` is later than the live-state fact's `t` by more than S, or with no live-state fact; §4 Timers | `Model::scheduled_stale` reports that staleness; a stale-for condition over a scheduled series is refused when routed | `tests/rules.rs` `s4_funnels_over_scheduled_and_forecast_series` |
-| Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
+| Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64), §5.7 | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly; a calendar day of an interval series is the merge of its stored quarter-hours like any other series (roadmap 1.6) | `tests/invariants.rs` `inv22_…` |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §4 Resync, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled, so no consumer receives `resync` for a cursor or `start` position below or inside a lost range | — |

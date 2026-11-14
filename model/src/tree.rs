@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 
-use crate::summary::{Node, Params, direct, merge, merge_all, with_stretches};
+use crate::registry::Timing;
+use crate::summary::{Node, Params, credit_intervals, direct, merge, merge_all, with_stretches};
 use crate::types::{MINUTE, Nanos, QUARTER, Value, floor_to};
 
 /// Node widths of the stored levels: index 0 is 1 minute, 1 is 15 minutes.
@@ -286,6 +287,9 @@ impl SeriesTree {
     /// scheduled or forecast one) are ignored and no time is credited past it;
     /// a window wholly after `now` on an observed series is empty.
     pub fn window(&self, start: Nanos, end: Nanos, now: Nanos) -> Node {
+        if self.params.interval.is_some() {
+            return self.interval_window(start, end, now);
+        }
         if self.params.wholly_future(start, now) {
             return Node::empty(self.params.kind, start, end);
         }
@@ -294,6 +298,54 @@ impl SeriesTree {
         let mut n = with_stretches(&self.params, core, self.last_before(start).as_ref(), until);
         n.end = end;
         n
+    }
+
+    /// A window over an interval series (§6 Aggregates): whole nodes of the
+    /// finest stored level in the middle (no interval crosses their edges,
+    /// §5.4), and at each edge the readings whose intervals reach into it,
+    /// apportioned; edge lookups reach back d. A reading of an observed
+    /// series enters only once `t + d ≤ now`.
+    fn interval_window(&self, start: Nanos, end: Nanos, now: Nanos) -> Node {
+        let p = &self.params;
+        let d = p.interval.expect("interval series").length;
+        let end = end.max(start);
+        let observed = p.timing == Timing::Observed;
+        let ready = |t: Nanos| !observed || t.saturating_add(d) <= now;
+        let reaching = |lo: Nanos, hi: Nanos| -> Vec<(Nanos, Value)> {
+            self.readings
+                .range(lo..hi.max(lo))
+                .filter(|(t, _)| ready(**t))
+                .map(|(t, v)| (*t, v.clone()))
+                .collect()
+        };
+        let middle = (0..LEVELS.len()).find(|l| p.stores(*l)).and_then(|l| {
+            let w = LEVELS[l];
+            let a = floor_to(start + w - 1, w);
+            // For an observed series only nodes ending by `now`, whose
+            // readings are all ready.
+            let b = floor_to(if observed { end.min(now) } else { end }, w);
+            (a < b).then(|| {
+                let nodes: Vec<Node> = (0..(b - a) / w).map(|i| self.node(l, a + i * w)).collect();
+                let mut n = merge_all(p, a, nodes.iter());
+                n.start = a;
+                n.end = b;
+                n
+            })
+        });
+        let edge = |lo: Nanos, hi: Nanos, from: Nanos| {
+            let mut n = Node::empty(p.kind, lo, hi);
+            credit_intervals(p, &mut n, reaching(from, hi).iter(), start, end);
+            n
+        };
+        let lookback = start.saturating_sub(d - 1);
+        match middle {
+            None => edge(start, end, lookback),
+            Some(m) => {
+                let left = edge(start, m.start, lookback);
+                let right = edge(m.end, end, m.end);
+                merge(p, &merge(p, &left, &m), &right)
+            }
+        }
     }
 
     /// The stored calendar node for `date` in `zone`: the merge of its
@@ -374,6 +426,9 @@ impl SlidingWindow {
     /// Evaluates the window `[now − len, now)`.
     pub fn evaluate(&mut self, tree: &SeriesTree, now: Nanos) -> Node {
         let (start, end) = (now - self.len, now);
+        if tree.params.interval.is_some() {
+            return tree.window(start, end, now);
+        }
         let q_lo = floor_to(start + QUARTER - 1, QUARTER);
         let q_hi = floor_to(end, QUARTER);
         if q_lo >= q_hi {

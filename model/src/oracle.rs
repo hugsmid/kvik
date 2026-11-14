@@ -40,6 +40,19 @@ pub fn node(p: &Params, all: &[(Nanos, Value)], start: Nanos, end: Nanos) -> Nod
 /// window holding the later reading. With no reading inside, `last` is the
 /// value held at the window start, if valid.
 pub fn window(p: &Params, all: &[(Nanos, Value)], start: Nanos, end: Nanos, now: Nanos) -> Node {
+    if let Some(iv) = p.interval {
+        // Interval series (§6): every ready reading's amount pro rata to the
+        // part of its interval inside the window; no hold, no stretches.
+        let observed = p.timing == crate::registry::Timing::Observed;
+        let ready: Vec<(Nanos, Value)> = all
+            .iter()
+            .filter(|(t, _)| !observed || t + iv.length <= now)
+            .cloned()
+            .collect();
+        let mut n = Node::empty(p.kind, start, end);
+        crate::summary::credit_intervals(p, &mut n, ready.iter(), start, end.max(start));
+        return n;
+    }
     if p.timing == crate::registry::Timing::Observed && start > now {
         return Node::empty(p.kind, start, end);
     }

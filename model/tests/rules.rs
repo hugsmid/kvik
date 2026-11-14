@@ -330,6 +330,83 @@ fn s6_edge_stretches() {
     );
 }
 
+/// §2.1: interval length and phase are for interval series only, with
+/// d > 0 and 0 ≤ phase < d; record on change does not apply to an interval
+/// series; counter rules are for counters only.
+#[test]
+fn s2_1_interval_and_record_on_change_definitions() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let def = |m: &mut Model, kind, options| {
+        m.define_with(
+            "site/meter-1/energy",
+            kind,
+            ValueType::Number,
+            "kWh",
+            None,
+            options,
+        )
+    };
+    for (kind, options) in [
+        (Kind::Interval, SeriesOptions::default()),
+        (Kind::Interval, SeriesOptions::interval(0, 0)),
+        (Kind::Interval, SeriesOptions::interval(MINUTE, MINUTE)),
+        (Kind::Interval, SeriesOptions::interval(MINUTE, -1)),
+        (Kind::Gauge, SeriesOptions::interval(MINUTE, 0)),
+    ] {
+        assert_eq!(
+            def(&mut m, kind, options),
+            Err(RegistryError::BadIntervalSpec.into())
+        );
+    }
+    let roc = SeriesOptions {
+        record_on_change: true,
+        ..SeriesOptions::interval(MINUTE, 0)
+    };
+    assert_eq!(
+        def(&mut m, Kind::Interval, roc),
+        Err(RegistryError::RecordOnChangeInterval.into())
+    );
+    let wrap = SeriesOptions {
+        counter: kvik_model::summary::CounterRules {
+            wrap_at: Some(100.0),
+            reset_ceiling: 0.1,
+        },
+        ..SeriesOptions::default()
+    };
+    assert_eq!(
+        def(&mut m, Kind::Gauge, wrap),
+        Err(RegistryError::BadCounterRules.into())
+    );
+    let s = def(&mut m, Kind::Interval, SeriesOptions::interval(MINUTE, 0)).unwrap();
+    let d = m.registry().unwrap().get(s).unwrap().clone();
+    assert_eq!(
+        (d.expected_interval(), d.staleness),
+        (Some(MINUTE), Some(3 * MINUTE)),
+        "S = 3 × d unless set"
+    );
+    // Counter rules set on a definition reach the summaries (§5.5).
+    let c = m
+        .define_with(
+            "site/meter-2/energy",
+            Kind::Counter,
+            ValueType::Number,
+            "kWh",
+            10 * SECOND,
+            wrap,
+        )
+        .unwrap();
+    m.ingest(vec![
+        Reading::num(c, T0, 90.0),
+        Reading::num(c, T0 + SECOND, 5.0),
+    ])
+    .unwrap();
+    let w = m.window(c, T0, T0 + MINUTE).unwrap();
+    assert_eq!(
+        w.aggregate(&Aggregate::Increase),
+        Some(AggValue::Exact(exact(15.0)))
+    );
+}
+
 /// §5.1 density rule: the 1-minute level is stored only for series whose
 /// expected interval is 5 s or shorter, the 15-minute level only for 60 s or
 /// shorter; a sparser series answers those levels from its facts, and stores

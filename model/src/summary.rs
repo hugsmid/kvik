@@ -10,7 +10,9 @@
 use std::collections::BTreeMap;
 
 use crate::registry::Timing;
-use crate::types::{Exact, Kind, Nanos, SECOND, StateKey, Value, exact, exact_ns};
+use crate::types::{
+    Exact, IntervalSpec, Kind, MINUTE, Nanos, QUARTER, SECOND, StateKey, Value, exact, exact_ns,
+};
 
 /// Counter rules (§5.5).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +48,8 @@ pub struct Params {
     pub expected_interval: Option<Nanos>,
     /// Timing (§2.1); it decides the credit limit ([`Params::credit_limit`]).
     pub timing: Timing,
+    /// Length and phase of an interval series (§2.1).
+    pub interval: Option<IntervalSpec>,
 }
 
 /// The longest expected interval for which each stored level is kept
@@ -69,6 +73,26 @@ impl Params {
             counter: CounterRules::default(),
             expected_interval: staleness.map(|s| s / 3),
             timing: Timing::Observed,
+            interval: None,
+        }
+    }
+
+    /// Parameters of an observed interval series of length `length` and
+    /// phase `phase`, whose expected interval is its length and S 3 × that
+    /// (§2.1); S plays no part in its summaries (§5.2).
+    pub fn interval(length: Nanos, phase: Nanos) -> Self {
+        Params {
+            interval: Some(IntervalSpec { length, phase }),
+            ..Params::new(Kind::Interval, 3 * length)
+        }
+    }
+
+    /// When a reading at `t` is ready against `now` (§2.2): `t + d` for a
+    /// reading of an observed interval series, otherwise `t`.
+    pub fn ready_at(&self, t: Nanos) -> Nanos {
+        match (self.timing, self.interval) {
+            (Timing::Observed, Some(iv)) => t.saturating_add(iv.length),
+            _ => t,
         }
     }
 
@@ -95,7 +119,14 @@ impl Params {
     /// series with no expected interval stores no level. A level that is not
     /// stored is answered from the facts.
     pub fn stores(&self, level: usize) -> bool {
+        // An interval series also needs every node edge of the level to be a
+        // multiple of d from the phase, so that no interval crosses one
+        // (§5.4): d divides the node length and the phase is 0.
+        let width = [MINUTE, QUARTER][level];
         self.expected_interval.is_some_and(|e| e <= DENSITY[level])
+            && self
+                .interval
+                .is_none_or(|iv| iv.phase == 0 && width % iv.length == 0)
     }
 
     /// End of the validity of a reading at `t`, clipped to `limit`.
@@ -146,6 +177,20 @@ pub enum Body {
     },
     /// Text has no extra fields.
     Text,
+    /// Interval fields (§5.2, §6). Coverage is the total length of the
+    /// intervals credited.
+    Interval {
+        /// Amount: the sum of reading values, or in a window the amount in
+        /// it, apportioned at its edges.
+        sum: Exact,
+        /// Smallest reading.
+        min: Option<f64>,
+        /// Largest reading.
+        max: Option<f64>,
+        /// A window edge lies inside an interval, whose amount is credited
+        /// pro rata (§6 `apportioned`).
+        apportioned: bool,
+    },
 }
 
 impl Body {
@@ -170,6 +215,12 @@ impl Body {
                 transitions: 0,
             },
             Kind::Text => Body::Text,
+            Kind::Interval => Body::Interval {
+                sum: exact(0.0),
+                min: None,
+                max: None,
+                apportioned: false,
+            },
         }
     }
 }
@@ -226,7 +277,7 @@ impl Node {
             Body::State { time, .. } => {
                 *time.entry(v.state_key()).or_insert(0) += ns;
             }
-            Body::Counter { .. } | Body::Text => {}
+            Body::Counter { .. } | Body::Text | Body::Interval { .. } => {}
         }
     }
 
@@ -265,12 +316,16 @@ impl Node {
                     *transitions += 1;
                 }
             }
-            Body::Gauge { .. } | Body::Text => {}
+            Body::Gauge { .. } | Body::Text | Body::Interval { .. } => {}
         }
     }
 
-    /// All terms of a consecutive pair (rᵢ, rᵢ₊₁).
+    /// All terms of a consecutive pair (rᵢ, rᵢ₊₁); none for an interval
+    /// series (§5.2: no hold, no S).
     fn pair(&mut self, p: &Params, a: &(Nanos, Value), b: &(Nanos, Value)) {
+        if p.interval.is_some() {
+            return;
+        }
         let to = p.valid_until(a.0, b.0);
         self.hold(&a.1, i128::from(to) - i128::from(a.0));
         self.step(p, a, b);
@@ -283,12 +338,20 @@ impl Node {
             self.first = Some((t, v.clone()));
         }
         self.last = Some((t, v.clone()));
-        if let Body::Gauge { sum, min, max, .. } = &mut self.body {
-            let x = v.as_f64().expect("gauge value");
+        if let Body::Gauge { sum, min, max, .. } | Body::Interval { sum, min, max, .. } =
+            &mut self.body
+        {
+            let x = v.as_f64().expect("numeric value");
             *sum += exact(x);
             *min = Some(min.map_or(x, |m| m.min(x)));
             *max = Some(max.map_or(x, |m| m.max(x)));
         }
+    }
+
+    /// Whether the result is flagged `apportioned` (§6): a window edge lies
+    /// inside an interval.
+    pub fn apportioned(&self) -> bool {
+        matches!(self.body, Body::Interval { apportioned, .. } if apportioned)
     }
 }
 
@@ -300,6 +363,9 @@ pub fn direct(p: &Params, start: Nanos, end: Nanos, readings: &[(Nanos, Value)])
     for (i, r) in readings.iter().enumerate() {
         debug_assert!(start <= r.0 && r.0 < end, "reading outside span");
         node.observe(r.0, &r.1);
+        if let Some(iv) = p.interval {
+            node.coverage += i128::from(iv.length);
+        }
         if i > 0 {
             node.pair(p, &readings[i - 1], r);
         }
@@ -314,13 +380,16 @@ pub fn direct(p: &Params, start: Nanos, end: Nanos, readings: &[(Nanos, Value)])
 /// Panics if the nodes are not adjacent or are of different kinds.
 pub fn merge(p: &Params, l: &Node, r: &Node) -> Node {
     assert_eq!(l.end, r.start, "merge needs adjacent nodes");
-    if l.is_empty() {
+    // A window part of an interval series can hold no reading and still an
+    // apportioned amount from an interval reaching into it, so it is the
+    // identity only with no coverage either.
+    if l.is_empty() && l.coverage == 0 {
         return Node {
             start: l.start,
             ..r.clone()
         };
     }
-    if r.is_empty() {
+    if r.is_empty() && r.coverage == 0 {
         return Node {
             end: r.end,
             ..l.clone()
@@ -391,20 +460,39 @@ pub fn merge(p: &Params, l: &Node, r: &Node) -> Node {
             }
         }
         (Body::Text, Body::Text) => Body::Text,
+        (
+            Body::Interval {
+                sum: l_sum,
+                min: l_min,
+                max: l_max,
+                apportioned: l_ap,
+            },
+            Body::Interval {
+                sum: r_sum,
+                min: r_min,
+                max: r_max,
+                apportioned: r_ap,
+            },
+        ) => Body::Interval {
+            sum: l_sum + r_sum,
+            min: opt(*l_min, *r_min, f64::min),
+            max: opt(*l_max, *r_max, f64::max),
+            apportioned: *l_ap || *r_ap,
+        },
         _ => panic!("merge of nodes of different kinds"),
     };
     let mut out = Node {
         start: l.start,
         end: r.end,
         count: l.count + r.count,
-        first: l.first.clone(),
-        last: r.last.clone(),
+        first: l.first.clone().or_else(|| r.first.clone()),
+        last: r.last.clone().or_else(|| l.last.clone()),
         coverage: l.coverage + r.coverage,
         body,
     };
-    let a = l.last.as_ref().expect("non-empty");
-    let b = r.first.as_ref().expect("non-empty");
-    out.pair(p, a, b);
+    if let (Some(a), Some(b)) = (&l.last, &r.first) {
+        out.pair(p, a, b);
+    }
     out
 }
 
@@ -466,6 +554,59 @@ fn opt(a: Option<f64>, b: Option<f64>, f: fn(f64, f64) -> f64) -> Option<f64> {
         (x, None) => x,
         (None, y) => y,
     }
+}
+
+/// Credits the readings of an interval series to the window `[start, end)`
+/// (§6 Aggregates, interval series): each reading's amount pro rata to the
+/// part of its interval `[t, t + d)` inside the window, computed exactly
+/// (the specification computes it in f64 and compares within the §5.6
+/// tolerance); coverage is the length of those parts; a part shorter than d
+/// flags the result `apportioned`. Count, first, last, min and max are over
+/// readings whose `t` lies in the window. Readings must be ready: the caller
+/// leaves out those of an observed series with `t + d > now`.
+pub fn credit_intervals<'a, I>(p: &Params, node: &mut Node, readings: I, start: Nanos, end: Nanos)
+where
+    I: IntoIterator<Item = &'a (Nanos, Value)>,
+{
+    let d = p.interval.expect("interval series").length;
+    for (t, v) in readings {
+        let overlap = (t.saturating_add(d)).min(end) - (*t).max(start);
+        if overlap <= 0 && !(start <= *t && *t < end) {
+            continue;
+        }
+        let sum_before = match &node.body {
+            Body::Interval { sum, .. } => sum.clone(),
+            _ => unreachable!("interval node"),
+        };
+        if start <= *t && *t < end {
+            // `observe` adds the whole value; the amount is credited below.
+            node.observe(*t, v);
+        }
+        if let Body::Interval {
+            sum, apportioned, ..
+        } = &mut node.body
+        {
+            *sum = sum_before;
+            if overlap > 0 {
+                let x = v.as_f64().expect("interval value");
+                *sum += exact(x) * exact_ns(i128::from(overlap)) / exact_ns(i128::from(d));
+                *apportioned |= overlap < d;
+            }
+        }
+        if overlap > 0 {
+            node.coverage += i128::from(overlap);
+        }
+    }
+}
+
+/// Aggregates refused for a kind (§6): avg, integral, increase and
+/// time-in-state on an interval series.
+pub fn refused(kind: Kind, agg: &Aggregate) -> bool {
+    kind == Kind::Interval
+        && matches!(
+            agg,
+            Aggregate::Avg | Aggregate::Integral | Aggregate::Increase | Aggregate::TimeInState(_)
+        )
 }
 
 /// Windowed aggregate (§6).
@@ -548,6 +689,14 @@ impl Node {
                     increase, elapsed, ..
                 },
             ) => (*elapsed > 0).then(|| AggValue::Exact(increase * ns_per_s / exact_ns(*elapsed))),
+            (Aggregate::Sum, Body::Interval { sum, .. }) => {
+                covered.map(|_| AggValue::Exact(sum.clone()))
+            }
+            (Aggregate::Rate, Body::Interval { sum, .. }) => {
+                covered.map(|c| AggValue::Exact(sum * ns_per_s / c))
+            }
+            (Aggregate::Min, Body::Interval { min, .. }) => min.map(|m| AggValue::Exact(exact(m))),
+            (Aggregate::Max, Body::Interval { max, .. }) => max.map(|m| AggValue::Exact(exact(m))),
             (Aggregate::Last, _) => self.last.as_ref().map(|(_, v)| AggValue::Value(v.clone())),
             (Aggregate::TimeInState(k), Body::State { time, .. }) => Some(AggValue::Exact(
                 exact_ns(time.get(k).copied().unwrap_or(0)) / ns_per_s,

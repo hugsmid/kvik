@@ -11,8 +11,8 @@ use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, ConditionState, Event, Runner};
 use kvik_model::engine::{
     CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, Error, FORMAT_VERSION, Fault,
-    FileClass, FileId, Funnel, FunnelId, Level, Locality, Model, Reason, Refusal, Selection,
-    TriggerCause, Wait, WriteOutcome,
+    FileClass, FileId, Funnel, FunnelId, Level, Locality, Model, Operator, Reason, Refusal,
+    Selection, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::registry::{ChangedAtKind, SeriesOptions, Timing};
@@ -518,6 +518,233 @@ fn row_39_window_ending_after_now_on_an_observed_series() {
     assert_eq!(w.count, 1);
     let w = m.window(s, now + 3 * MINUTE, now + HOUR).unwrap();
     assert_eq!((w.count, w.coverage, w.last.clone()), (0, 0, None));
+}
+
+/// A store with consumer `C` and an observed interval series of length
+/// `d` and phase `phase` (an amount of energy per interval).
+fn interval_model(d: Nanos, phase: Nanos) -> (Model, SeriesId) {
+    let (mut m, _) = model();
+    let s = m
+        .define_with(
+            "site/meter-1/energy",
+            Kind::Interval,
+            ValueType::Number,
+            "kWh",
+            None,
+            SeriesOptions::interval(d, phase),
+        )
+        .unwrap();
+    (m, s)
+}
+
+/// Row 40: "Interval reading off its phase: refused and counted."
+#[test]
+fn row_40_interval_reading_off_its_phase() {
+    let (mut m, s) = interval_model(30 * MINUTE, 15 * MINUTE);
+    let base = floor_to(m.wall, HOUR) - 2 * HOUR;
+    assert_eq!(m.emit(num(s, base, 1.0)), Err(Refusal::OffPhase.into()));
+    assert_eq!(
+        m.emit(num(s, base + 15 * MINUTE + 1, 1.0)),
+        Err(Refusal::OffPhase.into())
+    );
+    assert_eq!(m.counters.refused[&Refusal::OffPhase], 2);
+    m.ingest(vec![
+        num(s, base + 15 * MINUTE, 1.0),
+        num(s, base - 15 * MINUTE, 2.0),
+    ])
+    .unwrap();
+    assert_eq!(
+        m.facts().unwrap().len(),
+        2,
+        "on the phase, also before the epoch's multiple"
+    );
+}
+
+/// Row 41: "Window edge inside an interval: that interval's amount credited
+/// pro rata by time; result flagged `apportioned`." Sum is the amount in the
+/// window; rate is sum ÷ covered seconds; count, min, max and last are over
+/// readings whose `t` lies in the window; avg, integral, increase and
+/// time-in-state are refused (§6).
+#[test]
+fn row_41_window_edge_inside_an_interval() {
+    let (mut m, s) = interval_model(30 * MINUTE, 0);
+    let base = floor_to(m.wall, HOUR) - 3 * HOUR;
+    m.ingest(vec![
+        num(s, base, 6.0),
+        num(s, base + 30 * MINUTE, 3.0),
+        num(s, base + HOUR, 9.0),
+    ])
+    .unwrap();
+    let ex = |v: f64| Some(AggValue::Exact(exact(v)));
+    // Whole intervals: exact, not apportioned.
+    let w = m.window(s, base, base + HOUR).unwrap();
+    assert!(!w.apportioned());
+    assert_eq!(w.aggregate(&Aggregate::Sum), ex(9.0));
+    // From 10 minutes into the first interval to 10 minutes into the third.
+    let w = m.window(s, base + 10 * MINUTE, base + 70 * MINUTE).unwrap();
+    assert!(w.apportioned());
+    assert_eq!(
+        w.aggregate(&Aggregate::Sum),
+        ex(6.0 * 2.0 / 3.0 + 3.0 + 9.0 / 3.0)
+    );
+    assert_eq!(w.coverage, i128::from(HOUR));
+    let per_second = kvik_model::types::Exact::new(1.into(), 360.into());
+    assert_eq!(
+        w.aggregate(&Aggregate::Rate),
+        Some(AggValue::Exact(per_second))
+    );
+    assert_eq!(
+        (
+            w.count,
+            w.aggregate(&Aggregate::Min),
+            w.aggregate(&Aggregate::Max)
+        ),
+        (2, ex(3.0), ex(9.0))
+    );
+    assert_eq!(
+        w.aggregate(&Aggregate::Last),
+        Some(AggValue::Value(Value::Num(9.0)))
+    );
+    // A window inside one interval holds no reading but an amount.
+    let w = m.window(s, base + 40 * MINUTE, base + 50 * MINUTE).unwrap();
+    assert_eq!((w.count, w.aggregate(&Aggregate::Sum)), (0, ex(1.0)));
+    for agg in [Aggregate::Avg, Aggregate::Integral, Aggregate::Increase] {
+        assert_eq!(w.aggregate(&agg), None);
+        let route = Funnel::condition(
+            s,
+            Some(Operator {
+                aggregate: agg,
+                width: HOUR,
+            }),
+            Condition::Threshold {
+                on: 1.0,
+                clear: 0.0,
+            },
+        );
+        assert!(matches!(
+            m.add_route(C, FunnelId(1), route),
+            Err(Error::BadRoute(_))
+        ));
+    }
+}
+
+/// Row 42: "Interval missing: a gap in coverage; nothing held across it."
+#[test]
+fn row_42_interval_missing() {
+    let (mut m, s) = interval_model(15 * MINUTE, 0);
+    let base = floor_to(m.wall, HOUR) - 3 * HOUR;
+    m.ingest(vec![num(s, base, 1.0), num(s, base + 30 * MINUTE, 2.0)])
+        .unwrap();
+    let w = m.window(s, base, base + 45 * MINUTE).unwrap();
+    assert_eq!(w.coverage, i128::from(30 * MINUTE));
+    assert_eq!(
+        w.aggregate(&Aggregate::Sum),
+        Some(AggValue::Exact(exact(3.0)))
+    );
+    // A window over the missing interval alone is empty: no held value.
+    let w = m.window(s, base + 15 * MINUTE, base + 30 * MINUTE).unwrap();
+    assert_eq!((w.coverage, w.count, w.last.clone()), (0, 0, None));
+    assert_eq!(w.aggregate(&Aggregate::Sum), None);
+}
+
+/// §2.2 for an observed interval series: `t + d` stands for `t` in `future`,
+/// in the second clause of `late`, and in live state and windows (a reading
+/// enters them only once `t + d ≤ now`).
+#[test]
+fn s2_2_observed_interval_reading_ready_at_its_end() {
+    let (mut m, s) = interval_model(30 * MINUTE, 0);
+    let start = floor_to(m.wall, 30 * MINUTE);
+    m.ingest(vec![num(s, start - 30 * MINUTE, 1.0), num(s, start, 2.0)])
+        .unwrap();
+    let f = m.current().unwrap()[&(s, start)].clone();
+    assert!(f.flags.future, "its end is more than 60 s ahead");
+    let f = m.current().unwrap()[&(s, start - 30 * MINUTE)].clone();
+    assert!(!f.flags.late, "30 minutes old by t, on time by t + d");
+    assert_eq!(m.latest(s).unwrap().unwrap().t, start - 30 * MINUTE);
+    assert_eq!(m.window(s, start - HOUR, start + HOUR).unwrap().count, 1);
+    m.advance(30 * MINUTE);
+    assert_eq!(m.latest(s).unwrap().unwrap().t, start);
+    assert_eq!(m.window(s, start - HOUR, start + HOUR).unwrap().count, 2);
+    // Late by the bound measured from the interval's end.
+    let old = start - HOUR;
+    let p = m.ingest(vec![num(s, old, 3.0)]).unwrap().positions[0];
+    // The first clause of `late` (2 × S, S = 3 × d) applies as well: a
+    // series with a lateness bound of a day shows it alone.
+    let (mut m2, _) = model();
+    let e = m2
+        .define_with(
+            "site/meter-2/energy",
+            Kind::Interval,
+            ValueType::Number,
+            "kWh",
+            None,
+            SeriesOptions {
+                lateness_bound: Some(DAY),
+                ..SeriesOptions::interval(30 * MINUTE, 0)
+            },
+        )
+        .unwrap();
+    let now2 = floor_to(m2.wall, 30 * MINUTE);
+    m2.ingest(vec![num(e, now2 - 30 * MINUTE, 1.0)]).unwrap();
+    let ps = m2
+        .ingest(vec![
+            num(e, now2 - 3 * HOUR, 1.0),
+            num(e, now2 - 4 * HOUR, 1.0),
+        ])
+        .unwrap()
+        .positions;
+    let flags: Vec<bool> = ps
+        .iter()
+        .map(|p| {
+            m2.facts()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.position == *p)
+                .unwrap()
+                .flags
+                .late
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![false, true],
+        "earlier than the latest t by more than 3 h"
+    );
+    let late = |m: &Model, p| {
+        m.facts()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.position == p)
+            .unwrap()
+            .flags
+            .late
+    };
+    assert!(late(&m, p));
+}
+
+/// Row 20a for an interval series with d = 30 min: no stored level, so no
+/// calendar node; a day's result is a window over its facts.
+#[test]
+fn row_20a_interval_series_of_30_minutes_has_no_calendar_node() {
+    let tz = TimeZone::get("Asia/Kathmandu").unwrap();
+    let date = Date::constant(2026, 6, 1);
+    let (ds, de) = kvik_model::tree::day_span(&tz, date).unwrap();
+    let p = Params::interval(30 * MINUTE, 0);
+    let first = floor_to(ds, 30 * MINUTE) - 30 * MINUTE;
+    let rs: Vec<(Nanos, Value)> = (0..52)
+        .map(|k| (first + k * 30 * MINUTE, Value::Num(1.0)))
+        .collect();
+    let tree = SeriesTree::build(p, &rs);
+    assert!(!tree.stores(0) && !tree.stores(1));
+    assert_eq!(tree.day(&tz, date), Err(TreeError::NoCalendarNode));
+    // The day starts at 18:15 UTC, inside an interval: apportioned.
+    let w = tree.window(ds, de, de + DAY);
+    assert_eq!(w, oracle::window(&p, &rs, ds, de, de + DAY));
+    assert!(w.apportioned());
+    assert_eq!(
+        w.aggregate(&Aggregate::Sum),
+        Some(AggValue::Exact(exact(48.0)))
+    );
 }
 
 #[test]
@@ -1125,15 +1352,79 @@ fn row_17_series_goes_silent() {
     assert_eq!(stale.on_arrival(m.mono), vec![Event::Cleared]);
 }
 
+/// Row 17a: "Record-on-change series, value unchanged: keep-alive fact each
+/// expected interval; never stale while healthy." The series is declared
+/// record on change with a keep-alive interval of 20 s as its expected
+/// interval (§2.6), so S = 60 s; its source polls every 2 s. Whether the
+/// engine or the adapter leaves out the unchanged polls is Q-73; here the
+/// adapter emits only changes and keep-alive facts.
 #[test]
 fn row_17a_record_on_change_keep_alive_never_stale() {
-    let (mut m, s) = model(); // S = 10 s
-    let t0 = m.wall - MINUTE;
-    // The value never changes; a keep-alive fact arrives every 10 s.
-    let rs: Vec<Reading> = (0..6).map(|i| num(s, t0 + i * 10 * SECOND, 5.0)).collect();
-    m.ingest(rs).unwrap();
-    let w = m.window(s, t0, m.wall).unwrap();
-    assert_eq!(w.coverage, i128::from(MINUTE), "never stale while healthy");
+    let (mut m, _) = model();
+    let s = m
+        .define_with(
+            "plant/line-1/valve",
+            Kind::Gauge,
+            ValueType::Number,
+            "%",
+            None,
+            SeriesOptions {
+                record_on_change: true,
+                ..SeriesOptions::expected(20 * SECOND)
+            },
+        )
+        .unwrap();
+    let d = m.registry().unwrap().get(s).unwrap().clone();
+    assert!(d.options.record_on_change);
+    assert_eq!(
+        (d.expected_interval(), d.staleness),
+        (Some(20 * SECOND), Some(MINUTE))
+    );
+    let mut stale = Runner::new(
+        Condition::StaleFor {
+            staleness: MINUTE,
+            n: 0,
+        },
+        m.mono,
+    );
+    let t0 = m.wall;
+    let mut last: Option<(f64, Nanos)> = None;
+    // Ten minutes of polls: the value changes twice, at 2 and 5 minutes.
+    for k in 0..300 {
+        let t = t0 + k * 2 * SECOND;
+        let v = if k < 60 {
+            5.0
+        } else if k < 150 {
+            7.0
+        } else {
+            6.0
+        };
+        let changed = last.is_none_or(|(x, _)| x != v);
+        let due = last.is_none_or(|(_, at)| t - at >= 20 * SECOND);
+        if changed || due {
+            m.ingest(vec![num(s, t, v)]).unwrap();
+            stale.on_arrival(m.mono);
+            last = Some((v, t));
+        }
+        assert!(
+            stale.on_tick(m.mono).is_empty(),
+            "never stale while healthy"
+        );
+        m.advance(2 * SECOND);
+    }
+    assert_eq!(
+        m.facts().unwrap().iter().filter(|f| f.series == s).count(),
+        30
+    );
+    let w = m.window(s, t0, t0 + 10 * MINUTE).unwrap();
+    assert_eq!(
+        w.coverage,
+        i128::from(10 * MINUTE),
+        "never stale while healthy"
+    );
+    // The source falls silent: stale S after its last fact.
+    m.advance(MINUTE);
+    assert_eq!(stale.on_tick(m.mono), vec![Event::Fired]);
 }
 
 proptest! {

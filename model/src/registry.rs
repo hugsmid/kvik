@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::summary::CounterRules;
-use crate::types::{Kind, Nanos, SeriesId, ValueType};
+use crate::types::{IntervalSpec, Kind, Nanos, SeriesId, ValueType};
 
 /// What `changed_at` holds in a versioned series (§2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,6 +74,11 @@ pub struct SeriesOptions {
     pub counter: CounterRules,
     /// Lateness bound (§2.2); `None` takes the configured default (5 min).
     pub lateness_bound: Option<Nanos>,
+    /// Interval length and phase; interval series only, and required there.
+    /// Its expected interval defaults to its length, and S to 3 × that; S
+    /// serves only the first clause of `late` (§2.2), as an interval reading
+    /// is valid for its interval and holds nothing (§5.2, §5.4).
+    pub interval: Option<IntervalSpec>,
 }
 
 impl SeriesOptions {
@@ -89,6 +94,14 @@ impl SeriesOptions {
     pub fn timing(timing: Timing) -> Self {
         SeriesOptions {
             timing,
+            ..SeriesOptions::default()
+        }
+    }
+
+    /// An interval series of length `length` and phase `phase`.
+    pub fn interval(length: Nanos, phase: Nanos) -> Self {
+        SeriesOptions {
+            interval: Some(IntervalSpec { length, phase }),
             ..SeriesOptions::default()
         }
     }
@@ -178,7 +191,10 @@ impl SeriesDef {
     pub fn expected_interval(&self) -> Option<Nanos> {
         self.options
             .expected_interval
-            .or(self.staleness.map(|s| s / 3))
+            .or(match self.options.interval {
+                Some(iv) => Some(iv.length),
+                None => self.staleness.map(|s| s / 3),
+            })
     }
 }
 
@@ -213,6 +229,15 @@ pub enum RegistryError {
     /// An expected interval or lateness bound must be positive.
     #[error("expected interval and lateness bound must be positive")]
     BadInterval,
+    /// Interval length and phase missing on an interval series, given on
+    /// another, or out of range (§2.1: d > 0, 0 ≤ phase < d).
+    #[error(
+        "interval length and phase are for interval series only, with d > 0 and 0 <= phase < d"
+    )]
+    BadIntervalSpec,
+    /// Record on change on an interval series (§2.1).
+    #[error("record on change does not apply to an interval series")]
+    RecordOnChangeInterval,
     /// Counter rules on a series that is not a counter, or out of range
     /// (§5.5: `wrap_at` positive, `reset_ceiling` between 0 and 1).
     #[error("counter rules apply to counters only, with wrap_at > 0 and 0 <= reset_ceiling <= 1")]
@@ -332,8 +357,20 @@ impl Registry {
         {
             return Err(RegistryError::BadCounterRules);
         }
-        // S = 3 × expected interval unless set (§2.1).
-        let staleness = staleness.or(options.expected_interval.map(|e| 3 * e));
+        match (kind, options.interval) {
+            (Kind::Interval, Some(iv)) if iv.length > 0 && (0..iv.length).contains(&iv.phase) => {}
+            (Kind::Interval, _) | (_, Some(_)) => return Err(RegistryError::BadIntervalSpec),
+            _ => {}
+        }
+        if kind == Kind::Interval && options.record_on_change {
+            return Err(RegistryError::RecordOnChangeInterval);
+        }
+        // S = 3 × expected interval unless set (§2.1); an interval series'
+        // expected interval defaults to its length.
+        let expected = options
+            .expected_interval
+            .or(options.interval.map(|iv| iv.length));
+        let staleness = staleness.or(expected.map(|e| 3 * e));
         if options.timing == Timing::Forecast && options.versioned != Some(ChangedAtKind::Time) {
             return Err(RegistryError::ForecastNotVersioned);
         }

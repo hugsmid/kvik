@@ -487,7 +487,7 @@ proptest! {
         // Reuse gauge-valued readings for every kind by mapping values.
         let conv = |v: &Value, i: usize| -> Value {
             match p.kind {
-                kvik_model::types::Kind::Gauge => v.clone(),
+                kvik_model::types::Kind::Gauge | kvik_model::types::Kind::Interval => v.clone(),
                 kvik_model::types::Kind::Counter => Value::Num(v.as_f64().unwrap().abs().floor()),
                 kvik_model::types::Kind::State => Value::Str(["a", "b", "c"][i % 3].into()),
                 kvik_model::types::Kind::Text => Value::Str(["x", "y"][i % 2].into()),
@@ -1556,8 +1556,8 @@ proptest! {
 
     /// 20. No fact of a scheduled or forecast series carries `future`, or
     /// `late` by its first clause. The readings stay within the lateness
-    /// bound, so any `late` would come from the first clause; the observed
-    /// series shows that the same inputs do flag it there.
+    /// bound, so any `late` would come from the first clause; on the observed
+    /// series `future` is set exactly where its rule says.
     #[test]
     fn inv20_scheduled_and_forecast_facts_never_future_or_out_of_order_late(
         readings in arb_timed_readings(),
@@ -1569,6 +1569,95 @@ proptest! {
                 prop_assert!(!f.flags.future && !f.flags.late, "{:?}", f);
             } else {
                 prop_assert_eq!(f.flags.future, f.t > f.received_at + 60 * SECOND);
+            }
+        }
+    }
+}
+
+// ----- interval series (§2.1 `interval`, §5.4, §6) -----
+
+fn interval_sum(n: &Node) -> Exact {
+    match &n.body {
+        Body::Interval { sum, .. } => sum.clone(),
+        _ => unreachable!("interval node"),
+    }
+}
+
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// 22. For an interval series, the sums over adjacent windows add up to
+    /// the sum over their union (exactly in the model, where an apportioned
+    /// amount is a rational); so do the coverages. Each window equals the
+    /// direct computation (invariant 7).
+    #[test]
+    fn inv22_interval_sums_add_over_adjacent_windows(
+        (p, rs, cuts, now) in arb_interval_params().prop_flat_map(|p| (
+            Just(p),
+            arb_interval_readings(p),
+            proptest::collection::btree_set(arb_interval_instant(p), 2..6),
+            arb_interval_instant(p),
+        )),
+    ) {
+        let tree = SeriesTree::build(p, &rs);
+        let cuts: Vec<Nanos> = cuts.into_iter().collect();
+        let (start, end) = (cuts[0], cuts[cuts.len() - 1]);
+        let whole = tree.window(start, end, now);
+        prop_assert_eq!(&whole, &oracle::window(&p, &rs, start, end, now));
+        let parts: Vec<Node> = cuts.windows(2).map(|w| tree.window(w[0], w[1], now)).collect();
+        for (w, part) in cuts.windows(2).zip(&parts) {
+            prop_assert_eq!(part, &oracle::window(&p, &rs, w[0], w[1], now));
+        }
+        let sum = parts.iter().map(interval_sum).fold(Exact::from_integer(0.into()), |a, b| a + b);
+        prop_assert_eq!(sum, interval_sum(&whole));
+        prop_assert_eq!(parts.iter().map(|n| n.coverage).sum::<i128>(), whole.coverage);
+        prop_assert_eq!(parts.iter().map(|n| n.count).sum::<u64>(), whole.count);
+    }
+
+    /// 18 for an interval series: no time is credited past a reading's
+    /// interval or the credit limit; a reading of an observed series counts
+    /// only once `t + d ≤ now`.
+    #[test]
+    fn inv18_interval_reading_valid_for_its_interval_only(
+        (p, rs, a, b, now) in arb_interval_params().prop_flat_map(|p| (
+            Just(p),
+            arb_interval_readings(p),
+            arb_interval_instant(p),
+            arb_interval_instant(p),
+            arb_interval_instant(p),
+        )),
+    ) {
+        let (start, end) = (a.min(b), a.max(b));
+        let d = p.interval.unwrap().length;
+        let tree = SeriesTree::build(p, &rs);
+        let w = tree.window(start, end, now);
+        let observed = p.timing == kvik_model::registry::Timing::Observed;
+        let valid: Vec<(Nanos, Nanos)> = rs
+            .iter()
+            .filter(|(t, _)| !observed || t + d <= now)
+            .map(|(t, _)| (*t, t + d))
+            .collect();
+        prop_assert!(w.coverage <= union_within(&valid, start, p.credit_limit(end, now).max(start)));
+        prop_assert_eq!(w.coverage, union_within(&valid, start, end));
+    }
+
+    /// 5 for an interval series: a level is stored only where the density
+    /// rule keeps it and every node edge is a multiple of d from the phase
+    /// (§5.4); every node equals the direct computation.
+    #[test]
+    fn inv05_interval_levels_stored_only_where_no_interval_crosses_an_edge(
+        (p, rs) in arb_interval_params().prop_flat_map(|p| (Just(p), arb_interval_readings(p))),
+    ) {
+        let tree = SeriesTree::build(p, &rs);
+        let iv = p.interval.unwrap();
+        for (level, width) in LEVELS.iter().enumerate() {
+            let qualifies = iv.length <= [5 * SECOND, MINUTE][level] && iv.phase == 0 && width % iv.length == 0;
+            prop_assert_eq!(tree.stores(level), qualifies);
+            let with_data: BTreeSet<Nanos> = rs.iter().map(|(t, _)| floor_to(*t, *width)).collect();
+            let stored: BTreeSet<Nanos> = tree.stored(level).map(|n| n.start).collect();
+            prop_assert_eq!(&stored, &if qualifies { with_data.clone() } else { BTreeSet::new() });
+            for st in with_data {
+                prop_assert_eq!(tree.node(level, st), oracle::node(&p, &rs, st, st + width));
             }
         }
     }

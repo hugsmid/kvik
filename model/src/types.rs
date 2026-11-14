@@ -103,6 +103,25 @@ pub enum Kind {
     State,
     /// Short text, at most 255 bytes.
     Text,
+    /// An amount over a fixed interval `[t, t + d)` (§2.1).
+    Interval,
+}
+
+/// Length and phase of an interval series (§2.1): a reading's `t` is the
+/// start of its interval and satisfies `t ≡ phase (mod length)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IntervalSpec {
+    /// Length d > 0.
+    pub length: Nanos,
+    /// Phase, 0 ≤ phase < d.
+    pub phase: Nanos,
+}
+
+impl IntervalSpec {
+    /// Whether `t` is on the phase (Euclidean, on UTC nanoseconds).
+    pub fn on_phase(&self, t: Nanos) -> bool {
+        t.rem_euclid(self.length) == self.phase
+    }
 }
 
 /// Value type of a series, fixed for its life.
@@ -123,8 +142,10 @@ impl Kind {
     pub fn accepts(self, vt: ValueType) -> bool {
         matches!(
             (self, vt),
-            (Kind::Gauge | Kind::Counter, ValueType::Number)
-                | (Kind::State, ValueType::Boolean | ValueType::Name)
+            (
+                Kind::Gauge | Kind::Counter | Kind::Interval,
+                ValueType::Number
+            ) | (Kind::State, ValueType::Boolean | ValueType::Name)
                 | (Kind::Text, ValueType::Text)
         )
     }

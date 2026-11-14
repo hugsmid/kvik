@@ -90,6 +90,11 @@ pub fn arb_value(kind: Kind) -> BoxedStrategy<Value> {
         Kind::Text => {
             prop_oneof![Just(Value::Str("a".into())), Just(Value::Str("b".into()))].boxed()
         }
+        Kind::Interval => prop_oneof![
+            (0i32..8).prop_map(|v| Value::Num(f64::from(v) * 2.5)),
+            (-100.0f64..1000.0).prop_map(Value::Num),
+        ]
+        .boxed(),
     }
 }
 
@@ -131,7 +136,7 @@ pub fn arb_readings(kind: Kind, max: usize) -> impl Strategy<Value = Vec<(Nanos,
 
 pub fn value_type(kind: Kind) -> ValueType {
     match kind {
-        Kind::Gauge | Kind::Counter => ValueType::Number,
+        Kind::Gauge | Kind::Counter | Kind::Interval => ValueType::Number,
         Kind::State => ValueType::Name,
         Kind::Text => ValueType::Text,
     }
@@ -1156,4 +1161,63 @@ pub fn inv14_overlap(m: &Model) -> Option<(u64, Position)> {
         }
     }
     None
+}
+
+// ----- interval series (§2.1 `interval`, §6) -----
+
+/// Interval lengths around the stored-level conditions: dividing 1 minute,
+/// dividing 15 minutes only, longer than the density thresholds.
+pub const INTERVAL_LENGTHS: [Nanos; 6] = [
+    SECOND,
+    15 * SECOND,
+    36 * SECOND,
+    MINUTE,
+    7 * MINUTE,
+    30 * MINUTE,
+];
+
+/// Parameters of an interval series: a length from [`INTERVAL_LENGTHS`], a
+/// phase of 0 or a quarter, half or three quarters of it, and any timing.
+pub fn arb_interval_params() -> impl Strategy<Value = Params> {
+    (
+        proptest::sample::select(INTERVAL_LENGTHS.to_vec()),
+        0i64..4,
+        prop_oneof![
+            2 => Just(Timing::Observed),
+            1 => Just(Timing::Scheduled),
+            1 => Just(Timing::Forecast),
+        ],
+    )
+        .prop_map(|(d, q, timing)| Params {
+            timing,
+            ..Params::interval(d, q * d / 4)
+        })
+}
+
+/// Readings of an interval series on its phase: `t = T0 + phase + k·d` for
+/// distinct `k` in `0..60`, built on the phase by construction.
+pub fn arb_interval_readings(p: Params) -> impl Strategy<Value = Vec<(Nanos, Value)>> {
+    let iv = p.interval.expect("interval series");
+    proptest::collection::btree_map(0i64..60, arb_value(Kind::Interval), 0..40).prop_map(move |m| {
+        m.into_iter()
+            .map(|(k, v)| (T0 + iv.phase + k * iv.length, v))
+            .collect()
+    })
+}
+
+/// An instant near the readings of an interval series: on an interval
+/// edge, just off it, or inside it.
+pub fn arb_interval_instant(p: Params) -> impl Strategy<Value = Nanos> {
+    let iv = p.interval.expect("interval series");
+    (
+        -2i64..64,
+        prop_oneof![
+            Just(0),
+            Just(1),
+            Just(-1),
+            Just(iv.length / 3),
+            Just(iv.length / 2)
+        ],
+    )
+        .prop_map(move |(j, off)| T0 + iv.phase + j * iv.length + off)
 }
