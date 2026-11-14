@@ -1494,3 +1494,67 @@ fn golden_batches_are_canonical() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Near-valid bodies: encoder output with a few byte edits or a cut, fed straight to the body decoders (A.11).
+
+fn mutate(
+    mut b: Vec<u8>,
+    edits: &[(prop::sample::Index, u8)],
+    cut: Option<prop::sample::Index>,
+) -> Vec<u8> {
+    for (at, v) in edits {
+        let i = at.index(b.len());
+        b[i] = *v;
+    }
+    if let Some(c) = cut {
+        b.truncate(c.index(b.len() + 1));
+    }
+    b
+}
+
+proptest! {
+    #[test]
+    fn mutated_bodies_never_panic_and_what_decodes_encodes_again(
+        rows in rows(12),
+        entries in prop::collection::vec(prop_oneof![5 => entry(), 1 => recovery().prop_map(Entry::Recovery)], 1..5),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
+        cut in prop::option::weighted(0.2, any::<prop::sample::Index>()),
+    ) {
+        let f = mutate(FactsBlock { first_sequence: 3, received_at: T0, rows }.encode().unwrap(), &edits, cut);
+        if let Ok(d) = FactsBlock::decode(&f) {
+            let again = d.encode().unwrap();
+            prop_assert_eq!(FactsBlock::decode(&again).unwrap(), d.clone());
+            prop_assert_eq!(FactsBlock::decode_canonical(&f).is_ok(), again == f);
+        }
+        let e = mutate(EntriesBlock { first_sequence: 3, received_at: T0, entries }.encode().unwrap(), &edits, cut);
+        if let Ok(d) = EntriesBlock::decode(&e)
+            && !d.entries.iter().any(|x| matches!(x, Entry::Ignored { .. }))
+        {
+            let again = d.encode().unwrap();
+            prop_assert_eq!(EntriesBlock::decode(&again).unwrap(), d.clone());
+            prop_assert_eq!(EntriesBlock::decode_canonical(&e).is_ok(), again == e);
+        }
+    }
+}
+
+#[test]
+fn a_refusal_wins_over_invalid_content() {
+    // An unknown critical field repeated (out of order for a known field) is a version refusal, not a lost range.
+    let mut f = def_fields();
+    f.insert(2, (0x0100, vec![]));
+    f.insert(3, (0x0100, vec![]));
+    assert_eq!(
+        decode_one(1, f),
+        Err(BodyError::Unsupported(Element::Field {
+            entry_type: 1,
+            field: 0x0100
+        }))
+    );
+    // Undefined flag bits on a later row win over an out-of-range value on an earlier one.
+    let r = with(2, |c| {
+        insert(c, 3, 0, vec![4, 0]);
+        insert(c, 4, 0, vec![0, 0, 0, 0x80]);
+    });
+    assert_eq!(r, Err(BodyError::Unsupported(Element::FactFlags(0x8000))));
+}

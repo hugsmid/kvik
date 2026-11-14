@@ -535,6 +535,15 @@ fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
     .unwrap_or_default();
     let scales: Option<Vec<u8>> = small(&cols[usize::from(column::SCALE)], column::SCALE, n)?;
 
+    // Undefined flag bits are a version refusal, tested before any per-row check.
+    if let Some(f) = flags
+        .as_ref()
+        .and_then(|f| f.iter().find(|&&f| f & flag::UNDEFINED != 0))
+    {
+        return Err(BodyError::Unsupported(Element::FactFlags(
+            f & flag::UNDEFINED,
+        )));
+    }
     let mut out = Vec::with_capacity(n);
     let (mut any_text, mut any_changed, mut any_decimal) = (false, false, false);
     for i in 0..n {
@@ -545,11 +554,6 @@ fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
             row,
         })?;
         let f = flags.as_ref().map_or(0, |f| f[i]);
-        if f & flag::UNDEFINED != 0 {
-            return Err(BodyError::Unsupported(Element::FactFlags(
-                f & flag::UNDEFINED,
-            )));
-        }
         let vt = ValueType::from_code(vtypes[i]).ok_or(E::Value {
             column: column::VALUE_TYPE,
             row,

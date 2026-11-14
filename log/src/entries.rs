@@ -657,7 +657,8 @@ impl<'a> Parsed<'a> {
 fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
     let p = DataPrefix::decode(block_type::ENTRIES, body).map_err(|_| ContentError::Prefix)?;
     let mut at = DATA_PREFIX_LEN;
-    let mut entries = Vec::with_capacity((p.count as usize).min(body.len() / 8));
+    // No reservation from `entry_count`: nothing is allocated before the entries are read (A.11).
+    let mut entries = Vec::new();
     for i in 0..p.count {
         let overrun = BodyError::from(ContentError::EntryOverrun { entry: i });
         let head = body.get(at..at + 8).ok_or(overrun)?;
@@ -709,22 +710,26 @@ fn fields(raw: &[u8], entry: u32, t: u8, known: bool) -> Result<Vec<(u16, &[u8])
         if !known {
             continue;
         }
-        if id < 0x8000 && prev.is_some_and(|p| id < p || (id == p && !repeated(t, id))) {
-            return Err(ContentError::FieldOrder { entry, field: id }.into());
-        }
-        prev = Some(prev.map_or(id, |p| p.max(id)));
-        match allowed(t, id) {
-            Allowed::Yes => out.push((id, v)),
-            Allowed::Ignorable => {}
-            Allowed::Forbidden => {
-                return Err(ContentError::FieldNotAllowed { entry, field: id }.into());
-            }
+        // A version refusal wins over invalid content: unknown ids are classified before order is tested.
+        let kind = allowed(t, id);
+        match kind {
             Allowed::Unknown => {
                 return Err(BodyError::Unsupported(Element::Field {
                     entry_type: t,
                     field: id,
                 }));
             }
+            Allowed::Forbidden => {
+                return Err(ContentError::FieldNotAllowed { entry, field: id }.into());
+            }
+            Allowed::Yes | Allowed::Ignorable => {}
+        }
+        if id < 0x8000 && prev.is_some_and(|p| id < p || (id == p && !repeated(t, id))) {
+            return Err(ContentError::FieldOrder { entry, field: id }.into());
+        }
+        prev = Some(prev.map_or(id, |p| p.max(id)));
+        if let Allowed::Yes = kind {
+            out.push((id, v));
         }
     }
     Ok(out)

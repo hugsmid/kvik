@@ -76,6 +76,20 @@ pub fn decode_all(data: &[u8]) {
     let _ = SegmentIndex::decode(body);
     let _ = Trailer::decode(body);
     let _ = decode_end_marker(body);
+    // Every block body by its declared length, without the checksum gate, so the body decoders see the real bodies
+    // of mutated segments.
+    let mut at = HEADER_LEN;
+    for _ in 0..256 {
+        let Some(h) = data.get(at..at + BLOCK_HEADER_LEN) else {
+            break;
+        };
+        let len = u32_at(h, 4) as usize;
+        let start = at + BLOCK_HEADER_LEN;
+        let b = &data[start..start.saturating_add(len).min(data.len())];
+        let _ = FactsBlock::decode(b);
+        let _ = EntriesBlock::decode(b);
+        at = start.saturating_add(len.div_ceil(8) * 8);
+    }
     for d in [data, body] {
         let _ = FactsBlock::decode(d);
         let _ = FactsBlock::decode_canonical(d);
