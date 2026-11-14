@@ -18,7 +18,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-44 | §2.1 timing, §4, §11 | Gaps left by scheduled and forecast series |
 | Q-45 | §2.1 interval, §5.7 | Intervals of varying length |
 | Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
-| Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor |
+| Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
+| Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -132,14 +133,29 @@ reader receives nothing, and may skip the new fact or keep the lost one.
 **Needed.** Whether readers can see that a tail was truncated (for example a recovery count in the mark or the
 manifest that they compare), or whether the residual risk is accepted and stated.
 
-## Q-47 — How a consumer learns its recovered cursor
+## Q-47 — How a consumer learns its recovered cursor, and what forgetting means
 **Scenario.** A consumer confirms position p; its cursor file, synced at most every second (§4 Consumer state), still
 names an earlier position when power is lost. The tail holding p is truncated and p is assigned to a new fact
 (§3 Recovery rule 3). On `resync` the consumer must forget the positions it has seen above its recovered cursor
 (§4 At-least-once), p included, but nothing tells it which cursor was recovered; the `cursor` event in §11 is not
-defined.
+defined. Separately, "forget" is undefined for a consumer that keeps state outside the engine keyed by position:
+positions in the truncated tail may be the only copy of acknowledged facts that are now lost, and with an upsert
+keyed by position the new fact at p overwrites the lost one (see Q-34).
 **Model.** Not modelled; the mark is always exact.
-**Proposed.** `resync` after a truncated tail carries the consumer's recovered cursor.
+**Proposed.** `resync` after a truncated tail carries the consumer's recovered cursor. Alternatively, the engine
+delivers one value to every consumer: the first new position after recovery, since only positions at or above it
+(above the last kept batch, the synced cursors and the manifest records) can be reused; this is tighter than each
+consumer's recovered cursor and also serves readers (Q-46). What a consumer with outside state does with the lost
+facts is not proposed.
+
+## Q-48 — The resync owed after a truncated tail is not durable
+**Scenario.** Recovery under §3 Recovery rule 3 resumes, and a new fact commits at a reused position p. The process
+crashes on the same boot before consumer C has received its `resync`. On restart rule 1 applies, so no `resync` for
+a truncated tail is sent, and §6 Restart and resume delivers the facts after C's cursor, p included, before its
+`resync`; C may drop the new fact at p as a repeat.
+**Model.** Not modelled; the mark is always exact.
+**Proposed.** Persist a "resync owed" flag, or a reuse floor, with the mark until each consumer has confirmed its
+`resync`.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -247,7 +263,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44) |
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (open part: Q-45) |
-| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after §3 Recovery rule 3 truncates a tail), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46, Q-47) |
+| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future

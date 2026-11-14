@@ -156,9 +156,10 @@ a different boot. The rules apply in this order:
    readable in it; an empty tail is not reported. New positions then continue above the highest sequence of the
    current generation among the last kept batch, any local cursor file and any local manifest record; positions
    skipped that way are recorded as a lost range whose cause is a truncated tail. So no position named by a synced
-   cursor or manifest record is reused. A delivered position that no synced cursor names can be reused, so every
-   consumer receives `resync` and forgets the positions it has seen above its recovered cursor (§4 At-least-once,
-   Resync). A missing or unreadable cursor file is reported with `possible_loss`, and its consumer is treated as
+   cursor or manifest record is reused. A delivered position that no synced cursor names can be reused, so after
+   every recovery under this rule, whether or not anything was reported, every consumer receives `resync` before any
+   position above the last kept batch and forgets the positions it has seen above its recovered cursor (§4
+   At-least-once, Resync). A missing or unreadable cursor file is reported with `possible_loss`, and its consumer is treated as
    having no cursor.
 4. Whenever rule 1 did not apply, recovery syncs the segment and directory and writes the mark with the current boot
    id, then resumes. If that sync fails, the engine stays read-only and leaves the old mark.
@@ -175,7 +176,7 @@ a different boot. The rules apply in this order:
 | At-least-once | After a restart a consumer resumes after its cursor and may see a delivery again. Consumers de-duplicate fact deliveries by position and timer deliveries by `(funnel, sequence)`; commands carry ids. On `resync` a consumer must forget every position it has seen above its durable cursor as recovered from its file, which can lag its confirmations by up to the cursor sync interval (Consumer state): after a truncated tail such a position can name a different fact (§3 Recovery rule 3), which must not be dropped as a repeat. |
 | Overflow | A full queue switches the consumer to catch-up: it reads the log from after the last position already enqueued for it in the current session (not from its confirmed cursor, so order holds within a session) up to the durable mark, then re-attaches to live at the next position under the writer's delivery lock (no gap, no repeat). It never blocks the log or other consumers. Time behind is measured. |
 | Replay | Fact deliveries produced in catch-up are flagged `replayed` and keep their original times. They are for record-keeping and are never fed to a condition operator a second time (§6). A consumer that acts on devices must not act on old deliveries (default: `received_at` more than 60 s before now; event time does not count). |
-| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), when it is at or above the start of a tail truncated by §3 Recovery rule 3, and to every consumer after §3 Recovery rule 3 truncates a tail reported as `possible_loss`, before any position above the last kept batch is delivered to it, since any consumer may have been delivered positions in that tail. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
+| Resync | A `resync` delivery carries, per funnel, the current live state and condition state evaluated now. Sent on resume after downtime (§6), on `generation_changed` (§8), when the cursor is older than the oldest local log segment, when the cursor, or the `start` position of a newly registered consumer, is below or inside a lost range (§3), when it is at or above the start of a tail truncated by §3 Recovery rule 3, and to every consumer after every recovery under §3 Recovery rule 3, whether or not anything was reported, before any position above the last kept batch is delivered to it, since any consumer may have been delivered positions that are now reused. With no latch to compare, as after a restore, it delivers each condition's present state, true or false, as a transition. It is not flagged `replayed`; acting on it is acting on the present. |
 | Future facts | Observed series: delivered at commit, flagged `future`; ignored by live state, staleness and windows until `t ≤ now`. Scheduled and forecast facts are delivered once, at commit, in position order, not flagged `future`: the delivery is a notice of a value for `t`, and a consumer acts on live state or a condition, never on the delivery itself. A scheduled value taking effect is seen through live state or a condition funnel's timer evaluation; there is no second delivery. A stale-for condition on a forecast series is rejected when funnels are compiled (§6 Cadence), and `resync` for a funnel over a forecast series carries condition state only. |
 | Outranked facts | A fact outranked at commit (§2.3) is delivered in position order, flagged `outranked`, and counted per series (`outranked_on_arrival`). It does not change live state or staleness, is never fed to an operator or condition and must not be acted on. |
 | Timers | Window expiry, "held for N s" and staleness of an observed series use the monotonic clock; system clock corrections never fire or suppress them. A future fact matures, a scheduled value takes effect and a scheduled series falls stale by `now` (§6), so a forward correction of the system clock can bring any of them forward. Timer deliveries that fell due while the engine was down are not replayed; `resync` covers them. |
@@ -267,8 +268,10 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
   the affected days and is logged.
 - A calendar window or query may name an IANA zone instead; its days and months are then taken in that zone over
   the whole span, with no effective dating. Its result is a window evaluation over the UTC data like any other. A
-  stored calendar node is an input to it only where the site zone in force for that node is the named zone;
-  elsewhere the result is evaluated as for a span off 15-minute boundaries (last item).
+  stored calendar node is an input to it only when every local day the node covers was taken in the named zone
+  (zones compared by canonical name, after resolving IANA links; so not a month spanning a site-zone change) and
+  the node's recorded tzdata version is the current one; elsewhere the result is evaluated as for a span off
+  15-minute boundaries (last item).
 - A calendar day or month **result** is a window evaluation (§6) over its span, edge stretches included. Stored day
   nodes are an input to that evaluation, not the result.
 - A local day usually has 92–100 quarter-hours. A day whose local midnight does not exist starts at its first
@@ -405,7 +408,7 @@ gap until they are re-ingested.
 | 19 | Correction changes a node's min or max | Minute recomputed from facts, ancestors from children | property |
 | 20 | DST changes | UTC levels unaffected; local days of 92–100 quarter-hours, evaluated as windows over their spans | property |
 | 21 | Site zone changed, or tzdata changes its rules | Calendar nodes rebuilt from the effective time / affected days only; logged | integration |
-| 21a | Calendar query in a named zone whose offset is not a multiple of 15 minutes (historical offsets) | Days taken in that zone for the whole span; no stored calendar node used; evaluated as a window over the UTC data, with facts at its edges | model (roadmap 1.6) |
+| 21a | Calendar query in a named zone whose offset is not a multiple of 15 minutes (historical offsets); or, on an interval series, a multiple of 15 minutes but not of d (+05:45 with d = 30 min) | Days taken in that zone for the whole span; no stored calendar node used; evaluated as a window over the UTC data, with facts at its edges; an interval crossing a day edge is apportioned (§6) | model (roadmap 1.6) |
 | 22 | System clock jumps | Timers of observed series monotonic; future-fact maturity and scheduled values follow `now`; window `now` never runs backwards; `commit_time` monotonic | unit |
 | 22a | Host clock not yet synchronised at boot | `unsynced_clock`; host-stamped facts wait | unit |
 | 23 | Series renamed | Alias entry; id and data unchanged | unit |
@@ -434,7 +437,7 @@ gap until they are re-ingested.
 ## 10. Invariants (checked by the reference model and property tests)
 1. Sequences are strictly increasing and gap-free within a generation across restarts, except for lost ranges
    recorded in the manifest (§3); only a restore starts one.
-2. Every delivered position is durable; every durable position routed to a consumer is delivered to it, or
+2. Every delivered position is durable, except in a tail truncated by §3 Recovery rule 3 (invariant 10); every durable position routed to a consumer is delivered to it, or
    superseded by a `resync` covering it.
 3. For any consumer, fact deliveries are in position order.
 4. The current view equals "highest rank per `(series, t)`" (§2.2) over all facts in all tiers, quarantined segments
@@ -481,7 +484,8 @@ gap until they are re-ingested.
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
 | Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
 
-Every default in this document is a configuration key, with its unit where it is defined. Byte-level format,
+Every default in this document is a configuration key, with its unit where it is defined; the decided choices D1–D7
+(§12) are rules, not configuration keys. Byte-level format,
 Parquet export schema, API signatures and memory figures follow in separate documents.
 
 ## 12. Decided choices
@@ -495,7 +499,8 @@ Parquet export schema, API signatures and memory figures follow in separate docu
 | D6 | Bad-quality reading in a gauge | Ignored; previous value's hold continues up to S | Ends the previous hold (gap) |
 | D7 | 1-minute level for old spans | Stays hot forever (≈ 38 MB per series-year with data every minute) | Follows raw detail to cold |
 
-D4 and D7 are looked at again after the measurements of roadmap section 2 (§13) and may change then.
+D4 and D7 are looked at again once the §13 measurements behind them exist (hot disk during log retention and tree
+size, which need compaction and the tree: roadmap sections 6, 7 and 10), and may change then.
 
 ## 13. Risks to measure
 | Risk | How measured | If it fails |
