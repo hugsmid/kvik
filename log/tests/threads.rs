@@ -254,6 +254,136 @@ fn a_panic_on_the_writer_thread_fails_pending_calls_and_turns_the_store_read_onl
     );
 }
 
+fn big(i: i64) -> Vec<Item> {
+    (0..30)
+        .map(|k| {
+            Item::Fact(FactRow {
+                series_id: 1,
+                t: T0 + i * 100 + k,
+                quality: Quality::Good,
+                flags: FactFlags::default(),
+                value: Value::Text(format!("{k:0200}")),
+                changed_at: None,
+            })
+        })
+        .collect()
+}
+
+/// Waits for `cond`, at most 10 s.
+fn wait_for(cond: impl Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while !cond() {
+        if start.elapsed() > Duration::from_secs(10) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+#[test]
+fn a_maintenance_fault_during_a_commit_stops_the_writer_before_its_next_operation() {
+    // One call per batch, two batches per segment: the third call rolls into segment 2, and segment 3 is then
+    // created while the fourth call's batch is being synced. That creation's sync fails.
+    let fs = MemFs::new();
+    fs.fail_nth(
+        FaultOp::Sync,
+        "0000000000000003",
+        0,
+        std::io::ErrorKind::Other,
+    );
+    let writer_syncs = Arc::new(Mutex::new(0usize));
+    let in_sync = Arc::new(AtomicBool::new(false));
+    let (f2, n2, s2) = (fs.clone(), writer_syncs.clone(), in_sync.clone());
+    fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        let name = p.to_string_lossy();
+        match std::thread::current().name() {
+            Some("kvik-writer") if name.ends_with(".open") => {
+                let mut n = n2.lock().unwrap();
+                *n += 1;
+                if *n == 4 {
+                    // The fourth batch's sync is in flight until the maintenance fault has happened.
+                    s2.store(true, Ordering::SeqCst);
+                    assert!(wait_for(|| f2.ops().iter().any(|o| !o.ok)));
+                }
+            }
+            Some("kvik-maint") if name.contains("0000000000000003") => {
+                assert!(wait_for(|| s2.load(Ordering::SeqCst)));
+            }
+            _ => {}
+        }
+    })));
+    let log = start(
+        Arc::new(fs.clone()),
+        Path::new("store"),
+        WriterConfig {
+            min_sync_interval: Duration::ZERO,
+            max_batch_bytes: 7_000,
+            ..cfg()
+        },
+    );
+    for i in 0..3 {
+        log.submit(big(i)).unwrap().wait().unwrap();
+    }
+    let r = log.submit(big(3)).unwrap().wait();
+    assert_eq!(r, Err(CommitError::OutcomeUnknown));
+    assert!(log.shutdown().is_err());
+    // After the failed sync only the writer's sync already in flight completes; the mark is not written.
+    let ops = fs.ops();
+    let failed = ops.iter().position(|o| !o.ok).unwrap();
+    let after: Vec<_> = ops[failed + 1..].iter().collect();
+    assert!(after.len() <= 1, "{after:?}");
+    assert!(
+        after
+            .iter()
+            .all(|o| o.op == FaultOp::Sync && !o.path.ends_with("MARK"))
+    );
+}
+
+#[test]
+fn a_panic_on_the_maintenance_thread_turns_the_store_read_only_and_shutdown_finishes() {
+    let fs = MemFs::new();
+    let log = start(
+        Arc::new(fs.clone()),
+        Path::new("store"),
+        WriterConfig {
+            min_sync_interval: Duration::ZERO,
+            max_batch_bytes: 7_000,
+            ..cfg()
+        },
+    );
+    log.submit(big(0)).unwrap().wait().unwrap();
+    // The panic strikes while segment 1 is being sealed.
+    fs.set_sync_hook(Some(Arc::new(|p: &Path| {
+        if std::thread::current().name() == Some("kvik-maint")
+            && p.to_string_lossy().ends_with("0000000000000001.open")
+        {
+            panic!("injected panic");
+        }
+    })));
+    for i in 1..3 {
+        log.submit(big(i)).unwrap().wait().unwrap();
+    }
+    assert!(wait_for(|| log.fault().is_some()));
+    match log.submit(big(3)) {
+        Err(SubmitError::ReadOnly) => {}
+        Ok(p) => assert_eq!(p.wait(), Err(CommitError::ReadOnly)),
+        Err(e) => panic!("{e}"),
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.shutdown()));
+        tx.send(r.is_err()).unwrap();
+    });
+    let passed_on = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("shutdown finishes");
+    assert!(
+        passed_on,
+        "the panic is passed on once both threads are joined"
+    );
+}
+
 #[test]
 fn smoke_on_the_real_file_system() {
     let dir = std::env::temp_dir().join(format!("kvik-log-smoke-{}", std::process::id()));

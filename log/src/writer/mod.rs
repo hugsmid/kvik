@@ -321,7 +321,7 @@ pub enum FaultOp {
     MarkSync,
     /// Reading or encoding a segment for its seal.
     Seal,
-    /// The writer thread panicked.
+    /// A thread of the writer (`kvik-writer` or `kvik-maint`) panicked.
     Panic,
 }
 
@@ -973,7 +973,17 @@ impl LogWriter {
         }
     }
 
+    /// Whether the store is read-only, a fault recorded by the maintenance work included. Checked before every
+    /// file operation of the writer, so none starts once a fault on either thread is known.
+    fn halted(&mut self) -> bool {
+        self.sync_halt();
+        self.fault.is_some()
+    }
+
     fn sync_mark(&mut self, now: Duration) {
+        if self.halted() {
+            return;
+        }
         if let Err(e) = self.mark.sync_data() {
             let p = self.mark_path.clone();
             self.fail(FaultOp::MarkSync, &p, &e);
@@ -997,12 +1007,15 @@ impl LogWriter {
             .open
             .as_ref()
             .is_some_and(|o| o.summary.is_some() && now >= o.in_use_since + self.cfg.seal_interval);
-        if !due || self.ahead.is_none() {
+        if !due || self.ahead.is_none() || self.halted() {
             return;
         }
         let Some(next) = self.take_into_use(self.last_sequence + 1, now) else {
             return;
         };
+        if self.halted() {
+            return;
+        }
         if let Err(e) = next.file.sync_data() {
             let p = maint::segment_path(&self.log_dir, &next.id, false);
             self.fail(FaultOp::Sync, &p, &e);
@@ -1100,10 +1113,17 @@ impl LogWriter {
                 back.extend(rest);
                 return None;
             }
+            if self.halted() {
+                return Some(Self::finished(&calls, CommitError::ReadOnly));
+            }
             next = self.take_into_use(first, now);
             if next.is_none() {
                 return Some(Self::unknown(&calls));
             }
+        }
+        // Nothing of this batch is written yet: a fault known now leaves it unstored.
+        if self.halted() {
+            return Some(Self::finished(&calls, CommitError::ReadOnly));
         }
         let seg = next
             .as_ref()
@@ -1116,6 +1136,9 @@ impl LogWriter {
         let path = maint::segment_path(&self.log_dir, &seg.id, false);
         if let Err(e) = seg.file.write_at(&bytes, at) {
             self.fail(FaultOp::Write, &path, &e);
+            return Some(Self::unknown(&calls));
+        }
+        if self.halted() {
             return Some(Self::unknown(&calls));
         }
         self.last_sync_start = Some(now);
@@ -1198,6 +1221,9 @@ impl LogWriter {
             ..self.mark_slot
         };
         let mp = self.mark_path.clone();
+        if self.halted() {
+            return Some(Self::unknown(&calls));
+        }
         if let Err(e) = self
             .mark
             .write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64)
@@ -1243,10 +1269,11 @@ impl LogWriter {
     }
 
     fn unknown(calls: &[Call]) -> Vec<Done> {
-        calls
-            .iter()
-            .map(|c| (c.id, Err(CommitError::OutcomeUnknown)))
-            .collect()
+        Self::finished(calls, CommitError::OutcomeUnknown)
+    }
+
+    fn finished(calls: &[Call], e: CommitError) -> Vec<Done> {
+        calls.iter().map(|c| (c.id, Err(e.clone()))).collect()
     }
 
     /// Clean shutdown: syncs the mark if it moved since its last sync. Nothing is written after a fault. Seal jobs

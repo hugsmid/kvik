@@ -510,7 +510,26 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
     r
 }
 
+/// If `kvik-maint` panics: the store turns read-only and the writer is woken, so that it stops writing and its
+/// shutdown does not wait for a seal that will never finish.
+struct MaintGuard<'a>(&'a Shared);
+
+impl Drop for MaintGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.halt.set(Fault {
+                op: FaultOp::Panic,
+                path: Default::default(),
+                kind: io::ErrorKind::Other,
+                message: "the maintenance thread panicked".into(),
+            });
+            self.0.wake_writer();
+        }
+    }
+}
+
 fn maint_loop(s: &Shared) {
+    let _guard = MaintGuard(s);
     loop {
         let mut m = lock(&s.maint);
         while m.request.is_none() && m.jobs.is_empty() && !m.stop {
