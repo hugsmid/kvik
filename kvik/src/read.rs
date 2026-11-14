@@ -227,15 +227,17 @@ pub struct Bucket {
     pub count: u64,
     /// Smallest reading starting in the bucket, for a numeric series; `None`
     /// when no reading starts in it.
-    pub min: Option<f64>,
+    pub min: Option<Value>,
     /// Largest reading starting in the bucket, for a numeric series; `None`
     /// when no reading starts in it.
-    pub max: Option<f64>,
+    pub max: Option<Value>,
     /// Time-weighted mean of a gauge, which a value carried in from before
     /// the bucket can give with no reading in it.
     pub mean: Option<f64>,
     /// Time with a valid value.
     pub coverage: Duration,
+    /// Flags.
+    pub flags: ResultFlags,
 }
 
 /// The result of a chart query.

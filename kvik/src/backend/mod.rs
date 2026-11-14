@@ -1542,12 +1542,23 @@ impl Slot {
                 from: ts(lo),
                 to: ts(hi),
                 count: node.count,
-                min: readings.then(|| num(km::summary::Aggregate::Min)).flatten(),
-                max: readings.then(|| num(km::summary::Aggregate::Max)).flatten(),
+                min: readings
+                    .then(|| num(km::summary::Aggregate::Min))
+                    .flatten()
+                    .map(Value::F64),
+                max: readings
+                    .then(|| num(km::summary::Aggregate::Max))
+                    .flatten()
+                    .map(Value::F64),
                 mean: matches!(spec.kind, Kind::Gauge { .. })
                     .then(|| num(km::summary::Aggregate::Avg))
                     .flatten(),
                 coverage: dur(node.coverage),
+                flags: ResultFlags {
+                    restoring: self.model.restoring(),
+                    apportioned: node.apportioned(),
+                    ..ResultFlags::default()
+                },
             });
             t += step;
         }

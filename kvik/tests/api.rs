@@ -348,10 +348,11 @@ fn forecast_series_carry_values_into_windows() {
     {
         ChartData::Buckets { buckets, .. } => {
             assert_eq!(buckets.len(), 4);
-            assert_eq!((buckets[0].min, buckets[0].max), (Some(12.0), Some(12.0)));
+            assert_eq!(buckets[0].min, Some(Value::F64(12.0)));
+            assert_eq!(buckets[0].max, Some(Value::F64(12.0)));
             for b in &buckets[1..] {
                 assert_eq!(b.count, 0);
-                assert_eq!((b.min, b.max), (None, None));
+                assert_eq!((&b.min, &b.max), (&None, &None));
                 assert_eq!(b.mean, Some(12.0));
                 assert_eq!(b.coverage, Duration::from_secs(900));
             }
@@ -772,7 +773,7 @@ fn interval_series_and_calendar_results() {
             assert_eq!(step, Duration::from_secs(900));
             assert_eq!(buckets.len(), 4);
             assert_eq!(buckets[0].count, 11);
-            assert_eq!(buckets[0].max, Some(20.0));
+            assert_eq!(buckets[0].max, Some(Value::F64(20.0)));
         }
         other => panic!("{other:?}"),
     }

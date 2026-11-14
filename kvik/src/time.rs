@@ -249,6 +249,26 @@ mod jiff_conversions {
             LocalDate::new(d.year(), d.month().unsigned_abs(), d.day().unsigned_abs())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn round_trips() {
+            let t: Timestamp = "2026-01-05T12:00:00Z".parse().unwrap();
+            let j: jiff::Timestamp = t.into();
+            assert_eq!(Timestamp::try_from(j).unwrap(), t);
+            assert_eq!(
+                Span::try_from(jiff::SignedDuration::from_secs(-5)).unwrap(),
+                Span::from_secs(-5)
+            );
+            assert_eq!(
+                LocalDate::from(jiff::civil::date(2026, 3, 2)),
+                LocalDate::new(2026, 3, 2)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
