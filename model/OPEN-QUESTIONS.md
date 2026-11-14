@@ -123,7 +123,9 @@ revised-key index, which the deep tier does not list.
 **Model.** Downloads arrive one file per step (`Model::restore_step`) and do not fail, except that (a) a file holding
 a position whose content differs from the local copy is not installed: the restore stays in progress and the step
 fails again (`q39_conflicting_file_leaves_restore_in_progress`). (b) The record precedes every download, so a restore
-that stops before it has nothing local (`q39_nothing_local_before_the_record`). (c) The store is `restoring` until
+that stops before it has nothing local (`q39_nothing_local_before_the_record`); a retry after such a stop that fails during step 1 leaves the engine down with
+fatal health, keeps its claim and stays pending, so the next restart claims the next generation, although its record
+was written (`q39_failed_restart_of_a_restore_is_reported`). (c) The store is `restoring` until
 every file the restore reads is local; the label goes earlier, once every span the checkpoint covers is verified
 (`q39_restoring_ends_when_every_file_is_local`). (d) The revised-key index counts as back once every current chunk is
 local, and is taken from the restored facts (`q39_revised_key_index_back_with_current_chunks`). While `restoring`, a

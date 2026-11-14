@@ -2840,7 +2840,12 @@ impl Model {
                 self.signals = fresh.signals;
                 self.sessions = fresh.sessions;
             }
-            Err(e) => self.disk.restore_failed = Some(e),
+            Err(e) => {
+                // A claim is a marker in the bucket (§8 Generations): it
+                // stays even when the restore that made it fails.
+                self.disk.bucket.claims = bucket.claims;
+                self.disk.restore_failed = Some(e);
+            }
         }
     }
 

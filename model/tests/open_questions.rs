@@ -220,6 +220,7 @@ fn q39_failed_restart_of_a_restore_is_reported() {
         0,
     )
     .unwrap();
+    let claimed_before = before.disk.bucket.claims.len();
     for r in [&mut before, &mut after] {
         r.restart();
         assert!(!r.is_up());
@@ -228,4 +229,7 @@ fn q39_failed_restart_of_a_restore_is_reported() {
         assert_eq!(h.level, Level::Fatal);
         assert!(h.reasons.contains(&Reason::RestoreFailed));
     }
+    // The failed retry's claim persists, so another retry takes the next
+    // generation (§8 Generations).
+    assert_eq!(before.disk.bucket.claims.len(), claimed_before + 1);
 }
