@@ -71,12 +71,15 @@ and counted. The old id stays reachable by id.
   is tested (live state §2.3, future facts §4, live staleness §5.4, cadence §6); a scheduled or forecast interval
   reading takes effect at `t`. Delivery flags are separate (§4).
 - **Lateness reference** (observed series): the greatest `t` among the series' recorded facts of lower position that
-  are not flagged `future`, whatever their quality or rank, earlier facts of the same batch included; none until there
-  is such a fact. Only the first clause of `late` uses it. A fact flagged `future` never raises it, neither at commit
-  nor when its time comes, the flag being immutable, and is never `late` by the first clause. It is not the series'
-  **latest recorded `t`**, the greatest `t` over all its recorded facts, which the duplicate fast path (§2.4), Restore
-  step 2 (§8) and per-series statistics keep using. Both are functions of the log (positions set aside, §8 Restore,
-  and lost ranges, §3, excepted).
+  are flagged neither `future` nor `unsynced_clock` (§2.5), whatever their quality or rank, earlier facts of the same
+  batch included; none until there is such a fact. Only the first clause of `late` uses it. A fact flagged `future` or
+  `unsynced_clock` never raises it, neither at commit nor when its time comes, the flags being immutable, so a device
+  clock far ahead at boot does not raise it either; a fact flagged `future` is never `late` by the first clause. A
+  reading up to 60 s ahead is not `future` and does raise it, so on-time readings in the next 60 s − 2 × S of event
+  time can be flagged `late` (none when S ≥ 30 s), an accepted limit. It is not the series' **latest recorded `t`**,
+  the greatest `t` over all its recorded facts, which the duplicate fast path (§2.4), Restore step 2 (§8) and
+  per-series statistics keep using. Both are functions of the log (positions set aside, §8 Restore, and lost ranges,
+  §3, excepted).
 
 ### 2.3 Views
 | View | Definition |
@@ -205,7 +208,7 @@ a different boot. The rules apply in this order:
   over its facts (§5.7).
 - Memory holds only open nodes per series, a node cache, and a **recent window** of raw facts per series
   (default 15 minutes, at most 1 024 facts, and for an interval series at least its interval length, for a calendar
-  length its current interval) for the newest
+  length at least its latest two intervals) for the newest
   window edge and the duplicate fast path.
 - Tree files record the position up to which they are complete (the **checkpoint**, written at most every 60 s and
   on clean shutdown). On start the engine loads them and replays log entries after the checkpoint. Tree files are
@@ -254,18 +257,18 @@ of a current reading that is neither bad quality nor displaced (below). Coverage
 time-weighted results exclude the gap. Every windowed result carries coverage in seconds and as a fraction of the
 window. Live staleness applies only to live state and stale-for conditions.
 
-**Displaced readings.** After a tzdata change, a recorded reading of a calendar-length series whose `t` is no longer an
-interval start is **displaced**. It is kept (current, as-of and history views show it), and is ignored by live state,
-staleness and every window, as a bad-quality fact is (§2.5). A window result whose span contains the `t` of a
-displaced current reading is flagged `displaced`; health counts displaced current readings found in local detail per
-series (`interval_displaced`), recounted at each tzdata change. Flag and count stay while the rules displace the
+**Displaced readings.** After a tzdata change, a recorded reading of a calendar-length series whose `t` is no longer
+an interval start is **displaced**. It is kept (current, as-of and history views show it), and is ignored by live
+state, staleness and every window, as a bad-quality fact is (§2.5). A window result whose span contains the `t` of a
+displaced current reading is flagged `displaced`; a per-series statistic, `interval_displaced`, counts the readings
+found displaced, monotone and best effort like the other statistics (§11). The flag stays while the rules displace the
 reading, also after the source has repaired its interval; a window inside the affected interval that does not contain
-the old `t` shows the missing amount only as missing coverage. A reading whose `t` is still a start keeps its place and
-its end follows the version in force. Displacement is a function of `t`, the interval zone, the day start and the
+the old `t` shows the missing amount only as missing coverage. A reading whose `t` is still a start keeps its place
+and its end follows the version in force. Displacement is a function of `t`, the interval zone, the day start and the
 tzdata version in force, so a later release can undo it. The source repairs by sending the amount at the new start,
-which is a new key; nothing needs withdrawing. A replay or revision at the displaced `t` is refused off its phase (row
-40). A tzdata change invalidates cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there being
-no stored node.
+which is a new key; nothing needs withdrawing. An identical replay at the displaced `t` is a duplicate and is dropped
+(§2.4); any other reading there, a revision included, is refused off its phase (row 40). A tzdata change invalidates
+cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there being no stored node.
 
 ### 5.5 Counters
 - Counter values are non-negative; a negative value is recorded as bad quality with no value (§2.5).
@@ -310,12 +313,13 @@ no stored node.
   inside it, the facts at its edges and, where no level is stored, its facts.
 - The interval zone and day start of a calendar-length interval series (§2.1) define only its readings' intervals.
   Calendar windows and results on it are taken in the site zone, or in a zone the window names, as for any series, and
-  their days start at local midnight, never at a day start. Where every edge falls on an interval start (a day or month
-  of a `day` series whose day start is 00:00, or a month of a `month` series, taken in the interval zone) the result is
-  a sum of whole intervals, exact for a decimal scale and not flagged; anywhere else (another zone, a UTC span, a day of
-  a `month` series, any day or month of a `day` series with another day start, so a site-zone day against a day from
-  05:00) an edge lies inside an interval and the result is apportioned (§6). No zones are compared: `apportioned`
-  follows from the edges alone. The amount of one whole interval is its reading.
+  their days start at local midnight, never at a day start. Where every edge falls on an interval start the result is
+  a sum of whole intervals, exact for a decimal scale and not flagged: so for a day or month of a `day` series whose
+  day start is 00:00, or a month of a `month` series, taken in the interval zone, and for any other span whose edges
+  happen to fall on starts (a UTC day on a Europe/London `day` series in January). Elsewhere (another zone, a UTC
+  span, a day of a `month` series, a day or month of a `day` series with another day start, so a site-zone day against
+  a day from 05:00) an edge may lie inside an interval, and where one does the result is apportioned (§6). No zones
+  are compared: `apportioned` follows from the edges alone. The amount of one whole interval is its reading.
 
 ## 6. Windowed operators
 | Rule | |
@@ -512,11 +516,11 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 37b | Forecast source falls silent | No live staleness; reported by stale-for on the adapter's companion series, and later by shrinking lookahead coverage | integration |
 | 38 | Window over tomorrow on a scheduled or forecast series | Credited up to the window end; coverage shows where the values run out | property |
 | 39 | Window ending after `now` on an observed series | Nothing credited past `now` | property |
-| 40 | Interval reading off its phase; on a calendar-length series, not at an interval start in the interval zone (a day start, or the start of a month), including an irregular period or a day starting at another hour than its day start | Refused and counted | unit |
+| 40 | Interval reading off its phase; on a calendar-length series, not at an interval start in the interval zone (a day start, or the start of a month), including an irregular period or a day starting at another hour than its day start | Refused and counted; an identical replay of a reading already recorded at that `t` (now displaced, row 45) is dropped as a duplicate first (§2.4) | unit |
 | 41 | Window edge inside an interval | That interval's amount credited pro rata by time; result flagged `apportioned` | property |
 | 42 | Interval missing | A gap in coverage; nothing held across it | property |
-| 43 | Daily amount on a clock-change day (`day`, 23 or 25 h), with a day start of 00:00 or another (05:00) | Accepted at the day start; its interval runs to the next day start, a day start in the gap or the repeated hour placed as §2.1 says; with a day start of 00:00, day and month results in the interval zone are exact and unflagged; rate uses the true length | property |
-| 44 | Window edge inside an interval of a calendar-length series (a UTC day, another zone, a day of a `month` series, any calendar day or month of a `day` series whose day start is not 00:00) | Credited pro rata by the reading's exact length; `apportioned` | property |
+| 43 | Daily amount on a clock-change day (`day`, 23 or 25 h), with a day start of 00:00 or another (05:00) | Accepted at the day start; its interval runs to the next day start, a day start in the gap or the repeated hour placed as §2.1 says (a day start of 01:30 in Europe/London on 29 March 2026 falls in the gap and is placed at its end, 01:00Z; a reading labelled 01:30Z is refused, row 40); with a day start of 00:00, day and month results in the interval zone are exact and unflagged; rate uses the true length | property |
+| 44 | Window edge inside an interval of a calendar-length series (possible for a UTC day, another zone, a day of a `month` series, a calendar day or month of a `day` series whose day start is not 00:00) | Credited pro rata by the reading's exact length; `apportioned`. A window whose edges fall on starts is not flagged, whatever its zone (a UTC day on a Europe/London `day` series in January) | property |
 | 45 | tzdata change moves a boundary of a calendar-length series | Readings still on a start keep their place, their end following the new rules; a reading no longer on one is displaced: kept in views, ignored by live state and windows, result flagged `displaced`, counted; re-sent at the new start it is a new key | model |
 | 46 | Host tzdata older than the source's rules | Reading at the true start refused off phase and counted until tzdata is updated; the replay is then recorded | integration |
 
@@ -567,9 +571,9 @@ A disaster loses facts in files not backed up, which may already have been acted
     are pairwise disjoint, each running from one interval start to the next under the tzdata version in force; no
     displaced reading contributes to live state or to any window result.
 24. On an observed series, a fact committed with a synchronised clock is `late` by the first clause if and only if it
-    is not flagged `future` and a fact of its series with a lower position, not flagged `future`, has a `t` greater
-    than its own by more than 2 × S; no fact flagged `future` changes the `late` flag of any other fact (positions set
-    aside and lost ranges excepted).
+    is not flagged `future` and a fact of its series with a lower position, flagged neither `future` nor
+    `unsynced_clock`, has a `t` greater than its own by more than 2 × S; no fact flagged `future` or `unsynced_clock`
+    changes the `late` flag of any other fact (positions set aside and lost ranges excepted).
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |

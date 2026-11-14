@@ -129,8 +129,8 @@ let h: Health = store.health();     // Ok, Degraded { reasons }, ReadOnly { caus
 let s: Stats = store.stats();       // per series and per consumer counters, commit latency, queue depths,
                                     // time behind, disk marks, backup lag
 ```
-Every refusal, drop, repeat and delay the specification says is counted appears here, including the displaced
-readings of each calendar-length interval series (`interval_displaced`, spec §5.4). Health reasons include
+Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
+calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4). Health reasons include
 `restore_failed` (naming the file) and the set-aside range of each restore record; statistics include restore
 progress (files and bytes remaining), which is not a health condition (spec §8 Restore).
 

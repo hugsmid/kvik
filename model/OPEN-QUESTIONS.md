@@ -12,7 +12,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-34 (c) | §11 Health, §3 Recovery | Whether loss reports survive a restart, and whether they are latched until acknowledged |
 | Q-39 (e) | §8 Restore (Failures and end), §8 No deletion, §8 Corrupt block | What ends a restore when the bucket has lost or corrupted a listed object (for the owner) |
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
-| Q-44 (b)–(d) | §2.1 timing, §2.3 Views, §2.4, §11 | Withdrawn and far-future values on scheduled and forecast series; forecast accuracy ((d) for the owner) |
+| Q-44 (b)–(d) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series; forecast accuracy ((d) for the owner) |
 | Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
 | Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
 | Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
@@ -32,6 +32,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-77 | §5.7, §2.1 interval starts, row 20 | A day whose midnight occurs twice |
 | Q-78 | §4 Routing, Concurrency, row 33 | How routing compilation knows the series a consumer emits |
 | Q-79 | §3 Recovery rules 2 and 4, §11 Health, row 11a | A lost range found by a recovery whose sync fails |
+| Q-80 | §2.1 `interval zone`, §5.4 displaced readings, §5.7, §8 Restore | An interval zone that the tzdata version in force does not know, or that has become a link |
+| Q-81 | §6 Aggregates (interval series), §5.7 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -176,7 +178,10 @@ full coverage; "coverage ends where the remaining values' validity ends" holds o
 series that is not versioned, a later unchecked replay of the withdrawn value (§12 D5) can revert the withdrawal,
 which is the hazard §2.4 gives for declaring a series versioned. (c) Neither a revision nor a withdrawal lowers the
 latest recorded `t`, so a wrong value for 2099 disables the duplicate fast path (§2.4) for good, makes every fact
-during §8 Restore step 2 `duplicates_unchecked`, and keeps the latest-`t` statistic wrong.
+during §8 Restore step 2 `duplicates_unchecked`, and keeps the latest-`t` statistic wrong. The same holds on an
+observed series: since Q-74 the lateness reference leaves out a `future` fact, but the latest recorded `t` still
+includes it, so a device glitch to 2099 disables the fast path for good and makes Restore step 2 count every fact of
+the series `duplicates_unchecked`.
 **Proposal for (d) (for the owner).** Not served by the engine in v1. History carries every issue with its
 `changed_at`, so a reader can compute "known as of issue X" (per key, the fact of highest rank with
 `changed_at ≤ X`) from `View::History` and compare it with the outcome series. A view by `changed_at`, or
@@ -549,6 +554,34 @@ sealed segment with no other copy while the engine is read-only or stopped does 
 **Proposal.** §3 Recovery rule 4: "If that sync fails, the engine stays read-only, leaves the old mark and writes
 nothing; lost ranges it found are reported in health as found, and recorded by the next recovery."
 
+## Q-80 — An interval zone that the tzdata version in force does not know, or that has become a link
+**Scenario.** §2.1 refuses a definition naming a zone the tzdata version in force does not know, and compares interval
+zones by canonical name after resolving links. It does not say what happens to an existing calendar-length series when
+that stops holding: a restore onto a host whose tzdata predates the release that added the zone; a release that drops
+the name; or a release that turns the zone into a link to one with different old rules (2022b made Europe/Amsterdam a
+link to Europe/Brussels, whose rules before 1970 differ). Its interval starts, the phase check, displacement (§5.4)
+and every window on it are then undefined, or silently follow other rules.
+**Model.** Not modelled: the model has no calendar-length series.
+**Needed.** What an existing calendar-length series does when its interval zone is unknown to the version in force, or
+resolves to a zone with other rules.
+**Proposal.** Unknown zone: readings are refused off phase and counted, window results are the error
+`interval_zone_unknown`, and health is degraded naming the series and zone, until a version that knows it is in force;
+nothing is displaced. A link: resolved by the version in force like any tzdata change, so starts follow the target's
+rules and readings no longer on a start are displaced (§5.4); the definition keeps the name as given.
+
+## Q-81 — Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone
+**Scenario.** §6 takes count, min, max and last on an interval series over readings whose `t` lies in the window,
+while sum apportions. A `month` series with interval zone Europe/Oslo, queried for March 2026 in Europe/London: the
+window is 1 March 00:00Z to 31 March 23:00Z. Oslo's March reading has `t` = 28 February 23:00Z, outside it; Oslo's
+April reading has `t` = 31 March 22:00Z, inside it. So count is 1 and min, max and last are April's amount, while sum
+is March's amount × 742/743 plus April's × 1/720, flagged `apportioned`.
+**Model.** Not modelled: the model has no calendar-length series.
+**Needed.** Which readings count, min, max and last take on an interval series when an edge cuts an interval: those
+whose `t` lies in the window, those whose whole interval does, or those that overlap it, and whether the result is
+flagged.
+**Proposal.** Readings whose whole interval lies in the window; where an edge cuts an interval, the result is flagged
+`apportioned` as sum is. For fixed-length series this changes only windows whose edges cut an interval.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -639,11 +672,13 @@ The specification wins where the documents differ. These follow from it, for the
   zone as a UTF-8 string, as given at definition; day start as a local clock time in `i64` nanoseconds (05:00 is 5 h
   whatever the offset does before it; 0 ≤ day start < 24 h), tag 1 only. None of them may appear in a parameter-change
   entry. No change to fact columns or flags: a reading carries no length, and `displaced` is derived, not a fact flag.
-  A.8's reach of a reading on a calendar-length series is its interval under the tzdata version in force. The tree
-  checkpoint (layout not yet in `format.md`, F-7) carries per series the lateness reference (`i64`, absent when none)
-  beside the latest recorded `t`. `api.md` still needs: a change of interval length, zone or day start is an error
-  like a change of unit; a day start on a fixed or `month` length, or a zone the tzdata version in force does not
-  know, is refused at definition; exports and `live()` carry the interval end.
+  A.8's `min_t` and `max_t` must not depend on tzdata: a sealed segment bounds a calendar-length reading's reach by a
+  fixed upper bound on its length, 50 h for `day` and 33 days for `month` (a date-line change can repeat a date:
+  America/Sitka, 1867, has a local day of about 48 h). The tree checkpoint (layout not yet in `format.md`, F-7)
+  carries per series the lateness reference (`i64`, absent when none) beside the latest recorded `t`. `api.md` still
+  needs: a change of interval length, zone or day start is an error like a change of unit; a day start on a fixed or
+  `month` length, or a zone the tzdata version in force does not know, is refused at definition; exports and `live()`
+  carry the interval end.
 
 ## Settled
 | ID | Question | Settled in |
@@ -690,10 +725,10 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (calendar lengths: Q-45) |
 | Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
 | Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b)–(d)) |
-| Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (open parts: Q-76 and Q-77 decide only which tzdata version is in force and where a repeated day start lies) |
+| Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (open parts: Q-76 and Q-77 decide only which tzdata version is in force and where a repeated day start lies; Q-80, an interval zone unknown or become a link; Q-81, count, min, max and last when an edge cuts an interval) |
 | Q-49 | What a series with no stored level serves during a restore, part (a): queries | §8 Restore step 2 and §6 Old spans (window edges move to where detail is local, the error `detail_not_local` only when no span is left, never an empty result; reads of facts fetch on demand; no priority download), row 28 (open part: Q-49 (b)) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
-| Q-74 | One reading far ahead makes later on-time readings `late` | §2.2 `late` and the lateness reference (facts not flagged `future`; the latest recorded `t`, over all facts, stays for the §2.4 fast path, §8 Restore step 2 and statistics), §2.4 Fast path, §4 Future facts, §8 Deep, Continuous backup and Restore step 1 (each tree checkpoint carries both), invariant 24, rows 4 and 4a, `api.md` `SeriesInfo` |
+| Q-74 | One reading far ahead makes later on-time readings `late` | §2.2 `late` and the lateness reference (facts flagged neither `future` nor `unsynced_clock`; a reading up to 60 s ahead still raises it, an accepted limit; the latest recorded `t`, over all facts, stays for the §2.4 fast path, §8 Restore step 2 and statistics), §2.4 Fast path, §4 Future facts, §8 Deep, Continuous backup and Restore step 1 (each tree checkpoint carries both), invariant 24, rows 4 and 4a, `api.md` `SeriesInfo` (open part: Q-44 (c), far-future facts and the latest recorded `t`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
