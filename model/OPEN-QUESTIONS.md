@@ -436,6 +436,36 @@ is over the limit although the call is within its own.
 consecutive entries share one entries block up to a body of 16 MiB (Q-106 (e)), a split that the 8 MiB batch limit
 means is never reached; whichever option is chosen, the entries rule should name the limit that actually applies.
 
+## Q-115 — The commit path: points `spec.md` §3 and `format.md` A.4, A.10, A.12 and A.13 leave open
+Found while building the log writer (roadmap 4.4, crate `kvik-log`: `store`, `writer`, `fs`). Each part names the
+reading implemented for now; tests in `log/tests/writer.rs` pin it.
+**Scenario.** (a) *Closing a batch.* A.4 closes a batch "when the next call would take its data blocks past
+`max_batch_bytes`", but consecutive calls share blocks, so a batch's data blocks are only known once it is encoded.
+(b) *The seal clock.* "At 64 MiB or 5 minutes" does not say from when the 5 minutes run. (c) *The first mark.* The
+first start of a new store creates the mark before any segment is in use; its `file_id`, `offset` and
+`last_sequence` are not given. (d) *Retrying a creation.* After a creation fails for lack of space it is "retried when
+a free-space check passes", but no threshold is named. (e) *The low mark.* "5 % of the filesystem" needs the file
+system's size, which the `Fs` seam (`api.md`, accepted at gate 3.3) does not give; and on a platform with no
+free-space source (Windows, A.13) neither mark can be judged. (f) *The segment index's reach.* A.8's `max_t` for an
+interval series needs the series' interval length, which the writer knows only for definitions it committed itself;
+the registry (roadmap 5.1) holds the rest. (g) *The first manifest record.* A.12 creates `MANIFEST` with one empty
+record; A.14 does not say which epoch the first record takes. (h) *Failures while creating ahead.* Only lack of space
+is named; a failed sync or another write error during creation is not. (i) *The receive time.* A batch's blocks
+carry one `received_at`; whether it may differ from the commit time, and what either is when the wall clock steps
+back, is not said. (j) *Windows name durability.* A.13 assigns to roadmap 4.4 the check that a name made durable by
+flushing the file survives a power loss on Windows; it needs a Windows machine and power-loss trials.
+**Implemented.** (a) A call's own data-block bytes are measured when it is made; a batch takes whole calls while
+their sum stays within `max_batch_bytes`, at least one call. (b) From the moment the segment is taken into use. (c)
+Slot 0, counter 1, `file_id` 0, `offset` 0, `last_sequence` 0, `max_series_id` 0 and the current boot id; nothing is
+read below it. (d) Free space at least `disk_critical` + `segment_size`, checked every second; an unknown free space
+passes. (e) The low mark uses the byte floor alone (`disk_low_bytes`); an unknown free space applies neither mark, so
+ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other series
+takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (g) Epoch 1. (h) A write or sync failure
+on the log: read-only. (i) Both are the wall clock at commit, raised to the previous batch's commit time if it went
+back. (j) Not done; nothing in the writer depends on it.
+**Needed.** A rule for each part; for (e), whether the seam gains the file system's size; for (j), where the check is
+done. To be settled at gate 4.9.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled

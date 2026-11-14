@@ -10,6 +10,33 @@
 //!
 //! One batch is one sync: calls queued while a sync is in flight form the next batch. The writer writes a batch only
 //! after the previous batch's sync has returned and the mark has moved (`spec.md` §3 Recovery rule 1).
+//!
+//! ```
+//! use std::path::Path;
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//! use kvik_log::content::Item;
+//! use kvik_log::entries::Entry;
+//! use kvik_log::fs::MemFs;
+//! use kvik_log::store::{NewStore, StoreDir};
+//! use kvik_log::writer::{Log, LogWriter, SystemClock, WriterConfig};
+//!
+//! let new = NewStore {
+//!     store_id: [1; 16],
+//!     created_at: 0,
+//!     site_zone: "Etc/UTC".into(),
+//!     tzdata: "2026a".into(),
+//!     software: "example".into(),
+//! };
+//! let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("store"), Some(&new)).unwrap();
+//! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO).unwrap();
+//! let log = Log::start(writer, Arc::new(SystemClock::default())).unwrap();
+//! let alias = Item::Entry(Entry::Alias { id: 1, name: "hall".into() });
+//! // Acknowledged after the batch's sync and, as it holds an entry that is not a fact, the mark's sync.
+//! let ack = log.submit(vec![alias]).unwrap().wait().unwrap();
+//! assert_eq!(ack.first.sequence, 1);
+//! log.shutdown().unwrap();
+//! ```
 
 mod maint;
 mod queue;
@@ -74,7 +101,8 @@ pub struct WriterConfig {
     pub mark_sync: MarkSync,
     /// `limits.ingest_queue`: at least 1,024 entries.
     pub ingest_queue: usize,
-    /// `limits.disk_low`, its fraction, in per cent of the file system.
+    /// `limits.disk_low`, its fraction, in per cent of the file system. Not applied yet: the file-system seam gives
+    /// no size (Q-115 (e)).
     pub disk_low_percent: u8,
     /// `limits.disk_low`, its bytes.
     pub disk_low_bytes: u64,
