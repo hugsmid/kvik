@@ -145,7 +145,7 @@ fn build(p: &Plan) -> (Vec<u8>, Vec<Expected>) {
         let offset = s.append(b, *t).unwrap();
         let (first, last) = b.sequences().unwrap();
         let bytes = b.encode(&p.id, offset, *t).unwrap();
-        let blocks = read_back(&p.id, offset, &bytes);
+        let blocks = read_back(&bytes);
         expected.push(Expected {
             offset,
             end: offset + bytes.len() as u64,
@@ -172,7 +172,7 @@ fn build(p: &Plan) -> (Vec<u8>, Vec<Expected>) {
 }
 
 /// The blocks `(type, flags, body)` of the encoded batch `bytes`, split by hand from the block headers.
-fn read_back(_id: &SegmentIdentity, _offset: u64, bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
+fn read_back(bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while bytes[at] != block_type::COMMIT {
