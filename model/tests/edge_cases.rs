@@ -1941,7 +1941,10 @@ fn row_31_nan_or_infinite_recorded_as_bad_without_value() {
 }
 
 /// Row 22a: "Host clock not yet synchronised at boot: `unsynced_clock`;
-/// host-stamped facts wait."
+/// host-stamped facts wait." The wait pins the model's abstraction (see the
+/// table in `OPEN-QUESTIONS.md`): the emit returns back-pressure and the
+/// adapter emits the reading again, rather than the reading waiting in the
+/// ingest queue.
 #[test]
 fn row_22a_host_clock_not_yet_synchronised() {
     let (mut m, s) = model();

@@ -300,6 +300,30 @@ impl Runner {
         Vec::new()
     }
 
+    /// Stale for, on a scheduled series (§5.4, §4 Timers): the series is
+    /// stale when `now` is later than its live-state fact's `t` by more than
+    /// S, or when it has none, and commits do not refresh it. `since_effect`
+    /// is `now − t` of the live-state fact, `None` without one; the condition
+    /// is true once that reaches `staleness + n`, as for an observed series.
+    /// It follows `now`, so a forward correction of the system clock can
+    /// bring it forward.
+    pub fn on_scheduled(&mut self, since_effect: Option<Nanos>) -> Vec<Event> {
+        if let (Condition::StaleFor { staleness, n }, State::StaleFor { fired, .. }) =
+            (&self.cond, &mut self.state)
+        {
+            let stale = since_effect.is_none_or(|x| x >= staleness + n);
+            if stale && !*fired {
+                *fired = true;
+                return vec![Event::Fired];
+            }
+            if !stale && *fired {
+                *fired = false;
+                return vec![Event::Cleared];
+            }
+        }
+        Vec::new()
+    }
+
     /// Advances timers to monotonic time `mono`.
     pub fn on_tick(&mut self, mono: Nanos) -> Vec<Event> {
         match (&self.cond, &mut self.state) {

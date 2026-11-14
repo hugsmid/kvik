@@ -28,6 +28,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
 | Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
 | Q-73 | §2.6, §2.1 `record on change`, row 17a, §1.5 | Who leaves out the unchanged readings of a record-on-change series |
+| Q-74 | §2.2 `late`, §4 Future facts, row 4 | One reading far ahead makes later on-time readings `late` |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -465,13 +466,35 @@ series (§2.1) and its expected interval being the keep-alive interval.
 and sets S (§2.1); row 17a is shown with an adapter that emits only changes and keep-alive facts
 (`q73_record_on_change_series_records_every_reading`, `tests/edge_cases.rs` `row_17a_…`).
 **Needed.** Who filters, and, if the engine does, rules (a)–(d).
-**Proposal.** The adapter filters, and the engine records what it is given, so that every recorded fact is one the
-source meant (principle 1) and no reading is dropped silently; record on change in the definition states the
-source's contract and that its expected interval is the keep-alive interval. If the engine is to filter instead:
+**Argument that the text already decides it.** §2.4 identity includes `t`: "the same value one nanosecond later is a
+different fact and is recorded", with no exception for record-on-change series; principle 5 requires anything
+refused or repeated to be counted, and §11 lists no counter for readings left out as unchanged; so an engine that
+dropped unchanged polls would break §2.4 and principle 5 as written. Only a spec change can make it so; until then
+the field only fixes the expected interval as the keep-alive interval (and is refused on an interval series).
+**Proposal.** The adapter filters unchanged readings; the engine records every reading. §2.6 would gain: "The
+adapter leaves out unchanged readings between keep-alive facts; the engine records every reading it is given
+(§2.4)." Open until the specification says so.
+**Alternative, if the engine is to filter instead:**
 compare with the current fact at the series' latest recorded `t` by the duplicate rule's identity (value, compared
 bitwise, and supplied quality, §2.4); record a reading whose `t` is not after that `t`, or that carries `revise`,
 unfiltered; record an unchanged reading once its `t` is at least the expected interval after the latest recorded
 `t`; and count each dropped reading per series (`unchanged_dropped`).
+
+## Q-74 — One reading far ahead makes later on-time readings `late`
+**Scenario.** An observed gauge with S = 10 s reports every second. Once, its device clock glitches a day ahead: a
+reading with `t` = now + 1 day is recorded, flagged `future` and lowered to suspect (§2.2, row 4). The first clause of
+`late` compares a reading with "the series' latest recorded `t`", which is now a day ahead; so every later on-time
+reading, `t` ≈ `received_at`, is more than 2 × S earlier than it and is flagged `late` for a day, although none is
+late. `late` is immutable (§2.2), counted, and row 3's "no retroactive trigger" is about late facts, so consumers and
+health see a day of false lateness from one glitch. A correction of the glitch (a bad-quality reading for its `t`)
+does not lower the latest recorded `t`, as for Q-44 (c).
+**Model.** Follows §2.2 as written: the latest recorded `t` includes the future-flagged reading
+(`q74_one_far_future_reading_makes_later_on_time_readings_late`).
+**Needed.** Whether the first clause should compare with the latest recorded `t` that is not in the future (at most
+`received_at` + 60 s at the reading's commit, or the live-state `t`), or with the latest `t` of facts not flagged
+`future`.
+**Proposal.** Compare with the greatest `t` among recorded facts of the series that were not flagged `future`
+(a function of the log, so rebuild keeps it); a `future` reading neither raises it nor is judged by it.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -633,7 +656,7 @@ nodes in the middle and apportioned edges flagged `apportioned`, sum and rate ov
 increase and time-in-state refused; rows 20a, 40–42, invariants 5, 18 and 22), series timing (§2.1, §2.2, §2.3, §4, §5.4, §6: no `future`, and no `late` by its first clause, on a scheduled or
 forecast series; no live state for a forecast series; the credit limit `now` for an observed series and the window
 end for a scheduled or forecast one, a window wholly after `now` on an observed series being empty; scheduled live
-staleness; a stale-for condition over a forecast series, or any condition over one without a windowed operator,
+staleness, on `now`, and stale-for conditions over a scheduled series that follow it on the timer; a stale-for condition over a forecast series, or any condition over one without a windowed operator,
 refused when routed; rows 36, 37b, 38 and 39, invariants 18, 20 and 21), the density rule (§5.1, §5.7: the 1-minute level stored only for an expected interval of 5 s or shorter, the
 15-minute level and calendar nodes only for 60 s or shorter, other levels answered from facts, also in a tree
 checkpoint and its verification; row 20a for a series without a stored 15-minute level), counters and rate (§5.5, §6: resets, wraps and regressions, each regression
@@ -695,7 +718,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Clock of the eviction age | §8 Eviction at 90 days: no clock named | The engine clock `now`, as for the retention class, from the seal of a log segment, or of a compacted file's oldest input, so a merge does not reset it | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |
 | Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
-| Stale-for conditions on a scheduled series | §5.4: stale when `now` is later than the live-state fact's `t` by more than S, or with no live-state fact; §4 Timers | `Model::scheduled_stale` reports that staleness; a stale-for condition over a scheduled series is refused when routed | `tests/rules.rs` `s4_funnels_over_scheduled_and_forecast_series` |
+| Host-stamped readings before clock synchronisation | §2.5: they wait in the ingest queue (back-pressure) | The emit returns `Wait::UnsyncedClock` and the reading takes no queue capacity; the adapter emits it again later, and the wait is counted per attempt, not measured | `tests/edge_cases.rs` `row_22a_…` |
 | Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64), §5.7 | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly; a calendar day of an interval series is the merge of its stored quarter-hours like any other series (roadmap 1.6) | `tests/invariants.rs` `inv22_…` |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |

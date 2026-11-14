@@ -600,6 +600,12 @@ where
     }
 }
 
+/// Whether a counter step from `a` to `b` is a regression (§5.5, §12 D2): a
+/// decrease without `wrap_at` that is not below `reset_ceiling` × `a`.
+pub fn is_regression(p: &Params, a: f64, b: f64) -> bool {
+    b < a && p.counter.wrap_at.is_none() && b >= p.counter.reset_ceiling * a
+}
+
 /// Aggregates refused for a kind (§6): avg, integral, increase and
 /// time-in-state on an interval series.
 pub fn refused(kind: Kind, agg: &Aggregate) -> bool {

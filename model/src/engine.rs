@@ -733,6 +733,9 @@ pub struct Counters {
     /// Negative counter values recorded as bad quality without a value
     /// (§2.5, §5.5).
     pub negative_counter: u64,
+    /// Counter regressions per series (§5.5, §12 D2), raised at commit by
+    /// each regression step a batch brings into existence; never lowered.
+    pub counter_regressions: BTreeMap<SeriesId, u64>,
     /// Uploads the bucket rejected for a hash mismatch.
     pub uploads_rejected: u64,
     /// Compaction or tiering runs skipped for low disk.
@@ -2661,6 +2664,22 @@ impl Model {
             let run = v.skew_run.entry(f.series).or_insert(0);
             *run = if skewed { *run + 1 } else { 0 };
         }
+        // Counter regressions (§5.5, §12 D2, §11): a monotone count, raised
+        // at commit by each regression step the batch brings into existence;
+        // a later correction does not lower it.
+        let counters: BTreeSet<SeriesId> = touched
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| {
+                v.trees
+                    .get(s)
+                    .is_some_and(|t| t.params.kind == Kind::Counter)
+            })
+            .collect();
+        let before: BTreeMap<SeriesId, Vec<(Nanos, Value)>> = counters
+            .iter()
+            .map(|s| (*s, v.trees[s].readings()))
+            .collect();
         for (s, minute) in touched {
             if let Some(rt) = &v.restore {
                 let stale = rt.checkpoint_minutes.contains(&(s, minute))
@@ -2688,6 +2707,29 @@ impl Model {
             let tree = v.trees.get_mut(&s).expect("tree for defined series");
             tree.update_minute(minute, &rs);
             tree.set_stale(minute, missing);
+        }
+        for (s, old) in before {
+            let tree = &v.trees[&s];
+            let pairs = |rs: &[(Nanos, Value)]| -> Vec<((Nanos, Value), (Nanos, Value))> {
+                rs.windows(2)
+                    .map(|w| (w[0].clone(), w[1].clone()))
+                    .collect()
+            };
+            let old = pairs(&old);
+            let new = pairs(&tree.readings())
+                .into_iter()
+                .filter(|p| !old.contains(p))
+                .filter(|(a, b)| {
+                    crate::summary::is_regression(
+                        &tree.params,
+                        a.1.as_f64().expect("counter value"),
+                        b.1.as_f64().expect("counter value"),
+                    )
+                })
+                .count() as u64;
+            if new > 0 {
+                *self.counters.counter_regressions.entry(s).or_insert(0) += new;
+            }
         }
         Ok(())
     }
@@ -2750,11 +2792,6 @@ impl Model {
                     (Timing::Forecast, _) if op.is_none() => {
                         return Err(Error::BadRoute(
                             "a condition over a forecast series needs a windowed operator",
-                        ));
-                    }
-                    (Timing::Scheduled, Condition::StaleFor { .. }) => {
-                        return Err(Error::BadRoute(
-                            "a stale-for condition on a scheduled series is not modelled",
                         ));
                     }
                     _ => {}
@@ -2913,6 +2950,20 @@ impl Model {
         }
     }
 
+    /// For a stale-for condition over a scheduled series, the time since its
+    /// live-state fact took effect (`now − t`, `None` without one, §5.4);
+    /// `None` for any other condition funnel.
+    fn scheduled_since(&self, f: &Funnel) -> Option<Option<Nanos>> {
+        let s = f.series()?;
+        let v = self.vol.as_ref()?;
+        let scheduled = v
+            .registry
+            .get(s)
+            .is_some_and(|d| d.options.timing == Timing::Scheduled);
+        (scheduled && matches!(f.condition, Some(Condition::StaleFor { .. })))
+            .then(|| self.latest(s).ok().flatten().map(|x| self.now - x.t))
+    }
+
     /// What a resume rebuilds of a condition's past (§6 Restart and resume,
     /// "rebuilt from the tree and recent window as of now"). Held for: how
     /// long the live-state value has been above its level without a break,
@@ -2984,18 +3035,24 @@ impl Model {
                 continue;
             }
             let value = self.funnel_value(&f);
+            let scheduled = self.scheduled_since(&f);
             let mono = self.mono;
             let runner = self.vol.as_mut().expect("up").consumers[i]
                 .runners
                 .get_mut(&id)
                 .expect("runner for condition funnel");
             let mut events = Vec::new();
-            if arrived == Some(true) {
-                events.extend(runner.on_arrival(mono));
-            }
-            events.extend(runner.on_value(mono, value));
-            if batch.is_none() {
-                events.extend(runner.on_tick(mono));
+            if let Some(since) = scheduled {
+                // Commits do not refresh a scheduled series (§5.4).
+                events.extend(runner.on_scheduled(since));
+            } else {
+                if arrived == Some(true) {
+                    events.extend(runner.on_arrival(mono));
+                }
+                events.extend(runner.on_value(mono, value));
+                if batch.is_none() {
+                    events.extend(runner.on_tick(mono));
+                }
             }
             let cause = if batch.is_some() {
                 TriggerCause::Fact
@@ -3143,13 +3200,16 @@ impl Model {
                     .filter(|l| l.incarnation == inc)
                     .map(|l| &l.state);
                 let history = self.resume_history(f, cond);
-                let runner = Runner::resume(
+                let mut runner = Runner::resume(
                     cond.clone(),
                     self.mono,
                     self.funnel_value(f),
                     latch,
                     history,
                 );
+                if let Some(since) = self.scheduled_since(f) {
+                    runner.on_scheduled(since);
+                }
                 let state = runner.state();
                 let transition = cond.is_transition(&state, latch);
                 runners.insert(*id, runner);
@@ -3581,19 +3641,15 @@ impl Model {
         })))
     }
 
-    /// Decreases of a counter counted as regressions over its current view
-    /// (§5.5, §12 D2: each contributes 0 and is counted, `counter_regressions`).
-    pub fn counter_regressions(&self, s: SeriesId) -> Result<u64, Error> {
-        let tree = self.tree(s)?;
-        let rs = tree.readings();
-        let (Some(first), Some(last)) = (rs.first(), rs.last()) else {
-            return Ok(0);
-        };
-        let node = crate::summary::direct(&tree.params, first.0, last.0 + 1, &rs);
-        Ok(match node.body {
-            crate::summary::Body::Counter { regressions, .. } => regressions,
-            _ => 0,
-        })
+    /// Decreases of a counter counted as regressions (§5.5, §12 D2: each
+    /// contributes 0 and is counted, `counter_regressions`, §11): a monotone
+    /// count raised at commit, kept with the other statistics.
+    pub fn counter_regressions(&self, s: SeriesId) -> u64 {
+        self.counters
+            .counter_regressions
+            .get(&s)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Fetches missing detail for a minute and recomputes its path (§5.6).

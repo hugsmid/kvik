@@ -679,3 +679,47 @@ fn q73_record_on_change_series_records_every_reading() {
         .collect();
     assert_eq!(m.ingest(polls).unwrap().positions.len(), 10);
 }
+
+/// Q-74: the first clause of `late` compares with the series' latest
+/// recorded `t`, which a `future`-flagged reading a day ahead raises; every
+/// later on-time reading is then flagged `late`.
+#[test]
+fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let s = m
+        .define(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    let now = m.wall;
+    m.ingest(vec![
+        Reading::num(s, now, 1.0),
+        Reading::num(s, now + kvik_model::types::DAY, 9.0),
+    ])
+    .unwrap();
+    for _ in 0..3 {
+        m.advance(SECOND);
+        let now = m.wall;
+        m.ingest(vec![Reading::num(s, now, 1.0)]).unwrap();
+    }
+    let flags: Vec<(bool, bool)> = m
+        .facts()
+        .unwrap()
+        .iter()
+        .map(|f| (f.flags.future, f.flags.late))
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            (false, false),
+            (true, false),
+            (false, true),
+            (false, true),
+            (false, true)
+        ]
+    );
+}

@@ -636,7 +636,22 @@ fn s6_rate_over_elapsed_time_between_bounding_readings() {
             .collect(),
     )
     .unwrap();
-    assert_eq!(m.counter_regressions(c).unwrap(), 1);
+    assert_eq!(m.counter_regressions(c), 1);
+    // A monotone count (§11): a correction that removes the regression does
+    // not lower it, nor does a restart; a new regression raises it.
+    m.ingest(vec![Reading::num(c, T0 + 2 * MINUTE, 6.0)])
+        .unwrap();
+    let w = m.window(c, T0, T0 + 4 * MINUTE).unwrap();
+    let Body::Counter { regressions, .. } = w.body else {
+        unreachable!()
+    };
+    assert_eq!(regressions, 0, "the current view has none");
+    m.crash();
+    m.restart();
+    assert_eq!(m.counter_regressions(c), 1);
+    m.ingest(vec![Reading::num(c, T0 + 4 * MINUTE, 9.5)])
+        .unwrap();
+    assert_eq!(m.counter_regressions(c), 2);
 }
 
 #[test]
@@ -1862,11 +1877,84 @@ fn last_resync_condition(m: &Model) -> (ConditionState, bool) {
     (c.state, c.transition)
 }
 
+/// §5.4 and §4 Timers, row 36: a scheduled series is stale when `now` is
+/// later than the `t` of its live-state fact by more than S, or when it has
+/// none; commits do not refresh it. A stale-for condition over it follows
+/// that, evaluated on the timer, and `resync` reports it.
+#[test]
+fn s5_4_stale_for_on_a_scheduled_series() {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::Series(BTreeSet::new()),
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let s = m
+        .define_with(
+            "site/tariff-1/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "c/kWh",
+            10 * MINUTE,
+            SeriesOptions::timing(Timing::Scheduled),
+        )
+        .unwrap();
+    let stale = Condition::StaleFor {
+        staleness: 10 * MINUTE,
+        n: 5 * MINUTE,
+    };
+    m.add_route(C, FunnelId(1), Funnel::condition(s, None, stale))
+        .unwrap();
+    let states = |m: &mut Model| -> Vec<ConditionState> {
+        m.drain().unwrap();
+        m.received[&C]
+            .iter()
+            .filter_map(|r| r.delivery.trigger().map(|t| t.state.clone()))
+            .collect()
+    };
+    // No live-state fact: stale.
+    m.tick().unwrap();
+    assert_eq!(states(&mut m), vec![ConditionState::Active(true)]);
+    let now = m.wall;
+    m.ingest(vec![
+        Reading::num(s, now - MINUTE, 1.0),
+        Reading::num(s, now + 30 * MINUTE, 2.0),
+    ])
+    .unwrap();
+    assert_eq!(states(&mut m).len(), 2, "cleared by the value in force");
+    m.advance(13 * MINUTE);
+    m.tick().unwrap();
+    assert_eq!(states(&mut m).len(), 2);
+    m.advance(MINUTE);
+    m.tick().unwrap();
+    assert_eq!(
+        states(&mut m).last(),
+        Some(&ConditionState::Active(true)),
+        "S + n after it took effect"
+    );
+    // A commit does not refresh it, even of a value already in force.
+    let now = m.wall;
+    m.ingest(vec![Reading::num(s, now - 20 * MINUTE, 3.0)])
+        .unwrap();
+    m.tick().unwrap();
+    assert_eq!(states(&mut m).len(), 3);
+    assert_eq!(m.scheduled_stale(s).unwrap(), Some(true));
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(true), false)
+    );
+    // The next value takes effect at its `t`: no longer stale.
+    m.advance(16 * MINUTE);
+    m.tick().unwrap();
+    assert_eq!(states(&mut m).last(), Some(&ConditionState::Active(false)));
+}
+
 /// §4 Future facts and §6 Cadence: a stale-for condition on a forecast
 /// series, and any condition over one without a windowed operator, are
 /// rejected when funnels are compiled; `resync` for a funnel over a forecast
-/// series carries condition state only. A stale-for condition on a scheduled
-/// series is not modelled and refused.
+/// series carries condition state only.
 #[test]
 fn s4_funnels_over_scheduled_and_forecast_series() {
     let consumer = ConsumerDecl {
@@ -1915,7 +2003,6 @@ fn s4_funnels_over_scheduled_and_forecast_series() {
         (f, None, stale.clone()),
         (f, Some(avg.clone()), stale.clone()),
         (f, None, above.clone()),
-        (sched, None, stale),
     ] {
         assert!(matches!(
             m.add_route(C, FunnelId(1), Funnel::condition(s, op, cond)),
