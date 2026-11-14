@@ -172,7 +172,7 @@ tail, and it may follow an invalid region at the tail. Readers use only complete
 The last 16 bytes of a sealed file are `trailer_offset: u64` and the ASCII bytes `KVIKEND` followed by a zero
 byte. A file is sealed only if these are present and the trailer is valid.
 
-## A.10 Durable mark (`log/MARK`, 64 bytes, memory-mapped, synced on the timer, at clean shutdown and by recovery)
+## A.10 Durable mark (`log/MARK`, 64 bytes, memory-mapped, synced on the timer, at once after a batch holding an entry that is not a fact, at clean shutdown and by recovery)
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 8 | `magic` | ASCII `KVIKMARK` |

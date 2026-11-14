@@ -18,7 +18,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
 | Q-86 | §3 Write or sync failure, Disk space, Segments; `format.md` A.4 | No space when a log segment is created, or at a log write before any sync |
-| Q-87 | §3 Recovery rules 1, 3 and 4, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
+| Q-87 | §3 Recovery rules 1 and 3, Order of a start, steps 3 and 6, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
 | Q-90 | §8 Restore step 1, §8 Acknowledging a loss, §11 Health | Whether a restore record's set-aside report holds health degraded |
 | Q-91 | §4 Funnel, Routing, §6 Latch, `api.md` Consuming, row 16 | Funnel identity across configuration, run-time routes and restarts |
@@ -173,7 +173,7 @@ described, so no fact is lost. A record corrupted before upload, with no mirror 
 good although the files it described are still local.
 **Model.** Not modelled; manifest records are not corrupted.
 **Needed.** (a) A way to rebuild such a record from the files it described; this needs Part B of `format.md` to make
-a compacted file name its inputs. (b) To check with the roadmap 2.2 spike: that writing the last valid record's
+a compacted file name its inputs. (b) To check on each platform with roadmap 4.8: that writing the last valid record's
 identical bytes again in place at every start (§7 Manifest) makes the next sync write them on each platform; if not,
 the fallback is to rewrite the manifest to a new file and rename it. (c) The mark (`format.md` A.10) has no
 checksum: a reader accepts its fields when `seq` is even and unchanged, so damaged bytes with an even `seq` are read
@@ -263,9 +263,9 @@ Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by
 (§3). After a failed writeback Linux (ext4, XFS) marks the pages clean without writing them: the page cache holds b
 complete, the disk does not, and a later sync of the file returns success without writing it. Before the restart,
 and without a reboot, the mark file is lost or unreadable. Rule 3 treats a missing mark as a different boot: b is
-complete in the cache and kept, rule 4's sync succeeds without writing it, and b is delivered as durable although it
-is not on disk (principle 3). A later power loss removes it; nothing reports it as `possible_loss`, since it was
-never acknowledged and the next recovery has no record of it.
+complete in the cache and kept, the sync of the kept segments (§3 Order of a start, step 3) succeeds without
+writing it, and b is delivered as durable although it is not on disk (principle 3). A later power loss removes it;
+nothing reports it as `possible_loss`, since it was never acknowledged and the next recovery has no record of it.
 **Spike.** `spikes/commit/tests/faults.rs`
 `with_the_mark_lost_after_a_failed_sync_recovery_keeps_a_batch_that_is_not_on_disk`, on a simulated file system
 with the Linux behaviour.
@@ -402,7 +402,7 @@ changes to both documents (see Settled).
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
 | Q-46 | 4.5 | With 4.6 (second-process reader): the check of a kept position, `start: position` and row 7b |
-| Q-52 | 3.1 | Rebuilding a corrupt record never uploaded needs Part B (a compacted file names its inputs); the in-place rewrite is checked with the 2.2 spike; whether the mark needs a checksum |
+| Q-52 | 3.1 | Rebuilding a corrupt record never uploaded needs Part B (a compacted file names its inputs); the in-place rewrite is checked on each platform with roadmap 4.8; whether the mark needs a checksum |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
@@ -419,7 +419,7 @@ changes to both documents (see Settled).
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 
 Not a question: the figures behind §3 Sync primitive, and the cost of the reader's identity check of the mark (§7
-Readers), are measured by the roadmap 2.2 spike.
+Readers), are measured by roadmap 4.8 (the 2.2 spike measured sync costs on macOS only).
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -470,11 +470,12 @@ The specification wins where the documents differ. These follow from it, for the
   change of either is an error like a change of unit; refusals gain `changed_at` missing, `changed_at` unexpected and
   `revise` on a versioned series; fact deliveries and history results carry `changed_at`; deliveries gain the flag
   `outranked`; `Ack` and health gain an outranked count (§2.2, §2.4, §4, §11).
-- **F-11.** `format.md` A.10: the mark file is synced on a timer (`mark_sync_interval`), at clean shutdown and by
-  recovery; recovery reads the highest position named by cursor files, manifest records and derived files before it
-  writes the recovery entry. `api.md`: the `mark_sync_interval` configuration key and `possible_loss` among the losses
-  with its counts; acknowledgement of a batch of facts does not wait for the mark sync, while a batch holding any other
-  entry does (§3 Commit); test seams can inject a failed mark sync (§3). A.6, A.10, A.11 and Part B now carry the
+- **F-11.** `format.md` A.10: the mark file is synced on a timer (`mark_sync_interval`), at once after a batch holding
+  an entry that is not a fact, at clean shutdown and by recovery; recovery reads the highest position named by cursor
+  files, manifest records and derived files before it writes the recovery entry. `api.md`: the `mark_sync_interval`
+  configuration key and `possible_loss` among the losses with its counts; acknowledgement of a batch of facts does not
+  wait for the mark sync, while a batch holding any other entry does, and the writer forces that mark sync at once
+  (§3 Commit); test seams can inject a failed mark sync (§3). A.6, A.10, A.11 and Part B now carry the
   recovery entry, the mark's highest series id, and the lost-range record's identity and cause; since Q-34 (c)
   `possible_loss` never holds health degraded.
 - **F-12.** `format.md`: the parameter-change entry carries the retention class and period, taking effect at its position,
@@ -575,7 +576,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-40 | Ranking facts of versioned series during a restore | §2.4 Version index, §8 Continuous backup and Deep, §8 Restore steps 1–2 (each tree checkpoint carries the version index, and step 1's replay brings it to the restored end before ingest opens), §13 |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b) and (c)) |
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (calendar lengths: Q-45) |
-| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (refined by Q-47 and Q-48: recovery entries, reset points and `forget_above`; open part: Q-46, positions kept by readers) |
+| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (a `resync` carrying `forget_above` = X: the consumer drops every position above X from its de-duplication memory and confirms only when that is durable), §4 Resync (reset points: a recovery entry and a lost range not described by one, each applying to a consumer whose position is below its id), §3 Recovery rule 3 (a recovery entry at F, positions above K assigned again), row 7a; no margin of skipped positions (as refined by Q-47 and Q-48; open part: Q-46, positions kept by readers) |
 | Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b) and (c)) |
 | Q-44 (d) | Forecast accuracy | Not served by the engine in v1: history keeps every issue with its `changed_at`, so a reader computes "known as of issue X" from `View::History` and compares it with the outcome series; `api.md` Not in v1 (a view as of an issue time, forecast-accuracy operators) (open parts: Q-44 (b) and (c)) |
 | Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (the tzdata version in force, a day start that occurs twice, an interval zone unknown or become a link, and count, min, max and last when an edge cuts an interval were settled later by Q-76, Q-77, Q-80 and Q-81) |

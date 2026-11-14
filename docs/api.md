@@ -48,8 +48,9 @@ store.retire(id, t_r).await?;
 let info = store.series(id)?;                 // also by name
 ```
 These calls, and route changes, resolve only after the durable mark has been synced past their entry (spec §3
-Commit), so they can take up to `mark_sync_interval` unless they force the sync. Defining a series that already
-exists with the same specification returns its id. A different kind, value type,
+Commit). The writer forces that mark sync at once rather than waiting for `mark_sync_interval`, so each call waits
+for one mark sync, not for up to the interval. Defining a series that already exists with the same specification
+returns its id. A different kind, value type,
 scale or unit under the same name is an error; the caller retires and defines anew.
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
@@ -72,8 +73,8 @@ store.try_emit(&readings)?;                   // never waits; Err(Busy) under ba
 store.emit_with(&readings, Intent::Revise).await?;
 ```
 - `emit` resolves only after the batch is synced and the durable mark has moved. Batches resolve in commit order, so
-  a batch of facts committed after a batch holding any other entry also waits for that batch's mark sync (spec §3
-  Commit). It waits under back-pressure.
+  a batch of facts committed after a batch holding any other entry also waits for that batch's mark sync, which is
+  forced at once (spec §3 Commit). It waits under back-pressure.
 - A batch is all-or-nothing for durability, but individual readings may be refused (invalid series, retired
   series, a non-finite value recorded as bad quality is not a refusal). Refusals are reported per index.
 - Readings in one call keep their order; calls from different tasks are ordered by commit.
