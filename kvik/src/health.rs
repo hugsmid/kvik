@@ -1,6 +1,7 @@
 //! Health and statistics (spec §11; `docs/api.md` Health and statistics).
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use jiff::Timestamp;
 
@@ -46,8 +47,30 @@ pub enum HealthReason {
     },
 }
 
+impl fmt::Display for HealthReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HealthReason::Closed => f.write_str("the store is closed"),
+            HealthReason::SyncFailed => f.write_str("a write or sync failed"),
+            HealthReason::Superseded => f.write_str("a higher generation is claimed"),
+            HealthReason::RestoreFailed { file: Some(file) } => {
+                write!(f, "the restore failed at {file}")
+            }
+            HealthReason::RestoreFailed { file: None } => f.write_str("the restore failed"),
+            HealthReason::OpenRefused => f.write_str("the store refused to start"),
+            HealthReason::Quarantined { file } => write!(f, "file {file} is quarantined"),
+            HealthReason::LowDisk => f.write_str("free space below the low mark"),
+            HealthReason::CriticalDisk => f.write_str("free space below the critical mark"),
+            HealthReason::UploadStalled => f.write_str("uploads are stalled"),
+            HealthReason::ClockSkew(s) => write!(f, "the source clock of {s} appears skewed"),
+            HealthReason::DataLost { from, to } => write!(f, "data lost from {from} to {to}"),
+        }
+    }
+}
+
 /// Health (spec §11).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Health {
     /// All well.
     Ok,
@@ -67,6 +90,7 @@ pub enum Health {
 
 /// Per-series statistics.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SeriesStats {
     /// Facts recorded.
     pub facts: u64,
@@ -80,6 +104,7 @@ pub struct SeriesStats {
 
 /// Per-consumer statistics.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ConsumerStats {
     /// The durable cursor.
     pub cursor: Position,
@@ -94,6 +119,7 @@ pub struct ConsumerStats {
 /// Statistics: every refusal, drop, repeat and delay the specification
 /// counts (spec §1.5, §11). Fields the backend cannot measure are `None`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Identical repeats dropped (spec §2.4), all series.
     pub duplicates_dropped: u64,

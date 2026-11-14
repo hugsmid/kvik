@@ -13,7 +13,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// A refusal of one reading is not an error of the call: it is reported per
 /// index in [`Ack::refused`](crate::Ack::refused) and counted. A fault (a
 /// failed write or sync) makes the store read-only (spec §3).
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+///
+/// `Error` is neither `Clone` nor `PartialEq`, so that later variants can
+/// carry I/O errors; compare with `matches!`.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// Another writer handle holds the store directory (spec §3 Single writer).
@@ -74,6 +77,11 @@ pub enum Error {
         /// The configured zone.
         configured: String,
     },
+    /// A route, a change of `emits` or an alias would close a cycle between
+    /// consumers (spec §4 Routing); names the cycle. Not produced by the model
+    /// backend, which accepts only consumers that emit nothing.
+    #[error("routing cycle: {0}")]
+    RouteCycle(String),
     /// A routing change is refused (spec §4, §6 Cadence).
     #[error("route refused: {0}")]
     Route(String),
@@ -169,4 +177,8 @@ pub enum Refusal {
     /// `t` outside the range the store can represent.
     #[error("time out of range")]
     TimeOutOfRange,
+    /// A consumer emitted a reading on a series outside its `emits` (spec §4
+    /// Routing).
+    #[error("series not in the consumer's emits")]
+    NotDeclared,
 }

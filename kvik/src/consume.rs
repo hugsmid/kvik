@@ -34,6 +34,8 @@ pub enum Select {
     Names(String),
     /// Every series.
     All,
+    /// No series: for a consumer's `emits` when it emits nothing.
+    None,
 }
 
 /// A rolling-window operator over `[now − width, now)` (spec §6).
@@ -149,6 +151,7 @@ pub struct FunnelId(pub u32);
 
 /// The state of a condition (spec §6 Conditions, Latch).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ConditionState {
     /// The condition is true.
     True,
@@ -162,13 +165,15 @@ pub enum ConditionState {
 }
 
 /// Identity of a delivery (spec §4 At-least-once): fact deliveries are
-/// de-duplicated by position, timer deliveries by funnel and sequence.
+/// de-duplicated by position, condition deliveries by funnel and sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum DeliveryId {
     /// A fact delivery.
     Fact(Position),
-    /// A condition delivery.
-    Timer {
+    /// A condition delivery, caused by a routed fact or by the funnel's
+    /// timer.
+    Condition {
         /// Generation in which it was issued.
         generation: u32,
         /// Funnel.
@@ -196,6 +201,7 @@ pub enum TriggerCause {
 
 /// A condition transition.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Trigger {
     /// Funnel.
     pub funnel: FunnelId,
@@ -211,6 +217,7 @@ pub struct Trigger {
 
 /// One funnel's part of a `resync`.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct FunnelState {
     /// Funnel.
     pub funnel: FunnelId,
@@ -226,6 +233,7 @@ pub struct FunnelState {
 /// Live and condition state now (spec §4 Resync). On receiving it, a
 /// consumer forgets every position it has seen above its durable cursor.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Resync {
     /// Every funnel in force, in funnel order.
     pub funnels: Vec<FunnelState>,
@@ -255,6 +263,7 @@ pub enum DeliveryKind {
 
 /// Flags of a delivery (spec §4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct DeliveryFlags {
     /// Produced in catch-up: for record-keeping, never to act on.
     pub replayed: bool,
@@ -271,6 +280,7 @@ pub struct DeliveryFlags {
 
 /// A delivery to a consumer.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Delivery {
     /// Identity, for [`Consumer::confirm`](crate::Consumer::confirm).
     pub id: DeliveryId,

@@ -12,13 +12,16 @@ keywords = ["time-series", "storage", "embedded"]
 categories = ["database-implementations"]
 
 [features]
-default = ["model-backend"]
+default = ["model-backend", "bundled-tzdb"]
 # In-memory backend on the reference model: not durable, for development and
 # tests. The durable log engine replaces it from roadmap item 4.2.
 model-backend = ["dep:kvik-model"]
+# Embeds the IANA time-zone database in the binary instead of reading the
+# system's. The model backend embeds it in any case.
+bundled-tzdb = ["jiff/tzdb-bundle-always"]
 
 [dependencies]
-jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 kvik-model = { path = "../model", optional = true }
 thiserror = "2"
 

@@ -171,8 +171,11 @@ pub enum Intent {
     Revise,
 }
 
-/// The result of an emit: the batch is durable when it is returned.
+/// The result of [`Store::emit`](crate::Store::emit): returned once the batch
+/// is committed (synced in the durable engine; held in memory only with the
+/// model backend).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Ack {
     /// Position of the first fact recorded, if any.
     pub first: Option<Position>,
@@ -186,8 +189,25 @@ pub struct Ack {
     pub refused: Vec<(usize, Refusal)>,
 }
 
+/// What a non-waiting emit knows when it returns: the batch entered the
+/// ingest queue, except the readings refused at once. Positions, duplicates
+/// and durability are known only after the commit (spec §3).
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct Accepted {
+    /// Readings refused, by index in the batch.
+    pub refused: Vec<(usize, Refusal)>,
+}
+
+impl Accepted {
+    pub(crate) fn new(refused: Vec<(usize, Refusal)>) -> Self {
+        Accepted { refused }
+    }
+}
+
 /// Flags the engine stamps on a fact; immutable (spec §2.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct FactFlags {
     /// Observed series: `t` more than 60 s after `received_at`.
     pub future: bool,
@@ -205,6 +225,7 @@ pub struct FactFlags {
 
 /// A recorded fact (spec §2.2). Facts are immutable.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Fact {
     /// Series.
     pub series: SeriesId,

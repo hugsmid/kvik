@@ -77,7 +77,9 @@ async fn run() -> kvik::Result<()> {
 
     // A consumer with a threshold condition: true above 3 kW, false again
     // below 2.5 kW.
-    let mut alarms = store.consumer("load-shedding", Start::Now).await?;
+    let mut alarms = store
+        .consumer("load-shedding", Start::Now, Select::None)
+        .await?;
     alarms
         .route(Funnel {
             series: Select::Ids(vec![power]),

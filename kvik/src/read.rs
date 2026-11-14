@@ -9,6 +9,7 @@ use crate::types::{Fact, Position, Value};
 
 /// An aggregate over a window (spec §6 Aggregates).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Aggregate {
     /// Gauge: integral ÷ covered seconds.
     Avg,
@@ -134,6 +135,7 @@ impl Window {
 
 /// Flags of a query result (spec §6, §8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct ResultFlags {
     /// Served while a restore is bringing detail back.
     pub restoring: bool,
@@ -152,6 +154,7 @@ pub struct ResultFlags {
 
 /// A window result (spec §6).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct WindowResult {
     /// The aggregate's value; `None` when empty.
     pub value: Option<Aggregated>,
@@ -182,6 +185,7 @@ impl WindowResult {
 
 /// A view of the facts (spec §2.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum View {
     /// For each `(series, t)`, the fact of highest rank.
     Current,
@@ -209,6 +213,7 @@ pub enum Resolution {
 
 /// One chart bucket: enough to show gaps and spikes.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Bucket {
     /// Start.
     pub from: Timestamp,
@@ -243,6 +248,7 @@ pub enum ChartData {
 
 /// A series' live value (spec §2.3).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct LiveValue {
     /// The live-state fact.
     pub fact: Fact,
@@ -252,6 +258,7 @@ pub struct LiveValue {
 
 /// Live state (spec §2.3).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Live {
     /// The latest valid value.
     Value(LiveValue),

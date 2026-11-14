@@ -11,14 +11,14 @@ use jiff::Timestamp;
 use crate::backend::{self, Shared};
 use crate::backup::{BackupSink, Encryption, Rebuild, RestoreMode};
 use crate::config::StoreConfig;
-use crate::consume::{Delivery, DeliveryId, Funnel, FunnelId, Start};
+use crate::consume::{Delivery, DeliveryId, Funnel, FunnelId, Select, Start};
 use crate::error::{BusyReason, Error, Result};
 use crate::health::{Health, Stats};
 use crate::read::{
     Aggregate, CalendarPeriod, ChartData, Live, Resolution, View, Window, WindowResult,
 };
 use crate::series::{ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
-use crate::types::{Ack, Fact, Intent, Position, Reading, SeriesId};
+use crate::types::{Accepted, Ack, Fact, Intent, Position, Reading, SeriesId};
 
 /// The writer handle: one per store directory (spec §3 Single writer).
 ///
@@ -59,13 +59,15 @@ impl Store {
     /// The store's `now`: the window clock, which never runs backwards (spec
     /// §6).
     pub fn now(&self) -> Timestamp {
-        self.shared.lock().now()
+        self.shared.with(|s| s.now())
     }
 
-    /// Final sync, checkpoint and release of the directory. Consumers' and
-    /// readers' handles see [`Error::Closed`] afterwards.
+    /// Stops the writer and releases the directory: in the durable engine a
+    /// final sync and checkpoint; with the model backend the store stays in
+    /// memory. Consumers' handles see [`Error::Closed`] afterwards; readers
+    /// keep reading what was committed.
     pub async fn shutdown(self) -> Result<()> {
-        self.shared.lock().close(self.epoch);
+        self.shared.with(|s| s.close(self.epoch));
         Ok(())
     }
 
@@ -73,7 +75,7 @@ impl Store {
     /// way. A different definition under a live name is
     /// [`Error::NameInUse`]: retire and define anew.
     pub async fn define_series(&self, spec: SeriesSpec) -> Result<SeriesId> {
-        self.shared.lock().define(self.epoch, spec)
+        self.shared.with(|s| s.define(self.epoch, spec))
     }
 
     /// Changes a series' parameters from an effective event time (spec
@@ -86,27 +88,27 @@ impl Store {
         change: ParameterChange,
     ) -> Result<()> {
         self.shared
-            .lock()
-            .set_parameters(self.epoch, id, effective_from, change)
+            .with(|s| s.set_parameters(self.epoch, id, effective_from, change))
     }
 
     /// Adds a name for a series (a rename); the id is unchanged.
     pub async fn alias(&self, id: SeriesId, name: &str) -> Result<()> {
-        self.shared.lock().alias(self.epoch, id, name)
+        self.shared.with(|s| s.alias(self.epoch, id, name))
     }
 
     /// Retires a series at event time `t_r`: readings with `t ≥ t_r` are
     /// refused from then on; the series stays reachable by id.
     pub async fn retire(&self, id: SeriesId, t_r: Timestamp) -> Result<()> {
-        self.shared.lock().retire(self.epoch, id, t_r)
+        self.shared.with(|s| s.retire(self.epoch, id, t_r))
     }
 
     /// What the store knows about a series, by id or by name.
     pub fn series(&self, key: impl Into<SeriesKey>) -> Result<SeriesInfo> {
-        self.shared.lock().series(key.into())
+        self.shared.with(|s| s.series(key.into()))
     }
 
-    /// Emits a batch and returns once it is durable. Refused readings are
+    /// Emits a batch and returns once it is committed (synced in the durable
+    /// engine; held in memory only with the model backend). Refused readings are
     /// reported per index; the rest are recorded or dropped as duplicates.
     ///
     /// Waits under back-pressure (spec §3). With the model backend it waits
@@ -122,48 +124,61 @@ impl Store {
     pub async fn emit_with(&self, readings: &[Reading], intent: Intent) -> Result<Ack> {
         let mut first = true;
         poll_fn(|cx| {
-            let mut s = self.shared.lock();
-            let r = s.emit(self.epoch, readings, intent, first);
-            first = false;
-            match r {
-                Ok(Ok(ack)) => Poll::Ready(Ok(ack)),
-                Ok(Err(BusyReason::UnsyncedClock)) => {
-                    s.register(cx.waker());
-                    Poll::Pending
+            self.shared.with(|s| {
+                let r = s.emit(self.epoch, readings, intent, first);
+                first = false;
+                match r {
+                    Ok(Ok(ack)) => Poll::Ready(Ok(ack)),
+                    Ok(Err(BusyReason::UnsyncedClock)) => {
+                        s.register(cx.waker());
+                        Poll::Pending
+                    }
+                    // Nothing in the model backend drains a full queue or
+                    // frees disk while the caller waits, so these are
+                    // returned.
+                    Ok(Err(busy)) => Poll::Ready(Err(Error::Busy(busy))),
+                    Err(e) => Poll::Ready(Err(e)),
                 }
-                // Nothing in the model backend drains a full queue or frees
-                // disk while the caller waits, so these are returned.
-                Ok(Err(busy)) => Poll::Ready(Err(Error::Busy(busy))),
-                Err(e) => Poll::Ready(Err(e)),
-            }
+            })
         })
         .await
     }
 
     /// Emits without waiting: [`Error::Busy`] under back-pressure, with
-    /// nothing of the batch accepted. With the model backend the batch is
-    /// committed before this returns.
-    pub fn try_emit(&self, readings: &[Reading]) -> Result<Ack> {
+    /// nothing of the batch accepted. Returns what is known when the batch
+    /// enters the queue: the readings refused at once. Positions and
+    /// duplicates are known only after the commit (with the model backend
+    /// the batch is committed before this returns, but that is not part of
+    /// the interface).
+    pub fn try_emit(&self, readings: &[Reading]) -> Result<Accepted> {
         self.shared
-            .lock()
-            .emit(self.epoch, readings, Intent::Normal, true)?
+            .with(|s| s.emit(self.epoch, readings, Intent::Normal, true))?
+            .map(|ack| Accepted::new(ack.refused))
             .map_err(Error::Busy)
     }
 
     /// Runs the timer evaluations due by the clock now: window expiry,
     /// held-for and stale-for conditions, scheduled values taking effect
-    /// (spec §4 Timers, §6 Cadence). The durable engine runs these on the
-    /// caller's runtime every second; with the model backend they run when
-    /// this is called, and before every emit and delivery poll.
+    /// (spec §4 Timers, §6 Cadence).
+    ///
+    /// **Temporary.** With the model backend timers advance only when the
+    /// store is called: here, and before every emit and delivery poll.
+    /// The durable engine runs them itself, every second, and this call will
+    /// go.
     pub fn tick(&self) -> Result<()> {
-        self.shared.lock().tick(self.epoch)
+        self.shared.with(|s| s.tick(self.epoch))
     }
 
     /// A consumer by name. A new consumer starts at `start`; an existing one
-    /// resumes after its durable cursor, with replay then `resync` (spec §6
-    /// Restart and resume). One handle per name at a time.
-    pub async fn consumer(&self, name: &str, start: Start) -> Result<Consumer> {
-        self.shared.lock().consumer(self.epoch, name, start)?;
+    /// resumes after its cursor, with replay then `resync` (spec §6 Restart
+    /// and resume). One handle per name at a time.
+    ///
+    /// `emits` is the series the consumer may emit, so that routing can
+    /// refuse a cycle (spec §4 Routing). The model backend accepts only
+    /// [`Select::None`]; anything else is [`Error::NotSupportedYet`].
+    pub async fn consumer(&self, name: &str, start: Start, emits: Select) -> Result<Consumer> {
+        self.shared
+            .with(|s| s.consumer(self.epoch, name, start, &emits))?;
         Ok(Consumer {
             shared: self.shared.clone(),
             epoch: self.epoch,
@@ -180,12 +195,12 @@ impl Store {
 
     /// Health (spec §11).
     pub fn health(&self) -> Health {
-        self.shared.lock().health()
+        self.shared.with(|s| s.health())
     }
 
     /// Statistics (spec §11).
     pub fn stats(&self) -> Stats {
-        self.shared.lock().stats()
+        self.shared.with(|s| s.stats())
     }
 
     /// Attaches a backup sink (spec §8). Not supported yet.
@@ -223,13 +238,14 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        self.shared.lock().close(self.epoch);
+        self.shared.with(|s| s.close(self.epoch));
     }
 }
 
 /// A read-only handle (`docs/api.md` Reading). Takes no lock on the
-/// directory; all reads see only durable data. `Send + Sync` and cheap to
-/// clone.
+/// directory and keeps reading after the writer shuts down. Reads see only
+/// committed data (durable in the engine; in memory with the model backend).
+/// `Send + Sync` and cheap to clone.
 #[derive(Clone, Debug)]
 pub struct Reader {
     shared: Arc<Shared>,
@@ -246,7 +262,7 @@ impl Reader {
 
     /// Live state: the latest valid value, with staleness (spec §2.3).
     pub fn live(&self, id: SeriesId) -> Result<Live> {
-        self.shared.lock().live(id)
+        self.shared.with(|s| s.live(id))
     }
 
     /// A window result (spec §6).
@@ -256,7 +272,7 @@ impl Reader {
         window: Window,
         aggregate: Aggregate,
     ) -> Result<WindowResult> {
-        self.shared.lock().window(id, &window, &aggregate)
+        self.shared.with(|s| s.window(id, &window, &aggregate))
     }
 
     /// A chart query: raw facts or buckets with count, min, max and coverage.
@@ -267,13 +283,13 @@ impl Reader {
         resolution: Resolution,
     ) -> Result<ChartData> {
         self.shared
-            .lock()
-            .buckets(id, (range.start, range.end), resolution)
+            .with(|s| s.buckets(id, (range.start, range.end), resolution))
     }
 
     /// Facts with `t` in a range, in a view (spec §2.3).
     pub fn facts(&self, id: SeriesId, range: Range<Timestamp>, view: View) -> Result<Vec<Fact>> {
-        self.shared.lock().facts(id, (range.start, range.end), view)
+        self.shared
+            .with(|s| s.facts(id, (range.start, range.end), view))
     }
 
     /// A calendar day or month result in the site zone in force at each
@@ -288,7 +304,7 @@ impl Reader {
             window: crate::read::CalendarWindow::Period(period.into()),
             zone: None,
         };
-        self.shared.lock().window(id, &window, &aggregate)
+        self.shared.with(|s| s.window(id, &window, &aggregate))
     }
 
     /// A calendar day or month result in a named IANA zone for the whole
@@ -304,26 +320,27 @@ impl Reader {
             window: crate::read::CalendarWindow::Period(period.into()),
             zone: Some(zone.to_string()),
         };
-        self.shared.lock().window(id, &window, &aggregate)
+        self.shared.with(|s| s.window(id, &window, &aggregate))
     }
 
     /// The interval of an interval series that contains `t`: `[start, end)`.
     pub fn interval(&self, id: SeriesId, t: Timestamp) -> Result<(Timestamp, Timestamp)> {
-        self.shared.lock().interval(id, t)
+        self.shared.with(|s| s.interval(id, t))
     }
 
     /// What the store knows about a series, by id or by name.
     pub fn series(&self, key: impl Into<SeriesKey>) -> Result<SeriesInfo> {
-        self.shared.lock().series(key.into())
+        self.shared.with(|s| s.series(key.into()))
     }
 }
 
 /// A consumer: its funnels, deliveries and confirmations (spec §4).
 ///
 /// Deliveries are at least once: de-duplicate fact deliveries by position and
-/// timer deliveries by funnel and sequence; on a `resync`, forget every
+/// condition deliveries by funnel and sequence; on a `resync`, forget every
 /// position seen above the durable cursor. A consumer that emits readings
-/// uses [`Store::try_emit`] or its own task.
+/// uses [`Consumer::try_emit`], never the store's handle, so that its
+/// readings are checked against its `emits`.
 #[derive(Debug)]
 pub struct Consumer {
     shared: Arc<Shared>,
@@ -339,52 +356,66 @@ impl Consumer {
 
     /// Adds a funnel; a log entry that takes effect at its position.
     pub async fn route(&self, funnel: Funnel) -> Result<FunnelId> {
-        self.shared.lock().route(self.epoch, &self.name, funnel)
+        self.shared
+            .with(|s| s.route(self.epoch, &self.name, funnel))
     }
 
     /// Removes a funnel; a log entry that takes effect at its position.
     pub async fn unroute(&self, funnel: FunnelId) -> Result<()> {
-        self.shared.lock().unroute(self.epoch, &self.name, funnel)
+        self.shared
+            .with(|s| s.unroute(self.epoch, &self.name, funnel))
     }
 
     /// The funnels in force.
     pub fn routes(&self) -> Result<Vec<(FunnelId, Funnel)>> {
-        self.shared.lock().routes(self.epoch, &self.name)
+        self.shared.with(|s| s.routes(self.epoch, &self.name))
     }
 
-    /// The next delivery, waiting for one. `None` once the store is closed.
+    /// The next delivery, waiting for one. `Ok(None)` once the store is
+    /// closed; any other error is returned.
     ///
     /// With the model backend nothing runs in the background: a waiting call
     /// is woken by the next emit, routing change or [`Store::tick`].
-    pub async fn next(&mut self) -> Option<Delivery> {
+    pub async fn next(&mut self) -> Result<Option<Delivery>> {
         poll_fn(|cx| {
-            let mut s = self.shared.lock();
-            match s.poll_delivery(self.epoch, &self.name) {
-                Ok(Some(d)) => Poll::Ready(Some(d)),
-                Ok(None) => {
-                    s.register(cx.waker());
-                    Poll::Pending
-                }
-                Err(_) => Poll::Ready(None),
-            }
+            self.shared
+                .with(|s| match s.poll_delivery(self.epoch, &self.name) {
+                    Ok(Some(d)) => Poll::Ready(Ok(Some(d))),
+                    Ok(None) => {
+                        s.register(cx.waker());
+                        Poll::Pending
+                    }
+                    Err(Error::Closed) => Poll::Ready(Ok(None)),
+                    Err(e) => Poll::Ready(Err(e)),
+                })
         })
         .await
     }
 
+    /// Emits readings on behalf of this consumer, without waiting (spec §4
+    /// Concurrency): a reading on a series outside its `emits` is refused
+    /// [`Refusal::NotDeclared`](crate::Refusal::NotDeclared). With the model
+    /// backend a consumer emits nothing, so every reading is refused.
+    pub fn try_emit(&self, readings: &[Reading]) -> Result<Accepted> {
+        self.shared
+            .with(|s| s.consumer_emit(self.epoch, &self.name, readings))
+    }
+
     /// The next delivery if one is ready, without waiting.
     pub fn try_next(&mut self) -> Result<Option<Delivery>> {
-        self.shared.lock().poll_delivery(self.epoch, &self.name)
+        self.shared
+            .with(|s| s.poll_delivery(self.epoch, &self.name))
     }
 
     /// Confirms a delivery and every delivery received before it; advances
-    /// the durable cursor and the latches of the conditions they carried.
+    /// the consumer's cursor and the latches of the conditions they carried.
     pub async fn confirm(&self, id: DeliveryId) -> Result<()> {
-        self.shared.lock().confirm(self.epoch, &self.name, id)
+        self.shared.with(|s| s.confirm(self.epoch, &self.name, id))
     }
 }
 
 impl Drop for Consumer {
     fn drop(&mut self) {
-        self.shared.lock().release(self.epoch, &self.name);
+        self.shared.with(|s| s.release(self.epoch, &self.name));
     }
 }

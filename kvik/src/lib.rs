@@ -35,7 +35,12 @@
 //! The interface is asynchronous, as in `docs/api.md`, but does not depend on
 //! any runtime and starts no threads. With the model backend every call
 //! completes at once, except [`Consumer::next`], which waits for a delivery,
-//! and [`Store::emit`], which waits under back-pressure.
+//! and [`Store::emit`], which waits for clock synchronisation. Timers (window
+//! expiry, held-for and stale-for conditions, scheduled values) advance only
+//! when the store is called; [`Store::tick`] is a temporary way to run them.
+//!
+//! [`jiff`] 0.2 is part of the public interface: event times are
+//! [`jiff::Timestamp`], calendar dates [`jiff::civil::Date`].
 //!
 //! # Example
 //!
@@ -116,7 +121,7 @@ pub use series::{
 #[cfg(feature = "model-backend")]
 pub use store::{Consumer, Reader, Store};
 pub use types::{
-    Ack, Fact, FactFlags, Intent, Position, Quality, Reading, SeriesId, TimeSource, Value,
+    Accepted, Ack, Fact, FactFlags, Intent, Position, Quality, Reading, SeriesId, TimeSource, Value,
 };
 
 /// Re-exported so that callers use the same time types as the interface.

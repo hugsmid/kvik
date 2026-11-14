@@ -230,6 +230,7 @@ impl From<String> for SeriesKey {
 
 /// What the store knows about a series.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SeriesInfo {
     /// Identifier.
     pub id: SeriesId,

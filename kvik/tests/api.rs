@@ -71,13 +71,13 @@ fn define_emit_and_read() {
     let c = block_on(s.define_series(counter("plant/line-1/energy"))).unwrap();
     // Defining again the same way returns the same id; differently, an error.
     assert_eq!(
-        block_on(s.define_series(gauge("plant/line-1/power", 1))),
-        Ok(g)
+        block_on(s.define_series(gauge("plant/line-1/power", 1))).unwrap(),
+        g
     );
-    assert_eq!(
+    assert!(matches!(
         block_on(s.define_series(gauge("plant/line-1/power", 2))),
-        Err(Error::NameInUse("plant/line-1/power".into()))
-    );
+        Err(Error::NameInUse(n)) if n == "plant/line-1/power"
+    ));
 
     let ack = block_on(s.emit(&[
         num(g, 0, 100.0),
@@ -182,7 +182,7 @@ fn views_revise_and_retire() {
 fn threshold_condition_delivers_transitions() {
     let (s, clock) = store("threshold");
     let g = block_on(s.define_series(gauge("plant/line-1/power", 1))).unwrap();
-    let mut c = block_on(s.consumer("load-shedding", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("load-shedding", Start::Now, Select::None)).unwrap();
     let f = block_on(c.route(Funnel {
         series: Select::Ids(vec![g]),
         operator: None,
@@ -200,7 +200,7 @@ fn threshold_condition_delivers_transitions() {
         .iter()
         .find(|d| matches!(&d.kind, DeliveryKind::Trigger(t) if t.state == ConditionState::True))
         .unwrap();
-    assert!(matches!(t.id, DeliveryId::Timer { funnel, .. } if funnel == f));
+    assert!(matches!(t.id, DeliveryId::Condition { funnel, .. } if funnel == f));
     assert!(!t.flags.replayed);
 
     // Between the levels: no transition; below the clear level: false.
@@ -216,7 +216,7 @@ fn threshold_condition_delivers_transitions() {
 fn rolling_operator_and_stale_for_timer() {
     let (s, clock) = store("stale-for");
     let g = block_on(s.define_series(gauge("x/y/power", 1))).unwrap();
-    let mut c = block_on(s.consumer("watch", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("watch", Start::Now, Select::None)).unwrap();
     let stale = block_on(c.route(Funnel {
         series: Select::Ids(vec![g]),
         operator: None,
@@ -252,7 +252,7 @@ fn pattern_funnel_follows_new_definitions() {
     let (s, clock) = store("patterns");
     let a = block_on(s.define_series(gauge("plant/a/power", 1))).unwrap();
     let other = block_on(s.define_series(gauge("plant/a/energy", 1))).unwrap();
-    let mut c = block_on(s.consumer("all-power", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("all-power", Start::Now, Select::None)).unwrap();
     block_on(c.route(Funnel::facts(Select::Names("plant/*/power".into())))).unwrap();
     let b = block_on(s.define_series(gauge("plant/b/power", 1))).unwrap();
     block_on(s.emit(&[num(a, 0, 1.0), num(other, 0, 2.0), num(b, 0, 3.0)])).unwrap();
@@ -272,7 +272,7 @@ fn restart_replays_then_resyncs() {
     let clock = ManualClock::new(start());
     let s = block_on(Store::open(config("restart", &clock))).unwrap();
     let g = block_on(s.define_series(gauge("plant/line-1/power", 1))).unwrap();
-    let mut c = block_on(s.consumer("alarms", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("alarms", Start::Now, Select::None)).unwrap();
     let facts = block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
     let cond = block_on(c.route(Funnel {
         series: Select::Ids(vec![g]),
@@ -300,10 +300,10 @@ fn restart_replays_then_resyncs() {
         Err(Error::Locked { .. })
     ));
     block_on(s.shutdown()).unwrap();
-    assert_eq!(c.try_next(), Err(Error::Closed));
+    assert!(matches!(c.try_next(), Err(Error::Closed)));
     clock.advance(Duration::from_secs(60));
     let s = block_on(Store::open(config("restart", &clock))).unwrap();
-    let mut c = block_on(s.consumer("alarms", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("alarms", Start::Now, Select::None)).unwrap();
     let ds = drain(&mut c);
     let replayed: Vec<_> = ds
         .iter()
@@ -348,7 +348,7 @@ fn restart_replays_then_resyncs() {
 fn next_waits_until_an_emit() {
     let (s, _clock) = store("next-waits");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
-    let mut c = block_on(s.consumer("c", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     block_on(c.route(Funnel::facts(Select::All))).unwrap();
     let woken = Arc::new(Flag::default());
     let mut next = std::pin::pin!(c.next());
@@ -356,7 +356,7 @@ fn next_waits_until_an_emit() {
     block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
     assert!(woken.take());
     match poll_once(next.as_mut(), &woken) {
-        Poll::Ready(Some(d)) => assert!(matches!(d.kind, DeliveryKind::Fact(_))),
+        Poll::Ready(Ok(Some(d))) => assert!(matches!(d.kind, DeliveryKind::Fact(_))),
         other => panic!("{other:?}"),
     }
 }
@@ -369,21 +369,24 @@ fn back_pressure() {
     let s = block_on(Store::open(cfg)).unwrap();
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     let three = [num(g, 0, 1.0), num(g, 1, 1.0), num(g, 2, 1.0)];
-    assert_eq!(s.try_emit(&three), Err(Error::Busy(BusyReason::QueueFull)));
+    assert!(matches!(
+        s.try_emit(&three),
+        Err(Error::Busy(BusyReason::QueueFull))
+    ));
     // A batch larger than the queue would wait forever: emit returns.
-    assert_eq!(
+    assert!(matches!(
         block_on(s.emit(&three)),
         Err(Error::Busy(BusyReason::QueueFull))
-    );
+    ));
     // Host-stamped readings wait while the clock is not synchronised.
     clock.set_synchronised(false);
     let host = [num(g, 0, 1.0).host_stamped()];
-    assert_eq!(
+    assert!(matches!(
         s.try_emit(&host),
         Err(Error::Busy(BusyReason::UnsyncedClock))
-    );
+    ));
     let device = s.try_emit(&[num(g, 1, 2.0)]).unwrap();
-    assert_eq!(device.recorded, 1);
+    assert!(device.refused.is_empty());
     let woken = Arc::new(Flag::default());
     let mut emit = std::pin::pin!(s.emit(&host));
     assert!(poll_once(emit.as_mut(), &woken).is_pending());
@@ -449,10 +452,10 @@ fn interval_series_and_calendar_results() {
     assert!(part.flags.apportioned);
     // Avg, integral, increase and time-in-state are refused on an interval
     // series (spec §6 Aggregates).
-    assert_eq!(
+    assert!(matches!(
         r.window(energy, Window::between(at(-7_200), at(0)), Aggregate::Avg),
         Err(Error::AggregateNotApplicable)
-    );
+    ));
 
     let day = r.calendar(g, date(2026, 1, 5), Aggregate::Avg).unwrap();
     assert_eq!(day.number(), Some(20.0));
@@ -580,10 +583,10 @@ fn unsupported_items_say_so() {
     };
     block_on(s.set_parameters(g, at(0), retention)).unwrap();
     assert!(matches!(
-        block_on(s.consumer("late", Start::Position(Position::ORIGIN))),
+        block_on(s.consumer("late", Start::Position(Position::ORIGIN), Select::None)),
         Err(Error::NotSupportedYet { .. })
     ));
-    let c = block_on(s.consumer("ops", Start::Now)).unwrap();
+    let c = block_on(s.consumer("ops", Start::Now, Select::None)).unwrap();
     let operator_only = Funnel {
         series: Select::Ids(vec![g]),
         operator: Some(Operator::rolling(Aggregate::Avg, Duration::from_secs(60))),
@@ -618,7 +621,9 @@ fn opening_rules() {
     let reader = block_on(kvik::Reader::open("kvik-test/zones")).unwrap();
     assert_eq!(reader.series(g).unwrap().name, "a/b/c");
     block_on(s.shutdown()).unwrap();
-    assert_eq!(reader.live(g), Err(Error::Closed));
+    // Readers are independent of the writer (`docs/api.md` Opening): they
+    // keep reading what was committed after it shuts down.
+    assert!(matches!(reader.live(g), Ok(Live::Value(_))));
     let mut other = config("zones", &clock);
     other.time_zone = "Europe/Oslo".into();
     assert!(matches!(
@@ -629,20 +634,20 @@ fn opening_rules() {
     assert!(matches!(reader.live(g), Ok(Live::Value(_))));
     assert_eq!(s.health(), Health::Ok);
     // One handle per consumer name at a time.
-    let c = block_on(s.consumer("one", Start::Now)).unwrap();
+    let c = block_on(s.consumer("one", Start::Now, Select::None)).unwrap();
     assert!(matches!(
-        block_on(s.consumer("one", Start::Now)),
+        block_on(s.consumer("one", Start::Now, Select::None)),
         Err(Error::ConsumerInUse(_))
     ));
     drop(c);
-    block_on(s.consumer("one", Start::Now)).unwrap();
+    block_on(s.consumer("one", Start::Now, Select::None)).unwrap();
 }
 
 #[test]
 fn on_change_and_held_for_conditions() {
     let (s, clock) = store("on-change-held-for");
     let g = block_on(s.define_series(gauge("a/b/level", 1))).unwrap();
-    let mut c = block_on(s.consumer("c", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     let change = block_on(c.route(Funnel {
         series: Select::Ids(vec![g]),
         operator: None,
@@ -689,17 +694,17 @@ fn critical_disk_makes_ingest_wait() {
     cfg.limits.critical_mark = 2 << 40;
     let s = block_on(Store::open(cfg)).unwrap();
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
-    assert_eq!(
+    assert!(matches!(
         s.try_emit(&[num(g, 0, 1.0)]),
         Err(Error::Busy(BusyReason::DiskFull))
-    );
+    ));
     assert!(matches!(s.health(), Health::Degraded { .. }));
 }
 
 #[test]
 fn consumer_before_any_series() {
     let (s, clock) = store("consumer-first");
-    let mut c = block_on(s.consumer("early", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("early", Start::Now, Select::None)).unwrap();
     block_on(c.route(Funnel::facts(Select::All))).unwrap();
     block_on(c.route(Funnel::facts(Select::Names("site/*/power".into())))).unwrap();
     assert!(c.try_next().unwrap().is_none());

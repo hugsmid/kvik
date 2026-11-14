@@ -37,8 +37,8 @@ fn futures_are_send() {
     assert_send(&s.define_series(SeriesSpec::default()));
     let readings = [];
     assert_send(&s.emit(&readings));
-    assert_send(&s.consumer("c", Start::Now));
-    let mut c = block_on(s.consumer("c", Start::Now)).unwrap();
+    assert_send(&s.consumer("c", Start::Now, Select::None));
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     assert_send(&c.route(Funnel::facts(Select::All)));
     assert_send(&c.next());
     let id = kvik::DeliveryId::Resync;
@@ -58,12 +58,12 @@ fn writers_and_a_consumer_on_several_threads() {
     }))
     .unwrap();
     let s = Arc::new(s);
-    let mut c = block_on(s.consumer("counting", Start::Now)).unwrap();
+    let mut c = block_on(s.consumer("counting", Start::Now, Select::None)).unwrap();
     block_on(c.route(Funnel::facts(Select::Ids(vec![id])))).unwrap();
     let consumer = thread::spawn(move || {
         let mut seen = 0;
         while seen < 40 {
-            let d = block_on(c.next()).expect("store open");
+            let d = block_on(c.next()).unwrap().expect("store open");
             if matches!(d.kind, DeliveryKind::Fact(_)) {
                 seen += 1;
             }

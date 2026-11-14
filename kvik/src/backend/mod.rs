@@ -37,7 +37,7 @@ use crate::series::{
     IntervalLength, Kind, ParameterChange, RetentionClass, SeriesInfo, SeriesKey, SeriesSpec,
     StateValues, Timing,
 };
-use crate::types::{Ack, Fact, Intent, Position, Reading, SeriesId, TimeSource, Value};
+use crate::types::{Accepted, Ack, Fact, Intent, Position, Reading, SeriesId, TimeSource, Value};
 use convert::{dur, dur_nanos, fact_out, mpos, mquality, msid, mwait, nanos, pos, sid, ts};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -55,8 +55,18 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Slot> {
-        lock(&self.state)
+    /// Runs `f` under the store's lock, then wakes the wakers it released,
+    /// after the lock is dropped.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Slot) -> R) -> R {
+        let (r, wake) = {
+            let mut s = lock(&self.state);
+            let r = f(&mut s);
+            (r, std::mem::take(&mut s.to_wake))
+        };
+        for w in wake {
+            w.wake();
+        }
+        r
     }
 
     pub(crate) fn dir(&self) -> &Path {
@@ -82,7 +92,7 @@ pub(crate) fn open(config: &StoreConfig) -> Result<(Arc<Shared>, u64)> {
     let mut stores = lock(&STORES);
     if let Some(shared) = stores.get(&config.dir).cloned() {
         drop(stores);
-        let epoch = shared.lock().restart(config)?;
+        let epoch = shared.with(|s| s.restart(config))?;
         return Ok((shared, epoch));
     }
     let slot = Slot::create(config)?;
@@ -131,6 +141,8 @@ pub(crate) struct Slot {
     consumers: BTreeMap<String, ConsumerSlot>,
     max_consumers: usize,
     wakers: Vec<Waker>,
+    /// Wakers to wake once the lock is released.
+    to_wake: Vec<Waker>,
     /// Model monotonic time of each series' last commit of a fact that counts
     /// for live staleness (spec §5.4).
     committed_mono: BTreeMap<SeriesId, i64>,
@@ -200,6 +212,7 @@ impl Slot {
             consumers: BTreeMap::new(),
             max_consumers: max,
             wakers: Vec::new(),
+            to_wake: Vec::new(),
             committed_mono: BTreeMap::new(),
             refused: BTreeMap::new(),
         })
@@ -241,12 +254,13 @@ impl Slot {
         Ok(self.epoch)
     }
 
-    /// Stops the store: the model loses its volatile state, as at a crash or
-    /// shutdown; everything committed stays.
+    /// Stops the writer, as at a shutdown or crash: everything committed
+    /// stays, and readers keep reading it (`docs/api.md`: readers are
+    /// independent of the writer). The next open restarts the model from what
+    /// it holds as committed, discarding its volatile state.
     pub(crate) fn close(&mut self, epoch: u64) {
         if self.open && self.epoch == epoch {
             self.open = false;
-            self.model.crash();
             self.wake_all();
         }
     }
@@ -270,11 +284,23 @@ impl Slot {
         self.model.clock_synchronised = self.clock.synchronised();
     }
 
+    /// The writer is open.
     fn up(&mut self) -> Result<()> {
         if !self.open || !self.model.is_up() {
             return Err(Error::Closed);
         }
         self.sync_clock();
+        Ok(())
+    }
+
+    /// Committed data can be read, whether or not the writer is open.
+    fn readable(&mut self) -> Result<()> {
+        if !self.model.is_up() {
+            return Err(Error::Closed);
+        }
+        if self.open {
+            self.sync_clock();
+        }
         Ok(())
     }
 
@@ -285,7 +311,7 @@ impl Slot {
         self.up()?;
         if self.model.is_read_only() {
             return Err(Error::ReadOnly {
-                cause: format!("{:?}", self.model.health().reasons),
+                cause: self.read_only_cause(),
             });
         }
         Ok(())
@@ -297,9 +323,24 @@ impl Slot {
         }
     }
 
+    /// Moves every registered waker to the list woken once the store's
+    /// lock is released ([`Shared::with`]), so that no waker runs, or is
+    /// dropped, under the lock.
     fn wake_all(&mut self) {
-        for w in self.wakers.drain(..) {
-            w.wake();
+        self.to_wake.append(&mut self.wakers);
+    }
+
+    fn read_only_cause(&mut self) -> String {
+        let reasons: Vec<String> = match self.health() {
+            Health::ReadOnly { reasons, .. } | Health::Degraded { reasons } => {
+                reasons.iter().map(ToString::to_string).collect()
+            }
+            _ => Vec::new(),
+        };
+        if reasons.is_empty() {
+            "a write or sync failed".into()
+        } else {
+            reasons.join("; ")
         }
     }
 
@@ -394,7 +435,7 @@ impl Slot {
     }
 
     pub(crate) fn series(&mut self, key: SeriesKey) -> Result<SeriesInfo> {
-        self.up()?;
+        self.readable()?;
         let registry = self.model.registry().map_err(convert::error)?;
         let def = match &key {
             SeriesKey::Id(id) => registry.get(msid(*id)),
@@ -619,11 +660,23 @@ impl Slot {
 
     // ----- consumers -----
 
-    pub(crate) fn consumer(&mut self, epoch: u64, name: &str, start: Start) -> Result<()> {
+    pub(crate) fn consumer(
+        &mut self,
+        epoch: u64,
+        name: &str,
+        start: Start,
+        emits: &Select,
+    ) -> Result<()> {
         if self.epoch != epoch {
             return Err(Error::Closed);
         }
         self.up()?;
+        if *emits != Select::None {
+            return Err(Error::NotSupportedYet {
+                what: "a consumer that emits readings (emits other than Select::None): the model \
+                       has no routing-cycle check",
+            });
+        }
         if let Some(c) = self.consumers.get_mut(name) {
             if c.handle {
                 return Err(Error::ConsumerInUse(name.to_string()));
@@ -692,6 +745,24 @@ impl Slot {
         self.consumers.get(name).map(|c| c.id).ok_or(Error::Closed)
     }
 
+    /// Readings a consumer emits (spec §4 Routing): only series in its
+    /// `emits` are accepted. A consumer can only declare [`Select::None`] for
+    /// now, so every reading is refused [`Refusal::NotDeclared`].
+    pub(crate) fn consumer_emit(
+        &mut self,
+        epoch: u64,
+        name: &str,
+        readings: &[Reading],
+    ) -> Result<Accepted> {
+        self.bound(epoch, name)?;
+        self.writable(epoch)?;
+        let refused: Vec<(usize, Refusal)> = (0..readings.len())
+            .map(|i| (i, Refusal::NotDeclared))
+            .collect();
+        *self.refused.entry(Refusal::NotDeclared).or_insert(0) += refused.len() as u64;
+        Ok(Accepted::new(refused))
+    }
+
     pub(crate) fn release(&mut self, epoch: u64, name: &str) {
         if self.epoch == epoch
             && let Some(c) = self.consumers.get_mut(name)
@@ -710,6 +781,7 @@ impl Slot {
         let registry = self.model.registry().map_err(convert::error)?;
         let (selection, pattern_set) = match &funnel.series {
             Select::All => (Selection::All, None),
+            Select::None => (Selection::Series(BTreeSet::new()), None),
             Select::Ids(ids) => {
                 let mut set = BTreeSet::new();
                 for id in ids {
@@ -725,6 +797,20 @@ impl Slot {
                 (Selection::Series(set.clone()), Some(set))
             }
         };
+        // What the model does not support, before anything is recorded.
+        match (&funnel.operator, &funnel.condition) {
+            (Some(_), None) => {
+                return Err(Error::NotSupportedYet {
+                    what: "a funnel with an operator but no condition",
+                });
+            }
+            (Some(_), Some(Condition::HeldFor { .. })) => {
+                return Err(Error::NotSupportedYet {
+                    what: "a held-for condition over an operator",
+                });
+            }
+            _ => {}
+        }
         let single = match &selection {
             Selection::Series(set) if set.len() == 1 => set.iter().next().copied(),
             _ => None,
@@ -859,7 +945,7 @@ impl Slot {
                 generation,
                 funnel,
                 sequence,
-            } => DeliveryId::Timer {
+            } => DeliveryId::Condition {
                 generation,
                 funnel: self.api_funnel(name, funnel),
                 sequence,
@@ -929,7 +1015,7 @@ impl Slot {
             DeliveryId::Fact(p) => km::engine::DeliveryId::Fact(mpos(p)),
             // Condition funnels are never re-routed: their ids are the
             // model's.
-            DeliveryId::Timer {
+            DeliveryId::Condition {
                 generation,
                 funnel,
                 sequence,
@@ -983,7 +1069,7 @@ impl Slot {
     }
 
     pub(crate) fn live(&mut self, id: SeriesId) -> Result<Live> {
-        self.up()?;
+        self.readable()?;
         self.spec(id)?;
         let f = self.model.latest(msid(id)).map_err(convert::error)?;
         Ok(self.live_of(id, f.as_ref()))
@@ -1045,7 +1131,7 @@ impl Slot {
         window: &Window,
         agg: &Aggregate,
     ) -> Result<WindowResult> {
-        self.up()?;
+        self.readable()?;
         let a = self.model_aggregate(id, agg)?;
         let now = self.model.now;
         let span = match window {
@@ -1102,7 +1188,7 @@ impl Slot {
         range: (Timestamp, Timestamp),
         resolution: Resolution,
     ) -> Result<ChartData> {
-        self.up()?;
+        self.readable()?;
         let spec = self.spec(id)?.clone();
         let (a, b) = (nanos(range.0)?, nanos(range.1)?);
         if a >= b {
@@ -1126,14 +1212,22 @@ impl Slot {
                     return Ok(ChartData::Facts(raw));
                 }
                 let max = i64::try_from(max_points).unwrap_or(i64::MAX);
-                let fits = |step: i64| (span + step - 1) / step <= max;
-                if fits(MINUTE) {
+                // Buckets are aligned to UTC, so they are counted from the
+                // aligned floor of the start, not from the start.
+                let buckets = |step: i64| {
+                    let first = a.div_euclid(step) * step;
+                    (b - first + step - 1) / step
+                };
+                if buckets(MINUTE) <= max {
                     MINUTE
-                } else if fits(QUARTER) {
+                } else if buckets(QUARTER) <= max {
                     QUARTER
                 } else {
-                    let quarters = (span + QUARTER - 1) / QUARTER;
-                    QUARTER * ((quarters + max - 1) / max)
+                    let mut k = ((span + QUARTER - 1) / QUARTER + max - 1) / max;
+                    while buckets(QUARTER * k) > max {
+                        k += 1;
+                    }
+                    QUARTER * k
                 }
             }
             Resolution::Step(d) => {
@@ -1178,7 +1272,7 @@ impl Slot {
         range: (Timestamp, Timestamp),
         view: View,
     ) -> Result<Vec<Fact>> {
-        self.up()?;
+        self.readable()?;
         let spec = self.spec(id)?.clone();
         let (a, b) = (nanos(range.0)?, nanos(range.1)?);
         let s = msid(id);
@@ -1244,7 +1338,7 @@ impl Slot {
         id: SeriesId,
         t: Timestamp,
     ) -> Result<(Timestamp, Timestamp)> {
-        self.up()?;
+        self.readable()?;
         match &self.spec(id)?.kind {
             Kind::Interval {
                 length: IntervalLength::Fixed { d, phase },

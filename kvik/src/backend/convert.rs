@@ -159,7 +159,8 @@ pub(crate) fn error(e: km::engine::Error) -> Error {
         E::Tree(km::tree::TreeError::UnknownZone(z)) => Error::UnknownZone(z),
         E::BadConfirm => Error::BadConfirm,
         E::Restoring => Error::Restoring,
-        E::BadRoute(msg) if msg.contains("not modelled") => Error::NotSupportedYet { what: msg },
+        // What the model does not support is refused before it is called
+        // (`Slot::route`); every other refusal is the specification's.
         E::BadRoute(msg) => Error::Route(msg.to_string()),
         E::SiteZoneMismatch { store, configured } => Error::SiteZoneMismatch { store, configured },
         other => Error::Internal(other.to_string()),
@@ -311,7 +312,9 @@ pub(crate) fn aggregate(
                 ) => km::types::StateKey::Name(
                     names
                         .get(usize::from(*i))
-                        .ok_or(Error::Refused(Refusal::UnknownState))?
+                        .ok_or_else(|| {
+                            Error::InvalidQuery("state index outside the declared names".into())
+                        })?
                         .clone(),
                 ),
                 _ => return Err(Error::AggregateNotApplicable),
