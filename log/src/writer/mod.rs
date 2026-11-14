@@ -191,6 +191,7 @@ pub struct Call {
     data_len: u64,
     sequences: u64,
     has_non_fact: bool,
+    alone: bool,
 }
 
 /// Why a call cannot be made.
@@ -228,7 +229,11 @@ impl Call {
         })?;
         let items = content.items;
         let has_non_fact = items.iter().any(|i| matches!(i, Item::Entry(_)));
+        let alone = items
+            .iter()
+            .any(|i| matches!(i, Item::Entry(e) if e.is_recovery()));
         Ok(Self {
+            alone,
             id: 0,
             sequences: items.iter().map(Item::sequences).sum(),
             data_len: builder.data_len(),
@@ -265,6 +270,11 @@ impl Call {
     /// Whether it holds an entry that is not a fact.
     pub fn has_non_fact(&self) -> bool {
         self.has_non_fact
+    }
+
+    /// Whether it must be alone in its batch: it holds a recovery entry.
+    pub fn is_alone(&self) -> bool {
+        self.alone
     }
 }
 
@@ -844,12 +854,13 @@ impl LogWriter {
             }
             if !disk_wait && !source.is_empty() && now >= self.sync_ready_at() {
                 let calls = source.take(self.cfg.max_batch_bytes);
-                match self.commit(calls, now, wall) {
-                    Ok(done) => step.done = done,
-                    Err(calls) => {
-                        source.put_back(calls);
-                        self.waiting = Some(Wait::NoSegment);
-                    }
+                let mut back = Vec::new();
+                match self.commit(calls, now, wall, &mut back) {
+                    Some(done) => step.done = done,
+                    None => self.waiting = Some(Wait::NoSegment),
+                }
+                if !back.is_empty() {
+                    source.put_back(back);
                 }
             }
         }
@@ -985,23 +996,34 @@ impl LogWriter {
     }
 
     /// Commits one batch of `calls`: write, sync, mark update, the mark sync where required, then the
-    /// acknowledgements. Returns the calls unchanged if the batch needs the next segment and none is created yet.
+    /// acknowledgements. Calls left out of the batch go to `back`, in order: all of them, with `None`, if the batch
+    /// needs the next segment and none is created yet.
     fn commit(
         &mut self,
-        calls: Vec<Call>,
+        mut calls: Vec<Call>,
         now: Duration,
         wall: i64,
-    ) -> Result<Vec<Done>, Vec<Call>> {
+        back: &mut Vec<Call>,
+    ) -> Option<Vec<Done>> {
         let first = self.last_sequence + 1;
         let commit_time = wall.max(self.last_commit_time);
-        let content = BatchContent {
+        let mut content = BatchContent {
             first_sequence: first,
             received_at: commit_time,
             items: calls.iter().flat_map(|c| c.items.iter().cloned()).collect(),
         };
-        // Valid calls always form a valid batch of at most 8 MiB (each call was encoded when made, and the queue
-        // closes a batch at `max_batch_bytes`); anything else is a defect, not a write failure.
-        let builder = content.builder().expect("a batch of valid calls encodes");
+        // Calls that encode alone may still not encode together (merged blocks that pass 8 MiB, or a recovery entry
+        // that must be alone in its batch): the batch then takes the first call only. A lone call encodes as it did
+        // when it was made, whatever its first sequence.
+        let builder = match content.builder() {
+            Ok(b) => b,
+            Err(_) if calls.len() > 1 => {
+                back.extend(calls.split_off(1));
+                content.items = calls[0].items.clone();
+                content.builder().expect("a valid call encodes alone")
+            }
+            Err(_) => unreachable!("a valid call encodes alone"),
+        };
         let batch_len = builder.data_len() + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64;
         let fits = self
             .open
@@ -1010,11 +1032,14 @@ impl LogWriter {
         let mut next = None;
         if !fits {
             if self.ahead.is_none() {
-                return Err(calls);
+                let rest = std::mem::take(back);
+                back.extend(calls);
+                back.extend(rest);
+                return None;
             }
             next = self.take_into_use(first, now);
             if next.is_none() {
-                return Ok(Self::unknown(&calls));
+                return Some(Self::unknown(&calls));
             }
         }
         let seg = next
@@ -1028,7 +1053,7 @@ impl LogWriter {
         let path = maint::segment_path(&self.log_dir, &seg.id, false);
         if let Err(e) = seg.file.write_at(&bytes, at) {
             self.fail(FaultOp::Write, &path, &e);
-            return Ok(Self::unknown(&calls));
+            return Some(Self::unknown(&calls));
         }
         self.last_sync_start = Some(now);
         self.stats.syncs += 1;
@@ -1038,7 +1063,7 @@ impl LogWriter {
             .expect("a segment in use");
         if let Err(e) = seg.file.sync_data() {
             self.fail(FaultOp::Sync, &path, &e);
-            return Ok(Self::unknown(&calls));
+            return Some(Self::unknown(&calls));
         }
         let last = content.last_sequence();
         // The batch is on stable storage: account for it in the segment's summary and index.
@@ -1115,7 +1140,7 @@ impl LogWriter {
             .write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64)
         {
             self.fail(FaultOp::MarkWrite, &mp, &e);
-            return Ok(Self::unknown(&calls));
+            return Some(Self::unknown(&calls));
         }
         self.mark_slot = slot;
         self.mark_next_slot = 1 - self.mark_next_slot;
@@ -1125,7 +1150,7 @@ impl LogWriter {
         if forced {
             self.sync_mark(now);
             if self.fault.is_some() {
-                return Ok(Self::unknown(&calls));
+                return Some(Self::unknown(&calls));
             }
         }
         self.stats.durable = Position {
@@ -1133,23 +1158,25 @@ impl LogWriter {
             sequence: last,
         };
         let mut seq = first;
-        Ok(calls
-            .iter()
-            .map(|c| {
-                let ack = Ack {
-                    first: Position {
-                        generation: self.generation,
-                        sequence: seq,
-                    },
-                    last: Position {
-                        generation: self.generation,
-                        sequence: seq + c.sequences - 1,
-                    },
-                };
-                seq += c.sequences;
-                (c.id, Ok(ack))
-            })
-            .collect())
+        Some(
+            calls
+                .iter()
+                .map(|c| {
+                    let ack = Ack {
+                        first: Position {
+                            generation: self.generation,
+                            sequence: seq,
+                        },
+                        last: Position {
+                            generation: self.generation,
+                            sequence: seq + c.sequences - 1,
+                        },
+                    };
+                    seq += c.sequences;
+                    (c.id, Ok(ack))
+                })
+                .collect(),
+        )
     }
 
     fn unknown(calls: &[Call]) -> Vec<Done> {

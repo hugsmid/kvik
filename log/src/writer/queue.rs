@@ -78,7 +78,9 @@ impl CallSource for IngestQueue {
         let mut out = Vec::new();
         let mut bytes = 0u64;
         while let Some(c) = self.calls.front() {
-            if !out.is_empty() && bytes + c.data_len() > max_bytes {
+            // A call holding a recovery entry is alone in its batch (`format.md` A.6).
+            let alone = c.is_alone() || out.first().is_some_and(Call::is_alone);
+            if !out.is_empty() && (alone || bytes + c.data_len() > max_bytes) {
                 break;
             }
             bytes += c.data_len();

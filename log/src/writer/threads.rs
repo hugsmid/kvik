@@ -397,14 +397,14 @@ fn complete(s: &Shared, done: Vec<Done>) {
 
 fn publish(s: &Shared, w: &LogWriter) {
     {
-        let mut f = lock(&s.front);
-        f.read_only = w.fault().is_some();
-        f.waiting = w.waiting();
+        let mut i = lock(&s.info);
+        i.stats = w.stats().clone();
+        i.reasons = w.reasons();
+        i.fault = w.fault().cloned();
     }
-    let mut i = lock(&s.info);
-    i.stats = w.stats().clone();
-    i.reasons = w.reasons();
-    i.fault = w.fault().cloned();
+    let mut f = lock(&s.front);
+    f.read_only = w.fault().is_some();
+    f.waiting = w.waiting();
 }
 
 fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
@@ -412,10 +412,11 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         lock(&s.front).wake = false;
         exchange(s, &mut w);
         let step = w.step(s.clock.monotonic(), s.clock.wall(), &mut SharedSource(s));
-        complete(s, step.done);
-        // A roll or a seal in this step asks for maintenance work at once.
+        // A roll or a seal in this step asks for maintenance work at once. Statistics and the read-only state are
+        // published before any call of this step completes, so a caller that holds its acknowledgement sees them.
         exchange(s, &mut w);
         publish(s, &w);
+        complete(s, step.done);
         s.room_cv.notify_all();
         let mut f = lock(&s.front);
         if f.shutdown {
@@ -475,6 +476,17 @@ fn maint_loop(s: &Shared) {
         let mut m = lock(&s.maint);
         while m.request.is_none() && m.jobs.is_empty() && !m.stop {
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
+        }
+        // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
+        if lock(&s.front).read_only {
+            m.request = None;
+            m.jobs.clear();
+            if m.stop {
+                return;
+            }
+            m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
+            drop(m);
+            continue;
         }
         if let Some(req) = m.request.take() {
             drop(m);

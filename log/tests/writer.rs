@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use kvik_log::batch::SegmentIdentity;
 use kvik_log::content::{BatchContent, Item};
-use kvik_log::entries::{Definition, Entry, IntervalLength, Kind, Retention, Timing, Versioning};
+use kvik_log::entries::{
+    Definition, Entry, IntervalLength, Kind, MarkState, Recovery, Retention, Timing, Versioning,
+};
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value, ValueType};
 use kvik_log::fs::{FaultOp as MemOp, Fs, MemFs, OpenMode};
 use kvik_log::header::FileHeader;
@@ -851,6 +853,75 @@ fn commit_time_never_decreases_when_the_wall_clock_steps_back() {
     h.step();
     let b = batches(&h.fs, true);
     assert_eq!(b[0].2.received_at, b[1].2.received_at);
+}
+
+fn recovery() -> Item {
+    Item::Entry(Entry::Recovery(Recovery {
+        after: 0,
+        boot_id: BOOT,
+        tail_bytes: 0,
+        readable_commits: 0,
+        mark_state: MarkState::Readable,
+        id_floor: 0,
+        consumers: vec![],
+    }))
+}
+
+#[test]
+fn a_call_holding_a_recovery_entry_is_alone_in_its_batch() {
+    let mut h = H::new(WriterConfig {
+        min_sync_interval: Duration::ZERO,
+        ..cfg()
+    });
+    h.submit(vec![fact(1, T0, 0)]);
+    h.submit(vec![recovery()]);
+    h.submit(vec![fact(2, T0, 0)]);
+    h.drain();
+    let b = batches(&h.fs, true);
+    assert_eq!(b.len(), 3);
+    assert_eq!(b[1].2.items, vec![recovery()]);
+    check(&h);
+}
+
+/// A source that hands over every call at once, as a source that ignores the batch rules would.
+struct Greedy(Vec<Call>);
+
+impl CallSource for Greedy {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn take(&mut self, _: u64) -> Vec<Call> {
+        std::mem::take(&mut self.0)
+    }
+    fn put_back(&mut self, mut calls: Vec<Call>) {
+        calls.append(&mut self.0);
+        self.0 = calls;
+    }
+}
+
+#[test]
+fn calls_that_do_not_encode_together_are_committed_one_by_one() {
+    let mut h = H::new(WriterConfig {
+        min_sync_interval: Duration::ZERO,
+        ..cfg()
+    });
+    let limit = h.w.config().call_limit();
+    let mut src = Greedy(
+        [vec![fact(1, T0, 0)], vec![recovery()], vec![fact(2, T0, 0)]]
+            .into_iter()
+            .map(|i| Call::new(i, limit).unwrap())
+            .collect(),
+    );
+    let s = h.w.step(h.now, h.wall, &mut src);
+    assert_eq!(s.done.len(), 1);
+    assert_eq!(src.0.len(), 2);
+    for _ in 0..2 {
+        h.w.step(h.now, h.wall, &mut src);
+    }
+    assert!(src.is_empty());
+    let b = batches(&h.fs, true);
+    assert_eq!(b.len(), 3);
+    assert_eq!(b[1].2.items, vec![recovery()]);
 }
 
 #[derive(Clone, Debug)]

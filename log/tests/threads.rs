@@ -39,7 +39,8 @@ fn new_store() -> NewStore {
 
 fn cfg() -> WriterConfig {
     WriterConfig {
-        segment_size: 64 << 10,
+        segment_size: 16 << 10,
+        max_batch_bytes: 4 << 10,
         disk_critical: 0,
         disk_low_bytes: 0,
         relaxed_limits: true,
@@ -114,6 +115,7 @@ fn concurrent_callers_get_dense_positions_and_every_batch_is_on_disk() {
     log.shutdown().unwrap();
     // Every segment reads back completely; sealed ones carry their seal.
     let mut entries = 0;
+    let mut sealed = 0;
     for p in fs.paths() {
         let Some(name) = p.file_name().and_then(|n| SegmentName::parse(n.to_str()?)) else {
             continue;
@@ -127,10 +129,12 @@ fn concurrent_callers_get_dense_positions_and_every_batch_is_on_disk() {
         let r = scan(&bytes, &id, ScanLimit::End).unwrap();
         if name.sealed {
             assert_eq!(r.seal.as_ref().unwrap().state, SealState::Sealed);
+            sealed += 1;
         }
         entries += r.batches.iter().map(|b| b.entry_count()).sum::<u64>();
     }
     assert_eq!(entries, last);
+    assert!(sealed > 0, "segments rolled and were sealed");
     let mark = read_mark(&fs.read_durable(&dir.join("log/MARK")).unwrap(), &STORE_ID)
         .unwrap()
         .unwrap()
@@ -205,7 +209,7 @@ fn a_failed_sync_fails_the_calls_it_covered_and_the_store_turns_read_only() {
     assert_eq!(ack.first.sequence, 1);
     // Wait until the next segment is created ahead (its sync done), so the next `.open` sync is the batch's.
     let next = PathBuf::from("store/log/00000000-0000000000000002.open");
-    while fs.read_durable(&next).map(|b| b.len()) != Some(64 << 10) {
+    while fs.read_durable(&next).map(|b| b.len()) != Some(16 << 10) {
         std::thread::sleep(Duration::from_millis(1));
     }
     fs.fail_nth(FaultOp::Sync, ".open", 0, std::io::ErrorKind::Other);
@@ -218,6 +222,10 @@ fn a_failed_sync_fails_the_calls_it_covered_and_the_store_turns_read_only() {
     }
     assert!(log.fault().is_some());
     assert!(log.shutdown().is_err());
+    // No file operation after the failed sync, on either thread.
+    let ops = fs.ops();
+    let failed = ops.iter().position(|o| !o.ok).unwrap();
+    assert_eq!(failed, ops.len() - 1, "{:?}", &ops[failed..]);
 }
 
 #[test]
@@ -250,6 +258,7 @@ fn smoke_on_the_real_file_system() {
     log.shutdown().unwrap();
 
     let mut seen = Vec::new();
+    let mut sealed = 0;
     for e in std::fs::read_dir(dir.join("log")).unwrap() {
         let e = e.unwrap();
         let name = e.file_name().into_string().unwrap();
@@ -266,6 +275,7 @@ fn smoke_on_the_real_file_system() {
         if n.sealed {
             let seal = r.seal.as_ref().unwrap();
             assert!(seal.file_crc_matches(&bytes));
+            sealed += 1;
         }
         for b in &r.batches {
             seen.push(BatchContent::decode(b).unwrap());
@@ -278,6 +288,7 @@ fn smoke_on_the_real_file_system() {
         next = c.last_sequence() + 1;
     }
     assert_eq!(next - 1, last);
+    assert!(sealed > 0, "segments rolled and were sealed");
     let mark = read_mark(&std::fs::read(dir.join("log/MARK")).unwrap(), &STORE_ID)
         .unwrap()
         .unwrap()
