@@ -258,6 +258,7 @@ pub fn candidates() -> Vec<Box<dyn Candidate>> {
         Box::new(Own::DELTA_DECIMAL_RLE_ZSTD),
         Box::new(ParquetCodec::BYTE_STREAM_SPLIT),
         Box::new(ParquetCodec::ALP),
+        Box::new(ParquetCodec::DICTIONARY),
     ]
 }
 

@@ -10,12 +10,14 @@
 //! | `quality` | INT32 (u8) | dictionary (RLE_DICTIONARY) |
 //! | `flags` | INT32 (u16) | dictionary |
 //! | `position` | INT64 (u64) | DELTA_BINARY_PACKED |
-//! | `value` | DOUBLE, nullable | BYTE_STREAM_SPLIT, or ALP |
+//! | `value` | DOUBLE, nullable | BYTE_STREAM_SPLIT, ALP or dictionary |
 //! | `state` | INT32 (u16), nullable | dictionary |
 //! | `integer` | INT64, nullable | DELTA_BINARY_PACKED |
 //!
 //! Every column is compressed with zstd at [`ZSTD_LEVEL`]; data pages hold at
-//! most [`BLOCK_ROWS`] rows; page statistics and the page index are written.
+//! most [`BLOCK_ROWS`] rows. Page statistics, and so a column index, are
+//! written only for `t` (the own format keeps only first and last `t` per
+//! block); offset indexes are written for every column.
 //! A reader caches the footer and page index once per file. A range scan uses
 //! the page index of `t` to select whole pages, reads them with a row
 //! selection and trims the rows outside the range.
@@ -62,6 +64,12 @@ impl ParquetCodec {
         value: Encoding::ALP,
         name: "Parquet, ALP",
     };
+    /// (c) `value` dictionary-encoded (the writer falls back to plain for a
+    /// page when the dictionary outgrows its 1 MiB limit).
+    pub const DICTIONARY: ParquetCodec = ParquetCodec {
+        value: Encoding::RLE_DICTIONARY,
+        name: "Parquet, dictionary",
+    };
 }
 
 /// One Parquet file holding a set of chunks. Its footer and page index are
@@ -70,6 +78,8 @@ pub struct ParquetFile {
     bytes: Bytes,
     meta: OnceLock<ArrowReaderMetadata>,
     kinds: Vec<ValueKind>,
+    /// Whether each chunk has a row with a value.
+    has_values: Vec<bool>,
     /// Column index of the value column for each kind (F64, State, I64).
     value_columns: [Option<usize>; 3],
 }
@@ -124,7 +134,11 @@ fn schema(value_columns: &[Option<usize>; 3]) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-fn properties(columns: &[(&str, Encoding)]) -> WriterProperties {
+/// Writer properties: zstd, pages of [`BLOCK_ROWS`] rows, page statistics
+/// (and so a column index) only for `stats_column`, and the given encoding
+/// per column, dictionary for [`Encoding::RLE_DICTIONARY`]. Offset indexes are
+/// written for every column, so that a row selection can skip pages.
+fn properties(stats_column: &str, columns: &[(&str, Encoding)]) -> WriterProperties {
     let mut b = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(
@@ -132,13 +146,17 @@ fn properties(columns: &[(&str, Encoding)]) -> WriterProperties {
         ))
         .set_data_page_row_count_limit(BLOCK_ROWS)
         .set_write_batch_size(1024)
-        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_column_statistics_enabled(ColumnPath::from(stats_column), EnabledStatistics::Page)
         .set_max_row_group_row_count(None);
     for &(name, encoding) in columns {
         let path = ColumnPath::from(name);
-        b = b
-            .set_column_dictionary_enabled(path.clone(), false)
-            .set_column_encoding(path, encoding);
+        b = if encoding == Encoding::RLE_DICTIONARY {
+            b.set_column_dictionary_enabled(path, true)
+        } else {
+            b.set_column_dictionary_enabled(path.clone(), false)
+                .set_column_encoding(path, encoding)
+        };
     }
     b.build()
 }
@@ -242,7 +260,7 @@ impl ParquetCodec {
     pub fn check_layout(&self, file: &ParquetFile) {
         let md = file.meta().metadata();
         assert_eq!(md.num_row_groups(), file.kinds.len());
-        for (rg, &kind) in md.row_groups().iter().zip(&file.kinds) {
+        for (i, (rg, &kind)) in md.row_groups().iter().zip(&file.kinds).enumerate() {
             let has = |col: usize, e: Encoding| rg.column(col).encodings().any(|x| x == e);
             assert!(has(COL_T, Encoding::DELTA_BINARY_PACKED), "t encoding");
             assert!(
@@ -255,9 +273,7 @@ impl ParquetCodec {
             );
             assert!(has(COL_FLAGS, Encoding::RLE_DICTIONARY), "flags encoding");
             let col = file.value_column(kind);
-            let all_null = rg.column(col).statistics().and_then(|s| s.null_count_opt())
-                == Some(rg.num_rows() as u64);
-            if !all_null {
+            if file.has_values[i] {
                 let expected = match kind {
                     ValueKind::F64 => self.value,
                     ValueKind::State => Encoding::RLE_DICTIONARY,
@@ -302,12 +318,15 @@ impl Codec for ParquetCodec {
             }
         }
         let schema = schema(&value_columns);
-        let props = properties(&[
-            ("t", Encoding::DELTA_BINARY_PACKED),
-            ("value", self.value),
-            ("integer", Encoding::DELTA_BINARY_PACKED),
-            ("position", Encoding::DELTA_BINARY_PACKED),
-        ]);
+        let props = properties(
+            "t",
+            &[
+                ("t", Encoding::DELTA_BINARY_PACKED),
+                ("value", self.value),
+                ("integer", Encoding::DELTA_BINARY_PACKED),
+                ("position", Encoding::DELTA_BINARY_PACKED),
+            ],
+        );
         let mut w = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props)).expect("writer");
         for c in chunks {
             assert!(!c.is_empty(), "empty chunks are not written");
@@ -318,6 +337,10 @@ impl Codec for ParquetCodec {
             bytes: Bytes::from(w.into_inner().expect("close")),
             meta: OnceLock::new(),
             kinds: chunks.iter().map(|c| c.kind).collect(),
+            has_values: chunks
+                .iter()
+                .map(|c| c.flags.iter().any(|f| f & FLAG_NO_VALUE == 0))
+                .collect(),
             value_columns,
         }
     }
@@ -412,7 +435,7 @@ impl Codec for ParquetCodec {
 
     fn i64_column_size(&self, columns: &[&[i64]]) -> u64 {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-        let props = properties(&[("x", Encoding::DELTA_BINARY_PACKED)]);
+        let props = properties("x", &[("x", Encoding::DELTA_BINARY_PACKED)]);
         let mut w = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props)).expect("writer");
         for col in columns.iter().filter(|c| !c.is_empty()) {
             let b = RecordBatch::try_new(

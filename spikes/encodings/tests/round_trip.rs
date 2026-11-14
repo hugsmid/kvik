@@ -43,6 +43,7 @@ fn check_all(chunks: &[&Chunk], ranges: &[(i64, i64)]) {
     check(&Own::DELTA_DECIMAL_RLE_ZSTD, chunks, ranges);
     check(&ParquetCodec::BYTE_STREAM_SPLIT, chunks, ranges);
     check(&ParquetCodec::ALP, chunks, ranges);
+    check(&ParquetCodec::DICTIONARY, chunks, ranges);
 }
 
 fn span_ranges(start: i64, len: i64) -> Vec<(i64, i64)> {
@@ -220,7 +221,11 @@ fn edge_cases_round_trip() {
 fn parquet_layout() {
     let span = Generator::new(11, 10, SPAN).next_span();
     let ints = Generator::new(11, 10, SPAN).integers().next_span();
-    for codec in [ParquetCodec::BYTE_STREAM_SPLIT, ParquetCodec::ALP] {
+    for codec in [
+        ParquetCodec::BYTE_STREAM_SPLIT,
+        ParquetCodec::ALP,
+        ParquetCodec::DICTIONARY,
+    ] {
         codec.check(&codec.encode(&chunks_of(&span)));
         codec.check(&codec.encode(&chunks_of(&ints)));
     }
@@ -233,7 +238,7 @@ fn harness_runs() {
         ..DatasetSpec::decimal("test", 5, 5, 1)
     };
     let r = run(&spec, 1, &candidates());
-    assert_eq!(r.candidates.len(), 8);
+    assert_eq!(r.candidates.len(), 9);
     for c in &r.candidates {
         assert_eq!(c.rows, r.current_rows + r.revision_rows);
         assert!(c.range_rows > 0);
