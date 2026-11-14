@@ -265,7 +265,7 @@ on change, `wrap_at`, `reset_ceiling`) may change at all, which §2.1 does not f
 **Scenario.** A `day` interval series with a day start of 05:00 cannot be defined: the length tag, zone and day
 start have no ids, so two implementations choose different ones and cannot read each other's segments.
 **Needed:** the ids, and the complete list of fields a parameter change may carry.
-**Resolved at gate 3.3:** `format.md` A.6 (field ids 14–26 and the scale raise entry; the fields a parameter change may carry).
+**Resolved at gate 3.3:** `format.md` A.6 (field ids 14–27 and the scale raise entry; the fields a parameter change may carry).
 
 ### FC-15 — Entry types for the site zone and tzdata version are missing
 **Where:** A.6 · **Severity:** blocks (4.3) · **Relates to:** F-16, Q-76, §5.7, §2.1 interval starts

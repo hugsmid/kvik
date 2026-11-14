@@ -147,7 +147,7 @@ one row:
 
 | State of an `.open` file | Action |
 |---|---|
-| ends in a valid trailer and end marker (wherever the mark points) | finish the seal from step 2; never truncated |
+| its last non-zero bytes are a valid trailer and end marker (wherever the mark points; the file may still be longer than the end marker, after a crash between seal steps 1 and 2) | finish the seal from step 2; never truncated |
 | in use, not the last in use, no valid trailer | whatever follows its last complete batch is seal blocks or damage, never a torn batch: seal again from step 1 |
 | in use, the last in use | `spec.md` §3 Recovery rules 1–3 (a torn first batch included); then appended to while a batch fits; if its first batch is then a recovery batch, the header is rewritten with F |
 | header invalid or `base_sequence = 0`, but a complete batch is found | rewrite the header from the file name, the store descriptor and the first batch; then one of the two rows above |
@@ -243,7 +243,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | Entry type | Fields |
 |---:|---|
 | 1 series definition | the table below |
-| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life; whether 25 and 26 may change is open, Q-100). A change of 7 without 8 is written with 8 = 3 × the new interval, so the entry is self-contained |
+| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life; whether 25 and 26 may change is open, Q-100). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
 | 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
@@ -279,6 +279,7 @@ Series definition fields, all critical:
 | 24 | retention period | i64 ns | class 1 |
 | 25 | excess precision | u8: 0 round, 1 refuse, 2 auto-raise | value type 2 |
 | 26 | maximum scale | u8, 0–18, at least field 5 | field 25 = 2 |
+| 27 | staleness limit set | u8: 1 S was set by the caller, 0 S follows the expected interval | always; also in a parameter change carrying 8 |
 
 **Checks** (a failure makes the block invalid, A.2): `length` or a field overrunning its container; a critical
 field out of order or repeated when not marked repeated; a value outside its range above.
@@ -346,7 +347,7 @@ exists; a new file is created only when none exists.
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 8 | `magic` | ASCII `KVIKMARK` |
-| 8 | 4 | `version` | 3; an unknown version makes the mark unreadable for a writer and is `UnsupportedFormat` for a reader |
+| 8 | 4 | `version` | 3; a slot with valid magic and checksum and an unknown version is `UnsupportedFormat` for a writer and a reader alike (common rules): the writer refuses to open and never overwrites it |
 | 12 | 4 | `generation` | |
 | 16 | 16 | `store_id` | must equal the store descriptor's |
 | 32 | 16 | `boot_id` | zero where the platform has none |
@@ -361,8 +362,8 @@ exists; a new file is created only when none exists.
 - **Update.** After the batch's sync has returned, the writer writes the whole slot, with one positional write, to
   the slot that does not hold the highest valid `counter`. The writer writes the next batch only after that update
   (`spec.md` §3 Recovery rule 1).
-- **Read.** Read both slots; the mark is the valid slot (magic, version, checksum, store id) with the higher
-  `counter`. One slot is always stable, so a torn or concurrent write costs at most one update of staleness. If
+- **Read.** Read both slots; the mark is the valid slot (magic, known version, checksum, store id) with the higher
+  `counter`; a checksum-valid slot of unknown version is refused as above, never treated as invalid. One slot is always stable, so a torn or concurrent write costs at most one update of staleness. If
   neither slot is valid, a reader retries (8 times, then `MarkUnreadable`); for recovery the mark is unreadable. After
   a power loss the older slot is still a valid mark of any boot for `spec.md` §3 Recovery rule 2.
 - **Boot identity.** Linux: `/proc/sys/kernel/random/boot_id` (a file read). macOS: `kern.bootsessionuuid`, through
@@ -415,10 +416,13 @@ exists; a new file is created only when none exists.
   lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and the
   directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
   store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
-- **Open.** `STORE` valid: open. No `STORE` and no file under `log/`: a creation that did not finish; remove what it
-  left and create again. No `STORE` and a file under `log/`: `NotAStore` (never created over; a directory part-way
+- **Open.** `STORE` valid: open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
+  `STORE.tmp`, and the directories `log/`, `cursors/` and `leases/`, empty): a creation that did not finish; remove
+  what it left and create again. No `STORE` and any other name, a file under `log/` included: `NotAStore` (never
+  created over; a directory part-way
   through a restore is told apart by its restore record, roadmap 8.3). `STORE` invalid: `Corrupt`. Accepted limit:
-  `STORE` is a single local copy, repaired by an operator from the bucket's copy (roadmap 8.3). Every other file's
+  `STORE` is a single local copy until it is uploaded, repaired by an operator from the bucket's copy (`spec.md` §8
+  Deep, roadmap 8.2). Every other file's
   `store_id` must equal `STORE`'s.
 - **`file_id`** is unique per store and kind across all generations and never reused. The next id of a kind is 1 +
   the highest id among local file names of that kind, ids named by any manifest record (a restore record lists every
@@ -461,7 +465,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   + 1, or after a start the next above every epoch named by the last valid record and by any lease file (`spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
-  positions). Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
+  positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 epoch of the corrupt record, `u64`;
+  2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`), the
+  first record of a rebuilt manifest. Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
   `0x25` restore (8.3), `0x26` quarantine and `0x27` tier move (8.1).
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
@@ -471,11 +477,13 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
 - A torn tail and a corrupt record are told apart as `spec.md` §7 Manifest says: a forward search at 8-byte steps
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
   synced.
-- A corrupt record with no copy is fatal (`manifest_corrupt`) and is not rebuilt automatically. So that it can be
-  rebuilt, every file is self-describing: its header and trailer carry everything a publish record says about it
-  (kind, class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). An operator
-  call, `rebuild_manifest` (roadmap 6.3), then writes a new manifest from the local files; lost ranges are found
-  again by the scan and acknowledgements are given again (`spec.md` §7 Manifest).
+- Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
+  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
+  with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator
+  call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
+  (`0x28`), synced, renamed over `MANIFEST`, and the directory synced. The rebuild record is acknowledged by an
+  acknowledgement record carrying its epoch in field 2. What a rebuild cannot recover from local files is open
+  (Q-103).
 
 ## A.15 Cursor file and lease file
 - **Cursor**, `cursors/<name>.cur`, kind 4: an A.1 header then blocks of type `0x30`, **appended**, one per cursor
@@ -503,7 +511,8 @@ to every stored file.
   positions and `i64`; scaled decimal with per-value exceptions and a zstd-compressed XOR fallback; run-length for
   quality, flags and states; 4,096-row blocks behind a directory of first and last `t`. The layout, the per-batch
   `received_at` table and the self-description fields are written by roadmap 6.1. A chunk of a decimal series
-  records its own scale; the encoder may use any scale up to the series' current scale, and readers rescale exactly. The index can be fetched without
+  records its own scale; how that scale relates to the scales of its facts is open (Q-100, Q-101). The index can be
+  fetched without
   the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
 - **Manifest (`kind = 3`).** Framing, the empty, lost-range and acknowledgement records are in A.14. Still to be laid
   out: the publish and retire record (one record publishes a set of files and retires another set atomically, with an

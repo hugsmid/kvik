@@ -35,9 +35,9 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 ## Segment format (proposed)
 One container: a fixed header, then self-delimiting blocks (type, length, CRC32C), and a trailer written on
 seal. Log segments hold arrival batches; compacted segments hold per-series chunks with summaries, then an index.
-Encodings: delta-of-delta timestamps, ALP for decimal values with an XOR fallback, run-length for quality and
-rarely changing values. Safeguards for owning a format: a version in every header, golden files of every version
-read in CI, a fuzzed reader, and a differential check against Parquet throughout development.
+Encodings are those decided by roadmap 2.1 (`format.md` Part B). Safeguards for owning a format: a version in
+every header, golden files of every version read in CI, a fuzzed reader, and a differential check against Parquet
+throughout development.
 
 Compacted data uses this own chunk format, chosen because it fits the use: damage is confined to a checksummed
 block (no single footer to lose), per-file overhead is low for many small per-series chunks, the dependency
@@ -75,7 +75,7 @@ confirms the format against Parquet.
 2. Funnels and live state; delivery benchmark.
 3. Compacted segments, index, encodings; differential check against Parquet; Parquet export.
 4. Summary tree on disk, late-data updates, revisions, calendar levels.
-5. Query integration (a DataFusion table provider) and tier selection.
+5. Query integration (a table provider for a query engine) and tier selection.
 6. Scale test with billions of rows; confirm the own format against Parquet on size, per-file overhead, recovery
    from a damaged file, binary size and decode speed at scale; Parquet stays for export.
 

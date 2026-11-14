@@ -18,6 +18,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
 | Q-86 (b) | §3 Write or sync failure, Disk space | No space at a log write before any sync, checked on a file system that tracks pages |
+| Q-87 | §3 Recovery rules 1 and 3, Order of a start, steps 3 and 6, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
 | Q-90 | §8 Restore step 1, §8 Acknowledging a loss, §11 Health | Whether a restore record's set-aside report holds health degraded |
 | Q-91 | §4 Funnel, Routing, §6 Latch, `api.md` Consuming, row 16 | Funnel identity across configuration, run-time routes and restarts |
@@ -26,8 +27,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
-| Q-100 | §2.1 `decimal scale`, `excess precision`, §5.2, §5.6 | Where the largest stored magnitude is kept, whether the policy may change, and stored nodes across a scale raise |
-| Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise of a reading that was rounded |
+| Q-100 | §2.1 `decimal scale`, `excess precision`, §5.2, §5.6 | Where the largest stored magnitude is kept, whether the policy may change, stored nodes across a scale raise, and a lost raise |
+| Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise, rounded or not |
+| Q-102 | §2.1 `decimal scale`, §2.5 | A finite value too large for `i64` at the series' scale |
+| Q-103 | §7 Manifest, §8 Generations, Tiers | What an automatic manifest rebuild cannot recover from local files |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -269,10 +272,10 @@ nothing reports it as `possible_loss`, since it was never acknowledged and the n
 with the Linux behaviour.
 **Needed.** Whether this is accepted as outside damage (the writer never touches the mark after a failed sync, so a
 half-updated mark cannot arise this way; only a deleted or damaged mark file can), or recovery must tell it apart.
-**Proposal.** For the owner. If accepted, §3 Recovery says that a mark lost on the same boot after a failed sync can
-let an unsynced batch through, like corruption outside the engine. If not, rule 3 on Linux reads an unsealed
-segment's tail from the disk rather than the page cache (for example by evicting its clean pages first), so that it
-keeps only what the disk holds.
+**Owner (gate 3.3).** Not accepted as outside damage: a mechanism is wanted by which recovery keeps only what the
+disk holds, or tells this case apart and reports it. A candidate: rule 3 on Linux reads an unsealed segment's tail
+from the disk rather than the page cache (for example by evicting its clean pages first). To be settled by roadmap
+4.5, with its fault tests.
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
 compilation refuses a change that closes a cycle where "two patterns that one name could match" (§4 Routing), which
@@ -338,7 +341,9 @@ recorded release is the reader's, and the writer adopts a new host release witho
 rules, is trusted as the release the log names, so the derived values of two hosts with the same name can differ.
 (c) The ruling covers readers and calendar results. Not said: which rules a writer that cannot write (read-only after
 a failed sync, §3) uses for its reads, and how a reader of another release gives the other values that depend on
-tzdata (interval starts and displaced readings of calendar-length series, §2.1, §5.4).
+tzdata (interval starts and displaced readings of calendar-length series, §2.1, §5.4). Nor whether a reader whose
+release does not know the site zone or an interval zone answers `QueryError::UnknownZone` (`api.md` Errors) or
+computes as the version in force would, given that reads are not to fail because a release changed.
 **Model.** The model holds several releases and refuses nothing (see "Adopting a tzdata release" in the table below).
 **Needed.** (b) Whether the version must identify the rules (a fingerprint of the zones used) rather than the
 release name. (c) Whether a read-only writer reads as a reader does, and whether interval starts in a reader follow
@@ -386,8 +391,8 @@ middle is not examined. One `resync` delivery carries the state of every funnel 
 consumer or per funnel.
 
 ## Q-100 — Where the largest stored magnitude is kept, whether the policy may change, and nodes across a raise
-**Scenario.** The owner's decimal ruling (§2.1 `decimal scale`, `excess precision`): a raise is refused if the
-largest magnitude stored so far for the series would overflow `i64` at the new scale, and that magnitude is to be
+**Scenario.** The decimal ruling (§2.1 `decimal scale`, `excess precision`): a raise is refused if the largest
+magnitude stored so far for the series would overflow `i64` at the new scale; as proposed, that magnitude would be
 kept per series in the manifest. (a) Manifest records are appended when files are published, retired, moved or lost
 (§7 Manifest), and the last record is not acted on until a successor is synced; the largest magnitude changes with
 facts, at any commit. Recording it there needs a record per new maximum, or a value that lags the log, which the range
@@ -397,10 +402,13 @@ policy (`round`, `refuse`, `auto-raise` with its maximum) is a definition field;
 change it, and from which position or time, is not said. (c) Stored summary nodes of a decimal series hold exact
 `i128` sums (§5.6, bitwise reproducible): at which scale a node is held when the facts it covers were stored at
 different scales, and how rebuild-equals-live holds across a raise (for example, at the highest scale among its
-facts), is not said.
+facts), is not said. (d) A lost raise: the scale is raised from 4 to 5, facts are stored at 5, and the raise entry
+falls in a lost range; it is not appended again (§2.1). The registry then says 4 while kept facts carry 5, and
+rescaling them to the current scale cannot be exact.
 **Model.** Not modelled; the model has no decimal series (see the table below).
-**Needed.** (a) Where the magnitude is kept, or the owner's confirmation of the manifest with the record it needs.
-(b) Whether the policy may change after definition. (c) The scale of a stored node. To be settled by roadmap 5.1, (c)
+**Needed.** (a) Where the magnitude is kept, or confirmation of the manifest with the record it needs. (b) Whether
+the policy may change after definition. (c) The scale of a stored node. (d) The series' scale after a lost raise (for
+example, the highest scale among its kept facts). To be settled by roadmap 5.1, (c)
 by 7.1.
 
 ## Q-101 — A replay across a scale raise of a reading that was rounded
@@ -408,10 +416,34 @@ by 7.1.
 flagged `rounded`. The scale is raised to 5. The adapter replays the same reading: it is now stored as 0.12345, which
 is not identical to the stored fact (§2.4 compares values), so it is recorded as a new fact for the same `t` and
 becomes the current value, a correction nobody made. The same follows from `auto-raise` between a reading and its
-replay.
+replay. A replay with no rounding is affected too: 1.2 stored as 12000 at scale 4, replayed after a raise to 5 as
+120000, is not identical "as stored" and is recorded as a new fact.
 **Model.** Not modelled; the model has no decimal series.
-**Needed.** Whether duplicate identity compares a decimal value at the scale of the fact already stored (so the
-replay, rounded to that scale, is a duplicate), or the replay is recorded. To be settled by roadmap 5.1.
+**Needed.** Whether duplicate identity compares decimal values by their exact value (12000 at scale 4 equals 120000 at
+scale 5), and a rounded fact against the replay rounded to the stored fact's scale, or the replay is recorded. To be settled by roadmap 5.1.
+
+## Q-102 — A finite value too large for `i64` at the series' scale
+**Scenario.** A decimal series at scale 4 receives 1e300 (finite, so not "no value" under §2.5). Its shortest decimal
+representation does not fit `i64` at scale 4, and rounding does not help. No rule says whether it is refused (no
+`Refusal` variant names it), recorded as no value with quality bad as NaN is, or triggers `auto-raise` (which can only
+make it worse).
+**Model.** Not modelled; the model has no decimal series.
+**Needed.** The outcome and its counter. To be settled by roadmap 5.1.
+
+## Q-103 — What an automatic manifest rebuild cannot recover from local files
+**Scenario.** §7 Manifest rebuilds the manifest from the self-describing local files when a corrupt record has no
+copy. Cases the local files do not settle: (a) files held only in deep (evicted) or only in the mirror path: their
+positions look missing, and a local input whose merged output is only in deep would be taken as live beside it; (b)
+the corrupt record was a restore record (§8 Generations): the restored end, the ends carried from earlier
+generations, the set-aside range and the list of files restored from are in no file; (c) a lost range caused by a
+file lost in the bucket (cause 3) or by invalid content (cause 4) is found again only as missing positions, so its
+cause, and an extension's identity, may differ from the original record; (d) deep cannot be reached, so whether a copy
+of the record exists is unknown: for now the store stays read-only (`manifest_corrupt`) until deep answers; (e)
+quarantine and tier-move records (reserved, roadmap 8.1).
+**Model.** Not modelled; manifest records are not corrupted.
+**Needed.** For (a) and (b), whether the rebuild also lists the bucket (needs the object layout of roadmap 8.2); for
+(c), whether a cause may be recorded as unknown; for (d), whether the writer may rebuild without asking deep. To be
+settled by roadmap 6.3, (a) and (b) with 8.2 and 8.3.
 
 ## Open at v0.2
 
@@ -420,8 +452,8 @@ by the roadmap item named here, before that item is done. Until then the model's
 one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/format.md` or calls to `docs/api.md`
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
-changes to both documents (see Settled). Q-87 and Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at
-gate 3.3.
+changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
+Q-87 was reopened there.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -436,6 +468,7 @@ gate 3.3.
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
 | Q-86 (b) | 4.5 | Injected sync errors and full disk |
+| Q-87 | 4.5 | Fault tests; the owner declined the accepted limit at gate 3.3, so a mechanism is wanted |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
@@ -446,6 +479,8 @@ gate 3.3.
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-100 | 5.1 | Series registry; (c) by 7.1; recorded after gate 3.3, from the owner's decimal ruling |
 | Q-101 | 5.1 | Series registry and duplicates; recorded after gate 3.3, from the owner's decimal ruling |
+| Q-102 | 5.1 | Series registry; recorded at the gate 3.3 review |
+| Q-103 | 6.3 | Manifest rebuild; (a) and (b) with 8.2 and 8.3; recorded at the gate 3.3 review |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
@@ -616,7 +651,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-49 (b) | Conditions and live state with no local detail during a restore | §6 Conditions (the state is unknown, not false: the evaluation is skipped and counted, `evaluations_unknown`, the condition keeps its latched state, and the first evaluation with detail is delivered as a transition if it differs from the latched state, or there is none), §2.3 Live state (unknown, not none, for a series whose latest recorded `t` no local fact or stored node holds), §4 Resync and §6 Restart and resume (`resync` reports "unknown" for that funnel, no transition), §8 Restore step 2, invariant 16, §11 Health, `api.md` Consuming, Reading and statistics (`ConditionState::Unknown`, `Live::Unknown`) (open part: Q-84, a state that stays unknown) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
 | Q-52 | Manifest records as single copies, in part | §7 Manifest (a record appended only after the previous record's sync; the last valid record written again in place at every start; a torn tail, dropped, told from a corrupt record by a valid successor; the last record neither uploaded nor acted on irreversibly until a later record is synced; a corrupt record fetched from deep or the mirror path, else read-only with `manifest_corrupt` and no fact lost), §8 Corrupt block (a manifest record not yet uploaded is a single copy; `mirror_path` covers the manifest), invariant 10, `format.md` Part B (open part: Q-52, rebuilding a corrupt record never uploaded, and checking the in-place rewrite on each platform) |
-| Q-52 (a), (c) | Rebuilding a corrupt manifest record never uploaded; a mark without a checksum | §7 Manifest (not rebuilt automatically; every file self-describing; an operator call `rebuild_manifest`, roadmap 6.3; accepted limit), `format.md` A.10 (two checksummed slots), A.14 (open part: Q-52 (b)) |
+| Q-52 (a), (c) | Rebuilding a corrupt manifest record never uploaded; a mark without a checksum | §7 Manifest (every file self-describing; with no copy in the mirror path or deep, the writer rebuilds the manifest from the local files by the procedure of `rebuild_manifest`, continues, and reports `manifest_rebuilt` until acknowledged; open part: Q-103), §11 Health, `format.md` A.10 (two checksummed slots), A.14 (rebuild record; open part: Q-52 (b)), `api.md` Health |
 | Q-60 | Calendar nodes when the expected interval changes | §5.1 density rule (the levels a series stores are fixed by the expected interval its definition gives; a later change moves the staleness limit and keep-alive, never the levels), §5.1 table and §5.7 (calendar nodes for a series that stores the 15-minute level), §5.6 Canonical order (1-minute nodes computed for the merge where they are not stored), row 20a (open part: Q-83, node contents after a past-effective change of the staleness limit) |
 | Q-61 | Identity of a condition delivery, and where its sequence is kept | §4 Order (every condition delivery, on a fact or on the timer, is `(funnel, sequence)`; the sequence is in memory, from 1 at every engine start, and a consumer resuming at a start receives none before that start's `resync`), §4 At-least-once (never delivered twice; the identity holds until the consumer's next `resync`), `api.md` Consuming; no field in `format.md` |
 | Q-62 | Condition transitions while a consumer catches up after overflow | §4 Overflow (funnels evaluated but silent; the present state sent on re-attaching where it differs; transitions in between counted, `transitions_not_delivered`; catch-up reads hot and cold only and ends with `resync` where its next entry is on no local tier), §4 Resync, §8 Behind consumers, `api.md` Health and statistics |
@@ -635,7 +670,6 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 | Q-86 (a) | No space when a log segment is created | §3 Segments (the partial file deleted, health critical, ingest waits, creation retried), `format.md` A.4 (open part: Q-86 (b)) |
-| Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3 (accepted limit, as damage from outside the engine) |
 | Q-93 (a) | A store nobody can open after the host's tzdata changes | §5.7 (readers and drills never refuse; calendar results computed with the reader's own release; a stored calendar node used only where its recorded release is the reader's; the writer checks the host release about once a minute and at each local midnight and adopts a new one without a restart, by a tzdata entry and a rebuild of the affected days), `api.md` Opening and Environment seams (open part: Q-93 (b), (c)) |
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
 | Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |

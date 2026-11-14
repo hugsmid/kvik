@@ -68,9 +68,9 @@ The keys roadmap section 4 needs; all may change between opens.
 |---|---|---|---|
 | `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
-| `log.min_sync_interval` | `Duration` | 10 ms | bounds how often batches are synced (spec §3 Group commit); 0 disables the bound |
+| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: log syncs start at least this far apart, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
-| `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | forced to `EveryCommit` without a boot identity; `EveryCommit` closes the remount limit of spec §3 Recovery rule 1 |
+| `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` closes the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
 | `limits.series_ceiling` | `u32` | 100,000 | |
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
@@ -114,13 +114,13 @@ pub enum EmitError {               // per call
     OutcomeUnknown(Fault) }        // the call's batch may or may not be stored; never acknowledged; re-send after restart
 pub enum OpenError { Locked, NotAStore, StoreIdMismatch { file }, UnsupportedFormat { file, found, supported },
     SiteZoneMismatch { configured, in_force }, UnknownZone, Corrupt { file }, UnsupportedPlatform { reason },
-    Config { key, reason }, Io { path, source } }
+    MarkUnreadable, Config { key, reason }, Io { path, source } }     // MarkUnreadable: Reader::open only (format.md A.10)
 pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { epoch }, NoSpace { path } }
 pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault) }      // any call that appends an entry
 pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid { field, reason }, UnknownZone,
     UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 }, Write(WriteError) }
 pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timestamp> }, AggregateRefused { reason },
-    UnknownZone, NotAvailable { reason }, LostRange { id: Position }, UnsupportedFormat { file }, Corrupt { file },
+    UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source } }
 ```
 Funnel compilation errors (`RouteCycle` among them) and backup errors are added by roadmap 5.2 and 8.2.
@@ -314,7 +314,7 @@ pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }
 pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64 }, DiskCritical { free: u64 },
-    SealBlocked { file_id: u64 }, MarkSyncedEveryCommit }
+    SealBlocked { file_id: u64 }, ManifestRebuilt { epoch: u64, at: Timestamp } }
 pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost | PossibleLoss */,
     pub cause: LossCause /* Corruption | TruncatedTail | LostInBucket | InvalidContent */,
     pub first: Option<Position>, pub last: Option<Position>, pub file_id: Option<u64>, pub bytes: u64,
@@ -323,10 +323,12 @@ pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost |
     pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool }
 pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for ever; Store and Reader
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
+pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
-// LogStats { durable: Position, mark_synced: Position, open_file_id, sealed_segments, bytes }   ClockStats { jumps, last: Option<ClockJump> }
+// LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
+//            open_file_id, sealed_segments, bytes, manifest_rebuilds }   ClockStats { jumps, last: Option<ClockJump> }
 pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, duplicates_dropped, duplicates_unchecked,
                                                                    // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts,
                                                                    // rounded, scale_raises
@@ -336,7 +338,10 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is acknowledged; a
   `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
   a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
-  no copy is the fault `ManifestCorrupt` (spec §7 Manifest).
+  no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`;
+  while deep cannot be reached to tell whether a copy exists, it is the fault `ManifestCorrupt` (spec §7 Manifest).
+  `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
+  reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
   calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,
@@ -401,7 +406,8 @@ pub trait FsFile: Send + Sync {
 - There is no memory mapping: every byte the engine persists passes a seam call, so the test file system can drop
   unsynced writes (the mark's included) at a simulated power loss and model Linux's failed writeback per page.
 - `TzSource::current` returns one release as a whole, so a computation never mixes two releases. The writer calls
-  it at open, about once a minute and at each local midnight (spec §5.7); a reader calls it at open.
+  it at open, about once a minute and at each local midnight (spec §5.7); a reader calls it only at open, so a
+  long-lived `Reader` sees a host tzdata update only when it is opened again (accepted).
 - `Clock::synchronised` has no portable source without unsafe code: the system clock reports `true` unless the
   application supplies a probe (`SystemClock::with_sync_probe(impl Fn() -> bool)`); an accepted limit, documented.
 - The test implementations inject crashes at every write and sync, failed syncs, a full disk, clock jumps, a
