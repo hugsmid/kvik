@@ -18,7 +18,7 @@ records the choices decided between alternatives. The byte-level format will be 
 ### 2.1 Series
 | Field | Rule |
 |---|---|
-| `id` | u32, assigned once by the registry, never reused |
+| `id` | u32, assigned once by the registry, never reused among the entries the store holds (after a restore, §8 Restore step 1) |
 | `name` | `<instance>/<device>/<metric>`; a rename adds an alias, the id is unchanged; a name maps to its active series |
 | `kind` | `gauge`, `counter` (cumulative), `state` (named or boolean), `text` (UTF-8, ≤ 255 bytes), `interval` (an amount over a fixed interval) |
 | `value type` | gauge/counter/interval: `f64`, or `i64` with a declared `decimal scale` (exact); state: u16 index into declared names or bool |
@@ -34,11 +34,18 @@ records the choices decided between alternatives. The byte-level format will be 
 | `retention class` | `long-term` (default) or `diagnostic` with a retention period (default 30 days), for series kept mainly for short-term diagnosis, such as a machine's own resource metrics. It decides only where raw detail is kept (§8 Retention class), never which facts exist. A change of class is a registry entry that takes effect at its position, not by event time; it moves no detail back |
 | `timing` | `observed` (default), `scheduled` or `forecast`; fixed for the life of the series. **Scheduled:** values known in advance that take effect at their `t`, such as published prices; a scheduled source that revises its values must be versioned. **Forecast:** values about future times, re-issued over time; the series must be versioned with `changed_at kind` `time`, `changed_at` being the issue time and `t` the valid time. The engine does not report a silent forecast source: its adapter emits an observed series with an expected interval on each successful fetch, to which stale-for applies |
 
-Series definitions, parameter changes (with an effective event time, except a change of retention class, which
-takes effect at its position), aliases and retirements are log entries. A parameter other than the retention class
-applies to readings with `t` at or after its effective time. A definition entry always has a lower
-position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
-registry file that stays on the hot tier (tree checkpoints carry a copy, §8).
+Series definitions, parameter changes (with an effective event time, except a change of retention class, which takes
+effect at its position), aliases and retirements are log entries. A parameter other than the retention class applies
+to readings with `t` at or after its effective time. A parameter entry whose effective time is earlier than readings
+already recorded is applied to the tree like late data (§5.6): every stored node of the series from its effective time
+on is recomputed from facts under the parameters now in force, removed where its span no longer qualifies for its
+level (§5.1) and created where it newly does, calendar nodes following their quarter-hours. Until that is complete,
+every result using a stored node of the series from the effective time on is flagged `summary_stale`, and the tree
+file's checkpoint stays below the entry's position. It is complete when every such node is recomputed, removed,
+created, or, where its detail is not local, individually flagged `summary_stale` to be recomputed when the detail is
+fetched (§5.6). The stored nodes are thus the same whatever order parameter entries and facts arrived in. A definition
+entry always has a lower position than the series' first reading (the same batch is allowed). Registry entries are
+also compacted into a registry file that stays on the hot tier (tree checkpoints carry a copy, §8).
 
 **Retirement** is effective at `t_r`: facts with `t < t_r` are still accepted; facts with `t ≥ t_r` are refused
 and counted. The old id stays reachable by id.
@@ -95,11 +102,11 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
   series `revise` is refused and counted; a return to an earlier value there is a fact with a higher `changed_at`.
 - A reading recorded without a value (§2.5) is compared as "no value", with its adapter-supplied quality.
 - Identity includes `t`: the same value one nanosecond later is a different fact and is recorded.
-- **Revised-key index** (hot tier, never moves): for every `(series, t)` with more than one recorded fact, the exact
-  value, adapter-supplied quality and `changed_at` of each. For any other key, history holds at most the current
-  fact, which is compared directly.
-- **Version index** (hot tier, never moves, backed up): for every key of a versioned series, its highest recorded
-  `changed_at`. The rank of an arriving fact is therefore known whenever the index is local.
+- **Revised-key index** (hot tier, never moves; carried by each tree checkpoint, §8): for every `(series, t)` with
+  more than one recorded fact, the exact value, adapter-supplied quality and `changed_at` of each. For any other key,
+  history holds at most the current fact, which is compared directly.
+- **Version index** (hot tier, never moves; carried by each tree checkpoint, §8): for every key of a versioned series,
+  its highest recorded `changed_at`. The rank of an arriving fact is therefore known whenever the index is local.
 - **Fast path:** a fact with `t` later than the series' latest recorded `t` cannot be a duplicate; no lookup. Other
   facts are checked against the in-memory recent window (§5.1) before any index probe.
 - If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure or retention class),
@@ -190,11 +197,13 @@ a different boot. The rules apply in this order:
 | 15 minutes | Yes, aligned to UTC, only where there is data | per-series tree files on hot; never moves |
 | Local calendar day/month | Yes, for spans whose edges fall on 15-minute boundaries (§5.7) and throughout which the series' expected interval in force qualifies it for a stored 15-minute level (density rule; interval series §5.4), whether or not a given quarter-hour has data, assembled from 15-minute nodes in the site zone in force; an input to calendar results, not the result (§5.7) | per-series calendar file on hot |
 
-- **Density rule:** a level is stored for a series only where its nodes summarise many facts: the 1-minute
-  level only for series whose expected interval is 5 s or shorter, the 15-minute level only for 60 s or shorter.
-  A sparser series answers those levels from its facts directly, so a stored level is never larger than the
-  data it summarises. Such a series stores no calendar nodes either: its calendar results are window evaluations
-  over its facts (§5.7).
+- **Density rule:** a level is stored for a series only where its nodes summarise many facts: the 1-minute level only
+  for series whose expected interval is 5 s or shorter, the 15-minute level only for 60 s or shorter. A node of either
+  level is stored only for a span throughout which the expected interval in force qualifies; a minute or quarter-hour
+  in which a change of expected interval crosses the threshold stores no node and is answered from its facts. A
+  sparser series answers those levels from its facts directly, so a stored level is never larger than the data it
+  summarises. Such a series stores no calendar nodes either: its calendar results are window evaluations over its
+  facts (§5.7).
 - Memory holds only open nodes per series, a node cache, and a **recent window** of raw facts per series
   (default 15 minutes, at most 1 024 facts, and for an interval series at least its interval length) for the newest
   window edge and the duplicate fast path.
@@ -293,7 +302,7 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
 | `now` | The window clock: an engine UTC clock that never runs backwards: max(system clock, previous value), advanced by the monotonic clock. |
 | Evaluation | Whole stored nodes in the middle; at each edge, the partial minute is computed from raw facts (the recent window when the edge lies within it, the edge chunk otherwise). Exact to the nanosecond. Nodes whose span extends past the credit limit are never used whole. |
 | Edge stretches | Leading: from the window start to the first reading inside, credited with the last reading before the start if within its S. Whatever S, the counter step and the state transition from the last reading before the start to the first reading inside are credited to this window. Trailing: from the last reading to min(window end, credit limit, last.t + S). Time is never credited past the **credit limit**: `now` for an observed series, the window end for a scheduled or forecast series, whose values are known in advance. |
-| Old spans | If an edge's raw detail is not local, the edge is evaluated at 1-minute precision and the result is flagged `approximate_edges`. |
+| Old spans | A window never reads off-machine data. Where an edge's raw detail is not local (moved under §8, or counted as not local during a restore, §8 Restore), the edge moves inward to the nearest node boundary of the finest level stored for the series there, or, where it stores none, to the nearest instant from which all its detail to the other edge is local. The result gives the span evaluated (`from`, `to`) and is flagged `approximate_edges`. Where no span remains the result is the error `detail_not_local`, never an empty result. |
 | Cache | The merged middle is cached with the versions of its nodes and invalidated when any changes (late data included). |
 | Cadence | A windowed funnel is evaluated on each routed fact that is not outranked (§4) and on a timer every 1 s (configurable per funnel). A fact of a scheduled series is fed to a condition, or to an operator that is not windowed, only once `t ≤ now` (a windowed operator sees it at commit), and a condition funnel over a scheduled series is also evaluated on the timer, so a value taking effect is seen. A condition over a forecast series needs a windowed operator; any other is rejected when funnels are compiled. |
 | Conditions | Threshold with a separate clear level, on change (optional dead-band), held for N seconds, stale for N seconds. |
@@ -333,11 +342,11 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
 |---|---|---|
 | Hot | fast local disk | log segments < 90 days, current detail, revised-key index, version index, chunk indexes, registry, the whole stored tree |
 | Cold (optional) | another local path | older revision chunks and sealed log segments; moved current detail |
-| Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints, generation claims |
+| Deep | S3-compatible bucket, via a pluggable backup sink | every sealed file, every manifest record, tree checkpoints (with the registry, latest `t`, revised-key index and version index), generation claims |
 
 | Rule | |
 |---|---|
-| Continuous backup | Each sealed file is queued for upload once; upload never blocks ingest or delivery. After its files, each manifest record is uploaded; a tree checkpoint at least daily, and only after all log up to its position is backed up. Each tree checkpoint carries the registry file and each series' latest recorded `t`, as of its position. Cursor files are not backed up. |
+| Continuous backup | Each sealed file is queued for upload once; upload never blocks ingest or delivery. After its files, each manifest record is uploaded; a tree checkpoint at least daily, and only after all log up to its position is backed up. Each tree checkpoint carries the registry file, each series' latest recorded `t`, the revised-key index and the version index, as of its position. Cursor files are not backed up. |
 | Encryption | On the machine before upload, once per file; key supplied by the embedding application. |
 | Hashes | The manifest records SHA-256 of the plaintext at seal (hot and cold verification) and, per upload, SHA-256 of the ciphertext, sent with a single-part upload. The bucket must reject a mismatch and its reported hash must equal the manifest's; only then is the file backed up. Scheduled check: re-read reported hashes; sampled download-decrypt-verify proves key and content. |
 | Bucket | The engine never deletes from it. Versioning or object lock required. |
@@ -349,37 +358,74 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
 | Upload stalled | Files queue locally, health degraded, nothing evicted. |
 | No deletion | Every fact is kept forever in at least the deep tier; the engine has no purge. |
 | Re-ingest | Exported or foreign data goes through the normal ingest path, in batches. |
-| Restore drill | The restore procedure is testable end to end; operators should exercise it regularly. A drill restores read-only and claims nothing. |
-| Generations | Before accepting ingest, a restore claims the generation one above the highest claimed, by a create-if-absent marker in the bucket; if the marker already exists it takes the next. Manifest records are keyed by generation, and a restore reads those of the highest generation claimed before its own. A writer that finds a higher generation claimed stops uploading and becomes read-only (fatal health, §3). A restore from a bucket with no manifest records is refused. |
+| Restore drill | The restore procedure is testable end to end; operators should exercise it regularly. A drill restores read-only, claims and uploads nothing, and keeps its restore record locally. |
+| Generations | The first store of a bucket writes generation 0, which counts as claimed. Before accepting ingest, a restore claims the generation one above the highest claimed, by a create-if-absent marker in the bucket; if the marker already exists it takes the next. A claim is never withdrawn, also when its restore fails. Manifest records are keyed by generation. Every generation above 0 begins with its **restore record**: its generation, checkpoint and restored end, the restored ends carried from the restore record it read (each with its generation), and every file it restores from, with hash and tier. The records of one generation are therefore complete without those before it, and a restore reads the records of the highest generation below its own that has any in the bucket. The restore record is synced locally, then uploaded before any other file of its generation; the restore then reads the claims again and, if a generation above its own is claimed, stops before accepting ingest (superseded, fatal health). A writer that finds a higher generation claimed stops uploading and becomes read-only (fatal health, §3); what it uploads after the later restore has read its records stays in the bucket, in no later generation's records, and is lost to them as in a disaster. A restore keeps the store id of the files it restores (`format.md` file header), and backup is refused on a bucket that holds files of another store id. A restore from a bucket with no manifest records is refused. |
 
 **Restore** (onto an empty disk):
-1. Claim a generation (Generations above) and read the manifest records of the highest generation claimed before it.
-   The **restored end** is the last position before the first gap in the restored log that is not a recorded lost
-   range (§3). Write one manifest record (generation, checkpoint, restored end) before ingest is accepted. Download
-   the latest tree checkpoint at or below the restored end (labelled derived-unverified), with its registry file and
-   latest `t` per series, and the sealed log segments after its position; replay them into the tree. With no
-   checkpoint, download the whole sealed log. Segments beyond the restored end are downloaded and kept but
-   quarantined: outside views, trees and delivery, reported in health like a lost range, and available for re-ingest.
-   Positions of the new generation start at sequence 1.
-2. The store serves queries at ≥ 1-minute resolution, flagged `restoring`, and accepts ingest. Until the revised-key
-   index is back, facts whose `t` is at or before the latest `t` known for their series (from the checkpoint or the
-   restored log) and which match no local fact are recorded and counted `duplicates_unchecked`. A consumer without a
-   cursor is treated as beyond the restored end; one that kept its last confirmed position registers with
-   `start: position`. A cursor of an older generation at or below the restored end receives the facts after it up to
-   the restored end through catch-up, flagged `replayed`, if their segments are local; otherwise §4 Resync applies.
-   Every consumer then receives `generation_changed` and `resync`, and resumes at the new generation's first
-   position.
-3. Download current chunks and the revised-key index, then revision chunks and log segments. A position present in
-   two files is one fact and must have identical content.
+1. Claim a generation and read the manifest records it restores from (Generations above). Each restore record, the
+   carried ones and the new one, **sets aside** the positions above its restored end in the generations below its own;
+   a position set aside once stays so in every later restore. The **restored log** is the positions held by the listed
+   files that are not set aside. The **restored end** is its last position before the first gap that is not a recorded
+   lost range (§3), taken in position order, a generation following the restored end before it at sequence 1. The scan
+   for that gap starts above the restored end of the restore record read (with none, at the first position): what lies
+   at or below a recorded restored end was settled by that restore, and a file missing there is a failure of this
+   restore (below), not a new restored end. Write and upload the restore record (Generations above) before ingest is
+   accepted. Download the latest tree checkpoint at or below the restored end (labelled derived-unverified), with its
+   registry file, latest `t` per series, revised-key index and version index, and the sealed log segments after its
+   position; replay them into the tree, which brings the registry, latest `t` and version index up to the restored
+   end. With no checkpoint, download the whole sealed log. Positions set aside are kept, not served: the log segments
+   holding them are downloaded in this step and are then files like any other (compaction and tiering move them
+   losslessly), and they are excluded by position from views, trees, indexes, the registry, delivery and catch-up, in
+   the writer and in reader processes, which take the restored ends from the restore record. Queries do not see them
+   and return no error for them. A definition entry set aside keeps its id reserved in the registry and nothing else:
+   a new series never takes that id, and its name is free. Health reports each restore record's set-aside range (first
+   and last position, number of facts, commit times at both ends), derived from the record at every start. The engine
+   never re-ingests them: the operator exports them, each fact under the name its own definition gives, and submits
+   what is wanted through Re-ingest, where the duplicate rule drops what is already recorded. An id defined only in
+   files that were never backed up, or uploaded by a superseded writer after the restore read its records, is in no
+   file the store holds and can be assigned again. Positions of the new generation start at sequence 1.
+2. The store serves queries, flagged `restoring`, and accepts ingest. Until the restore ends, detail at or before a
+   series' latest restored `t` counts as not local (Failures and end below), so results come from the checkpoint's
+   nodes under §6 Old spans, at the resolution of each series' stored levels; a result that needs facts that are not
+   local (a resolution below the series' finest stored level, or a series with no stored level) is the error
+   `detail_not_local`. Until the current chunks are back, facts whose `t` is at or before the latest `t` known for
+   their series (from the checkpoint or the restored log) and which match no local fact and no entry of the
+   revised-key index are recorded and counted `duplicates_unchecked`. A key that gains a second fact meanwhile, in the
+   replay or by ingest, has its index entry completed when its chunk is back. The rank of an arriving fact on a
+   versioned series is known from step 1 on, the version index being exact at the restored end (from the checkpoint
+   and the replay; with no checkpoint, from the whole log). A consumer without a cursor is treated as beyond the
+   restored end; one that kept its last confirmed position registers with `start: position`. A cursor of an older
+   generation at or below the restored end receives the facts after it up to the restored end through catch-up,
+   flagged `replayed`, if their segments are local; otherwise §4 Resync applies. Every consumer then receives
+   `generation_changed` and `resync`, and resumes at the new generation's first position.
+3. Bring back the files the restore record places on the hot tier, and on the cold tier where one is configured:
+   current chunks, then revision chunks and log segments. Other files stay in deep and are fetched on demand as
+   before. A position present in two files is one fact and must have identical content.
 4. When detail for a span is back, recompute its nodes from facts and compare with the checkpoint; any difference
-   is reported and the recomputed value wins. The checkpoint label is removed when all detail has been verified.
+   is reported and the recomputed value wins. The checkpoint label is removed when the detail the restore brings
+   back has been verified (Failures and end below).
 
-A restart after the restore record is written resumes the restore in its generation, fetching the files listed by
-the manifest records it restores from that are not yet local.
+A restart after the restore record is written resumes the restore in its generation, uploading its restore record if
+that had not finished, and fetching the files its restore record lists that steps 1 and 3 bring back and are not yet
+local.
 A crash before the record starts the restore again with the next generation.
 
-A disaster loses facts in files not backed up, which may already have been acted upon, and those beyond the first
-gap until they are re-ingested.
+**Failures and end.** The restore record is written before any file is downloaded, so a restore that stops before it
+leaves nothing local; `restore` refuses a directory that holds files and no restore record. Until step 1 is complete
+no ingest is accepted: a failure in it leaves the engine down with fatal health (`restore_failed`, naming the file)
+and a restart resumes it. After that, a file that cannot be fetched, that the bucket no longer holds or whose
+plaintext hash fails is retried, with degraded health naming it and the reason, while the others continue; the
+restore stays in progress. A file holding a position whose content differs from a local copy is not installed;
+health names both files and the restore stays in progress until an operator acts. The store is `restoring` from the
+restore record until every file step 3 brings back is installed; this follows from the record and the local files
+and is not recorded. While `restoring`, every query result carries the flag, detail at or before a series' latest
+restored `t` counts as not local (§6 Old spans, §5.6), and no tree checkpoint is taken. The `derived-unverified`
+label goes when every span whose detail the restore brings back is verified, which can be earlier; nodes over detail
+that stays in deep are not verified by the restore. Progress (files and bytes remaining) is a statistic, not a health
+condition.
+
+A disaster loses facts in files not backed up, which may already have been acted upon, and the positions set aside
+(step 1) until they are re-ingested.
 
 ## 9. Edge cases
 | # | Case | Rule | Test |
@@ -412,7 +458,8 @@ gap until they are re-ingested.
 | 18a | Counter wraps, glitches low, or is silent for hours | `wrap_at` rule; regression (0, counted); full step credited after the gap, coverage shows it and rate is flagged | property |
 | 19 | Correction changes a node's min or max | Minute recomputed from facts, ancestors from children | property |
 | 20 | DST changes | UTC levels unaffected; local days of 92–100 quarter-hours, evaluated as windows over their spans | property |
-| 20a | Calendar day or month of a series with no stored 15-minute level (expected interval above 60 s; an interval series with d = 30 min), or of a span in which the expected interval crosses the threshold | No calendar node; the result is a window over its facts and any stored nodes inside the span | property |
+| 20a | Calendar day or month of a series with no stored 15-minute level (expected interval above 60 s; an interval series with d = 30 min), or of a span in which the expected interval crosses the threshold; or a minute or quarter-hour in which it crosses | No calendar node (for a minute or quarter-hour, no node of its level); the result is a window over its facts and any stored nodes inside the span | property |
+| 20b | Parameter change with a past effective time | Nodes from the effective time recomputed, removed or created; `summary_stale` meanwhile; equal to a rebuild | property |
 | 21 | Site zone changed, or tzdata changes its rules | Calendar nodes rebuilt from the effective time / affected days only; logged | integration |
 | 21a | Calendar query in a named zone whose offset is not a multiple of 15 minutes (historical offsets); or, on an interval series, a multiple of 15 minutes but not of d (+05:45 with d = 30 min) | Days taken in that zone for the whole span; no stored calendar node used; evaluated as a window over the UTC data, with facts at its edges; an interval crossing a day edge is apportioned (§6) | model (roadmap 1.6) |
 | 22 | System clock jumps | Timers of observed series monotonic; future-fact maturity and scheduled values follow `now`; window `now` never runs backwards; `commit_time` monotonic | unit |
@@ -422,9 +469,9 @@ gap until they are re-ingested.
 | 25 | Series retired at `t_r` | Facts with `t < t_r` accepted; later refused and counted | integration |
 | 26 | Reader holds an old epoch | Its files stay while its lease names that epoch and its counter keeps changing; leases of a different boot are void | integration |
 | 27 | Bucket unreachable for days | Queue grows, no eviction, degraded health | fault injection |
-| 28 | Restore onto an empty disk | New generation, claimed in the bucket; queries at ≥ 1 min from the checkpoint; detail back-fills and verifies the checkpoint; segments beyond the first gap quarantined | restore drill |
+| 28 | Restore onto an empty disk | New generation, claimed in the bucket; queries from the checkpoint's stored levels; `detail_not_local` where facts are needed and not back; detail back-fills and verifies the checkpoint; positions beyond the restored end set aside, reported, ids reserved | restore drill |
 | 28a | Crash or reboot during a restore | Resumes in its generation from the restore record; before the record, starts again with the next generation | kill loop |
-| 28b | Two restores from one bucket, or a drill beside a live store | Each restore claims its own generation; a writer that finds a higher one stops uploading; a drill claims nothing | fault injection |
+| 28b | Two restores from one bucket, or a drill beside a live store | Each restore claims its own generation; a writer that finds a higher one stops uploading; of two concurrent restores, the one that finds the higher claim after uploading its record never accepts ingest; a drill claims nothing | fault injection |
 | 29 | Late fact for a minute whose detail is not local | Recorded; node `summary_stale` until fetched | model |
 | 30 | Very many series | Memory per series bounded and documented; ceiling (default 100,000) refuses new series clearly | load test |
 | 31 | Value NaN or infinite, or a negative counter value | Recorded as bad quality without a value; counted | unit |
@@ -447,16 +494,17 @@ gap until they are re-ingested.
 2. Every delivered position is durable, except where invariant 10 allows a loss (a lost range under §3 Recovery rule 2, or a tail truncated by rule 3); every durable position routed to a consumer is delivered to it, or
    superseded by a `resync` covering it.
 3. For any consumer, fact deliveries are in position order.
-4. The current view equals "highest rank per `(series, t)`" (§2.2) over all facts in all tiers, quarantined segments
+4. The current view equals "highest rank per `(series, t)`" (§2.2) over all facts in all tiers, positions set aside
    (§8 Restore) excepted.
 5. Every stored node is bitwise equal to its canonical computation over the current view of its span (nodes flagged
    `summary_stale` excepted).
 6. `merge` is associative with the empty node as identity and agrees with direct computation (tolerance §5.6).
-7. A window result equals direct computation over the current view at evaluation time (tolerance §5.6).
-8. Rebuilding derived structures from log entries yields exactly the live structures.
+7. A window result equals direct computation over the current view at evaluation time (tolerance §5.6; results
+   flagged `approximate_edges` or `summary_stale` excepted).
+8. Rebuilding derived structures from log entries yields exactly the live structures (once no recompute under §2.1
+   is pending).
 9. Compaction, tiering and backup preserve the set of positions outside lost ranges, each with identical content;
-   restore preserves the positions held in sealed, backed-up files up to the restored end, and keeps later ones
-   quarantined.
+   restore preserves the positions of the restored log (§8) and keeps the positions set aside.
 10. No operation removes a durable fact. The only losses short of a disaster are corruption of a log segment, open
     or sealed, with no other copy (§3 Recovery, §8 Corrupt block), which is recorded as a lost range and reported as
     `data_lost`, and a tail truncated by §3 Recovery rule 3 after a reboot or with the mark lost, reported as
@@ -471,7 +519,7 @@ gap until they are re-ingested.
     `revise` applies to series that are not versioned.
 16. After resume, every condition true now is delivered once in `resync`.
 17. For a counter, increases over adjacent windows sum to the increase over their union; for a state series, so do
-    transitions (each step or transition credited once).
+    transitions (each step or transition credited once; results flagged `approximate_edges` excepted).
 18. No time is credited past the credit limit (§6) or past a reading's validity: its staleness limit, or for an
     interval reading its interval (counter steps excepted).
 19. For a source whose `changed_at` rises with every revision, re-submitting readings already recorded on a versioned
@@ -481,7 +529,7 @@ gap until they are re-ingested.
 21. A window result over a scheduled or forecast series is a function of the current view and the window's bounds
     alone (tolerance §5.6; results flagged `approximate_edges` or `summary_stale` excepted).
 22. For an interval series, the sums over adjacent windows add up to the sum over their union (within the §5.6
-    tolerance where an interval is apportioned).
+    tolerance where an interval is apportioned; results flagged `approximate_edges` excepted).
 
 ## 11. Interfaces and configuration (outline; signatures follow in the API document)
 | Interface | Contents |
@@ -489,7 +537,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost. Each report carries what is known of its range: positions, bytes and the commit times of the batches on either side. Query results carry no flag for a lost range: the engine knows its positions, not the series and times it held |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost. Each report carries what is known of its range: positions, bytes and the commit times of the batches on either side. Query results carry no flag for a lost range: the engine knows its positions, not the series and times it held. Each restore record's set-aside range, and `restore_failed` (§8 Restore) |
 
 Every default in this document is a configuration key, with its unit where it is defined; the decided choices D1–D7
 (§12) are rules, not configuration keys. Byte-level format,
@@ -516,12 +564,12 @@ size, which need compaction and the tree: roadmap sections 6, 7 and 10), and may
 | Funnel budget ≤ 1 µs | Benchmark per-reading routing and a 24 h rolling average with cached middle | Budget excludes windowed conditions; cadence-only evaluation |
 | Batch tree update cost | Backfill at a stated target rate through normal ingest, with late facts | Larger batches for re-ingest |
 | Duplicate check on replay | 1 hour × 100 series replay; probes outside the recent window | Larger recent window |
-| Forecast series | Revised-key index size, chunk overlap and duplicate probes below the latest `t`, since every key of a forecast series is revised by design | Keep fewer issues hot; larger recent window |
+| Forecast series | Revised-key index size (on hot and in each tree checkpoint), chunk overlap and duplicate probes below the latest `t`, since every key of a forecast series is revised by design | Keep fewer issues hot; larger recent window |
 | Tree size | Bytes per series-year per level on real data | D7 alternative |
 | Hot disk during 90-day log retention | Log plus compacted bytes per day at expected load | D4 rule; earlier move to cold |
 | Restart ≤ 1 s | Start time with 100,000 series and 60 s of log after the checkpoint | Shorter checkpoint interval |
 | Calendar results from facts | Time for a year of monthly results on a series just above the 60 s threshold (about 525,000 facts) | Store day nodes for such series, folded from facts in `t` order |
-| Version index size | Bytes per series-year on hot for versioned series at their real reading rates | Keep index entries only for keys that were revised or are recent |
+| Version index size | Bytes per series-year on hot, and in each tree checkpoint, for versioned series at their real reading rates | Keep index entries only for keys that were revised or are recent |
 | Deep object count | Objects per year and restore time from deep | Larger seal size for sealed-log uploads |
 | Bucket SHA-256 checksums | Confirm the bucket provider's S3 API rejects a mismatched single-part SHA-256 | Hash in object metadata plus sampled downloads |
 | Memory per series | Resident bytes per series at the ceiling | Lower ceiling; smaller recent window |

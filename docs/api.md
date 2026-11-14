@@ -78,7 +78,7 @@ while let Some(d) = consumer.next().await {
 }
 ```
 - A delivery carries `id` (position, or funnel and sequence for timer deliveries), `flags` (`replayed`,
-  `future`) and the times needed to judge its age.
+  `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
 - `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.
 - On `Resync` the consumer must forget every position it has seen above its durable cursor as recovered, which can
   lag its last confirmation: after a power loss such a position can name a different fact (spec §3 Recovery rule 3,
@@ -101,6 +101,9 @@ let day = reader.calendar_in(id, date, zone, Aggregate::Integral)?;   // a named
 - Data is stored in UTC; a zone only defines calendar days and months. `calendar` uses the site zone in force at
   each day's start; `calendar_in` and calendar windows that name a zone use that zone throughout, evaluated as a
   window over the UTC data (spec §5.7).
+- Every result type carries the flag `restoring` while a restore is bringing detail back (spec §8 Restore);
+  `WindowResult.flags` also carries `approximate_edges`, with `from` and `to` giving the span evaluated (spec §6
+  Old spans). A window with no span over local detail is the error `DetailNotLocal`, never an empty result.
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 
@@ -110,7 +113,9 @@ let h: Health = store.health();     // Ok, Degraded { reasons }, ReadOnly { caus
 let s: Stats = store.stats();       // per series and per consumer counters, commit latency, queue depths,
                                     // time behind, disk marks, backup lag
 ```
-Every refusal, drop, repeat and delay the specification says is counted appears here.
+Every refusal, drop, repeat and delay the specification says is counted appears here. Health reasons include
+`restore_failed` (naming the file) and the set-aside range of each restore record; statistics include restore
+progress (files and bytes remaining), which is not a health condition (spec §8 Restore).
 
 ## Backup and restore
 ```rust
@@ -121,7 +126,8 @@ trait BackupSink {
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 store.attach_backup(sink, Encryption::Key(key)).await?;
-Store::restore(dir, sink, Encryption::Key(key), RestoreMode::SummariesFirst).await?;
+let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode::SummariesFirst).await?;
+let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
 ```
 The sink has no delete. An S3-compatible implementation lives in a separate crate.
