@@ -91,8 +91,8 @@ compaction (§7) or out of step 3's "log segments", where they would re-enter th
 "queries return an error" in §8 Corrupt block, and it is not said who triggers their re-ingest.
 **Model.** Positions of older generations beyond the restored end are kept and excluded by position from views,
 trees, the registry and delivery, wherever compaction moves them. They are not reported, their series ids are not
-reserved (so (a) applies), reader epochs still read them, and re-ingest is not modelled. A drill sets aside only
-positions of generations below the highest in the bucket.
+reserved (so (a) applies), reader epochs still read them, and re-ingest is not modelled. A drill sets aside what
+the restore it rehearses would set aside.
 **Needed.** How these segments are held, named and reported, which ids they reserve, and how re-ingest is started.
 
 ## Q-39 — Failures during a restore, and when it ends
@@ -317,7 +317,7 @@ generation claimed stops uploading and becomes read-only (`tests/rules.rs` `s8_�
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; `resync` to every consumer after it | §3 Durable mark, §3 Recovery rule 3, §4 Resync, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
 | Restore record and resuming a restore | §8 Generations, §8 Restore step 1 and the paragraph after step 4, row 28a (see Q-32, Q-37, Q-39) | No restore record; manifest records are not keyed by generation, and a restore reads every file in the bucket whatever its generation, so a second restore finds the first restore's gap again and sets aside the generation that restore started (see Q-37); a restore completes in one call, so a restart has nothing to resume | — |
 | Restore from a checkpoint, step by step | §8 Continuous backup, §8 Restore steps 1–4, row 28: tree checkpoint with registry and latest `t`; queries at ≥ 1 minute flagged `restoring`; detail back-filled and compared with the checkpoint | No checkpoints; restore downloads files (current chunks first, optionally) and rebuilds; no `restoring` flag | `restore_onto_empty_disk_current_first` |
-| Segments beyond the restored end | §8 Restore step 1: quarantined, reported in health like a lost range, available for re-ingest (see Q-38) | Kept and excluded by position from views, trees, the registry and delivery; not reported; their series ids are not reserved; reader epochs (§7) still read them; a drill takes the highest generation in the bucket as its own, so it keeps that generation's positions beyond the gap in its views | `tests/rules.rs` `s8_restored_end_before_first_gap` |
+| Segments beyond the restored end | §8 Restore step 1: quarantined, reported in health like a lost range, available for re-ingest (see Q-38) | Kept and excluded by position from views, trees, the registry and delivery; not reported; their series ids are not reserved; reader epochs (§7) still read them | `tests/rules.rs` `s8_restored_end_before_first_gap` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
 | `duplicates_unchecked` during a restore | §2.4, §8 Restore step 2 | Not modelled: all detail is back before ingest is accepted, so the duplicate check always runs | — |
 | Invariants 12–16 | §10 | Not checked yet | — |

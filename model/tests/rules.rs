@@ -615,6 +615,40 @@ fn s8_restored_end_before_first_gap() {
     assert_eq!(got, vec![Position::new(0, 5)]);
 }
 
+/// §8 Restore drill: a drill sets aside what a restore would, so positions
+/// beyond the first gap stay out of its views.
+#[test]
+fn s8_drill_sets_aside_beyond_restored_end() {
+    let (mut m, s) = backed_up_model(); // positions 0:1 to 0:5 backed up
+    m.ingest(vec![Reading::num(s, T0 + 10 * SECOND, 10.0)])
+        .unwrap(); // 0:6
+    m.seal_active();
+    let missing = *m.disk.files.keys().next_back().unwrap();
+    m.ingest(vec![Reading::num(s, T0 + 11 * SECOND, 11.0)])
+        .unwrap(); // 0:7
+    m.seal_active();
+    m.upload();
+    m.disk.bucket.objects.remove(&missing);
+    let r = Model::restore_with_cursors(
+        m.config.clone(),
+        vec![],
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(m.disk.bucket.claims.is_empty());
+    assert_eq!(r.disk.restored_end, Some(Position::new(0, 5)));
+    assert!(
+        r.facts()
+            .unwrap()
+            .iter()
+            .all(|f| f.position <= Position::new(0, 5))
+    );
+}
+
 /// §8 Restore step 2: a cursor at or below the restored end catches up to it,
 /// flagged `replayed`; the consumer then receives `generation_changed` and
 /// `resync` like every other.

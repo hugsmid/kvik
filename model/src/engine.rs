@@ -2203,7 +2203,9 @@ impl Model {
             .max()
             .unwrap_or(0);
         let generation = if drill {
-            highest
+            // The generation a restore would claim, unclaimed, so the drill
+            // sets aside exactly what that restore would.
+            highest + 1
         } else {
             // Create-if-absent: if the marker exists, take the next.
             let mut g = highest + 1;
