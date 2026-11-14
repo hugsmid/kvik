@@ -93,10 +93,10 @@ while let Some(d) = consumer.next().await {
 enum ConditionState { True, False, Unknown }
 enum Live { Value(Fact), None, Unknown }
 ```
-- During a restore a condition evaluation with no local detail, and live state with no local fact or node, are
+- During a restore a condition evaluation with no local detail, and live state whose fact may not be local yet (spec §2.3), are
   `Unknown` (spec §2.3, §6 Conditions): the evaluation is skipped and counted (`evaluations_unknown`), the latch is
   unchanged, `Resync` carries `Unknown` for that funnel, and the first evaluation with detail is delivered as a
-  `Trigger`.
+  `Trigger` if it differs from the latched state, or there is none.
 - A delivery carries `id` (position, or funnel and sequence for timer deliveries), `flags` (`replayed`,
   `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
 - `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.

@@ -89,7 +89,7 @@ and counted. The old id stays reachable by id.
 | As-of P | the current view over facts with position ≤ P |
 | As-of time T | as-of P, where P is the last position whose batch `commit_time` ≤ T |
 | History | all facts for `(series, t)` in position order, each with its `changed_at` in a versioned series |
-| Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad; a forecast series has none. While a restore brings detail back, a series whose latest recorded `t` (§8 Restore step 1) is held by no local fact and no stored node has live state **unknown**, not none, such as a state or text series with no stored level whose last fact predates the log replayed in step 1 (open: what ends it when that fact stays in deep or is lost, Q-84) |
+| Live state | per series, the current fact with the greatest `t ≤ now` and quality not bad; a forecast series has none. While a restore brings detail back, a series has live state **unknown**, not none, when its live-state fact may be in a file not yet local: that is, unless the fact with its latest recorded `t` (§8 Restore step 1) is local or in a stored node and is itself the live-state fact (`t ≤ now`, quality not bad), such as a state or text series with no stored level whose last fact predates the log replayed in step 1 (open: what ends it when that fact stays in deep or is lost, Q-84) |
 
 A fact that is not current for its key is a **revision**. In a versioned series a fact can be a revision from the
 moment it is recorded: it is **outranked** when a fact of higher rank for its key is already recorded.
@@ -423,7 +423,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
    the restore record lists that is not yet local counts as not local (Failures and end below). Window evaluations
    follow §6 Old spans, from the checkpoint's nodes and the local facts, for a series with no stored level as for any
    other: an edge moves to where its detail is local, and the result is the error `detail_not_local` only when no span
-   is left. A condition evaluation with no local detail, and live state with no local fact or node, are unknown (§2.3,
+   is left. A condition evaluation with no local detail, and live state whose fact may not be local yet, are unknown (§2.3,
    §6 Conditions). Reads of facts in any view (current, as-of, history) over detail not yet local fetch it on demand, as for
    moved detail (§8 Retention class, Fill pressure). Until the current chunks that step 3 brings back are local, facts
    whose `t` is at or before the latest `t` known for their series (from the checkpoint or the restored log) and which
@@ -456,7 +456,7 @@ whose plaintext hash fails, is retried, with degraded health naming it and the r
 restore stays in progress. A listed file that the bucket no longer holds, or has corrupted, in step 1 or later, is
 treated as §8 Corrupt block with deep as the failed tier: what it held is compacted again from the other listed files,
 and the positions that no other listed file holds become a lost range, recorded and reported as `data_lost` (§3
-Recovery rule 2); the restore then completes without them. Facts of a lost log segment that other listed files hold
+Recovery rule 2); the restore then completes without them. Facts of a log segment found lost in step 1 that other listed files hold
 (such as compacted chunks) are fetched in step 1, before ingest is accepted, so that the version index and each
 series' latest recorded `t` stay exact at the restored end (§2.4, step 2). A lost or corrupted tree checkpoint is
 replaced by the latest earlier checkpoint the records list, or, with none, by the whole sealed log, as step 1 allows.
@@ -570,7 +570,8 @@ A disaster loses facts in files not backed up, which may already have been acted
     series) to a fact in the history of its `(series, t)` and lacks `revise` (except `duplicates_unchecked`, §2.4);
     `revise` applies to series that are not versioned.
 16. After resume, every condition true now is delivered once in `resync`, except one whose state is unknown during a
-    restore (§6 Conditions), which is delivered as a transition at its first evaluation with detail.
+    restore (§6 Conditions), which is delivered as a transition at its first evaluation with detail if that differs
+    from the latched state, or there is none.
 17. For a counter, increases over adjacent windows sum to the increase over their union; for a state series, so do
     transitions (each step or transition credited once; results flagged `approximate_edges` excepted).
 18. No time is credited past the credit limit (§6) or past a reading's validity: its staleness limit, or for an
