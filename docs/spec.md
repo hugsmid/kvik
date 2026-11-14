@@ -169,30 +169,36 @@ The adapter leaves out unchanged readings between keep-alive facts; the engine r
 |---|---|
 | Batches | Append-only segments of arrival batches. A batch ends with a **commit block** (last position, checksum of the batch's blocks). One batch = one commit = one sync. A batch never spans segments. |
 | Commit | Write batch, sync, update the durable mark, then (and only then) acknowledge adapters, update tree and live state, and deliver. A batch holding any entry that is not a fact is acknowledged and delivered only after the mark file has been synced past it, so a truncated tail holds no acknowledged definition, parameter, alias, retirement, routing or zone entry. For such a batch the writer forces the mark sync as soon as the batch's own sync has returned, rather than waiting for the timed `mark_sync_interval` (Durable mark). Batches are acknowledged and delivered in commit order, so a later batch holding only facts waits for that one mark sync too, not for up to an interval, and every entry still takes effect at its position. |
-| Durable mark | After each successful sync the writer updates a memory-mapped mark file: segment id, byte offset, last position, boot id, highest series id assigned, sequence lock. The mark file itself is synced on a timer (`mark_sync_interval`, default 1 s), at once after a batch holding an entry that is not a fact (Commit), at clean shutdown and by recovery, so after a power loss the mark on disk lags acknowledged batches by about one interval. It is updated in place and never replaced while it exists. Readers read log segments only up to the mark. No cursor file or derived file is written naming a position above the last synced mark, nor any manifest record except a lost-range record written by a start (§3 Order of a start, step 4), which names only positions in segments that start has synced; a write that would name one waits for the next mark sync or forces one. |
-| Sync primitive | "Sync" means the bytes are on stable storage with the device cache flushed, and a returned error is never retried on the same handle. Linux: `fdatasync` or `fsync` on the file, `fsync` on the directory after a create or rename, `msync(MS_SYNC)` or `fsync` for the mapped mark. macOS: `F_FULLFSYNC` for every sync named in this document (`fsync` alone does not flush the device), also for the mark and directories. Windows: `FlushFileBuffers` on the file, `FlushViewOfFile` then `FlushFileBuffers` for the mark; there is no directory sync, so a create or rename must be made durable by a write-through rename or a flushed handle; a file that is open or mapped cannot be replaced by rename, which is why the mark is updated in place and a manifest record is repaired in place (§7 Manifest), a rename being the fallback. A platform or file system that cannot give these guarantees is refused at open. (A platform without a boot identifier syncs the mark after every update, `format.md` A.10; that is a separate case.) These are requirements; the roadmap 2.2 spike measured their costs on macOS only, and roadmap 4.8 measures them on Linux and Windows. |
+| Durable mark | After each successful sync the writer updates the mark file in place by positional writes (`format.md` A.10): segment id, byte offset, last position, boot id, highest series id assigned. The file holds two checksummed slots, so a torn update falls back to the other slot. The writer writes a batch only after the previous batch's sync has returned and the mark has moved. The mark file itself is synced on a timer (`mark_sync_interval`, default 1 s), at once after a batch holding an entry that is not a fact (Commit), at clean shutdown and by recovery, so after a power loss the mark on disk lags acknowledged batches by about one interval. It is updated in place and never replaced while it exists. Readers read log segments only up to the mark. No cursor file or derived file is written naming a position above the last synced mark, nor any manifest record except a lost-range record written by a start (§3 Order of a start, step 4), which names only positions in segments that start has synced; a write that would name one waits for the next mark sync or forces one. |
+| Sync primitive | "Sync" means the bytes are on stable storage with the device cache flushed. A failed sync is never retried, on any handle: the file's contents since its last successful sync are unknown. Linux: `fdatasync` or `fsync` on the file, `fsync` on the directory after a create or rename. macOS: `F_FULLFSYNC` for every sync named in this document (`fsync` alone does not flush the device), also for directories. Windows: `FlushFileBuffers` on the file; there is no directory sync, so a create or rename is made durable by flushing the created or renamed file (`format.md` A.13); a file that is open cannot always be replaced by rename, which is why the mark is updated in place and a manifest record is repaired in place (§7 Manifest), a rename being the fallback. The mark is synced like any other file; no file is memory-mapped. A platform or file system that cannot give these guarantees is refused at open, except Windows, which is a development platform like macOS (`design.md` Budgets): it builds, runs and is tested, runs with the mark synced at every commit, and is not held to these durability guarantees or to the budgets. (A platform without a boot identifier syncs the mark after every update, `format.md` A.10; that is a separate case.) These are requirements; the roadmap 2.2 spike measured their costs on macOS only, and roadmap 4.8 measures them on Linux and Windows. |
 | Group commit | While a sync is in flight, arriving readings queue and form the next batch. A batch is synced at once if no log sync is in flight and at least `min_sync_interval` (default 10 ms; 0 disables the bound) has passed since the previous log sync started; otherwise it waits until both hold, taking in whatever arrives meanwhile. So the first reading after a quiet period has no added delay, and log syncs run at most 1/`min_sync_interval` per second (100 at the default). Mark syncs (Durable mark), timed or forced, are separate and not bounded by it. |
-| Segments | Preallocated at creation (64 MiB). The directory is synced after creating, sealing or renaming a file. |
+| Segments | Created ahead of use and zero-filled (64 MiB, `format.md` A.4). If creating one fails for lack of space, the partial file is deleted, health is critical, ingest waits, and the creation is retried when a free-space check passes; lack of space at a batch write or sync is a write failure (below). The directory is synced after creating, sealing or renaming a file. |
 | Sealing | At 64 MiB or 5 minutes (both configurable), whichever first; an empty segment is not sealed. Sealed segments are immutable and eligible for backup. Compaction never removes a log segment (§8). |
 | Recovery | Below this table. |
-| Write or sync failure | On the log, manifest, mark, cursor or registry files: stop accepting writes, mark read-only, fatal health; never retry on the same handle; recovery by restart. After a failed sync the batch's fate is unknown: a restart on the same boot truncates it; after a reboot recovery may keep it (row 7a). It was never acknowledged, so adapters may replay it, which the duplicate rule absorbs. A failed compaction, tiering or tree write abandons that job, deletes its partial output and degrades health. |
+| Write or sync failure | On the log, manifest, mark, cursor or registry files: stop accepting writes, mark read-only, fatal health; a failed sync is never retried, on any handle; recovery by restart. After a failed sync the batch's fate is unknown: a restart on the same boot truncates it; after a reboot recovery may keep it (row 7a). It was never acknowledged, so adapters may replay it, which the duplicate rule absorbs. A failed compaction, tiering or tree write abandons that job, deletes its partial output and degrades health. |
 | Disk space | Low mark: free space below 5 % of the filesystem or 2 GiB, whichever is larger → compaction pauses, health degraded. Tiering and eviction, which free space, continue at every mark. Critical: below 512 MiB free → ingest waits (back-pressure). Reads continue. Space is never freed by deleting facts. |
 | Back-pressure | Ingest is a bounded queue (default 65 536 readings); a full queue makes adapter emits wait; the wait is measured. |
-| Single writer | Exclusive `flock` on the store directory; readers never take it. |
+| Single writer | An exclusive operating-system lock on the file `LOCK` in the store directory (`format.md` A.12), held for the life of the writer and released when the process ends; readers never take it. Network file systems are not supported. |
 
-**Recovery.** Every unsealed segment is scanned to its end. A missing, unreadable or half-updated mark is treated as
-a different boot. The rules apply in this order:
+**Recovery.** Every unsealed segment is scanned to its end. A missing or unreadable mark (no valid slot, `format.md`
+A.10) is treated as a different boot. The rules apply in this order:
 1. **Same boot id as the mark:** truncate everything after the mark. It may have reached the disk, but the mark did
-   not cover it, so it was never acknowledged or delivered; adapters replay.
-2. **Corruption:** an invalid region that lies below a valid mark (even sequence lock) of any boot, or that is
+   not cover it, so it was never acknowledged or delivered; adapters replay. A batch is written only after the
+   previous batch's sync and mark update, so beyond a current mark lies at most one complete batch. If two or more
+   complete batches lie beyond the mark on the same boot, the mark is **stale** (the store's file system was
+   unmounted or detached within the boot and the page cache lost): rule 3 applies, as for a different boot. Accepted
+   limit: when exactly one batch was committed since the mark's last sync, a remount within the boot truncates it
+   without a report. A store on media that may be remounted within a boot closes this by syncing the mark at every
+   commit (`api.md` `log.mark_sync`).
+2. **Corruption:** an invalid region that lies below a valid mark (a valid slot, `format.md` A.10) of any boot, or that is
    followed by a complete batch, was synced (the mark is written only after a sync returns, and a batch only after
    the previous batch's sync), so it is corruption, not a torn tail. Later complete batches are kept and nothing is
    overwritten. The byte and position range, from the last valid batch to the next valid batch or, at the tail, to
    the mark's last position, is reported as `data_lost` when found and recorded in the manifest as a **lost range**
    by step 4 below; neither makes the store read-only. Its positions are not reused. A lost range is a reset point
    for consumers (§4 Resync).
-3. **Different boot id** (the machine rebooted, the page cache is gone), or the mark missing, unreadable or
-   half-updated: any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
+3. **Different boot id** (the machine rebooted, the page cache is gone), or the mark missing, unreadable or stale
+   (rule 1): any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
    batch's last position and the end of a lost range found at the tail under rule 2. Let F = 1 + the highest
    sequence of the current generation among K and every position named by a local cursor file, manifest record or
    derived file. Recovery writes a **recovery entry** at F, alone in its batch, at the next write position (after
@@ -205,15 +211,18 @@ a different boot. The rules apply in this order:
    and the bytes after it show no later write (none lies beyond the end of the tail it reported, and no readable
    commit block among them has a commit time at or after the entry's), no recovery since has resumed: that entry is
    adopted, whether or not the mark is readable, no second entry is written, and the invalid bytes after it are the
-   rest of the tail it reported (a mark left half-updated by a crash in step 6 is no new loss). Otherwise a new entry
+   rest of the tail it reported (a mark update torn by a crash in step 6 is no new loss). Otherwise a new entry
    is written, and the bytes after the old one are a newly truncated tail that the new entry reports as
    `possible_loss`, so a doubtful case costs a second report rather than a reused position without a reset point.
    Accepted limit: a write after the entry that left no readable commit block inside the reported tail cannot be
    detected, and the entry is adopted. Such a batch was never synced, so it was never acknowledged or delivered (a
    synced batch survives as a complete batch, and the entry is then not the last kept batch), and the consumers that
    had confirmed the entry's reset point received nothing above it from that write; at worst one `possible_loss` goes
-   unreported. The first start of a new
-   store (no mark file and an empty log) writes no entry and creates the mark.
+   unreported. Accepted limit, as damage from outside the engine: on Linux a page whose writeback failed is marked
+   clean and kept in the page cache, so if the mark file is deleted, or damaged in both slots, on the same boot after
+   a failed sync, this rule keeps the batch whose sync failed although the disk may not hold it, and a later power
+   loss removes it unreported. The writer never writes the mark after a failed sync, so the engine does not cause
+   this. The first start of a new store (no mark file and an empty log) writes no entry and creates the mark.
 
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
@@ -362,8 +371,10 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 
 ### 5.7 Calendar
 - Facts and the UTC levels are in UTC; a zone only defines calendar days and months. The site zone is a log entry with
-  an effective time (a registry entry, §2.1); of two entries with the same effective time the later in the log holds,
-  and the first entry is in force from the beginning of time. The **local date** at an instant is its date in the zone
+  an effective time (a registry entry, §2.1); of two entries with the same effective time the later in the log holds.
+  The store descriptor written at creation (`format.md` A.12) records the first site zone and tzdata version; it
+  counts as the first site-zone and tzdata entries, in force from the beginning of time, so positions start with the
+  application's entries. The **local date** at an instant is its date in the zone
   in force at that instant. The local day of date D starts at the first instant whose local date is D or later and
   ends where the day of D + 1 starts; a month runs from the start of its first day to the start of the next month's
   first day. Local days therefore tile the time line whatever the entries, and months tile with their days. Away from
@@ -379,20 +390,24 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   to no local day (the one exception to tiling), and health is degraded, naming the zone, until a version that knows
   it is in force, which undoes it; a new site-zone entry naming such a zone is refused.
 - The **tzdata version in force** is the one named by the latest **tzdata entry** in the log (a registry entry,
-  §2.1); a store's first batch holds one, beside its first site-zone entry. The engine reads one tzdata release at
-  open, through the environment (`api.md`), and uses no other while it runs. A writer whose release is not the
-  version in force writes a tzdata entry naming its own before it accepts ingest, whether its release is newer or
-  older. The entry takes effect at its position, for every derived value at once; no as-of view brings an earlier
-  version back. It rebuilds the calendar days and months whose spans or zones differ, moves interval starts (§2.1,
-  §5.4) and is reported in health with both versions and the days rebuilt. A reader process, or a restore drill,
-  whose release is not the version in force is refused at open with `tzdata_mismatch`, and a reader stops with it
-  when a later entry names another version; so is a writer that cannot write (read-only after a failed sync, §3).
-  The version is also recorded per calendar file; a file of another version is rebuilt.
+  §2.1), or before the first, by the store descriptor. The writer reads the host's tzdata release through the
+  environment (`api.md`) at open, about once a minute and at each local midnight. A writer whose release is not the
+  version in force writes a tzdata entry naming its own, at open before it accepts ingest and later without a
+  restart, whether its release is newer or older; the change is logged. The entry takes effect at its position, for
+  every derived value at once; no as-of view brings an earlier version back. It rebuilds the calendar days and months
+  whose spans or zones differ, moves interval starts (§2.1, §5.4) and is reported in health with both versions and
+  the days rebuilt. **Readers never refuse a tzdata release:** a reader process, or a restore drill, computes calendar
+  results with its own release from the UTC data, using a stored calendar node only where the node's recorded
+  version is its own release, and otherwise evaluating from the 15-minute nodes and the edges, as for a span off
+  15-minute boundaries (below). Which rules a writer that cannot write (read-only after a failed sync, §3) uses, and
+  how a reader of another release gives the values other than calendar results that depend on tzdata, are open
+  (Q-93). The version is also recorded per calendar file; the writer rebuilds a file of another version.
 - A calendar window or query may name an IANA zone instead; its days and months are then taken in that zone over
   the whole span, with no effective dating. Its result is a window evaluation over the UTC data like any other. A
   stored calendar node is an input to it only when every local day the node covers was taken in the named zone
   (zones compared by canonical name, after resolving IANA links; so not a month spanning a site-zone change) and
-  the node's recorded tzdata version is the version in force; elsewhere the result is evaluated as for a span off
+  the node's recorded tzdata version is the release of the process evaluating it (the writer's is the version in
+  force); elsewhere the result is evaluated as for a span off
   15-minute boundaries (below).
 - A calendar day or month **result** is a window evaluation (§6) over its span, edge stretches included. Stored day
   nodes are an input to that evaluation, not the result.
@@ -460,8 +475,11 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   fetched from deep (by generation and epoch) or from the mirror path, verified, written again in place over the
   corrupt bytes and synced; where that cannot be done, the manifest is rewritten to a new file and renamed while no
   handle holds the old one open (§3 Sync primitive). If no copy exists the store opens read-only with fatal health (`manifest_corrupt`); the
-  files the record described are kept, so no fact is lost (rebuilding such a record from those files is open,
-  Q-52).
+  files the record described are kept, so no fact is lost. Such a record is not rebuilt automatically. So that an
+  operator can rebuild it, every file is self-describing: its header and trailer carry everything a publish record
+  says about it (`format.md` A.14), and an operator call (`rebuild_manifest`, roadmap 6.3) writes a new manifest from
+  the local files; lost ranges are found again by the scan and acknowledgements are given again. Accepted limit:
+  without a copy in deep or the mirror path, one damaged record stops the writer until the operator runs that call.
 - Compaction of compacted files (merging overlapping chunks created by late data) publishes outputs and retires
   inputs in one record. Policy: merge when a series' chunks overlapping any 15-minute span exceed 4.
 - A sealed file's **inputs are kept** until the file is verified in another tier. Log segments are never retired by
@@ -477,9 +495,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   needs nothing from the writer's memory: it reads via the manifest, the documented layout, tree files and log
   segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
   `after`. How a reader that keeps a position for later use learns of a truncation or a restore that happened after
-  it read the position is open (Q-46). Before each read of an unsealed segment a reader confirms that the mark it
-  maps is still the file at the mark's path (file identity or link count) and maps it anew if not, so it never reads
-  past a mark the writer no longer maintains (invariant 11).
+  it read the position is open (Q-46). A reader opens the mark by path for every read of it and
+  reads files by position, never mapping them (`format.md` A.10, A.13), so it never reads past a mark the writer no
+  longer maintains (invariant 11).
 
 ## 8. Tiers, backup and rebuild
 | Tier | Location | Holds |
@@ -683,8 +701,10 @@ A disaster loses facts in files not backed up, which may already have been acted
     corrupted when a restore reads it (§8 Restore, Failures and end), each recorded as a lost range and
     reported as `data_lost`, and a tail truncated by §3 Recovery rule 3 after a reboot or with the mark lost, reported as
     `possible_loss`; after a reboot with a readable mark it can hold about one mark-sync interval of acknowledged
-    batches of facts (§3 Commit), and with the mark lost it is unbounded. Corruption of a manifest record with no
-    other copy loses no fact but stops the writer (§7 Manifest).
+    batches of facts (§3 Commit), and with the mark lost it is unbounded. On a store whose file system is unmounted
+    within one boot, one batch committed since the last mark sync can be truncated by §3 Recovery rule 1 unreported
+    (accepted limit). Corruption of a manifest record with no other copy loses no fact but stops the writer (§7
+    Manifest).
 11. No reader or consumer observes a position beyond the durable mark as the writer holds it in memory.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
 13. A cursor or latch on disk is never ahead of the consumer's confirmation.

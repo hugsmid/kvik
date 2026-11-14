@@ -7,7 +7,9 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 ## Requirements
 - **Solid first.** Nothing a consumer reacted to may differ from what is on disk. Every block is checksummed. On
   storage that honours sync, a crash at any point loses nothing that was acknowledged; on storage that does not,
-  a loss is detected and reported (`possible_loss`, `data_lost`), never silent.
+  a loss is detected and reported (`possible_loss`, `data_lost`), never silent. One limit is accepted: a store whose
+  file system is remounted within one boot can lose the one batch committed since the last mark sync, unreported,
+  unless the mark is synced at every commit (spec §3 Recovery rule 1).
 - **Fast reaction.** A reading should reach in-process consumers within a few milliseconds of arrival,
   including the sync.
 - **Granularity.** Per-second data, with drill-down from years to seconds at interactive speed.
@@ -51,7 +53,9 @@ footprint is small for embedded use, and decoding is fast for large scans. Parqu
 | Size on disk, per-second numeric series | no larger than Parquet with ALP on the same data |
 
 **Delivery.** macOS is a development platform: its durable sync (`F_FULLFSYNC`) measured 4–6 ms p50 in roadmap
-2.2 and is not held to the budget. The relaxed figure is enough, as device and human reaction times in automation
+2.2 and is not held to the budget. Windows is a development platform too: it builds, runs and is tested, runs with
+the mark synced at every commit (it has no verified boot identity), and is held neither to these budgets nor to the
+durability guarantees of spec §3 Sync primitive. The relaxed figure is enough, as device and human reaction times in automation
 are tens to hundreds of milliseconds. Roadmap 2.2 found that each durable sync writes a minimum amount, which
 unbatched small writers multiply, so log syncs start at least `min_sync_interval` apart (spec §3 Group commit). The
 default of 10 ms adds on average under half the interval, and only when syncs are back to back, inside the p99 budget;
