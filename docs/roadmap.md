@@ -23,8 +23,8 @@ again; nothing after a gate starts before it is passed.
   4.8; syncs bounded by `min_sync_interval`; the mark synced on the writer thread)
 
 ## 3. Format and interface
-- [ ] 3.1 `docs/format.md` checked for implementability; problems listed
-- [ ] 3.2 `docs/api.md` checked for implementability; problems listed
+- [x] 3.1 `docs/format.md` checked for implementability; problems listed
+- [x] 3.2 `docs/api.md` checked for implementability; problems listed
 - [ ] 3.3 **Gate** — format and interface accepted
 
 ## 4. Log
