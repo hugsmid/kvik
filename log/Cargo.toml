@@ -1,0 +1,22 @@
+[package]
+name = "kvik-log"
+version = "0.1.0"
+description = "On-disk log format of the kvik time-series store: segment files, blocks, checksums and the durable mark"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository = "https://github.com/hugsmid/kvik"
+readme = "README.md"
+keywords = ["time-series", "storage", "embedded", "log"]
+categories = ["database-implementations"]
+
+[dependencies]
+crc = "3.4"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

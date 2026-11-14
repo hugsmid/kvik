@@ -1,8 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["model", "kvik", "spikes/encodings", "spikes/commit"]
+members = ["model", "kvik", "log", "spikes/encodings", "spikes/commit"]
+# The fuzz targets build with nightly cargo-fuzz in their own workspace (`log/fuzz/README.md`).
+exclude = ["log/fuzz"]
 # The spikes are built and tested in their own CI job (`cargo test -p encodings`, `cargo test -p commit`).
-default-members = ["model", "kvik"]
+default-members = ["model", "kvik", "log"]
 
 [workspace.package]
 edition = "2024"
