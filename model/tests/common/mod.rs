@@ -3,14 +3,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use kvik_model::condition::{Condition, ConditionState};
 use kvik_model::engine::{
-    CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryKind, Envelope, Fault,
-    Model, Selection, WriteOutcome,
+    CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryKind, EntryBody,
+    Envelope, Fault, Funnel, FunnelId, Model, Operator, RouteChange, Selection, WriteOutcome,
 };
+use kvik_model::oracle;
+use kvik_model::summary::Aggregate;
 use kvik_model::summary::Params;
 use kvik_model::types::{
-    Fact, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId, Value,
-    ValueType,
+    DAY, Fact, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId,
+    Value, ValueType,
 };
 use proptest::prelude::*;
 
@@ -498,4 +501,355 @@ pub fn restore_in_progress(m: &mut Model, cursors: &BTreeMap<ConsumerId, Positio
         false,
     )
     .unwrap()
+}
+
+// ----- delivery machine: routes, conditions and timers -----
+
+/// A funnel a route operation adds, over series index `0` or `1`.
+#[derive(Clone, Debug)]
+pub enum RouteKind {
+    /// Every fact of the series, or of every series.
+    Facts(Option<usize>),
+    /// Threshold 50 / clear 40 on the live-state value, or on a 30 s average.
+    Threshold(usize, bool),
+    /// Held above 50 for 10 s.
+    HeldFor(usize),
+    /// On change with a dead-band of 5.
+    OnChange(usize),
+    /// Stale for S + 5 s.
+    StaleFor(usize),
+}
+
+#[derive(Clone, Debug)]
+pub enum DOp {
+    /// One reading at the current wall time, committed (with an optional fault).
+    Put {
+        series: usize,
+        value: f64,
+        fault: Option<Fault>,
+    },
+    Advance(Nanos),
+    Tick,
+    Crash,
+    PowerLoss,
+    Restart,
+    /// Catch up by up to `2n` entries, then take up to `n` deliveries.
+    Receive {
+        c: usize,
+        n: usize,
+    },
+    /// Confirm the last delivery taken in the current session.
+    Confirm {
+        c: usize,
+    },
+    CatchUp {
+        c: usize,
+        n: usize,
+    },
+    Reconnect {
+        c: usize,
+    },
+    AddRoute {
+        c: usize,
+        funnel: u32,
+        kind: RouteKind,
+    },
+    RemoveRoute {
+        c: usize,
+        funnel: u32,
+    },
+    Seal,
+    Compact,
+    Upload,
+    Housekeeping,
+}
+
+pub const D_STALENESS: Nanos = 5 * SECOND;
+
+pub fn arb_route_kind() -> impl Strategy<Value = RouteKind> {
+    prop_oneof![
+        2 => proptest::option::of(0usize..2).prop_map(RouteKind::Facts),
+        2 => (0usize..2, any::<bool>()).prop_map(|(s, w)| RouteKind::Threshold(s, w)),
+        1 => (0usize..2).prop_map(RouteKind::HeldFor),
+        1 => (0usize..2).prop_map(RouteKind::OnChange),
+        1 => (0usize..2).prop_map(RouteKind::StaleFor),
+    ]
+}
+
+pub fn arb_delivery_op() -> impl Strategy<Value = DOp> {
+    let put = (
+        0usize..2,
+        proptest::sample::select(vec![0.0, 10.0, 45.0, 60.0, 90.0, 90.0]),
+        prop_oneof![
+            40 => Just(None),
+            1 => Just(Some(Fault::Crash(CrashPoint::AfterSync))),
+            1 => (0usize..3).prop_map(|n| Some(Fault::Crash(CrashPoint::DuringDelivery(n)))),
+            1 => Just(Some(Fault::PowerLoss(WriteOutcome::Survived))),
+            1 => Just(Some(Fault::PowerLoss(WriteOutcome::Torn))),
+        ],
+    )
+        .prop_map(|(series, value, fault)| DOp::Put {
+            series,
+            value,
+            fault,
+        });
+    prop_oneof![
+        16 => put,
+        8 => prop_oneof![
+            8 => Just(SECOND),
+            6 => Just(5 * SECOND),
+            2 => Just(30 * SECOND),
+            1 => Just(2 * HOUR),
+            1 => Just(91 * DAY),
+        ]
+        .prop_map(DOp::Advance),
+        8 => Just(DOp::Tick),
+        1 => Just(DOp::Crash),
+        1 => Just(DOp::PowerLoss),
+        1 => Just(DOp::Restart),
+        12 => (0usize..2, 1usize..8).prop_map(|(c, n)| DOp::Receive { c, n }),
+        8 => (0usize..2).prop_map(|c| DOp::Confirm { c }),
+        5 => (0usize..2, 1usize..20).prop_map(|(c, n)| DOp::CatchUp { c, n }),
+        1 => (0usize..2).prop_map(|c| DOp::Reconnect { c }),
+        2 => (0usize..2, 1u32..4, arb_route_kind()).prop_map(|(c, funnel, kind)| DOp::AddRoute {
+            c,
+            funnel,
+            kind
+        }),
+        1 => (0usize..2, 0u32..4).prop_map(|(c, funnel)| DOp::RemoveRoute { c, funnel }),
+        1 => Just(DOp::Seal),
+        1 => Just(DOp::Compact),
+        1 => Just(DOp::Upload),
+        1 => Just(DOp::Housekeeping),
+    ]
+}
+
+pub fn funnel_of(kind: &RouteKind, ids: &[SeriesId]) -> Funnel {
+    let avg = Operator {
+        aggregate: Aggregate::Avg,
+        width: 30 * SECOND,
+    };
+    match *kind {
+        RouteKind::Facts(None) => Funnel::facts(Selection::All),
+        RouteKind::Facts(Some(s)) => Funnel::facts(Selection::Series([ids[s]].into())),
+        RouteKind::Threshold(s, windowed) => Funnel::condition(
+            ids[s],
+            windowed.then_some(avg),
+            Condition::Threshold {
+                on: 50.0,
+                clear: 40.0,
+            },
+        ),
+        RouteKind::HeldFor(s) => Funnel::condition(
+            ids[s],
+            None,
+            Condition::HeldFor {
+                above: 50.0,
+                n: 10 * SECOND,
+            },
+        ),
+        RouteKind::OnChange(s) => {
+            Funnel::condition(ids[s], None, Condition::OnChange { deadband: 5.0 })
+        }
+        RouteKind::StaleFor(s) => Funnel::condition(
+            ids[s],
+            None,
+            Condition::StaleFor {
+                staleness: D_STALENESS,
+                n: 5 * SECOND,
+            },
+        ),
+    }
+}
+
+/// The consumers of the delivery machine: as [`consumers`], with queues of 8
+/// and 4.
+pub fn delivery_consumers() -> Vec<ConsumerDecl> {
+    let mut cs = consumers();
+    cs[0].capacity = 8;
+    cs[1].capacity = 4;
+    cs
+}
+
+/// A model with two gauges (S = 5 s) and the consumers of
+/// [`delivery_consumers`], each with a condition funnel `1` over the first
+/// gauge: consumer 0 a threshold on a 30 s average, consumer 1 a held-for
+/// condition.
+pub fn delivery_machine() -> (Model, Vec<SeriesId>) {
+    let cfg = Config {
+        seal_after_batches: 3,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, delivery_consumers(), T0 + HOUR);
+    let ids: Vec<SeriesId> = ["plant/line-1/temperature", "plant/line-2/temperature"]
+        .iter()
+        .map(|n| {
+            m.define(n, Kind::Gauge, ValueType::Number, "degC", D_STALENESS)
+                .unwrap()
+        })
+        .collect();
+    for (c, kind) in [
+        (0, RouteKind::Threshold(0, true)),
+        (1, RouteKind::HeldFor(0)),
+    ] {
+        m.add_route(ConsumerId(c), FunnelId(1), funnel_of(&kind, &ids))
+            .unwrap();
+    }
+    (m, ids)
+}
+
+/// Applies one delivery-machine operation, restarting first if the engine is
+/// down and the operation needs it. Checks that every delivery taken is of a
+/// durable fact (invariant 2's first half).
+pub fn apply_delivery(m: &mut Model, ids: &[SeriesId], op: &DOp) -> Result<(), String> {
+    let needs_up = !matches!(
+        op,
+        DOp::Crash | DOp::PowerLoss | DOp::Restart | DOp::Advance(_)
+    );
+    if needs_up && !m.is_up() {
+        m.restart();
+    }
+    let cid = |c: usize| ConsumerId(c as u32);
+    match op {
+        DOp::Put {
+            series,
+            value,
+            fault,
+        } => {
+            let now = m.wall;
+            let _ = m.emit(Reading::num(ids[*series], now, *value));
+            let _ = m.commit(*fault);
+        }
+        DOp::Advance(d) => m.advance(*d),
+        DOp::Tick => m.tick().map_err(|e| e.to_string())?,
+        DOp::Crash => m.crash(),
+        DOp::PowerLoss => m.power_loss(),
+        DOp::Restart => m.restart(),
+        DOp::Receive { c, n } => {
+            // Engine-side catch-up runs whenever the queue has room.
+            let _ = m.catch_up(cid(*c), 2 * *n);
+            let got = m.receive(cid(*c), *n).map_err(|e| e.to_string())?;
+            let dur = durable(m);
+            for d in got {
+                if let Some(f) = d.fact()
+                    && dur.get(&d.position) != Some(f)
+                {
+                    return Err(format!("delivered position {} is not durable", d.position));
+                }
+            }
+        }
+        DOp::Confirm { c } => {
+            // Fails (and is ignored) if the last delivery was taken in an
+            // earlier session.
+            if let Some(last) = m.received.get(&cid(*c)).and_then(|r| r.last()) {
+                let _ = m.confirm_delivery(cid(*c), last.delivery.id());
+            }
+        }
+        DOp::CatchUp { c, n } => {
+            let _ = m.catch_up(cid(*c), *n);
+        }
+        DOp::Reconnect { c } => {
+            let _ = m.reconnect(cid(*c));
+        }
+        DOp::AddRoute { c, funnel, kind } => {
+            let _ = m.add_route(cid(*c), FunnelId(*funnel), funnel_of(kind, ids));
+        }
+        DOp::RemoveRoute { c, funnel } => {
+            let _ = m.remove_route(cid(*c), FunnelId(*funnel));
+        }
+        DOp::Seal => m.seal_active(),
+        DOp::Compact => {
+            let _ = m.compact(None);
+        }
+        DOp::Upload => {
+            m.upload();
+        }
+        DOp::Housekeeping => {
+            let _ = m.housekeeping();
+        }
+    }
+    Ok(())
+}
+
+/// Whether a fact of `series` at position `p` is routed to the consumer by a
+/// funnel without a condition in force at `p`, from the configured selection
+/// and the routing entries in the log (§4 Routing).
+pub fn routed_at(m: &Model, decl: &ConsumerDecl, p: Position, series: SeriesId) -> bool {
+    let mut funnels: BTreeMap<FunnelId, Funnel> =
+        [(FunnelId::CONFIGURED, Funnel::facts(decl.selection.clone()))].into();
+    for e in m.disk.all_entries().into_values() {
+        if e.position >= p {
+            break;
+        }
+        match e.body {
+            EntryBody::Route(RouteChange::Add {
+                consumer,
+                funnel,
+                spec,
+            }) if consumer == decl.id => {
+                funnels.insert(funnel, spec);
+            }
+            EntryBody::Route(RouteChange::Remove { consumer, funnel }) if consumer == decl.id => {
+                funnels.remove(&funnel);
+            }
+            _ => {}
+        }
+    }
+    funnels.values().any(|f| {
+        f.condition.is_none()
+            && match &f.selection {
+                Selection::All => true,
+                Selection::Series(set) => set.contains(&series),
+            }
+    })
+}
+
+/// The value a condition funnel sees now, computed directly from the current
+/// view: the live-state value, or the operator's window by the window oracle.
+pub fn oracle_funnel_value(m: &Model, f: &Funnel) -> Option<f64> {
+    let Selection::Series(set) = &f.selection else {
+        return None;
+    };
+    let s = *set.iter().next()?;
+    let current = m.current().ok()?;
+    match &f.operator {
+        Some(op) => {
+            let p = kvik_model::summary::Params::new(Kind::Gauge, D_STALENESS);
+            let rs = oracle::readings(current, s);
+            oracle::window(&p, &rs, m.now - op.width, m.now, m.now)
+                .aggregate(&op.aggregate)?
+                .to_f64()
+        }
+        None => current
+            .range((s, Nanos::MIN)..=(s, m.now))
+            .rev()
+            .map(|(_, f)| f)
+            .find(|f| f.summarised())
+            .and_then(|f| match f.value {
+                Value::Num(x) => Some(x),
+                _ => None,
+            }),
+    }
+}
+
+/// The condition state on resume that `OPEN-QUESTIONS.md` Q-63 (and Q-16
+/// for stale-for) describes, from the value now and the latch.
+pub fn resumed_state(
+    cond: &Condition,
+    value: Option<f64>,
+    latch: Option<&ConditionState>,
+) -> ConditionState {
+    let latched = matches!(latch, Some(ConditionState::Active(true)));
+    match cond {
+        Condition::Threshold { on, clear } => ConditionState::Active(match value {
+            Some(v) if v > *on => true,
+            Some(v) if v < *clear => false,
+            _ => latched,
+        }),
+        Condition::OnChange { .. } => ConditionState::Value(value),
+        Condition::HeldFor { above, .. } => {
+            ConditionState::Active(latched && value.is_some_and(|v| v > *above))
+        }
+        Condition::StaleFor { .. } => ConditionState::Active(false),
+    }
 }

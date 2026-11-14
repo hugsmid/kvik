@@ -200,6 +200,158 @@ proptest! {
         }
     }
 
+    /// 2, with run-time routes, conditions and timers: every durable position
+    /// routed to a consumer by the routes in force at it is delivered to it,
+    /// or superseded by a `resync` delivered in place of its replay; every
+    /// delivered fact is durable (checked as it is taken).
+    #[test]
+    fn inv02_routed_positions_delivered_or_resynced(ops in proptest::collection::vec(arb_delivery_op(), 1..100)) {
+        let (mut m, ids) = delivery_machine();
+        for op in &ops {
+            apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+        }
+        settle(&mut m);
+        m.drain().unwrap();
+        let dur = durable(&m);
+        for d in delivery_consumers() {
+            let seen = observed_positions(&m, d.id.0);
+            let replaced = resync_replaced(&m, d.id.0);
+            for p in &seen {
+                prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", d.id.0, p);
+            }
+            for (p, f) in &dur {
+                if routed_at(&m, &d, *p, f.series) {
+                    let superseded = replaced.iter().any(|(a, b)| a < p && p <= b);
+                    prop_assert!(seen.contains(p) || superseded, "consumer {} never got {}", d.id.0, p);
+                } else {
+                    prop_assert!(!seen.contains(p), "consumer {} got unrouted {}", d.id.0, p);
+                }
+            }
+        }
+    }
+
+    /// 3, with run-time routes, conditions and timers: within a consumer
+    /// session, fact deliveries are in strictly increasing position order,
+    /// whatever condition deliveries and `resync` lie between them.
+    #[test]
+    fn inv03_fact_deliveries_in_order_among_other_deliveries(ops in proptest::collection::vec(arb_delivery_op(), 1..100)) {
+        let (mut m, ids) = delivery_machine();
+        for op in &ops {
+            apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+        }
+        settle(&mut m);
+        m.drain().unwrap();
+        for d in delivery_consumers() {
+            let mut by_session: BTreeMap<u32, Vec<kvik_model::types::Position>> = BTreeMap::new();
+            for r in m.received.get(&d.id).into_iter().flatten() {
+                if r.delivery.fact().is_some() {
+                    by_session.entry(r.session).or_default().push(r.delivery.position);
+                }
+            }
+            for (s, ps) in by_session {
+                prop_assert!(ps.windows(2).all(|w| w[0] < w[1]), "consumer {} session {}: {:?}", d.id.0, s, ps);
+            }
+        }
+    }
+
+    /// 11, for deliveries of every kind: no fact, condition delivery,
+    /// `generation_changed` or `resync` names a position beyond the durable
+    /// mark.
+    #[test]
+    fn inv11_no_delivery_of_any_kind_beyond_mark(ops in proptest::collection::vec(arb_delivery_op(), 1..100)) {
+        let (mut m, ids) = delivery_machine();
+        for op in &ops {
+            apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            let last = m.disk.mark.map_or(kvik_model::types::Position::ORIGIN, |k| k.last);
+            for r in m.received.values().flatten() {
+                prop_assert!(r.delivery.position <= last, "{:?} beyond {}", r.delivery, last);
+            }
+        }
+    }
+
+    /// 13. A cursor or latch on disk is never ahead of the consumer's
+    /// confirmation: after every operation, each cursor is at or below the
+    /// highest position the consumer has confirmed, and each latch holds the
+    /// state and position of a delivery the consumer has confirmed.
+    #[test]
+    fn inv13_cursor_and_latch_never_ahead_of_confirmation(ops in proptest::collection::vec(arb_delivery_op(), 1..100)) {
+        use kvik_model::engine::DeliveryKind;
+        let (mut m, ids) = delivery_machine();
+        for op in &ops {
+            apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            for d in delivery_consumers() {
+                let confirmed = m.confirmed.get(&d.id).cloned().unwrap_or_default();
+                let cursor = m.disk.cursors.get(&d.id).copied().unwrap_or(kvik_model::types::Position::ORIGIN);
+                let top = confirmed.iter().map(|x| x.position).max().unwrap_or(kvik_model::types::Position::ORIGIN);
+                prop_assert!(cursor <= top, "consumer {} cursor {} above confirmed {}", d.id.0, cursor, top);
+                for ((c, f), latch) in &m.disk.latches {
+                    if *c != d.id {
+                        continue;
+                    }
+                    let carried = confirmed.iter().any(|x| x.position == latch.position && match &x.kind {
+                        DeliveryKind::Trigger(t) => t.funnel == *f && t.state == latch.state,
+                        DeliveryKind::Resync(r) => r.funnels.iter().any(|fs| {
+                            fs.funnel == *f && fs.condition.as_ref().is_some_and(|cn| cn.state == latch.state)
+                        }),
+                        _ => false,
+                    });
+                    prop_assert!(carried, "consumer {} latch {:?} for {:?} never confirmed", d.id.0, latch, f);
+                }
+            }
+        }
+    }
+
+    /// 16. After resume, every condition true now is delivered once in
+    /// `resync`: each condition funnel in force appears exactly once, with
+    /// its state now (the value computed directly from the current view;
+    /// conditions with memory as in Q-63) and a transition exactly when that
+    /// differs from the latch on disk.
+    #[test]
+    fn inv16_resume_delivers_each_condition_once_in_resync(
+        ops in proptest::collection::vec(arb_delivery_op(), 1..100),
+        by_reconnect in any::<bool>(),
+    ) {
+        let (mut m, ids) = delivery_machine();
+        for op in &ops {
+            apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+        }
+        settle(&mut m);
+        m.drain().unwrap();
+        let latches = m.disk.latches.clone();
+        if by_reconnect {
+            for d in delivery_consumers() {
+                m.reconnect(d.id).unwrap();
+            }
+        } else {
+            m.crash();
+            m.restart();
+        }
+        m.drain().unwrap();
+        for d in delivery_consumers() {
+            let routes = m.routes(d.id).unwrap();
+            let last = m.received[&d.id].last().unwrap();
+            let resync = m.received[&d.id]
+                .iter()
+                .filter(|r| r.session == last.session)
+                .find_map(|r| r.delivery.resync().cloned())
+                .expect("a resync after resume");
+            let listed: Vec<_> = resync.funnels.iter().map(|f| f.funnel).collect();
+            prop_assert_eq!(listed, routes.keys().copied().collect::<Vec<_>>());
+            for fs in &resync.funnels {
+                let f = &routes[&fs.funnel];
+                let Some(cond) = &f.condition else {
+                    prop_assert!(fs.condition.is_none());
+                    continue;
+                };
+                let latch = latches.get(&(d.id, fs.funnel)).map(|l| &l.state);
+                let want = resumed_state(cond, oracle_funnel_value(&m, f), latch);
+                let got = fs.condition.clone().unwrap();
+                prop_assert_eq!(&got.state, &want, "consumer {} funnel {:?}", d.id.0, fs.funnel);
+                prop_assert_eq!(got.transition, cond.is_transition(&want, latch));
+            }
+        }
+    }
+
     /// 4. The current view equals "highest position per (series, t)" over all
     /// facts in all tiers.
     #[test]
@@ -674,4 +826,64 @@ fn generator_coverage() {
     assert!(facts > 1000 && revisions > 50 && discarded > 10 && overflows > 10);
     assert!(compacted > 20 && uploaded > 20);
     assert!(tails > 50 && kept_after_reboot > 15 && recovery_failed > 5);
+}
+
+/// Guards the delivery generator: the random histories must actually
+/// exercise condition deliveries of each cause, resync in place of a replay,
+/// overflow, run-time routes and latches.
+#[test]
+fn delivery_generator_coverage() {
+    use kvik_model::engine::{DeliveryKind, TriggerCause};
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = proptest::collection::vec(arb_delivery_op(), 80..100);
+    let mut causes: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut replaced, mut resyncs, mut overflows, mut routes, mut latches, mut equal) =
+        (0usize, 0usize, 0u64, 0usize, 0usize, 0usize);
+    for _ in 0..200 {
+        let ops = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, ids) = delivery_machine();
+        for op in &ops {
+            apply_delivery(&mut m, &ids, op).unwrap();
+        }
+        settle(&mut m);
+        m.drain().unwrap();
+        for r in m.received.values().flatten() {
+            match &r.delivery.kind {
+                DeliveryKind::Trigger(t) => {
+                    let k = match t.cause {
+                        TriggerCause::Fact => "fact",
+                        TriggerCause::Timer => "timer",
+                        TriggerCause::Reattach => "reattach",
+                    };
+                    *causes.entry(k.into()).or_default() += 1;
+                }
+                DeliveryKind::Resync(x) => {
+                    resyncs += 1;
+                    replaced += usize::from(x.replaced.is_some());
+                    equal += x
+                        .funnels
+                        .iter()
+                        .filter(|f| f.condition.as_ref().is_some_and(|c| !c.transition))
+                        .count();
+                }
+                _ => {}
+            }
+        }
+        overflows += m.counters.overflows;
+        latches += m.disk.latches.len();
+        routes += m
+            .entries()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, kvik_model::engine::EntryBody::Route(_)))
+            .count();
+    }
+    eprintln!(
+        "causes {causes:?} resyncs {resyncs} replaced {replaced} equal-to-latch {equal} overflows {overflows} routes {routes} latches {latches}"
+    );
+    assert!(causes["fact"] > 50 && causes["timer"] > 30 && causes["reattach"] > 10);
+    assert!(resyncs > 500 && replaced > 10 && equal > 100);
+    assert!(overflows > 30 && routes > 400 && latches > 200);
 }

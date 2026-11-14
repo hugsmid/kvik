@@ -1707,3 +1707,93 @@ fn s4_overflow_catch_up_with_conditions_and_route_changes() {
         ["F4", "F5", "R6", "R7", "R10"]
     );
 }
+
+fn delivery_history(ops: &[DOp]) -> Result<Model, proptest::test_runner::TestCaseError> {
+    let (mut m, ids) = delivery_machine();
+    for op in ops {
+        apply_delivery(&mut m, &ids, op).map_err(proptest::test_runner::TestCaseError::fail)?;
+    }
+    settle(&mut m);
+    m.drain().unwrap();
+    Ok(m)
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(256),
+        ..proptest::test_runner::Config::default()
+    })]
+
+    /// §4 At-least-once and Order: consumers de-duplicate condition
+    /// deliveries by `(funnel, sequence)`, so no two condition deliveries to
+    /// a consumer share one, across restarts, reconnects and route changes.
+    #[test]
+    fn s4_condition_deliveries_unique_by_funnel_and_sequence(
+        ops in proptest::collection::vec(arb_delivery_op(), 1..100)
+    ) {
+        let m = delivery_history(&ops)?;
+        for (c, rs) in &m.received {
+            let mut seen = std::collections::BTreeSet::new();
+            for r in rs {
+                if let Some(t) = r.delivery.trigger() {
+                    proptest::prop_assert!(seen.insert((t.funnel, t.sequence)), "consumer {:?} got {:?} twice", c, (t.funnel, t.sequence));
+                }
+            }
+        }
+    }
+
+    /// §4 Resync and §6 Restart and resume: on resume the replay stops at the
+    /// position the `resync` names, and no fact above it is delivered before
+    /// the `resync` (after a §3 Recovery rule 3 recovery, the last kept
+    /// batch); a `generation_changed` comes just before its `resync`.
+    #[test]
+    fn s4_resync_separates_replay_from_later_positions(
+        ops in proptest::collection::vec(arb_delivery_op(), 1..100)
+    ) {
+        let m = delivery_history(&ops)?;
+        for (c, rs) in &m.received {
+            for (i, r) in rs.iter().enumerate() {
+                let Some(_) = r.delivery.resync() else { continue };
+                let p = r.delivery.position;
+                let same = |x: &&kvik_model::engine::Received| x.session == r.session;
+                for x in rs[..i].iter().filter(same) {
+                    if x.delivery.fact().is_some() {
+                        proptest::prop_assert!(x.delivery.position <= p, "consumer {:?}: {} before resync at {}", c, x.delivery.position, p);
+                    }
+                }
+                for x in rs[i + 1..].iter().filter(same) {
+                    if x.delivery.fact().is_some() {
+                        proptest::prop_assert!(x.delivery.position > p, "consumer {:?}: {} after resync at {}", c, x.delivery.position, p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// §4 Overflow and row 14: catch-up resumes "after the last position
+    /// already enqueued for it in the current session … no gap, no repeat":
+    /// within a session, the facts delivered are exactly the routed durable
+    /// positions between the first and the last one delivered.
+    #[test]
+    fn s4_no_gap_no_repeat_within_a_session(
+        ops in proptest::collection::vec(arb_delivery_op(), 1..100)
+    ) {
+        let m = delivery_history(&ops)?;
+        let dur = durable(&m);
+        for d in delivery_consumers() {
+            let mut by_session: BTreeMap<u32, Vec<Position>> = BTreeMap::new();
+            for o in m.observed.get(&d.id).into_iter().flatten() {
+                by_session.entry(o.session).or_default().push(o.position);
+            }
+            for (s, ps) in by_session {
+                let (first, last) = (ps[0], ps[ps.len() - 1]);
+                let want: Vec<Position> = dur
+                    .range(first..=last)
+                    .filter(|(p, f)| routed_at(&m, &d, **p, f.series))
+                    .map(|(p, _)| *p)
+                    .collect();
+                proptest::prop_assert_eq!(&ps, &want, "consumer {} session {}", d.id.0, s);
+            }
+        }
+    }
+}
