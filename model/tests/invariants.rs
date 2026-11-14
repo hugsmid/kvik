@@ -1041,6 +1041,7 @@ fn delivery_generator_coverage() {
     let mut causes: BTreeMap<String, usize> = BTreeMap::new();
     let (mut replaced, mut resyncs, mut overflows, mut routes, mut latches, mut equal) =
         (0usize, 0usize, 0u64, 0usize, 0usize, 0usize);
+    let mut true_now = 0usize;
     for _ in 0..200 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let (mut m, ids) = delivery_machine();
@@ -1067,6 +1068,16 @@ fn delivery_generator_coverage() {
                         .iter()
                         .filter(|f| f.condition.as_ref().is_some_and(|c| !c.transition))
                         .count();
+                    // Conditions true now on resume (invariant 16).
+                    true_now += x
+                        .funnels
+                        .iter()
+                        .filter(|f| {
+                            f.condition.as_ref().is_some_and(|c| {
+                                c.state == kvik_model::condition::ConditionState::Active(true)
+                            })
+                        })
+                        .count();
                 }
                 _ => {}
             }
@@ -1081,8 +1092,9 @@ fn delivery_generator_coverage() {
             .count();
     }
     eprintln!(
-        "causes {causes:?} resyncs {resyncs} replaced {replaced} equal-to-latch {equal} overflows {overflows} routes {routes} latches {latches}"
+        "causes {causes:?} resyncs {resyncs} replaced {replaced} equal-to-latch {equal} true-now {true_now} overflows {overflows} routes {routes} latches {latches}"
     );
+    assert!(true_now > 100);
     assert!(causes["fact"] > 50 && causes["timer"] > 30 && causes["reattach"] > 10);
     assert!(resyncs > 500 && replaced > 10 && equal > 100);
     assert!(overflows > 30 && routes > 400 && latches > 200);
@@ -1973,4 +1985,193 @@ proptest! {
         }
         prop_assert_eq!(total, sum(&month.node));
     }
+}
+
+// ----- guards for the timing, interval and calendar generators -----
+
+/// Guards `arb_timed_readings`, the input of invariants 20 and 21: scheduled
+/// and forecast facts must arrive more than 60 s ahead (where an observed
+/// fact is `future`) and more than 2 × S behind their series' latest `t`
+/// (where an observed fact is `late` by the first clause), and the observed
+/// series must get both flags.
+#[test]
+fn timed_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = proptest::collection::vec(arb_timed_readings(), 1..2);
+    let (mut ahead, mut behind, mut future, mut late) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..300 {
+        let readings = strat.new_tree(&mut runner).unwrap().current().remove(0);
+        let (mut m, ids) = timed_machine();
+        emit_timed(&mut m, ids, &readings);
+        let mut latest: BTreeMap<kvik_model::types::SeriesId, Nanos> = BTreeMap::new();
+        let mut facts = m.facts().unwrap();
+        facts.sort_by_key(|f| f.position);
+        for f in facts {
+            let top = latest.get(&f.series).copied();
+            if f.series == ids[2] {
+                future += usize::from(f.flags.future);
+                late += usize::from(f.flags.late);
+            } else {
+                ahead += usize::from(f.t > f.received_at + 60 * SECOND);
+                behind += usize::from(top.is_some_and(|x| f.t < x - 20 * MINUTE));
+            }
+            latest.insert(f.series, top.map_or(f.t, |x| x.max(f.t)));
+        }
+    }
+    eprintln!("ahead {ahead} behind {behind} observed-future {future} observed-late {late}");
+    assert!(ahead > 500 && behind > 200 && future > 100 && late > 50);
+}
+
+/// Guards the interval generators, the inputs of invariants 5, 18 and 22:
+/// trees that store a level and trees that store none, windows whose edges
+/// apportion an interval, and observed readings not yet ready at `now`.
+#[test]
+fn interval_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = arb_interval_params().prop_flat_map(|p| {
+        (
+            Just(p),
+            arb_interval_readings(p),
+            proptest::collection::btree_set(arb_interval_instant(p), 2..6),
+            arb_interval_instant(p),
+        )
+    });
+    let (mut stored, mut unstored, mut apportioned, mut not_ready) =
+        (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..1000 {
+        let (p, rs, cuts, now) = strat.new_tree(&mut runner).unwrap().current();
+        let tree = SeriesTree::build(p, &rs);
+        if tree.stores(0) || tree.stores(1) {
+            stored += 1;
+        } else {
+            unstored += 1;
+        }
+        let cuts: Vec<Nanos> = cuts.into_iter().collect();
+        apportioned += cuts
+            .windows(2)
+            .filter(|w| tree.window(w[0], w[1], now).apportioned())
+            .count();
+        let d = p.interval.unwrap().length;
+        if p.timing == kvik_model::registry::Timing::Observed {
+            not_ready += rs.iter().filter(|(t, _)| *t < now && t + d > now).count();
+        }
+    }
+    eprintln!(
+        "stored {stored} unstored {unstored} apportioned {apportioned} not-ready {not_ready}"
+    );
+    assert!(stored > 100 && unstored > 100 && apportioned > 300 && not_ready > 30);
+}
+
+/// Guards `arb_cal_case`, the input of invariants 5, 7 and 8 over calendar
+/// days: stored day and month nodes, results that take them as inputs and
+/// results that cannot, site-zone changes to another zone, and days that
+/// are not 96 quarter-hours long or not on 15-minute boundaries.
+#[test]
+fn calendar_generator_coverage() {
+    use kvik_model::calendar::{CalendarWindow, Period};
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = arb_cal_case();
+    let (mut days, mut months, mut with_input, mut without) = (0usize, 0usize, 0usize, 0usize);
+    let (mut changed, mut odd_length, mut off_grid) = (0usize, 0usize, 0usize);
+    for _ in 0..300 {
+        let c = strat.new_tree(&mut runner).unwrap().current();
+        let (m, s, base) = cal_model(&c);
+        let file = m.calendar_file(s).unwrap();
+        days += file.days.len();
+        months += file.months.len();
+        changed += usize::from(c.changes.iter().any(|(z, _)| *z != c.zone));
+        for d in cal_dates(base) {
+            let a = m
+                .calendar_window(s, CalendarWindow::Period(Period::Day(d)), None)
+                .unwrap();
+            if a.inputs.is_empty() {
+                without += 1;
+            } else {
+                with_input += 1;
+            }
+            let len = a.to - a.from;
+            odd_length += usize::from(len != 96 * QUARTER);
+            off_grid += usize::from(a.from % QUARTER != 0);
+        }
+    }
+    eprintln!(
+        "days {days} months {months} with-input {with_input} without {without} zone-changes {changed} odd-length {odd_length} off-grid {off_grid}"
+    );
+    assert!(days > 300 && months > 50 && with_input > 300 && without > 300);
+    assert!(changed > 50 && odd_length > 20 && off_grid > 30);
+}
+
+/// Guards the restore in `inv01_only_restore_starts_generation`: random
+/// histories must give restores with a gap before the last backed-up
+/// position, consumers that catch up to the restored end and consumers that
+/// get no replay, and empty buckets.
+#[test]
+fn restore_generator_coverage() {
+    use kvik_model::engine::Model;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = (
+        proptest::collection::vec(arb_op(), 1..80),
+        any::<bool>(),
+        proptest::option::weighted(0.5, any::<proptest::sample::Index>()),
+    );
+    let (mut gaps, mut caught_up, mut no_replay, mut empty) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..200 {
+        let (ops, upload_all, missing) = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, ids) = machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).unwrap();
+        }
+        settle(&mut m);
+        if upload_all {
+            m.seal_active();
+            m.disk.bucket.reachable = true;
+            m.upload();
+        }
+        if let Some(i) = missing {
+            let files: Vec<_> = m.disk.bucket.objects.keys().copied().collect();
+            if !files.is_empty() {
+                m.disk.bucket.objects.remove(i.get(&files));
+            }
+        }
+        let last = m
+            .disk
+            .bucket
+            .objects
+            .values()
+            .flat_map(|(_, f)| f.entries().map(|e| e.position))
+            .max();
+        let cursors = m.disk.cursors.clone();
+        let Ok(mut r) = Model::restore_with_cursors(
+            m.config.clone(),
+            consumers(),
+            &mut m.disk.bucket,
+            &cursors,
+            m.wall,
+            false,
+            false,
+        ) else {
+            empty += 1;
+            continue;
+        };
+        gaps += usize::from(r.disk.restored_end < last);
+        r.drain().unwrap();
+        for d in consumers() {
+            let replayed = r
+                .observed
+                .get(&d.id)
+                .is_some_and(|o| o.iter().any(|x| x.replayed));
+            caught_up += usize::from(replayed);
+            no_replay += usize::from(!replayed);
+        }
+    }
+    eprintln!("gaps {gaps} caught-up {caught_up} no-replay {no_replay} empty {empty}");
+    assert!(gaps > 10 && caught_up > 20 && no_replay > 50 && empty > 5);
 }

@@ -122,6 +122,9 @@ proptest! {
     }
 }
 
+/// Row 2: "Same `(series, t)`, identical to any fact in its history: dropped
+/// and counted (§2.4)." Across batches and within one; a different quality or
+/// `t` is a new fact.
 #[test]
 fn row_02_identical_repeat_dropped_and_counted() {
     let (mut m, s) = model();
@@ -144,6 +147,8 @@ fn row_02_identical_repeat_dropped_and_counted() {
     assert_eq!(m.facts().unwrap().len(), 3);
 }
 
+/// Row 2a: "Series not versioned: A, then B, then a replay of A: replay
+/// dropped; B stays current. With `revise`, A is recorded and current."
 #[test]
 fn row_02a_replay_of_earlier_value_dropped_unless_revise() {
     let (mut m, s) = model();
@@ -750,6 +755,8 @@ fn row_20a_interval_series_of_30_minutes_has_no_calendar_node() {
     );
 }
 
+/// Row 3: "Reading for last week arrives now: flagged `late`; minute path
+/// updated; no retroactive trigger."
 #[test]
 fn row_03_late_reading_flagged_tree_updated_no_retroactive_trigger() {
     let (mut m, s) = model();
@@ -780,6 +787,8 @@ fn row_03_late_reading_flagged_tree_updated_no_retroactive_trigger() {
     assert!(delivered(&m).contains(&p), "a late fact is still a fact");
 }
 
+/// Row 4: "Reading > 60 s in the future, on an observed series: recorded,
+/// `future`, suspect; ignored by live state, staleness, windows until due."
 #[test]
 fn row_04_future_reading_recorded_suspect_excluded_until_its_time() {
     let (mut m, s) = model();
@@ -808,6 +817,8 @@ fn row_04_future_reading_recorded_suspect_excluded_until_its_time() {
     assert!(!m.current().unwrap()[&(s, now + 60 * SECOND)].flags.future);
 }
 
+/// Row 5: "Device clock stuck or far in the past: late data; adapter health
+/// reports skew when `received_at − t` is persistently large."
 #[test]
 fn row_05_stuck_or_past_clock_is_late_and_reported() {
     let (mut m, s) = model();
@@ -830,6 +841,7 @@ fn row_05_stuck_or_past_clock_is_late_and_reported() {
     assert_eq!(m.health().level, Level::Ok);
 }
 
+/// Row 6: "Two readings in one second: both facts; the minute node folds both."
 #[test]
 fn row_06_two_readings_in_one_second() {
     let (mut m, s) = model();
@@ -847,6 +859,11 @@ fn row_06_two_readings_in_one_second() {
     leaf_ok(&m, s, t);
 }
 
+/// Row 7: "Process crash after write, before sync. Same boot: truncated to
+/// the durable mark on restart; never delivered." With the mark lost
+/// (row 7, second clause) recovery treats it as a different boot and may keep
+/// the batch: `s3_missing_mark_counts_as_different_boot`. The model's mark is
+/// exact and `possible_loss` is not reported (see `OPEN-QUESTIONS.md`).
 #[test]
 fn row_07_process_crash_after_write_before_sync() {
     // Same boot: recovery truncates to the durable mark, whatever reached the
@@ -874,6 +891,10 @@ fn row_07_process_crash_after_write_before_sync() {
     }
 }
 
+/// Row 7a: "Power loss after write, before sync. New boot: torn tail truncated
+/// by checksum; complete batches synced on recovery before use." The `resync`
+/// owed after the recovery is
+/// `s4_resync_after_rule_3_recovery_before_later_positions`.
 #[test]
 fn row_07a_power_loss_after_write_before_sync() {
     // New boot: a torn tail is truncated; a complete batch with valid
@@ -908,6 +929,8 @@ fn row_07a_power_loss_after_write_before_sync() {
     assert_eq!(m.counters.batches_discarded, 0);
 }
 
+/// Row 8: "Crash after sync, before delivery: delivered on restart from each
+/// consumer's cursor."
 #[test]
 fn row_08_crash_after_sync_before_delivery() {
     let (mut m, s) = model();
@@ -923,7 +946,7 @@ fn row_08_crash_after_sync_before_delivery() {
     assert!(obs[0].replayed);
 }
 
-/// A crash during delivery comes after the durable mark: a consumer never sees
+/// Row 8: a crash during delivery comes after the durable mark: a consumer never sees
 /// a batch that a restart on the same boot could truncate.
 #[test]
 fn row_08_crash_during_delivery_after_mark() {
@@ -956,7 +979,7 @@ fn sealed_model() -> (Model, SeriesId) {
     (m, s)
 }
 
-/// A failed recovery sync leaves the engine read-only before it writes
+/// Row 9: a failed recovery sync leaves the engine read-only before it writes
 /// anything: unpublished compaction outputs stay until a later recovery.
 #[test]
 fn row_09_failed_recovery_sync_discards_nothing() {
@@ -979,6 +1002,8 @@ fn row_09_failed_recovery_sync_discards_nothing() {
     assert_eq!(m.disk.mark.unwrap().boot, m.boot);
 }
 
+/// Row 9: "Crash during compaction: output unpublished and discarded; inputs
+/// intact."
 #[test]
 fn row_09_crash_during_compaction() {
     let (mut m, _) = sealed_model();
@@ -1045,6 +1070,10 @@ fn row_10_crash_around_the_manifest_record() {
     );
 }
 
+/// Row 11: "Torn or corrupt block in a sealed file: quarantine; fetch from
+/// cold/deep; verify, swap by manifest; errors meanwhile." Never repaired in
+/// place. A log segment with no other copy is
+/// `s8_corrupt_log_segment_with_no_other_copy_loses_range`.
 #[test]
 fn row_11_corrupt_sealed_file_quarantined_and_restored_from_tier() {
     let (mut m, _) = sealed_model();
@@ -1063,6 +1092,8 @@ fn row_11_corrupt_sealed_file_quarantined_and_restored_from_tier() {
     assert_eq!(durable(&m), before);
 }
 
+/// Row 12: "Sync returns an error: read-only, fatal; a restart on the same boot
+/// truncates to the durable mark."
 #[test]
 fn row_12_sync_error_read_only_fatal_restart_truncates() {
     for outcome in [
@@ -1091,6 +1122,9 @@ fn row_12_sync_error_read_only_fatal_restart_truncates() {
     }
 }
 
+/// Row 13: "Disk fills: degrade, then ingest waits; compaction ENOSPC abandons
+/// the job; nothing deleted." Here compaction pauses at the low mark before any
+/// ENOSPC.
 #[test]
 fn row_13_disk_fills_degrade_then_ingest_waits_nothing_deleted() {
     let cfg = Config {
@@ -1127,6 +1161,8 @@ fn row_13_disk_fills_degrade_then_ingest_waits_nothing_deleted() {
     assert_eq!(m.window(s, T0, T0 + MINUTE).unwrap().count, 2);
 }
 
+/// Row 14: "Consumer slower than the stream: catch-up from the log after the
+/// last position enqueued, hand-over to live without gap or repeat."
 #[test]
 fn row_14_consumer_slower_than_stream_catches_up_from_log() {
     let slow = ConsumerDecl {
@@ -1336,6 +1372,101 @@ fn row_34_route_added_while_catching_up() {
     assert_eq!(got, want);
 }
 
+/// Row 33: "Consumer emits readings from a delivery: non-blocking emit off the
+/// writer thread; cyclic routes rejected." A consumer that takes a delivery
+/// emits a derived reading: the emit returns at once, enters the next batch
+/// and waits only as back-pressure (`Wait::QueueFull`), never for a commit;
+/// nothing is delivered until that batch commits, and then at a later position.
+/// The model is synchronous, so "off the writer thread" is shown by the engine
+/// (roadmap 5.2). Rejecting a cycle is Q-78: nothing tells the engine which
+/// series a consumer emits, and here a route from the emitted series back to
+/// the consumer is accepted; each emitted reading reaches it once.
+#[test]
+fn row_33_consumer_emits_readings_from_a_delivery() {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::Series(Default::default()),
+        capacity: 100,
+    };
+    let cfg = Config {
+        ingest_capacity: 2,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![consumer], T0 + HOUR);
+    let def = |m: &mut Model, name: &str| {
+        m.define_with(
+            name,
+            Kind::Gauge,
+            ValueType::Number,
+            "W",
+            10 * SECOND,
+            SeriesOptions::expected(SECOND),
+        )
+        .unwrap()
+    };
+    let raw = def(&mut m, "plant/line-1/power");
+    let derived = def(&mut m, "plant/line-1/power-smoothed");
+    m.add_route(
+        C,
+        FunnelId(1),
+        Funnel::facts(Selection::Series([raw].into())),
+    )
+    .unwrap();
+    // A route from the series the consumer emits back to it (Q-78).
+    m.add_route(
+        C,
+        FunnelId(2),
+        Funnel::facts(Selection::Series([derived].into())),
+    )
+    .unwrap();
+    let now = m.wall;
+    let p_raw = m.ingest(vec![num(raw, now, 10.0)]).unwrap().positions[0];
+    let mut seen = Vec::new();
+    let mut emitted = 0;
+    for _ in 0..4 {
+        for d in m.poll(C, 10).unwrap() {
+            seen.push(d.position);
+            m.confirm(C, d.position).unwrap();
+            if d.fact.series == raw {
+                // Emits from the delivery; the emit does not commit.
+                let before = m.disk.all_entries().len();
+                m.emit(num(derived, d.fact.t, 5.0)).unwrap();
+                emitted += 1;
+                assert_eq!(
+                    m.disk.all_entries().len(),
+                    before,
+                    "no commit inside the emit"
+                );
+                assert!(
+                    m.poll(C, 10).unwrap().is_empty(),
+                    "nothing delivered before the commit"
+                );
+            }
+        }
+        if m.queued() > 0 {
+            m.commit(None).unwrap();
+        }
+    }
+    assert_eq!(emitted, 1);
+    let p_derived = m.current().unwrap()[&(derived, now)].position;
+    assert!(p_raw < p_derived);
+    assert_eq!(
+        seen,
+        vec![p_raw, p_derived],
+        "each emitted reading delivered once"
+    );
+    // A full ingest queue makes the emit return back-pressure, not wait.
+    m.emit(num(derived, now + SECOND, 1.0)).unwrap();
+    m.emit(num(derived, now + 2 * SECOND, 1.0)).unwrap();
+    assert_eq!(
+        m.emit(num(derived, now + 3 * SECOND, 1.0)),
+        Err(Wait::QueueFull.into())
+    );
+    assert_eq!(m.counters.waits[&Wait::QueueFull], 1);
+}
+
+/// Row 17: "Series goes silent: stale after S; coverage stops; stale-for-N
+/// funnels fire."
 #[test]
 fn row_17_series_goes_silent() {
     let (mut m, s) = model(); // staleness 10 s
@@ -1675,6 +1806,9 @@ fn row_20_dst_transition_days_explicit() {
     assert!(a.same_summaries(&b));
 }
 
+/// Row 18a: "Counter wraps, glitches low, or is silent for hours: `wrap_at`
+/// rule; regression (0, counted); full step credited after the gap, coverage
+/// shows it and rate is flagged."
 #[test]
 fn row_18a_counter_wraps_glitches_low_or_is_silent_for_hours() {
     let mut p = Params::new(Kind::Counter, MINUTE);
@@ -1729,6 +1863,8 @@ fn row_18a_counter_wraps_glitches_low_or_is_silent_for_hours() {
     );
 }
 
+/// Row 22: "System clock jumps: timers of observed series monotonic; window
+/// `now` never runs backwards." Commit order holds across a backward jump.
 #[test]
 fn row_22_system_clock_jump_timers_unaffected() {
     let (mut m, s) = model();
@@ -1760,6 +1896,7 @@ fn row_22_system_clock_jump_timers_unaffected() {
     assert_eq!(held.on_tick(m.mono), vec![Event::Fired]);
 }
 
+/// Row 23: "Series renamed: alias entry; id and data unchanged."
 #[test]
 fn row_23_series_renamed_alias_fact() {
     let (mut m, s) = model();
@@ -1781,6 +1918,7 @@ fn row_23_series_renamed_alias_fact() {
     );
 }
 
+/// Row 24: "Unit, kind or scale changes: new series; old one retired."
 #[test]
 fn row_24_unit_or_kind_change_is_new_series() {
     let (mut m, s) = model();
@@ -1813,6 +1951,8 @@ fn row_24_unit_or_kind_change_is_new_series() {
     assert_eq!(m.facts().unwrap().len(), 1, "old series not rewritten");
 }
 
+/// Row 25: "Series retired at `t_r`: facts with `t < t_r` accepted; later
+/// refused and counted."
 #[test]
 fn row_25_series_retired_at_t_r() {
     let (mut m, s) = model();
@@ -1894,6 +2034,8 @@ fn row_26_reader_holds_an_old_epoch() {
     assert!(inputs.iter().all(|f| !m.disk.hot.contains(f)));
 }
 
+/// Row 27: "Bucket unreachable for days: queue grows, no eviction, degraded
+/// health."
 #[test]
 fn row_27_bucket_unreachable_for_days() {
     let (mut m, s) = model();
@@ -1914,6 +2056,8 @@ fn row_27_bucket_unreachable_for_days() {
     assert_eq!(m.health().level, Level::Ok);
 }
 
+/// Row 29: "Late fact for a minute whose detail is not local: recorded; node
+/// `summary_stale` until fetched."
 #[test]
 fn row_29_late_fact_for_span_without_local_detail() {
     let cfg = Config {
@@ -1947,6 +2091,8 @@ fn row_29_late_fact_for_span_without_local_detail() {
     leaf_ok(&m, s, T0);
 }
 
+/// Row 30: "Very many series: ceiling refuses new series clearly." Memory per
+/// series is a load test (roadmap 10.1).
 #[test]
 fn row_30_series_ceiling() {
     let cfg = Config {
@@ -1979,6 +2125,8 @@ fn row_30_series_ceiling() {
     ));
 }
 
+/// Row 31: "Value NaN or infinite, or a negative counter value: recorded as bad
+/// quality without a value; counted."
 #[test]
 fn row_31_nan_or_infinite_recorded_as_bad_without_value() {
     let (mut m, s) = model();
@@ -2086,6 +2234,8 @@ fn row_22a_host_clock_not_yet_synchronised() {
     assert!(f.flags.host_time && !f.flags.unsynced_clock);
 }
 
+/// Row 32: "Format version newer than the reader: refused with a clear error."
+/// Golden files follow with the format (roadmap 4.2).
 #[test]
 fn row_32_newer_format_refused() {
     let (mut m, _) = sealed_model();
@@ -2095,6 +2245,8 @@ fn row_32_newer_format_refused() {
     assert_eq!(m.read(&r), Err(Error::NewerFormat(f, FORMAT_VERSION + 1)));
 }
 
+/// Row 35: "Window with no new data, or edge inside the open minute: timer
+/// evaluation; nothing credited past the credit limit or S."
 #[test]
 fn row_35_window_with_no_new_data_or_edge_in_open_minute() {
     let (mut m, s) = model(); // S = 10 s

@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-75 | §5.7, §12 D3, §6 Windows, rows 20 and 21 | Local days around a site-zone change to another offset |
 | Q-76 | §5.7, row 21, invariant 8 | Whether a tzdata change is a log entry |
 | Q-77 | §5.7, row 20 | A day whose midnight occurs twice |
+| Q-78 | §4 Routing, Concurrency, row 33 | How routing compilation knows the series a consumer emits |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -555,6 +556,24 @@ ends, also when the gap straddles midnight (Toronto, 31 March 1919, 23:30 to 00:
 **Needed.** Which instant starts a day whose midnight occurs twice.
 **Proposal.** §5.7: "A day whose local midnight occurs twice starts at the earlier."
 
+## Q-78 — How routing compilation knows the series a consumer emits
+**Scenario.** Consumer A routes `plant/*/power` and, from each delivery, emits a smoothed value on
+`plant/line-1/power-smoothed`. The pattern matches its own output, so every reading A emits is routed back to A, which
+emits again: one batch per commit, without end. §4 Routing says "Compilation rejects a cycle where a consumer's
+emitted series routes back to it", and row 33 "cyclic routes rejected", but nothing tells the engine which series a
+consumer emits: `try_emit` is a call on the store (`api.md` Writing), a reading carries no emitter, and a funnel
+declares only what its consumer receives. The cycle can also be indirect (A emits a series routed to B, which emits
+one routed to A), or be closed later by a run-time route or by a definition entry that a pattern matches.
+**Model.** A consumer emits through the store like any adapter; no cycle is detected, and a route from the series a
+consumer emits back to it is accepted (`tests/edge_cases.rs` `row_33_consumer_emits_readings_from_a_delivery`).
+**Needed.** How the engine learns the series a consumer emits, and which changes the check runs on (start, route
+changes, definition entries matched by a pattern).
+**Proposal.** A consumer declares the series it may emit (`emits: Select`, ids or name patterns, default none) with
+its other configuration, and emits through its own handle, which refuses and counts a reading on a series outside
+it. Compilation builds the graph from each consumer through its emitted series to the consumers they are routed to,
+and refuses a route change that closes a cycle, naming it. A definition entry that would close one through patterns
+is not routed to the funnel that closes it, and is reported.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -782,7 +801,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
 | Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
 | Entries at store creation | §5.7: the site zone is a log entry; Q-76: the tzdata version | A store header beside the log, written at creation and carried by the bucket, holds the site zone and tzdata version before any entry, so that positions start at `0:1`; a start or restore configured with a zone other than the store's zone in force (its site-zone entry with the latest effective time, else the header's) is refused (`OpenRefused`, `SiteZoneMismatch`), a restore before it claims a generation | `tests/rules.rs` `s5_7_store_keeps_its_site_zone_and_refuses_another_at_open` |
-| New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
+| New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 (see Q-78) | Consumers are declared when the model is created and start before the first position; a consumer emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_consumer_emits_readings_from_a_delivery` |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
 | Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |

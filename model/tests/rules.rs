@@ -991,6 +991,7 @@ fn backed_up_model() -> (Model, SeriesId) {
 /// §2.2, §8 Restore step 1: a restore claims the next generation and starts it
 /// at sequence 1; a restart keeps the generation, and a restore of the
 /// restored store claims another.
+/// Row 28: "Restore onto an empty disk: new generation, claimed in the bucket."
 #[test]
 fn s8_restore_claims_next_generation_from_sequence_1() {
     let (mut m, s) = backed_up_model();
@@ -1017,6 +1018,8 @@ fn s8_restore_claims_next_generation_from_sequence_1() {
 
 /// §8 Generations: two restores from one bucket claim different generations,
 /// so the same position never names two facts.
+/// Row 28b: "Two restores from one bucket: each restore claims its own
+/// generation."
 #[test]
 fn s8_two_restores_from_one_bucket_claim_different_generations() {
     let (m, s) = backed_up_model();
@@ -1039,6 +1042,7 @@ fn s8_restore_from_empty_bucket_refused() {
 }
 
 /// §8 Restore drill: a drill restores read-only and claims nothing.
+/// Row 28b: "a drill beside a live store … claims nothing".
 #[test]
 fn s8_drill_is_read_only_and_claims_nothing() {
     let (mut m, s) = backed_up_model();
@@ -1060,6 +1064,9 @@ fn s8_drill_is_read_only_and_claims_nothing() {
 
 /// §8 Generations: a writer that finds a higher generation claimed stops
 /// uploading and becomes read-only.
+/// Row 28b: "a writer that finds a higher one stops uploading". The model does
+/// not read the claims again after a restore uploads its record, so the clause
+/// on two concurrent restores is not shown (see `OPEN-QUESTIONS.md`).
 #[test]
 fn s8_superseded_writer_stops_uploading() {
     let (mut m, s) = backed_up_model();
@@ -1076,6 +1083,9 @@ fn s8_superseded_writer_stops_uploading() {
 /// §8 Restore step 1: the restored end is the last position before the first
 /// gap; later positions are set aside, outside views and delivery, and a
 /// cursor below the gap catches up only to the restored end.
+/// Row 28: "positions beyond the restored end set aside, reported, ids
+/// reserved" (the model sets them aside but neither reports them nor reserves
+/// their ids; see `OPEN-QUESTIONS.md`).
 #[test]
 fn s8_restored_end_before_first_gap() {
     let (mut m, s) = backed_up_model(); // positions 0:1 to 0:5 backed up
@@ -1430,6 +1440,8 @@ fn s8_restore_record_written_before_ingest() {
 /// restored end (labelled derived-unverified), with its registry file and
 /// latest `t` per series, and the sealed log segments after its position;
 /// replay them into the tree."
+/// Row 28: the tree starts from the checkpoint's stored nodes and the local
+/// facts.
 #[test]
 fn s8_restore_from_latest_checkpoint_at_or_below_restored_end() {
     let (mut m, s, cp) = checkpointed_model();
@@ -1533,7 +1545,8 @@ fn s8_replayed_minute_of_a_series_without_a_1_minute_level_is_stale() {
 }
 
 /// §8 Restore step 2: "The store serves queries at ≥ 1-minute resolution,
-/// flagged `restoring`".
+/// flagged `restoring`". Row 28: "windows from the checkpoint's stored levels
+/// and local facts".
 #[test]
 fn s8_restoring_queries_at_one_minute_resolution() {
     let (mut m, s, _) = checkpointed_model();
@@ -1663,6 +1676,7 @@ fn s8_position_in_two_files_must_have_identical_content() {
 /// from facts and compare with the checkpoint; any difference is reported and
 /// the recomputed value wins. The checkpoint label is removed when all detail
 /// has been verified."
+/// Row 28: "detail back-fills and verifies the checkpoint".
 #[test]
 fn s8_detail_back_verifies_checkpoint_and_removes_label() {
     let (mut m, s, _) = checkpointed_model();
@@ -1703,6 +1717,8 @@ fn s8_checkpoint_difference_reported_and_recomputed_wins() {
 /// §8 Restore: "A restart after the restore record is written resumes the
 /// restore in its generation, fetching the files listed by the manifest
 /// records it restores from that are not yet local."
+/// Row 28a: "Crash or reboot during a restore: resumes in its generation from
+/// the restore record."
 #[test]
 fn s8_restart_after_record_resumes_in_its_generation() {
     let (mut m, s, _) = checkpointed_model();
@@ -1725,6 +1741,7 @@ fn s8_restart_after_record_resumes_in_its_generation() {
 
 /// §8 Restore: "A crash before the record starts the restore again with the
 /// next generation."
+/// Row 28a: "before the record, starts again with the next generation".
 #[test]
 fn s8_crash_before_record_restarts_with_next_generation() {
     let (mut m, s, _) = checkpointed_model();
@@ -1778,6 +1795,7 @@ fn s8_restoring_window_past_now_inside_a_minute() {
 /// accepted", then downloads the checkpoint and "the sealed log segments after
 /// its position; replay them into the tree". A crash during step 1 therefore
 /// finishes step 1, with the latest `t` per series, before ingest.
+/// Row 28a, a crash during step 1.
 #[test]
 fn s8_crash_during_step_1_finishes_it_before_ingest() {
     let (mut m, s, _) = checkpointed_model();
