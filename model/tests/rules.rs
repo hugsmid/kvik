@@ -10,10 +10,10 @@ use kvik_model::condition::{Condition, ConditionState};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
     Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, Locality, ManifestOp, Model,
-    Operator, Reason, Refusal, Selection, Signal, TriggerCause, Wait, WriteOutcome,
+    Operator, Reason, Refusal, Selection, Signal, Tier, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
-use kvik_model::registry::{ChangedAtKind, RegistryError, SeriesOptions, Timing};
+use kvik_model::registry::{ChangedAtKind, RegistryError, RetentionClass, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
@@ -2573,5 +2573,248 @@ fn s7_leases_expire_on_the_writers_monotonic_clock() {
     assert!(
         m.live_lease_epochs().is_empty(),
         "a lease of another boot is void"
+    );
+    m.refresh_reader(&reader, true);
+    assert!(
+        m.live_lease_epochs().is_empty(),
+        "also when refreshed after the reboot"
+    );
+}
+
+// ----- tiers and eviction (§3 Disk space, §8) -----
+
+/// The manifest's tier moves, in order.
+fn moves(m: &Model) -> Vec<Vec<(FileId, Tier)>> {
+    m.disk
+        .manifest
+        .iter()
+        .filter_map(|r| match &r.op {
+            ManifestOp::Publish { moved, .. } if !moved.is_empty() => {
+                Some(moved.iter().map(|x| (x.file, x.to)).collect())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// §3 Disk space: "Low mark … → compaction pauses, health degraded. Tiering
+/// and eviction, which free space, continue at every mark."
+#[test]
+fn s3_low_mark_pauses_compaction_not_tiering() {
+    let cfg = Config {
+        disk_bytes: 100_000,
+        low_mark: 20_000,
+        critical_mark: 5_000,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], T0 + HOUR);
+    let s = m
+        .define(
+            "vehicle/7/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.seal_active();
+    m.upload();
+    m.disk.other_bytes = 85_000;
+    assert_eq!(m.compact(None), Err(Error::Paused));
+    m.advance(91 * DAY);
+    assert_eq!(m.housekeeping().unwrap().len(), 1, "the old segment leaves");
+}
+
+/// §8 Eviction at 90 days: "Revision chunks (age per series, 'never'
+/// allowed) and sealed log segments leave hot only after they are verified in
+/// cold or deep. Current detail and the stored tree stay." §7: "Tier moves
+/// keep the file's identity and change its location"; one record may move
+/// files atomically.
+#[test]
+fn s8_eviction_at_90_days_with_revision_age_per_series() {
+    let (mut m, a) = model(10 * SECOND);
+    let b = m
+        .define(
+            "vehicle/8/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    m.config.revision_age.insert(b, None);
+    for s in [a, b] {
+        m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+        m.ingest(vec![Reading::num(s, T0, 2.0)]).unwrap();
+    }
+    m.seal_active();
+    let out = m.compact(None).unwrap();
+    let revision = |s: SeriesId| {
+        *out.iter()
+            .find(|f| {
+                m.disk.files[*f].class == FileClass::Revision
+                    && m.disk.files[*f]
+                        .entries()
+                        .any(|e| e.fact().unwrap().series == s)
+            })
+            .unwrap()
+    };
+    let (ra, rb) = (revision(a), revision(b));
+    m.advance(91 * DAY);
+    assert!(
+        m.housekeeping().unwrap().is_empty(),
+        "nothing verified elsewhere"
+    );
+    m.copy_to_cold(ra);
+    m.upload();
+    let segment = m.disk.compacted_segments().into_iter().next().unwrap();
+    let mut gone = m.housekeeping().unwrap();
+    gone.sort();
+    assert_eq!(
+        gone,
+        vec![segment, ra],
+        "never for series b; current detail stays"
+    );
+    assert!(m.disk.hot.contains(&rb));
+    assert_eq!(
+        moves(&m),
+        vec![vec![(segment, Tier::Deep), (ra, Tier::Cold)]]
+    );
+    let before = durable(&m);
+    m.restart();
+    assert_eq!(durable(&m), before);
+}
+
+/// §8 Retention class: "For a diagnostic series (§2.1), raw detail (current
+/// and revision chunks) whose span ends more than the retention period before
+/// `now` leaves hot once verified in cold or deep … The stored tree stays hot.
+/// Nothing is deleted: such detail is fetched on demand like moved current
+/// detail, so … the duplicate check for it is unchecked (§2.4)." §2.1: "A
+/// change of class is a registry entry that takes effect at its position, not
+/// by event time; it moves no detail back."
+#[test]
+fn s8_retention_class_moves_diagnostic_detail_after_its_period() {
+    let (mut m, s) = model(10 * SECOND);
+    let g = m
+        .define(
+            "vehicle/8/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    for x in [s, g] {
+        m.ingest(vec![
+            Reading::num(x, T0, 1.0),
+            Reading::num(x, T0 + SECOND, 2.0),
+        ])
+        .unwrap();
+    }
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.upload();
+    let p = m.registry().unwrap().get(s).unwrap().retention;
+    assert_eq!(p, RetentionClass::LongTerm);
+    m.set_retention(s, RetentionClass::diagnostic()).unwrap();
+    m.advance(29 * DAY);
+    assert!(m.housekeeping().unwrap().is_empty(), "within the period");
+    m.advance(2 * DAY);
+    let gone = m.housekeeping().unwrap();
+    assert_eq!(gone.len(), 1);
+    let chunk = &m.disk.files[&gone[0]];
+    assert_eq!(chunk.class, FileClass::Current);
+    assert!(chunk.entries().all(|e| e.fact().unwrap().series == s));
+    // The tree stays. The log segment, younger than 90 days, still holds
+    // the facts locally, so the duplicate check runs.
+    assert_eq!(m.tree(s).unwrap().node(0, T0).count, 2);
+    assert_eq!(
+        m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().duplicates,
+        1
+    );
+    // Once the segment has left too, it is unchecked for the diagnostic
+    // series only.
+    m.advance(60 * DAY);
+    m.housekeeping().unwrap();
+    let r = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    assert_eq!((r.positions.len(), m.counters.duplicates_unchecked), (1, 1));
+    let r = m.ingest(vec![Reading::num(g, T0, 1.0)]).unwrap();
+    assert_eq!(r.duplicates, 1, "a long-term series is checked");
+    // Back to long-term: nothing moves back.
+    m.set_retention(s, RetentionClass::LongTerm).unwrap();
+    m.housekeeping().unwrap();
+    assert!(!m.disk.hot.contains(&gone[0]));
+    m.restart();
+    assert_eq!(
+        m.registry().unwrap().get(s).unwrap().retention,
+        RetentionClass::LongTerm
+    );
+}
+
+/// §8 Fill pressure: "Above 70 % fill, verified sealed log segments leave
+/// first, then the oldest current raw detail (verified first, fetched on
+/// demand)" (§12 D4). The registry's chunk stays.
+#[test]
+fn s8_fill_pressure_moves_log_segments_before_current_detail() {
+    let cfg = Config {
+        disk_bytes: 64 * 12,
+        low_mark: 0,
+        critical_mark: 0,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], T0 + HOUR);
+    let s = m
+        .define(
+            "vehicle/7/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    let mut chunks = Vec::new();
+    for hour in [3, 1, 2] {
+        let t = T0 - hour * HOUR;
+        m.ingest(
+            (0..3)
+                .map(|i| Reading::num(s, t + i * SECOND, 1.0))
+                .collect(),
+        )
+        .unwrap();
+        m.seal_active();
+        chunks.extend(
+            m.compact(None)
+                .unwrap()
+                .into_iter()
+                .filter(|f| m.disk.files[f].entries().any(|e| e.fact().is_some())),
+        );
+    }
+    let segments = m.disk.compacted_segments();
+    m.upload();
+    // 9 facts in segments, 9 in chunks, 1 registry entry twice: 20 entries;
+    // 70 % of the disk holds 7. The segments leave (10 remain), then one
+    // chunk of 3.
+    let gone = m.housekeeping().unwrap();
+    let left_segments: Vec<FileId> = gone
+        .iter()
+        .copied()
+        .filter(|f| segments.contains(f))
+        .collect();
+    assert_eq!(left_segments.len(), segments.len(), "every segment first");
+    // Then the chunk of the oldest data (3 hours ago), not the first written.
+    let rest: Vec<FileId> = gone
+        .iter()
+        .copied()
+        .filter(|f| !segments.contains(f))
+        .collect();
+    assert_eq!(rest, vec![chunks[0]]);
+    assert!(m.disk.used_bytes(64) <= 64 * 12 / 100 * 70);
+    assert_eq!(moves(&m).len(), 1, "one record");
+    assert!(
+        m.disk
+            .hot
+            .iter()
+            .any(|f| m.disk.files[f].entries().all(|e| e.fact().is_none()))
     );
 }

@@ -601,3 +601,70 @@ fn q71_log_segment_and_its_chunks_listed_in_one_epoch() {
     );
     assert_eq!(inv14_overlap(&r), None);
 }
+
+/// Q-72: a replay whose key's detail is off every local tier is recorded
+/// unchecked although the revised-key index holds it. On a series that is
+/// not versioned it reverts the correction; on a versioned one it is
+/// outranked.
+#[test]
+fn q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it() {
+    use kvik_model::registry::{ChangedAtKind, SeriesOptions};
+    let cfg = Config {
+        disk_bytes: 64 * 4,
+        low_mark: 0,
+        critical_mark: 0,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], T0 + HOUR);
+    let s = m
+        .define(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    let v = m
+        .define_with(
+            "site/forecast-1/load",
+            Kind::Gauge,
+            ValueType::Number,
+            "kW",
+            10 * SECOND,
+            SeriesOptions::versioned(ChangedAtKind::Version),
+        )
+        .unwrap();
+    m.ingest(vec![
+        Reading::num(s, T0, 1.0),
+        Reading::versioned(v, T0, 1.0, 1),
+    ])
+    .unwrap();
+    m.ingest(vec![
+        Reading::num(s, T0, 2.0),
+        Reading::versioned(v, T0, 2.0, 2),
+    ])
+    .unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.upload();
+    // Fill pressure moves the current detail; the revision chunks leave at
+    // 90 days. Only the registry's chunk stays.
+    m.advance(91 * 24 * HOUR);
+    m.housekeeping().unwrap();
+    assert!(m.disk.local_positions().iter().all(|p| p.sequence <= 2));
+    let r = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    assert_eq!((r.positions.len(), m.counters.duplicates_unchecked), (1, 1));
+    assert_eq!(
+        m.current().unwrap()[&(s, T0)].value,
+        Value::Num(1.0),
+        "reverted"
+    );
+    let r = m.ingest(vec![Reading::versioned(v, T0, 1.0, 1)]).unwrap();
+    assert_eq!((r.positions.len(), m.counters.duplicates_unchecked), (1, 2));
+    assert_eq!(
+        m.current().unwrap()[&(v, T0)].value,
+        Value::Num(2.0),
+        "outranked"
+    );
+}

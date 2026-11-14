@@ -26,6 +26,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-64 | §4 Routing, §8 Continuous backup, §8 Restore step 1 | Routing changes before a restore's checkpoint |
 | Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
 | Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
+| Q-72 | §2.4, §8 Restore step 2, row 2c, invariant 15 | Whether the revised-key index is consulted when the current fact is off the machine |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -427,6 +428,22 @@ restore the chunks it will bring back, is not compacted again (`q71_log_segment_
 **Proposal.** §7 Manifest and invariant 14: "No manifest epoch lists two live compacted files holding the same
 position. A log segment holds the same positions as the chunks compacted from it until it leaves (§8)."
 
+## Q-72 — Whether the revised-key index is consulted when the current fact is off the machine
+**Scenario.** (a) A series that is not versioned records A and then a correction B for one `(series, t)`; fill
+pressure moves the detail holding both off every local tier. An adapter replays A. §2.4 says that if the current fact
+for a key is on no local tier the fact is recorded and counted `duplicates_unchecked`, and that such a repeat "can
+revert a correction that differs in value"; so A is recorded and becomes current. But the revised-key index, which
+is hot and never moves, holds A's value and quality, so the check could run and drop A; and §8 Restore step 2 drops a
+fact that matches an entry of the index, so the same replay is dropped during a restore once the index is back.
+(b) The versioned twin: A (`changed_at` 1), B (2), both off every local tier; a replay of A matches "a fact off every
+local tier" by `changed_at`, so §2.4 records it unchecked, although the index holds it. Row 2c allows both outcomes.
+**Model.** Outside a restore it follows §2.4 as written: (a) records A unchecked and A becomes current; (b) records A
+unchecked, outranked, and B stays current. During a restore with the index back, the replay is dropped
+(`q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it`,
+`q39_revised_key_index_back_with_current_chunks`).
+**Needed.** Whether the check compares with the revised-key index whenever it holds the key, so that "on no local
+tier" applies only to a key with a single fact, or whether the unchecked rule applies whatever the index holds.
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -556,7 +573,8 @@ adapter-supplied quality; a fact whose key's current fact is on no local tier, h
 `duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), versioned series (§2.1–§2.4: `changed_at` required on
 every reading of a versioned series and refused on any other, `revise` refused there, rank `(changed_at, position)`
 in every view, identity including `changed_at`, the version index, carried by each tree checkpoint and exact while a
-restore brings detail back; §4: an outranked fact delivered flagged `outranked`, live and in catch-up, counted, and
+restore brings detail back; §4: an outranked fact delivered flagged `outranked`, live and in catch-up (where catch-up judges it from the local
+history, so while a restore's detail is not yet local a replayed fact can miss the flag), counted, and
 never fed to a condition or refreshing stale-for; §5.6: it changes no node; invariants 4, 15 and 19, rows 2c, 2d and
 37), compaction and files (§7: per-series current and revision chunks, ranked within the compaction's inputs, and a
 chunk of the registry and routing entries; one manifest record that adds, retires and moves files atomically;
@@ -566,7 +584,14 @@ start, once their replacements are verified in another tier and no live lease na
 invariant 12, once the retired file itself has a verified copy in another tier; reader leases with boot id and
 refresh counter, expired on the writer's monotonic clock, first observed at the writer's start, void on another boot;
 a restore leaves out files retired by a record whose added files are in the bucket; invariant 14 (see Q-71), rows 10
-and 26; `tests/rules.rs` `s7_…`), the late and future
+and 26; `tests/rules.rs` `s7_…`), tiers and eviction (§3 Disk space: tiering and eviction continue at every mark;
+§8: sealed log segments and revision chunks leave hot at 90 days, revision chunks by an age per series that may be
+never; current detail stays except under the retention class, a registry entry in force from its position that
+moves a diagnostic series' current and revision chunks whose span ends more than its period before `now`, and moves
+nothing back; fill pressure moves verified sealed log segments first, oldest first, then the current chunks of the
+oldest data, never the registry's chunk; every move needs a verified copy in cold or deep and is recorded in one
+manifest record; invariant 12; `tests/rules.rs` `s3_low_mark_…` and `s8_eviction_…`, `s8_retention_…`,
+`s8_fill_…`), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
 delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
 condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
@@ -607,7 +632,6 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Negative counter values | §2.5, §5.5: bad quality, no value | Reset rule applied | `negative_counter_decrease_counts_as_reset` |
 | Record on change | §2.6, row 17a | Keep-alive facts are ordinary facts from the adapter | `tests/edge_cases.rs` `row_17a_…` |
 | Effective-dated parameters and site zone | §2.1, §5.7, row 21 | One staleness limit per series; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
-| Low disk mark | §3: compaction pauses; tiering continues | Tiering pauses too | `low_mark_pauses_tiering_too` |
 | New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
@@ -624,8 +648,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Compaction of compacted files | §7 Policy: merge when a series' chunks overlapping any 15-minute span exceed 4 | Counts and merges the live current chunks of a series on the fast disk only; revision chunks are never merged | `tests/rules.rs` `s7_merge_publishes_outputs_and_retires_inputs_in_one_record` |
 | Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
-| Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry (they carry the version index); during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
-| Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
+| Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry (they carry the version index); outside a restore the index is not consulted when the current fact is off the machine (Q-72); during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
 | Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Timing is recorded with the definition, and a forecast series must be versioned with `changed_at` kind `time`; otherwise every series is treated as observed (`future` and `late` flags, live state, staleness, delivery, cadence and the credit limit `now`) | — |
 | Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
@@ -634,7 +657,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost and the quarantine stays | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; forgetting positions above the recovered cursor | §3 Durable mark, §3 Recovery rule 3, §4 At-least-once, Resync, row 7a | The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail; a truncation after a reboot is not reported. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
 | Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start; exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
-| Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |
+| Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, except files retired by a record whose added files are all in the bucket, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |
 | A failed retry of a restore | §8 Restore, the paragraph after step 4: a restart after the record resumes the restore in its generation | In `restart_restore`, a retry after a crash before the record that writes its record and then fails in step 1 is discarded and stays pending, so the next restart claims another generation | `tests/open_questions.rs` `q39_failed_restart_of_a_restore_is_reported` |
 | Failures after step 1 | §8 Restore, Failures and end: a file that cannot be fetched, that the bucket no longer holds or whose hash fails is retried with degraded health naming it; a content conflict is named in health with both files | Downloads do not fail; a conflicting file is not installed and the step returns `Conflict`, with no health reason | `tests/open_questions.rs` `q39_conflicting_file_leaves_restore_in_progress` |
 | End of `restoring` | §8 Restore step 3 and Failures and end: only files the restore record places on hot (and cold where configured) are brought back, and `restoring` ends when they are installed; the label goes when the spans whose detail comes back are verified | Every file the restore restores from comes back, and `restoring` ends when all are local; the label goes when every span the checkpoint covers is verified | `tests/open_questions.rs` `q39_restoring_ends_when_every_file_is_local` |
@@ -642,4 +665,3 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Window edges over detail that is not local | §6 Old spans, §8 Restore step 2: an edge moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, the error `detail_not_local`; no bound is refused for its resolution | No window is flagged `approximate_edges` and no edge moves; while restoring, a window bound inside a minute is refused with `Restoring` | `tests/open_questions.rs` `q39_no_sub_minute_query_or_checkpoint_while_restoring` |
 | Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
-| Invariant 12 | §10 | Not checked yet | — |

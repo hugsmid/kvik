@@ -611,8 +611,9 @@ proptest! {
         }
     }
 
-    /// 9. Compaction, tiering and backup preserve the set of positions with
-    /// their content; restore preserves the backed-up ones.
+    /// 9. Compaction, compaction of compacted files, tiering and backup
+    /// preserve the set of positions with their content; restore preserves
+    /// the backed-up ones, leaving out files retired by a merge.
     #[test]
     fn inv09_tiering_backup_restore_preserve_facts(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
@@ -622,6 +623,7 @@ proptest! {
         let _ = m.compact(None);
         m.seal_active();
         let _ = m.compact(None);
+        let _ = m.merge_chunks(None);
         m.disk.bucket.reachable = true;
         m.upload();
         m.advance(100 * 24 * 3600 * SECOND);
@@ -761,6 +763,22 @@ proptest! {
         }
     }
 
+    /// 12. "No file leaves a tier unless a hash-verified copy exists in
+    /// another tier", checked after every operation, with eviction at 90
+    /// days, retention classes, fill pressure, retirement and copies to
+    /// cold; and nothing is lost doing so (`apply` checks invariant 10).
+    #[test]
+    fn inv12_no_file_leaves_a_tier_without_a_verified_copy(ops in proptest::collection::vec(arb_files_op(), 1..80)) {
+        let (mut m, ids) = files_machine();
+        for op in &ops {
+            let before = m.clone();
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            if let Some(e) = inv12_unverified_departure(&before, &m) {
+                return Err(TestCaseError::fail(format!("{e} after {op:?}")));
+            }
+        }
+    }
+
     /// 10. No operation reduces the set of facts.
     #[test]
     fn inv10_no_operation_reduces_facts(ops in proptest::collection::vec(arb_op(), 1..120)) {
@@ -897,6 +915,7 @@ fn files_generator_coverage() {
     let mut runner = TestRunner::deterministic();
     let strat = proptest::collection::vec(arb_files_op(), 60..80);
     let (mut retired, mut gone, mut leases) = (0usize, 0usize, 0usize);
+    let (mut moved, mut current_moved) = (0usize, 0usize);
     for _ in 0..200 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let (mut m, ids) = machine();
@@ -907,9 +926,34 @@ fn files_generator_coverage() {
         retired += r.len();
         gone += r.keys().filter(|f| !m.disk.hot.contains(f)).count();
         leases += m.disk.leases.len();
+        let (mut m, ids) = files_machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).unwrap();
+        }
+        moved += m
+            .disk
+            .manifest
+            .iter()
+            .map(|r| match &r.op {
+                kvik_model::engine::ManifestOp::Publish { moved, .. } => moved.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        current_moved += m
+            .disk
+            .published()
+            .iter()
+            .filter(|f| {
+                m.disk.files[f].class == kvik_model::engine::FileClass::Current
+                    && !m.disk.hot.contains(f)
+            })
+            .count();
     }
-    eprintln!("retired {retired} removed {gone} leases {leases}");
+    eprintln!(
+        "retired {retired} removed {gone} leases {leases} moved {moved} current-moved {current_moved}"
+    );
     assert!(retired > 200 && gone > 15 && leases > 30);
+    assert!(moved > 200 && current_moved > 50);
 }
 
 /// Guards invariant 2's exception: a `resync` in place of a replay is

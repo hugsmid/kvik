@@ -9,7 +9,7 @@ use common::*;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, Event, Runner};
-use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Error, Model, Selection};
+use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Model, Selection};
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
@@ -154,21 +154,6 @@ fn calendar_depends_on_zone_utc_levels_do_not() {
             "UTC levels untouched"
         );
     }
-}
-
-/// §3 Disk space: below the low mark the specification pauses compaction only;
-/// the model also pauses tiering, which would free space.
-#[test]
-fn low_mark_pauses_tiering_too() {
-    let cfg = Config {
-        disk_bytes: 100_000,
-        low_mark: 20_000,
-        critical_mark: 5_000,
-        ..Config::default()
-    };
-    let mut m = Model::new(cfg, vec![], T0 + HOUR);
-    m.disk.other_bytes = 85_000;
-    assert_eq!(m.housekeeping(), Err(Error::Paused));
 }
 
 /// §5.7: a calendar result is a window evaluation over the day, edge stretches

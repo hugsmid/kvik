@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
-use crate::registry::{Registry, RegistryError, RegistryEvent, SeriesDef, SeriesOptions};
+use crate::registry::{
+    Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions,
+};
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{SeriesTree, TreeError};
 use crate::types::{
@@ -51,16 +53,21 @@ pub struct Config {
     /// Age after which revision chunks and sealed segments leave the fast disk
     /// (§8: 90 days).
     pub eviction_age: Nanos,
+    /// Age per series after which its revision chunks leave the fast disk,
+    /// `None` for never (§8 Eviction at 90 days); `eviction_age` for a series
+    /// not listed.
+    pub revision_age: BTreeMap<SeriesId, Option<Nanos>>,
     /// Fast-disk capacity in bytes.
     pub disk_bytes: u64,
     /// Bytes one log entry costs on disk (model accounting).
     pub entry_bytes: u64,
-    /// Low mark: compaction pauses, health degraded (§3). The model also
-    /// pauses tiering (see `OPEN-QUESTIONS.md`).
+    /// Low mark: compaction pauses, health degraded; tiering and eviction
+    /// continue (§3).
     pub low_mark: u64,
     /// Critical mark: ingest waits (§3).
     pub critical_mark: u64,
-    /// Fill ratio (percent) above which the oldest current detail moves out (§8: 70 %).
+    /// Fill ratio (percent) above which verified sealed log segments, then
+    /// the oldest current detail, leave the fast disk (§8: 70 %).
     pub fill_threshold_pct: u64,
 }
 
@@ -79,6 +86,7 @@ impl Default for Config {
             lease_expiry: HOUR,
             merge_threshold: 4,
             eviction_age: 90 * 24 * HOUR,
+            revision_age: BTreeMap::new(),
             disk_bytes: 1 << 40,
             entry_bytes: 64,
             low_mark: 2 << 30,
@@ -2061,6 +2069,24 @@ impl Model {
         Ok(())
     }
 
+    /// Changes a series' retention class (§2.1): a registry entry that takes
+    /// effect at its position, not by event time, and moves no detail back.
+    pub fn set_retention(&mut self, id: SeriesId, class: RetentionClass) -> Result<(), Error> {
+        let d = self
+            .vol()?
+            .registry
+            .get(id)
+            .ok_or(RegistryError::Unknown(id))?;
+        if class == d.retention {
+            return Ok(());
+        }
+        if matches!(class, RetentionClass::Diagnostic { period } if period <= 0) {
+            return Err(RegistryError::BadRetention.into());
+        }
+        self.commit_registry(RegistryEvent::Retention { id, class })?;
+        Ok(())
+    }
+
     /// The registry.
     pub fn registry(&self) -> Result<&Registry, Error> {
         Ok(&self.vol()?.registry)
@@ -3698,8 +3724,9 @@ impl Model {
 
     /// A reader refreshes its lease (§7: at least every 30 minutes): it
     /// increments the refresh counter and, with `latest`, takes the latest
-    /// epoch, which the lease then names. A reader without a lease file is
-    /// returned unchanged.
+    /// epoch, which the lease then names. The boot id stays the one the lease
+    /// was written with, so a lease from before a reboot stays void. A reader
+    /// without a lease file is returned unchanged.
     pub fn refresh_reader(&mut self, r: &Reader, latest: bool) -> Reader {
         let Some(lease) = r.lease.and_then(|id| self.disk.leases.get_mut(&id)) else {
             return r.clone();
@@ -3708,7 +3735,6 @@ impl Model {
             lease.epoch = self.disk.manifest.last().map_or(0, |x| x.epoch);
         }
         lease.counter += 1;
-        lease.boot = self.boot;
         let epoch = lease.epoch;
         Reader {
             epoch,
@@ -3858,10 +3884,8 @@ impl Model {
     /// Removes files from the fast disk where the rules allow (§7 retirement,
     /// §8 eviction and fill threshold). Returns the files removed.
     pub fn housekeeping(&mut self) -> Result<Vec<FileId>, Error> {
-        if self.free_bytes() < self.config.low_mark {
-            self.counters.paused += 1;
-            return Err(Error::Paused);
-        }
+        // Tiering and eviction free space and continue at every mark (§3
+        // Disk space).
         self.vol()?;
         let mut removed = Vec::new();
         let retired = self.disk.retired();
@@ -3895,67 +3919,102 @@ impl Model {
                 self.disk.cold.remove(&f);
             }
         }
-        let hot: Vec<FileId> = self.disk.hot.iter().copied().collect();
-        for f in hot {
-            if !self.disk.verified_elsewhere(f)
-                || self.disk.active == Some(f)
-                || retired.contains_key(&f)
-            {
+        // Files that leave hot by the tier rules (§8): each needs a verified
+        // copy in cold or deep first, and the moves are recorded in one
+        // manifest record (§7: a tier move keeps the file's identity).
+        let registry = self.vol()?.registry.clone();
+        let movable = |m: &Model, f: FileId| {
+            m.disk.verified_elsewhere(f) && m.disk.active != Some(f) && !retired.contains_key(&f)
+        };
+        let mut moves: Vec<FileId> = Vec::new();
+        for f in self.disk.hot.iter().copied() {
+            if !movable(self, f) {
                 continue;
             }
             let file = &self.disk.files[&f];
-            let remove = matches!(file.class, FileClass::Revision | FileClass::Segment)
-                && file
-                    .sealed_at
-                    .is_some_and(|s| self.wall - s >= self.config.eviction_age);
-            if remove {
-                self.disk.hot.remove(&f);
-                removed.push(f);
+            let age = |limit: Nanos| file.sealed_at.is_some_and(|s| self.wall - s >= limit);
+            // Retention class (§8): a diagnostic series' raw detail whose span
+            // ends more than its retention period before `now`.
+            let span = self.chunk_span(f);
+            let expired = span.is_some_and(|(s, _, hi)| {
+                registry.get(s).is_some_and(|d| match d.retention {
+                    RetentionClass::Diagnostic { period } => hi < self.now - period,
+                    RetentionClass::LongTerm => false,
+                })
+            });
+            let leave = match file.class {
+                // Eviction at 90 days (§8).
+                FileClass::Segment => age(self.config.eviction_age),
+                // Age per series, "never" allowed; or the retention class,
+                // whichever is earlier.
+                FileClass::Revision => {
+                    let limit = span.map_or(Some(self.config.eviction_age), |(s, _, _)| {
+                        self.config
+                            .revision_age
+                            .get(&s)
+                            .copied()
+                            .unwrap_or(Some(self.config.eviction_age))
+                    });
+                    limit.is_some_and(age) || expired
+                }
+                // Current detail stays, except as the retention class allows.
+                FileClass::Current => expired,
+            };
+            if leave {
+                moves.push(f);
             }
         }
-        // Fill threshold: verified sealed log segments leave first, oldest
-        // first, then the oldest current detail, verified first (§8, §12 D4).
+        for f in &moves {
+            self.disk.hot.remove(f);
+        }
+        // Fill pressure (§8, §12 D4): above the fill threshold, verified
+        // sealed log segments leave first, oldest first, then the oldest
+        // current raw detail, verified first. The registry's chunk stays.
         let limit = self.config.disk_bytes / 100 * self.config.fill_threshold_pct;
         let mut segments: Vec<FileId> = self
             .disk
             .hot
             .iter()
-            .filter(|f| {
-                let file = &self.disk.files[f];
-                file.class == FileClass::Segment
-                    && file.sealed
-                    && self.disk.active != Some(**f)
-                    && self.disk.verified_elsewhere(**f)
-            })
             .copied()
+            .filter(|f| self.disk.files[f].class == FileClass::Segment && movable(self, *f))
             .collect();
         segments.sort();
-        for f in segments {
-            if self.disk.used_bytes(self.config.entry_bytes) <= limit {
-                break;
-            }
-            self.disk.hot.remove(&f);
-            removed.push(f);
-        }
-        let mut current: Vec<FileId> = self
+        let mut current: Vec<(Nanos, FileId)> = self
             .disk
             .hot
             .iter()
-            .filter(|f| {
-                self.disk.files[f].class == FileClass::Current
-                    && !retired.contains_key(f)
-                    && self.disk.verified_elsewhere(**f)
-            })
             .copied()
+            .filter(|f| self.disk.files[f].class == FileClass::Current && movable(self, *f))
+            .filter_map(|f| self.chunk_span(f).map(|(_, _, hi)| (hi, f)))
             .collect();
         current.sort();
-        for f in current {
+        for f in segments
+            .into_iter()
+            .chain(current.into_iter().map(|(_, f)| f))
+        {
             if self.disk.used_bytes(self.config.entry_bytes) <= limit {
                 break;
             }
             self.disk.hot.remove(&f);
-            removed.push(f);
+            moves.push(f);
         }
+        if !moves.is_empty() {
+            let moved = moves
+                .iter()
+                .map(|f| Moved {
+                    file: *f,
+                    from: Tier::Hot,
+                    to: if self.disk.cold.contains(f) {
+                        Tier::Cold
+                    } else {
+                        Tier::Deep
+                    },
+                })
+                .collect();
+            self.disk
+                .publish(self.wall, &[], Vec::new(), Vec::new(), moved);
+        }
+        removed.extend(moves);
         Ok(removed)
     }
 

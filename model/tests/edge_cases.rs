@@ -689,7 +689,8 @@ fn row_13_disk_fills_degrade_then_ingest_waits_nothing_deleted() {
     m.disk.other_bytes = 85_000;
     assert!(m.health().reasons.contains(&Reason::LowDisk));
     assert_eq!(m.compact(None), Err(Error::Paused));
-    assert_eq!(m.housekeeping(), Err(Error::Paused));
+    // Tiering and eviction, which free space, continue (§3 Disk space).
+    assert!(m.housekeeping().is_ok());
     m.disk.other_bytes = 96_000;
     assert!(m.health().reasons.contains(&Reason::CriticalDisk));
     // Ingest waits: the reading is held back, not refused, and the wait is

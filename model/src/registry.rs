@@ -27,6 +27,30 @@ pub enum Timing {
     Forecast,
 }
 
+/// Where a series' raw detail is kept (§2.1 `retention class`, §8 Retention
+/// class). It never decides which facts exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RetentionClass {
+    /// Raw detail stays on the fast disk under the general tier rules.
+    #[default]
+    LongTerm,
+    /// Raw detail whose span ends more than `period` before `now` leaves
+    /// the fast disk once verified in another tier.
+    Diagnostic {
+        /// Retention period (default 30 days).
+        period: Nanos,
+    },
+}
+
+impl RetentionClass {
+    /// The diagnostic class with the default period of 30 days.
+    pub const fn diagnostic() -> Self {
+        RetentionClass::Diagnostic {
+            period: 30 * 24 * 3_600 * 1_000_000_000,
+        }
+    }
+}
+
 /// Definition fields fixed for the life of a series beyond kind, type and
 /// unit (§2.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -75,6 +99,13 @@ pub enum RegistryEvent {
         /// New name.
         name: String,
     },
+    /// A change of retention class, in force from its position (§2.1).
+    Retention {
+        /// Series.
+        id: SeriesId,
+        /// The class.
+        class: RetentionClass,
+    },
     /// The series is hidden from name resolution and refuses facts with
     /// `t ≥ at`; its facts stay and it stays reachable by id (§2.1).
     Retire {
@@ -102,6 +133,8 @@ pub struct SeriesDef {
     pub staleness: Option<Nanos>,
     /// Versioned and timing (§2.1).
     pub options: SeriesOptions,
+    /// Retention class in force (§2.1).
+    pub retention: RetentionClass,
     /// Whether the series is retired.
     pub retired: bool,
     /// Effective time of the retirement, if retired.
@@ -133,6 +166,9 @@ pub enum RegistryError {
     /// (§2.1 `timing`).
     #[error("a forecast series must be versioned with changed_at kind time")]
     ForecastNotVersioned,
+    /// A retention period must be positive.
+    #[error("retention period must be positive")]
+    BadRetention,
 }
 
 /// The registry.
@@ -164,6 +200,7 @@ impl Registry {
                         unit: unit.clone(),
                         staleness: *staleness,
                         options: *options,
+                        retention: RetentionClass::LongTerm,
                         retired: false,
                         retired_at: None,
                     },
@@ -172,6 +209,11 @@ impl Registry {
             RegistryEvent::Alias { id, name } => {
                 if let Some(d) = self.series.get_mut(id) {
                     d.names.push(name.clone());
+                }
+            }
+            RegistryEvent::Retention { id, class } => {
+                if let Some(d) = self.series.get_mut(id) {
+                    d.retention = *class;
                 }
             }
             RegistryEvent::Retire { id, at } => {

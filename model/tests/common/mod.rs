@@ -9,7 +9,7 @@ use kvik_model::engine::{
     Envelope, Fault, Funnel, FunnelId, Model, Operator, RouteChange, Selection, WriteOutcome,
 };
 use kvik_model::oracle;
-use kvik_model::registry::{ChangedAtKind, SeriesOptions};
+use kvik_model::registry::{ChangedAtKind, RetentionClass, SeriesOptions};
 use kvik_model::summary::Aggregate;
 use kvik_model::summary::Params;
 use kvik_model::types::{
@@ -188,6 +188,12 @@ pub enum Op {
     RefreshReader(proptest::sample::Index, bool),
     /// A reader ends.
     CloseReader(proptest::sample::Index),
+    /// A series' retention class changes (§2.1): diagnostic with a period of
+    /// one hour, or long-term.
+    Retention {
+        series: usize,
+        diagnostic: bool,
+    },
 }
 
 pub fn arb_compaction_crash() -> impl Strategy<Value = Option<CompactionCrash>> {
@@ -286,6 +292,8 @@ pub fn arb_files_op() -> impl Strategy<Value = Op> {
         2 => Just(Op::Upload),
         2 => Just(Op::Housekeeping),
         1 => Just(Op::Advance(2 * HOUR)),
+        1 => (0usize..=VERSIONED, proptest::bool::weighted(0.7))
+            .prop_map(|(series, diagnostic)| Op::Retention { series, diagnostic }),
     ]
 }
 
@@ -341,6 +349,41 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
         .unwrap(),
     );
     (m, ids)
+}
+
+/// [`machine`] with a fast disk small enough for fill pressure (§8) and no
+/// low or critical mark, for the invariants about files.
+pub fn files_machine() -> (Model, Vec<SeriesId>) {
+    let (mut m, ids) = machine();
+    m.config.disk_bytes = 64 * 40;
+    m.config.low_mark = 0;
+    m.config.critical_mark = 0;
+    (m, ids)
+}
+
+/// Invariant 12: a published file that left the fast disk or the cold tier
+/// during an operation without a verified copy in another tier afterwards.
+pub fn inv12_unverified_departure(before: &Model, after: &Model) -> Option<String> {
+    let published = after.disk.published();
+    for f in &before.disk.hot {
+        if published.contains(f)
+            && !after.disk.hot.contains(f)
+            && !after.disk.verified_elsewhere(*f)
+        {
+            return Some(format!("{f:?} left hot with no verified copy elsewhere"));
+        }
+    }
+    for f in &before.disk.cold {
+        let hot = after.disk.locality(*f) == kvik_model::engine::Locality::Hot;
+        if published.contains(f)
+            && !after.disk.cold.contains(f)
+            && !hot
+            && !after.disk.in_bucket(*f)
+        {
+            return Some(format!("{f:?} left cold with no verified copy elsewhere"));
+        }
+    }
+    None
 }
 
 /// Durable facts (any tier), by position.
@@ -439,6 +482,14 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             if !readers.is_empty() {
                 m.refresh_reader(i.get(&readers), *latest);
             }
+        }
+        Op::Retention { series, diagnostic } => {
+            let class = if *diagnostic {
+                RetentionClass::Diagnostic { period: HOUR }
+            } else {
+                RetentionClass::LongTerm
+            };
+            let _ = m.set_retention(ids[*series], class);
         }
         Op::CloseReader(i) => {
             let readers = m.readers();
