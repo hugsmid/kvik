@@ -110,7 +110,8 @@ fn define_emit_and_read() {
         .window(c, Window::between(at(0), at(10)), Aggregate::Increase)
         .unwrap();
     assert_eq!(inc.number(), Some(10.0));
-    // An average of a counter is empty, not an error (spec §6 Aggregates).
+    // An average of a counter is empty, not an error: the reference model's
+    // choice; spec §6 refuses some aggregates only on interval series.
     let avg = r
         .window(c, Window::rolling(Duration::from_secs(10)), Aggregate::Avg)
         .unwrap();
@@ -367,8 +368,11 @@ fn back_pressure() {
     cfg.limits.ingest_queue = 2;
     let s = block_on(Store::open(cfg)).unwrap();
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    let three = [num(g, 0, 1.0), num(g, 1, 1.0), num(g, 2, 1.0)];
+    assert_eq!(s.try_emit(&three), Err(Error::Busy(BusyReason::QueueFull)));
+    // A batch larger than the queue would wait forever: emit returns.
     assert_eq!(
-        s.try_emit(&[num(g, 0, 1.0), num(g, 1, 1.0), num(g, 2, 1.0)]),
+        block_on(s.emit(&three)),
         Err(Error::Busy(BusyReason::QueueFull))
     );
     // Host-stamped readings wait while the clock is not synchronised.
@@ -391,7 +395,7 @@ fn back_pressure() {
         other => panic!("{other:?}"),
     }
     let st = s.stats();
-    assert_eq!(st.waits[&BusyReason::QueueFull], 1);
+    assert_eq!(st.waits[&BusyReason::QueueFull], 2);
     assert_eq!(st.waits[&BusyReason::UnsyncedClock], 2);
 }
 
@@ -690,4 +694,37 @@ fn critical_disk_makes_ingest_wait() {
         Err(Error::Busy(BusyReason::DiskFull))
     );
     assert!(matches!(s.health(), Health::Degraded { .. }));
+}
+
+#[test]
+fn consumer_before_any_series() {
+    let (s, clock) = store("consumer-first");
+    let mut c = block_on(s.consumer("early", Start::Now)).unwrap();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    block_on(c.route(Funnel::facts(Select::Names("site/*/power".into())))).unwrap();
+    assert!(c.try_next().unwrap().is_none());
+    let g = block_on(s.define_series(gauge("site/a/power", 1))).unwrap();
+    block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
+    clock.advance(Duration::from_secs(1));
+    let facts = drain(&mut c)
+        .into_iter()
+        .filter(|d| matches!(d.kind, DeliveryKind::Fact(_)))
+        .count();
+    assert_eq!(
+        facts, 1,
+        "one fact delivery per position, whatever the funnels"
+    );
+    assert!(matches!(
+        block_on(s.define_series(SeriesSpec {
+            retention: kvik::RetentionClass::Diagnostic {
+                period: Duration::ZERO
+            },
+            ..gauge("site/b/power", 1)
+        })),
+        Err(Error::InvalidDefinition(_))
+    ));
+    assert!(matches!(
+        s.series("site/b/power"),
+        Err(Error::UnknownSeries(_))
+    ));
 }

@@ -285,7 +285,12 @@ Whether `*` matches one whole segment of `<instance>/<device>/<metric>`, any run
 Q-78's scenario takes `plant/*/power` to match `plant/line-1/power-smoothed`, which it does under none of these
 readings. Overlap is a per-segment comparison for whole-segment wildcards and needs an intersection test for
 wildcards within a segment.
-**Model.** A selection is a list of ids or every series; there are no patterns.
+**Model.** A selection is a list of ids or every series; there are no patterns. The `kvik` crate's in-memory backend
+pins a provisional choice for now: each `/`-separated segment is matched on its own, `*` matching any run of
+characters within it (so `plant/line-*/power` works); a live series matches if any of its names does; patterns are
+re-evaluated when a series is defined or aliased, so a retired series leaves the selection at the next
+re-evaluation; a condition funnel's pattern is resolved once, when routed, and must match exactly one series. It has
+no overlap test, as it compiles no `emits`.
 **Needed.** The pattern grammar and its overlap test.
 **Proposal.** A pattern has the three segments of a name, each a literal or `*`, which matches any one whole segment;
 two patterns overlap when, in each segment, they are equal or either is `*`; an id overlaps a pattern when any name

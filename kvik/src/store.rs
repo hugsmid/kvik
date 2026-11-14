@@ -12,7 +12,7 @@ use crate::backend::{self, Shared};
 use crate::backup::{BackupSink, Encryption, Rebuild, RestoreMode};
 use crate::config::StoreConfig;
 use crate::consume::{Delivery, DeliveryId, Funnel, FunnelId, Start};
-use crate::error::{Error, Result};
+use crate::error::{BusyReason, Error, Result};
 use crate::health::{Health, Stats};
 use crate::read::{
     Aggregate, CalendarPeriod, ChartData, Live, Resolution, View, Window, WindowResult,
@@ -108,8 +108,12 @@ impl Store {
 
     /// Emits a batch and returns once it is durable. Refused readings are
     /// reported per index; the rest are recorded or dropped as duplicates.
-    /// Waits under back-pressure (with the model backend the wait is retried
-    /// whenever the store is called again).
+    ///
+    /// Waits under back-pressure (spec §3). With the model backend it waits
+    /// only for clock synchronisation (host-stamped readings, spec §2.5),
+    /// retried whenever the store is called again; a batch larger than the
+    /// ingest queue, or free space below the critical mark, returns
+    /// [`Error::Busy`] instead, as nothing would end the wait.
     pub async fn emit(&self, readings: &[Reading]) -> Result<Ack> {
         self.emit_with(readings, Intent::Normal).await
     }
@@ -123,10 +127,13 @@ impl Store {
             first = false;
             match r {
                 Ok(Ok(ack)) => Poll::Ready(Ok(ack)),
-                Ok(Err(_busy)) => {
+                Ok(Err(BusyReason::UnsyncedClock)) => {
                     s.register(cx.waker());
                     Poll::Pending
                 }
+                // Nothing in the model backend drains a full queue or frees
+                // disk while the caller waits, so these are returned.
+                Ok(Err(busy)) => Poll::Ready(Err(Error::Busy(busy))),
                 Err(e) => Poll::Ready(Err(e)),
             }
         })

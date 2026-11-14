@@ -229,6 +229,9 @@ impl Slot {
                 convert::error,
             ));
         }
+        // The monotonic clock of the last session says nothing about this
+        // one: live staleness falls back to event time until the next commit.
+        self.committed_mono.clear();
         self.open = true;
         self.epoch += 1;
         for c in self.consumers.values_mut() {

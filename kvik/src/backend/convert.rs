@@ -267,6 +267,11 @@ pub(crate) fn definition(spec: &SeriesSpec) -> Result<ModelDefinition, Error> {
 pub(crate) fn retention(r: RetentionClass) -> Result<km::registry::RetentionClass, Error> {
     Ok(match r {
         RetentionClass::LongTerm => km::registry::RetentionClass::LongTerm,
+        RetentionClass::Diagnostic { period } if period.is_zero() => {
+            return Err(Error::InvalidDefinition(
+                "a retention period must be positive".into(),
+            ));
+        }
         RetentionClass::Diagnostic { period } => km::registry::RetentionClass::Diagnostic {
             period: dur_nanos(period)?,
         },

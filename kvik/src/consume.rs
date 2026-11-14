@@ -27,7 +27,10 @@ pub enum Select {
     Ids(Vec<SeriesId>),
     /// Live series with a name or alias matching a pattern, re-evaluated when
     /// a series is defined or aliased (spec §4 Routing). `*` matches any run
-    /// of characters within one `/`-separated segment.
+    /// of characters within one `/`-separated segment. The specification does
+    /// not define the grammar yet, so this one is provisional
+    /// (`model/OPEN-QUESTIONS.md` Q-88). A condition funnel's pattern is
+    /// resolved once, when routed, and must match exactly one series.
     Names(String),
     /// Every series.
     All,

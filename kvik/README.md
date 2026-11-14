@@ -52,3 +52,8 @@ What returns `Error::NotSupportedYet`, or is never produced:
 - backup, restore, export of set-aside facts and rebuild;
 - the `Unknown` live and condition states, `approximate_edges`, `displaced`, a trigger's value and coverage, commit
   latency, backup lag and restore progress, which need the durable engine, tiers or restore.
+
+Name patterns in a funnel's selection work, but their grammar is provisional (`*` within one `/`-separated segment),
+as the specification does not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).
+`Store::emit` waits under back-pressure only for clock synchronisation; a batch larger than the ingest queue, or free
+space below the critical mark, returns `Error::Busy`, as nothing in this backend would end the wait.
