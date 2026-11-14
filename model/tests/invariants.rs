@@ -467,8 +467,9 @@ proptest! {
     }
 
     /// 9 and 8. A restore from a tree checkpoint, possibly with a gap in the
-    /// backed-up log, brought back step by step with a crash and restart at a
-    /// random step (§8 Restore, row 28a),
+    /// backed-up log, possibly crashing during step 1, brought back step by
+    /// step with a crash and restart at a random later step (§8 Restore, row
+    /// 28a),
     /// with ingest while restoring, keeps the running engine's trees equal to
     /// what a restart derives, and ends with the facts up to the restored end
     /// and trees equal to a rebuild from the facts. A checkpoint taken
@@ -480,6 +481,7 @@ proptest! {
         after in proptest::collection::vec(arb_op(), 0..30),
         crash_at in 0usize..6,
         missing in proptest::option::weighted(0.3, any::<proptest::sample::Index>()),
+        interrupt in proptest::option::of(0usize..3),
     ) {
         use kvik_model::engine::{Error, Model};
         let (mut m, ids) = run(&before)?;
@@ -502,10 +504,21 @@ proptest! {
                 m.disk.bucket.objects.remove(i.get(&files));
             }
         }
-        let mut r = match Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &m.disk.cursors.clone(), m.wall, true, false) {
-            Err(Error::EmptyBucket) => return Ok(()),
-            r => r.unwrap(),
+        let cursors = m.disk.cursors.clone();
+        let started = match interrupt {
+            // A crash after the record, during step 1; the restart finishes it.
+            Some(n) => Model::restore_interrupted_after_record(m.config.clone(), consumers(), &mut m.disk.bucket, &cursors, m.wall, n).map(|mut r| {
+                prop_assert!(!r.is_up());
+                r.restart();
+                Ok(r)
+            }),
+            None => Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &cursors, m.wall, true, false).map(Ok),
         };
+        let mut r = match started {
+            Err(Error::EmptyBucket) => return Ok(()),
+            r => r.unwrap()?,
+        };
+        prop_assert!(r.is_up() && r.disk.restore.as_ref().unwrap().step_one_done);
         let end = r.disk.restored_end.unwrap();
         for i in 0..crash_at {
             if i == 1 {

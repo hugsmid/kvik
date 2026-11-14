@@ -286,6 +286,12 @@ pub struct RestoreState {
     pub verified: BTreeSet<(SeriesId, Nanos)>,
     /// Spans where the checkpoint differed from the recomputed nodes.
     pub differences: Vec<(SeriesId, Nanos)>,
+    /// Cursors the consumers kept from before the restore.
+    pub kept_cursors: BTreeMap<ConsumerId, Position>,
+    /// Whether step 1 is complete: the checkpoint and the log after it are
+    /// local, the latest `t` per series is known and cursors are settled.
+    /// Ingest is accepted only then.
+    pub step_one_done: bool,
 }
 
 /// A restore that claimed a generation but has not yet written its record.
@@ -490,6 +496,8 @@ pub enum Reason {
     /// A higher generation is claimed: this writer stopped uploading and is
     /// read-only (§8 Generations).
     Superseded,
+    /// Starting or resuming a restore failed; the engine is down.
+    RestoreFailed,
     /// A file is quarantined.
     Quarantined(FileId),
     /// Below the low mark.
@@ -645,6 +653,9 @@ pub struct Disk {
     /// Tree checkpoints taken locally, uploaded once the log up to their
     /// position is backed up.
     pub checkpoints: Vec<Checkpoint>,
+    /// Why the last attempt to start or resume a restore failed; the engine
+    /// stays down meanwhile.
+    pub restore_failed: Option<Error>,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
     pub other_bytes: u64,
     /// Next file id.
@@ -1084,6 +1095,15 @@ impl Model {
         {
             self.restart_restore(pending);
             return;
+        }
+        // A restore that stopped after its record finishes step 1 before it
+        // accepts ingest (§8 Restore).
+        if self.disk.restore.as_ref().is_some_and(|r| !r.step_one_done) {
+            if let Err(e) = self.finish_step_one() {
+                self.disk.restore_failed = Some(e);
+                return;
+            }
+            self.disk.restore_failed = None;
         }
         // 1. The active segment past the durable mark (§3 Recovery).
         let sync_failed = self.recover_tail(recovery_sync_fails);
@@ -2136,10 +2156,12 @@ impl Model {
     /// (§8 Restore step 2); a bound inside a minute is refused.
     pub fn query_window(&self, s: SeriesId, start: Nanos, end: Nanos) -> Result<Answer, Error> {
         let restoring = self.restoring();
-        let until = end.min(self.now).max(start);
-        if restoring && (floor_to(start, MINUTE) != start || floor_to(until, MINUTE) != until) {
+        // Resolution is judged on the requested bounds; clipping at `now`
+        // does not make a window finer.
+        if restoring && (floor_to(start, MINUTE) != start || floor_to(end, MINUTE) != end) {
             return Err(Error::Restoring);
         }
+        let until = end.min(self.now).max(start);
         let tree = self.tree(s)?;
         Ok(Answer {
             node: tree.window(start, end, self.now),
@@ -2187,6 +2209,9 @@ impl Model {
         }
         if self.disk.superseded {
             raise(Level::Fatal, Reason::Superseded, &mut reasons);
+        }
+        if self.disk.restore_failed.is_some() {
+            raise(Level::Fatal, Reason::RestoreFailed, &mut reasons);
         }
         for f in &self.disk.quarantined {
             raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
@@ -2593,7 +2618,7 @@ impl Model {
         in_progress: bool,
         drill: bool,
     ) -> Result<Model, Error> {
-        let mut m = Model::restore_impl(config, consumers, bucket, cursors, wall, drill, false)?;
+        let mut m = Model::restore_impl(config, consumers, bucket, cursors, wall, drill, Stop::No)?;
         if !in_progress {
             m.restore_rest()?;
         }
@@ -2610,7 +2635,38 @@ impl Model {
         cursors: &BTreeMap<ConsumerId, Position>,
         wall: Nanos,
     ) -> Result<Model, Error> {
-        Model::restore_impl(config, consumers, bucket, cursors, wall, false, true)
+        Model::restore_impl(
+            config,
+            consumers,
+            bucket,
+            cursors,
+            wall,
+            false,
+            Stop::BeforeRecord,
+        )
+    }
+
+    /// A restore that writes its record, downloads the first `downloads`
+    /// files of step 1 and stops (the machine crashes) before step 1 is
+    /// complete. [`Model::restart`] then finishes step 1 before it accepts
+    /// ingest (§8 Restore).
+    pub fn restore_interrupted_after_record(
+        config: Config,
+        consumers: Vec<ConsumerDecl>,
+        bucket: &mut Bucket,
+        cursors: &BTreeMap<ConsumerId, Position>,
+        wall: Nanos,
+        downloads: usize,
+    ) -> Result<Model, Error> {
+        Model::restore_impl(
+            config,
+            consumers,
+            bucket,
+            cursors,
+            wall,
+            false,
+            Stop::AfterRecord(downloads),
+        )
     }
 
     fn restore_impl(
@@ -2620,7 +2676,7 @@ impl Model {
         cursors: &BTreeMap<ConsumerId, Position>,
         wall: Nanos,
         drill: bool,
-        stop_before_record: bool,
+        stop: Stop,
     ) -> Result<Model, Error> {
         let mut restored: Vec<Position> = bucket
             .objects
@@ -2657,7 +2713,7 @@ impl Model {
         m.disk.next_file = bucket.objects.keys().next_back().map_or(0, |f| f.0 + 1);
         m.disk.generation = generation;
         m.disk.drill = drill;
-        if stop_before_record {
+        if stop == Stop::BeforeRecord {
             m.disk.pending_restore = Some(PendingRestore {
                 cursors: cursors.clone(),
                 drill,
@@ -2693,27 +2749,52 @@ impl Model {
             latest_t,
             verified: BTreeSet::new(),
             differences: Vec::new(),
+            kept_cursors: cursors.clone(),
+            step_one_done: false,
         });
-        // Step 1: the log after the checkpoint (no checkpoint: all of it).
-        for f in m.step_one_files() {
-            m.download(f)?;
+        if let Stop::AfterRecord(n) = stop {
+            for f in m.step_one_files().into_iter().take(n) {
+                m.download(f)?;
+            }
+            m.crash();
+            return Ok(m);
         }
-        let local = m.disk.live_entries();
-        let r = m.disk.restore.as_mut().expect("restore state");
+        m.finish_step_one()?;
+        m.restart();
+        Ok(m)
+    }
+
+    /// Completes step 1, also after a crash part-way through it: downloads
+    /// the step-1 files not yet local, takes the latest `t` per series from
+    /// the checkpoint and the restored log, and settles each consumer's
+    /// cursor (step 2): a kept cursor continues only if the log segments after
+    /// it, up to the restored end, are local.
+    fn finish_step_one(&mut self) -> Result<(), Error> {
+        let published = self.disk.published();
+        for f in self.step_one_files() {
+            if !published.contains(&f) {
+                self.download(f)?;
+            }
+        }
+        let local = self.disk.live_entries();
+        let r = self.disk.restore.as_mut().expect("restore state");
+        let end = r.restored_end;
+        r.latest_t = r
+            .checkpoint
+            .as_ref()
+            .map_or_else(BTreeMap::new, |c| c.latest_t.clone());
         for f in local.values().filter_map(Entry::fact) {
             if f.position <= end {
                 let n = r.latest_t.entry(f.series).or_insert(f.t);
                 *n = (*n).max(f.t);
             }
         }
-        // Step 2: a kept cursor continues only if the log segments after it,
-        // up to the restored end, are local.
-        let r = m.disk.restore.clone().expect("restore state");
-        let listed: BTreeSet<Position> = m.listed_entries(&r).into_keys().collect();
-        let segments = m.local_segment_positions();
-        let ids: Vec<ConsumerId> = m.consumers.iter().map(|c| c.id).collect();
+        let r = self.disk.restore.clone().expect("restore state");
+        let listed: BTreeSet<Position> = self.listed_entries(&r).into_keys().collect();
+        let segments = self.local_segment_positions();
+        let ids: Vec<ConsumerId> = self.consumers.iter().map(|c| c.id).collect();
         for id in ids {
-            let cursor = cursors.get(&id).copied();
+            let cursor = r.kept_cursors.get(&id).copied();
             let continues = cursor.filter(|c| {
                 *c <= end
                     && listed
@@ -2721,8 +2802,8 @@ impl Model {
                         .filter(|p| *p > c && **p <= end)
                         .all(|p| segments.contains(p))
             });
-            m.disk.cursors.insert(id, continues.unwrap_or(end));
-            m.signals.entry(id).or_default().extend([
+            self.disk.cursors.insert(id, continues.unwrap_or(end));
+            self.signals.entry(id).or_default().extend([
                 Signal::GenerationChanged {
                     cursor,
                     restored_end: end,
@@ -2730,27 +2811,36 @@ impl Model {
                 Signal::ResyncDue,
             ]);
         }
-        m.restart();
-        Ok(m)
+        self.disk
+            .restore
+            .as_mut()
+            .expect("restore state")
+            .step_one_done = true;
+        Ok(())
     }
 
     /// Starts a restore that stopped before its record again, with the next
     /// generation.
+    /// If that fails, the engine stays down, the pending restore is kept for
+    /// the next restart, and health reports why.
     fn restart_restore(&mut self, pending: PendingRestore) {
         let mut bucket = self.disk.bucket.clone();
-        if let Ok(fresh) = Model::restore_impl(
+        match Model::restore_impl(
             self.config.clone(),
             self.consumers.clone(),
             &mut bucket,
             &pending.cursors,
             self.wall,
             pending.drill,
-            false,
+            Stop::No,
         ) {
-            self.disk = fresh.disk;
-            self.vol = fresh.vol;
-            self.signals = fresh.signals;
-            self.sessions = fresh.sessions;
+            Ok(fresh) => {
+                self.disk = fresh.disk;
+                self.vol = fresh.vol;
+                self.signals = fresh.signals;
+                self.sessions = fresh.sessions;
+            }
+            Err(e) => self.disk.restore_failed = Some(e),
         }
     }
 
@@ -3027,6 +3117,17 @@ fn minute_readings(
         .filter(|f| f.summarised())
         .map(|f| (f.t, f.value.clone()))
         .collect()
+}
+
+/// Where a restore stops (the machine crashes), for crash tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// It does not stop.
+    No,
+    /// After claiming its generation, before its record.
+    BeforeRecord,
+    /// After its record and the first `n` downloads of step 1.
+    AfterRecord(usize),
 }
 
 /// Order of downloads after step 1: current chunks first, then revision

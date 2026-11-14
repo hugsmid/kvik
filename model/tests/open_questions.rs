@@ -8,7 +8,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
-use kvik_model::engine::{EntryBody, Error, FileClass, FileId, Model};
+use kvik_model::engine::{EntryBody, Error, FileClass, FileId, Level, Model, Reason};
 use kvik_model::types::{HOUR, MINUTE, Position, Reading, SECOND, SeriesId, Value};
 
 /// A store as [`checkpointed_model`] with two more segments, `0:9` and
@@ -166,4 +166,66 @@ fn q39_no_sub_minute_query_or_checkpoint_while_restoring() {
     r.restore_rest().unwrap();
     assert!(r.query_window(s, T0 + SECOND, T0 + MINUTE).is_ok());
     assert!(r.checkpoint().is_ok());
+}
+
+/// Q-39: a restore in progress is no health condition of its own; §8 does not
+/// say whether `restoring` shows in health.
+#[test]
+fn q39_restoring_is_no_health_condition() {
+    let (mut m, _, _) = checkpointed_model();
+    let r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert!(r.restoring());
+    assert_eq!(r.health().level, Level::Ok);
+}
+
+/// Q-39: when starting a restore again after a crash before its record, or
+/// finishing its step 1 after a crash, fails (here a position held twice with
+/// different content), the engine stays down and health reports it.
+#[test]
+fn q39_failed_restart_of_a_restore_is_reported() {
+    let (mut m, _, _) = checkpointed_model();
+    let p = Position::new(0, 7);
+    let (hash, mut copy) = m
+        .disk
+        .bucket
+        .objects
+        .values()
+        .find(|(_, f)| f.class == FileClass::Segment && f.entries().any(|e| e.position == p))
+        .cloned()
+        .unwrap();
+    for e in copy.batches.iter_mut().flatten() {
+        if let (true, EntryBody::Fact(f)) = (e.position == p, &mut e.body) {
+            f.value = Value::Num(7.0);
+        }
+    }
+    m.disk.bucket.objects.insert(FileId(99), (hash, copy));
+    let conflict = Some(Error::Conflict {
+        file: FileId(99),
+        position: p,
+    });
+    let mut before = Model::restore_interrupted_before_record(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+    )
+    .unwrap();
+    let mut after = Model::restore_interrupted_after_record(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        0,
+    )
+    .unwrap();
+    for r in [&mut before, &mut after] {
+        r.restart();
+        assert!(!r.is_up());
+        assert_eq!(r.disk.restore_failed, conflict);
+        let h = r.health();
+        assert_eq!(h.level, Level::Fatal);
+        assert!(h.reasons.contains(&Reason::RestoreFailed));
+    }
 }

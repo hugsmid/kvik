@@ -902,8 +902,7 @@ fn s8_restore_record_written_before_ingest() {
         1
     );
     assert!(r.restoring());
-    // Restoring is no health condition, for a restore or for a drill.
-    assert_eq!(r.health().level, Level::Ok);
+    // A drill raises no health condition of its own, also while restoring.
     let drill = Model::restore_with_cursors(
         m.config.clone(),
         vec![],
@@ -1192,7 +1191,8 @@ fn s8_restart_after_record_resumes_in_its_generation() {
     assert_eq!(r.current().unwrap(), m.current().unwrap());
     assert!(r.tree(s).unwrap().same_summaries(m.tree(s).unwrap()));
     assert!(!r.checkpoint_unverified());
-    assert_eq!(m.disk.bucket.claims.len(), 1);
+    assert_eq!(r.disk.generation, 1);
+    assert_eq!(r.disk.bucket.claims, [1].into_iter().collect());
     let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
     assert_eq!(p.positions, vec![Position::new(1, 1)]);
 }
@@ -1229,4 +1229,63 @@ fn s8_crash_before_record_restarts_with_next_generation() {
     );
     let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
     assert_eq!(p.positions, vec![Position::new(2, 1)]);
+}
+
+/// §8 Restore step 2: "The store serves queries at ≥ 1-minute resolution".
+/// Resolution is that of the requested bounds: a whole-minute window reaching
+/// past a `now` inside a minute is served.
+#[test]
+fn s8_restoring_window_past_now_inside_a_minute() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    r.advance(30 * SECOND);
+    let a = r.query_window(s, T0 + HOUR, T0 + HOUR + MINUTE).unwrap();
+    assert!(a.restoring);
+    assert_eq!(
+        r.query_window(s, T0 + HOUR, T0 + HOUR + 30 * SECOND),
+        Err(Error::Restoring)
+    );
+}
+
+/// §8 Restore: "A restart after the restore record is written resumes the
+/// restore in its generation"; step 1 writes the record "before ingest is
+/// accepted", then downloads the checkpoint and "the sealed log segments after
+/// its position; replay them into the tree". A crash during step 1 therefore
+/// finishes step 1, with the latest `t` per series, before ingest.
+#[test]
+fn s8_crash_during_step_1_finishes_it_before_ingest() {
+    let (mut m, s, _) = checkpointed_model();
+    let c = ConsumerId(1);
+    let cursors = [(c, Position::new(0, 6))].into_iter().collect();
+    let mut r = Model::restore_interrupted_after_record(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &cursors,
+        m.wall,
+        0,
+    )
+    .unwrap();
+    assert!(!r.is_up());
+    assert!(!r.disk.restore.as_ref().unwrap().step_one_done);
+    r.restart();
+    assert_eq!(r.disk.generation, 1);
+    let local: Vec<Position> = r.facts().unwrap().iter().map(|f| f.position).collect();
+    assert_eq!(local, vec![Position::new(0, 7), Position::new(0, 8)]);
+    // The latest `t` known (200 s, from the log after the checkpoint) counts.
+    let p = r
+        .ingest(vec![Reading::num(s, T0 + 150 * SECOND, 9.0)])
+        .unwrap();
+    assert_eq!(p.positions, vec![Position::new(1, 1)]);
+    assert_eq!(r.counters.duplicates_unchecked, 1);
+    r.drain().unwrap();
+    let got: Vec<Position> = r.observed[&c].iter().map(|o| o.position).collect();
+    assert_eq!(
+        got,
+        vec![
+            Position::new(0, 7),
+            Position::new(0, 8),
+            Position::new(1, 1)
+        ]
+    );
 }

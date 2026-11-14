@@ -129,7 +129,9 @@ every file the restore reads is local; the label goes earlier, once every span t
 local, and is taken from the restored facts (`q39_revised_key_index_back_with_current_chunks`). While `restoring`, a
 window bound inside a minute is refused and no tree checkpoint is taken
 (`q39_no_sub_minute_query_or_checkpoint_while_restoring`); only window queries are guarded, and `current`, `facts`
-and `latest` return the local facts, unflagged.
+and `latest` return the local facts, unflagged. A restore in progress is no health condition of its own
+(`q39_restoring_is_no_health_condition`). If starting a restore again, or finishing its step 1, fails at a restart,
+the engine stays down and health reports `RestoreFailed` (`q39_failed_restart_of_a_restore_is_reported`).
 **Needed.** What each failure does, what a restart clears, and when the store stops being flagged `restoring`.
 
 ## Q-40 — Ranking facts of versioned series during a restore
@@ -378,7 +380,8 @@ The model implements the summary semantics (§5, §6), the duplicate rule with `
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
 catch-up after overflow (§4), loss of a corrupt log segment with no other copy (§8), and generations, tree checkpoints
 and restore (§2.2, §8 Continuous backup, Generations, Restore drill, Restore steps 1–4 and the paragraph after them,
-rows 28, 28a and 28b): a tree checkpoint carries the stored nodes, the registry and each series' latest recorded `t`
+rows 28, 28a and 28b; for 28a, a crash before the record, during step 1 or between later downloads, a download
+being atomic): a tree checkpoint carries the stored nodes, the registry and each series' latest recorded `t`
 as of its position, and is uploaded only once log segments in the bucket hold every position up to it; a restore
 claims the generation one above the highest claimed or present in the bucket by a create-if-absent marker, taking the
 next if the marker exists, and starts it at sequence 1; a bucket with nothing backed up is refused; the restored end
@@ -393,8 +396,8 @@ then receives `generation_changed` and `resync`; current chunks, then revision c
 one per step, a position in two files must have identical content, and as each span's detail is back its nodes are
 recomputed from the facts as of the checkpoint's position and compared with the checkpoint's, a difference is
 counted and the recomputed nodes win, and the `derived-unverified` label goes when every span the checkpoint covers
-is verified; a restart after the record resumes the restore in its generation, and one before it starts again with
-the next generation; a drill is read-only, claims nothing and raises no health condition of its own; a writer that
+is verified; a restart after the record resumes the restore in its generation, finishing an interrupted step 1
+before it accepts ingest, and one before it starts again with the next generation; a drill is read-only, claims nothing and raises no health condition of its own; a writer that
 finds a higher generation claimed stops uploading and stays read-only across restarts, with fatal health
 (`tests/rules.rs` `s8_…`, `tests/invariants.rs`
 `inv01_only_restore_starts_generation` and `inv09_stepwise_restore_from_checkpoint`). It does not yet implement:
