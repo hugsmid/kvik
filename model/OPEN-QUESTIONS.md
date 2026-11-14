@@ -504,14 +504,24 @@ continue above every epoch named by a lease file; leases are roadmap 4.6. (h) *G
 gap rule between a segment's last sequence and the next one's `base_sequence` (A.4) is not said to be checked at
 every start for segments already sealed. (i) *An empty segment in use that is not the last.* A segment taken into
 use with no batch, followed by another in use, is never sealed (an empty segment is not sealed) and is not named in
-A.4's table.
+A.4's table. (j) *A batch beyond the mark in a sealed file.* Rule 1 counts the complete batches beyond the mark; one
+that lies in a sealed segment cannot be truncated, and the spec does not say what rule 1 does then. (k) *No space for
+the recovery entry's segment.* A creation that fails for lack of space waits (§3 Segments); at a start that needs a
+new segment for its entry, nothing can be written until it exists. (l) *Unused segments with bytes beyond the
+header.* A.4 keeps an unused segment as the one created ahead by its header and length alone. (m) *Consumers.* The
+entry's field 47 names consumers whose cursor file was missing or unreadable; cursor files are roadmap 5.2. (n)
+*Restart time.* A start reads every unsealed segment whole, and the last sealed one for its trailer, against the
+restart budget of `design.md`.
 **Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
 manifest count. (c) A start reports what it found and what the manifest holds; earlier recovery entries are read by
 the item that puts the engine behind the interface. (d) Treated as a first start: the mark is written again in place.
 (e) Their headers stay; the writer resumes in the last segment in use, after its header, whose `base_sequence` is the
 mark's last position + 1. (f) Only the last segment in use. (g) Not done. (h) Only unsealed segments are checked. (i)
-Left as it is.
-**Needed.** A rule for each part; (a) with roadmap 6.3, (b) with 5.2, (c) with the interface wiring, (g) with 4.6.
+Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
+stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
+(n) Measured by roadmap 4.8.
+**Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (g)
+with 4.6, (n) with 4.8.
 To be settled at gate 4.9.
 
 ## Open at v0.2

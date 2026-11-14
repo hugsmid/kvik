@@ -214,6 +214,11 @@ fn scan_segment(store: &StoreDir, name: SegmentName, path: PathBuf) -> Result<Se
             bytes: bytes[b.offset as usize..b.end() as usize].to_vec(),
         });
     }
+    // Only the last batch's bytes can be written again (Q-87).
+    let n = batches.len();
+    for b in batches.iter_mut().take(n.saturating_sub(1)) {
+        b.bytes = Vec::new();
+    }
     let tail_commits = match &r.tail {
         Some(Tail::Torn { commits, .. }) => commits
             .iter()
@@ -308,10 +313,17 @@ fn plan(
     segs: &[Seg],
     mark: &MarkRead,
     boot: [u8; 16],
-    sealed_last: Option<(u64, i64)>,
+    sealed_last: Option<(u64, u64, i64)>,
     manifest_highest: u64,
 ) -> Plan {
     let in_use: Vec<usize> = (0..segs.len()).filter(|&i| segs[i].in_use()).collect();
+    // Segments in use below the last sealed one are left from a seal that did not finish: they are sealed again and
+    // take no part in the position chain.
+    let chain: Vec<usize> = in_use
+        .iter()
+        .copied()
+        .filter(|&i| sealed_last.is_none_or(|s| segs[i].id.file_id > s.0))
+        .collect();
     let last_in_use = in_use.last().copied();
     let mut kept: Vec<usize> = segs.iter().map(|s| s.batches.len()).collect();
     let mut zero = Vec::new();
@@ -322,10 +334,15 @@ fn plan(
                 segs[i].id.file_id > slot.file_id
                     || (segs[i].id.file_id == slot.file_id && b.offset >= slot.offset)
             };
-            let n: usize = in_use
+            let mut n: usize = chain
                 .iter()
                 .map(|&i| segs[i].batches.iter().filter(|b| beyond(i, b)).count())
                 .sum();
+            // A sealed segment holding positions above the mark: the mark cannot be current, as it moved past each
+            // of that segment's batches before the seal started (Q-116 (j)).
+            if sealed_last.is_some_and(|s| s.1 > slot.last_sequence) {
+                n += 2;
+            }
             let rule = if slot.boot_id != boot {
                 StartRule::Reboot(MarkState::Readable)
             } else if n <= 1 {
@@ -359,10 +376,10 @@ fn plan(
     };
     // Losses: gaps in the kept positions (rule 2 regions and recovery-entry gaps), then the tail below the mark.
     let mut losses = Vec::new();
-    let mut expect: Option<u64> = sealed_last.map(|(l, _)| l + 1);
+    let mut expect: Option<u64> = sealed_last.map(|(_, l, _)| l + 1);
     let mut prev: Option<(usize, u64, i64)> = None;
     let mut last_kept: Option<(usize, usize)> = None;
-    for &i in &in_use {
+    for &i in &chain {
         let s = &segs[i];
         let mut e = expect.or(s.base()).unwrap_or(1);
         // A segment whose base is above the previous segment's last position lost positions between them (A.4,
@@ -428,9 +445,8 @@ fn plan(
     }
     let kept_last = expect
         .map_or(0, |e| e - 1)
-        .max(sealed_last.map_or(0, |s| s.0));
+        .max(sealed_last.map_or(0, |s| s.1));
     // The tail below a valid mark of any boot: positions up to the mark's are lost (rule 2).
-    let mut write_offset = last_kept.map_or(HEADER_LEN as u64, |(i, j)| segs[i].batches[j].end);
     let mut k = kept_last;
     if let Some(m) = mark_slot
         && m.last_sequence > kept_last
@@ -454,25 +470,19 @@ fn plan(
             boot,
             (prev.map(|p| p.2), None),
         ));
-        if file == m.file_id {
-            write_offset = write_offset.max(m.offset);
-        }
         k = m.last_sequence;
     }
-    // Where writing resumes: the last segment in use, after its kept bytes (and any lost region at its tail).
+    // Where writing resumes: the last segment in use, after its kept bytes, and after a lost region at its tail
+    // below the mark, which is never overwritten.
     let resume_in = last_in_use;
-    if let (Some(r), Some((i, _))) = (resume_in, last_kept)
-        && r != i
+    let mut write_offset = match (resume_in, last_kept) {
+        (Some(r), Some((i, j))) if r == i => segs[i].batches[j].end,
+        _ => HEADER_LEN as u64,
+    };
+    if let (Some(r), Some(m)) = (resume_in, mark_slot)
+        && segs[r].id.file_id == m.file_id
     {
-        write_offset = HEADER_LEN as u64;
-    }
-    if last_kept.is_none() {
-        write_offset = match (resume_in, mark_slot) {
-            (Some(r), Some(m)) if segs[r].id.file_id == m.file_id => {
-                m.offset.max(HEADER_LEN as u64)
-            }
-            _ => HEADER_LEN as u64,
-        };
+        write_offset = write_offset.max(m.offset);
     }
     let mut p = Plan {
         rule,
@@ -610,8 +620,13 @@ pub(super) fn start(
                 generation: name.generation,
             };
             let r = scan(&bytes, &id, ScanLimit::End).map_err(StoreError::Unsupported)?;
-            r.seal
-                .map(|s| (s.trailer.last_sequence, s.trailer.last_commit_time))
+            r.seal.map(|s| {
+                (
+                    name.file_id,
+                    s.trailer.last_sequence,
+                    s.trailer.last_commit_time,
+                )
+            })
         }
         None => None,
     };
@@ -710,6 +725,12 @@ pub(super) fn start(
         manifest.highest_sequence(0),
     );
     report.rule = p.rule;
+    // What was found is reported even if the start cannot record it.
+    report.losses = p
+        .losses
+        .iter()
+        .map(|l| found(l, LossKind::DataLost, false))
+        .collect();
     let ro = |f: Fault, report: StartReport| Ok(read_only(f, report, halt));
 
     // Headers of segments in use that are invalid or not yet taken into use, rewritten from the name and the first
@@ -852,10 +873,9 @@ pub(super) fn start(
         Ok(()) => {}
         Err(e) => return ro(fault(FaultOp::Sync, &manifest_path, &e), report),
     }
-    for l in &losses {
-        let recorded = record_loss(&*mfile, &manifest, l, &mut epoch, wall, &manifest_path);
-        match recorded {
-            Ok(r) => report.losses.push(found(l, LossKind::DataLost, r)),
+    for (k, l) in losses.iter().enumerate() {
+        match record_loss(&*mfile, &manifest, l, &mut epoch, wall, &manifest_path) {
+            Ok(r) => report.losses[k].recorded = r,
             Err(f) => return ro(f, report),
         }
     }
@@ -870,7 +890,7 @@ pub(super) fn start(
     let mut last_commit_time = segs
         .iter()
         .flat_map(|s| s.batches.iter().map(|b| b.commit_time))
-        .chain(sealed_last.map(|s| s.1))
+        .chain(sealed_last.map(|s| s.2))
         .max()
         .unwrap_or(i64::MIN);
     let mark_slot;
@@ -920,6 +940,20 @@ pub(super) fn start(
             // In a new segment when the open one is full, or when no segment is in use.
             let (file, id, at, path): (&dyn FsFile, SegmentIdentity, u64, PathBuf) = if fits {
                 let i = open_idx.expect("fits");
+                // The recovery batch as the segment's first batch: its header is rewritten with F (A.4).
+                if p.kept[i] == 0 {
+                    let mut h = FileHeader::new(
+                        kind::LOG_SEGMENT,
+                        segs[i].id.generation,
+                        segs[i].id.file_id,
+                        segs[i].header.map_or(wall, |h| h.created_at),
+                        store_id,
+                    );
+                    h.base_sequence = f_seq;
+                    if let Err(e) = files[&i].write_at(&h.encode(), 0) {
+                        return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
+                    }
+                }
                 (&*files[&i], segs[i].id, write_offset, segs[i].path.clone())
             } else {
                 let a = match ahead.take() {

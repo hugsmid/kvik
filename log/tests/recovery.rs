@@ -18,8 +18,8 @@ use kvik_log::name::SegmentName;
 use kvik_log::scan::{ScanLimit, Tail, scan};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
-    Call, CallSource as _, IngestQueue, LogWriter, MarkSync, StartReport, StartRule, WriterConfig,
-    create_segment, seal_segment,
+    Call, CallSource as _, IngestQueue, LogWriter, LossKind, MarkSync, StartReport, StartRule,
+    WriterConfig, create_segment, seal_segment,
 };
 use proptest::prelude::*;
 
@@ -269,7 +269,8 @@ impl Rig {
         let mut next = 1;
         for c in self.batches() {
             if let [Item::Entry(Entry::Recovery(r))] = c.items.as_slice() {
-                assert!(r.after + 1 >= next.min(r.after + 1));
+                // `after` is the last kept position: the previous batch's, or the end of a lost range.
+                assert!(r.after + 1 >= next);
                 assert!(c.first_sequence >= next);
             } else {
                 assert_eq!(c.first_sequence, next, "dense positions");
@@ -293,8 +294,9 @@ impl Rig {
                     generation: 0,
                 };
                 let r = scan(&bytes, &id, ScanLimit::End).unwrap();
+                // A segment the mark still names may be awaiting its seal, or sealed but not yet renamed.
                 assert!(
-                    matches!(r.tail, Some(Tail::Clean { .. })),
+                    r.seal.is_some() || matches!(r.tail, Some(Tail::Clean { .. })),
                     "a clean tail after a start: {:?}",
                     r.tail
                 );
@@ -731,6 +733,56 @@ fn a_definition_still_readable_in_the_torn_tail_raises_the_id_floor() {
     r.check_started();
 }
 
+#[test]
+fn a_segment_whose_creation_stopped_before_its_directory_sync_is_made_durable_by_the_start() {
+    // The segment created ahead was written and synced, but the directory sync that makes its name durable failed.
+    // The next start keeps it as created ahead; step 1's directory sync makes its name durable before batches are
+    // acknowledged in it.
+    for seed in 0..16 {
+        let mut r = Rig::new(cfg());
+        r.submit(vec![fact(1, 0)]);
+        r.drain();
+        r.fs.fail_nth(FaultOp::SyncDir, "log", 0, io::ErrorKind::Other);
+        // Write until the writer asks for its next segment; that creation fails at its directory sync.
+        let fs = r.fs.clone();
+        for i in 0..500 {
+            r.submit(vec![fact(1, i)]);
+            r.step();
+            r.advance(20 * MS);
+            let w = r.w();
+            if let Some(req) = w.segment_request(T0) {
+                let res = create_segment(&fs, &req, &w.halt());
+                w.segment_created(res);
+                break;
+            }
+        }
+        assert!(r.w().fault().is_some());
+        r.kill();
+        let created: Vec<PathBuf> = r.fs.paths();
+        r.open().unwrap();
+        // Batches fill the segment in use and roll into the kept one; no further creation runs.
+        for i in 0..200 {
+            r.submit(vec![fact(2, i)]);
+            r.step();
+            r.advance(20 * MS);
+        }
+        r.power_loss(Some(seed));
+        let ids = |v: &[PathBuf]| -> Vec<u64> {
+            v.iter()
+                .filter_map(|p| SegmentName::parse(p.file_name()?.to_str()?))
+                .map(|n| n.file_id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&r.fs.paths()),
+            ids(&created),
+            "no segment's name is undone"
+        );
+        r.open().unwrap();
+        r.check_started();
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Crash {
     /// The process is killed (same boot).
@@ -828,7 +880,7 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
             let _ = r.shutdown();
         }
         r.fs.set_free_space(1 << 40);
-        let mark_before = match c.crash {
+        let mut mark_before = match c.crash {
             Crash::Kill => {
                 r.kill();
                 r.mark()
@@ -863,10 +915,28 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
                 continue;
             }
             r.kill();
+            // The start that stopped may have written a mark; the next one reads it.
+            if mark_before.is_some() || r.mark().is_some_and(|m| m.boot_id == r.boot_id()) {
+                mark_before = r.mark();
+            }
         }
         let before = r.batches();
         let rep = r.open().expect("a start finishes");
         r.check_started();
+        // No corruption is injected: nothing is certainly lost, and each recovery entry follows the batch before
+        // it directly.
+        assert!(
+            rep.losses.iter().all(|l| l.kind == LossKind::PossibleLoss),
+            "{:?}",
+            rep.losses
+        );
+        let mut next = 1;
+        for b in r.batches() {
+            if let [Item::Entry(Entry::Recovery(e))] = b.items.as_slice() {
+                assert_eq!(e.after, next - 1);
+            }
+            next = b.last_sequence() + 1;
+        }
         // What was kept is the image's committed prefix: under rule 1 up to the mark, otherwise every complete
         // batch, followed by at most a recovery entry.
         let after = r.batches();
@@ -921,30 +991,140 @@ fn kill_loop_long() {
 
 #[test]
 fn a_full_disk_at_a_start_that_needs_a_segment_leaves_it_read_only() {
-    let mut r = Rig::new(WriterConfig {
-        segment_size: 4096,
-        ..cfg()
-    });
-    // Fill segment 1 so that the entry needs a new segment.
-    for i in 0..40 {
-        r.submit(vec![fact(1, i)]);
-        r.step();
-    }
+    // A store with no batch yet: after a reboot its recovery entry needs a segment, and there is no space for one.
+    let mut r = Rig::new(cfg());
     r.w = None;
-    // Remove the segment created ahead, then leave no space.
     for p in r.fs.paths() {
-        let s = p.to_string_lossy().to_string();
-        if s.ends_with(".open") && r.fs.read(&p).unwrap().iter().skip(64).all(|&b| b == 0) {
+        if p.to_string_lossy().ends_with(".open") {
             r.fs.remove_file(&p).unwrap();
         }
     }
     r.power_loss(None);
     r.fs.set_free_space(100);
-    let fits = r.open();
+    r.fs.clear_ops();
+    assert!(r.open().is_none(), "the start is read-only");
+    assert!(
+        r.fs.paths()
+            .iter()
+            .all(|p| !p.to_string_lossy().ends_with(".open")),
+        "the partial file is deleted"
+    );
     r.fs.set_free_space(1 << 40);
-    r.fs.restart();
-    if fits.is_none() {
-        r.open().expect("with space, the start finishes");
-    }
+    r.open().expect("with space, the start finishes");
     r.check_started();
+}
+
+#[test]
+fn a_crash_while_creating_the_store_or_in_its_first_start_is_recovered() {
+    for n in 0..30 {
+        let fs = MemFs::new();
+        fs.crash_after(n);
+        let store = StoreDir::open(Arc::new(fs.clone()), &dir(), Some(&new_store()));
+        if let Ok(store) = store {
+            let _ = LogWriter::open(store, cfg(), Some([1; 16]), Duration::ZERO, T0);
+        }
+        for seed in [None, Some(n as u64)] {
+            let fs = fs.clone();
+            match seed {
+                None => fs.restart(),
+                Some(s) => {
+                    fs.power_loss_partial(s);
+                    fs.restart();
+                }
+            }
+            let mut r = Rig {
+                fs,
+                boot: 1,
+                cfg: cfg(),
+                w: None,
+                q: IngestQueue::new(cfg().ingest_queue),
+                calls: BTreeMap::new(),
+                now: Duration::ZERO,
+                wall: T0,
+                acked: BTreeMap::new(),
+            };
+            r.open()
+                .unwrap_or_else(|| panic!("crash after {n} operations"));
+            r.check_started();
+            r.submit(vec![fact(1, 0)]);
+            r.drain();
+            r.check_acked();
+        }
+    }
+}
+
+#[test]
+fn a_sealed_segment_above_the_mark_makes_the_mark_stale() {
+    // b1 is sealed in segment 1 and b2 committed in segment 2; the mark, synced only on its timer, still names
+    // nothing when a remount loses the page cache. Rule 1 would truncate b2; the mark is stale.
+    let mut r = Rig::new(WriterConfig {
+        segment_size: 4096,
+        min_sync_interval: Duration::ZERO,
+        seal_interval: Duration::from_millis(5),
+        ..cfg()
+    });
+    r.submit(vec![fact(1, 0)]);
+    r.step();
+    r.maint();
+    r.advance(10 * MS);
+    r.step();
+    r.maint();
+    r.submit(vec![fact(1, 1)]);
+    r.step();
+    r.maint();
+    assert!(
+        r.fs.paths()
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".kvl"))
+    );
+    assert_eq!(r.acked.len(), 2);
+    r.w = None;
+    r.fs.power_loss();
+    r.fs.restart();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::Reboot(MarkState::Stale));
+    r.check_started();
+}
+
+#[test]
+fn a_loss_at_the_tail_below_the_mark_is_not_overwritten() {
+    // b1 in segment 1, b2 in segment 2 with the mark after it; b2 is then damaged. The positions up to the mark's
+    // are lost, and writing resumes after the damaged bytes.
+    let mut r = Rig::new(WriterConfig {
+        segment_size: 4096,
+        min_sync_interval: Duration::ZERO,
+        seal_interval: Duration::from_millis(5),
+        mark_sync: MarkSync::EveryCommit,
+        ..cfg()
+    });
+    r.submit(vec![fact(1, 0)]);
+    r.step();
+    r.maint();
+    r.advance(10 * MS);
+    r.step();
+    r.maint();
+    r.submit(vec![fact(1, 1)]);
+    r.step();
+    r.maint();
+    let m = r.mark().unwrap();
+    assert_eq!((m.file_id, m.last_sequence), (2, 2));
+    r.w = None;
+    let seg = log_path("00000000-0000000000000002.open");
+    r.fs.poke(&seg, 64 + 40, &[0xff; 8]);
+    r.kill();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    assert_eq!(rep.losses.len(), 1);
+    assert_eq!(
+        (rep.losses[0].first, rep.losses[0].last),
+        (Some(2), Some(2))
+    );
+    let damaged = r.fs.read(&seg).unwrap()[64..m.offset as usize].to_vec();
+    r.submit(vec![fact(1, 2)]);
+    r.drain();
+    assert_eq!(r.fs.read(&seg).unwrap()[64..m.offset as usize], damaged[..]);
+    assert_eq!(
+        r.positions().keys().copied().collect::<Vec<_>>(),
+        vec![1, 3]
+    );
 }
