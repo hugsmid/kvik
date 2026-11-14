@@ -84,7 +84,9 @@ refresh instant, since the writer's monotonic clock is not in the log.
 change; later complete batches, which are kept, hold facts of that series. The registry file is compacted from the
 log and may not hold the lost entry. Tree files and the revised-key index were built over facts that are now lost,
 so rebuilding from the log no longer equals the live structures (invariant 8).
-**Model.** Not modelled; a lost range is not produced.
+**Model.** Not modelled: a lost range comes only from a damaged batch of facts in the open segment (row 11a), and
+`Model::corrupt_open_batch` refuses a batch holding a registry, routing or zone entry
+(`tests/edge_cases.rs` `row_11a_fault_injection_limits`).
 **Tried and rejected.** Syncing every non-fact entry to the registry file and re-appending lost ones to the log with
 their original positions; keeping facts of undefined series apart until a definition names their id. Review found
 that re-appended entries put lower sequences after higher ones (§2.2, `format.md` A.4), that a definition taking
@@ -120,7 +122,9 @@ holding a registry entry is acknowledged only after a mark sync.
 right after a `possible_loss` may no longer report it, and nothing says whether health stays degraded. Parts (a) and
 (b) are settled (§8 Corrupt block, §11 Health); part (d) is Q-52. The same question applies to the set-aside range
 each restore record reports (§8 Restore step 1), which is derived from the record at every start.
-**Model.** Not modelled; the model records no lost ranges and does not report a truncated tail.
+**Model.** `data_lost` is read from the manifest's lost-range records, so it is reported after every start, never
+cleared, and holds health degraded without making the store read-only (`tests/edge_cases.rs`
+`row_11a_corrupt_block_inside_the_open_segment`); a truncated tail is not reported.
 **Proposal.** Both reports are read from manifest records at every start (for `possible_loss`, the truncated-tail
 record proposed in Q-48), so a restart does not clear them, the list is never shortened and the counts only rise;
 neither makes the store read-only. For the owner: whether they also hold health degraded until an operator
@@ -767,7 +771,9 @@ on every resume, after a restart, a recovery on a new boot or a consumer restart
 position followed by `resync` with the live state and the condition state now, a transition where it differs from
 the latch or there is no latch, or `resync` alone when the cursor is too far behind the local log segments; and
 catch-up after overflow from the last position enqueued in the session; rows 14–16 and 34, invariants 2, 3, 11, 13
-and 16; `tests/rules.rs` `s4_…` and `s6_…`), loss of a corrupt log segment with no other copy (§8; the whole range, see the table), and generations, tree checkpoints
+and 16; `tests/rules.rs` `s4_…` and `s6_…`), loss of a corrupt log segment with no other copy (§8; the whole range, see the table), lost ranges in the open
+segment found by recovery (§3 Recovery rule 2, row 11a: later batches kept, the range recorded in the manifest and
+reported as `data_lost`, its positions not reused; see the table), and generations, tree checkpoints
 and restore (§2.2, §8 Continuous backup, Generations, Restore drill, Restore steps 1–4 and the paragraph after them,
 rows 28, 28a and 28b; for 28a, a crash before the record, during step 1 or between later downloads, a download
 being atomic): a tree checkpoint carries the stored nodes, the registry and each series' latest recorded `t`
@@ -823,7 +829,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Interval series | §2.1 (an `i64` value with a decimal scale), §6 (an apportioned amount computed in f64) | Values are `f64`, and sums, including apportioned amounts, are exact rationals, so invariant 22 holds exactly, also over the days of a month in a +05:45 zone | `tests/invariants.rs` `inv22_…` |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
-| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §4 Resync, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled, so no consumer receives `resync` for a cursor or `start` position below or inside a lost range | — |
+| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2, §4 Resync, §8 Corrupt block ("recorded when found"), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), and found by the next recovery; a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches; the `resync` for a cursor below or inside it is the one every resume sends | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost and the quarantine stays | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; forgetting positions above the recovered cursor | §3 Durable mark, §3 Recovery rule 3, §4 At-least-once, Resync, row 7a | The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail; a truncation after a reboot is not reported. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
 | Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start; exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
@@ -834,4 +840,4 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Query flags and fact reads | §11 Query; §8 Restore step 2 and Failures and end: every query result carries `restoring` while restoring, and fact reads fetch detail not yet local on demand | Only window results carry flags (`restoring`, `summary_stale`); while restoring, `current`, `facts` and `latest` return the local facts, unflagged, without fetching | — |
 | Window edges over detail that is not local | §6 Old spans, §8 Restore step 2: an edge moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, the error `detail_not_local`; no bound is refused for its resolution | No window is flagged `approximate_edges` and no edge moves; while restoring, a window bound inside a minute is refused with `Restoring`. A series that stores no level, or only the 15-minute level, answers the unstored levels from its local facts: a minute the replay touches inside a quarter-hour the checkpoint holds is flagged `summary_stale`, but a window over part of a quarter-hour whose detail is not yet local is computed from the local facts without a flag (see Q-49 (b)) | `tests/open_questions.rs` `q39_no_sub_minute_query_or_checkpoint_while_restoring` |
 | Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |
-| Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
+| Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap: lost-range records stay in the local manifest and the bucket does not carry them, so a restore sets aside the positions after a lost range | — |

@@ -2175,3 +2175,196 @@ fn restore_generator_coverage() {
     eprintln!("gaps {gaps} caught-up {caught_up} no-replay {no_replay} empty {empty}");
     assert!(gaps > 10 && caught_up > 20 && no_replay > 50 && empty > 5);
 }
+
+// ----- lost ranges (§3 Recovery rule 2, row 11a) -----
+
+/// Positions in the recorded lost ranges.
+fn lost_positions(m: &kvik_model::engine::Model) -> BTreeSet<kvik_model::types::Position> {
+    use kvik_model::types::Position;
+    m.disk
+        .lost_ranges()
+        .into_iter()
+        .flat_map(|(from, to)| {
+            (from.sequence..=to.sequence).map(move |q| Position::new(from.generation, q))
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// 1 with lost ranges. Whenever no damage awaits recovery, the durable
+    /// positions and the positions of the recorded lost ranges are disjoint
+    /// and together gap-free from the first position; after a restart the
+    /// next position follows both, so no lost position is reused.
+    #[test]
+    fn inv01_gap_free_except_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, ids) = machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            if !m.disk.damaged.is_empty() {
+                continue;
+            }
+            let durable: BTreeSet<_> = m.disk.all_entries().into_keys().collect();
+            let lost = lost_positions(&m);
+            prop_assert!(durable.is_disjoint(&lost), "a lost position is durable after {:?}", op);
+            let all = seqs(durable.union(&lost).copied());
+            let expect: Vec<u64> = (1..=all.len() as u64).collect();
+            prop_assert_eq!(&all, &expect, "positions not gap-free outside lost ranges after {:?}", op);
+        }
+        m.restart();
+        let top = m.disk.all_entries().into_keys().chain(lost_positions(&m)).max().unwrap();
+        let _ = m.emit(kvik_model::types::Reading::num(ids[0], T0 + 7, 1.0e9));
+        let r = m.commit(None).unwrap();
+        prop_assert_eq!(r.positions, vec![top.next()]);
+    }
+
+    /// 2 with lost ranges. Every delivered position is durable or, delivered
+    /// before its batch was damaged, in a lost range; no lost position is
+    /// delivered once its range is recorded; every durable position routed
+    /// to a consumer is delivered to it, or superseded by a `resync`.
+    #[test]
+    fn inv02_delivered_iff_durable_except_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, ids) = machine();
+        let mut basis = ResyncBasis::new();
+        // Per consumer, how many observations each lost range found.
+        let mut seen_at: BTreeMap<(u32, kvik_model::types::Position), usize> = BTreeMap::new();
+        let note = |m: &kvik_model::engine::Model, seen_at: &mut BTreeMap<_, _>| {
+            for (from, _) in m.disk.lost_ranges() {
+                for c in [0u32, 1] {
+                    let n = m.observed.get(&ConsumerId(c)).map_or(0, Vec::len);
+                    seen_at.entry((c, from)).or_insert(n);
+                }
+            }
+        };
+        for op in &ops {
+            track_resyncs(&mut m, &mut basis, |m| apply(m, &ids, op)).map_err(TestCaseError::fail)?;
+            note(&m, &mut seen_at);
+        }
+        track_resyncs(&mut m, &mut basis, settle);
+        note(&m, &mut seen_at);
+        track_resyncs(&mut m, &mut basis, |m| m.drain()).unwrap();
+        let dur = durable(&m);
+        let ranges = m.disk.lost_ranges();
+        for (c, sel) in [(0u32, None), (1u32, Some(ids[0]))] {
+            let obs = m.observed.get(&ConsumerId(c)).cloned().unwrap_or_default();
+            for (i, o) in obs.iter().enumerate() {
+                let range = ranges.iter().find(|(a, b)| *a <= o.position && o.position <= *b);
+                match range {
+                    None => prop_assert!(dur.contains_key(&o.position), "consumer {} saw non-durable {}", c, o.position),
+                    Some((from, _)) => prop_assert!(i < seen_at[&(c, *from)], "consumer {} got lost {} after its range was recorded", c, o.position),
+                }
+            }
+            let seen = observed_positions(&m, c);
+            let replaced = resync_replaced_justified(&m, &basis, c);
+            for (p, f) in &dur {
+                if sel.is_none_or(|s| s == f.series) {
+                    let superseded = replaced.iter().any(|(a, b)| a < p && p <= b);
+                    prop_assert!(seen.contains(p) || superseded, "consumer {} never got {}", c, p);
+                }
+            }
+        }
+    }
+
+    /// 9 with lost ranges: compaction, compaction of compacted files,
+    /// tiering and backup preserve the positions outside lost ranges, each
+    /// with identical content. (A restore reads every missing position as a
+    /// gap; see `OPEN-QUESTIONS.md`.)
+    #[test]
+    fn inv09_files_preserve_positions_outside_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, _) = run(&ops)?;
+        settle(&mut m);
+        let committed = durable(&m);
+        let lost = lost_positions(&m);
+        prop_assert!(committed.keys().all(|p| !lost.contains(p)));
+        let _ = m.compact(None);
+        m.seal_active();
+        let _ = m.compact(None);
+        let _ = m.merge_chunks(None);
+        m.disk.bucket.reachable = true;
+        m.upload();
+        m.advance(100 * 24 * 3600 * SECOND);
+        let _ = m.housekeeping();
+        prop_assert_eq!(&durable(&m), &committed);
+        prop_assert_eq!(&lost_positions(&m), &lost);
+        let in_bucket: BTreeMap<_, _> = m.disk.bucket.objects.values()
+            .flat_map(|(_, f)| f.entries().filter_map(|e| e.fact().map(|x| (e.position, x.clone()))).collect::<Vec<_>>())
+            .collect();
+        for (p, f) in &in_bucket {
+            prop_assert_eq!(Some(f), committed.get(p));
+        }
+    }
+
+    /// 10 with lost ranges: every fact ever durable is durable at the end,
+    /// unless its position lies in a recorded lost range; each lost range is
+    /// reported as `data_lost`, and the store stays writable.
+    #[test]
+    fn inv10_only_lost_ranges_remove_facts(ops in proptest::collection::vec(arb_lossy_op(), 1..120)) {
+        use kvik_model::engine::Reason;
+        let (mut m, ids) = machine();
+        let mut ever = durable(&m);
+        for op in &ops {
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            ever.extend(durable(&m));
+        }
+        settle(&mut m);
+        m.restart();
+        let now = durable(&m);
+        let lost = lost_positions(&m);
+        for (p, f) in &ever {
+            prop_assert!(now.get(p) == Some(f) || lost.contains(p), "fact at {} removed outside a lost range", p);
+        }
+        let h = m.health();
+        for (from, to) in m.disk.lost_ranges() {
+            prop_assert!(h.reasons.contains(&Reason::DataLost(from, to)));
+        }
+        prop_assert!(!m.is_read_only());
+    }
+}
+
+/// Guards `arb_lossy_op`: its histories must record lost ranges after a
+/// process crash and after a power loss, ranges with kept batches after
+/// them and ranges at the end of the log, and consumers whose cursor is
+/// below or inside a range.
+#[test]
+fn lossy_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = proptest::collection::vec(arb_lossy_op(), 60..80);
+    let (mut crash, mut power, mut followed, mut at_end) = (0usize, 0usize, 0usize, 0usize);
+    let (mut below, mut inside) = (0usize, 0usize);
+    for _ in 0..200 {
+        let ops = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, ids) = machine();
+        let mut damage = Vec::new();
+        for op in &ops {
+            let n = m.disk.damaged.len();
+            let ranges = m.disk.lost_ranges().len();
+            apply(&mut m, &ids, op).unwrap();
+            if let Op::Corrupt { power_loss, .. } = op
+                && m.disk.damaged.len() > n
+            {
+                damage.push(*power_loss);
+            }
+            for (from, to) in m.disk.lost_ranges().into_iter().skip(ranges) {
+                let later = m.disk.all_entries().into_keys().any(|p| p > to);
+                followed += usize::from(later);
+                at_end += usize::from(!later);
+                for c in m.disk.cursors.values() {
+                    below += usize::from(*c < from);
+                    inside += usize::from(from <= *c && *c <= to);
+                }
+            }
+        }
+        crash += damage.iter().filter(|p| !**p).count();
+        power += damage.iter().filter(|p| **p).count();
+    }
+    eprintln!(
+        "crash {crash} power-loss {power} followed {followed} at-end {at_end} cursor-below {below} cursor-inside {inside}"
+    );
+    assert!(crash > 50 && power > 50 && followed > 30 && at_end > 30);
+    // A cursor inside a range is rare here; `tests/edge_cases.rs`
+    // `row_11a_corrupt_block_inside_the_open_segment` has one by hand.
+    assert!(below > 50 && inside > 2);
+}

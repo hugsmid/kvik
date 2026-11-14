@@ -227,6 +227,15 @@ pub enum Op {
         series: usize,
         diagnostic: bool,
     },
+    /// The engine stops (a power loss if `power_loss`, else a process
+    /// crash) and a batch of facts in the open segment below the durable
+    /// mark is damaged, if there is one (row 11a): the one `batch` selects,
+    /// or with `None` the earliest. The next start records a lost range (§3
+    /// Recovery rule 2). Only [`arb_lossy_op`] makes it.
+    Corrupt {
+        power_loss: bool,
+        batch: Option<proptest::sample::Index>,
+    },
 }
 
 pub fn arb_compaction_crash() -> impl Strategy<Value = Option<CompactionCrash>> {
@@ -310,6 +319,40 @@ pub fn arb_op() -> impl Strategy<Value = Op> {
         1 => (any::<proptest::sample::Index>(), any::<bool>()).prop_map(|(i, l)| Op::RefreshReader(i, l)),
         1 => any::<proptest::sample::Index>().prop_map(Op::CloseReader),
     ]
+}
+
+/// [`arb_op`] with damage to the open segment (row 11a), for the
+/// invariants read with lost ranges (1, 2, 9 and 10).
+pub fn arb_lossy_op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        12 => arb_op(),
+        // Several batches in the open segment, so that kept batches follow
+        // a damaged one.
+        4 => arb_emit(),
+        4 => Just(Op::Commit(None)),
+        // Consumers that keep up, so that some cursors lie inside a range.
+        2 => (0usize..2).prop_map(|c| Op::Poll { c, n: 3 }),
+        2 => (0usize..2).prop_map(|c| Op::Confirm { c }),
+        1 => (any::<bool>(), proptest::option::of(any::<proptest::sample::Index>()))
+            .prop_map(|(power_loss, batch)| Op::Corrupt { power_loss, batch }),
+    ]
+}
+
+/// Batches of the open segment that [`Model::corrupt_open_batch`] can
+/// damage: below the durable mark, not yet lost, and holding facts only.
+pub fn corruptible_batches(m: &Model) -> Vec<usize> {
+    let Some(f) = m.disk.active else {
+        return Vec::new();
+    };
+    let Some(mark) = m.disk.mark.filter(|k| k.file == f) else {
+        return Vec::new();
+    };
+    m.disk.files[&f].batches[..mark.batches]
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.is_empty() && b.iter().all(|e| e.fact().is_some()))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// [`arb_op`] with more sealing, compaction and compaction of compacted
@@ -454,6 +497,7 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             | Op::OpenReader
             | Op::RefreshReader(..)
             | Op::CloseReader(_)
+            | Op::Corrupt { .. }
     );
     if needs_up && !m.is_up() {
         m.restart();
@@ -555,6 +599,24 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
         }
         Op::Housekeeping => {
             let _ = m.housekeeping();
+        }
+        Op::Corrupt { power_loss, batch } => {
+            if *power_loss {
+                m.power_loss();
+            } else {
+                m.crash();
+            }
+            let candidates = corruptible_batches(m);
+            let chosen = match batch {
+                Some(i) if !candidates.is_empty() => Some(*i.get(&candidates)),
+                _ => candidates.first().copied(),
+            };
+            if let Some(b) = chosen {
+                m.corrupt_open_batch(b).map_err(|e| e.to_string())?;
+            }
+            // The loss is the one invariant 10 allows; the lost-range
+            // properties check that it is recorded and reported.
+            return Ok(());
         }
     }
     let after = durable(m);

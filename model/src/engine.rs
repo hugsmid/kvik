@@ -394,6 +394,15 @@ pub enum ManifestOp {
         /// The restored end.
         restored_end: Position,
     },
+    /// A lost range (§3 Recovery rule 2): positions from `from` to `to`
+    /// whose batch in the open segment was found corrupt by recovery, with no
+    /// other copy. Reported as `data_lost`; its positions are not reused.
+    LostRange {
+        /// First lost position.
+        from: Position,
+        /// Last lost position.
+        to: Position,
+    },
 }
 
 /// A tree checkpoint (§5.1, §8 Continuous backup): the stored nodes of every
@@ -676,6 +685,9 @@ pub enum Error {
     /// A routing change is refused.
     #[error("route refused: {0}")]
     BadRoute(&'static str),
+    /// A fault injection the model does not support.
+    #[error("fault not modelled: {0}")]
+    BadFault(&'static str),
     /// A downloaded file holds a position whose content differs from the
     /// copy already local (§8 Restore step 3).
     #[error("file {file:?} holds {position} with different content")]
@@ -780,6 +792,10 @@ pub enum Reason {
     UploadStalled,
     /// A series' source clock appears skewed.
     ClockSkew(SeriesId),
+    /// A lost range caused by corruption (§3 Recovery rule 2, §11 Health):
+    /// its first and last position. Read from the manifest, so it is reported
+    /// after every start (see Q-34 (c)).
+    DataLost(Position, Position),
 }
 
 /// Health report.
@@ -1105,6 +1121,10 @@ pub struct Disk {
     pub corrupt: BTreeSet<FileId>,
     /// Quarantined hot copies.
     pub quarantined: BTreeSet<FileId>,
+    /// Batches of the open segment whose bytes were damaged (fault
+    /// injection), each with the first and last position it held; the next
+    /// recovery finds them (§3 Recovery rule 2).
+    pub damaged: BTreeMap<(FileId, usize), (Position, Position)>,
     /// Deep tier.
     pub bucket: Bucket,
     /// Manifest.
@@ -1266,6 +1286,25 @@ impl Disk {
         epoch
     }
 
+    /// Lost ranges recorded in the manifest (§3 Recovery rule 2), as first
+    /// and last position.
+    pub fn lost_ranges(&self) -> Vec<(Position, Position)> {
+        self.manifest
+            .iter()
+            .filter_map(|r| match r.op {
+                ManifestOp::LostRange { from, to } => Some((from, to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `p` lies in a recorded lost range.
+    pub fn is_lost(&self, p: Position) -> bool {
+        self.lost_ranges()
+            .iter()
+            .any(|(from, to)| *from <= p && p <= *to)
+    }
+
     /// Log segments already compacted (§7).
     pub fn compacted_segments(&self) -> BTreeSet<FileId> {
         self.manifest
@@ -1285,7 +1324,9 @@ impl Disk {
             .iter()
             .flat_map(|r| match &r.op {
                 ManifestOp::Publish { added, .. } => added.iter().map(|a| a.file).collect(),
-                ManifestOp::Seal { .. } | ManifestOp::Restore { .. } => Vec::new(),
+                ManifestOp::Seal { .. }
+                | ManifestOp::Restore { .. }
+                | ManifestOp::LostRange { .. } => Vec::new(),
             })
             .collect()
     }
@@ -1797,12 +1838,17 @@ impl Model {
         // The next position continues the current generation; a generation
         // started by a restore begins at its first position (§8).
         let generation = self.disk.generation;
+        // Positions of a lost range are not reused (§3 Recovery rule 2).
         let next_position = d
             .entries
             .keys()
             .next_back()
+            .copied()
+            .into_iter()
+            .chain(self.disk.lost_ranges().into_iter().map(|(_, to)| to))
             .filter(|p| p.generation == generation)
-            .map_or(Position::first(generation), |p| p.next());
+            .max()
+            .map_or(Position::first(generation), Position::next);
         // A consumer that is behind catches up from its cursor. Every later
         // start is a resume (§6 Restart and resume): replay, then `resync`.
         let mut resuming = Vec::new();
@@ -2133,13 +2179,47 @@ impl Model {
         // What is left on disk is now whole.
         self.disk.tail_fate = None;
         if same_boot {
+            self.record_lost_ranges(active);
             return false;
         }
         if sync_fails {
             return true;
         }
+        self.record_lost_ranges(active);
         self.sync_mark();
         false
+    }
+
+    /// §3 Recovery rule 2: a damaged batch of the open segment lies below the
+    /// mark (injection allows nothing else), so it was synced: corruption, not
+    /// a torn tail. Later batches are kept and nothing is overwritten; each run
+    /// of adjacent damaged batches is recorded as one lost range. The engine
+    /// takes the range from the last valid batch before it to the next valid
+    /// batch or, with none, to the mark's last position; the model keeps the
+    /// positions each damaged batch held, which give the same range when its
+    /// neighbours are valid, and do not repeat an earlier lost range next to it.
+    fn record_lost_ranges(&mut self, active: FileId) {
+        let runs: Vec<(Position, Position)> = self
+            .disk
+            .damaged
+            .range((active, 0)..=(active, usize::MAX))
+            .fold(Vec::new(), |mut runs, (_, (from, to))| {
+                match runs.last_mut() {
+                    Some((_, end)) if end.next() == *from => *end = *to,
+                    _ => runs.push((*from, *to)),
+                }
+                runs
+            });
+        let at = self.wall;
+        for (from, to) in runs {
+            let epoch = self.disk.epoch();
+            self.disk.manifest.push(ManifestRecord {
+                epoch,
+                at,
+                op: ManifestOp::LostRange { from, to },
+            });
+        }
+        self.disk.damaged.retain(|(f, _), _| *f != active);
     }
 
     /// Moves the durable mark to the end of the active segment, stamped with
@@ -2152,11 +2232,13 @@ impl Model {
             return;
         };
         let file = &self.disk.files[&active];
+        // A lost range at the end of the segment stays covered (§3 Recovery
+        // rule 2: its positions are not reused).
         let last = file
             .entries()
             .last()
             .map(|e| e.position)
-            .or(self.disk.mark.map(|m| m.last));
+            .max(self.disk.mark.map(|m| m.last));
         if let Some(last) = last {
             self.disk.mark = Some(Mark {
                 boot: self.boot,
@@ -4056,6 +4138,10 @@ impl Model {
         for f in &self.disk.quarantined {
             raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
         }
+        // Not read-only (§3 Recovery rule 2).
+        for (from, to) in self.disk.lost_ranges() {
+            raise(Level::Degraded, Reason::DataLost(from, to), &mut reasons);
+        }
         let free = self.free_bytes();
         if free < self.config.critical_mark {
             raise(Level::Degraded, Reason::CriticalDisk, &mut reasons);
@@ -4645,7 +4731,45 @@ impl Model {
         Ok(removed)
     }
 
-    /// Fault injection: a hot copy no longer matches its hash.
+    /// Fault injection while the engine is down: batch `batch` of the open
+    /// segment, below the durable mark, is damaged (row 11a), on the same boot
+    /// or after a power loss. Its entries become unreadable; the next recovery
+    /// records the lost range (§3 Recovery rule 2). A batch holding anything
+    /// but facts is refused: what a lost registry, routing or zone entry means
+    /// is Q-33.
+    pub fn corrupt_open_batch(&mut self, batch: usize) -> Result<(), Error> {
+        if self.vol.is_some() {
+            return Err(Error::BadFault(
+                "corruption of the open segment is found by recovery; stop the engine first",
+            ));
+        }
+        let active = self.disk.active.ok_or(Error::BadFault("no open segment"))?;
+        let below_mark = self
+            .disk
+            .mark
+            .is_some_and(|m| m.file == active && batch < m.batches);
+        if !below_mark {
+            return Err(Error::BadFault("only a batch below the durable mark"));
+        }
+        let entries = &self.disk.files[&active].batches[batch];
+        if entries.is_empty() {
+            return Err(Error::BadFault("the batch is already lost"));
+        }
+        if !entries.iter().all(|e| matches!(e.body, EntryBody::Fact(_))) {
+            return Err(Error::BadFault(
+                "a lost registry, routing or zone entry is open (Q-33)",
+            ));
+        }
+        let range = (
+            entries.first().expect("non-empty").position,
+            entries.last().expect("non-empty").position,
+        );
+        self.disk.files.get_mut(&active).expect("segment").batches[batch].clear();
+        self.disk.damaged.insert((active, batch), range);
+        Ok(())
+    }
+
+    /// Fault injection: the hot copy of `f` no longer matches its hash.
     pub fn corrupt_hot(&mut self, f: FileId) {
         self.disk.corrupt.insert(f);
     }

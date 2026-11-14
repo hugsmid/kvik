@@ -1092,6 +1092,183 @@ fn row_11_corrupt_sealed_file_quarantined_and_restored_from_tier() {
     assert_eq!(durable(&m), before);
 }
 
+/// Two consumers of every series and a gauge; four batches of two facts
+/// each in the open segment. Returns the model, the series and the positions
+/// of each batch.
+fn open_segment_model() -> (Model, SeriesId, Vec<Vec<Position>>) {
+    let consumers = [ConsumerId(1), ConsumerId(2)].map(|id| ConsumerDecl {
+        id,
+        selection: Selection::All,
+        capacity: 100,
+    });
+    let mut m = Model::new(Config::default(), consumers.to_vec(), T0 + HOUR);
+    let s = m
+        .define_with(
+            "plant/line-1/temperature",
+            Kind::Gauge,
+            ValueType::Number,
+            "degC",
+            10 * SECOND,
+            SeriesOptions::expected(SECOND),
+        )
+        .unwrap();
+    let batches = (0..4)
+        .map(|i| {
+            let t = T0 + i * SECOND;
+            m.ingest(vec![num(s, t, 1.0), num(s, t + SECOND / 2, 2.0)])
+                .unwrap()
+                .positions
+        })
+        .collect();
+    (m, s, batches)
+}
+
+/// Index in the open segment of the batch holding `p`.
+fn batch_holding(m: &Model, p: Position) -> usize {
+    let f = m.disk.active.unwrap();
+    m.disk.files[&f]
+        .batches
+        .iter()
+        .position(|b| b.iter().any(|e| e.position == p))
+        .unwrap()
+}
+
+/// Takes and confirms deliveries of consumer `c` up to `upto`.
+fn confirm_upto(m: &mut Model, c: ConsumerId, upto: Position) {
+    for d in m.poll(c, 100).unwrap() {
+        if d.position <= upto {
+            m.confirm(c, d.position).unwrap();
+        }
+    }
+}
+
+/// Asserts what consumer `c` receives in session `session` after a lost
+/// range: the kept facts above `cursor`, none in the range, then `resync`.
+fn assert_resumed(m: &Model, c: ConsumerId, session: u32, cursor: Position, kept: &[Position]) {
+    let stream = session_stream(m, c, session);
+    let (last, facts) = stream.split_last().unwrap();
+    let got: Vec<Position> = facts.iter().map(|d| d.fact().unwrap().position).collect();
+    let want: Vec<Position> = kept.iter().copied().filter(|p| *p > cursor).collect();
+    assert_eq!(got, want, "consumer {}", c.0);
+    assert!(last.resync().is_some(), "consumer {} ends with resync", c.0);
+}
+
+/// Row 11a: "Corrupt block inside the open segment, or below an old boot's
+/// mark after a power loss: later complete batches kept; range recorded as
+/// lost, `data_lost`; positions not reused; `resync` for cursors below it."
+/// Same boot: the second of four batches of the open segment, below the
+/// mark, is damaged while the engine is down. Recovery keeps the later
+/// batches, records the range from the position after the first batch to the
+/// position before the third, reports `data_lost` without going read-only,
+/// and continues above the last batch. A consumer whose cursor is below the
+/// range and one whose cursor is inside it receive the kept facts after their
+/// cursor, never a lost position, then `resync`. The report stays after
+/// another restart, read from the manifest (pins the model's choice for
+/// Q-34 (c)).
+#[test]
+fn row_11a_corrupt_block_inside_the_open_segment() {
+    let (mut m, s, b) = open_segment_model();
+    let (below, inside) = (ConsumerId(1), ConsumerId(2));
+    let below_cursor = b[0][1];
+    let inside_cursor = b[1][0];
+    confirm_upto(&mut m, below, below_cursor);
+    confirm_upto(&mut m, inside, inside_cursor);
+    m.crash();
+    let damaged = batch_holding(&m, b[1][0]);
+    m.corrupt_open_batch(damaged).unwrap();
+    m.restart();
+    let lost = (b[1][0], b[1][1]);
+    assert_eq!(m.disk.lost_ranges(), vec![lost]);
+    let kept: Vec<Position> = [&b[0], &b[2], &b[3]]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+    let facts: Vec<Position> = m.facts().unwrap().iter().map(|f| f.position).collect();
+    assert_eq!(facts, kept, "later complete batches kept");
+    let h = m.health();
+    assert_eq!(h.level, Level::Degraded);
+    assert!(h.reasons.contains(&Reason::DataLost(lost.0, lost.1)));
+    assert!(!m.is_read_only());
+    m.drain().unwrap();
+    assert_resumed(&m, below, 2, below_cursor, &kept);
+    assert_resumed(&m, inside, 2, inside_cursor, &kept);
+    let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
+    assert_eq!(next, b[3][1].next());
+    m.restart();
+    assert!(
+        m.health()
+            .reasons
+            .contains(&Reason::DataLost(lost.0, lost.1))
+    );
+    assert_eq!(m.disk.lost_ranges(), vec![lost], "recorded once");
+}
+
+/// Row 11a after a power loss: the last batch below the old boot's mark is
+/// damaged, with no complete batch after it, so the range runs to the mark's
+/// last position (§3 Recovery rule 2), and new positions continue above it:
+/// treated as a torn tail (rule 3), the range would be truncated and its
+/// positions issued again. A consumer whose cursor is below it receives
+/// `resync`, and no lost position.
+#[test]
+fn row_11a_corrupt_block_below_an_old_boots_mark() {
+    let (mut m, s, b) = open_segment_model();
+    let c = ConsumerId(1);
+    confirm_upto(&mut m, c, b[2][1]);
+    let mark = m.disk.mark.unwrap();
+    assert_eq!(mark.last, b[3][1]);
+    m.power_loss();
+    let damaged = batch_holding(&m, b[3][0]);
+    m.corrupt_open_batch(damaged).unwrap();
+    m.restart();
+    assert_ne!(m.disk.mark.unwrap().boot, mark.boot, "a new boot");
+    assert_eq!(m.disk.lost_ranges(), vec![(b[3][0], mark.last)]);
+    assert!(
+        m.health()
+            .reasons
+            .contains(&Reason::DataLost(b[3][0], mark.last))
+    );
+    m.drain().unwrap();
+    let kept: Vec<Position> = b[..3].iter().flatten().copied().collect();
+    assert_resumed(&m, c, 2, b[2][1], &kept);
+    let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
+    assert_eq!(next, mark.last.next(), "positions not reused");
+    // Across a later restart too.
+    m.crash();
+    m.restart();
+    let after = m
+        .ingest(vec![num(s, T0 + 2 * MINUTE, 4.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(after, next.next());
+}
+
+/// Row 11a in the model: damage to a batch holding a definition is refused,
+/// since what a lost registry, routing or zone entry means is open (Q-33);
+/// so is damage while the engine runs (the model finds corruption of the open
+/// segment at recovery only) or past the mark.
+#[test]
+fn row_11a_fault_injection_limits() {
+    let (mut m, _, b) = open_segment_model();
+    assert!(
+        matches!(m.corrupt_open_batch(1), Err(Error::BadFault(_))),
+        "engine up"
+    );
+    m.crash();
+    let definition = batch_holding(&m, Position::new(0, 1));
+    assert!(matches!(
+        m.corrupt_open_batch(definition),
+        Err(Error::BadFault(_))
+    ));
+    let past_mark = batch_holding(&m, b[3][0]) + 1;
+    assert!(matches!(
+        m.corrupt_open_batch(past_mark),
+        Err(Error::BadFault(_))
+    ));
+    m.restart();
+    assert!(m.disk.lost_ranges().is_empty());
+}
+
 /// Row 12: "Sync returns an error: read-only, fatal; a restart on the same boot
 /// truncates to the durable mark."
 #[test]
