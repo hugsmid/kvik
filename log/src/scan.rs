@@ -1,9 +1,10 @@
 //! Reading a log segment: complete batches, invalid regions, the tail and the seal (`format.md` A.2, A.4, A.9).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::batch::{
-    Batch, BatchFault, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, read_batch,
+    Batch, BatchFault, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, framing_holds,
+    read_batch,
 };
 use crate::block::{BLOCK_HEADER_LEN, block_type, peek_header, read_block};
 use crate::body::{
@@ -434,10 +435,12 @@ fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, Format
 
 /// Steps forward 8 bytes at a time from an invalid region at `start` and returns the first complete batch (A.2).
 ///
-/// Each chain of consecutive checksum-valid blocks is walked once: the commit block (or fault) it ends in is
-/// remembered for every block start on it, and a candidate offset `o` is read in full only when that commit's
-/// `batch_bytes` is the distance from `o`. So the blocks read grow linearly with the region, also when it holds a
-/// long chain of block images without a commit (for example inside text values).
+/// Candidates are judged on block headers first. Each chain of consecutive block headers is walked once, without
+/// checksumming any body: the commit block it ends in is remembered for every block start on it, and a block too
+/// long for a batch ends the chain. A candidate `o` goes further only when that commit's `batch_bytes` is the
+/// distance from `o`; then its framing and `batch_crc32c` are checked on headers ([`framing_holds`]); only a
+/// candidate that passes, a batch image for this store, file and offset, is read and checksummed in full (at most
+/// 8 MiB). So block reads and bytes hashed grow linearly with the region, plus 8 MiB per such batch image.
 fn resync<'a>(
     bytes: &'a [u8],
     id: &SegmentIdentity,
@@ -445,9 +448,15 @@ fn resync<'a>(
     limit: u64,
     min_first: u64,
 ) -> Result<Option<Batch<'a>>, FormatError> {
-    let mut chains: HashMap<u64, Option<(u64, Commit)>> = HashMap::new();
+    let mut chains: BTreeMap<u64, Option<ChainEnd>> = BTreeMap::new();
     let mut o = start + 8;
+    let mut pruned = o;
     while o + (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
+        // Block starts below `o` are never asked about again.
+        if o - pruned >= 1 << 16 {
+            chains = chains.split_off(&o);
+            pruned = o;
+        }
         // A zero word cannot start a block header (type 0 is never valid), and a header that fails its checksum
         // cannot start a batch: both are passed without reading further.
         if slice(bytes, o, 8).is_none_or(|w| u64_at(w, 0) == 0)
@@ -456,9 +465,9 @@ fn resync<'a>(
             o += 8;
             continue;
         }
-        let ends_here = chain_end(bytes, o, limit, &mut chains)
-            .is_some_and(|(at, c)| at > o && c.batch_bytes == at - o && at - o <= MAX_BATCH_DATA);
-        if ends_here {
+        let candidate = chain_end(bytes, o, limit, &mut chains)
+            .is_some_and(|c| c.at > o && c.batch_bytes == c.at - o && c.at - o <= MAX_BATCH_DATA);
+        if candidate && framing_holds(bytes, id, o, limit) {
             match read_batch(bytes, id, o, limit, min_first, Refusal::IfBatchVerifies) {
                 BatchRead::Complete(b) => return Ok(Some(b)),
                 BatchRead::Refused(e) => return Err(e),
@@ -470,28 +479,45 @@ fn resync<'a>(
     Ok(None)
 }
 
-/// The commit block that the chain of checksum-valid blocks from `o` ends in, with its offset, or `None` if the
-/// chain ends in anything else. Every block start walked is remembered in `chains`.
+/// Where a chain of block headers ends in a commit block: its offset and the `batch_bytes` it claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChainEnd {
+    at: u64,
+    batch_bytes: u64,
+}
+
+/// The commit block that the chain of block headers from `o` ends in, or `None` if the chain ends in anything
+/// else: a header that is not valid, a seal block, or a block too long for a batch. Bodies are not read, except
+/// the `batch_bytes` field of a commit body. Every block start walked, the failing one included, is remembered.
 fn chain_end(
     bytes: &[u8],
     o: u64,
     limit: u64,
-    chains: &mut HashMap<u64, Option<(u64, Commit)>>,
-) -> Option<(u64, Commit)> {
+    chains: &mut BTreeMap<u64, Option<ChainEnd>>,
+) -> Option<ChainEnd> {
     let mut walked = Vec::new();
     let mut p = o;
     let end = loop {
         if let Some(known) = chains.get(&p) {
             break *known;
         }
-        let Ok(b) = read_block(bytes, p, limit) else {
+        walked.push(p);
+        let Some(h) = peek_header(bytes, p, limit) else {
             break None;
         };
-        walked.push(p);
-        match b.header.block_type {
-            block_type::COMMIT => break Commit::decode(b.body).ok().map(|c| (p, c)),
-            block_type::SEGMENT_INDEX | block_type::TRAILER => break None,
-            _ => p = b.next_offset(),
+        match h.block_type {
+            block_type::COMMIT if h.body_len as usize == COMMIT_LEN => {
+                let field = p + (BLOCK_HEADER_LEN + 32) as u64;
+                break slice(bytes, field, 8)
+                    .filter(|_| p + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit)
+                    .map(|b| ChainEnd {
+                        at: p,
+                        batch_bytes: u64_at(b, 0),
+                    });
+            }
+            block_type::COMMIT | block_type::SEGMENT_INDEX | block_type::TRAILER => break None,
+            _ if h.block_len() > MAX_BATCH_DATA => break None,
+            _ => p += h.block_len(),
         }
     };
     for w in walked {
@@ -604,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn resynchronising_over_a_chain_of_block_images_is_linear() {
+    fn resynchronising_over_a_chain_of_block_images_takes_linear_block_reads() {
         for n in [1_000, 2_000, 4_000, 16_000] {
             let (bytes, id) = chain(n);
             BLOCK_READS.with(|c| c.set(0));
@@ -612,9 +638,47 @@ mod tests {
             let reads = BLOCK_READS.with(|c| c.get());
             assert!(r.batches.is_empty());
             assert!(matches!(r.tail, Some(Tail::Torn { start: 64, .. })));
+            // The boundary read, the resynchronisation and the tail's commit search each read every header a
+            // bounded number of times.
             assert!(
-                reads <= 3 * n as u64 + 64,
+                reads <= 8 * n as u64 + 64,
                 "{reads} block reads for {n} blocks"
+            );
+        }
+    }
+
+    /// Back-to-back checksum-valid block headers that each claim a 1 MiB body with a wrong checksum.
+    fn long_claims(headers_len: usize) -> (Vec<u8>, SegmentIdentity) {
+        let (mut b, id) = chain(0);
+        b.truncate(HEADER_LEN);
+        let claim = crate::block::BlockHeader {
+            block_type: 0x50,
+            flags: FLAG_SKIPPABLE,
+            body_len: 1 << 20,
+            body_crc32c: 1,
+        };
+        while b.len() < HEADER_LEN + headers_len {
+            b.extend_from_slice(&claim.encode());
+        }
+        b.resize(b.len() + (1 << 20) + 64, 0);
+        (b, id)
+    }
+
+    #[test]
+    fn resynchronising_over_long_claimed_bodies_hashes_linear_bytes() {
+        // Only the first claim, read at a block boundary, has its body checksummed; resynchronisation judges the
+        // rest on their headers.
+        for headers_len in [128 << 10, 512 << 10, 1 << 20] {
+            let (bytes, id) = long_claims(headers_len);
+            crate::crc::BYTES_HASHED.with(|c| c.set(0));
+            let r = scan(&bytes, &id, ScanLimit::End).unwrap();
+            let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
+            assert!(r.batches.is_empty());
+            // A bounded number of 12-byte header checksums per 16-byte header, plus the one body read in full.
+            let bound = 6 * headers_len as u64 + (2 << 20);
+            assert!(
+                hashed <= bound,
+                "{hashed} bytes hashed for {headers_len} bytes of headers"
             );
         }
     }

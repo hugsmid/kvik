@@ -4,7 +4,8 @@
 //! their sequences and computes the commit block, and on reading decides whether a batch is complete.
 
 use crate::block::{
-    BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block, read_block,
+    BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block, peek_header,
+    peek_raw, read_block,
 };
 use crate::body::{COMMIT_LEN, Commit, ContentFault, DataPrefix};
 use crate::crc::Crc32c;
@@ -115,6 +116,22 @@ pub(crate) fn read_batch<'a>(
     let mut unknown_critical = None;
     let mut pos = o;
     let commit_block = loop {
+        // Sizes are judged on the header, before the body is checksummed: a data block that would take the batch
+        // past 8 MiB, or a commit block of another length, ends the batch here.
+        if let Some(h) = peek_header(bytes, pos, limit) {
+            let too_long = match h.block_type {
+                block_type::COMMIT => h.body_len as usize != COMMIT_LEN,
+                _ => pos - o + h.block_len() > MAX_BATCH_DATA,
+            };
+            if too_long {
+                let fault = if h.block_type == block_type::COMMIT {
+                    BatchFault::Content
+                } else {
+                    BatchFault::Disagreement
+                };
+                return incomplete(fault);
+            }
+        }
         let b = match read_block(bytes, pos, limit) {
             Ok(b) => b,
             Err(f) => return incomplete(BatchFault::Block(f)),
@@ -146,10 +163,6 @@ pub(crate) fn read_batch<'a>(
         crc.update(&b.header_bytes);
         blocks.push(DataBlock { block: b, prefix });
         pos = b.next_offset();
-        // A batch holds at most 8 MiB of data blocks (A, common rules: sizes).
-        if pos - o > MAX_BATCH_DATA {
-            return incomplete(BatchFault::Disagreement);
-        }
     };
     let Ok(commit) = Commit::decode(commit_block.body) else {
         return incomplete(BatchFault::Content);
@@ -165,7 +178,9 @@ pub(crate) fn read_batch<'a>(
     if let Some(refused) = unknown_critical {
         return BatchRead::Refused(refused);
     }
-    // Sequences are counted from the commit's first sequence; a skipped block takes none (Q-105 (b)).
+    // Sequences are counted from the commit's first sequence; a skipped block takes none (Q-105 (b)). A reader
+    // accepts any gap above the last kept sequence (A.4 Gaps). That a batch starts higher only after an invalid
+    // region or with a recovery entry (A.7) is checked by the writer's recovery, roadmap 4.5 (Q-105 (d)).
     if commit.first_sequence < min_first.max(1) {
         return incomplete(BatchFault::Disagreement);
     }
@@ -188,6 +203,51 @@ pub(crate) fn read_batch<'a>(
         blocks,
         commit,
     })
+}
+
+/// Whether the blocks from `o` frame a batch, judged on block headers and the 48-byte commit body only: the commit
+/// block is reached within 8 MiB of data blocks, and its `block_count`, `batch_bytes`, generation and
+/// `batch_crc32c` hold. No data block body is checksummed, so this costs O(blocks); a candidate that passes it is a
+/// batch image for this store, file and offset, and only then is read in full.
+pub(crate) fn framing_holds(bytes: &[u8], id: &SegmentIdentity, o: u64, limit: u64) -> bool {
+    let mut crc = Crc32c::new();
+    crc.update(&id.store_id);
+    crc.update(&id.file_id.to_le_bytes());
+    crc.update(&o.to_le_bytes());
+    let mut pos = o;
+    let mut count: u64 = 0;
+    loop {
+        let Some((h, raw)) = peek_raw(bytes, pos, limit) else {
+            return false;
+        };
+        match h.block_type {
+            block_type::COMMIT => {
+                if h.body_len as usize != COMMIT_LEN {
+                    return false;
+                }
+                let Ok(b) = read_block(bytes, pos, limit) else {
+                    return false;
+                };
+                let Ok(c) = Commit::decode(b.body) else {
+                    return false;
+                };
+                return count >= 1
+                    && u64::from(c.block_count) == count
+                    && c.batch_bytes == pos - o
+                    && c.generation == id.generation
+                    && c.batch_crc32c == crc.finish();
+            }
+            block_type::SEGMENT_INDEX | block_type::TRAILER => return false,
+            _ => {
+                if pos - o + h.block_len() > MAX_BATCH_DATA {
+                    return false;
+                }
+                crc.update(&raw);
+                count += 1;
+                pos += h.block_len();
+            }
+        }
+    }
 }
 
 /// Builds the bytes of one batch from data block bodies.

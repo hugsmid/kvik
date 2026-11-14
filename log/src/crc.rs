@@ -8,7 +8,15 @@ static CASTAGNOLI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCS
 
 /// CRC32C of `bytes`.
 pub fn crc32c(bytes: &[u8]) -> u32 {
+    #[cfg(test)]
+    BYTES_HASHED.with(|c| c.set(c.get() + bytes.len() as u64));
     CASTAGNOLI.checksum(bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes checksummed on this thread, for tests of how much a scan hashes.
+    pub(crate) static BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// An incremental CRC32C over several slices.
@@ -20,6 +28,8 @@ impl Crc32c {
     }
 
     pub(crate) fn update(&mut self, bytes: &[u8]) {
+        #[cfg(test)]
+        BYTES_HASHED.with(|c| c.set(c.get() + bytes.len() as u64));
         self.0.update(bytes);
     }
 

@@ -146,7 +146,7 @@ pub(crate) enum BlockFault {
 
 #[cfg(test)]
 thread_local! {
-    /// Calls of [`read_block`] on this thread, for tests of how much a scan reads.
+    /// Blocks and block headers read on this thread, for tests of how much a scan reads.
     pub(crate) static BLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -169,8 +169,21 @@ fn header_bytes(
 /// The header of the block at `offset`, without reading or checking its body: a cheap test before
 /// [`read_block`]. Type 0 is not a header.
 pub(crate) fn peek_header(bytes: &[u8], offset: u64, limit: u64) -> Option<BlockHeader> {
+    peek_raw(bytes, offset, limit).map(|(h, _)| h)
+}
+
+/// [`peek_header`] with the 16 header bytes as read.
+pub(crate) fn peek_raw(
+    bytes: &[u8],
+    offset: u64,
+    limit: u64,
+) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
+    #[cfg(test)]
+    BLOCK_READS.with(|c| c.set(c.get() + 1));
     let raw = header_bytes(bytes, offset, limit).ok()?;
-    BlockHeader::decode(raw).filter(|h| h.block_type != 0)
+    BlockHeader::decode(raw)
+        .filter(|h| h.block_type != 0)
+        .map(|h| (h, *raw))
 }
 
 /// Reads the block at `offset`, accepting it only if it lies wholly below `limit`.
