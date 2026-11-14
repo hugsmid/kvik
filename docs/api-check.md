@@ -10,7 +10,7 @@ cross-referenced, not restated. Format problems are in [`format-check.md`](forma
 Gate 3.3 resolved every blocking item in [`api.md`](api.md); each item below ends with a line saying where it was
 resolved, or the roadmap item it was deferred to. Of the cross-referenced items: F-2, F-6 and F-11 are resolved in
 `api.md` (Errors, Writing, Reader processes, Configuration, Health); Q-34 (c), Q-47 and Q-48 were settled before the
-gate (crash recovery); Q-46 stays with 4.5 and 4.6; the rest stay with the items named in the table below.
+gate (crash recovery); Q-46 stays with 4.5 and 4.6 (moved to 4.6 alone at roadmap 4.5); the rest stay with the items named in the table below.
 
 ## Severity
 - **Blocks:** the document contradicts the specification, or a type or rule needed by a section 4 item is absent.
@@ -36,7 +36,7 @@ single-writer and read-only handle split; and the `BootId` seam.
 | F-6 | 4.4, 4.6 | Blocks (outcome unknown, AC-4, AC-10); before 4.6 (reader lease and boot identity, AC-11) | |
 | F-11 | 4.1, 4.5 | Before 4.1 | `mark_sync_interval` key (AC-7); `possible_loss` reason (AC-13) |
 | Q-34 (c), Q-48 | 4.5 | Before 4.5 | Whether loss reports are latched; `store.lost_ranges()` (AC-13) |
-| Q-46 | 4.5 | Before 4.6 | `reader.epoch()` and a truncated-tail check (AC-11) |
+| Q-46 | 4.5 (moved to 4.6) | Before 4.6 | `reader.epoch()` and a truncated-tail check (AC-11) |
 | Q-47 | 4.5 | Can wait (5.3) | `Resync.forget_from` (AC-22); settled by 4.5, built in 5.3 |
 | F-10, F-12, F-13, F-14, F-17 | 5.1 | Can wait | `SeriesSpec`, `Reading` and refusal additions (AC-15, AC-16) |
 | F-3, F-16, Q-81 | 5.4, 7.3 | Can wait | Window and calendar results (AC-17, AC-18) |

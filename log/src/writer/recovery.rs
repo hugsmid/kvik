@@ -537,8 +537,12 @@ fn plan(
             p.last_sequence = 1 + k.max(manifest_highest);
         }
         // Q-87: with no readable mark of another boot, the last complete batch is written again before the sync; so
-        // is an adopted entry, whose own sync may have failed (Q-117).
-        if state != MarkState::Readable || p.adopt.is_some() {
+        // is a recovery entry the mark does not cover, adopted or not, whose own sync may have failed (Q-117).
+        let uncovered_entry = last_kept.is_some_and(|(i, j)| {
+            let b = &segs[i].batches[j];
+            b.recovery().is_some() && mark_slot.is_none_or(|m| m.last_sequence < b.first)
+        });
+        if state != MarkState::Readable || uncovered_entry {
             p.rewrite_last = last_kept;
         }
     } else {

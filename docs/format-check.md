@@ -12,7 +12,7 @@ item below ends with a line saying where it was resolved, or the roadmap item it
 are settled. Of the cross-referenced items: F-1, F-4, F-5, F-7, F-9, F-11, F-13, F-14, F-15 and F-17 are resolved in
 `format.md` A.2 and A.4–A.10; F-16 for the site-zone and tzdata entries (A.6), the calendar file deferred to 7.3;
 F-12's field ids are fixed (A.6), the interface deferred to 5.1; Q-52 (a) and (c) are settled (A.10, A.14), (b)
-deferred to 4.5; Q-76 and Q-48 were settled before the gate; Q-33 stays with 4.5; Q-61, Q-64, Q-70 and Q-71 stay
+deferred to 4.5; Q-76 and Q-48 were settled before the gate; Q-33 stays with 4.5 (moved to 5.1 at roadmap 4.5); Q-61, Q-64, Q-70 and Q-71 stay
 with their items.
 
 ## Severity
@@ -53,7 +53,7 @@ ids (7 and 8).
 | F-7 | 4.2 | Before 4.2 | First sequence at least 1, last sequence 0 means empty |
 | F-11 | 4.4 | Before 4.4 | A.10 says the mark is not synced; §3 syncs it on a timer |
 | F-15 | 4.5 | Before 4.5 | A segment copy that omits a lost range |
-| Q-33, Q-48 | 4.5 | Before 4.5 | Lost-range and truncated-tail record fields; settled by 4.5 |
+| Q-33, Q-48 | 4.5 (Q-33 moved to 5.1) | Before 4.5 | Lost-range and truncated-tail record fields; settled by 4.5 |
 | F-13, F-14 | 4.3 | Blocks | Definition fields (timing, interval length and phase) with no ids (FC-14) |
 | F-16 | 4.3, 7.3 | Blocks (site-zone entry, FC-15); can wait (calendar file, 7.3) | |
 | F-12 | 5.1 | Can wait | Retention class in a parameter change (FC-14) |

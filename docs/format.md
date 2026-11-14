@@ -403,7 +403,8 @@ exists; a new file is created only when none exists.
   state 3.
 - **No usable mark.** With the mark missing, unreadable or stale, recovery cannot rule out the same boot, so it
   writes the last complete batch again before its first sync (`spec.md` §3 Recovery rule 3), with the segment's
-  header when that batch is the segment's first.
+  header when that batch is the segment's first. It does the same when the last complete batch is a recovery entry
+  that the mark does not cover, whatever the mark, as the start that wrote it may have failed its sync (Q-117).
 - Readers of an unsealed segment never read past `offset`; they open the mark by path for each read of it. Sealed
   segments are read whole.
 - Recovery follows `spec.md` §3; the order of a start (§3) says when the mark is written and synced.

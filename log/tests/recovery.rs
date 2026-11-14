@@ -794,6 +794,9 @@ enum Crash {
     Remount(u64),
     /// The process is killed and the mark file deleted, or damaged in both slots (same boot).
     LoseMark { delete: bool },
+    /// A power loss while the segment created ahead was being taken into use: its header reached the disk, its
+    /// first batch only as a torn tail.
+    TornRoll(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -833,6 +836,7 @@ fn cycle() -> impl Strategy<Value = Cycle> {
         3 => any::<u64>().prop_map(Crash::Power),
         1 => any::<u64>().prop_map(Crash::Remount),
         1 => any::<bool>().prop_map(|delete| Crash::LoseMark { delete }),
+        1 => any::<u64>().prop_map(Crash::TornRoll),
     ];
     (
         prop::collection::vec((1..12usize, prop::bool::weighted(0.15)), 0..12),
@@ -909,6 +913,27 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
             }
             Crash::Power(seed) | Crash::Remount(seed) => {
                 r.power_loss(Some(seed));
+                None
+            }
+            Crash::TornRoll(seed) => {
+                r.w = None;
+                r.fs.power_loss_partial(seed);
+                let next = r.positions().keys().last().map_or(1, |p| p + 1);
+                let ahead = r.fs.paths().into_iter().rev().find(|p| {
+                    p.to_string_lossy().ends_with(".open")
+                        && r.fs.read(p).is_some_and(|b| {
+                            b.len() as u64 == r.cfg.segment_size && FileHeaderOf::base(&b) == 0
+                        })
+                });
+                if let Some(p) = ahead {
+                    let mut h =
+                        kvik_log::header::FileHeader::decode(&r.fs.read(&p).unwrap()).unwrap();
+                    h.base_sequence = next;
+                    r.fs.poke(&p, 0, &h.encode());
+                    r.fs.poke(&p, 400, &[0x5a; 64]);
+                }
+                r.fs.restart();
+                r.boot = r.boot.wrapping_add(1).max(1);
                 None
             }
             Crash::LoseMark { delete } => {
@@ -1467,4 +1492,39 @@ fn unused_segments_are_kept_only_with_a_valid_header_the_configured_size_and_zer
         r.fs.read(&s5).is_some(),
         "the highest valid one is kept as created ahead"
     );
+}
+
+#[test]
+fn an_unadopted_entry_that_is_its_segments_first_batch_is_written_again() {
+    // Q-117 for an entry that is not adopted: the last segment in use holds only a torn tail; the start writes its
+    // entry at the header's end and the entry's sync fails, leaving the tail after it. The next start on the same
+    // boot cannot adopt the entry (bytes follow it) but writes it again, with the header, before its sync.
+    let mut r = rig_with_batches(1, cfg());
+    r.shutdown().unwrap();
+    r.w = None;
+    // Segment 2, created ahead, is taken into use by its header and holds a torn tail.
+    let seg2 = log_path("00000000-0000000000000002.open");
+    let mut h = kvik_log::header::FileHeader::decode(&r.fs.read(&seg2).unwrap()).unwrap();
+    h.base_sequence = 2;
+    r.fs.poke(&seg2, 0, &h.encode());
+    r.fs.poke(&seg2, 400, &[0x5a; 64]);
+    r.power_loss(None);
+    // Step 3 syncs segments 1 and 2; the entry's own sync is the next.
+    r.fs.fail_nth(FaultOp::Sync, ".open", 2, io::ErrorKind::Other);
+    assert!(r.open().is_none());
+    r.kill();
+    let rep = r.open().unwrap();
+    assert!(!rep.entry.as_ref().unwrap().adopted);
+    assert!(rep.rewrote_last_batch);
+    r.submit(vec![fact(2, 0)]);
+    r.drain();
+    r.shutdown().unwrap();
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    assert!(
+        rep.losses.iter().all(|l| l.kind == LossKind::PossibleLoss),
+        "{:?}",
+        rep.losses
+    );
+    r.check_started();
 }
