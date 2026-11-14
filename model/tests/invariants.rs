@@ -118,7 +118,7 @@ proptest! {
             let got: Vec<(Position, bool)> = r.observed.get(&d.id).map(|o| o.iter().map(|x| (x.position, x.replayed)).collect()).unwrap_or_default();
             prop_assert_eq!(
                 r.signals[&d.id].clone(),
-                vec![Signal::GenerationChanged { cursor: kept.unwrap_or(Position::ORIGIN), restored_end: end }, Signal::ResyncDue]
+                vec![Signal::GenerationChanged { cursor: kept, restored_end: end }, Signal::ResyncDue]
             );
             let want: Vec<(Position, bool)> = match kept {
                 Some(cursor) if cursor <= end => r

@@ -403,6 +403,9 @@ pub enum Level {
 pub enum Reason {
     /// A write or sync failed.
     SyncFailed,
+    /// A higher generation is claimed: this writer stopped uploading and is
+    /// read-only (§8 Generations).
+    Superseded,
     /// A file is quarantined.
     Quarantined(FileId),
     /// Below the low mark.
@@ -545,6 +548,9 @@ pub struct Disk {
     pub restored_end: Option<Position>,
     /// A restore drill: read-only, and it claims no generation (§8).
     pub drill: bool,
+    /// This writer found a higher generation claimed: it stopped uploading
+    /// and stays read-only across restarts (§8 Generations).
+    pub superseded: bool,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
     pub other_bytes: u64,
     /// Next file id.
@@ -554,11 +560,13 @@ pub struct Disk {
 /// A consumer event that is not a fact delivery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Signal {
-    /// The store was restored and the consumer's cursor lies beyond what the
-    /// restore brought back (§8 Restore step 2).
+    /// The store was restored and started a new generation; every consumer
+    /// receives it, after any catch-up to the restored end (§8 Restore step
+    /// 2).
     GenerationChanged {
-        /// The consumer's cursor before the restore.
-        cursor: Position,
+        /// The cursor the consumer kept from before the restore; `None` for a
+        /// consumer without one, which is treated as beyond the restored end.
+        cursor: Option<Position>,
         /// The last restored position.
         restored_end: Position,
     },
@@ -821,7 +829,11 @@ struct Volatile {
     queue: VecDeque<(Reading, bool)>,
     next_position: Position,
     consumers: Vec<ConsumerRt>,
+    /// Read-only for any cause: a failed write or sync, a drill, or a higher
+    /// generation claimed.
     read_only: bool,
+    /// A write or sync failed (§3), as opposed to read-only by design.
+    sync_failed: bool,
     skew_run: BTreeMap<SeriesId, u32>,
 }
 
@@ -922,7 +934,8 @@ impl Model {
         self.crash();
     }
 
-    /// Whether the engine is up but read-only after a failed write or sync.
+    /// Whether the engine is up but read-only: after a failed write or sync
+    /// (§3), as a restore drill, or superseded by a higher generation (§8).
     pub fn is_read_only(&self) -> bool {
         self.vol.as_ref().is_some_and(|v| v.read_only)
     }
@@ -938,9 +951,9 @@ impl Model {
     pub fn restart_with(&mut self, recovery_sync_fails: bool) {
         self.vol = None;
         // 1. The active segment past the durable mark (§3 Recovery).
-        let read_only = self.recover_tail(recovery_sync_fails);
+        let sync_failed = self.recover_tail(recovery_sync_fails);
         // Read-only after a failed recovery sync: nothing more is written.
-        if !read_only {
+        if !sync_failed {
             self.clean_up_files();
         }
         // 4. Rebuild volatile state from every readable entry.
@@ -1011,7 +1024,8 @@ impl Model {
             queue: VecDeque::new(),
             next_position,
             consumers,
-            read_only: read_only || self.disk.drill,
+            read_only: sync_failed || self.disk.drill || self.disk.superseded,
+            sync_failed,
             skew_run: BTreeMap::new(),
         });
     }
@@ -1416,7 +1430,9 @@ impl Model {
             }
             Some(Fault::SyncError(outcome)) => {
                 self.disk.tail_fate = Some(outcome);
-                self.vol_mut()?.read_only = true;
+                let v = self.vol_mut()?;
+                v.read_only = true;
+                v.sync_failed = true;
                 report.positions.clear();
                 return Err(Error::SyncFailed);
             }
@@ -1862,8 +1878,12 @@ impl Model {
             level = level.max(l);
             reasons.push(r);
         };
-        if self.vol.as_ref().is_some_and(|v| v.read_only) {
+        // A drill is read-only by design and raises nothing of its own.
+        if self.vol.as_ref().is_some_and(|v| v.sync_failed) {
             raise(Level::Fatal, Reason::SyncFailed, &mut reasons);
+        }
+        if self.disk.superseded {
+            raise(Level::Fatal, Reason::Superseded, &mut reasons);
         }
         for f in &self.disk.quarantined {
             raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
@@ -2017,11 +2037,11 @@ impl Model {
 
     /// Uploads queued sealed files to the bucket, verifying hashes (§8).
     pub fn upload(&mut self) -> usize {
-        if !self.disk.bucket.reachable || self.disk.drill {
+        if !self.disk.bucket.reachable || self.disk.drill || self.disk.superseded {
             return 0;
         }
         // A writer that finds a higher generation claimed stops uploading and
-        // becomes read-only (§8 Generations).
+        // becomes read-only (§8 Generations), durably, so a restart keeps it.
         if self
             .disk
             .bucket
@@ -2029,6 +2049,7 @@ impl Model {
             .iter()
             .any(|g| *g > self.disk.generation)
         {
+            self.disk.superseded = true;
             if let Some(v) = self.vol.as_mut() {
                 v.read_only = true;
             }
@@ -2227,7 +2248,7 @@ impl Model {
                 .insert(id, cursor.filter(|c| *c <= end).unwrap_or(end));
             m.signals.entry(id).or_default().extend([
                 Signal::GenerationChanged {
-                    cursor: cursor.unwrap_or(Position::ORIGIN),
+                    cursor,
                     restored_end: end,
                 },
                 Signal::ResyncDue,
@@ -2292,13 +2313,15 @@ fn build_trees(
 }
 
 /// The last position before the first gap in sorted, distinct positions: the
-/// log starts at sequence 1 of its first generation, a gap is a missing
-/// sequence within a generation, and a later generation starts at sequence 1
-/// (§8 Restore step 1). `(g, 0)` when even the first position is missing.
+/// log starts at `0:1`, as every store begins in generation 0, a gap is a
+/// missing sequence within a generation, and a later generation starts at
+/// sequence 1 after at least one position (§8 Restore step 1).
+/// [`Position::ORIGIN`] when `0:1` is missing or nothing was restored.
 fn restored_end(sorted: &[Position]) -> Position {
-    let mut end = Position::new(sorted[0].generation, 0);
+    let mut end = Position::ORIGIN;
     for p in sorted {
-        let follows = *p == end.next() || (p.generation > end.generation && p.sequence == 1);
+        let follows = *p == end.next()
+            || (end.sequence > 0 && p.generation > end.generation && p.sequence == 1);
         if !follows {
             break;
         }

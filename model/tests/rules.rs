@@ -681,7 +681,7 @@ fn s8_cursor_at_or_below_restored_end_continues() {
         r.signals[&c],
         vec![
             Signal::GenerationChanged {
-                cursor,
+                cursor: Some(cursor),
                 restored_end: Position::new(0, 5)
             },
             Signal::ResyncDue
@@ -689,8 +689,9 @@ fn s8_cursor_at_or_below_restored_end_continues() {
     );
 }
 
-/// §8 Restore step 2: cursor files are not backed up; a consumer without a
-/// kept cursor counts as beyond the restored end and is not replayed.
+/// §8 Restore step 2: "A consumer without a cursor is treated as beyond the
+/// restored end"; cursor files are not backed up. It is not replayed, and its
+/// `generation_changed` says it kept no cursor.
 #[test]
 fn s8_missing_cursor_counts_as_beyond_restored_end() {
     let (mut m, _) = backed_up_model();
@@ -711,7 +712,7 @@ fn s8_missing_cursor_counts_as_beyond_restored_end() {
         r.signals[&c],
         vec![
             Signal::GenerationChanged {
-                cursor: Position::ORIGIN,
+                cursor: None,
                 restored_end: Position::new(0, 5)
             },
             Signal::ResyncDue
@@ -742,7 +743,7 @@ fn s8_cursor_beyond_restored_end_generation_changed() {
         r.signals[&c],
         vec![
             Signal::GenerationChanged {
-                cursor,
+                cursor: Some(cursor),
                 restored_end: Position::new(0, 5)
             },
             Signal::ResyncDue
@@ -757,4 +758,88 @@ fn s8_cursor_beyond_restored_end_generation_changed() {
         .map(|o| (o.position, o.replayed))
         .collect();
     assert_eq!(got, vec![(Position::new(1, 1), false)]);
+}
+
+/// §8 Generations: "A writer that finds a higher generation claimed stops
+/// uploading and becomes read-only (fatal health, §3)." Read-only survives a
+/// restart, so the superseded writer never accepts ingest again.
+#[test]
+fn s8_superseded_writer_stays_read_only_after_restart() {
+    let (mut m, s) = backed_up_model();
+    let _r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
+    assert_eq!(m.upload(), 0);
+    assert!(m.is_read_only());
+    m.crash();
+    m.restart();
+    assert!(m.is_read_only());
+    assert_eq!(
+        m.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).err(),
+        Some(Error::ReadOnly)
+    );
+    assert_eq!(m.upload(), 0);
+}
+
+/// §8 Generations: "A writer that finds a higher generation claimed stops
+/// uploading and becomes read-only (fatal health, §3)." The health report
+/// names the cause, not a failed sync.
+#[test]
+fn s8_superseded_writer_reports_fatal_superseded() {
+    let (mut m, _) = backed_up_model();
+    let _r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
+    m.upload();
+    let h = m.health();
+    assert_eq!(h.level, Level::Fatal);
+    assert!(h.reasons.contains(&Reason::Superseded));
+    assert!(!h.reasons.contains(&Reason::SyncFailed));
+    m.crash();
+    m.restart();
+    assert!(m.health().reasons.contains(&Reason::Superseded));
+}
+
+/// §8 Restore drill: "A drill restores read-only and claims nothing." Being
+/// read-only by design, a drill reports no health condition of its own.
+#[test]
+fn s8_drill_reports_no_fatal_health() {
+    let (mut m, _) = backed_up_model();
+    let r = Model::restore_with_cursors(
+        m.config.clone(),
+        vec![],
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(r.is_read_only());
+    let h = r.health();
+    assert_eq!(h.level, Level::Ok);
+    assert!(!h.reasons.contains(&Reason::SyncFailed));
+}
+
+/// §8 Restore step 1: "The restored end is the last position before the first
+/// gap in the restored log". Every store begins in generation 0, so with no
+/// generation-0 position restored the log has a gap before its first position
+/// and the restored end is before everything.
+#[test]
+fn s8_restored_end_starts_at_generation_0() {
+    let (mut m, s) = backed_up_model();
+    let mut r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
+    for i in 0..3 {
+        r.ingest(vec![Reading::num(s, T0 + HOUR + i * SECOND, 1.0)])
+            .unwrap(); // 1:1 to 1:3
+    }
+    r.seal_active();
+    r.upload();
+    let mut bucket = r.disk.bucket.clone();
+    bucket
+        .objects
+        .retain(|_, (_, f)| f.entries().all(|e| e.position.generation > 0));
+    assert!(!bucket.objects.is_empty());
+    let r2 = Model::restore_from(r.config.clone(), vec![], &mut bucket, r.wall, false).unwrap();
+    assert_eq!(r2.disk.restored_end, Some(Position::ORIGIN));
+    assert!(r2.facts().unwrap().is_empty());
 }

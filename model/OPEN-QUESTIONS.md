@@ -279,9 +279,10 @@ Generations, Restore drill, Restore steps 1–2, row 28b): a restore claims the 
 claimed or present in the bucket by a create-if-absent marker, taking the next if the marker exists, and starts it at
 sequence 1; a bucket with nothing backed up is refused; the restored end is the last position before the first gap,
 and later positions of older generations are set aside, outside views, trees, the registry and delivery; a consumer
-whose kept cursor is at or below the restored end catches up to it, flagged `replayed`, and every consumer then
-receives `generation_changed` and `resync`; a drill is read-only and claims nothing; a writer that finds a higher
-generation claimed stops uploading and becomes read-only (`tests/rules.rs` `s8_…`, `tests/invariants.rs`
+whose kept cursor is at or below the restored end catches up to it, flagged `replayed` (whether or not its segments
+are local; see the table), and every consumer receives `generation_changed` and `resync`; a drill is read-only,
+claims nothing and raises no health condition of its own; a writer that finds a higher generation claimed stops
+uploading and stays read-only across restarts, with fatal health (`tests/rules.rs` `s8_…`, `tests/invariants.rs`
 `inv01_only_restore_starts_generation`). It does not yet implement:
 
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
@@ -319,5 +320,6 @@ generation claimed stops uploading and becomes read-only (`tests/rules.rs` `s8_�
 | Restore from a checkpoint, step by step | §8 Continuous backup, §8 Restore steps 1–4, row 28: tree checkpoint with registry and latest `t`; queries at ≥ 1 minute flagged `restoring`; detail back-filled and compared with the checkpoint | No checkpoints; restore downloads files (current chunks first, optionally) and rebuilds; no `restoring` flag | `restore_onto_empty_disk_current_first` |
 | Segments beyond the restored end | §8 Restore step 1: quarantined, reported in health like a lost range, available for re-ingest (see Q-38) | Kept and excluded by position from views, trees, the registry and delivery; not reported; their series ids are not reserved; reader epochs (§7) still read them | `tests/rules.rs` `s8_restored_end_before_first_gap` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
+| Consumers after a restore | §8 Restore step 2: catch-up to the restored end only "if their segments are local; otherwise §4 Resync applies"; every consumer "then" receives `generation_changed` and `resync` | The local-segments condition is not yet modelled: catch-up replays whatever the restore brought back, so with `current_only` it replays from current chunks only. Signals and fact deliveries are kept in separate lists (`signals`, `observed`), so the model cannot show that `generation_changed` follows the catch-up | `tests/rules.rs` `s8_cursor_at_or_below_restored_end_continues` |
 | `duplicates_unchecked` during a restore | §2.4, §8 Restore step 2 | Not modelled: all detail is back before ingest is accepted, so the duplicate check always runs | — |
 | Invariants 12–16 | §10 | Not checked yet | — |
