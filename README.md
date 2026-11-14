@@ -2,15 +2,15 @@
 
 [![CI](https://github.com/hugsmid/kvik/actions/workflows/ci.yml/badge.svg)](https://github.com/hugsmid/kvik/actions/workflows/ci.yml)
 
-**An embedded time-series store for device and sensor data, in Rust: a durable ordered log and an analytical store
+**A planned embedded time-series store for device and sensor data, in Rust: a durable ordered log and an analytical store
 in one library, with no database service.**
 
-kvik is meant to sit inside the application that talks to the devices. Readings go into a checksummed, append-only
+kvik is designed to sit inside the application that talks to the devices. Readings go into a checksummed, append-only
 log and are synced to disk before anything reacts to them; the same library then delivers them to in-process
 consumers, keeps per-series summaries for drill-down from years to seconds, and moves old files to cheaper storage
-and an off-site bucket without ever deleting a fact. Typical uses are home and building automation, energy
+and an off-site bucket; the engine itself never deletes a fact. Typical uses are home and building automation, energy
 monitoring, small industrial or laboratory installations and edge devices: places where per-second data from many
-sources must be acted on quickly, kept for years and restored exactly after a failure.
+sources must be acted on quickly, kept for years and restored to a known, recorded point after a failure.
 
 > [!IMPORTANT]
 > **Status: design stage. The engine does not exist yet.**
@@ -29,27 +29,32 @@ sources must be acted on quickly, kept for years and restored exactly after a fa
 > 9 of 46 roadmap items are done.
 
 ## Principles
-From [spec §1](docs/spec.md#1-principles):
+From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 
 - **Durable before anything reacts.** A batch of readings is synced and the durable mark moved before adapters are
   acknowledged, summaries are updated or any consumer or reader process sees it.
 - **Late and corrected data are recorded.** A reading is never edited in place; a correction is a new fact and the
   old one stays as a revision. Sources that revise what they have published declare a *versioned series*, so a
-  replay can never undo a correction.
-- **Facts are immutable; everything else is derived.** The summary tree, indexes, compacted layout and consumer
-  state are pure functions of the log, so each can be rebuilt from the facts. Rebuild-equals-live is a test.
-- **Data moves, it is never deleted.** Old files leave fast local disk for cold or deep storage only after a
-  hash-verified copy exists there. The engine has no purge.
+  replay cannot undo a correction that carries a higher `changed_at`.
+- **Facts are immutable; everything else is derived.** The summary tree, indexes, compacted layout and funnel
+  state are pure functions of the log entries and the configuration recorded in them, so each can be rebuilt from the facts. Rebuild-equals-live is a test.
+- **Data moves; the engine never deletes it.** A file leaves fast local disk for cold or deep storage only after a
+  hash-verified copy exists there, and there is no purge. Losses the engine cannot prevent, such as a corrupt block
+  with no other copy or a file the bucket has lost when a restore reads it, are recorded as lost ranges and reported as `data_lost`.
 - **No silent loss.** Anything refused, repeated, flagged or delayed is counted and visible.
-- **Exact restore.** A restore from the bucket starts a new generation and records exactly which positions it
-  restored; anything after that point is set aside, kept and exportable, never silently mixed in.
+- **Restore to a known point.** A restore from the bucket starts a new generation and is restored to a known,
+  recorded point. Positions beyond it that reached the bucket are set aside: kept and exportable, never silently
+  mixed in. Facts in files that were never backed up are lost.
 - **One writer process, any number of readers**, including readers in other processes while the writer runs.
+
+**Not planned for v1:** a network server, SQL, multiple writers, clustering, or any form of deletion
+([`docs/api.md`](docs/api.md#not-in-v1)).
 
 ## How it works
 The intended shape, from [`docs/design.md`](docs/design.md) and the [specification](docs/spec.md):
 
 ```mermaid
-flowchart LR
+flowchart TB
     A["Adapters (devices, APIs)"] -->|emit| I["Ingest: validate, stamp, de-duplicate"]
     I --> L[("Log: arrival batches, checksummed")]
     L -->|"sync, then move the durable mark"| M{{"Durable mark"}}
@@ -62,21 +67,24 @@ flowchart LR
     K --> CH[("Per-series chunks: current and revisions")]
     T --> Q["Queries: windows, calendar results, charts"]
     CH --> Q
+    L -->|"recent facts not yet compacted"| Q
 ```
 
-Each batch is one commit and one sync; while a sync is in flight, new readings form the next batch. Only then do
-the summary tree and live state update and consumers receive the batch. A consumer that falls behind catches up
+Each batch is one commit and one sync; while a sync is in flight, new readings form the next batch. Only after the
+sync and the durable mark do the summary tree and live state update and consumers receive the batch. A consumer that falls behind catches up
 from the log without blocking the writer or other consumers; one that was away too long receives a `resync` with
 the present state instead of a stale replay. Compaction later rewrites sealed log segments into per-series chunks,
 keeping every fact with its position. Queries combine whole summary nodes in the middle of a window with raw facts
-at its edges, so results are exact to the nanosecond and carry their coverage.
+at its edges, so results are exact to the nanosecond where the detail is local, and carry their coverage. A window never reads
+off-machine data: where an edge's detail is not local, the edge moves inward and the result is flagged
+`approximate_edges`, or is the error `detail_not_local` if no span is left.
 
 ### A reading, from emit to delivery
 
 ```mermaid
 sequenceDiagram
     participant A as Adapter
-    participant W as Writer
+    participant W as Store
     participant F as Log file
     participant C as Consumer
     A->>W: emit(readings)
@@ -96,20 +104,21 @@ sequenceDiagram
 flowchart LR
     H[("Hot: local disk")] -->|"after a verified copy"| CO[("Cold: another local path (optional)")]
     H -->|"every sealed file, encrypted, hash-checked"| DP[("Deep: object-storage bucket")]
-    CO -.->|"fetched on demand"| H
-    DP -.->|"fetched on demand"| H
+    DP -.->|"fact reads fetched on demand"| H
     DP ==>|"restore onto an empty disk: new generation"| R["Restored store"]
 ```
 
-The summary tree, indexes and registry stay hot; raw detail and old log segments move out only once they are
-verified elsewhere, and are fetched back when a query needs them. The engine never deletes from the bucket.
+The stored summary tree, indexes and registry never leave hot. At 90 days, revision chunks and sealed log segments
+leave hot once verified in cold or deep; current detail stays hot except under fill pressure or for a series with a
+diagnostic retention class. Cold is another local path, read in place. Detail held only in the bucket is fetched on
+demand for fact reads, never for windows or consumer catch-up. The engine never deletes from the bucket.
 
 ### Key concepts
 
 | Concept | Meaning |
 |---|---|
 | Fact | One recorded reading: series, event time `t`, value, quality, flags, position. Never edited or deleted |
-| Position | `(generation, sequence)`, gap-free within a generation; orders every log entry |
+| Position | `(generation, sequence)`, gap-free within a generation except recorded lost ranges; orders every log entry |
 | Series | A named stream with a fixed kind (gauge, counter, state, text, interval), value type and unit |
 | Versioned series | A series whose source revises readings; each carries `changed_at`, and the highest revision wins |
 | Window | A rolling or calendar span evaluated in event time; every result carries coverage and flags |
@@ -119,23 +128,15 @@ verified elsewhere, and are fetched back when a query needs them. The engine nev
 | Tier | Hot local disk, optional cold path, deep bucket; files move between them only after a verified copy |
 
 ### Planned interface
-*Planned interface, subject to change: an outline from [`docs/api.md`](docs/api.md), not yet implemented.*
+*Subject to change: an outline from [`docs/api.md`](docs/api.md), not yet implemented.*
 
 ```rust
-let store = Store::open(StoreConfig {
-    dir: path,
-    time_zone: tz,                 // required: calendar levels use it
-    log: LogConfig::default(),
-    limits: Limits::default(),
-    tiers: TierConfig::default(),
-    env: Env::system(),            // clock, file system, boot identity
-}).await?;
+let store = Store::open(config).await?;   // StoreConfig: directory, time zone, limits, tiers, ...
 
 let id = store.define_series(SeriesSpec {
     name: "plant/line-1/temperature".into(),
     kind: Kind::Gauge { value: ValueType::Decimal { scale: 1 } },
     unit: "°C".into(),
-    expected_interval: Some(Duration::from_secs(1)),
     ..Default::default()
 }).await?;
 
@@ -155,15 +156,16 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
    invariants of spec §10 that the model covers; CI runs them with 10,000 cases on every change and 40,000 nightly.
 3. **Measurements before building.** Roadmap item 2.1 compared candidate chunk encodings with Parquet on synthetic
    per-second data: the own encoding was 8–14 % smaller than Parquet with ALP for decimal readings stored as
-   `f64`, but only about 1 % smaller when they are declared as scaled `i64`
+   `f64`, but only about 1 % smaller when they are declared as scaled `i64`. On two non-decimal shapes it was 13 %
+   smaller than the best Parquet variant on one and 23 % larger than Parquet's dictionary encoding on the other
    ([results](docs/measurements/2.1-chunk-encodings.md)). Whether compacted data stays in its own format or in
    Parquet is decided at later gates.
-4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) is built
-   behind injectable clock and file-system seams and tested differentially against the model, with crash points,
+4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) will be
+   built behind injectable clock and file-system seams and tested differentially against the model, with crash points,
    failed syncs and full disks injected.
 
 Design budgets, still to be measured: a reading delivered to an in-process consumer within p50 ≤ 2 ms and
-p99 ≤ 10 ms of acceptance, sync included; a chart query at any zoom level within 50 ms; restart to serving within
+p99 ≤ 10 ms of acceptance on an SSD, sync included; a chart query at any zoom level within 50 ms; restart to serving within
 1 s ([`docs/design.md`](docs/design.md)).
 
 ## Repository map
