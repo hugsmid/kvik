@@ -955,10 +955,8 @@ fn s6_rolling_window_in_event_time_after_clock_jump() {
 }
 
 /// §2.4: a reading recorded without a value is compared as "no value", so a
-/// NaN and then an infinity at the same `t` and quality are one fact. (By the
-/// specification a different supplied quality is not a duplicate; the model
-/// still treats it as one: see `duplicate_check_compares_engine_assigned_quality`
-/// in `model.rs`.)
+/// NaN and then an infinity at the same `t` and quality are one fact (a
+/// different supplied quality is a new fact: `s2_4_absent_compared_by_supplied_quality`).
 #[test]
 fn s2_4_reading_without_value_compared_as_no_value() {
     let (mut m, s) = consumer_model();
@@ -4248,4 +4246,194 @@ fn s5_7_store_keeps_its_site_zone_and_refuses_another_at_open() {
         Err(Error::SiteZoneMismatch { .. })
     ));
     assert!(m.disk.bucket.claims.is_empty());
+}
+
+const QUALITIES: [Quality; 4] = [
+    Quality::Good,
+    Quality::Estimated,
+    Quality::Suspect,
+    Quality::Bad,
+];
+
+/// A model with one series of `kind`, its staleness limit and expected
+/// interval taken from `p`.
+fn absent_model(p: &Params) -> (Model, SeriesId) {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let options = SeriesOptions {
+        expected_interval: p.expected_interval,
+        ..SeriesOptions::default()
+    };
+    let s = m
+        .define_with(
+            "site/unit-1/value",
+            p.kind,
+            value_type(p.kind),
+            "u",
+            p.staleness,
+            options,
+        )
+        .unwrap();
+    (m, s)
+}
+
+fn absent(s: SeriesId, t: Nanos, q: Quality) -> Reading {
+    Reading {
+        series: s,
+        t,
+        value: Value::Absent,
+        quality: q,
+        changed_at: None,
+        t_source: kvik_model::types::TSource::Device,
+    }
+}
+
+fn reading(s: SeriesId, t: Nanos, v: Value) -> Reading {
+    Reading {
+        value: v,
+        ..absent(s, t, Quality::Good)
+    }
+}
+
+/// §2.5: a reading submitted with no value is recorded with quality bad,
+/// no value, flagged and counted, whatever quality was supplied, on a series
+/// of any kind. It is never live state and enters no summary: the previous
+/// reading stays live (on a state or text series, which has no staleness
+/// limit, for ever).
+#[test]
+fn s2_5_absent_recorded_bad_whatever_quality_supplied() {
+    for kind in [Kind::Gauge, Kind::Counter, Kind::State, Kind::Text] {
+        let staleness = matches!(kind, Kind::Gauge | Kind::Counter).then_some(HOUR);
+        let (mut m, s) = absent_model(&Params::new(kind, staleness));
+        let first = match kind {
+            Kind::State => Value::Str("idle".into()),
+            Kind::Text => Value::Str("a".into()),
+            _ => Value::Num(10.0),
+        };
+        m.ingest(vec![reading(s, T0, first.clone())]).unwrap();
+        let before = m.window(s, T0, T0 + HOUR).unwrap();
+        let readings = QUALITIES
+            .iter()
+            .enumerate()
+            .map(|(i, q)| absent(s, T0 + (i as i64 + 1) * SECOND, *q))
+            .collect();
+        m.ingest(readings).unwrap();
+        assert_eq!(m.counters.absent_supplied, 4, "{kind:?}");
+        let facts = m.facts().unwrap();
+        assert_eq!(facts.len(), 5, "{kind:?}");
+        for (f, q) in facts[1..].iter().zip(QUALITIES) {
+            assert_eq!((f.quality, f.supplied_quality), (Quality::Bad, q));
+            assert!(f.value == Value::Absent && f.flags.no_value);
+        }
+        assert_eq!(
+            m.latest(s).unwrap().map(|f| f.value),
+            Some(first),
+            "{kind:?}"
+        );
+        assert_eq!(m.window(s, T0, T0 + HOUR).unwrap(), before, "{kind:?}");
+        m.restart();
+        assert_eq!(m.window(s, T0, T0 + HOUR).unwrap(), before, "{kind:?}");
+    }
+}
+
+/// §2.4, §2.5: a supplied `Absent` keeps its supplied quality for the
+/// duplicate rule, across a restart. `Absent` good then `Absent` bad at one
+/// `t` are two facts; NaN good then `Absent` good at one `t` are one.
+#[test]
+fn s2_4_absent_compared_by_supplied_quality() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![absent(s, T0, Quality::Good)]).unwrap();
+    m.restart();
+    let r = m.ingest(vec![absent(s, T0, Quality::Bad)]).unwrap();
+    assert_eq!(
+        r.positions.len(),
+        1,
+        "a different supplied quality is a new fact"
+    );
+    let r = m.ingest(vec![absent(s, T0, Quality::Good)]).unwrap();
+    assert_eq!(r.duplicates, 1, "the same supplied quality is a duplicate");
+    m.ingest(vec![Reading::num(s, T0 + SECOND, f64::NAN)])
+        .unwrap();
+    m.restart();
+    let r = m
+        .ingest(vec![absent(s, T0 + SECOND, Quality::Good)])
+        .unwrap();
+    assert_eq!(r.duplicates, 1, "NaN and Absent are both \"no value\"");
+    assert_eq!(m.facts().unwrap().len(), 3);
+}
+
+/// Readings of one series and supplied `Absent`s of any quality, at keys
+/// that no reading has (by construction: an `Absent` on a taken key is moved
+/// to the next free nanosecond).
+type AbsentHistory = (Params, Vec<(Nanos, Value)>, Vec<(Nanos, Quality)>);
+
+fn arb_absent_history() -> impl proptest::strategy::Strategy<Value = AbsentHistory> {
+    use proptest::strategy::Strategy;
+    arb_params()
+        .prop_map(|mut p| {
+            p.timing = Timing::Observed;
+            p
+        })
+        .prop_flat_map(|p| {
+            (
+                proptest::strategy::Just(p),
+                arb_readings(p.kind, 20),
+                proptest::collection::vec(
+                    (arb_offset(), proptest::sample::select(QUALITIES.to_vec())),
+                    0..10,
+                ),
+            )
+        })
+        .prop_map(|(p, rs, abs)| {
+            let mut taken: BTreeSet<Nanos> = rs.iter().map(|(t, _)| *t).collect();
+            let abs = abs
+                .into_iter()
+                .map(|(o, q)| {
+                    let mut t = T0 + o;
+                    while !taken.insert(t) {
+                        t += 1;
+                    }
+                    (t, q)
+                })
+                .collect();
+            (p, rs, abs)
+        })
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(256),
+        ..proptest::test_runner::Config::default()
+    })]
+
+    /// §2.5: supplied `Absent`s of any quality, on every kind, change no
+    /// summary, no live state and no staleness: every tree, window and live
+    /// state equals that of the same history without them, also after a
+    /// restart.
+    #[test]
+    fn s2_5_absent_changes_no_summary_or_live_state(
+        (p, rs, abs) in arb_absent_history(),
+        (a, b) in (arb_offset(), arb_offset()),
+    ) {
+        let (mut plain, s) = absent_model(&p);
+        let (mut with, s2) = absent_model(&p);
+        proptest::prop_assert_eq!(s, s2);
+        plain.ingest(rs.iter().map(|(t, v)| reading(s, *t, v.clone())).collect()).unwrap();
+        let mut all: Vec<Reading> = rs.iter().map(|(t, v)| reading(s, *t, v.clone())).collect();
+        all.extend(abs.iter().map(|(t, q)| absent(s, *t, *q)));
+        all.sort_by_key(|r| r.t);
+        with.ingest(all).unwrap();
+        proptest::prop_assert_eq!(with.counters.absent_supplied, abs.len() as u64);
+        let (start, end) = (T0 + a.min(b), T0 + a.max(b));
+        for _ in 0..2 {
+            proptest::prop_assert!(with.tree(s).unwrap().same_summaries(plain.tree(s).unwrap()));
+            proptest::prop_assert_eq!(
+                with.latest(s).unwrap().map(|f| (f.t, f.value)),
+                plain.latest(s).unwrap().map(|f| (f.t, f.value))
+            );
+            proptest::prop_assert_eq!(with.window(s, start, end).unwrap(), plain.window(s, start, end).unwrap());
+            proptest::prop_assert_eq!(with.window(s, T0, T0 + HOUR).unwrap(), plain.window(s, T0, T0 + HOUR).unwrap());
+            with.restart();
+            plain.restart();
+        }
+    }
 }

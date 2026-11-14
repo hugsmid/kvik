@@ -31,7 +31,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise, rounded or not |
 | Q-102 | §2.1 `decimal scale`, §2.5 | A finite value too large for `i64` at the series' scale |
 | Q-103 | §7 Manifest, §8 Generations, Tiers | What an automatic manifest rebuild cannot recover from local files |
-| Q-104 | §2.5, §2.4 | A supplied `Absent` value with a quality other than bad |
 | Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
 | Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
 
@@ -464,19 +463,6 @@ no longer seen, so an id could be issued again.
 kept; for (d), the writer's behaviour while deep is unreachable; for (g), a floor that survives a rebuild (for
 example in the rebuild record). To be settled by roadmap 6.3; (a), (b) and (f) with 8.2 and 8.3.
 
-## Q-104 — A supplied `Absent` value with a quality other than bad
-**Scenario.** `api.md` Core types gives `Value::Absent`, "no value" (§2.5), as a value an adapter may submit. §2.5
-names only NaN, ±∞ and a negative counter value as recorded without a value, each with quality bad; no rule covers an
-`Absent` submitted with quality good, estimated or suspect. Recorded as given, it would be a reading of good quality
-with nothing to summarise.
-**Model.** `Value::fits` accepts `Absent` for every value type (`model/src/types.rs`), and the reading is recorded
-with its supplied quality; the summary then expects a number for a reading that is not bad and panics
-(`model/src/summary.rs`, `Node::hold`). The `kvik` crate submits an `Absent` as bad quality, so its supplied quality
-is lost and §2.4's comparison of no-value readings by supplied quality cannot hold: an `Absent` of good quality and
-then one of bad quality at the same `t` is dropped as a duplicate.
-**Needed.** Whether a supplied `Absent` is accepted, and with what quality.
-**Proposal.** Treat it as NaN is treated: recorded as quality bad with no value, flagged and counted, with its supplied
-quality kept for the duplicate rule (one more arm beside NaN and ±∞ in `Model::commit`, `model/src/engine.rs`).
 
 ## Q-105 — Reading a segment: points `format.md` Part A leaves open
 Found while building the segment reader (roadmap 4.2, crate `kvik-log`). Each part names the reading implemented for
@@ -557,7 +543,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there.
+Q-87 was reopened there. Q-104 was settled after gate 3.3 by the owner's ruling.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -585,7 +571,6 @@ Q-87 was reopened there.
 | Q-101 | 5.1 | Series registry and duplicates; recorded after gate 3.3, from the owner's decimal ruling |
 | Q-102 | 5.1 | Series registry; recorded at the gate 3.3 review |
 | Q-103 | 6.3 | Manifest rebuild; (a) and (b) with 8.2 and 8.3; recorded at the gate 3.3 review |
-| Q-104 | 4.3 | Arrival batches; recorded after gate 3.3, from the interface crate |
 | Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
 | Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
 
@@ -781,6 +766,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
 | Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |
 | Q-99 | An exclusive `flock` on the store directory on Windows | §3 Single writer (an operating-system lock on the file `LOCK`, released when the process ends; network file systems not supported), `format.md` A.12, `api.md` Handles |
+| Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

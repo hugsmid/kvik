@@ -163,7 +163,9 @@ pub enum Value {
     Bool(bool),
     /// Named state or text.
     Str(String),
-    /// No value: a NaN or infinite input, recorded with bad quality (§2.5).
+    /// No value (§2.5): a NaN or infinite input, a negative counter value, or
+    /// `Absent` as submitted, whatever its supplied quality; always recorded
+    /// with bad quality, the supplied quality kept for the duplicate rule.
     Absent,
 }
 
@@ -259,8 +261,8 @@ pub struct Flags {
     pub host_time: bool,
     /// Committed before the system reported clock synchronisation (§2.5).
     pub unsynced_clock: bool,
-    /// Recorded without a value: a NaN or infinite value, or a negative
-    /// counter value (§2.5, §5.5).
+    /// Recorded without a value: a NaN or infinite value, a negative counter
+    /// value or a supplied `Absent` (§2.5, §5.5).
     pub no_value: bool,
 }
 

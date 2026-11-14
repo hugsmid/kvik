@@ -660,14 +660,9 @@ impl Slot {
             (Kind::Text, Value::Text(s)) => V::Str(s.clone()),
             _ => return Err(Refusal::WrongType),
         };
-        // The reference model summarises a value-less reading only when it
-        // is bad quality, so an `Absent` is submitted as bad (its supplied
-        // quality is not kept).
-        let quality = if matches!(value, V::Absent) {
-            km::types::Quality::Bad
-        } else {
-            mquality(r.quality)
-        };
+        // An `Absent` is recorded with quality bad and its supplied quality
+        // kept for the duplicate rule (spec §2.5).
+        let quality = mquality(r.quality);
         Ok(km::types::Reading {
             series: msid(r.series),
             t: nanos(r.t),
@@ -835,6 +830,7 @@ impl Slot {
             st.late += u64::from(f.flags.late);
             st.future += u64::from(f.flags.future);
             st.outranked_on_arrival += u64::from(outranked);
+            st.absent_supplied += u64::from(matches!(mr.value, km::types::Value::Absent));
             outcomes[i] = Some(Outcome::Recorded {
                 position: pos(f.position),
                 outranked,

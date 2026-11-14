@@ -835,6 +835,9 @@ pub struct Counters {
     /// Negative counter values recorded as bad quality without a value
     /// (§2.5, §5.5).
     pub negative_counter: u64,
+    /// Readings submitted as `Absent`, of any supplied quality, recorded as
+    /// bad quality without a value (§2.5).
+    pub absent_supplied: u64,
     /// Counter regressions per series (§5.5, §12 D2), raised at commit by
     /// each regression step a batch brings into existence; never lowered.
     pub counter_regressions: BTreeMap<SeriesId, u64>,
@@ -2549,6 +2552,7 @@ impl Model {
         let mut unchecked = 0;
         let mut non_finite = 0;
         let mut negative = 0;
+        let mut absent = 0;
         let synced = self.clock_synchronised;
         let mut next = v.next_position;
         let readings: Vec<(Reading, bool)> = v.queue.drain(..).collect();
@@ -2563,10 +2567,16 @@ impl Model {
                 continue;
             }
             let supplied = r.quality;
-            // NaN and ±∞ (§12 D1), and a negative counter value (§5.5), are
-            // recorded as bad quality without a value, flagged and counted;
-            // the duplicate rule compares them as "no value" (§2.4).
+            // NaN and ±∞ (§12 D1), a negative counter value (§5.5) and a
+            // supplied `Absent` of any quality (§2.5) are recorded as bad
+            // quality without a value, flagged and counted; the duplicate
+            // rule compares them as "no value" with the supplied quality
+            // (§2.4).
             let (value, mut quality) = match r.value {
+                Value::Absent => {
+                    absent += 1;
+                    (Value::Absent, Quality::Bad)
+                }
                 Value::Num(x) if !x.is_finite() => {
                     non_finite += 1;
                     (Value::Absent, Quality::Bad)
@@ -2713,6 +2723,7 @@ impl Model {
         self.counters.duplicates_dropped += duplicates as u64;
         self.counters.non_finite += non_finite;
         self.counters.negative_counter += negative;
+        self.counters.absent_supplied += absent;
         let mut report = CommitReport {
             positions: batch.iter().map(|e| e.position).collect(),
             duplicates,

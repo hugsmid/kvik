@@ -157,6 +157,15 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
 - Bad-quality facts stay in views but are ignored by summaries and do not refresh staleness (§12 D6).
 - NaN or ±∞ is recorded as quality bad with no value, flagged and counted (§12 D1). A negative counter value
   (§5.5) is recorded the same way; D1 concerns NaN and ±∞ only.
+- A reading submitted with no value (`Value::Absent`, `api.md`) is recorded the same way whatever quality was
+  supplied, on a series of any kind: quality bad, no value, flagged and counted on its own (`absent_supplied`). Its
+  supplied quality is kept for the duplicate rule (§2.4), so two such readings at one `t` are duplicates only when
+  their supplied qualities are equal, and any two readings recorded without a value under this section at one `t`
+  with the same supplied quality are duplicates (the stored row does not tell them apart, `format.md` A.5). It is
+  never live state (§2.3), enters no summary and does not refresh staleness; it does not end the validity of the
+  reading before it, whose hold runs on to its staleness limit (§5.2). On a state or text series, which has none,
+  the previous value therefore stays live: an application that must record that a state is unknown declares a
+  state name for it.
 - Until the system reports clock synchronisation, batches carry `unsynced_clock`, `future`/`late` are not set, and
   facts with `t_source = host` wait in the ingest queue (back-pressure) rather than being stamped with a wrong time.
   Device-stamped facts are accepted.
@@ -681,7 +690,7 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 28b | Two restores from one bucket, or a drill beside a live store | Each restore claims its own generation; a writer that finds a higher one stops uploading; of two concurrent restores, the one that finds the higher claim after uploading its record never accepts ingest; a drill claims nothing | fault injection |
 | 29 | Late fact for a minute whose detail is not local | Recorded; node `summary_stale` until fetched | model |
 | 30 | Very many series | Memory per series bounded and documented; ceiling (default 100,000) refuses new series clearly | load test |
-| 31 | Value NaN or infinite, or a negative counter value | Recorded as bad quality without a value; counted | unit |
+| 31 | Value NaN or infinite, a negative counter value, or `Absent` of any supplied quality | Recorded as bad quality without a value, the supplied quality kept for the duplicate rule; counted | unit |
 | 32 | Format version newer than the reader | Refused with a clear error | golden files |
 | 33 | Consumer emits readings from a delivery | Non-blocking emit off the writer thread, through the consumer's handle and within its `emits`; a route, `emits` or alias that closes a cycle is refused | integration |
 | 34 | Route added while a consumer is catching up | Applies from its position only | model |

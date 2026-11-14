@@ -95,8 +95,10 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
   then handled by its `ExcessPrecision` policy (spec §2.1): rounded half to even and flagged `rounded` (the default),
   refused with `Refusal::ExcessPrecision { scale_needed }`, or the scale raised up to a maximum. Writers should round
   to the precision they actually need; raw sensor floats belong in an `f64` series, which keeps the value bit-exact.
-  `Absent` is "no value" (spec §2.5); NaN and ±∞ are recorded as quality bad with no value, flagged and counted
-  (spec §2.5), on a decimal series as on any other. A finite value too large for `i64` at the series' scale is open
+  `Absent` is "no value" (spec §2.5): it is recorded with quality bad whatever quality is supplied, and the supplied
+  quality is kept for the duplicate rule; to record that a state is unknown, declare a state name for it. NaN and
+  ±∞ are recorded as quality bad with no value, flagged and counted (spec §2.5), on a decimal series as on any
+  other. A finite value too large for `i64` at the series' scale is open
   (Q-102 in `model/OPEN-QUESTIONS.md`).
 - Configuration durations are `std::time::Duration`; `Span` is used only where a sign is needed.
 
@@ -339,7 +341,7 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //            open_file_id, sealed_segments, bytes, manifest_rebuilds }   ClockStats { jumps, last: Option<ClockJump> }
 pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, duplicates_dropped, duplicates_unchecked,
                                                                    // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts,
-                                                                   // rounded, scale_raises
+                                                                   // rounded, scale_raises, absent_supplied
 let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), for re-ingest
 ```
 - A loss's identity is the first position of its range when it was first reported. Reports are read from the

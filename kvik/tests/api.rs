@@ -220,6 +220,26 @@ fn absent_and_non_finite_values_are_recorded_without_a_value() {
 }
 
 #[test]
+fn absent_keeps_its_supplied_quality_for_the_duplicate_rule() {
+    let (s, _clock) = store("absent-quality");
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    let absent = |q| Reading {
+        quality: q,
+        ..Reading::new(g, at(0), Value::Absent)
+    };
+    let ack = block_on(s.emit(&[absent(Quality::Good), absent(Quality::Bad)])).unwrap();
+    assert_eq!(ack.recorded(), 2, "spec §2.4: different supplied qualities");
+    let ack = block_on(s.emit(&[absent(Quality::Good)])).unwrap();
+    assert_eq!(ack.outcomes, vec![Outcome::Duplicate]);
+    assert_eq!(s.series_stats(g).unwrap().absent_supplied, 2);
+    let fs = facts(&s.reader(), g, at(0)..at(1), View::History);
+    assert!(
+        fs.iter()
+            .all(|f| f.quality == Quality::Bad && f.flags.no_value)
+    );
+}
+
+#[test]
 fn try_emit_returns_a_pending_ack() {
     let (s, _clock) = store("try-emit");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
