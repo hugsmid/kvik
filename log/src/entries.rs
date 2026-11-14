@@ -237,7 +237,7 @@ pub struct Recovery {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Entry {
     /// 1.
-    Definition(Definition),
+    Definition(Box<Definition>),
     /// 2.
     ParameterChange(ParameterChange),
     /// 3.
@@ -275,10 +275,11 @@ pub enum Entry {
         /// 5: the new scale.
         scale: u8,
     },
-    /// An entry of an unknown, ignorable type (`≥ 0x80`): skipped, but it takes its sequence. Never written.
+    /// Consecutive entries of unknown, ignorable types (`≥ 0x80`): skipped, but each takes its sequence. Never
+    /// written.
     Ignored {
-        /// Its type.
-        entry_type: u8,
+        /// How many.
+        count: u32,
     },
 }
 
@@ -464,7 +465,7 @@ fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
             f.u8(5, *scale);
             entry_type::SCALE_RAISE
         }
-        Entry::Ignored { entry_type } => *entry_type,
+        Entry::Ignored { .. } => unreachable!("ignored entries are never encoded"),
     };
     (t, f.0)
 }
@@ -655,10 +656,31 @@ impl<'a> Parsed<'a> {
 }
 
 fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
+    let mut entries: Vec<Entry> = Vec::new();
+    let p = walk(body, |e| match (entries.last_mut(), e) {
+        // Consecutive ignored entries are counted, not stored one by one.
+        (Some(Entry::Ignored { count }), Entry::Ignored { count: n }) => *count += n,
+        (_, e) => entries.push(e),
+    })?;
+    Ok(EntriesBlock {
+        first_sequence: p.first_sequence,
+        received_at: p.received_at,
+        entries,
+    })
+}
+
+/// Applies every check of A.6 to a body without keeping its entries: its prefix, and whether it holds a recovery
+/// entry. This is what a reader runs on every entries block it accepts.
+pub(crate) fn check(body: &[u8]) -> Result<(DataPrefix, bool), BodyError> {
+    let mut recovery = false;
+    let p = walk(body, |e| recovery |= e.is_recovery())?;
+    Ok((p, recovery))
+}
+
+/// Decodes the entries of a body one at a time, handing each to `sink`.
+fn walk(body: &[u8], mut sink: impl FnMut(Entry)) -> Result<DataPrefix, BodyError> {
     let p = DataPrefix::decode(block_type::ENTRIES, body).map_err(|_| ContentError::Prefix)?;
     let mut at = DATA_PREFIX_LEN;
-    // No reservation from `entry_count`: nothing is allocated before the entries are read (A.11).
-    let mut entries = Vec::new();
     for i in 0..p.count {
         let overrun = BodyError::from(ContentError::EntryOverrun { entry: i });
         let head = body.get(at..at + 8).ok_or(overrun)?;
@@ -673,7 +695,7 @@ fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
         if !known {
             if t >= 0x80 {
                 fields(raw, i, t, false)?;
-                entries.push(Entry::Ignored { entry_type: t });
+                sink(Entry::Ignored { count: 1 });
                 continue;
             }
             return Err(BodyError::Unsupported(Element::EntryType(t)));
@@ -682,14 +704,10 @@ fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
             entry: i,
             fields: fields(raw, i, t, true)?,
         };
-        entries.push(entry(t, &parsed)?);
+        sink(entry(t, &parsed)?);
     }
     // Bytes after the last entry are not checked here (Q-106 (a)); the canonical decoder rejects them.
-    Ok(EntriesBlock {
-        first_sequence: p.first_sequence,
-        received_at: p.received_at,
-        entries,
-    })
+    Ok(p)
 }
 
 /// Splits a field list, checking framing and, for a known type, order and allowed ids.
@@ -737,7 +755,7 @@ fn fields(raw: &[u8], entry: u32, t: u8, known: bool) -> Result<Vec<(u16, &[u8])
 
 fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
     Ok(match t {
-        entry_type::DEFINITION => Entry::Definition(definition(p)?),
+        entry_type::DEFINITION => Entry::Definition(Box::new(definition(p)?)),
         entry_type::PARAMETER_CHANGE => Entry::ParameterChange(parameter_change(p)?),
         entry_type::ALIAS => Entry::Alias {
             id: p.u32(1)?,
@@ -967,6 +985,14 @@ pub(crate) fn entry_len(e: &Entry) -> u64 {
 }
 
 impl Entry {
+    /// The sequences this entry takes: 1, or the count of an [`Entry::Ignored`].
+    pub fn sequences(&self) -> u64 {
+        match self {
+            Self::Ignored { count } => u64::from(*count),
+            _ => 1,
+        }
+    }
+
     /// Whether this is a recovery entry.
     pub fn is_recovery(&self) -> bool {
         matches!(self, Self::Recovery(_))

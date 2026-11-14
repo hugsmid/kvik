@@ -330,7 +330,7 @@ fn golden_files_decode_to_what_they_show() {
     assert_eq!(content.items.len(), 3);
     assert!(matches!(
         content.items[1],
-        kvik_log::content::Item::Entry(kvik_log::entries::Entry::Ignored { entry_type: 0x90 })
+        kvik_log::content::Item::Entry(kvik_log::entries::Entry::Ignored { count: 1 })
     ));
     for (name, element) in [
         ("unknown-critical-column.open", Element::Column(0x10)),

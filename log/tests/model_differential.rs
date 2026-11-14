@@ -1,6 +1,8 @@
 //! Differential check against the reference model (`kvik-model`): model facts and registry events, converted to
 //! log entries, encoded in a segment, read back and converted again, are the same model values. The model is the
-//! reference for what each field means.
+//! reference for what each field means. Decimal values, scale raises and the excess-precision fields are not
+//! covered: the model has no decimal type. Recovery entries are not registry events in the model either; they are
+//! covered by the round trips in `batches.rs`.
 
 mod support;
 
@@ -173,7 +175,7 @@ fn event_to_entry(e: &RegistryEvent) -> Entry {
             unit,
             staleness,
             options,
-        } => Entry::Definition(Definition {
+        } => Entry::Definition(Box::new(Definition {
             id: id.0,
             name: name.clone(),
             kind: kind_to_log(*kind),
@@ -210,7 +212,7 @@ fn event_to_entry(e: &RegistryEvent) -> Entry {
             retention: Retention::LongTerm,
             excess_precision: None,
             staleness_set: false,
-        }),
+        })),
         RegistryEvent::Alias { id, name } => Entry::Alias {
             id: id.0,
             name: name.clone(),

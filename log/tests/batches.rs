@@ -270,7 +270,7 @@ fn recovery() -> impl Strategy<Value = Recovery> {
 /// Every entry type except the recovery entry, which is alone in its batch.
 fn entry() -> impl Strategy<Value = Entry> {
     prop_oneof![
-        definition().prop_map(Entry::Definition),
+        definition().prop_map(|d| Entry::Definition(Box::new(d))),
         parameter_change().prop_map(Entry::ParameterChange),
         (any::<u32>(), name()).prop_map(|(id, name)| Entry::Alias { id, name }),
         (any::<u32>(), any::<i64>()).prop_map(|(id, t_r)| Entry::Retirement { id, t_r }),
@@ -392,7 +392,7 @@ fn the_encoders_follow_the_tables() {
         first_sequence: 1,
         received_at: T0,
         entries: vec![
-            Entry::Definition(def),
+            Entry::Definition(Box::new(def)),
             Entry::Alias {
                 id: 1,
                 name: "a".into(),
@@ -1082,7 +1082,7 @@ fn field_framing_order_and_unknown_elements() {
         &[(0x90, vec![(1, vec![9])]), alias(1, "a")],
     ))
     .unwrap();
-    assert_eq!(b.entries[0], Entry::Ignored { entry_type: 0x90 });
+    assert_eq!(b.entries[0], Entry::Ignored { count: 1 });
     assert_eq!(b.entries.len(), 2);
     // Overruns: an entry past the body, a field past its entry, an entry count past the entries.
     let body = entries_body(1, T0, &[alias(1, "a")]);
@@ -1251,7 +1251,7 @@ fn entries_encode_refuses_what_it_cannot_write() {
         }))
     ));
     assert!(matches!(
-        one(Entry::Ignored { entry_type: 0x90 }),
+        one(Entry::Ignored { count: 1 }),
         Err(EncodeError::Content(_))
     ));
     // An entry above 8 MiB.
@@ -1557,4 +1557,75 @@ fn a_refusal_wins_over_invalid_content() {
         insert(c, 4, 0, vec![0, 0, 0, 0x80]);
     });
     assert_eq!(r, Err(BodyError::Unsupported(Element::FactFlags(0x8000))));
+}
+
+#[test]
+fn ignored_entries_are_counted_not_stored() {
+    // Nearly 8 MiB of zero-length entries of an ignorable type (as many as fit a batch): one value, and the reader's
+    // check keeps none.
+    let n = ((8 << 20) - 16 - 24) / 8;
+    let mut body = vec![0u8; 24];
+    kvik_log::body::DataPrefix {
+        first_sequence: 1,
+        received_at: T0,
+        count: n as u32,
+    }
+    .write(&mut body);
+    for _ in 0..n {
+        body.extend_from_slice(&[0x90, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    let b = EntriesBlock::decode(&body).unwrap();
+    assert_eq!(b.entries, [Entry::Ignored { count: n as u32 }]);
+    assert_eq!(b.entries[0].sequences(), n as u64);
+    let mut builder = BatchBuilder::new();
+    builder.push(block_type::ENTRIES, body).unwrap();
+    let mut img = SegmentImage::create_ahead(ID, T0, (9 << 20) + 4096).unwrap();
+    img.take_into_use(1).unwrap();
+    img.append(&builder, T0).unwrap();
+    let r = scan(img.bytes(), &ID, ScanLimit::End).unwrap();
+    let c = BatchContent::decode(&r.batches[0]).unwrap();
+    assert_eq!(c.last_sequence(), n as u64);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// Long runs of equal rows: 2- and 3-byte run lengths, and runs that cross the 65,536-row and the 8 MiB
+    /// plain-encoded block limits.
+    #[test]
+    fn long_runs_split_at_both_block_limits(
+        runs in prop::collection::vec(
+            (
+                prop_oneof![Just(Value::Bool(true)), Just(Value::Text("t".repeat(255))), Just(Value::F64(7))],
+                prop_oneof![1usize..4, 128usize..400, 16_384usize..17_000, 29_000usize..29_300, 65_500usize..65_600],
+            ),
+            1..3,
+        ),
+    ) {
+        let items: Vec<Item> = runs.iter().flat_map(|(v, n)| std::iter::repeat_n(fact(v.clone()), *n)).collect();
+        let content = BatchContent { first_sequence: 1, received_at: T0, items: items.clone() };
+        let blocks = content.blocks().unwrap();
+        let mut rows = Vec::new();
+        let mut next = 1u64;
+        for (k, b) in blocks.iter().enumerate() {
+            let kvik_log::content::DataBody::Facts(f) = b else { panic!("only facts") };
+            prop_assert_eq!(f.first_sequence, next);
+            let plain: u64 = f.rows.iter().map(FactRow::plain_len).sum();
+            prop_assert!(f.rows.len() <= 65_536 && plain <= 8 << 20);
+            // Every block but the last is as full as the limits allow.
+            if let Some(kvik_log::content::DataBody::Facts(n)) = blocks.get(k + 1) {
+                prop_assert!(f.rows.len() == 65_536 || plain + n.rows[0].plain_len() > 8 << 20);
+            }
+            let body = f.encode().unwrap();
+            prop_assert_eq!(&FactsBlock::decode_canonical(&body).unwrap(), f);
+            next += f.rows.len() as u64;
+            rows.extend(f.rows.iter().cloned().map(Item::Fact));
+        }
+        prop_assert_eq!(rows, items);
+        // Within 8 MiB of data blocks the batch is framed; above it the writer refuses it.
+        match content.builder() {
+            Ok(b) => prop_assert!(b.encode(&ID, 64, T0).is_ok()),
+            Err(e) => prop_assert_eq!(e, EncodeError::TooLarge),
+        }
+    }
 }

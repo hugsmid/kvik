@@ -19,6 +19,16 @@ pub enum Item {
     Entry(Entry),
 }
 
+impl Item {
+    /// The sequences this item takes: 1, or the count of an [`Entry::Ignored`].
+    pub fn sequences(&self) -> u64 {
+        match self {
+            Self::Fact(_) => 1,
+            Self::Entry(e) => e.sequences(),
+        }
+    }
+}
+
 /// A batch's data blocks, typed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DataBody {
@@ -51,7 +61,7 @@ pub struct BatchContent {
 impl BatchContent {
     /// The last sequence.
     pub fn last_sequence(&self) -> u64 {
-        self.first_sequence + self.items.len() as u64 - 1
+        self.first_sequence + self.items.iter().map(Item::sequences).sum::<u64>() - 1
     }
 
     /// The data blocks in canonical form (A.4): consecutive facts fill a facts block until the next row would take it
@@ -60,6 +70,17 @@ impl BatchContent {
     pub fn blocks(&self) -> Result<Vec<DataBody>, EncodeError> {
         if self.items.is_empty() || self.first_sequence == 0 {
             return Err(EncodeError::EmptyBatch);
+        }
+        // Ignored entries are read, never written.
+        if let Some(k) = self
+            .items
+            .iter()
+            .position(|i| matches!(i, Item::Entry(Entry::Ignored { .. })))
+        {
+            return Err(EncodeError::Content(ContentError::FieldPresence {
+                entry: k as u32,
+                field: 0,
+            }));
         }
         if self.items.len() > 1
             && self
@@ -155,7 +176,7 @@ impl BatchContent {
     }
 
     /// The content of a complete batch, every body checked (A.5, A.6). Blocks of unknown, skippable type are
-    /// skipped; unknown ignorable entries are kept as [`Entry::Ignored`] so that sequences still count.
+    /// skipped; unknown ignorable entries are counted in [`Entry::Ignored`] so that sequences still count.
     pub fn decode(batch: &Batch<'_>) -> Result<Self, BodyError> {
         let mut items = Vec::new();
         let mut received_at = None;
@@ -226,10 +247,7 @@ pub(crate) fn check_block(t: u8, body: &[u8]) -> Result<(DataPrefix, bool), Body
     })?;
     let recovery = match t {
         block_type::FACTS => FactsBlock::decode(body).map(|_| false)?,
-        _ => EntriesBlock::decode(body)?
-            .entries
-            .iter()
-            .any(Entry::is_recovery),
+        _ => crate::entries::check(body)?.1,
     };
     Ok((prefix, recovery))
 }

@@ -40,6 +40,10 @@ pub fn decode_all(data: &[u8]) {
     ];
     if let Ok(r) = scan(data, &id, ScanLimit::End) {
         check(&r, len, true);
+        if let Some(s) = &r.seal {
+            assert!(s.end <= len && s.trailer_offset < s.end && s.start <= s.trailer_offset);
+            let _ = s.file_crc_matches(data);
+        }
         for b in &r.batches {
             // The reader applied the body checks, so the content decodes; canonical content encodes again.
             assert!(
