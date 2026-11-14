@@ -17,7 +17,7 @@ again; nothing after a gate starts before it is passed.
 
 ## 2. Measurements before building
 - [x] 2.1 Spike: candidate chunk encodings against the Parquet reader — size and scan speed on synthetic per-second data; results in `docs/measurements/`
-- [ ] 2.2 Spike: commit and sync latency, group commit, behaviour on sync failure and a full disk; results in `docs/measurements/`
+- [x] 2.2 Spike: commit and sync latency, group commit, behaviour on sync failure and a full disk; results in `docs/measurements/`
 - [ ] 2.3 **Gate** — measurements looked at
 
 ## 3. Format and interface
