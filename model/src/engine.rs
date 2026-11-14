@@ -8,8 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::condition::{Condition, ConditionState, Runner};
 use crate::registry::{Registry, RegistryError, RegistryEvent, SeriesDef};
-use crate::summary::{Node, Params};
+use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{SeriesTree, TreeError};
 use crate::types::{
     Fact, Flags, HOUR, Kind, MAX_TEXT_BYTES, MINUTE, Nanos, Position, QUARTER, Quality, Reading,
@@ -111,6 +112,90 @@ pub struct ConsumerDecl {
     pub capacity: usize,
 }
 
+/// Funnel identifier, unique within its consumer (§4 Funnel). Funnel 0 is
+/// the consumer's configured selection ([`ConsumerDecl::selection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FunnelId(pub u32);
+
+impl FunnelId {
+    /// The funnel of a consumer's configured selection.
+    pub const CONFIGURED: FunnelId = FunnelId(0);
+}
+
+/// A rolling-window operator `[now − width, now)` (§6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Operator {
+    /// Aggregate over the window.
+    pub aggregate: Aggregate,
+    /// Window width.
+    pub width: Nanos,
+}
+
+/// A funnel (§4): a series selection, an optional operator and an optional
+/// condition. A funnel without a condition delivers every fact it selects; a
+/// condition funnel delivers transitions of its condition, evaluated on the
+/// operator's value (or, without an operator, on the live-state value).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Funnel {
+    /// Series selection; a condition funnel selects exactly one series (§6
+    /// Multi-series).
+    pub selection: Selection,
+    /// Operator.
+    pub operator: Option<Operator>,
+    /// Condition.
+    pub condition: Option<Condition>,
+}
+
+impl Funnel {
+    /// A funnel that delivers every fact of the selection.
+    pub fn facts(selection: Selection) -> Self {
+        Funnel {
+            selection,
+            operator: None,
+            condition: None,
+        }
+    }
+
+    /// A condition funnel over one series.
+    pub fn condition(series: SeriesId, operator: Option<Operator>, condition: Condition) -> Self {
+        Funnel {
+            selection: Selection::Series([series].into_iter().collect()),
+            operator,
+            condition: Some(condition),
+        }
+    }
+
+    /// The one series a condition funnel watches.
+    fn series(&self) -> Option<SeriesId> {
+        match &self.selection {
+            Selection::Series(set) if set.len() == 1 => set.iter().next().copied(),
+            _ => None,
+        }
+    }
+}
+
+/// A routing change (§4 Routing): a log entry that takes effect at its
+/// position.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RouteChange {
+    /// A funnel is added to a consumer.
+    Add {
+        /// Consumer.
+        consumer: ConsumerId,
+        /// Funnel identifier.
+        funnel: FunnelId,
+        /// The funnel.
+        spec: Funnel,
+    },
+    /// A funnel is removed from a consumer.
+    Remove {
+        /// Consumer.
+        consumer: ConsumerId,
+        /// Funnel identifier.
+        funnel: FunnelId,
+    },
+}
+
 /// Body of a log entry.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntryBody {
@@ -118,6 +203,8 @@ pub enum EntryBody {
     Fact(Fact),
     /// A registry event.
     Registry(RegistryEvent),
+    /// A routing change.
+    Route(RouteChange),
 }
 
 /// A log entry: every entry, fact or registry event, has a position.
@@ -136,7 +223,7 @@ impl Entry {
     pub fn fact(&self) -> Option<&Fact> {
         match &self.body {
             EntryBody::Fact(f) => Some(f),
-            EntryBody::Registry(_) => None,
+            EntryBody::Registry(_) | EntryBody::Route(_) => None,
         }
     }
 }
@@ -466,6 +553,12 @@ pub enum Error {
     /// 1-minute resolution, or a tree checkpoint (§8 Restore step 2).
     #[error("restoring")]
     Restoring,
+    /// A routing change names a consumer that is not declared.
+    #[error("unknown consumer {0:?}")]
+    UnknownConsumer(ConsumerId),
+    /// A routing change is refused.
+    #[error("route refused: {0}")]
+    BadRoute(&'static str),
     /// A downloaded file holds a position whose content differs from the
     /// copy already local (§8 Restore step 3).
     #[error("file {file:?} holds {position} with different content")]
@@ -574,6 +667,173 @@ pub struct Observed {
     pub replayed: bool,
 }
 
+/// Identity of a delivery (§4 At-least-once): consumers de-duplicate fact
+/// deliveries by position and condition deliveries by `(funnel, sequence)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeliveryId {
+    /// A fact delivery.
+    Fact(Position),
+    /// A condition delivery.
+    Timer {
+        /// Funnel.
+        funnel: FunnelId,
+        /// Per-funnel sequence.
+        sequence: u64,
+    },
+    /// `generation_changed` (at most one per consumer session).
+    GenerationChanged,
+    /// `resync` (at most one per consumer session).
+    Resync,
+}
+
+/// What produced a condition delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerCause {
+    /// An evaluation on a routed fact at commit (§6 Cadence).
+    Fact,
+    /// An evaluation on the funnel's timer (§4 Timers, §6 Cadence).
+    Timer,
+    /// Re-attaching to live after catch-up, when the present state differs
+    /// from the last state emitted (see `OPEN-QUESTIONS.md`).
+    Reattach,
+}
+
+/// A transition of a condition funnel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trigger {
+    /// Funnel.
+    pub funnel: FunnelId,
+    /// Per-funnel sequence, never repeated for the funnel (§4 Order).
+    pub sequence: u64,
+    /// The state the transition leads to.
+    pub state: ConditionState,
+    /// What produced it.
+    pub cause: TriggerCause,
+}
+
+/// Condition state in a `resync`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionNow {
+    /// The condition state evaluated now.
+    pub state: ConditionState,
+    /// Whether it differs from the latch, or there is no latch to compare
+    /// (§4 Resync, §6 Restart and resume): a transition, to be acted on.
+    pub transition: bool,
+}
+
+/// One funnel's part of a `resync`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunnelState {
+    /// Funnel.
+    pub funnel: FunnelId,
+    /// Live state (§2.3) of each selected series.
+    pub live: Vec<(SeriesId, Option<Fact>)>,
+    /// Condition state, for a condition funnel.
+    pub condition: Option<ConditionNow>,
+}
+
+/// A `resync` delivery (§4 Resync).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resync {
+    /// Every funnel in force, in funnel order.
+    pub funnels: Vec<FunnelState>,
+    /// The positions `(after, up_to]` it was sent instead of replaying,
+    /// when the cursor was too far behind for catch-up from local log
+    /// segments (§4 Resync, §8 Behind consumers).
+    pub replaced: Option<(Position, Position)>,
+}
+
+/// What a delivery carries.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeliveryKind {
+    /// A fact.
+    Fact(Fact),
+    /// A condition transition.
+    Trigger(Trigger),
+    /// The store was restored and started a new generation (§8 Restore
+    /// step 2).
+    GenerationChanged {
+        /// The cursor the consumer kept from before the restore.
+        cursor: Option<Position>,
+        /// The last restored position.
+        restored_end: Position,
+    },
+    /// Live and condition state now.
+    Resync(Resync),
+}
+
+/// A delivery of any kind, in the order the consumer receives it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Envelope {
+    /// For a fact, its position; for a condition delivery, the last
+    /// committed position at evaluation (§4 Order); for `resync`, the
+    /// position up to which the stream before it is complete; for
+    /// `generation_changed`, the restored end.
+    pub position: Position,
+    /// Produced during catch-up (§4 Replay); facts only.
+    pub replayed: bool,
+    /// Content.
+    pub kind: DeliveryKind,
+}
+
+impl Envelope {
+    /// The delivery's identity.
+    pub fn id(&self) -> DeliveryId {
+        match &self.kind {
+            DeliveryKind::Fact(_) => DeliveryId::Fact(self.position),
+            DeliveryKind::Trigger(t) => DeliveryId::Timer {
+                funnel: t.funnel,
+                sequence: t.sequence,
+            },
+            DeliveryKind::GenerationChanged { .. } => DeliveryId::GenerationChanged,
+            DeliveryKind::Resync(_) => DeliveryId::Resync,
+        }
+    }
+
+    /// The fact, for a fact delivery.
+    pub fn fact(&self) -> Option<&Fact> {
+        match &self.kind {
+            DeliveryKind::Fact(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// The `resync`, for a resync delivery.
+    pub fn resync(&self) -> Option<&Resync> {
+        match &self.kind {
+            DeliveryKind::Resync(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The trigger, for a condition delivery.
+    pub fn trigger(&self) -> Option<&Trigger> {
+        match &self.kind {
+            DeliveryKind::Trigger(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// A delivery as received, recorded by the model as an outside observer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Received {
+    /// Consumer session.
+    pub session: u32,
+    /// The delivery.
+    pub delivery: Envelope,
+}
+
+/// A condition funnel's latch (§6 Latch): the last state its consumer
+/// confirmed, and the position at which it was emitted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Latch {
+    /// State.
+    pub state: ConditionState,
+    /// Position of the delivery that carried it.
+    pub position: Position,
+}
+
 /// Result of a commit.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CommitReport {
@@ -634,6 +894,18 @@ pub struct Disk {
     pub tail_fate: Option<WriteOutcome>,
     /// Durable consumer cursors (last confirmed position).
     pub cursors: BTreeMap<ConsumerId, Position>,
+    /// Durable latches, one per condition funnel, written with the cursor
+    /// when the consumer confirms the delivery that carried the state (§4
+    /// Consumer state, §6 Latch).
+    pub latches: BTreeMap<(ConsumerId, FunnelId), Latch>,
+    /// The last sequence issued per condition funnel, written when a
+    /// condition delivery is issued, so a sequence is never issued twice for
+    /// a funnel, across restarts too (see `OPEN-QUESTIONS.md`).
+    pub sequences: BTreeMap<(ConsumerId, FunnelId), u64>,
+    /// `generation_changed` owed to each consumer after a restore (§8
+    /// Restore step 2): the cursor it kept and the restored end. Delivered
+    /// before its `resync`, after any catch-up to the restored end.
+    pub generation_changed: BTreeMap<ConsumerId, (Option<Position>, Position)>,
     /// Current generation (§2.2): 0 until a restore starts a new one (§8).
     pub generation: u32,
     /// The restored end (§8 Restore step 1): the last position before the
@@ -675,8 +947,8 @@ pub enum Signal {
         /// The last restored position.
         restored_end: Position,
     },
-    /// A `resync` is due (§4). Its contents (live state and condition state)
-    /// are not modelled yet.
+    /// A `resync` was queued (§4); the delivery itself is a
+    /// [`DeliveryKind::Resync`].
     ResyncDue,
 }
 
@@ -918,10 +1190,21 @@ enum Mode {
 #[derive(Clone, Debug)]
 struct ConsumerRt {
     decl: ConsumerDecl,
-    queue: VecDeque<Delivery>,
+    queue: VecDeque<Envelope>,
     mode: Mode,
     session: u32,
+    /// Highest position among the deliveries taken in this session.
     last_received: Position,
+    /// Deliveries taken in this session and not yet confirmed, in order.
+    unconfirmed: Vec<Envelope>,
+    /// On resume: catch-up replays up to `stop`, then `resync` (§6 Restart
+    /// and resume).
+    resume: Option<Position>,
+    /// Running conditions of the condition funnels in force; rebuilt on
+    /// resume, never replayed (§6).
+    runners: BTreeMap<FunnelId, Runner>,
+    /// The last state emitted per condition funnel in this session.
+    emitted: BTreeMap<FunnelId, ConditionState>,
 }
 
 /// State a crash discards.
@@ -937,6 +1220,8 @@ struct Volatile {
     /// Queued readings with their `revise` intent.
     queue: VecDeque<(Reading, bool)>,
     next_position: Position,
+    /// Routing changes by position (§4 Routing).
+    routes: BTreeMap<Position, RouteChange>,
     consumers: Vec<ConsumerRt>,
     /// Read-only for any cause: a failed write or sync, a drill, or a higher
     /// generation claimed.
@@ -952,6 +1237,7 @@ struct Volatile {
 struct Derived {
     registry: Registry,
     entries: BTreeMap<Position, Entry>,
+    routes: BTreeMap<Position, RouteChange>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
     history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>>,
@@ -988,8 +1274,13 @@ pub struct Model {
     pub counters: Counters,
     /// What each consumer has received, as observed from outside.
     pub observed: BTreeMap<ConsumerId, Vec<Observed>>,
-    /// Events other than fact deliveries each consumer has received.
+    /// `generation_changed` and `resync` issued to each consumer, in the
+    /// order they were queued.
     pub signals: BTreeMap<ConsumerId, Vec<Signal>>,
+    /// Every delivery each consumer has received, of any kind, in order.
+    pub received: BTreeMap<ConsumerId, Vec<Received>>,
+    /// Every delivery each consumer has confirmed, in order.
+    pub confirmed: BTreeMap<ConsumerId, Vec<Envelope>>,
     /// Host wall clock (may jump).
     pub wall: Nanos,
     /// Monotonic clock (only advances).
@@ -1018,6 +1309,8 @@ impl Model {
             counters: Counters::default(),
             observed: BTreeMap::new(),
             signals: BTreeMap::new(),
+            received: BTreeMap::new(),
+            confirmed: BTreeMap::new(),
             wall,
             mono: 0,
             now: wall,
@@ -1123,34 +1416,42 @@ impl Model {
             .next_back()
             .filter(|p| p.generation == generation)
             .map_or(Position::first(generation), |p| p.next());
-        let consumers = self
-            .consumers
-            .iter()
-            .map(|c| {
-                let s = self.sessions.entry(c.id).or_insert(0);
-                *s += 1;
-                let cursor = self
-                    .disk
-                    .cursors
-                    .get(&c.id)
-                    .copied()
-                    .unwrap_or(Position::ORIGIN);
-                ConsumerRt {
-                    decl: c.clone(),
-                    queue: VecDeque::new(),
-                    // A consumer that is behind catches up from its cursor.
-                    mode: if d.entries.range(cursor.next()..).next().is_some() {
-                        Mode::CatchUp {
-                            next: cursor.next(),
-                        }
-                    } else {
-                        Mode::Live
-                    },
-                    session: *s,
-                    last_received: cursor,
+        // A consumer that is behind catches up from its cursor. Every later
+        // start is a resume (§6 Restart and resume): replay, then `resync`.
+        let mut resuming = Vec::new();
+        let mut consumers = Vec::new();
+        for (i, c) in self.consumers.iter().enumerate() {
+            let s = self.sessions.entry(c.id).or_insert(0);
+            *s += 1;
+            let cursor = self
+                .disk
+                .cursors
+                .get(&c.id)
+                .copied()
+                .unwrap_or(Position::ORIGIN);
+            let behind = d.entries.range(cursor.next()..).next().is_some();
+            let mode = if *s == 1 && behind {
+                Mode::CatchUp {
+                    next: cursor.next(),
                 }
-            })
-            .collect();
+            } else {
+                Mode::Live
+            };
+            if *s > 1 {
+                resuming.push((i, cursor));
+            }
+            consumers.push(ConsumerRt {
+                decl: c.clone(),
+                queue: VecDeque::new(),
+                mode,
+                session: *s,
+                last_received: cursor,
+                unconfirmed: Vec::new(),
+                resume: None,
+                runners: BTreeMap::new(),
+                emitted: BTreeMap::new(),
+            });
+        }
         self.vol = Some(Volatile {
             registry: d.registry,
             entries: d.entries,
@@ -1160,12 +1461,16 @@ impl Model {
             trees: d.trees,
             queue: VecDeque::new(),
             next_position,
+            routes: d.routes,
             consumers,
             read_only: sync_failed || self.disk.drill || self.disk.superseded,
             sync_failed,
             skew_run: BTreeMap::new(),
             restore: d.restore,
         });
+        for (i, cursor) in resuming {
+            self.begin_resume(i, cursor);
+        }
     }
 
     /// Derives registry, views, duplicate history and trees from the disk
@@ -1178,11 +1483,15 @@ impl Model {
         let cp = restoring.and_then(|r| r.checkpoint.as_ref());
         let since = cp.map_or(Position::ORIGIN, |c| c.position);
         let mut registry = cp.map_or_else(Registry::default, |c| c.registry.clone());
+        let mut routes = BTreeMap::new();
         let mut facts = Vec::new();
         for (p, e) in &entries {
             match &e.body {
                 EntryBody::Registry(r) if *p > since => registry.apply(r),
                 EntryBody::Registry(_) => {}
+                EntryBody::Route(r) => {
+                    routes.insert(*p, r.clone());
+                }
                 EntryBody::Fact(f) => facts.push(f.clone()),
             }
         }
@@ -1220,6 +1529,7 @@ impl Model {
         Derived {
             registry,
             entries,
+            routes,
             current,
             newest_t,
             history,
@@ -1235,6 +1545,7 @@ impl Model {
         if let Some(v) = self.vol.as_mut() {
             v.registry = d.registry;
             v.entries = d.entries;
+            v.routes = d.routes;
             v.current = d.current;
             v.newest_t = d.newest_t;
             v.history = d.history;
@@ -1760,6 +2071,7 @@ impl Model {
                 return Err(Error::Crashed);
             }
             self.deliver_live(i, &batch);
+            self.evaluate_funnels(i, Some(&batch));
         }
         if stop_after.is_some_and(|n| n >= n_consumers) {
             self.crash();
@@ -1918,23 +2230,139 @@ impl Model {
             .any(|f| self.disk.files[f].class == FileClass::Current && !self.disk.hot.contains(f))
     }
 
+    // ----- routing (§4 Routing) -----
+
+    /// Adds a funnel to a consumer at run time: a log entry that takes effect
+    /// at its position (§4 Routing). Facts at later positions are routed by
+    /// it, in live delivery and in catch-up alike; a condition funnel starts
+    /// with no latch and a fresh condition, and is first evaluated on the
+    /// next routed fact or timer.
+    pub fn add_route(
+        &mut self,
+        consumer: ConsumerId,
+        funnel: FunnelId,
+        spec: Funnel,
+    ) -> Result<Position, Error> {
+        let decl = self
+            .consumers
+            .iter()
+            .find(|c| c.id == consumer)
+            .ok_or(Error::UnknownConsumer(consumer))?;
+        let v = self.vol()?;
+        if routes_in_force(decl, &v.routes, None).contains_key(&funnel) {
+            return Err(Error::BadRoute("funnel already in force"));
+        }
+        match (&spec.operator, &spec.condition) {
+            (Some(_), None) => {
+                return Err(Error::BadRoute(
+                    "an operator without a condition is not modelled",
+                ));
+            }
+            (_, Some(_)) => {
+                let s = spec
+                    .series()
+                    .ok_or(Error::BadRoute("a condition funnel selects one series"))?;
+                if v.registry.get(s).is_none() {
+                    return Err(Error::BadRoute("unknown series"));
+                }
+            }
+            (None, None) => {}
+        }
+        self.commit_route(RouteChange::Add {
+            consumer,
+            funnel,
+            spec,
+        })
+    }
+
+    /// Removes a funnel from a consumer at run time; it routes nothing at
+    /// later positions (§4 Routing). Its latch is dropped.
+    pub fn remove_route(
+        &mut self,
+        consumer: ConsumerId,
+        funnel: FunnelId,
+    ) -> Result<Position, Error> {
+        let decl = self
+            .consumers
+            .iter()
+            .find(|c| c.id == consumer)
+            .ok_or(Error::UnknownConsumer(consumer))?;
+        if !routes_in_force(decl, &self.vol()?.routes, None).contains_key(&funnel) {
+            return Err(Error::BadRoute("funnel not in force"));
+        }
+        let p = self.commit_route(RouteChange::Remove { consumer, funnel })?;
+        self.disk.latches.remove(&(consumer, funnel));
+        Ok(p)
+    }
+
+    /// The funnels of a consumer in force now.
+    pub fn routes(&self, consumer: ConsumerId) -> Result<BTreeMap<FunnelId, Funnel>, Error> {
+        let decl = self
+            .consumers
+            .iter()
+            .find(|c| c.id == consumer)
+            .ok_or(Error::UnknownConsumer(consumer))?;
+        Ok(routes_in_force(decl, &self.vol()?.routes, None))
+    }
+
+    fn commit_route(&mut self, change: RouteChange) -> Result<Position, Error> {
+        let wall = self.wall;
+        let v = self.vol_mut()?;
+        if v.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let position = v.next_position;
+        v.next_position = position.next();
+        let entry = Entry {
+            position,
+            received_at: wall,
+            body: EntryBody::Route(change.clone()),
+        };
+        // Durable first; only then does routing see the change.
+        self.append_batch(vec![entry.clone()]);
+        self.sync_mark();
+        let v = self.vol_mut()?;
+        v.entries.insert(position, entry);
+        v.routes.insert(position, change);
+        for i in 0..v.consumers.len() {
+            self.sync_runners(i);
+        }
+        self.maybe_seal();
+        Ok(position)
+    }
+
     // ----- delivery -----
+
+    fn consumer_index(&self, id: ConsumerId) -> Option<usize> {
+        self.vol
+            .as_ref()?
+            .consumers
+            .iter()
+            .position(|c| c.decl.id == id)
+    }
+
+    /// The last committed position, or `None` before the first.
+    fn head(&self) -> Option<Position> {
+        self.vol
+            .as_ref()
+            .and_then(|v| v.entries.keys().next_back().copied())
+    }
 
     fn deliver_live(&mut self, i: usize, batch: &[Entry]) {
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
         for e in batch {
             let Some(f) = e.fact() else { continue };
-            if !c.decl.selection.matches(f.series) {
+            if !routed(&c.decl, &v.routes, f) {
                 continue;
             }
             match c.mode {
                 Mode::Live => {
                     if c.queue.len() < c.decl.capacity {
-                        c.queue.push_back(Delivery {
+                        c.queue.push_back(Envelope {
                             position: e.position,
-                            fact: f.clone(),
                             replayed: false,
+                            kind: DeliveryKind::Fact(f.clone()),
                         });
                     } else {
                         // Catch up from the first position not enqueued
@@ -1948,87 +2376,454 @@ impl Model {
         }
     }
 
-    /// Engine-side catch-up for a consumer: reads up to `max` log entries from
-    /// its catch-up position into its queue, flagged `replayed`. Switches back
-    /// to live once it reaches the head.
-    pub fn catch_up(&mut self, id: ConsumerId, max: usize) -> Result<(), Error> {
-        let v = self.vol_mut()?;
-        let Some(c) = v.consumers.iter_mut().find(|c| c.decl.id == id) else {
-            return Ok(());
-        };
-        let Mode::CatchUp { mut next } = c.mode else {
-            return Ok(());
-        };
-        // Entries in position order from `next`, across generations.
-        let mut at_head = true;
-        for (reads, (p, e)) in v.entries.range(next..).enumerate() {
-            if reads >= max || c.queue.len() >= c.decl.capacity {
-                at_head = false;
-                next = *p;
-                break;
-            }
-            if let Some(f) = e.fact()
-                && c.decl.selection.matches(f.series)
-            {
-                c.queue.push_back(Delivery {
-                    position: *p,
-                    fact: f.clone(),
-                    replayed: true,
-                });
-            }
-            next = p.next();
+    /// Creates a condition for each condition funnel in force that has none
+    /// and drops those of funnels no longer in force. A consumer waiting for
+    /// its `resync` gets its conditions there instead.
+    fn sync_runners(&mut self, i: usize) {
+        let mono = self.mono;
+        let v = self.vol.as_mut().expect("up");
+        let c = &mut v.consumers[i];
+        if c.resume.is_some() {
+            return;
         }
-        c.mode = if at_head {
-            Mode::Live
-        } else {
-            Mode::CatchUp { next }
-        };
+        let funnels = routes_in_force(&c.decl, &v.routes, None);
+        c.runners.retain(|f, _| funnels.contains_key(f));
+        c.emitted.retain(|f, _| funnels.contains_key(f));
+        for (id, f) in funnels {
+            if let Some(cond) = f.condition
+                && !c.runners.contains_key(&id)
+            {
+                let r = Runner::new(cond, mono);
+                c.emitted.insert(id, r.state());
+                c.runners.insert(id, r);
+            }
+        }
+    }
+
+    /// The value a condition funnel's condition sees now: the operator over
+    /// its window ending at `now`, or without an operator the live-state
+    /// value (§2.3).
+    fn funnel_value(&self, f: &Funnel) -> Option<f64> {
+        let s = f.series()?;
+        match &f.operator {
+            Some(op) => self
+                .window(s, self.now - op.width, self.now)
+                .ok()?
+                .aggregate(&op.aggregate)?
+                .to_f64(),
+            None => match self.latest(s).ok()??.value {
+                Value::Num(x) => Some(x),
+                _ => None,
+            },
+        }
+    }
+
+    /// Evaluates a consumer's condition funnels: on a committed batch (those
+    /// whose series has a fact in it) or on the timer (all of them). Replayed
+    /// facts never reach a condition (§4 Replay). A consumer waiting for its
+    /// `resync` is not evaluated; its conditions are rebuilt then (§6).
+    fn evaluate_funnels(&mut self, i: usize, batch: Option<&[Entry]>) {
+        if self.vol.as_ref().expect("up").consumers[i].resume.is_some() {
+            return;
+        }
+        self.sync_runners(i);
+        let v = self.vol.as_ref().expect("up");
+        let c = &v.consumers[i];
+        let funnels = routes_in_force(&c.decl, &v.routes, None);
+        for (id, f) in funnels {
+            let Some(s) = f.series().filter(|_| f.condition.is_some()) else {
+                continue;
+            };
+            let arrived = batch.map(|b| b.iter().filter_map(Entry::fact).any(|x| x.series == s));
+            if arrived == Some(false) {
+                continue;
+            }
+            let value = self.funnel_value(&f);
+            let mono = self.mono;
+            let runner = self.vol.as_mut().expect("up").consumers[i]
+                .runners
+                .get_mut(&id)
+                .expect("runner for condition funnel");
+            let mut events = Vec::new();
+            if arrived == Some(true) {
+                events.extend(runner.on_arrival(mono));
+            }
+            events.extend(runner.on_value(mono, value));
+            if batch.is_none() {
+                events.extend(runner.on_tick(mono));
+            }
+            let cause = if batch.is_some() {
+                TriggerCause::Fact
+            } else {
+                TriggerCause::Timer
+            };
+            for e in events {
+                self.emit_trigger(i, id, e.state(), cause);
+            }
+        }
+    }
+
+    /// Issues a condition delivery with the funnel's next sequence and the
+    /// last committed position (§4 Order). A consumer that is catching up,
+    /// or whose queue is full, is not sent it: the state is not emitted, and
+    /// a full queue switches the consumer to catch-up (§4 Overflow). On
+    /// re-attaching it receives the present state if that differs from the
+    /// last emitted (see `OPEN-QUESTIONS.md`).
+    fn emit_trigger(
+        &mut self,
+        i: usize,
+        funnel: FunnelId,
+        state: ConditionState,
+        cause: TriggerCause,
+    ) {
+        let head = self.head().unwrap_or(Position::ORIGIN);
+        let v = self.vol.as_mut().expect("up");
+        let c = &mut v.consumers[i];
+        if !matches!(c.mode, Mode::Live) {
+            return;
+        }
+        if c.queue.len() >= c.decl.capacity {
+            c.mode = Mode::CatchUp { next: head.next() };
+            self.counters.overflows += 1;
+            return;
+        }
+        let seq = self.disk.sequences.entry((c.decl.id, funnel)).or_insert(0);
+        *seq += 1;
+        c.queue.push_back(Envelope {
+            position: head,
+            replayed: false,
+            kind: DeliveryKind::Trigger(Trigger {
+                funnel,
+                sequence: *seq,
+                state: state.clone(),
+                cause,
+            }),
+        });
+        c.emitted.insert(funnel, state);
+    }
+
+    /// Evaluates every condition funnel on its timer (§4 Timers, §6 Cadence:
+    /// every second by default; the model evaluates when called). Timers use
+    /// the monotonic clock.
+    pub fn tick(&mut self) -> Result<(), Error> {
+        let n = self.vol()?.consumers.len();
+        for i in 0..n {
+            self.evaluate_funnels(i, None);
+        }
         Ok(())
     }
 
-    /// The consumer takes up to `max` deliveries from its queue.
-    pub fn poll(&mut self, id: ConsumerId, max: usize) -> Result<Vec<Delivery>, Error> {
+    /// Positions held by log segments on a local tier (hot or cold).
+    fn local_log_positions(&self) -> BTreeSet<Position> {
+        let mut out = BTreeSet::new();
+        for f in self.disk.published() {
+            let file = &self.disk.files[&f];
+            let local = self.disk.locality(f) == Locality::Hot
+                || (self.disk.cold.contains(&f) && !self.disk.quarantined.contains(&f));
+            if file.class == FileClass::Segment && local {
+                out.extend(
+                    self.disk
+                        .visible_entries(f, file)
+                        .iter()
+                        .map(|e| e.position),
+                );
+            }
+        }
+        out
+    }
+
+    /// Starts a consumer's resume after downtime (§6 Restart and resume): the
+    /// entries after its cursor up to the last committed position are
+    /// replayed through catch-up, then `resync` follows. If any of them is
+    /// not in a local log segment, the cursor is too far behind: `resync`
+    /// replaces the replay (§4 Resync, §8 Behind consumers). After a §3
+    /// Recovery rule 3 recovery the last committed position is the last kept
+    /// batch, so the one `resync` serves both rules.
+    fn begin_resume(&mut self, i: usize, cursor: Position) {
+        let stop = self.head().unwrap_or(cursor).max(cursor);
+        let local = self.local_log_positions();
+        let v = self.vol.as_mut().expect("up");
+        let behind: Vec<Position> = v.entries.range(cursor.next()..).map(|(p, _)| *p).collect();
+        let c = &mut v.consumers[i];
+        if behind.is_empty() {
+            c.mode = Mode::Live;
+            self.issue_resync(i, stop, None);
+        } else if behind.iter().all(|p| local.contains(p)) {
+            c.mode = Mode::CatchUp {
+                next: cursor.next(),
+            };
+            c.resume = Some(stop);
+        } else {
+            c.mode = Mode::Live;
+            self.issue_resync(i, stop, Some((cursor, stop)));
+        }
+    }
+
+    /// Queues any `generation_changed` owed, then `resync` with the live
+    /// state and the condition state now of every funnel in force (§4
+    /// Resync). Conditions are rebuilt as of now from the latch on disk; a
+    /// state that differs from the latch, or with no latch, is a transition.
+    fn issue_resync(
+        &mut self,
+        i: usize,
+        position: Position,
+        replaced: Option<(Position, Position)>,
+    ) {
+        let v = self.vol.as_ref().expect("up");
+        let decl = v.consumers[i].decl.clone();
+        let funnels = routes_in_force(&decl, &v.routes, None);
+        let mut states = Vec::new();
+        let mut runners = BTreeMap::new();
+        let mut emitted = BTreeMap::new();
+        for (id, f) in &funnels {
+            let series: Vec<SeriesId> = match &f.selection {
+                Selection::All => v.registry.all().map(|d| d.id).collect(),
+                Selection::Series(set) => set.iter().copied().collect(),
+            };
+            let live = series
+                .into_iter()
+                .map(|s| (s, self.latest(s).ok().flatten()))
+                .collect();
+            let condition = f.condition.as_ref().map(|cond| {
+                let latch = self.disk.latches.get(&(decl.id, *id)).map(|l| &l.state);
+                let runner = Runner::resume(cond.clone(), self.mono, self.funnel_value(f), latch);
+                let state = runner.state();
+                let transition = cond.is_transition(&state, latch);
+                runners.insert(*id, runner);
+                emitted.insert(*id, state.clone());
+                ConditionNow { state, transition }
+            });
+            states.push(FunnelState {
+                funnel: *id,
+                live,
+                condition,
+            });
+        }
+        let gc = self.disk.generation_changed.remove(&decl.id);
+        let signals = self.signals.entry(decl.id).or_default();
+        let v = self.vol.as_mut().expect("up");
+        let c = &mut v.consumers[i];
+        if let Some((cursor, restored_end)) = gc {
+            c.queue.push_back(Envelope {
+                position: restored_end,
+                replayed: false,
+                kind: DeliveryKind::GenerationChanged {
+                    cursor,
+                    restored_end,
+                },
+            });
+            signals.push(Signal::GenerationChanged {
+                cursor,
+                restored_end,
+            });
+        }
+        c.queue.push_back(Envelope {
+            position,
+            replayed: false,
+            kind: DeliveryKind::Resync(Resync {
+                funnels: states,
+                replaced,
+            }),
+        });
+        signals.push(Signal::ResyncDue);
+        c.runners = runners;
+        c.emitted = emitted;
+        c.resume = None;
+    }
+
+    /// On re-attaching to live after catch-up, a condition whose present
+    /// state differs from the last state emitted to the consumer is sent now.
+    fn reattach(&mut self, i: usize) {
+        let c = &self.vol.as_ref().expect("up").consumers[i];
+        let changed: Vec<(FunnelId, ConditionState)> = c
+            .runners
+            .iter()
+            .filter(|(id, r)| c.emitted.get(id) != Some(&r.state()))
+            .map(|(id, r)| (*id, r.state()))
+            .collect();
+        for (id, state) in changed {
+            self.emit_trigger(i, id, state, TriggerCause::Reattach);
+        }
+    }
+
+    /// Engine-side catch-up for a consumer: reads up to `max` log entries from
+    /// its catch-up position into its queue, applying the routes in force at
+    /// each position, flagged `replayed`. On resume it stops at the last
+    /// position committed before the resume to queue `resync`. Switches back
+    /// to live once it reaches the head.
+    pub fn catch_up(&mut self, id: ConsumerId, max: usize) -> Result<(), Error> {
+        self.vol()?;
+        let Some(i) = self.consumer_index(id) else {
+            return Ok(());
+        };
+        let mut reads = 0usize;
+        loop {
+            let v = self.vol.as_mut().expect("up");
+            let c = &mut v.consumers[i];
+            let Mode::CatchUp { mut next } = c.mode else {
+                return Ok(());
+            };
+            // Entries in position order from `next`, across generations.
+            let mut paused = false;
+            for (p, e) in v.entries.range(next..) {
+                if c.resume.is_some_and(|stop| *p > stop) {
+                    break;
+                }
+                if reads >= max || c.queue.len() >= c.decl.capacity {
+                    paused = true;
+                    break;
+                }
+                reads += 1;
+                if let Some(f) = e.fact()
+                    && routed(&c.decl, &v.routes, f)
+                {
+                    c.queue.push_back(Envelope {
+                        position: *p,
+                        replayed: true,
+                        kind: DeliveryKind::Fact(f.clone()),
+                    });
+                }
+                next = p.next();
+            }
+            c.mode = Mode::CatchUp { next };
+            if paused {
+                return Ok(());
+            }
+            if let Some(stop) = c.resume {
+                self.issue_resync(i, stop, None);
+                continue;
+            }
+            c.mode = Mode::Live;
+            self.reattach(i);
+            return Ok(());
+        }
+    }
+
+    /// Takes up to `max` deliveries of any kind from the consumer's queue.
+    pub fn receive(&mut self, id: ConsumerId, max: usize) -> Result<Vec<Envelope>, Error> {
         let v = self.vol_mut()?;
         let Some(c) = v.consumers.iter_mut().find(|c| c.decl.id == id) else {
             return Ok(Vec::new());
         };
         let n = max.min(c.queue.len());
-        let out: Vec<Delivery> = c.queue.drain(..n).collect();
+        let out: Vec<Envelope> = c.queue.drain(..n).collect();
         let session = c.session;
-        if let Some(d) = out.last() {
-            c.last_received = d.position;
+        for d in &out {
+            c.last_received = c.last_received.max(d.position);
         }
+        c.unconfirmed.extend(out.iter().cloned());
         let obs = self.observed.entry(id).or_default();
         for d in &out {
-            obs.push(Observed {
-                session,
-                position: d.position,
-                replayed: d.replayed,
-            });
+            if d.fact().is_some() {
+                obs.push(Observed {
+                    session,
+                    position: d.position,
+                    replayed: d.replayed,
+                });
+            }
         }
+        self.received
+            .entry(id)
+            .or_default()
+            .extend(out.iter().map(|d| Received {
+                session,
+                delivery: d.clone(),
+            }));
         Ok(out)
     }
 
-    /// The consumer confirms it has processed everything up to `p`; the cursor
-    /// is durable at once.
+    /// The consumer takes up to `max` deliveries from its queue; the fact
+    /// deliveries among them are returned (see [`Model::receive`] for all).
+    pub fn poll(&mut self, id: ConsumerId, max: usize) -> Result<Vec<Delivery>, Error> {
+        Ok(self
+            .receive(id, max)?
+            .into_iter()
+            .filter_map(|d| match d.kind {
+                DeliveryKind::Fact(fact) => Some(Delivery {
+                    position: d.position,
+                    fact,
+                    replayed: d.replayed,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The consumer confirms it has processed everything up to `p`: every
+    /// delivery taken in this session at or before `p`. The cursor, and the
+    /// latch of each condition funnel whose state those deliveries carried,
+    /// are durable at once.
     pub fn confirm(&mut self, id: ConsumerId, p: Position) -> Result<(), Error> {
-        let v = self.vol()?;
-        let c = v
-            .consumers
-            .iter()
-            .find(|c| c.decl.id == id)
-            .ok_or(Error::BadConfirm)?;
+        let i = self.consumer_index(id).ok_or(Error::BadConfirm)?;
+        let c = &self.vol()?.consumers[i];
         if p > c.last_received {
             return Err(Error::BadConfirm);
         }
-        let cur = self.disk.cursors.entry(id).or_insert(Position::ORIGIN);
-        *cur = (*cur).max(p);
+        let n = c.unconfirmed.iter().take_while(|d| d.position <= p).count();
+        self.confirm_prefix(i, n, p);
         Ok(())
     }
 
+    /// The consumer confirms a delivery by its identity, and with it every
+    /// delivery taken before it in this session.
+    pub fn confirm_delivery(&mut self, id: ConsumerId, d: DeliveryId) -> Result<(), Error> {
+        let i = self.consumer_index(id).ok_or(Error::BadConfirm)?;
+        let c = &self.vol()?.consumers[i];
+        let n = c
+            .unconfirmed
+            .iter()
+            .rposition(|x| x.id() == d)
+            .ok_or(Error::BadConfirm)?
+            + 1;
+        let p = c.unconfirmed[..n]
+            .iter()
+            .map(|x| x.position)
+            .max()
+            .expect("non-empty");
+        self.confirm_prefix(i, n, p);
+        Ok(())
+    }
+
+    fn confirm_prefix(&mut self, i: usize, n: usize, p: Position) {
+        let v = self.vol.as_mut().expect("up");
+        let c = &mut v.consumers[i];
+        let id = c.decl.id;
+        let done: Vec<Envelope> = c.unconfirmed.drain(..n).collect();
+        let funnels = routes_in_force(&c.decl, &v.routes, None);
+        let mut latch = |f: FunnelId, state: &ConditionState, position: Position| {
+            if funnels.get(&f).is_some_and(|x| x.condition.is_some()) {
+                self.disk.latches.insert(
+                    (id, f),
+                    Latch {
+                        state: state.clone(),
+                        position,
+                    },
+                );
+            }
+        };
+        for d in &done {
+            match &d.kind {
+                DeliveryKind::Trigger(t) => latch(t.funnel, &t.state, d.position),
+                DeliveryKind::Resync(r) => {
+                    for f in &r.funnels {
+                        if let Some(cn) = &f.condition {
+                            latch(f.funnel, &cn.state, d.position);
+                        }
+                    }
+                }
+                DeliveryKind::Fact(_) | DeliveryKind::GenerationChanged { .. } => {}
+            }
+        }
+        let cur = self.disk.cursors.entry(id).or_insert(Position::ORIGIN);
+        *cur = (*cur).max(p);
+        self.confirmed.entry(id).or_default().extend(done);
+    }
+
     /// The consumer process restarted: its queue is dropped and it resumes
-    /// from its durable cursor in catch-up mode.
+    /// from its durable cursor: catch-up, then `resync` (§6 Restart and
+    /// resume, §9 rows 15 and 16).
     pub fn reconnect(&mut self, id: ConsumerId) -> Result<(), Error> {
+        self.vol()?;
         let cursor = self
             .disk
             .cursors
@@ -2038,15 +2833,18 @@ impl Model {
         let s = self.sessions.entry(id).or_insert(0);
         *s += 1;
         let session = *s;
-        let v = self.vol_mut()?;
-        if let Some(c) = v.consumers.iter_mut().find(|c| c.decl.id == id) {
-            c.queue.clear();
-            c.mode = Mode::CatchUp {
-                next: cursor.next(),
-            };
-            c.session = session;
-            c.last_received = cursor;
-        }
+        let Some(i) = self.consumer_index(id) else {
+            return Ok(());
+        };
+        let c = &mut self.vol_mut()?.consumers[i];
+        c.queue.clear();
+        c.unconfirmed.clear();
+        c.runners.clear();
+        c.emitted.clear();
+        c.resume = None;
+        c.session = session;
+        c.last_received = cursor;
+        self.begin_resume(i, cursor);
         Ok(())
     }
 
@@ -2059,17 +2857,17 @@ impl Model {
         })
     }
 
-    /// Runs catch-up, polling and confirming for every consumer until all are
-    /// live with empty queues.
+    /// Runs catch-up, receiving and confirming for every consumer until all
+    /// are live with empty queues.
     pub fn drain(&mut self) -> Result<(), Error> {
         let ids: Vec<ConsumerId> = self.consumers.iter().map(|c| c.id).collect();
         loop {
             let mut progress = false;
             for &id in &ids {
                 self.catch_up(id, usize::MAX)?;
-                let got = self.poll(id, usize::MAX)?;
+                let got = self.receive(id, usize::MAX)?;
                 if let Some(d) = got.last() {
-                    self.confirm(id, d.position)?;
+                    self.confirm_delivery(id, d.id())?;
                     progress = true;
                 }
             }
@@ -2803,13 +3601,7 @@ impl Model {
                         .all(|p| segments.contains(p))
             });
             self.disk.cursors.insert(id, continues.unwrap_or(end));
-            self.signals.entry(id).or_default().extend([
-                Signal::GenerationChanged {
-                    cursor,
-                    restored_end: end,
-                },
-                Signal::ResyncDue,
-            ]);
+            self.disk.generation_changed.insert(id, (cursor, end));
         }
         self.disk
             .restore
@@ -2838,6 +3630,8 @@ impl Model {
                 self.disk = fresh.disk;
                 self.vol = fresh.vol;
                 self.signals = fresh.signals;
+                self.received = fresh.received;
+                self.confirmed = fresh.confirmed;
                 self.sessions = fresh.sessions;
             }
             Err(e) => {
@@ -3147,6 +3941,43 @@ fn download_rank(class: FileClass) -> u8 {
 
 fn params_of(d: &SeriesDef) -> Params {
     Params::new(d.kind, d.staleness)
+}
+
+/// The funnels of a consumer in force at `before` (routing changes at
+/// earlier positions applied), or now with `None` (§4 Routing).
+fn routes_in_force(
+    decl: &ConsumerDecl,
+    routes: &BTreeMap<Position, RouteChange>,
+    before: Option<Position>,
+) -> BTreeMap<FunnelId, Funnel> {
+    let mut out = BTreeMap::from([(FunnelId::CONFIGURED, Funnel::facts(decl.selection.clone()))]);
+    for (p, change) in routes {
+        if before.is_some_and(|b| *p >= b) {
+            break;
+        }
+        match change {
+            RouteChange::Add {
+                consumer,
+                funnel,
+                spec,
+            } if *consumer == decl.id => {
+                out.insert(*funnel, spec.clone());
+            }
+            RouteChange::Remove { consumer, funnel } if *consumer == decl.id => {
+                out.remove(funnel);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a fact is routed to a consumer by a funnel without a condition in
+/// force at its position.
+fn routed(decl: &ConsumerDecl, routes: &BTreeMap<Position, RouteChange>, f: &Fact) -> bool {
+    routes_in_force(decl, routes, Some(f.position))
+        .values()
+        .any(|x| x.condition.is_none() && x.selection.matches(f.series))
 }
 
 fn build_trees(

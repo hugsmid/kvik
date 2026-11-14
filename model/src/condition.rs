@@ -56,6 +56,44 @@ pub enum Event {
     Changed(f64),
 }
 
+/// The state of a condition as a latch holds it and a `resync` reports it
+/// (§4 Resync, §6 Latch).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConditionState {
+    /// Threshold, held-for and stale-for: whether the condition is true.
+    Active(bool),
+    /// On change: the last value delivered (`None` before any value).
+    Value(Option<f64>),
+}
+
+impl Event {
+    /// The condition state this event delivers.
+    pub fn state(&self) -> ConditionState {
+        match self {
+            Event::Fired => ConditionState::Active(true),
+            Event::Cleared => ConditionState::Active(false),
+            Event::Changed(v) => ConditionState::Value(Some(*v)),
+        }
+    }
+}
+
+impl Condition {
+    /// Whether `now` is a transition from the latched state: always with no
+    /// latch to compare (§4 Resync); for on-change, a move beyond the
+    /// dead-band; otherwise any difference.
+    pub fn is_transition(&self, now: &ConditionState, latch: Option<&ConditionState>) -> bool {
+        let Some(latch) = latch else { return true };
+        match (self, now, latch) {
+            (
+                Condition::OnChange { deadband },
+                ConditionState::Value(Some(a)),
+                ConditionState::Value(Some(b)),
+            ) => (a - b).abs() > *deadband,
+            _ => now != latch,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum State {
     Threshold { active: bool },
@@ -93,9 +131,9 @@ impl Runner {
     /// Rebuilds a runner after a restart from what the tree knows (§6 "Restart"):
     /// `history` is the operator's value sequence up to now (oldest first) and
     /// `now_value` its value now. A condition that is true now is treated as
-    /// having fired already, so it does not fire again until it clears
-    /// The specification replaces this with a persisted latch and `resync`
-    /// (§6); see "Where the model differs" in `OPEN-QUESTIONS.md`.
+    /// having fired already, so it does not fire again until it clears. The
+    /// engine resumes condition funnels with [`Runner::resume`], from the
+    /// persisted latch (§6).
     pub fn rebuild(cond: Condition, mono: Nanos, history: &[f64], now_value: Option<f64>) -> Self {
         let state = match &cond {
             Condition::Threshold { on, clear } => {
@@ -126,6 +164,55 @@ impl Runner {
             },
         };
         Runner { cond, state }
+    }
+
+    /// Rebuilds a runner on resume (§6 Restart and resume) from the
+    /// operator's value now and the latch, if any. A condition with memory is
+    /// not fully determined by the value now (see `OPEN-QUESTIONS.md`); the
+    /// model resolves it as follows. Threshold: true above `on`, false below
+    /// `clear`, and between them the latched state (false with no latch).
+    /// On change: the value now. Held for: true only if the value is above
+    /// now and the latch is true; otherwise the hold starts now. Stale for:
+    /// not fired, with the last arrival taken as now (see Q-16).
+    pub fn resume(
+        cond: Condition,
+        mono: Nanos,
+        now_value: Option<f64>,
+        latch: Option<&ConditionState>,
+    ) -> Self {
+        let latched = matches!(latch, Some(ConditionState::Active(true)));
+        let state = match &cond {
+            Condition::Threshold { on, clear } => State::Threshold {
+                active: match now_value {
+                    Some(v) if v > *on => true,
+                    Some(v) if v < *clear => false,
+                    _ => latched,
+                },
+            },
+            Condition::OnChange { .. } => State::OnChange {
+                reference: now_value,
+            },
+            Condition::HeldFor { above, .. } => {
+                let above_now = now_value.is_some_and(|v| v > *above);
+                State::HeldFor {
+                    since: above_now.then_some(mono),
+                    fired: above_now && latched,
+                }
+            }
+            Condition::StaleFor { .. } => State::StaleFor {
+                last_arrival: mono,
+                fired: false,
+            },
+        };
+        Runner { cond, state }
+    }
+
+    /// The condition's present state.
+    pub fn state(&self) -> ConditionState {
+        match &self.state {
+            State::OnChange { reference } => ConditionState::Value(*reference),
+            _ => ConditionState::Active(self.active()),
+        }
     }
 
     /// Whether the condition is currently active (fired and not cleared).

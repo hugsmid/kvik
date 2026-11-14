@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kvik_model::engine::{
-    CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, Fault, Model, Selection,
-    WriteOutcome,
+    CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryKind, Envelope, Fault,
+    Model, Selection, WriteOutcome,
 };
 use kvik_model::summary::Params;
 use kvik_model::types::{
@@ -382,6 +382,47 @@ pub fn observed_positions(m: &Model, c: u32) -> BTreeSet<Position> {
         .get(&ConsumerId(c))
         .map(|o| o.iter().map(|x| x.position).collect())
         .unwrap_or_default()
+}
+
+/// The ranges `(after, up_to]` that a `resync` delivered to consumer `c`
+/// replaced, because its cursor was too far behind for catch-up (§4 Resync).
+pub fn resync_replaced(m: &Model, c: u32) -> Vec<(Position, Position)> {
+    m.received
+        .get(&ConsumerId(c))
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.delivery.resync().and_then(|x| x.replaced))
+        .collect()
+}
+
+/// What consumer `c` received in `session`, in order.
+pub fn session_stream(m: &Model, c: ConsumerId, session: u32) -> Vec<Envelope> {
+    m.received
+        .get(&c)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.session == session)
+        .map(|r| r.delivery.clone())
+        .collect()
+}
+
+/// A short label per delivery: `F<seq>` for a fact (`R<seq>` if replayed),
+/// `T<funnel>:<sequence>` for a condition delivery, `G` for
+/// `generation_changed`, `S` for `resync`. Positions must be in generation 0.
+pub fn labels(stream: &[Envelope]) -> Vec<String> {
+    stream
+        .iter()
+        .map(|d| match &d.kind {
+            DeliveryKind::Fact(_) => format!(
+                "{}{}",
+                if d.replayed { "R" } else { "F" },
+                seqs([d.position])[0]
+            ),
+            DeliveryKind::Trigger(t) => format!("T{}:{}", t.funnel.0, t.sequence),
+            DeliveryKind::GenerationChanged { .. } => "G".into(),
+            DeliveryKind::Resync(_) => "S".into(),
+        })
+        .collect()
 }
 
 /// Restarts the engine if it is down, read-only, or has batches past the

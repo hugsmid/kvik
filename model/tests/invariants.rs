@@ -159,7 +159,8 @@ proptest! {
     }
 
     /// 2. Every delivered position is durable; every durable position is
-    /// eventually delivered to each matching consumer.
+    /// eventually delivered to each matching consumer, or superseded by a
+    /// `resync` delivered to it in place of the replay of that position.
     #[test]
     fn inv02_delivered_iff_durable(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, ids) = run(&ops)?;
@@ -168,12 +169,14 @@ proptest! {
         let dur = durable(&m);
         for (c, sel) in [(0u32, None), (1u32, Some(ids[0]))] {
             let seen = observed_positions(&m, c);
+            let replaced = resync_replaced(&m, c);
             for p in &seen {
                 prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", c, p);
             }
             for (p, f) in &dur {
                 if sel.is_none_or(|s| s == f.series) {
-                    prop_assert!(seen.contains(p), "consumer {} never got {}", c, p);
+                    let superseded = replaced.iter().any(|(a, b)| a < p && p <= b);
+                    prop_assert!(seen.contains(p) || superseded, "consumer {} never got {}", c, p);
                 }
             }
         }
