@@ -1,0 +1,17 @@
+[package]
+name = "commit"
+version = "0.0.0"
+description = "Spike for roadmap item 2.2: commit and sync latency, group commit, sync failure and a full disk"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+crc = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
+[lints]
+workspace = true

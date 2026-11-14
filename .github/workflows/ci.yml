@@ -74,9 +74,10 @@ jobs:
       - run: cargo run --locked --example basic
 
   spike:
-    # The encoding spike (roadmap 2.1) is outside the default members; its
-    # round-trip and property tests run here, on one OS. The measurement
-    # itself (`cargo run --release -p encodings`) is never run in CI.
+    # The encoding spike (roadmap 2.1) and the commit-path spike (roadmap
+    # 2.2) are outside the default members; their tests run here, on one OS.
+    # The measurements themselves (`cargo run --release -p encodings`,
+    # `cargo run --release -p commit --bin measure`) are never run in CI.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -92,6 +93,11 @@ jobs:
       - run: cargo test -p encodings --locked
         env:
           PROPTEST_CASES: "1024"
+      - run: cargo clippy -p commit --all-targets --locked
+      - run: cargo doc -p commit --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test -p commit --locked
 
   deep-shards:
     # The deep job's matrix, generated from the table in .github/deep-shards.sh.

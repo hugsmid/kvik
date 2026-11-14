@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["model", "spikes/encodings"]
-# The spike is built and tested in its own CI job (`cargo test -p encodings`).
+members = ["model", "spikes/encodings", "spikes/commit"]
+# The spikes are built and tested in their own CI job (`cargo test -p encodings`, `cargo test -p commit`).
 default-members = ["model"]
 
 [workspace.package]
