@@ -466,8 +466,9 @@ proptest! {
         prop_assert_eq!(r.current().unwrap(), m.current().unwrap());
     }
 
-    /// 9 and 8. A restore from a tree checkpoint, brought back step by step
-    /// with a crash and restart at a random step (§8 Restore, row 28a),
+    /// 9 and 8. A restore from a tree checkpoint, possibly with a gap in the
+    /// backed-up log, brought back step by step with a crash and restart at a
+    /// random step (§8 Restore, row 28a),
     /// with ingest while restoring, keeps the running engine's trees equal to
     /// what a restart derives, and ends with the facts up to the restored end
     /// and trees equal to a rebuild from the facts. A checkpoint taken
@@ -478,8 +479,9 @@ proptest! {
         before in proptest::collection::vec(arb_op(), 1..60),
         after in proptest::collection::vec(arb_op(), 0..30),
         crash_at in 0usize..6,
+        missing in proptest::option::weighted(0.3, any::<proptest::sample::Index>()),
     ) {
-        use kvik_model::engine::Model;
+        use kvik_model::engine::{Error, Model};
         let (mut m, ids) = run(&before)?;
         settle(&mut m);
         let rebuilt = m.rebuild_trees().unwrap();
@@ -492,8 +494,17 @@ proptest! {
         m.seal_active();
         m.disk.bucket.reachable = true;
         m.upload_checkpoints();
-        let Ok(mut r) = Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &m.disk.cursors.clone(), m.wall, true, false) else {
-            return Ok(());
+        // Possibly one backed-up file missing, so the log has a gap and the
+        // checkpoint may lie beyond the restored end.
+        if let Some(i) = missing {
+            let files: Vec<_> = m.disk.bucket.objects.keys().copied().collect();
+            if !files.is_empty() {
+                m.disk.bucket.objects.remove(i.get(&files));
+            }
+        }
+        let mut r = match Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &m.disk.cursors.clone(), m.wall, true, false) {
+            Err(Error::EmptyBucket) => return Ok(()),
+            r => r.unwrap(),
         };
         let end = r.disk.restored_end.unwrap();
         for i in 0..crash_at {

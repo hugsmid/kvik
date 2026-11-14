@@ -997,9 +997,9 @@ fn s8_restore_without_checkpoint_downloads_whole_log() {
     assert!(!r.checkpoint_unverified());
 }
 
-/// §8 Restore step 1 with §5.6 and row 29: a fact after the checkpoint in a
-/// minute whose earlier detail is not yet local is recorded; the node is
-/// `summary_stale` until the detail is back.
+/// §8 Restore step 1: "the sealed log segments after its position; replay
+/// them into the tree", with row 29: "Late fact for a minute whose detail is
+/// not local: Recorded; node `summary_stale` until fetched".
 #[test]
 fn s8_replayed_minute_without_its_detail_is_stale() {
     let (mut m, s, _) = checkpointed_model();
@@ -1154,8 +1154,8 @@ fn s8_detail_back_verifies_checkpoint_and_removes_label() {
     assert!(r.tree(s).unwrap().same_summaries(m.tree(s).unwrap()));
 }
 
-/// §8 Restore step 4: a checkpoint node that differs from the facts is
-/// reported, and the node recomputed from the facts wins.
+/// §8 Restore step 4: "recompute its nodes from facts and compare with the
+/// checkpoint; any difference is reported and the recomputed value wins."
 #[test]
 fn s8_checkpoint_difference_reported_and_recomputed_wins() {
     let (mut m, s, cp) = checkpointed_model();
