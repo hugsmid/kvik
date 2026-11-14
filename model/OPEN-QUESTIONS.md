@@ -247,7 +247,7 @@ does not apply, and No deletion says nothing of it.
 files that hold its positions, the rest a lost range reported as `data_lost`), and how it is reported.
 
 ## Q-86 (b) — No space at a log write before any sync
-Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
+Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.8 (moved from 4.5).
 **Scenario.** (a) Free space is above the critical mark at the last check; another process then fills the file
 system, and creating the next preallocated segment (§3 Segments) fails with `ENOSPC`, leaving a partial `.open`
 file. Every acknowledged batch is durable and nothing has been written to the new file. (b) On a copy-on-write file
@@ -266,7 +266,9 @@ deletes an `.open` segment that holds no complete batch and is shorter than the 
 header.
 **Settled at gate 3.3.** (a) as proposed: `spec.md` §3 Segments, `format.md` A.4 Creation and the states recovery
 may find. (b) stays a write failure (`spec.md` §3 Segments); what remains is to confirm with the page-tracking fault
-file system of roadmap 4.5 that no acknowledged byte or dirty page is lost.
+file system of roadmap 4.5 that no acknowledged byte or dirty page is lost. **Roadmap 4.5** does not confirm it: its
+in-memory file system fails a write for lack of space only when a file grows, so a batch written into a preallocated
+segment never meets the case; it is confirmed by trials on a copy-on-write file system at roadmap 4.8.
 
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
@@ -403,7 +405,7 @@ reads the records before its rebuild record, as if the rebuild had not happened,
 rebuilt manifest is not read. To be settled with roadmap 8.3 (restore).
 
 ## Q-109 — A forged seal in an `.open` file
-Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled by roadmap item 4.5.
+Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9 (moved from 4.5, which left it open).
 **Scenario.** `format.md` A.4 classes an `.open` file whose last non-zero bytes are a valid trailer and end marker as
 seal-written, and seals it again (since Q-87) without truncating anything. A text value of 96 bytes holds exactly a
 segment index block, a trailer block and an end marker; when it is the last thing written to the open segment before
@@ -538,16 +540,16 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
 | Q-16 | 5.4 | Live state and staleness are built there |
-| Q-33 | 4.5 | The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
+| Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-46 | 4.5 | With 4.6 (second-process reader): the check of a kept position, `start: position` and row 7b |
+| Q-46 | 4.6 | Second-process reader (moved from 4.5): the check of a kept position, `start: position` and row 7b |
 | Q-52 (b) | 4.8 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
-| Q-86 (b) | 4.5 | Injected sync errors and full disk |
+| Q-86 (b) | 4.8 | Platform trials on a copy-on-write file system (moved from 4.5, see the question) |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
@@ -557,7 +559,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
-| Q-109 | 4.5 | Recovery; recorded at the review of roadmap 4.2 |
+| Q-109 | 4.9 | Gate; left open by 4.5 (see the question); recorded at the review of roadmap 4.2 |
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2 |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
 
