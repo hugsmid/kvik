@@ -218,25 +218,6 @@ fn reader_epoch_survives_grace_then_reads_remotely() {
     assert_eq!(again, facts);
 }
 
-#[test]
-fn restore_onto_empty_disk_current_first() {
-    let (mut m, s) = sealed_model();
-    m.compact(None).unwrap();
-    m.upload();
-    let cur = m.current().unwrap().clone();
-    let tree = m.tree(s).unwrap().clone();
-    let mut r =
-        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, true).unwrap();
-    assert_eq!(r.current().unwrap(), &cur, "usable after current facts");
-    assert!(r.tree(s).unwrap().same_summaries(&tree));
-    assert!(
-        r.facts().unwrap().len() < durable(&m).len(),
-        "detail not yet back"
-    );
-    r.restore_rest(false);
-    assert_eq!(durable(&r), durable(&m));
-}
-
 /// §3 Disk space: below the low mark the specification pauses compaction only;
 /// the model also pauses tiering, which would free space.
 #[test]

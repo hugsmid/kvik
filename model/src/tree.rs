@@ -181,12 +181,44 @@ impl SeriesTree {
         self.params == other.params && self.levels == other.levels
     }
 
-    /// The last summarised reading strictly before `t`.
+    /// The last summarised reading strictly before `t`. A tree loaded from a
+    /// checkpoint holds nodes without their readings (§8 Restore), so the last
+    /// reading of every whole minute before `t` is also taken from its node.
     pub fn last_before(&self, t: Nanos) -> Option<(Nanos, Value)> {
-        self.readings
+        let reading = self
+            .readings
             .range(..t)
             .next_back()
-            .map(|(t, v)| (*t, v.clone()))
+            .map(|(t, v)| (*t, v.clone()));
+        let node = self.levels[0]
+            .range(..floor_to(t, MINUTE))
+            .next_back()
+            .and_then(|(_, n)| n.last.clone());
+        match (reading, node) {
+            (Some(r), Some(n)) => Some(if n.0 > r.0 { n } else { r }),
+            (r, n) => r.or(n),
+        }
+    }
+
+    /// The stored nodes alone, without readings, versions or flags: what a
+    /// tree checkpoint carries (§5.1, §8 Continuous backup).
+    pub fn nodes_only(&self) -> SeriesTree {
+        SeriesTree {
+            params: self.params,
+            readings: BTreeMap::new(),
+            levels: self.levels.clone(),
+            versions: BTreeMap::new(),
+            stale_minutes: BTreeSet::new(),
+        }
+    }
+
+    /// Whether any minute overlapping `[start, end)` is flagged
+    /// `summary_stale`.
+    pub fn any_stale(&self, start: Nanos, end: Nanos) -> bool {
+        self.stale_minutes
+            .range(floor_to(start, MINUTE)..end.max(start))
+            .next()
+            .is_some()
     }
 
     /// The merge over `[start, end)` from whole stored nodes in the middle and

@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use common::*;
 use kvik_model::engine::{
-    Config, ConsumerDecl, ConsumerId, CrashPoint, Error, Fault, FileClass, Level, Model, Reason,
-    Selection, Signal, Wait, WriteOutcome,
+    Config, ConsumerDecl, ConsumerId, CrashPoint, EntryBody, Error, Fault, FileClass, FileId,
+    Level, ManifestOp, Model, Reason, Selection, Signal, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
@@ -842,4 +842,455 @@ fn s8_restored_end_starts_at_generation_0() {
     let r2 = Model::restore_from(r.config.clone(), vec![], &mut bucket, r.wall, false).unwrap();
     assert_eq!(r2.disk.restored_end, Some(Position::ORIGIN));
     assert!(r2.facts().unwrap().is_empty());
+}
+
+/// A store with a tree checkpoint at `0:6`: facts at `T0` + 0, 20, 40 and
+/// 130 s and a revision of the one at 20 s, compacted into a current and a
+/// revision chunk; then facts at 150 s (the minute of the one at 130 s) and
+/// 200 s after the checkpoint (`0:7`, `0:8`). Everything is sealed and backed
+/// up, and the checkpoint is uploaded.
+fn checkpointed_model() -> (Model, SeriesId, Position) {
+    let c = ConsumerDecl {
+        id: ConsumerId(1),
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![c], T0 + HOUR);
+    let s = m
+        .define(
+            "plant/line-1/temperature",
+            Kind::Gauge,
+            ValueType::Number,
+            "degC",
+            2 * MINUTE,
+        )
+        .unwrap();
+    for (t, v) in [(0, 0.0), (20, 1.0), (40, 2.0), (130, 3.0), (20, 100.0)] {
+        m.ingest(vec![Reading::num(s, T0 + t * SECOND, v)]).unwrap();
+    }
+    m.seal_active();
+    m.compact(None).unwrap();
+    let cp = m.checkpoint().unwrap();
+    assert_eq!(cp, Position::new(0, 6));
+    for (t, v) in [(150, 4.0), (200, 5.0)] {
+        m.ingest(vec![Reading::num(s, T0 + t * SECOND, v)]).unwrap();
+    }
+    m.seal_active();
+    assert_eq!(m.upload_checkpoints(), 1);
+    (m, s, cp)
+}
+
+/// A restore of `m`'s bucket that returns as soon as it accepts ingest.
+fn restore_in_progress(m: &mut Model, cursors: &BTreeMap<ConsumerId, Position>) -> Model {
+    Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        cursors,
+        m.wall,
+        true,
+        false,
+    )
+    .unwrap()
+}
+
+/// The bucket's log segment holding `p`.
+fn segment_holding(m: &Model, p: Position) -> FileId {
+    *m.disk
+        .bucket
+        .objects
+        .iter()
+        .find(|(_, (_, f))| f.class == FileClass::Segment && f.entries().any(|e| e.position == p))
+        .unwrap()
+        .0
+}
+
+/// §8 Continuous backup: "a tree checkpoint at least daily, and only after
+/// all log up to its position is backed up. Each tree checkpoint carries the
+/// registry file and each series' latest recorded `t`, as of its position."
+#[test]
+fn s8_checkpoint_carries_registry_and_latest_t_after_log_backed_up() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.ingest(vec![Reading::num(s, T0 + SECOND, 2.0)]).unwrap();
+    let p = m.checkpoint().unwrap();
+    assert_eq!(
+        m.upload_checkpoints(),
+        0,
+        "its log is still in the open segment"
+    );
+    m.ingest(vec![Reading::num(s, T0 + 2 * SECOND, 3.0)])
+        .unwrap();
+    m.seal_active();
+    assert_eq!(m.upload_checkpoints(), 1);
+    let cp = &m.disk.bucket.checkpoints[&p];
+    assert_eq!(cp.position, p);
+    assert_eq!(cp.latest_t[&s], T0 + SECOND);
+    assert!(cp.registry.get(s).is_some());
+    assert!(cp.trees[&s].readings().is_empty(), "nodes only, no facts");
+    assert_eq!(cp.trees[&s].node(0, T0).count, 2);
+}
+
+/// §8 Restore step 1: "Write one manifest record (generation, checkpoint,
+/// restored end) before ingest is accepted."
+#[test]
+fn s8_restore_record_written_before_ingest() {
+    let (mut m, s, cp) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    let record = ManifestOp::Restore {
+        generation: 1,
+        checkpoint: Some(cp),
+        restored_end: Position::new(0, 8),
+    };
+    let at = r.disk.manifest.iter().position(|x| x.op == record).unwrap();
+    assert_eq!(
+        r.disk
+            .manifest
+            .iter()
+            .filter(|x| matches!(x.op, ManifestOp::Restore { .. }))
+            .count(),
+        1
+    );
+    assert!(r.restoring());
+    // Restoring is no health condition, for a restore or for a drill.
+    assert_eq!(r.health().level, Level::Ok);
+    let drill = Model::restore_with_cursors(
+        m.config.clone(),
+        vec![],
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        true,
+        true,
+    )
+    .unwrap();
+    assert!(drill.restoring() && drill.is_read_only());
+    assert_eq!(drill.health().level, Level::Ok);
+    let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
+    assert_eq!(p.positions, vec![Position::new(1, 1)]);
+    let first_new = r
+        .disk
+        .manifest
+        .iter()
+        .position(|x| {
+            matches!(x.op, ManifestOp::Add { file, .. }
+                if r.disk.files[&file].entries().any(|e| e.position == Position::new(1, 1)))
+        })
+        .unwrap();
+    assert!(at < first_new);
+}
+
+/// §8 Restore step 1: "Download the latest tree checkpoint at or below the
+/// restored end (labelled derived-unverified), with its registry file and
+/// latest `t` per series, and the sealed log segments after its position;
+/// replay them into the tree."
+#[test]
+fn s8_restore_from_latest_checkpoint_at_or_below_restored_end() {
+    let (mut m, s, cp) = checkpointed_model();
+    m.ingest(vec![Reading::num(s, T0 + 250 * SECOND, 6.0)])
+        .unwrap(); // 0:9
+    m.seal_active();
+    let missing = segment_holding_local(&m, Position::new(0, 9));
+    m.ingest(vec![Reading::num(s, T0 + 260 * SECOND, 7.0)])
+        .unwrap(); // 0:10
+    let beyond = m.checkpoint().unwrap();
+    m.seal_active();
+    assert_eq!(m.upload_checkpoints(), 1);
+    assert!(m.disk.bucket.checkpoints.contains_key(&beyond));
+    m.disk.bucket.objects.remove(&missing);
+    let r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert_eq!(r.disk.restored_end, Some(Position::new(0, 8)));
+    assert_eq!(
+        r.disk
+            .restore
+            .as_ref()
+            .unwrap()
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .position,
+        cp
+    );
+    let local: Vec<Position> = r.facts().unwrap().iter().map(|f| f.position).collect();
+    assert_eq!(local, vec![Position::new(0, 7), Position::new(0, 8)]);
+    assert!(r.registry().unwrap().get(s).is_some());
+    assert!(r.checkpoint_unverified());
+    // The checkpoint's node, and a minute computed from the replayed log.
+    assert_eq!(
+        r.tree(s).unwrap().node(0, T0),
+        m.tree(s).unwrap().node(0, T0)
+    );
+    assert_eq!(
+        r.tree(s).unwrap().node(0, T0 + 3 * MINUTE),
+        m.tree(s).unwrap().node(0, T0 + 3 * MINUTE)
+    );
+}
+
+fn segment_holding_local(m: &Model, p: Position) -> FileId {
+    *m.disk
+        .files
+        .iter()
+        .find(|(_, f)| f.class == FileClass::Segment && f.entries().any(|e| e.position == p))
+        .unwrap()
+        .0
+}
+
+/// §8 Restore step 1: "With no checkpoint, download the whole sealed log."
+#[test]
+fn s8_restore_without_checkpoint_downloads_whole_log() {
+    let (mut m, _) = backed_up_model();
+    let r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, true).unwrap();
+    assert!(r.disk.restore.as_ref().unwrap().checkpoint.is_none());
+    assert_eq!(r.facts().unwrap().len(), 4);
+    assert!(!r.restoring());
+    assert!(!r.checkpoint_unverified());
+}
+
+/// §8 Restore step 1 with §5.6 and row 29: a fact after the checkpoint in a
+/// minute whose earlier detail is not yet local is recorded; the node is
+/// `summary_stale` until the detail is back.
+#[test]
+fn s8_replayed_minute_without_its_detail_is_stale() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert!(r.tree(s).unwrap().is_stale(0, T0 + 2 * MINUTE));
+    assert!(!r.tree(s).unwrap().is_stale(0, T0 + 3 * MINUTE));
+    r.restore_rest().unwrap();
+    assert!(!r.tree(s).unwrap().is_stale(0, T0 + 2 * MINUTE));
+    assert_eq!(
+        r.tree(s).unwrap().node(0, T0 + 2 * MINUTE),
+        m.tree(s).unwrap().node(0, T0 + 2 * MINUTE)
+    );
+}
+
+/// §8 Restore step 2: "The store serves queries at ≥ 1-minute resolution,
+/// flagged `restoring`".
+#[test]
+fn s8_restoring_queries_at_one_minute_resolution() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    let a = r.query_window(s, T0, T0 + MINUTE).unwrap();
+    assert!(a.restoring && !a.summary_stale);
+    assert_eq!(a.node, m.window(s, T0, T0 + MINUTE).unwrap());
+    // The reading held into an empty minute comes from the checkpoint's node.
+    let b = r.query_window(s, T0 + MINUTE, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(b.node, m.window(s, T0 + MINUTE, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(b.node.coverage, i128::from(MINUTE));
+    assert!(
+        r.query_window(s, T0 + 2 * MINUTE, T0 + 3 * MINUTE)
+            .unwrap()
+            .summary_stale
+    );
+    assert_eq!(
+        r.query_window(s, T0 + SECOND, T0 + MINUTE),
+        Err(Error::Restoring)
+    );
+    r.restore_rest().unwrap();
+    let c = r.query_window(s, T0 + SECOND, T0 + 4 * MINUTE).unwrap();
+    assert!(!c.restoring);
+    assert_eq!(c.node, m.window(s, T0 + SECOND, T0 + 4 * MINUTE).unwrap());
+}
+
+/// §8 Restore step 2: "A cursor of an older generation at or below the
+/// restored end receives the facts after it up to the restored end through
+/// catch-up, flagged `replayed`, if their segments are local; otherwise §4
+/// Resync applies."
+#[test]
+fn s8_cursor_catches_up_only_if_its_segments_are_local() {
+    let (mut m, _, _) = checkpointed_model();
+    let c = ConsumerId(1);
+    let end = Position::new(0, 8);
+    for (cursor, want) in [
+        (
+            Position::new(0, 6),
+            vec![(Position::new(0, 7), true), (end, true)],
+        ),
+        (Position::new(0, 3), vec![]),
+    ] {
+        let cursors = [(c, cursor)].into_iter().collect();
+        let mut r = restore_in_progress(&mut m, &cursors);
+        r.restore_rest().unwrap();
+        r.drain().unwrap();
+        let got: Vec<(Position, bool)> = r
+            .observed
+            .get(&c)
+            .map(|o| o.iter().map(|x| (x.position, x.replayed)).collect())
+            .unwrap_or_default();
+        assert_eq!(got, want, "cursor {cursor}");
+        assert_eq!(r.disk.cursors[&c], end);
+        assert!(matches!(
+            r.signals[&c][..],
+            [Signal::GenerationChanged { .. }, Signal::ResyncDue]
+        ));
+    }
+}
+
+/// §8 Restore step 2: "Until the revised-key index is back, facts whose `t`
+/// is at or before the latest `t` known for their series (from the checkpoint
+/// or the restored log) and which match no local fact are recorded and
+/// counted `duplicates_unchecked`."
+#[test]
+fn s8_duplicates_unchecked_until_revised_key_index_back() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    // Later than the latest known `t` (200 s): recorded, not counted.
+    let p = r
+        .ingest(vec![Reading::num(s, T0 + 300 * SECOND, 9.0)])
+        .unwrap();
+    assert_eq!((p.positions.len(), r.counters.duplicates_unchecked), (1, 0));
+    // At or before it and matching a local fact: dropped.
+    let p = r
+        .ingest(vec![Reading::num(s, T0 + 200 * SECOND, 5.0)])
+        .unwrap();
+    assert_eq!((p.positions.len(), p.duplicates), (0, 1));
+    // At or before it and matching no local fact: recorded and counted.
+    let p = r.ingest(vec![Reading::num(s, T0, 0.0)]).unwrap();
+    assert_eq!((p.positions.len(), r.counters.duplicates_unchecked), (1, 1));
+    // With the current chunk back, the revised-key index is back: a replay of
+    // a revised key's earlier value is dropped although the revision chunk
+    // holding it is still remote.
+    let f = r.restore_step().unwrap().unwrap();
+    assert_eq!(r.disk.files[&f].class, FileClass::Current);
+    let p = r
+        .ingest(vec![Reading::num(s, T0 + 20 * SECOND, 1.0)])
+        .unwrap();
+    assert_eq!((p.positions.len(), p.duplicates), (0, 1));
+    assert_eq!(r.counters.duplicates_unchecked, 1);
+}
+
+/// §8 Restore step 3: "Download current chunks and the revised-key index,
+/// then revision chunks and log segments."
+#[test]
+fn s8_download_order_current_then_revision_then_log() {
+    let (mut m, _, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    let mut order = Vec::new();
+    while let Some(f) = r.restore_step().unwrap() {
+        order.push(r.disk.files[&f].class);
+    }
+    assert_eq!(
+        order,
+        vec![FileClass::Current, FileClass::Revision, FileClass::Segment]
+    );
+    assert!(!r.restoring());
+}
+
+/// §8 Restore step 3: "A position present in two files is one fact and must
+/// have identical content."
+#[test]
+fn s8_position_in_two_files_must_have_identical_content() {
+    let (mut m, _, _) = checkpointed_model();
+    let p = Position::new(0, 2);
+    let log = segment_holding(&m, p);
+    let (_, file) = m.disk.bucket.objects.get_mut(&log).unwrap();
+    for e in file.batches.iter_mut().flatten() {
+        if let (true, EntryBody::Fact(f)) = (e.position == p, &mut e.body) {
+            f.value = n(7.0);
+        }
+    }
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert_eq!(
+        r.restore_rest(),
+        Err(Error::Conflict {
+            file: log,
+            position: p
+        })
+    );
+}
+
+/// §8 Restore step 4: "When detail for a span is back, recompute its nodes
+/// from facts and compare with the checkpoint; any difference is reported and
+/// the recomputed value wins. The checkpoint label is removed when all detail
+/// has been verified."
+#[test]
+fn s8_detail_back_verifies_checkpoint_and_removes_label() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert!(r.checkpoint_unverified());
+    r.restore_step().unwrap(); // current chunk
+    assert!(r.checkpoint_unverified(), "a revision is still remote");
+    r.restore_step().unwrap(); // revision chunk: every fact of the span is local
+    assert!(!r.checkpoint_unverified());
+    r.restore_rest().unwrap();
+    assert!(r.disk.restore.as_ref().unwrap().differences.is_empty());
+    assert_eq!(r.counters.checkpoint_differences, 0);
+    assert!(r.tree(s).unwrap().same_summaries(m.tree(s).unwrap()));
+}
+
+/// §8 Restore step 4: a checkpoint node that differs from the facts is
+/// reported, and the node recomputed from the facts wins.
+#[test]
+fn s8_checkpoint_difference_reported_and_recomputed_wins() {
+    let (mut m, s, cp) = checkpointed_model();
+    let held = m.disk.bucket.checkpoints.get_mut(&cp).unwrap();
+    let params = held.trees[&s].params;
+    held.trees
+        .insert(s, SeriesTree::build(params, &[(T0, n(50.0))]).nodes_only());
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert_eq!(
+        r.window(s, T0, T0 + MINUTE).unwrap().first,
+        Some((T0, n(50.0)))
+    );
+    r.restore_rest().unwrap();
+    assert_eq!(r.disk.restore.as_ref().unwrap().differences, vec![(s, T0)]);
+    assert_eq!(r.counters.checkpoint_differences, 1);
+    assert!(r.tree(s).unwrap().same_summaries(m.tree(s).unwrap()));
+    assert!(!r.checkpoint_unverified());
+}
+
+/// §8 Restore: "A restart after the restore record is written resumes the
+/// restore in its generation, fetching the files listed by the manifest
+/// records it restores from that are not yet local."
+#[test]
+fn s8_restart_after_record_resumes_in_its_generation() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    r.restore_step().unwrap();
+    r.crash();
+    r.restart();
+    assert_eq!(r.disk.generation, 1);
+    assert!(r.restoring());
+    assert_eq!(r.restore_queue().len(), 2);
+    r.restore_rest().unwrap();
+    assert_eq!(r.current().unwrap(), m.current().unwrap());
+    assert!(r.tree(s).unwrap().same_summaries(m.tree(s).unwrap()));
+    assert!(!r.checkpoint_unverified());
+    assert_eq!(m.disk.bucket.claims.len(), 1);
+    let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
+    assert_eq!(p.positions, vec![Position::new(1, 1)]);
+}
+
+/// §8 Restore: "A crash before the record starts the restore again with the
+/// next generation."
+#[test]
+fn s8_crash_before_record_restarts_with_next_generation() {
+    let (mut m, s, _) = checkpointed_model();
+    let mut r = Model::restore_interrupted_before_record(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+    )
+    .unwrap();
+    assert!(!r.is_up());
+    assert!(m.disk.bucket.claims.contains(&1));
+    assert!(
+        !r.disk
+            .manifest
+            .iter()
+            .any(|x| matches!(x.op, ManifestOp::Restore { .. }))
+    );
+    r.restart();
+    assert_eq!(r.disk.generation, 2);
+    assert!(r.disk.bucket.claims.contains(&1) && r.disk.bucket.claims.contains(&2));
+    assert!(
+        r.disk
+            .manifest
+            .iter()
+            .any(|x| matches!(x.op, ManifestOp::Restore { generation: 2, .. }))
+    );
+    let p = r.ingest(vec![Reading::num(s, T0 + HOUR, 9.0)]).unwrap();
+    assert_eq!(p.positions, vec![Position::new(2, 1)]);
 }

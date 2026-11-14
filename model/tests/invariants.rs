@@ -68,8 +68,10 @@ proptest! {
     /// generation and starts it at sequence 1, and restarts keep it; a bucket
     /// with nothing backed up is refused. The restored end is the last
     /// position before the first gap. A consumer whose kept cursor is at or
-    /// below it catches up to it, flagged `replayed`; one without a cursor, or
-    /// beyond the restored end, gets no replay. Every consumer receives
+    /// below it catches up to it, flagged `replayed`, if log segments holding
+    /// every position after it up to the restored end are local; otherwise,
+    /// and without a cursor or beyond the restored end, it gets no replay.
+    /// Every consumer receives
     /// `generation_changed` and `resync` (§8 Restore steps 1-2).
     #[test]
     fn inv01_only_restore_starts_generation(
@@ -95,6 +97,10 @@ proptest! {
         let mut restored: Vec<Position> = m.disk.bucket.objects.values().flat_map(|(_, f)| f.entries().map(|e| e.position)).collect();
         restored.sort_unstable();
         restored.dedup();
+        let in_segments: BTreeSet<Position> = m.disk.bucket.objects.values()
+            .filter(|(_, f)| f.class == kvik_model::engine::FileClass::Segment)
+            .flat_map(|(_, f)| f.entries().map(|e| e.position))
+            .collect();
         let cursors = m.disk.cursors.clone();
         let r = Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &cursors, m.wall, false, false);
         if restored.is_empty() {
@@ -121,7 +127,11 @@ proptest! {
                 vec![Signal::GenerationChanged { cursor: kept, restored_end: end }, Signal::ResyncDue]
             );
             let want: Vec<(Position, bool)> = match kept {
-                Some(cursor) if cursor <= end => r
+                Some(cursor)
+                    if cursor <= end
+                        && restored.iter().filter(|p| **p > cursor && **p <= end).all(|p| in_segments.contains(p)) =>
+                {
+                    r
                     .disk
                     .all_facts()
                     .into_iter()
@@ -131,7 +141,8 @@ proptest! {
                         Selection::Series(set) => set.contains(&f.series),
                     })
                     .map(|f| (f.position, true))
-                    .collect(),
+                    .collect()
+                }
                 _ => Vec::new(),
             };
             prop_assert_eq!(got, want);
@@ -453,6 +464,69 @@ proptest! {
         let r = kvik_model::engine::Model::restore_from(m.config.clone(), consumers(), &mut m.disk.bucket, m.wall, false).unwrap();
         prop_assert_eq!(&durable(&r), &committed);
         prop_assert_eq!(r.current().unwrap(), m.current().unwrap());
+    }
+
+    /// 9 and 8. A restore from a tree checkpoint, brought back step by step
+    /// with a crash and restart at a random step (§8 Restore, row 28a),
+    /// with ingest while restoring, keeps the running engine's trees equal to
+    /// what a restart derives, and ends with the facts up to the restored end
+    /// and trees equal to a rebuild from the facts. A checkpoint taken
+    /// from a tree equal to its rebuild shows no difference, and the
+    /// `derived-unverified` label is removed.
+    #[test]
+    fn inv09_stepwise_restore_from_checkpoint(
+        before in proptest::collection::vec(arb_op(), 1..60),
+        after in proptest::collection::vec(arb_op(), 0..30),
+        crash_at in 0usize..6,
+    ) {
+        use kvik_model::engine::Model;
+        let (mut m, ids) = run(&before)?;
+        settle(&mut m);
+        let rebuilt = m.rebuild_trees().unwrap();
+        let clean = m.trees().unwrap().iter().all(|(s, t)| t.same_summaries(&rebuilt[s]));
+        m.checkpoint().unwrap();
+        for op in &after {
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+        }
+        settle(&mut m);
+        m.seal_active();
+        m.disk.bucket.reachable = true;
+        m.upload_checkpoints();
+        let Ok(mut r) = Model::restore_with_cursors(m.config.clone(), consumers(), &mut m.disk.bucket, &m.disk.cursors.clone(), m.wall, true, false) else {
+            return Ok(());
+        };
+        let end = r.disk.restored_end.unwrap();
+        for i in 0..crash_at {
+            if i == 1 {
+                // Ingest while restoring: one fact inside restored minutes, one after.
+                let _ = r.ingest(vec![
+                    kvik_model::types::Reading::num(ids[0], T0 + 7, 1.0e9),
+                    kvik_model::types::Reading::num(ids[0], T0 + 50 * MINUTE, 3.0),
+                ]);
+            }
+            r.restore_step().unwrap();
+        }
+        // What the running engine holds equals what a restart derives.
+        let live = r.trees().unwrap().clone();
+        r.crash();
+        r.restart();
+        for (s, t) in &live {
+            prop_assert!(t.same_summaries(&r.trees().unwrap()[s]), "series {} differs after restart", s);
+        }
+        r.restore_rest().unwrap();
+        prop_assert!(!r.restoring());
+        prop_assert!(!r.checkpoint_unverified());
+        let want: BTreeMap<_, _> = durable(&m).into_iter().filter(|(p, _)| *p <= end).collect();
+        let got: BTreeMap<_, _> = r.facts().unwrap().into_iter().filter(|f| f.position <= end).map(|f| (f.position, f)).collect();
+        prop_assert_eq!(&got, &want);
+        prop_assert_eq!(r.current().unwrap(), &view::current(r.facts().unwrap().iter()));
+        let rebuilt = r.rebuild_trees().unwrap();
+        for (s, t) in r.trees().unwrap() {
+            prop_assert!(t.same_summaries(&rebuilt[s]), "series {} differs", s);
+        }
+        if clean {
+            prop_assert!(r.disk.restore.as_ref().unwrap().differences.is_empty());
+        }
     }
 
     /// 10. No operation reduces the set of facts.

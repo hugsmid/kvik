@@ -12,8 +12,8 @@ use crate::registry::{Registry, RegistryError, RegistryEvent, SeriesDef};
 use crate::summary::{Node, Params};
 use crate::tree::{SeriesTree, TreeError};
 use crate::types::{
-    Fact, Flags, HOUR, Kind, MAX_TEXT_BYTES, MINUTE, Nanos, Position, Quality, Reading, SECOND,
-    SeriesId, Value, ValueType, floor_to,
+    Fact, Flags, HOUR, Kind, MAX_TEXT_BYTES, MINUTE, Nanos, Position, QUARTER, Quality, Reading,
+    SECOND, SeriesId, Value, ValueType, floor_to,
 };
 use crate::view;
 
@@ -238,6 +238,75 @@ pub enum ManifestOp {
         /// Hash of the sealed file.
         hash: u64,
     },
+    /// The restore record (§8 Restore step 1), written before ingest is
+    /// accepted.
+    Restore {
+        /// The generation the restore claimed.
+        generation: u32,
+        /// Position of the tree checkpoint it restores from, if any.
+        checkpoint: Option<Position>,
+        /// The restored end.
+        restored_end: Position,
+    },
+}
+
+/// A tree checkpoint (§5.1, §8 Continuous backup): the stored nodes of every
+/// series, the registry file and each series' latest recorded `t`, all as of
+/// its position. It carries no facts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Checkpoint {
+    /// Position up to which it is complete.
+    pub position: Position,
+    /// The registry as of the position.
+    pub registry: Registry,
+    /// Each series' latest recorded `t` as of the position.
+    pub latest_t: BTreeMap<SeriesId, Nanos>,
+    /// Stored nodes per series, without readings.
+    pub trees: BTreeMap<SeriesId, SeriesTree>,
+}
+
+/// A restore in progress or finished, kept on the local disk with its
+/// record (§8 Restore).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoreState {
+    /// The generation it claimed.
+    pub generation: u32,
+    /// The restored end.
+    pub restored_end: Position,
+    /// The tree checkpoint it restores from, downloaded in step 1.
+    pub checkpoint: Option<Checkpoint>,
+    /// The bucket objects it restores from. The model has no backed-up
+    /// manifest records; this list stands in for the files they list.
+    pub sources: BTreeSet<FileId>,
+    /// Latest `t` per series from the checkpoint and the restored log
+    /// (§8 Restore step 2).
+    pub latest_t: BTreeMap<SeriesId, Nanos>,
+    /// Spans `(series, 15-minute start)` whose nodes have been recomputed
+    /// from facts and compared with the checkpoint (§8 Restore step 4).
+    pub verified: BTreeSet<(SeriesId, Nanos)>,
+    /// Spans where the checkpoint differed from the recomputed nodes.
+    pub differences: Vec<(SeriesId, Nanos)>,
+}
+
+/// A restore that claimed a generation but has not yet written its record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingRestore {
+    /// Cursors the consumers kept from before the restore.
+    pub cursors: BTreeMap<ConsumerId, Position>,
+    /// Whether it is a drill.
+    pub drill: bool,
+}
+
+/// A query result with its flags (§11 Query).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Answer {
+    /// The result.
+    pub node: Node,
+    /// Served while a restore is still bringing detail back (§8 Restore
+    /// step 2).
+    pub restoring: bool,
+    /// A minute in the span is flagged `summary_stale` (§5.6).
+    pub summary_stale: bool,
 }
 
 /// The backup bucket (deep tier).
@@ -252,6 +321,8 @@ pub struct Bucket {
     /// Generations claimed by restores, each by a create-if-absent marker
     /// (§8 Generations).
     pub claims: BTreeSet<u32>,
+    /// Tree checkpoints by position (§8 Continuous backup).
+    pub checkpoints: BTreeMap<Position, Checkpoint>,
 }
 
 /// Outcome of a batch that was written but not synced when the machine stopped.
@@ -385,6 +456,19 @@ pub enum Error {
     /// Generations).
     #[error("nothing to restore")]
     EmptyBucket,
+    /// Refused while a restore is bringing detail back: a query below
+    /// 1-minute resolution, or a tree checkpoint (§8 Restore step 2).
+    #[error("restoring")]
+    Restoring,
+    /// A downloaded file holds a position whose content differs from the
+    /// copy already local (§8 Restore step 3).
+    #[error("file {file:?} holds {position} with different content")]
+    Conflict {
+        /// The downloaded file.
+        file: FileId,
+        /// The position.
+        position: Position,
+    },
 }
 
 /// Health level.
@@ -455,6 +539,9 @@ pub struct Counters {
     pub uploads_rejected: u64,
     /// Compaction or tiering runs skipped for low disk.
     pub paused: u64,
+    /// Restored spans whose recomputed nodes differed from the checkpoint
+    /// (§8 Restore step 4).
+    pub checkpoint_differences: u64,
 }
 
 /// A delivery to a consumer.
@@ -551,6 +638,13 @@ pub struct Disk {
     /// This writer found a higher generation claimed: it stopped uploading
     /// and stays read-only across restarts (§8 Generations).
     pub superseded: bool,
+    /// The restore this store came from, once its record is written.
+    pub restore: Option<RestoreState>,
+    /// A restore that claimed a generation and stopped before its record.
+    pub pending_restore: Option<PendingRestore>,
+    /// Tree checkpoints taken locally, uploaded once the log up to their
+    /// position is backed up.
+    pub checkpoints: Vec<Checkpoint>,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
     pub other_bytes: u64,
     /// Next file id.
@@ -652,7 +746,9 @@ impl Disk {
             .iter()
             .filter_map(|r| match r.op {
                 ManifestOp::Add { file, .. } => Some(file),
-                ManifestOp::Retire { .. } | ManifestOp::Seal { .. } => None,
+                ManifestOp::Retire { .. }
+                | ManifestOp::Seal { .. }
+                | ManifestOp::Restore { .. } => None,
             })
             .collect()
     }
@@ -663,7 +759,9 @@ impl Disk {
             .iter()
             .filter_map(|r| match r.op {
                 ManifestOp::Retire { file } => Some((file, r.at)),
-                ManifestOp::Add { .. } | ManifestOp::Seal { .. } => None,
+                ManifestOp::Add { .. } | ManifestOp::Seal { .. } | ManifestOp::Restore { .. } => {
+                    None
+                }
             })
             .collect()
     }
@@ -679,7 +777,7 @@ impl Disk {
                 ManifestOp::Retire { file } => {
                     set.remove(&file);
                 }
-                ManifestOp::Seal { .. } => {}
+                ManifestOp::Seal { .. } | ManifestOp::Restore { .. } => {}
             }
         }
         set.into_iter().collect()
@@ -835,6 +933,35 @@ struct Volatile {
     /// A write or sync failed (§3), as opposed to read-only by design.
     sync_failed: bool,
     skew_run: BTreeMap<SeriesId, u32>,
+    /// While a restore is bringing detail back (§8 Restore steps 2–4).
+    restore: Option<RestoreRt>,
+}
+
+/// Volatile state derived from the disk alone.
+struct Derived {
+    registry: Registry,
+    entries: BTreeMap<Position, Entry>,
+    current: BTreeMap<(SeriesId, Nanos), Fact>,
+    newest_t: BTreeMap<SeriesId, Nanos>,
+    history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>>,
+    trees: BTreeMap<SeriesId, SeriesTree>,
+    restore: Option<RestoreRt>,
+}
+
+/// What ingest and the tree need while a restore is bringing detail back.
+#[derive(Clone, Debug)]
+struct RestoreRt {
+    /// Latest `t` per series from the checkpoint and the restored log.
+    latest_t: BTreeMap<SeriesId, Nanos>,
+    /// Whether every current chunk, and with them the revised-key index, is
+    /// back.
+    index_back: bool,
+    /// Keys whose only restored fact is not local.
+    remote_single: BTreeSet<(SeriesId, Nanos)>,
+    /// Minutes `(series, start)` for which the checkpoint holds a node.
+    checkpoint_minutes: BTreeSet<(SeriesId, Nanos)>,
+    /// Spans `(series, 15-minute start)` whose detail is not all local.
+    not_back: BTreeSet<(SeriesId, Nanos)>,
 }
 
 /// The engine model.
@@ -950,38 +1077,28 @@ impl Model {
     /// sync fails, stay read-only").
     pub fn restart_with(&mut self, recovery_sync_fails: bool) {
         self.vol = None;
+        // A restore that stopped before its record starts again with the
+        // next generation (§8 Restore).
+        if self.disk.restore.is_none()
+            && let Some(pending) = self.disk.pending_restore.clone()
+        {
+            self.restart_restore(pending);
+            return;
+        }
         // 1. The active segment past the durable mark (§3 Recovery).
         let sync_failed = self.recover_tail(recovery_sync_fails);
         // Read-only after a failed recovery sync: nothing more is written.
         if !sync_failed {
             self.clean_up_files();
         }
+        self.verify_restored();
         // 4. Rebuild volatile state from every readable entry.
-        let entries = self.disk.live_entries();
-        let mut registry = Registry::default();
-        let mut facts = Vec::new();
-        for e in entries.values() {
-            match &e.body {
-                EntryBody::Registry(r) => registry.apply(r),
-                EntryBody::Fact(f) => facts.push(f.clone()),
-            }
-        }
-        let current = view::current(facts.iter());
-        let mut newest_t = BTreeMap::new();
-        let mut history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>> = BTreeMap::new();
-        for f in &facts {
-            history
-                .entry((f.series, f.t))
-                .or_default()
-                .push((f.value.clone(), f.quality));
-            let n = newest_t.entry(f.series).or_insert(f.t);
-            *n = (*n).max(f.t);
-        }
-        let trees = build_trees(&registry, &current);
+        let d = self.derive();
         // The next position continues the current generation; a generation
         // started by a restore begins at its first position (§8).
         let generation = self.disk.generation;
-        let next_position = entries
+        let next_position = d
+            .entries
             .keys()
             .next_back()
             .filter(|p| p.generation == generation)
@@ -989,20 +1106,20 @@ impl Model {
         let consumers = self
             .consumers
             .iter()
-            .map(|d| {
-                let s = self.sessions.entry(d.id).or_insert(0);
+            .map(|c| {
+                let s = self.sessions.entry(c.id).or_insert(0);
                 *s += 1;
                 let cursor = self
                     .disk
                     .cursors
-                    .get(&d.id)
+                    .get(&c.id)
                     .copied()
                     .unwrap_or(Position::ORIGIN);
                 ConsumerRt {
-                    decl: d.clone(),
+                    decl: c.clone(),
                     queue: VecDeque::new(),
                     // A consumer that is behind catches up from its cursor.
-                    mode: if entries.range(cursor.next()..).next().is_some() {
+                    mode: if d.entries.range(cursor.next()..).next().is_some() {
                         Mode::CatchUp {
                             next: cursor.next(),
                         }
@@ -1015,19 +1132,161 @@ impl Model {
             })
             .collect();
         self.vol = Some(Volatile {
-            registry,
-            entries,
-            current,
-            newest_t,
-            history,
-            trees,
+            registry: d.registry,
+            entries: d.entries,
+            current: d.current,
+            newest_t: d.newest_t,
+            history: d.history,
+            trees: d.trees,
             queue: VecDeque::new(),
             next_position,
             consumers,
             read_only: sync_failed || self.disk.drill || self.disk.superseded,
             sync_failed,
             skew_run: BTreeMap::new(),
+            restore: d.restore,
         });
+    }
+
+    /// Derives registry, views, duplicate history and trees from the disk
+    /// alone. While a restore is bringing detail back, the registry and trees
+    /// start from its checkpoint and only entries after the checkpoint's
+    /// position are applied (§8 Restore step 1).
+    fn derive(&self) -> Derived {
+        let entries = self.disk.live_entries();
+        let restoring = self.disk.restore.as_ref().filter(|_| self.restoring());
+        let cp = restoring.and_then(|r| r.checkpoint.as_ref());
+        let since = cp.map_or(Position::ORIGIN, |c| c.position);
+        let mut registry = cp.map_or_else(Registry::default, |c| c.registry.clone());
+        let mut facts = Vec::new();
+        for (p, e) in &entries {
+            match &e.body {
+                EntryBody::Registry(r) if *p > since => registry.apply(r),
+                EntryBody::Registry(_) => {}
+                EntryBody::Fact(f) => facts.push(f.clone()),
+            }
+        }
+        let current = view::current(facts.iter());
+        let mut newest_t = restoring.map_or_else(BTreeMap::new, |r| r.latest_t.clone());
+        let mut history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>> = BTreeMap::new();
+        for f in &facts {
+            history
+                .entry((f.series, f.t))
+                .or_default()
+                .push((f.value.clone(), f.quality));
+            let n = newest_t.entry(f.series).or_insert(f.t);
+            *n = (*n).max(f.t);
+        }
+        let (trees, restore) = match restoring {
+            None => (build_trees(&registry, &current), None),
+            Some(r) => {
+                let (trees, rt) = self.restoring_trees(r, &registry, &entries, &current);
+                if rt.index_back {
+                    // The revised-key index: every value of each key with
+                    // more than one restored fact (§2.4).
+                    let revised = self.revised_keys(r);
+                    for f in self.listed_facts(r) {
+                        if revised.contains(&(f.series, f.t)) {
+                            history
+                                .entry((f.series, f.t))
+                                .or_default()
+                                .push((f.value.clone(), f.quality));
+                        }
+                    }
+                }
+                (trees, Some(rt))
+            }
+        };
+        Derived {
+            registry,
+            entries,
+            current,
+            newest_t,
+            history,
+            trees,
+            restore,
+        }
+    }
+
+    /// Replaces the derived parts of the running engine, keeping consumers,
+    /// the ingest queue and the next position.
+    fn rederive(&mut self) {
+        let d = self.derive();
+        if let Some(v) = self.vol.as_mut() {
+            v.registry = d.registry;
+            v.entries = d.entries;
+            v.current = d.current;
+            v.newest_t = d.newest_t;
+            v.history = d.history;
+            v.trees = d.trees;
+            v.restore = d.restore;
+        }
+    }
+
+    /// Trees while a restore is bringing detail back. Each series starts from
+    /// the checkpoint's nodes. A span whose detail is all local is recomputed
+    /// from facts (§8 Restore step 4). Elsewhere a minute holding a fact after
+    /// the checkpoint's position is recomputed from the local facts; if the
+    /// checkpoint holds a node for that minute, facts at or before its
+    /// position are missing, so the minute is flagged `summary_stale` (§5.6,
+    /// row 29). Other minutes keep the checkpoint's node.
+    fn restoring_trees(
+        &self,
+        r: &RestoreState,
+        registry: &Registry,
+        entries: &BTreeMap<Position, Entry>,
+        current: &BTreeMap<(SeriesId, Nanos), Fact>,
+    ) -> (BTreeMap<SeriesId, SeriesTree>, RestoreRt) {
+        let listed = self.listed_facts(r);
+        let since = r
+            .checkpoint
+            .as_ref()
+            .map_or(Position::ORIGIN, |c| c.position);
+        let mut count: BTreeMap<(SeriesId, Nanos), Vec<Position>> = BTreeMap::new();
+        let mut not_back = BTreeSet::new();
+        for f in &listed {
+            count.entry((f.series, f.t)).or_default().push(f.position);
+            if !entries.contains_key(&f.position) {
+                not_back.insert((f.series, floor_to(f.t, QUARTER)));
+            }
+        }
+        let remote_single = count
+            .into_iter()
+            .filter(|(_, ps)| ps.len() == 1 && !entries.contains_key(&ps[0]))
+            .map(|(k, _)| k)
+            .collect();
+        let mut checkpoint_minutes = BTreeSet::new();
+        let mut trees = BTreeMap::new();
+        for d in registry.all() {
+            let params = params_of(d);
+            let mut tree = r
+                .checkpoint
+                .as_ref()
+                .and_then(|c| c.trees.get(&d.id))
+                .map_or_else(|| SeriesTree::new(params), SeriesTree::nodes_only);
+            let held: BTreeSet<Nanos> = tree.stored(0).map(|n| n.start).collect();
+            checkpoint_minutes.extend(held.iter().map(|m| (d.id, *m)));
+            let mut after: BTreeMap<Nanos, bool> = held.iter().map(|m| (*m, false)).collect();
+            for ((_, t), f) in current.range((d.id, Nanos::MIN)..=(d.id, Nanos::MAX)) {
+                *after.entry(floor_to(*t, MINUTE)).or_insert(false) |= f.position > since;
+            }
+            for (m, after) in after {
+                let back = !not_back.contains(&(d.id, floor_to(m, QUARTER)));
+                if back || after {
+                    tree.update_minute(m, &minute_readings(current, d.id, m));
+                    tree.set_stale(m, !back && held.contains(&m));
+                }
+            }
+            trees.insert(d.id, tree);
+        }
+        let rt = RestoreRt {
+            latest_t: r.latest_t.clone(),
+            index_back: self.index_back(r),
+            remote_single,
+            checkpoint_minutes,
+            not_back,
+        };
+        (trees, rt)
     }
 
     /// Discards unpublished compaction outputs and resumes retirements of
@@ -1052,7 +1311,9 @@ impl Model {
             .iter()
             .flat_map(|r| match &r.op {
                 ManifestOp::Add { replaces, .. } => replaces.clone(),
-                ManifestOp::Retire { .. } | ManifestOp::Seal { .. } => Vec::new(),
+                ManifestOp::Retire { .. }
+                | ManifestOp::Seal { .. }
+                | ManifestOp::Restore { .. } => Vec::new(),
             })
             .filter(|f| !retired.contains_key(f))
             .collect();
@@ -1338,6 +1599,7 @@ impl Model {
         let mut batch_history: BTreeMap<(SeriesId, Nanos), Vec<(Value, Quality)>> = BTreeMap::new();
         let mut batch_newest: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
         let mut duplicates = 0;
+        let mut unchecked = 0;
         let mut non_finite = 0;
         let mut next = v.next_position;
         let readings: Vec<(Reading, bool)> = v.queue.drain(..).collect();
@@ -1364,6 +1626,19 @@ impl Model {
             if seen && !revise {
                 duplicates += 1;
                 continue;
+            }
+            // During a restore the check cannot run against facts that are
+            // not yet local (§8 Restore step 2, §2.4).
+            if !revise
+                && v.restore.as_ref().is_some_and(|rt| {
+                    if rt.index_back {
+                        rt.remote_single.contains(&key)
+                    } else {
+                        rt.latest_t.get(&r.series).is_some_and(|l| r.t <= *l)
+                    }
+                })
+            {
+                unchecked += 1;
             }
             let newest = batch_newest
                 .get(&r.series)
@@ -1451,6 +1726,7 @@ impl Model {
             return Err(Error::Crashed);
         }
         // Live state.
+        self.counters.duplicates_unchecked += unchecked;
         self.publish_live(&batch)?;
         // Delivery.
         let stop_after = match fault {
@@ -1549,7 +1825,8 @@ impl Model {
 
     fn publish_live(&mut self, batch: &[Entry]) -> Result<(), Error> {
         let cfg = self.config.clone();
-        let local = if self.any_current_detail_evicted() {
+        let restoring = self.vol.as_ref().is_some_and(|v| v.restore.is_some());
+        let local = if !restoring && self.any_current_detail_evicted() {
             Some(self.disk.local_positions())
         } else {
             None
@@ -1584,6 +1861,15 @@ impl Model {
             *run = if skewed { *run + 1 } else { 0 };
         }
         for (s, minute) in touched {
+            if let Some(rt) = &v.restore {
+                let stale = rt.checkpoint_minutes.contains(&(s, minute))
+                    && rt.not_back.contains(&(s, floor_to(minute, QUARTER)));
+                let rs = minute_readings(&v.current, s, minute);
+                let tree = v.trees.get_mut(&s).expect("tree for defined series");
+                tree.update_minute(minute, &rs);
+                tree.set_stale(minute, stale);
+                continue;
+            }
             let mut rs: Vec<(Nanos, Value)> = Vec::new();
             let mut missing = false;
             for (_, f) in v.current.range((s, minute)..(s, minute + MINUTE)) {
@@ -1842,7 +2128,24 @@ impl Model {
     /// A window `[start, end)` over a series from the tree, evaluated at the
     /// engine clock `now` (§6).
     pub fn window(&self, s: SeriesId, start: Nanos, end: Nanos) -> Result<Node, Error> {
-        Ok(self.tree(s)?.window(start, end, self.now))
+        self.query_window(s, start, end).map(|a| a.node)
+    }
+
+    /// A window with its flags. While a restore is bringing detail back, only
+    /// windows at 1-minute resolution are served, flagged `restoring`
+    /// (§8 Restore step 2); a bound inside a minute is refused.
+    pub fn query_window(&self, s: SeriesId, start: Nanos, end: Nanos) -> Result<Answer, Error> {
+        let restoring = self.restoring();
+        let until = end.min(self.now).max(start);
+        if restoring && (floor_to(start, MINUTE) != start || floor_to(until, MINUTE) != until) {
+            return Err(Error::Restoring);
+        }
+        let tree = self.tree(s)?;
+        Ok(Answer {
+            node: tree.window(start, end, self.now),
+            restoring,
+            summary_stale: tree.any_stale(start, until),
+        })
     }
 
     /// Fetches missing detail for a minute and recomputes its path (§5.6).
@@ -2164,6 +2467,85 @@ impl Model {
         }
     }
 
+    /// Takes a tree checkpoint at the last durable position: the stored
+    /// nodes, the registry and each series' latest recorded `t` (§5.1, §8
+    /// Continuous backup). It is uploaded by [`Model::upload_checkpoints`].
+    /// Refused while a restore is bringing detail back.
+    pub fn checkpoint(&mut self) -> Result<Position, Error> {
+        if self.restoring() {
+            return Err(Error::Restoring);
+        }
+        let v = self.vol()?;
+        let position = v
+            .entries
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(Position::ORIGIN);
+        let cp = Checkpoint {
+            position,
+            registry: v.registry.clone(),
+            latest_t: v.newest_t.clone(),
+            trees: v.trees.iter().map(|(s, t)| (*s, t.nodes_only())).collect(),
+        };
+        self.disk.checkpoints.push(cp);
+        Ok(position)
+    }
+
+    /// Uploads queued files, then every local tree checkpoint whose position
+    /// the backed-up log reaches: each position up to it is held by a log
+    /// segment in the bucket (§8 Continuous backup). Returns the checkpoints
+    /// uploaded.
+    pub fn upload_checkpoints(&mut self) -> usize {
+        // Uploading also notices a higher generation claimed (§8 Generations).
+        self.upload();
+        if !self.disk.bucket.reachable || self.disk.drill || self.disk.superseded {
+            return 0;
+        }
+        let backed: BTreeSet<Position> = self
+            .disk
+            .bucket
+            .objects
+            .values()
+            .filter(|(_, f)| f.class == FileClass::Segment)
+            .flat_map(|(_, f)| f.entries().map(|e| e.position))
+            .collect();
+        let live: Vec<Position> = self.disk.live_entries().into_keys().collect();
+        let mut n = 0;
+        for cp in &self.disk.checkpoints {
+            if self.disk.bucket.checkpoints.contains_key(&cp.position) {
+                continue;
+            }
+            if live
+                .iter()
+                .take_while(|p| **p <= cp.position)
+                .all(|p| backed.contains(p))
+            {
+                self.disk.bucket.checkpoints.insert(cp.position, cp.clone());
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Whether a restore is still bringing detail back: some file it
+    /// restores from is not yet local (§8 Restore step 2).
+    pub fn restoring(&self) -> bool {
+        self.disk.restore.as_ref().is_some_and(|r| {
+            let published = self.disk.published();
+            !r.sources.iter().all(|f| published.contains(f))
+        })
+    }
+
+    /// Whether the store still carries the label `derived-unverified`: it was
+    /// restored from a checkpoint and some span the checkpoint covers has not
+    /// yet been recomputed from facts and compared (§8 Restore step 4).
+    pub fn checkpoint_unverified(&self) -> bool {
+        self.disk.restore.as_ref().is_some_and(|r| {
+            r.checkpoint.is_some() && !self.verify_candidates(r).is_subset(&r.verified)
+        })
+    }
+
     /// A new engine restored from the bucket alone (§8), with consumers that
     /// kept no cursor. See [`Model::restore_with_cursors`].
     pub fn restore_from(
@@ -2171,7 +2553,7 @@ impl Model {
         consumers: Vec<ConsumerDecl>,
         bucket: &mut Bucket,
         wall: Nanos,
-        current_only: bool,
+        in_progress: bool,
     ) -> Result<Model, Error> {
         Model::restore_with_cursors(
             config,
@@ -2179,7 +2561,7 @@ impl Model {
             bucket,
             &BTreeMap::new(),
             wall,
-            current_only,
+            in_progress,
             false,
         )
     }
@@ -2191,20 +2573,54 @@ impl Model {
     /// and its positions start at sequence 1. A bucket with nothing backed up
     /// is refused. The restored end is the last position before the first gap
     /// in the restored log; later positions of older generations are set
-    /// aside. `cursors` are the positions consumers kept from before the
-    /// restore: a consumer without one counts as beyond the restored end, and
-    /// one at or below it catches up to the restored end, flagged
-    /// `replayed`. Every consumer then receives `generation_changed` and
-    /// `resync`. With `current_only`, only current chunks are restored first
-    /// (partial restore); [`Model::restore_rest`] adds the rest.
+    /// aside. The restore writes its record, downloads the latest tree
+    /// checkpoint at or below the restored end and the log segments after its
+    /// position (with no checkpoint, the whole log), and then accepts ingest.
+    /// `cursors` are the positions consumers kept from before the restore: a
+    /// consumer without one counts as beyond the restored end, and one at or
+    /// below it catches up to the restored end, flagged `replayed`, if the
+    /// log segments after it are local; otherwise it only receives `resync`.
+    /// Every consumer then receives `generation_changed` and `resync`. With
+    /// `in_progress`, the restore returns as soon as it accepts ingest;
+    /// [`Model::restore_step`] brings the rest back. Otherwise it runs to the
+    /// end.
     pub fn restore_with_cursors(
         config: Config,
         consumers: Vec<ConsumerDecl>,
         bucket: &mut Bucket,
         cursors: &BTreeMap<ConsumerId, Position>,
         wall: Nanos,
-        current_only: bool,
+        in_progress: bool,
         drill: bool,
+    ) -> Result<Model, Error> {
+        let mut m = Model::restore_impl(config, consumers, bucket, cursors, wall, drill, false)?;
+        if !in_progress {
+            m.restore_rest()?;
+        }
+        Ok(m)
+    }
+
+    /// A restore that claims its generation and stops (the machine crashes)
+    /// before it writes its record. [`Model::restart`] then starts the
+    /// restore again with the next generation (§8 Restore).
+    pub fn restore_interrupted_before_record(
+        config: Config,
+        consumers: Vec<ConsumerDecl>,
+        bucket: &mut Bucket,
+        cursors: &BTreeMap<ConsumerId, Position>,
+        wall: Nanos,
+    ) -> Result<Model, Error> {
+        Model::restore_impl(config, consumers, bucket, cursors, wall, false, true)
+    }
+
+    fn restore_impl(
+        config: Config,
+        consumers: Vec<ConsumerDecl>,
+        bucket: &mut Bucket,
+        cursors: &BTreeMap<ConsumerId, Position>,
+        wall: Nanos,
+        drill: bool,
+        stop_before_record: bool,
     ) -> Result<Model, Error> {
         let mut restored: Vec<Position> = bucket
             .objects
@@ -2237,15 +2653,75 @@ impl Model {
         };
         let mut m = Model::new(config, consumers, wall);
         m.disk.bucket = bucket.clone();
+        // New files never take the identity of a bucket file not yet local.
+        m.disk.next_file = bucket.objects.keys().next_back().map_or(0, |f| f.0 + 1);
         m.disk.generation = generation;
-        m.disk.restored_end = Some(end);
         m.disk.drill = drill;
+        if stop_before_record {
+            m.disk.pending_restore = Some(PendingRestore {
+                cursors: cursors.clone(),
+                drill,
+            });
+            m.crash();
+            return Ok(m);
+        }
+        // The restore record, written before ingest is accepted (step 1).
+        let checkpoint = bucket
+            .checkpoints
+            .range(..=end)
+            .next_back()
+            .map(|(_, c)| c.clone());
+        m.disk.restored_end = Some(end);
+        let epoch = m.disk.epoch();
+        m.disk.manifest.push(ManifestRecord {
+            epoch,
+            at: wall,
+            op: ManifestOp::Restore {
+                generation,
+                checkpoint: checkpoint.as_ref().map(|c| c.position),
+                restored_end: end,
+            },
+        });
+        let latest_t = checkpoint
+            .as_ref()
+            .map_or_else(BTreeMap::new, |c| c.latest_t.clone());
+        m.disk.restore = Some(RestoreState {
+            generation,
+            restored_end: end,
+            checkpoint,
+            sources: bucket.objects.keys().copied().collect(),
+            latest_t,
+            verified: BTreeSet::new(),
+            differences: Vec::new(),
+        });
+        // Step 1: the log after the checkpoint (no checkpoint: all of it).
+        for f in m.step_one_files() {
+            m.download(f)?;
+        }
+        let local = m.disk.live_entries();
+        let r = m.disk.restore.as_mut().expect("restore state");
+        for f in local.values().filter_map(Entry::fact) {
+            if f.position <= end {
+                let n = r.latest_t.entry(f.series).or_insert(f.t);
+                *n = (*n).max(f.t);
+            }
+        }
+        // Step 2: a kept cursor continues only if the log segments after it,
+        // up to the restored end, are local.
+        let r = m.disk.restore.clone().expect("restore state");
+        let listed: BTreeSet<Position> = m.listed_entries(&r).into_keys().collect();
+        let segments = m.local_segment_positions();
         let ids: Vec<ConsumerId> = m.consumers.iter().map(|c| c.id).collect();
         for id in ids {
             let cursor = cursors.get(&id).copied();
-            m.disk
-                .cursors
-                .insert(id, cursor.filter(|c| *c <= end).unwrap_or(end));
+            let continues = cursor.filter(|c| {
+                *c <= end
+                    && listed
+                        .iter()
+                        .filter(|p| *p > c && **p <= end)
+                        .all(|p| segments.contains(p))
+            });
+            m.disk.cursors.insert(id, continues.unwrap_or(end));
             m.signals.entry(id).or_default().extend([
                 Signal::GenerationChanged {
                     cursor,
@@ -2254,41 +2730,312 @@ impl Model {
                 Signal::ResyncDue,
             ]);
         }
-        m.restore_rest(current_only);
+        m.restart();
         Ok(m)
     }
 
-    /// Downloads bucket files not yet on the fast disk and restarts.
-    pub fn restore_rest(&mut self, current_only: bool) {
-        let objects: Vec<(FileId, u64, StoredFile)> = self
-            .disk
-            .bucket
-            .objects
-            .iter()
-            .map(|(id, (h, c))| (*id, *h, c.clone()))
-            .collect();
-        for (id, hash, content) in objects {
-            if current_only && content.class != FileClass::Current {
-                continue;
-            }
-            if self.disk.files.contains_key(&id) && self.disk.hot.contains(&id) {
-                continue;
-            }
-            self.disk.next_file = self.disk.next_file.max(id.0 + 1);
-            self.disk.files.insert(id, content);
-            self.disk.hot.insert(id);
-            let epoch = self.disk.epoch();
-            self.disk.manifest.push(ManifestRecord {
-                epoch,
-                at: self.wall,
-                op: ManifestOp::Add {
-                    file: id,
-                    replaces: Vec::new(),
-                    hash,
-                },
-            });
+    /// Starts a restore that stopped before its record again, with the next
+    /// generation.
+    fn restart_restore(&mut self, pending: PendingRestore) {
+        let mut bucket = self.disk.bucket.clone();
+        if let Ok(fresh) = Model::restore_impl(
+            self.config.clone(),
+            self.consumers.clone(),
+            &mut bucket,
+            &pending.cursors,
+            self.wall,
+            pending.drill,
+            false,
+        ) {
+            self.disk = fresh.disk;
+            self.vol = fresh.vol;
+            self.signals = fresh.signals;
+            self.sessions = fresh.sessions;
         }
-        self.restart();
+    }
+
+    /// Downloads the next file the restore still needs, in the order of
+    /// §8 Restore step 3, verifies the spans whose detail is now all local
+    /// (step 4) and returns the file; `None` once nothing is missing.
+    pub fn restore_step(&mut self) -> Result<Option<FileId>, Error> {
+        self.vol()?;
+        let Some(next) = self.restore_queue().into_iter().next() else {
+            return Ok(None);
+        };
+        self.download(next)?;
+        self.verify_restored();
+        self.rederive();
+        Ok(Some(next))
+    }
+
+    /// Runs [`Model::restore_step`] until nothing is missing.
+    pub fn restore_rest(&mut self) -> Result<(), Error> {
+        while self.restore_step()?.is_some() {}
+        Ok(())
+    }
+
+    /// Files the restore still needs after step 1, in download order.
+    pub fn restore_queue(&self) -> Vec<FileId> {
+        let Some(r) = &self.disk.restore else {
+            return Vec::new();
+        };
+        let published = self.disk.published();
+        let mut q: Vec<FileId> = r
+            .sources
+            .iter()
+            .filter(|f| !published.contains(f))
+            .copied()
+            .collect();
+        q.sort_by_key(|f| (download_rank(self.disk.bucket.objects[f].1.class), *f));
+        q
+    }
+
+    /// Step 1: the log segments holding a position after the checkpoint's
+    /// (every segment with no checkpoint). Where no segment holds a position
+    /// up to the restored end (the model's compaction retires segments), the
+    /// first file in download order that holds it.
+    fn step_one_files(&self) -> Vec<FileId> {
+        let r = self.disk.restore.as_ref().expect("restore state");
+        let since = r
+            .checkpoint
+            .as_ref()
+            .map_or(Position::ORIGIN, |c| c.position);
+        let objects = &self.disk.bucket.objects;
+        let mut chosen: Vec<FileId> = r
+            .sources
+            .iter()
+            .filter(|f| {
+                let file = &objects[f].1;
+                file.class == FileClass::Segment && file.entries().any(|e| e.position > since)
+            })
+            .copied()
+            .collect();
+        let mut needed: BTreeSet<Position> = self
+            .listed_entries(r)
+            .into_keys()
+            .filter(|p| *p > since)
+            .collect();
+        for f in &chosen {
+            for e in objects[f].1.entries() {
+                needed.remove(&e.position);
+            }
+        }
+        let mut rest: Vec<FileId> = r
+            .sources
+            .iter()
+            .filter(|f| !chosen.contains(f))
+            .copied()
+            .collect();
+        rest.sort_by_key(|f| (download_rank(objects[f].1.class), *f));
+        for f in rest {
+            if needed.is_empty() {
+                break;
+            }
+            let file = &objects[&f].1;
+            if file.entries().any(|e| needed.contains(&e.position)) {
+                for e in file.entries() {
+                    needed.remove(&e.position);
+                }
+                chosen.push(f);
+            }
+        }
+        chosen
+    }
+
+    /// Installs a bucket file on the fast disk. A position it shares with a
+    /// file already local must have identical content (§8 Restore step 3).
+    fn download(&mut self, id: FileId) -> Result<(), Error> {
+        let (hash, content) = self.disk.bucket.objects[&id].clone();
+        let local = self.disk.all_entries();
+        for e in content.entries() {
+            if local.get(&e.position).is_some_and(|l| l != e) {
+                return Err(Error::Conflict {
+                    file: id,
+                    position: e.position,
+                });
+            }
+        }
+        self.disk.next_file = self.disk.next_file.max(id.0 + 1);
+        self.disk.files.insert(id, content);
+        self.disk.hot.insert(id);
+        let epoch = self.disk.epoch();
+        self.disk.manifest.push(ManifestRecord {
+            epoch,
+            at: self.wall,
+            op: ManifestOp::Add {
+                file: id,
+                replaces: Vec::new(),
+                hash,
+            },
+        });
+        Ok(())
+    }
+
+    /// Entries of the files the restore restores from, up to the restored end.
+    fn listed_entries(&self, r: &RestoreState) -> BTreeMap<Position, Entry> {
+        let mut out = BTreeMap::new();
+        for f in &r.sources {
+            for e in self.disk.bucket.objects[f].1.entries() {
+                if e.position <= r.restored_end {
+                    out.entry(e.position).or_insert_with(|| e.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Facts of the files the restore restores from, up to the restored end.
+    fn listed_facts(&self, r: &RestoreState) -> Vec<Fact> {
+        self.listed_entries(r)
+            .into_values()
+            .filter_map(|e| e.fact().cloned())
+            .collect()
+    }
+
+    /// Keys with more than one restored fact: those the revised-key index
+    /// holds.
+    fn revised_keys(&self, r: &RestoreState) -> BTreeSet<(SeriesId, Nanos)> {
+        let mut seen = BTreeSet::new();
+        let mut revised = BTreeSet::new();
+        for f in self.listed_facts(r) {
+            if !seen.insert((f.series, f.t)) {
+                revised.insert((f.series, f.t));
+            }
+        }
+        revised
+    }
+
+    /// Whether every current chunk the restore restores from is local. The
+    /// revised-key index counts as back with them (see `OPEN-QUESTIONS.md`
+    /// Q-39).
+    fn index_back(&self, r: &RestoreState) -> bool {
+        let published = self.disk.published();
+        r.sources.iter().all(|f| {
+            self.disk.bucket.objects[f].1.class != FileClass::Current || published.contains(f)
+        })
+    }
+
+    /// Positions held by local log segments.
+    fn local_segment_positions(&self) -> BTreeSet<Position> {
+        self.disk
+            .published()
+            .into_iter()
+            .filter(|f| {
+                self.disk.files[f].class == FileClass::Segment
+                    && self.disk.locality(*f) == Locality::Hot
+            })
+            .flat_map(|f| self.disk.files[&f].entries().map(|e| e.position))
+            .collect()
+    }
+
+    /// Spans the checkpoint covers: those where it holds a node, and those
+    /// holding a restored fact at or before its position.
+    fn verify_candidates(&self, r: &RestoreState) -> BTreeSet<(SeriesId, Nanos)> {
+        let Some(cp) = &r.checkpoint else {
+            return BTreeSet::new();
+        };
+        let mut out: BTreeSet<(SeriesId, Nanos)> = cp
+            .trees
+            .iter()
+            .flat_map(|(s, t)| t.stored(0).map(move |n| (*s, floor_to(n.start, QUARTER))))
+            .collect();
+        out.extend(
+            self.listed_facts(r)
+                .iter()
+                .filter(|f| f.position <= cp.position)
+                .map(|f| (f.series, floor_to(f.t, QUARTER))),
+        );
+        out
+    }
+
+    /// Step 4: for each span the checkpoint covers whose detail is now all
+    /// local, recomputes its nodes from the facts as of the checkpoint's
+    /// position and compares them with the checkpoint's; a difference is
+    /// recorded and counted. The live tree is recomputed from the facts
+    /// whatever the outcome (`restoring_trees`), so the recomputed value wins.
+    fn verify_restored(&mut self) {
+        let Some(r) = self.disk.restore.clone() else {
+            return;
+        };
+        let Some(cp) = &r.checkpoint else {
+            return;
+        };
+        let local = self.disk.live_entries();
+        let listed = self.listed_facts(&r);
+        let not_back: BTreeSet<(SeriesId, Nanos)> = listed
+            .iter()
+            .filter(|f| !local.contains_key(&f.position))
+            .map(|f| (f.series, floor_to(f.t, QUARTER)))
+            .collect();
+        let before: Vec<Fact> = local
+            .values()
+            .filter_map(Entry::fact)
+            .filter(|f| f.position <= cp.position)
+            .cloned()
+            .collect();
+        let mut verified = r.verified.clone();
+        let mut differences = r.differences.clone();
+        for (s, q) in self.verify_candidates(&r) {
+            if verified.contains(&(s, q)) || not_back.contains(&(s, q)) {
+                continue;
+            }
+            verified.insert((s, q));
+            let params = cp
+                .registry
+                .get(s)
+                .map(params_of)
+                .or_else(|| cp.trees.get(&s).map(|t| t.params));
+            let same = params.is_some_and(|params| {
+                let span = before
+                    .iter()
+                    .filter(|f| f.series == s && floor_to(f.t, QUARTER) == q);
+                let rs: Vec<(Nanos, Value)> = view::as_of_position(span, cp.position)
+                    .into_values()
+                    .filter(Fact::summarised)
+                    .map(|f| (f.t, f.value))
+                    .collect();
+                let check = SeriesTree::build(params, &rs);
+                let held = cp
+                    .trees
+                    .get(&s)
+                    .cloned()
+                    .unwrap_or_else(|| SeriesTree::new(params));
+                held.node(1, q) == check.node(1, q)
+                    && (0..QUARTER / MINUTE)
+                        .all(|i| held.node(0, q + i * MINUTE) == check.node(0, q + i * MINUTE))
+            });
+            if !same {
+                differences.push((s, q));
+                self.counters.checkpoint_differences += 1;
+            }
+        }
+        let state = self.disk.restore.as_mut().expect("restore state");
+        state.verified = verified;
+        state.differences = differences;
+    }
+}
+
+/// The summarised current readings of one minute of a series.
+fn minute_readings(
+    current: &BTreeMap<(SeriesId, Nanos), Fact>,
+    s: SeriesId,
+    minute: Nanos,
+) -> Vec<(Nanos, Value)> {
+    current
+        .range((s, minute)..(s, minute + MINUTE))
+        .map(|(_, f)| f)
+        .filter(|f| f.summarised())
+        .map(|f| (f.t, f.value.clone()))
+        .collect()
+}
+
+/// Order of downloads after step 1: current chunks first, then revision
+/// chunks, then log segments (§8 Restore step 3).
+fn download_rank(class: FileClass) -> u8 {
+    match class {
+        FileClass::Current => 0,
+        FileClass::Revision => 1,
+        FileClass::Segment => 2,
     }
 }
 
