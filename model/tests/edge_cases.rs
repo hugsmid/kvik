@@ -1496,7 +1496,7 @@ proptest! {
     #[test]
     fn row_20_dst_days(
         zone in proptest::sample::select(vec![
-            "UTC", "Europe/Paris", "Europe/London", "America/New_York", "America/Santiago",
+            "UTC", "Europe/Paris", "Europe/Berlin", "Europe/London", "America/New_York", "America/Santiago",
             "Australia/Sydney", "Asia/Kolkata", "Asia/Kathmandu", "Pacific/Chatham", "America/Havana",
             "Australia/Lord_Howe", "Asia/Tokyo", "Africa/Cairo", "America/Sao_Paulo",
         ]),
@@ -2219,10 +2219,28 @@ fn row_21_site_zone_change_rebuilds_from_its_effective_time() {
         assert_eq!(a.node, oracle::window(&p, &rs, from, to, m.now));
     }
     // The rebuild equals a build from the log alone (invariant 8), also after
-    // a restart.
+    // a restart, and after compaction, a tree checkpoint and a restore, which
+    // carry the site-zone entry as a registry entry.
     assert_eq!(m.calendars().unwrap(), &m.rebuilt_calendars().unwrap());
     m.restart();
     assert_eq!(m.calendar_file(s).unwrap(), &after);
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.checkpoint().unwrap();
+    m.seal_active();
+    m.upload();
+    m.upload_checkpoints();
+    let mut r =
+        Model::restore_from(m.config.clone(), vec![], &mut m.disk.bucket, m.wall, false).unwrap();
+    assert_eq!(r.calendar_file(s).unwrap(), &after, "from the checkpoint");
+    r.restore_rest().unwrap();
+    assert!(!r.restoring());
+    assert_eq!(
+        r.calendar_file(s).unwrap(),
+        &after,
+        "once the detail is back"
+    );
+    assert_eq!(r.calendar(s, Period::Month(may)).unwrap().node, site.node);
 }
 
 /// Row 21: "tzdata changes its rules: calendar nodes rebuilt for the affected

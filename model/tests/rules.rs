@@ -3726,6 +3726,15 @@ fn s5_7_named_zone_compared_after_resolving_links() {
         assert_eq!((a.from, a.to), span);
         assert_eq!(a.node, site.node);
     }
+    // Identity follows the data a link shares: in the bundled database
+    // Europe/Amsterdam is a link to Europe/Brussels.
+    let db = &m.tzdb;
+    let id = |z| db.id(z).unwrap();
+    assert_eq!(id("Asia/Calcutta"), id("Asia/Kolkata"));
+    assert_eq!(id("UTC"), id("Etc/UTC"));
+    assert_eq!(id("Europe/Amsterdam"), id("Europe/Brussels"));
+    assert_ne!(id("Etc/GMT"), id("Etc/UTC"));
+    assert_ne!(id("Europe/Paris"), id("Europe/Berlin"));
     assert!(matches!(
         m.calendar_in(s, Period::Day(date), "Mars/Olympus_Mons"),
         Err(Error::Tree(kvik_model::tree::TreeError::UnknownZone(_)))
@@ -3888,6 +3897,26 @@ fn s5_7_day_spans_pinned() {
         );
         let quarter_edges = !matches!(y, 1900 | 1912 | 1970);
         assert_eq!(aligned((day.start, day.end)), quarter_edges, "{zone}");
+        // Such a day has no whole number of quarter-hours and no calendar
+        // node, though its result is a window (`row_21a_…`).
+        let tz = jiff::tz::TimeZone::get(zone).unwrap();
+        let date = jiff::civil::Date::constant(y, mo, d);
+        let dense = SeriesTree::new(Params {
+            expected_interval: Some(SECOND),
+            ..Params::new(Kind::Gauge, MINUTE)
+        });
+        for refused in [
+            kvik_model::tree::quarters_in_day(&tz, date).err(),
+            dense.day(&tz, date).err(),
+        ] {
+            assert_eq!(
+                matches!(
+                    refused,
+                    Some(kvik_model::tree::TreeError::UnalignedDay { .. })
+                ),
+                !quarter_edges
+            );
+        }
     }
 }
 

@@ -30,8 +30,10 @@ use crate::types::{MINUTE, Nanos, QUARTER, floor_to};
 /// Identity of a zone after resolving IANA links (§5.7: zones are compared by
 /// canonical name). The bundled database exposes no link table, but a link
 /// shares its target's data, so the identity is a fingerprint of the zone's
-/// bundled rules: every transition (instant, offset, DST flag, abbreviation)
-/// up to 2200. Distinct zones differ at least in their local mean time.
+/// bundled rules: the initial offset and abbreviation and every transition
+/// (instant, offset, DST flag, abbreviation) up to 2200. Distinct zones of
+/// the bundled data differ in these (most in their local mean time); two
+/// zones whose rules are identical would count as one.
 pub type ZoneId = u64;
 
 /// The time-zone database the engine uses, with its version (§5.7: the tzdata
@@ -107,7 +109,10 @@ fn zone_id(name: &str) -> Result<ZoneId, TreeError> {
     let tz = bundled(name)?;
     let horizon: Timestamp = "2200-01-01T00:00:00Z".parse().expect("valid instant");
     let mut h = Fnv::default();
-    h.write(&tz.to_offset(Timestamp::MIN).seconds().to_le_bytes());
+    let initial = tz.to_offset_info(Timestamp::MIN);
+    h.write(&initial.offset().seconds().to_le_bytes());
+    h.write(initial.abbreviation().as_bytes());
+    h.write(&[0]);
     for tr in tz.following(Timestamp::MIN) {
         if tr.timestamp() >= horizon {
             break;
