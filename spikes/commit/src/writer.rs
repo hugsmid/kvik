@@ -74,7 +74,8 @@ impl Default for Config {
             max_batch_readings: 1 << 20,
             max_batch_bytes: 1 << 20,
             queue_capacity: 65_536,
-            mark_sync: MarkSync::Thread(Duration::from_secs(1)),
+            // The rule the measurements recommend: once a second, on the writer thread.
+            mark_sync: MarkSync::Inline(Duration::from_secs(1)),
             preallocate_ahead: true,
             space_check_interval: Duration::from_millis(100),
             low_mark_percent: 5,

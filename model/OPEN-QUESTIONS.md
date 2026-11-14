@@ -577,12 +577,12 @@ header.
 ## Q-87 — A mark lost on the same boot after a failed sync
 Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
 **Scenario.** On Linux, the sync of batch b fails; the writer becomes read-only and the mark still covers b − 1
-(§3). After a failed writeback Linux marks the pages clean without writing them: the page cache holds b complete,
-the disk does not, and a later sync of the file returns success without writing it. Before the restart, and without
-a reboot, the mark file is lost or unreadable. Rule 3 treats a missing mark as a different boot: b is complete in
-the cache and kept, rule 4's sync succeeds without writing it, and b is delivered as durable although it is not on
-disk (principle 3). A later power loss removes it; nothing reports it as `possible_loss`, since it was never
-acknowledged and the next recovery has no record of it.
+(§3). After a failed writeback Linux (ext4, XFS) marks the pages clean without writing them: the page cache holds b
+complete, the disk does not, and a later sync of the file returns success without writing it. Before the restart,
+and without a reboot, the mark file is lost or unreadable. Rule 3 treats a missing mark as a different boot: b is
+complete in the cache and kept, rule 4's sync succeeds without writing it, and b is delivered as durable although it
+is not on disk (principle 3). A later power loss removes it; nothing reports it as `possible_loss`, since it was
+never acknowledged and the next recovery has no record of it.
 **Spike.** `spikes/commit/tests/faults.rs`
 `with_the_mark_lost_after_a_failed_sync_recovery_keeps_a_batch_that_is_not_on_disk`, on a simulated file system
 with the Linux behaviour.

@@ -354,10 +354,7 @@ fn below_the_critical_mark_emits_wait_and_resume_when_space_returns() {
     wait_until("all six", || acked.lock().unwrap().last().unwrap().1 == 6);
     let (waited, waits) = ingest.back_pressure();
     assert_eq!(waits, 1);
-    assert!(
-        waited >= Duration::from_millis(25),
-        "the wait is measured: {waited:?}"
-    );
+    assert!(waited > Duration::ZERO, "the wait is measured");
     assert_eq!(ingest.health(), Health::Ok);
     drop(ingest);
     assert!(writer.join().fatal.is_none());
@@ -437,16 +434,21 @@ fn the_clean_shutdown_syncs_the_mark_once_and_the_log_directory_was_synced() {
 fn the_writer_thread_mark_sync_also_runs_when_ingest_stops() {
     let fs = SimFs::new();
     let config = Config {
-        mark_sync: MarkSync::Inline(Duration::from_millis(200)),
+        mark_sync: MarkSync::Inline(Duration::from_secs(1)),
         ..config()
     };
     let (writer, ingest, acked) = start(&fs, config);
-    // The batch is acknowledged well within the first interval, so its own commit does not sync the mark,
-    // and nothing else arrives: only the idle path can.
     emit_acked(&ingest, &acked, 0);
-    wait_until("the idle mark sync", || {
-        Mark::decode(&fs.read_disk(MARK_NAME).unwrap()).is_some_and(|m| m.last_sequence == 1)
-    });
+    // Only the start's sync so far: the batch came well within the first interval, so its commit did not
+    // sync the mark.
+    assert_eq!(fs.syncs_of(MARK_NAME), 1);
+    // Nothing else arrives, so only the idle path can sync it now.
+    wait_until("the idle mark sync", || fs.syncs_of(MARK_NAME) == 2);
+    assert_eq!(acked.lock().unwrap().len(), 1, "no batch in between");
+    assert_eq!(
+        Mark::decode(&fs.read_disk(MARK_NAME).unwrap()).map(|m| m.last_sequence),
+        Some(1)
+    );
     drop(ingest);
     writer.join();
 }

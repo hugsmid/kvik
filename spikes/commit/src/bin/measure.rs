@@ -372,6 +372,11 @@ fn load_with(
     drop(ingest);
     let report = writer.join();
     let elapsed = start.elapsed().as_secs_f64();
+    assert!(
+        report.fatal.is_none(),
+        "the writer failed: {:?}",
+        report.fatal
+    );
     let device_bytes = device_before
         .zip(device_bytes_written())
         .map(|(a, b)| b.saturating_sub(a));
@@ -720,7 +725,8 @@ fn mark_arg(s: &str) -> MarkSync {
         "off" => MarkSync::Off,
         "inline" => MarkSync::Inline(Duration::from_secs(1)),
         "every" => MarkSync::EveryBatch,
-        _ => MarkSync::Thread(Duration::from_secs(1)),
+        "thread" => MarkSync::Thread(Duration::from_secs(1)),
+        _ => MarkSync::Inline(Duration::from_secs(1)),
     }
 }
 
@@ -759,7 +765,7 @@ fn main() {
                 .map_or(SyncCall::durable(), |s| SyncCall::parse(s).expect("call"));
             let mark = args
                 .get(7)
-                .map_or(MarkSync::Thread(Duration::from_secs(1)), |s| mark_arg(s));
+                .map_or(MarkSync::Inline(Duration::from_secs(1)), |s| mark_arg(s));
             header();
             row(window, &load(&dir, call, rate, window, secs, mark));
         }
