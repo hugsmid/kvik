@@ -1,7 +1,7 @@
 # kvik
 
-The public Rust interface of the kvik store, as outlined in [`docs/api.md`](../docs/api.md) and governed by the
-[specification](../docs/spec.md). Applications can write adapters and consumers against it today; the durable log
+The public Rust interface of the kvik store, as settled at gate 3.3 in [`docs/api.md`](../docs/api.md) and governed by
+the [specification](../docs/spec.md). Applications can write adapters and consumers against it today; the durable log
 engine will replace the backend behind the same interface (roadmap section 4 onwards).
 
 ## Backend: in-memory, not durable, for development and tests
@@ -12,17 +12,19 @@ engine will replace the backend behind the same interface (roadmap section 4 onw
 > current process and is lost when the process ends.
 
 `Store::open` takes a directory but only uses it as a name. Within one process, opening the same directory again after
-`Store::shutdown` (or after dropping the store, which acts as a crash) restarts the store as it was left, so restarts,
-catch-up, replay and `resync` can be exercised in tests. `Reader::open` finds a store opened in the same process.
+`Store::shutdown` (or after dropping the last `Store` clone, which acts as a crash) restarts the store as it was left,
+so restarts, catch-up, replay and resyncs can be exercised in tests. `Reader::open` finds a store opened in the same
+process.
 
-The interface is asynchronous but needs no particular runtime and starts no threads. Timers (window expiry, held-for
-and stale-for conditions, scheduled values taking effect) advance only when the store is called: before every emit
-and delivery poll, and on `Store::tick`, which is temporary and goes when the engine runs its own timers. A waiting
-`Consumer::next` is woken by the next emit, routing change or tick.
+The engine owns its threads; the model backend has none. Its calls complete at once, except `Consumer::next`, which
+waits for a delivery, and `Store::emit`, which waits under back-pressure. Timers (window expiry, held-for and
+stale-for conditions, scheduled values taking effect) advance only when the store is called: before every emit and
+delivery poll, and on `Store::tick`, which is temporary and goes when the engine runs its own timers. A waiting call
+is woken by the next emit, routing change, confirmation or tick.
 
-[jiff](https://docs.rs/jiff) 0.2 is part of the public interface (`Timestamp`, `civil::Date`, `SignedDuration`) and is
-re-exported as `kvik::jiff`. The default feature `bundled-tzdb` embeds the time-zone database; the model backend
-embeds it in any case.
+Only std types appear in signatures. The optional feature `jiff` adds conversions between the interface's time types
+and jiff 0.2's; the default feature `bundled-tzdb` embeds the time-zone database (the model backend embeds it in any
+case).
 
 ## Example
 
@@ -35,55 +37,72 @@ receives and confirms a threshold condition's transition, and queries a rolling 
 
 ## Coverage
 
-What the model backend supports, each with a test in [`tests/`](tests/):
+What the model backend supports, each with a test in [`tests/`](tests/) or the crate's unit tests:
 
 | Area | Supported |
 |---|---|
-| Opening | `Store::open` and `shutdown`, one writer per directory, `Reader::open`, readers after the writer shuts down, site-zone check, restart |
-| Environment | `Clock`, `Fs` and `BootId` seams with production and test implementations; the backend uses the clock only |
-| Series | gauge, counter, boolean and named state, text, fixed-length interval series with a phase, versioned series; defining again, `alias`, `retire`, `series` by id or name, a change of retention class. Other definition fields (record on change, counter rules, lateness bound, timing) are passed to the model unchanged |
-| Writing | `emit`, `emit_with` (`Intent::Revise`), `try_emit`; refusals per index; back-pressure (queue full, unsynchronised clock for host-stamped readings, critical disk) |
-| Consuming | consumers by name; funnels by ids, name pattern (re-routed on definition and alias) or all; `unroute`; threshold, on-change, held-for and stale-for conditions, with or without a rolling operator; `next`, `try_next`, `confirm`; the `replayed`, `future` and `outranked` flags; overflow and catch-up; a consumer taken again replays then resyncs; `resync` with live and condition state and `transition`; condition deliveries on the timer |
-| Reading | live state with staleness; rolling, absolute and calendar windows in the site zone or a named zone; calendar day and month results; facts in the current, as-of (position or time) and history views; chart buckets (automatic and fixed steps); the interval containing a time |
-| Health | health with reasons; statistics per store, series and consumer |
-
-What returns `Error::NotSupportedYet`, or is never produced:
-
-- decimal value types (`ValueType::Decimal`) and calendar-length interval series (a local day or month, with a day
-  start);
-- parameter changes other than the retention class;
-- a new consumer starting at a position or a time (`Start::Position`, `Start::Time`);
-- a consumer that emits readings: `emits` other than `Select::None` (the model has no routing-cycle check), so
-  `Consumer::try_emit` refuses every reading `NotDeclared`, and `Error::RouteCycle` is never returned;
-- a funnel with an operator but no condition, and a held-for condition over an operator;
-- backup, restore, export of set-aside facts and rebuild;
-- the `Unknown` live and condition states, `approximate_edges`, `displaced`, a trigger's value and coverage, commit
-  latency, backup lag and restore progress, which need the durable engine, tiers or restore.
-
-Name patterns in a funnel's selection work, but their grammar is provisional (`*` within one `/`-separated segment),
-as the specification does not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).
-`Store::emit` waits under back-pressure only for clock synchronisation; a batch larger than the ingest queue, or free
-space below the critical mark, returns `Error::Busy`, as nothing in this backend would end the wait.
+| Opening | `Store::open` with `create_if_missing`, one writer per directory (`OpenError::Locked`), configuration checked against its limits, site-zone check and `set_site_zone`, restart; `Reader::open(ReaderConfig)`, `refresh`, readers after the writer shuts down; `Store` clones and `shutdown(&self)` |
+| Environment | `Clock` (with `Monotonic`), `Fs`, `BootId`, `TzSource`/`TzRelease` and `Entropy` seams, each with a production and a test implementation; the backend uses the clock only |
+| Series | gauge, counter, boolean and named state, text, fixed-length interval series with a phase, versioned series; defining again, `Conflict` naming the differing field, `alias`, `retire`, `series` by id or name, a change of retention class. Other definition fields (record on change, counter rules, lateness bound, timing) are passed to the model unchanged |
+| Writing | `emit`, `emit_with` (`Intent::Revise`), `try_emit` returning a `Pending`; one `Outcome` per reading (recorded with its position and `outranked`, duplicate, refused); `Value::Absent` and non-finite values recorded without a value; back-pressure as `Wait` (unsynchronised clock for host-stamped readings, critical disk), named in `stats().ingest.waiting` and health while it lasts; `EmitError::TooLarge` over the call limits |
+| Consuming | consumers by name; funnels by ids, name pattern (re-routed on definition and alias) or all; `unroute`; threshold, on-change, held-for and stale-for conditions, with or without a rolling operator; `next`, `try_next`, `confirm`; the `replayed`, `future` and `outranked` flags; overflow and catch-up; a consumer taken again replays then resyncs; resyncs in parts of at most 256 funnel states, confirmed by the last part, with nothing delivered until then; condition deliveries on the timer; `Consumer::try_emit` |
+| Reading | live state with staleness; rolling, relative, absolute and calendar windows in the site zone or a named zone; calendar day and month results; facts in the current, as-of (position or time) and history views, as a `Facts` iterator; the fact at a time (`Reader::at`), also for a versioned or forecast series; chart buckets (automatic and fixed steps) whose min and max are over readings only while the mean can come from a carried-in value; the interval containing a time |
+| Health | `Health` with `Reason`s and a `Fault`; `Stats` (ingest, log, disk, clock jumps); `series_stats`; `losses`, `acknowledge_losses`, `acknowledge_manifest_rebuild` |
 
 ## Differences from `docs/api.md`
 
-The crate follows the specification where `docs/api.md` is silent, ambiguous or differs; `docs/api.md` is being
-revised at gate 3.3 and the crate will be aligned with it then.
+Not supported by the model backend:
 
-- `Reading` carries `changed_at` (spec §2.2).
-- `ConditionState` has `Value` for an on-change condition's last value.
-- A `resync`'s `FunnelState` carries live state per selected series and whether it is a `transition`; `Resync` carries
-  the positions it `replaced`.
-- `DeliveryKind::GenerationChanged` and the `outranked` delivery flag exist (spec §4, §8).
-- `Ack.first` and `Ack.last` are optional, as a batch may record nothing; `Ack.recorded` counts the facts.
-- `try_emit` returns `Accepted`, only what is known when the batch enters the queue (the refusals).
-- `Fs` has no memory mapping: the crate forbids `unsafe` code.
-- `Resolution::Auto` takes the finest of 1 minute, 15 minutes and multiples of 15 minutes that fits `max_points`
-  (`docs/api.md` says the coarsest), counted from the UTC-aligned start.
-- `Reader::interval` returns the interval that contains `t`, whether or not `t` is its start.
-- `Consumer::next` returns `Result<Option<Delivery>>`: `Ok(None)` once the store is closed.
-- Added: `Store::tick` (temporary), `Store::now`, `Store::is_durable`, `Consumer::try_next`, `Consumer::unroute`,
-  `Consumer::routes`, `Reader::series`.
-- Absent: the `Tzdata` seam and the `TzdataMismatch` error; tzdata health reasons; per-funnel
-  `transitions_not_delivered`; queue depths in `Stats`. `evaluations_unknown` is per consumer, not per funnel, and
-  always 0.
+- **Decimal series** (`ValueType::Decimal`, `ValueType::decimal()`), so also `raise_scale`, the excess-precision
+  policy and `Refusal::ExcessPrecision`: defining one returns `DefineError::NotSupportedYet`. The reference model has
+  no exact decimal values, and storing decimals as `f64` would not give the exact sums the specification promises.
+  `Value::Decimal` on an `f64` series is refused `WrongType`; `Outcome::Recorded.rounded` and the `rounded` fact flag
+  are never set.
+- **Calendar-length interval series** (a local day or month, with a day start): `DefineError::NotSupportedYet`.
+- **Parameter changes** other than the retention class: `DefineError::NotSupportedYet`.
+- **A new consumer starting at a position or a time**, and **a consumer that emits** (`emits` other than
+  `Select::None`): `ConsumerError::NotSupportedYet`. `Consumer::try_emit` therefore refuses every reading
+  `NotDeclared`, and `RouteCycle` is never returned.
+- **A funnel with an operator but no condition**, and a held-for condition over an operator:
+  `ConsumerError::NotSupportedYet`.
+- **Backup, restore, export of set-aside facts and rebuild** (`BackupError::NotSupportedYet`), and
+  `export_orphaned` (`QueryError::NotAvailable`).
+- Never produced: the `Unknown` live and condition states, `approximate_edges`, `displaced`, a trigger's value and
+  coverage, `forget_above`, the `ResetPoint` and `GenerationChanged` resync causes, `PossibleLoss`, `ManifestRebuilt`,
+  `SealBlocked`, `Wait::QueueFull` (a call never exceeds the queue, which is empty between calls), commit latency and
+  time waited, `orphaned_facts`, `scale_raises`, `interval_displaced`, and `evaluations_unknown` and
+  `transitions_not_delivered`, which are not reported at all.
+- The seams other than the clock are not used: the backend writes no files, takes no lock file and computes calendars
+  with the reference model's embedded tzdata rather than through `Env::tz`. `SystemTz` reports the embedded tzdata as
+  the release `"embedded"`; `StdFs::free_space` returns `Unsupported`; `SystemBootId` is `None` outside Linux.
+
+Different from `docs/api.md`:
+
+- **Configuration and specification structs are `#[non_exhaustive]`**, as the stable-shapes principle requires, so
+  `docs/api.md`'s `StoreConfig { .., ..Default::default() }` and `SeriesSpec { .., ..Default::default() }` examples do
+  not compile outside the crate: build them with `new`, the setters, or `default()` and field assignment. `Funnel` and
+  `Reading` stay plain structs, as `docs/api.md` builds them literally.
+- **Errors**: the backend adds `NotSupportedYet` to `DefineError`, `ConsumerError::NotSupportedYet`,
+  `QueryError::Invalid` (a malformed query) and `QueryError::Closed`. `ConsumerError` and `BackupError` stand in for
+  the funnel-compilation and backup errors that roadmap 5.2 and 8.2 settle.
+- **`Health::Closed`** after the writer shuts down, and **`Reason::ClockSkew`** (spec §9 row 5).
+- **`Live::Value` carries a `LiveValue`** (the fact and whether it is stale), where `docs/api.md` shows the fact alone
+  "with staleness".
+- **`ConditionState::Value`** holds an on-change condition's last value; **`FunnelState.transition`** says whether a
+  resync's condition state differs from the latch.
+- **`Reader::buckets` returns `ChartData`**: raw facts when the range is short enough, else buckets, where
+  `docs/api.md` shows `Vec<Bucket>` and also says raw facts. `Resolution::Auto` takes the finest of 1 minute,
+  15 minutes and multiples of 15 minutes that fits `max_points` (`docs/api.md` says the coarsest), counted from the
+  UTC-aligned start.
+- **`Reader::interval`** returns the interval that contains `t`, whether or not `t` is its start.
+- **`Consumer::next`** ends with `None` on any error, not only after a shutdown; `try_next` returns the error.
+- **`Value::Absent`** is recorded with quality bad: the reference model summarises a value-less reading only when it
+  is bad, so the supplied quality is not kept.
+- `BackupSink` takes and returns `Vec<u8>` until roadmap 8.2 settles its signatures.
+- **Added**: `Store::tick` (temporary), `Store::now`, `Store::is_durable`, `Store::consumer_stats`,
+  `Consumer::try_next`, `Consumer::unroute`, `Consumer::routes`, `Reader::series`, `Ack::recorded`,
+  `SeriesStats.latest_t` and `counter_regressions`, `IngestStats.waits`, and `Limits.consumer_queue` and
+  `max_consumers` (keys of later sections that the backend needs).
+
+Name patterns in a funnel's selection work, but their grammar is provisional (`*` within one `/`-separated segment),
+as the specification does not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).

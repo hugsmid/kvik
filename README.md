@@ -34,10 +34,10 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 1. Specification settled | 8 of 8 done |
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
-> | 4. Log | not started (the interface crate was started early, on the reference model) |
+> | 4. Log | 1 of 9 done (the interface crate, on the reference model) |
 > | 5–10. Delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 14 of 47 roadmap items are done, including 3 of 9 gates.
+> 15 of 47 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
