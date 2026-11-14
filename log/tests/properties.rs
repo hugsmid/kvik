@@ -4,7 +4,9 @@ mod support;
 
 use kvik_log::batch::{BatchBuilder, SegmentIdentity};
 use kvik_log::block::{FLAG_SKIPPABLE, block_type};
-use kvik_log::body::{DataPrefix, IndexRecord};
+use kvik_log::body::IndexRecord;
+use kvik_log::entries::{EntriesBlock, Entry};
+use kvik_log::facts::{FactFlags, FactRow, FactsBlock, Quality, Value};
 use kvik_log::scan::{ScanLimit, ScanReport, SealState, Tail, scan};
 use kvik_log::segment::SegmentImage;
 use proptest::prelude::*;
@@ -109,19 +111,7 @@ fn build(p: &Plan) -> (Vec<u8>, Vec<Expected>) {
                     count,
                     payload,
                 } => {
-                    let mut body = vec![0u8; 24];
-                    DataPrefix {
-                        first_sequence: next,
-                        received_at: *received_at,
-                        count: *count,
-                    }
-                    .write(&mut body);
-                    body.extend_from_slice(payload);
-                    let t = if *facts {
-                        block_type::FACTS
-                    } else {
-                        block_type::ENTRIES
-                    };
+                    let (t, body) = data_body(*facts, next, *received_at, *count, payload);
                     b.push(t, body).unwrap();
                     next += u64::from(*count);
                 }
@@ -169,6 +159,57 @@ fn build(p: &Plan) -> (Vec<u8>, Vec<Expected>) {
         }
     }
     (s.into_bytes(), expected)
+}
+
+/// A valid facts or entries body of `count` rows or entries, its values taken from `payload` (the container treats
+/// the content as opaque; only its validity matters here).
+fn data_body(
+    facts: bool,
+    first_sequence: u64,
+    received_at: i64,
+    count: u32,
+    payload: &[u8],
+) -> (u8, Vec<u8>) {
+    let byte = |i: usize| payload.get(i % payload.len().max(1)).copied().unwrap_or(0);
+    if facts {
+        let rows = (0..count as usize)
+            .map(|i| FactRow {
+                series_id: u32::from(byte(i)),
+                t: i64::from(byte(i + 1)) * 1_000,
+                quality: Quality::Good,
+                flags: FactFlags::default(),
+                value: Value::F64(u64::from(byte(i + 2)) << 52),
+                changed_at: None,
+            })
+            .collect();
+        (
+            block_type::FACTS,
+            FactsBlock {
+                first_sequence,
+                received_at,
+                rows,
+            }
+            .encode()
+            .unwrap(),
+        )
+    } else {
+        let entries = (0..count as usize)
+            .map(|i| Entry::Alias {
+                id: u32::from(byte(i)),
+                name: format!("s/{}", byte(i + 1)),
+            })
+            .collect();
+        (
+            block_type::ENTRIES,
+            EntriesBlock {
+                first_sequence,
+                received_at,
+                entries,
+            }
+            .encode()
+            .unwrap(),
+        )
+    }
 }
 
 /// The blocks `(type, flags, body)` of the encoded batch `bytes`, split by hand from the block headers.

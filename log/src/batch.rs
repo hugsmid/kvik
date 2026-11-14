@@ -6,7 +6,9 @@
 use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block, read_block,
 };
-use crate::body::{COMMIT_LEN, Commit, ContentFault, DataPrefix};
+use crate::body::{COMMIT_LEN, Commit, DataPrefix};
+use crate::content::check_block;
+use crate::content_error::BodyError;
 use crate::crc::Crc32c;
 use crate::error::{Element, EncodeError, FormatError};
 
@@ -113,6 +115,7 @@ pub(crate) fn read_batch<'a>(
     crc.update(&o.to_le_bytes());
     let mut blocks = Vec::new();
     let mut unknown_critical = None;
+    let mut recovery = false;
     let mut pos = o;
     let commit_block = loop {
         let b = match read_block(bytes, pos, limit) {
@@ -122,9 +125,25 @@ pub(crate) fn read_batch<'a>(
         let t = b.header.block_type;
         let prefix = match t {
             block_type::COMMIT => break b,
-            block_type::FACTS | block_type::ENTRIES => match DataPrefix::decode(t, b.body) {
-                Ok(p) => Some(p),
-                Err(ContentFault) => return incomplete(BatchFault::Content),
+            // The body checks of A.5 and A.6; an unknown critical element inside is refused like an unknown
+            // critical block.
+            block_type::FACTS | block_type::ENTRIES => match check_block(t, b.body) {
+                Ok((p, r)) => {
+                    recovery |= r;
+                    Some(p)
+                }
+                Err(BodyError::Unsupported(element)) => {
+                    let refused = FormatError::Unsupported {
+                        offset: pos,
+                        element,
+                    };
+                    if refusal == Refusal::AtOnce {
+                        return BatchRead::Refused(refused);
+                    }
+                    unknown_critical.get_or_insert(refused);
+                    None
+                }
+                Err(_) => return incomplete(BatchFault::Content),
             },
             // Seal blocks never belong to a batch.
             block_type::SEGMENT_INDEX | block_type::TRAILER => {
@@ -183,6 +202,10 @@ pub(crate) fn read_batch<'a>(
     {
         return incomplete(BatchFault::Disagreement);
     }
+    // A recovery entry is the only entry of its batch (A.6).
+    if recovery && commit.last_sequence != commit.first_sequence {
+        return incomplete(BatchFault::Content);
+    }
     BatchRead::Complete(Batch {
         offset: o,
         blocks,
@@ -240,6 +263,18 @@ impl BatchBuilder {
         Self {
             blocks: blocks.collect(),
         }
+    }
+
+    /// Whether the builder holds exactly these blocks `(type, flags, body)`.
+    pub fn blocks_eq<'b>(&self, other: impl Iterator<Item = (u8, u8, &'b [u8])>) -> bool {
+        let mut n = 0;
+        for (i, (t, f, b)) in other.enumerate() {
+            match self.blocks.get(i) {
+                Some((t2, f2, b2)) if *t2 == t && *f2 == f && b2.as_slice() == b => n += 1,
+                _ => return false,
+            }
+        }
+        n == self.blocks.len()
     }
 
     /// The types of the blocks added so far, in order.

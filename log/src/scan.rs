@@ -623,27 +623,26 @@ mod tests {
     fn a_resumed_scan_continues_where_the_last_stopped() {
         let (mut bytes, id) = chain(0);
         bytes.truncate(64);
-        let mut builder = crate::batch::BatchBuilder::new();
-        let mut body = vec![0u8; 24];
-        crate::body::DataPrefix {
-            first_sequence: 1,
-            received_at: 0,
-            count: 1,
-        }
-        .write(&mut body);
-        builder.push(block_type::ENTRIES, body.clone()).unwrap();
-        let first = builder.encode(&id, 64, 0).unwrap();
-        bytes.extend_from_slice(&first);
+        // A batch of one alias entry (A.6) at sequence `first`.
+        let alias = |first: u64, at: u64| {
+            let e = crate::entries::Entry::Alias {
+                id: 1,
+                name: "a".into(),
+            };
+            let body = crate::entries::EntriesBlock {
+                first_sequence: first,
+                received_at: 0,
+                entries: vec![e],
+            };
+            let mut builder = crate::batch::BatchBuilder::new();
+            builder
+                .push(block_type::ENTRIES, body.encode().unwrap())
+                .unwrap();
+            builder.encode(&id, at, 0).unwrap()
+        };
+        bytes.extend_from_slice(&alias(1, 64));
         let at = bytes.len() as u64;
-        let mut builder = crate::batch::BatchBuilder::new();
-        crate::body::DataPrefix {
-            first_sequence: 2,
-            received_at: 0,
-            count: 1,
-        }
-        .write(&mut body);
-        builder.push(block_type::ENTRIES, body).unwrap();
-        bytes.extend_from_slice(&builder.encode(&id, at, 0).unwrap());
+        bytes.extend_from_slice(&alias(2, at));
         let mut s = Scanner::new(&bytes, &id, ScanLimit::Mark(at)).unwrap();
         assert!(matches!(s.next(), Some(Ok(Found::Batch(_)))));
         assert!(s.next().is_none());

@@ -50,16 +50,22 @@ pub mod batch;
 pub mod block;
 pub mod body;
 mod bytes;
+pub mod content;
+mod content_error;
 pub mod crc;
+pub mod entries;
 mod error;
+pub mod facts;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod header;
 pub mod mark;
 pub mod name;
+mod rle;
 pub mod scan;
 pub mod segment;
 
+pub use content_error::{BodyError, ContentError};
 pub use error::{Element, EncodeError, FormatError};
 
 /// The major format version this crate reads and writes.

@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// An element of a file that this version of the format does not know and may not ignore.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Element {
     /// A file whose `format_major` is newer than the supported one.
     FormatMajor(u8),
@@ -11,6 +11,19 @@ pub enum Element {
     BlockType(u8),
     /// A mark slot of unknown version (`format.md` A.10).
     MarkVersion(u32),
+    /// A facts column id below `0x80` that is not known (A.5).
+    Column(u8),
+    /// Fact flag bits not defined in A.5 (bits 8 to 15).
+    FactFlags(u16),
+    /// An entry type below `0x80` that is not known or not yet laid out (A.6).
+    EntryType(u8),
+    /// A field id below `0x8000` that the entry type does not define (A.6).
+    Field {
+        /// The entry type.
+        entry_type: u8,
+        /// The field id.
+        field: u16,
+    },
 }
 
 impl fmt::Display for Element {
@@ -27,6 +40,12 @@ impl fmt::Display for Element {
                 "mark version {v} (supported: {})",
                 crate::mark::MARK_VERSION
             ),
+            Self::Column(c) => write!(f, "facts column {c:#04x}"),
+            Self::FactFlags(b) => write!(f, "fact flag bits {b:#06x}"),
+            Self::EntryType(t) => write!(f, "entry type {t}"),
+            Self::Field { entry_type, field } => {
+                write!(f, "field {field} of entry type {entry_type}")
+            }
         }
     }
 }
@@ -103,6 +122,12 @@ pub enum EncodeError {
         /// Bytes left.
         left: u64,
     },
+    /// Content that would fail a check of A.5 or A.6.
+    #[error("invalid content: {0:?}")]
+    Content(crate::content_error::ContentError),
+    /// An entry above 8 MiB, or a batch above 8 MiB of data blocks.
+    #[error("too large")]
+    TooLarge,
     /// A segment that is not in use yet (`base_sequence = 0`), already sealed, or empty where a batch is needed.
     #[error("operation not allowed in the segment's state: {0}")]
     State(&'static str),
