@@ -32,6 +32,8 @@ open_questions  model open_questions
 model           model model
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
+log-batches     log   batches
+log-model       log   model_differential
 '
 
 cd "$(dirname "$0")/.."

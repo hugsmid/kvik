@@ -118,8 +118,8 @@ jobs:
   deep:
     # Many more random cases, in release mode, one job per shard: the
     # invariants file is split by invariant number into 8 shards, each other
-    # property-test file of the model, and the property and fuzz-input tests
-    # of kvik-log, is one shard (.github/deep-shards.sh). Each job first
+    # property-test file of the model, and the property, fuzz-input, batch
+    # and model-differential tests of kvik-log, is one shard (.github/deep-shards.sh). Each job first
     # checks that the shards of its file select every test exactly once.
     #
     # Durations. Measured on the runner: invariants as one job at 10,000
