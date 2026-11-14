@@ -6,10 +6,11 @@ mod common;
 use common::*;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
-use kvik_model::condition::{Condition, Event, Runner};
+use kvik_model::condition::{Condition, ConditionState, Event, Runner};
 use kvik_model::engine::{
     CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, Error, FORMAT_VERSION, Fault,
-    FileClass, Level, Model, Reason, Refusal, Selection, Wait, WriteOutcome,
+    FileClass, Funnel, FunnelId, Level, Model, Reason, Refusal, Selection, TriggerCause, Wait,
+    WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Params};
@@ -545,6 +546,164 @@ fn row_14_consumer_slower_than_stream_catches_up_from_log() {
     assert!(got[..2].iter().all(|d| !d.replayed));
     assert!(got[2..].iter().all(|d| d.replayed));
     assert_eq!(m.counters.overflows, 1);
+}
+
+/// Row 15: consumer down for a day — "Resumes from cursor; deliveries
+/// `replayed`; then `resync`. Cursor older than the oldest local log
+/// segment: `resync` only".
+#[test]
+fn row_15_consumer_down_for_a_day() {
+    let (mut m, s) = model();
+    m.ingest(vec![num(s, T0, 0.0)]).unwrap();
+    m.drain().unwrap();
+    let cursor = m.disk.cursors[&C];
+    for i in 1..=24 {
+        m.advance(HOUR);
+        let now = m.wall;
+        m.ingest(vec![num(s, now, f64::from(i))]).unwrap();
+    }
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 2);
+    assert_eq!(stream.len(), 25);
+    assert_eq!(stream[0].position, cursor.next());
+    assert!(
+        stream[..24]
+            .iter()
+            .all(|d| d.replayed && d.fact().is_some())
+    );
+    assert!(stream[24].resync().is_some_and(|r| r.replaced.is_none()));
+    // Down for 91 days, with the log of that time uploaded and gone from
+    // the fast disk: `resync` only.
+    let cursor = m.disk.cursors[&C];
+    for _ in 0..3 {
+        m.advance(DAY);
+        let now = m.wall;
+        m.ingest(vec![num(s, now, 1.0)]).unwrap();
+    }
+    m.seal_active();
+    m.upload();
+    m.advance(91 * DAY);
+    m.housekeeping().unwrap();
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 3);
+    assert_eq!(stream.len(), 1);
+    let head = m.entries().unwrap().last().unwrap().position;
+    assert_eq!(stream[0].resync().unwrap().replaced, Some((cursor, head)));
+}
+
+/// Row 16: consumer restarts; a condition became true while it was down —
+/// "Operator rebuilt as of now, not replayed; `resync` differs from the latch
+/// → acted on (equal → no new transition)".
+#[test]
+fn row_16_condition_true_while_consumer_down() {
+    let (mut m, s) = model();
+    let f = FunnelId(1);
+    let cond = Condition::Threshold {
+        on: 50.0,
+        clear: 40.0,
+    };
+    m.add_route(C, f, Funnel::condition(s, None, cond)).unwrap();
+    for v in [90.0, 10.0] {
+        m.advance(SECOND);
+        let now = m.wall;
+        m.ingest(vec![num(s, now, v)]).unwrap();
+    }
+    m.drain().unwrap();
+    assert_eq!(m.disk.latches[&(C, f)].state, ConditionState::Active(false));
+    // Down: the condition becomes true; the consumer never takes it.
+    m.advance(SECOND);
+    let now = m.wall;
+    m.ingest(vec![num(s, now, 90.0)]).unwrap();
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 2);
+    // The fact is replayed, never fed to the condition; then `resync`.
+    assert_eq!(stream.len(), 2);
+    assert!(stream[0].replayed && stream[0].fact().is_some());
+    let cond_now = |d: &kvik_model::engine::Envelope| {
+        let c = d
+            .resync()
+            .unwrap()
+            .funnels
+            .iter()
+            .find(|x| x.funnel == f)
+            .unwrap();
+        let c = c.condition.clone().unwrap();
+        (c.state, c.transition)
+    };
+    assert_eq!(cond_now(&stream[1]), (ConditionState::Active(true), true));
+    // Restarting again with the latch now equal: no new transition.
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 3);
+    assert_eq!(cond_now(&stream[0]), (ConditionState::Active(true), false));
+    // Live transitions resume after the `resync`.
+    m.advance(SECOND);
+    let now = m.wall;
+    m.ingest(vec![num(s, now, 10.0)]).unwrap();
+    m.drain().unwrap();
+    let t = session_stream(&m, C, 3)
+        .iter()
+        .find_map(|d| d.trigger().cloned())
+        .unwrap();
+    assert_eq!(
+        (t.cause, t.state),
+        (TriggerCause::Fact, ConditionState::Active(false))
+    );
+}
+
+/// Row 34: route added while a consumer is catching up — "Applies from its
+/// position only".
+#[test]
+fn row_34_route_added_while_catching_up() {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::Series(Default::default()),
+        capacity: 1,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let a = m
+        .define(
+            "vehicle/7/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            SECOND,
+        )
+        .unwrap();
+    let b = m
+        .define(
+            "vehicle/7/rpm",
+            Kind::Gauge,
+            ValueType::Number,
+            "1/min",
+            SECOND,
+        )
+        .unwrap();
+    m.add_route(C, FunnelId(1), Funnel::facts(Selection::Series([a].into())))
+        .unwrap();
+    let mut a_facts = Vec::new();
+    for i in 0..3 {
+        a_facts.extend(
+            m.ingest(vec![num(a, T0 + i * SECOND, 1.0)])
+                .unwrap()
+                .positions,
+        );
+    }
+    assert!(m.in_catch_up(C));
+    let before = m.ingest(vec![num(b, T0, 1.0)]).unwrap().positions[0];
+    let route = m
+        .add_route(C, FunnelId(2), Funnel::facts(Selection::Series([b].into())))
+        .unwrap();
+    let after = m.ingest(vec![num(b, T0 + SECOND, 2.0)]).unwrap().positions[0];
+    assert!(before < route && route < after);
+    m.drain().unwrap();
+    let got: Vec<Position> = m.observed[&C].iter().map(|o| o.position).collect();
+    let mut want = a_facts;
+    want.push(after);
+    assert_eq!(got, want);
 }
 
 #[test]

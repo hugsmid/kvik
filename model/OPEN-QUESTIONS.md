@@ -21,6 +21,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-52 | §8 Corrupt block, invariant 10, §3 Recovery | Manifest records as single copies |
 | Q-60 | §5.1 density rule, §5.7, §2.1 parameters, invariant 8 | Calendar nodes when the expected interval changes |
 | Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
+| Q-61 | §4 Order, At-least-once, Consumer state, §6 Latch | Identity of a condition delivery, and where its sequence is kept |
+| Q-62 | §4 Overflow, Replay, §6 Cadence | Condition transitions while a consumer catches up after overflow |
+| Q-63 | §6 Restart and resume, Conditions, Latch, invariant 16 | Condition state now, for conditions with memory |
+| Q-64 | §4 Routing, §8 Continuous backup, §8 Restore step 1 | Routing changes before a restore's checkpoint |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -340,6 +344,64 @@ edge's detail is off the machine.
 **Model.** Not modelled; a restore brings every file back.
 **Needed.** Where chunk indexes come from after a restore (carried by the tree checkpoint, listed with the files in
 the restore record, or downloaded in step 1 or step 3), and what holds until they are local.
+
+## Q-61 — Identity of a condition delivery, and where its sequence is kept
+**Scenario.** (a) A threshold funnel is evaluated on a routed fact at position 0:7 (§6 Cadence) and fires. §4 Order
+gives an identity only to fact deliveries (the position) and timer deliveries (the last committed position plus a
+per-funnel sequence); `api.md` gives "position, or funnel and sequence for timer deliveries". Identified by 0:7, the
+delivery would share its identity with the fact delivery at 0:7, and two funnels firing on one fact would share one.
+(b) A timer delivery `(F, 5)` is taken but not confirmed, and the engine crashes. The latch (§6) holds the state
+and position, not the sequence, and is never ahead of confirmation (invariant 13), so a sequence restored from it
+starts again at 5: the next, different transition is `(F, 5)`, which a consumer de-duplicating by `(funnel,
+sequence)` (§4 At-least-once) drops. Nothing else on disk is said to hold the sequence.
+**Model.** Every condition delivery, on a routed fact or on the timer, is identified by `(funnel, sequence)` and
+carries the last committed position at evaluation. The sequence is kept on disk when the delivery is issued, so it
+is never issued twice for a funnel (`q61_condition_delivery_sequence_survives_a_crash`).
+**Needed.** The identity of a delivery from an evaluation on a fact, and where the per-funnel sequence is persisted
+(with the mark, in the cursor file at issue, or a sequence that a consumer forgets on `resync`).
+
+## Q-62 — Condition transitions while a consumer catches up after overflow
+**Scenario.** A consumer has a fact funnel and a threshold funnel; its queue is full, so it is catching up from the
+log (§4 Overflow). Meanwhile a routed fact makes the threshold fire. The transition is not in the log, so catch-up
+cannot deliver it, the queue has no room, and overflow is not among the `resync` triggers (§4 Resync); delivered
+later it would follow facts committed after it. Separately, catch-up reads "from after the last position already
+enqueued"; if that position's segment has left the local tiers meanwhile (§8), §8 Behind consumers ("never downloads
+from deep for catch-up") speaks only of a cursor.
+**Model.** The condition keeps being evaluated on live facts and on the timer, but nothing is sent while the
+consumer is catching up and the last emitted state is unchanged; on re-attaching to live the consumer receives the
+present state as a delivery if it differs from the last state emitted to it
+(`q62_transition_during_overflow_sent_on_reattach`). A transition that finds a live consumer's queue full switches it
+to catch-up in the same way. Catch-up after overflow reads an entry wherever it is held.
+**Needed.** What a consumer receives for transitions during catch-up after overflow, and what catch-up does when its
+position is no longer local.
+
+## Q-63 — Condition state now, for conditions with memory
+**Scenario.** §6 Restart and resume rebuilds the operator "as of now" and compares "the condition state now" with the
+latch. (a) A threshold with activation 50 and clear 40 whose value now is 45: its state depends on the last crossing,
+which the value now does not show; after a restore there is no latch either. (b) A held-for-10-s condition whose
+value has been above its level for 30 s, partly while the consumer was down: the monotonic hold started before the
+resume, and the spec does not say whether it is rebuilt from the tree or restarts. Row 16 and invariant 16 ("every
+condition true now is delivered once in `resync`") depend on the answer. (c) For an on-change condition, "differs
+from the latch" is not said to use the dead-band. (d) A condition funnel added at run time has no latch; it is not
+said whether it announces its present state.
+**Model.** `Runner::resume`: a threshold is true above its activation level, false below its clear level and, between
+them, keeps the latched state (false with no latch); a held-for condition is true only if its value is above now and
+the latch is true, and otherwise its hold starts at the resume, so a condition held while the consumer was down is
+delivered only N later (`q63_conditions_with_memory_resume_from_the_latch`); an on-change condition reports the value
+now, a transition if it moved beyond the dead-band from the latched value; stale-for follows Q-16. A funnel added at
+run time starts with a fresh condition and announces nothing until it is first evaluated; a removed funnel's latch is
+dropped.
+**Needed.** How each condition's state now is determined on resume, whether from the tree, the latch or both.
+
+## Q-64 — Routing changes before a restore's checkpoint
+**Scenario.** A route is added at 0:2; a tree checkpoint is taken at 0:5 and the log before it is compacted. A restore
+downloads the checkpoint, with the registry file, and the log segments after 0:5 (§8 Restore step 1), and accepts
+ingest. Routing changes are log entries (§4 Routing), and the checkpoint is not said to carry them, so until the chunk
+holding 0:2 is back (step 3) the route is unknown and new facts are not delivered by it.
+**Model.** Routes are taken from the entries that are local; a route added before the checkpoint is not in force until
+the file holding its entry is downloaded
+(`q64_route_before_checkpoint_not_in_force_until_its_entry_is_back`).
+**Needed.** Whether a tree checkpoint (or the registry file it carries) holds the routing table as of its position.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and

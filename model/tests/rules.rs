@@ -6,15 +6,17 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
+use kvik_model::condition::{Condition, ConditionState};
 use kvik_model::engine::{
-    Config, ConsumerDecl, ConsumerId, CrashPoint, EntryBody, Error, Fault, FileClass, FileId,
-    Level, ManifestOp, Model, Reason, Selection, Signal, Wait, WriteOutcome,
+    Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Error,
+    Fault, FileClass, FileId, Funnel, FunnelId, Level, ManifestOp, Model, Operator, Reason,
+    Selection, Signal, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
-    HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId, Value, ValueType,
+    DAY, HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId, Value, ValueType,
     exact,
 };
 
@@ -1287,5 +1289,421 @@ fn s8_crash_during_step_1_finishes_it_before_ingest() {
             Position::new(0, 8),
             Position::new(1, 1)
         ]
+    );
+}
+
+// ----- delivery (§4, §6) -----
+
+const F: FunnelId = FunnelId(1);
+
+/// A consumer with no configured selection and two gauges, `a` and `b`.
+fn routed_model(capacity: usize) -> (Model, SeriesId, SeriesId) {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::Series(Default::default()),
+        capacity,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let a = m
+        .define(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    let b = m
+        .define(
+            "site/pump-3/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    (m, a, b)
+}
+
+/// One fact for `s` at the current wall time; returns its position.
+fn put(m: &mut Model, s: SeriesId, v: f64) -> Position {
+    let now = m.wall;
+    m.ingest(vec![Reading::num(s, now, v)]).unwrap().positions[0]
+}
+
+fn threshold() -> Condition {
+    Condition::Threshold {
+        on: 50.0,
+        clear: 40.0,
+    }
+}
+
+/// The condition part of the one condition funnel in the last `resync`
+/// consumer `C` received.
+fn last_resync_condition(m: &Model) -> (ConditionState, bool) {
+    let r = m.received[&C]
+        .iter()
+        .rev()
+        .find_map(|r| r.delivery.resync().cloned())
+        .expect("a resync");
+    let c = r
+        .funnels
+        .iter()
+        .find_map(|f| f.condition.clone())
+        .expect("a condition funnel");
+    (c.state, c.transition)
+}
+
+/// §4 Routing: "Changes are log entries and take effect at their position;
+/// catch-up applies the routes in force at each position." A route added at
+/// run time routes only later facts, a removed one none after its removal,
+/// live and in catch-up alike.
+#[test]
+fn s4_run_time_routes_take_effect_at_their_position() {
+    let (mut m, a, b) = routed_model(100);
+    put(&mut m, a, 1.0);
+    let added = m
+        .add_route(C, F, Funnel::facts(Selection::Series([a].into())))
+        .unwrap();
+    let p2 = put(&mut m, a, 2.0);
+    put(&mut m, b, 3.0);
+    let removed = m.remove_route(C, F).unwrap();
+    put(&mut m, a, 4.0);
+    assert!(added < p2 && p2 < removed);
+    assert!(
+        m.entries()
+            .unwrap()
+            .iter()
+            .any(|e| e.position == added && matches!(e.body, EntryBody::Route(_)))
+    );
+    m.drain().unwrap();
+    assert_eq!(labels(&session_stream(&m, C, 1)), ["F5"]);
+    // Nothing confirmed: after a crash the whole log is replayed with the
+    // routes in force at each position.
+    m.disk.cursors.insert(C, Position::ORIGIN);
+    m.crash();
+    m.restart();
+    m.drain().unwrap();
+    assert_eq!(labels(&session_stream(&m, C, 2)), ["R5", "S"]);
+    // A funnel id in force cannot be added twice, nor one not in force removed.
+    assert!(matches!(m.remove_route(C, F), Err(Error::BadRoute(_))));
+    m.add_route(C, F, Funnel::facts(Selection::All)).unwrap();
+    assert!(matches!(
+        m.add_route(C, F, Funnel::facts(Selection::All)),
+        Err(Error::BadRoute(_))
+    ));
+    assert!(matches!(
+        m.add_route(ConsumerId(9), F, Funnel::facts(Selection::All)),
+        Err(Error::UnknownConsumer(_))
+    ));
+}
+
+/// §4 Resync: "Sent on resume after downtime (§6)"; §6 Restart and resume:
+/// "Facts after the cursor are delivered flagged `replayed` … The funnel then
+/// sends `resync`." Live delivery follows the `resync`.
+#[test]
+fn s4_resync_follows_replay_on_restart() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, F, Funnel::facts(Selection::All)).unwrap();
+    let p1 = put(&mut m, a, 1.0);
+    m.drain().unwrap();
+    put(&mut m, a, 2.0);
+    put(&mut m, a, 3.0);
+    m.poll(C, 1).unwrap(); // taken, never confirmed
+    assert_eq!(m.disk.cursors[&C], p1);
+    m.crash();
+    m.restart();
+    m.catch_up(C, usize::MAX).unwrap();
+    put(&mut m, a, 4.0);
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 2);
+    assert_eq!(labels(&stream), ["R5", "R6", "S", "F7"]);
+    assert_eq!(
+        stream[2].position,
+        Position::new(0, 6),
+        "complete up to 0:6"
+    );
+    assert_eq!(m.signals[&C], [Signal::ResyncDue]);
+    // The `resync` carries the live state of each selected series.
+    let r = stream[2].resync().unwrap();
+    assert_eq!(r.replaced, None);
+    let live = &r.funnels.iter().find(|f| f.funnel == F).unwrap().live;
+    assert_eq!(
+        live[0].1.as_ref().map(|f| f.value.clone()),
+        Some(Value::Num(3.0))
+    );
+}
+
+/// §4 Resync: sent "when the cursor is older than the oldest local log
+/// segment"; §8 Behind consumers: such a consumer "receives `resync`, not a
+/// replay. The engine never downloads from deep for catch-up." Confirming the
+/// `resync` moves the cursor past the positions it replaced.
+#[test]
+fn s4_resync_replaces_replay_when_cursor_too_far_behind() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, F, Funnel::facts(Selection::All)).unwrap();
+    let p1 = put(&mut m, a, 1.0);
+    m.drain().unwrap();
+    put(&mut m, a, 2.0);
+    let p3 = put(&mut m, a, 3.0);
+    m.seal_active();
+    assert!(m.upload() > 0);
+    m.advance(91 * DAY);
+    assert!(
+        !m.housekeeping().unwrap().is_empty(),
+        "the segment left hot"
+    );
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 2);
+    assert_eq!(labels(&stream), ["S"]);
+    assert_eq!(stream[0].resync().unwrap().replaced, Some((p1, p3)));
+    assert_eq!(m.disk.cursors[&C], p3);
+}
+
+/// §3 Recovery rule 3 and §4 Resync: after a recovery on a new boot, every
+/// consumer receives `resync` "before any position above the last kept batch
+/// is delivered to it"; §6: "this replay stops at the last kept batch, and the
+/// one `resync` that follows serves both rules."
+#[test]
+fn s4_resync_after_rule_3_recovery_before_later_positions() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, F, Funnel::facts(Selection::All)).unwrap();
+    put(&mut m, a, 1.0);
+    m.drain().unwrap();
+    put(&mut m, a, 2.0);
+    let now = m.wall;
+    m.emit(Reading::num(a, now, 3.0)).unwrap();
+    assert_eq!(
+        m.commit(Some(Fault::PowerLoss(WriteOutcome::Survived))),
+        Err(Error::Crashed)
+    );
+    m.restart();
+    let kept = m.entries().unwrap().last().unwrap().position;
+    assert_eq!(kept, Position::new(0, 6), "the unsynced batch was kept");
+    put(&mut m, a, 4.0);
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 2);
+    assert_eq!(labels(&stream), ["R5", "R6", "S", "R7"]);
+    assert_eq!(stream[2].position, kept);
+}
+
+/// §8 Restore step 2: a cursor at or below the restored end catches up to it,
+/// and "every consumer then receives `generation_changed` and `resync`": both
+/// follow the catch-up in the consumer's stream.
+#[test]
+fn s4_generation_changed_and_resync_follow_catch_up_after_restore() {
+    let (mut m, _) = backed_up_model();
+    let cursors = [(C, Position::new(0, 3))].into_iter().collect();
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &cursors,
+        m.wall,
+        false,
+        false,
+    )
+    .unwrap();
+    r.drain().unwrap();
+    let kinds: Vec<(Position, &str)> = r.received[&C]
+        .iter()
+        .map(|x| {
+            let k = match &x.delivery.kind {
+                DeliveryKind::Fact(_) => "fact",
+                DeliveryKind::GenerationChanged { .. } => "generation_changed",
+                DeliveryKind::Resync(_) => "resync",
+                DeliveryKind::Trigger(_) => "trigger",
+            };
+            (x.delivery.position, k)
+        })
+        .collect();
+    let end = Position::new(0, 5);
+    assert_eq!(
+        kinds,
+        [
+            (Position::new(0, 4), "fact"),
+            (end, "fact"),
+            (end, "generation_changed"),
+            (end, "resync")
+        ]
+    );
+}
+
+/// §4 Order: "Timer deliveries carry the last committed position at
+/// evaluation plus a per-funnel sequence"; §4 Timers: "held for N s" uses the
+/// monotonic clock; §6 Cadence: a funnel is evaluated on each routed fact and
+/// on a timer.
+#[test]
+fn s4_timer_deliveries_carry_last_position_and_funnel_sequence() {
+    let (mut m, a, _) = routed_model(100);
+    let held = Condition::HeldFor {
+        above: 5.0,
+        n: 10 * SECOND,
+    };
+    m.add_route(C, F, Funnel::condition(a, None, held)).unwrap();
+    let p = put(&mut m, a, 9.0);
+    m.advance(5 * SECOND);
+    m.tick().unwrap();
+    m.jump_wall(HOUR);
+    m.tick().unwrap();
+    assert!(
+        m.receive(C, 10).unwrap().is_empty(),
+        "a wall jump fires nothing"
+    );
+    m.advance(5 * SECOND);
+    m.tick().unwrap();
+    let q = put(&mut m, a, 1.0);
+    let got = m.receive(C, 10).unwrap();
+    assert_eq!(
+        got.iter().map(|d| (d.id(), d.position)).collect::<Vec<_>>(),
+        [
+            (
+                DeliveryId::Timer {
+                    funnel: F,
+                    sequence: 1
+                },
+                p
+            ),
+            (
+                DeliveryId::Timer {
+                    funnel: F,
+                    sequence: 2
+                },
+                q
+            )
+        ]
+    );
+    let causes: Vec<(TriggerCause, ConditionState)> = got
+        .iter()
+        .map(|d| d.trigger().map(|t| (t.cause, t.state.clone())).unwrap())
+        .collect();
+    assert_eq!(
+        causes,
+        [
+            (TriggerCause::Timer, ConditionState::Active(true)),
+            (TriggerCause::Fact, ConditionState::Active(false))
+        ]
+    );
+}
+
+/// §4 Timers: "Timer deliveries that fell due while the engine was down are
+/// not replayed; `resync` covers them."
+#[test]
+fn s4_timer_deliveries_falling_due_while_down_are_not_replayed() {
+    let (mut m, a, _) = routed_model(100);
+    let held = Condition::HeldFor {
+        above: 5.0,
+        n: 10 * SECOND,
+    };
+    m.add_route(C, F, Funnel::condition(a, None, held)).unwrap();
+    put(&mut m, a, 9.0);
+    m.drain().unwrap();
+    m.crash();
+    m.advance(20 * SECOND);
+    m.restart();
+    m.tick().unwrap();
+    m.drain().unwrap();
+    let stream = session_stream(&m, C, 2);
+    assert_eq!(labels(&stream), ["S"], "no timer delivery, no replay");
+}
+
+/// §6 Latch: "Each condition funnel persists, with its consumer's cursor, the
+/// last emitted state"; invariant 13: a latch on disk is never ahead of the
+/// consumer's confirmation. A transition taken but not confirmed is not in
+/// the latch, so the `resync` after a crash delivers it again as a
+/// transition; once confirmed, an equal state is no new transition.
+#[test]
+fn s6_latch_moves_on_confirmation_only() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, F, Funnel::condition(a, None, threshold()))
+        .unwrap();
+    put(&mut m, a, 90.0);
+    let got = m.receive(C, 10).unwrap();
+    assert_eq!(
+        got[0].trigger().unwrap().state,
+        ConditionState::Active(true)
+    );
+    assert!(m.disk.latches.is_empty(), "taken, not confirmed");
+    m.crash();
+    m.restart();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(true), true)
+    );
+    assert_eq!(m.disk.latches[&(C, F)].state, ConditionState::Active(true));
+    m.crash();
+    m.restart();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(true), false)
+    );
+    // The same through a consumer restart.
+    put(&mut m, a, 10.0);
+    m.receive(C, 10).unwrap();
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(false), true)
+    );
+}
+
+/// §4 Replay: replayed facts "are never fed to a condition operator a second
+/// time"; §6 Restart and resume: "The operator is rebuilt from the tree and
+/// recent window as of now; it is never replayed." A windowed operator sees
+/// the facts in its window now, not their replay.
+#[test]
+fn s6_replayed_facts_never_reach_a_condition() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, FunnelId(2), Funnel::facts(Selection::All))
+        .unwrap();
+    let avg = Operator {
+        aggregate: Aggregate::Avg,
+        width: MINUTE,
+    };
+    m.add_route(C, F, Funnel::condition(a, Some(avg), threshold()))
+        .unwrap();
+    put(&mut m, a, 10.0);
+    m.drain().unwrap();
+    m.advance(5 * SECOND);
+    put(&mut m, a, 90.0);
+    m.advance(5 * SECOND);
+    put(&mut m, a, 90.0);
+    m.advance(5 * SECOND);
+    m.crash();
+    m.restart();
+    m.drain().unwrap();
+    // Replayed facts, then `resync` with the average now (above 50): no
+    // transition from the replay itself.
+    assert_eq!(labels(&session_stream(&m, C, 2)), ["R6", "R7", "S"]);
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(true), true)
+    );
+}
+
+/// §4 Overflow: catch-up after overflow re-attaches "at the next position
+/// under the writer's delivery lock (no gap, no repeat)", also when the
+/// consumer has condition funnels and routes change meanwhile.
+#[test]
+fn s4_overflow_catch_up_with_conditions_and_route_changes() {
+    let (mut m, a, b) = routed_model(2);
+    m.add_route(C, FunnelId(2), Funnel::facts(Selection::Series([a].into())))
+        .unwrap();
+    for i in 0..4 {
+        put(&mut m, a, f64::from(i));
+    }
+    assert!(m.in_catch_up(C));
+    put(&mut m, b, 9.0);
+    m.add_route(C, FunnelId(3), Funnel::facts(Selection::Series([b].into())))
+        .unwrap();
+    put(&mut m, b, 10.0);
+    m.drain().unwrap();
+    assert_eq!(
+        labels(&session_stream(&m, C, 1)),
+        ["F4", "F5", "R6", "R7", "R10"]
     );
 }
