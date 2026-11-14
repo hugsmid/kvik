@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="kvik: Durable time series for devices, in one Rust library. Design stage.">
+<defs><linearGradient id="tile" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#14B8A6"/><stop offset="1" stop-color="#0F766E"/></linearGradient><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0B1220"/><stop offset="1" stop-color="#0E2326"/></linearGradient></defs>
+<rect width="1280" height="640" fill="url(#bg)"/>
+<g transform="translate(96 132) scale(2.25)"><rect width="64" height="64" rx="14" fill="url(#tile)"/>
+<g transform="translate(5 0) skewX(-6)" fill="#FFFFFF">
+<rect x="14" y="10" width="10" height="9.5" rx="2"/>
+<rect x="14" y="21.5" width="10" height="9.5" rx="2"/>
+<rect x="14" y="33" width="10" height="9.5" rx="2"/>
+<rect x="14" y="44.5" width="10" height="9.5" rx="2"/>
+<g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round">
+<path d="M24.5 42 L30 35.5 L34.5 39.5 L46 24.5" stroke-width="4.5"/>
+<path d="M34.5 39.5 L46.5 53" stroke-width="5"/>
+</g>
+<circle cx="47.2" cy="22.8" r="4"/>
+</g></g>
+<g transform="translate(272 118) scale(2.5)"><g transform="translate(5 0) skewX(-6)">
+<g fill="none" stroke="#F1F5F9" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+<path d="M4 8 V56 M29 24 L10 41.5 M16.5 35.5 L31 56"/>
+<path d="M42 24 L55 56 L68 24"/>
+<path d="M81 27 V56"/>
+<path d="M95 8 V56 M120 24 L101 41.5 M107.5 35.5 L122 56"/>
+</g>
+<circle cx="81" cy="12" r="5.5" fill="#14B8A6"/>
+</g></g>
+<g font-family="ui-sans-serif, system-ui, -apple-system, &quot;Segoe UI&quot;, Roboto, sans-serif">
+<text x="98" y="368" font-size="46" font-weight="600" fill="#E2E8F0">Durable time series for devices,</text>
+<text x="98" y="426" font-size="46" font-weight="600" fill="#E2E8F0">in one Rust library</text>
+<text x="98" y="494" font-size="25" fill="#94A3B8">An ordered, checksummed log and an analytical store, with no database service</text>
+<rect x="98" y="530" width="164" height="34" rx="17" fill="none" stroke="#2DD4BF" stroke-width="2"/><text x="180.0" y="553" text-anchor="middle" font-size="16" font-weight="700" letter-spacing="1.5" fill="#2DD4BF">DESIGN STAGE</text>
+<text x="280" y="553" font-size="21" fill="#94A3B8">Specification v0.2 and an exact reference model; the engine is not built yet</text>
+</g>
+<g transform="translate(790 120) scale(1.0)"><g fill="none" stroke="#2DD4BF" stroke-width="4" stroke-linecap="round"><path d="M0 96 L26 74" stroke-opacity="0.27"/><path d="M26 74 L52 88" stroke-opacity="0.36"/><path d="M52 88 L78 52" stroke-opacity="0.45"/><path d="M78 52 L104 66" stroke-opacity="0.54"/><path d="M104 66 L130 34" stroke-opacity="0.64"/><path d="M130 34 L156 58" stroke-opacity="0.73"/><path d="M156 58 L182 40" stroke-opacity="0.82"/><path d="M182 40 L208 70" stroke-opacity="0.91"/><path d="M208 70 L234 58" stroke-opacity="1.00"/></g><g fill="#2DD4BF"><circle cx="0" cy="96" r="4.5" fill-opacity="0.18"/><circle cx="26" cy="74" r="4.5" fill-opacity="0.27"/><circle cx="52" cy="88" r="4.5" fill-opacity="0.36"/><circle cx="78" cy="52" r="4.5" fill-opacity="0.45"/><circle cx="104" cy="66" r="4.5" fill-opacity="0.54"/><circle cx="130" cy="34" r="4.5" fill-opacity="0.64"/><circle cx="156" cy="58" r="4.5" fill-opacity="0.73"/><circle cx="182" cy="40" r="4.5" fill-opacity="0.82"/><circle cx="208" cy="70" r="4.5" fill-opacity="0.91"/><circle cx="234" cy="58" r="4.5" fill-opacity="1.00"/></g><path d="M234 58 C258 58 262 150.0 260.2 150.0" fill="none" stroke="#2DD4BF" stroke-width="3" stroke-linecap="round" stroke-dasharray="2 7"/><path d="M258.2 143.0 L268.2 150.0 L258.2 157.0" fill="none" stroke="#2DD4BF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><g transform="translate(0 0) skewX(-6)"><rect x="290" y="0" width="120" height="20" rx="4" fill="#1E293B" stroke="#475569" stroke-width="1.5"/><rect x="392" y="6" width="10" height="8" rx="2" fill="#14B8A6" fill-opacity="0.85"/><path d="M300 10 H380" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5" fill="none"/><rect x="290" y="28" width="120" height="20" rx="4" fill="#1E293B" stroke="#475569" stroke-width="1.5"/><rect x="392" y="34" width="10" height="8" rx="2" fill="#14B8A6" fill-opacity="0.85"/><path d="M300 38 H380" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5" fill="none"/><rect x="290" y="56" width="120" height="20" rx="4" fill="#1E293B" stroke="#475569" stroke-width="1.5"/><rect x="392" y="62" width="10" height="8" rx="2" fill="#14B8A6" fill-opacity="0.85"/><path d="M300 66 H380" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5" fill="none"/><rect x="290" y="84" width="120" height="20" rx="4" fill="#1E293B" stroke="#475569" stroke-width="1.5"/><rect x="392" y="90" width="10" height="8" rx="2" fill="#14B8A6" fill-opacity="0.85"/><path d="M300 94 H380" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5" fill="none"/><rect x="290" y="112" width="120" height="20" rx="4" fill="#1E293B" stroke="#475569" stroke-width="1.5"/><rect x="392" y="118" width="10" height="8" rx="2" fill="#14B8A6" fill-opacity="0.85"/><path d="M300 122 H380" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5" fill="none"/><rect x="290" y="140" width="120" height="20" rx="4" fill="#14B8A6" stroke="#14B8A6" stroke-width="1.5"/><rect x="392" y="146" width="10" height="8" rx="2" fill="#FFFFFF" fill-opacity="1"/></g></g>
+</svg>

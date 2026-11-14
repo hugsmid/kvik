@@ -1,4 +1,9 @@
-# kvik
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+    <img src="docs/assets/banner.svg" width="100%" alt="kvik: durable time series for devices, in one Rust library. Design stage: specification v0.2 and an exact reference model; the engine is not built yet.">
+  </picture>
+</h1>
 
 [![CI](https://github.com/hugsmid/kvik/actions/workflows/ci.yml/badge.svg)](https://github.com/hugsmid/kvik/actions/workflows/ci.yml)
 
@@ -19,17 +24,43 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > - The [specification](docs/spec.md) is tagged **v0.2**.
 > - A slow, exact [reference model](model/) of its semantics exists, with property tests and edge-case tests; a few
 >   newer rules are not yet modelled ([coverage table](model/README.md#coverage)).
-> - The first measurement, of chunk encodings against Parquet, is [recorded](docs/measurements/2.1-chunk-encodings.md).
+> - Two measurements are recorded: [chunk encodings against Parquet](docs/measurements/2.1-chunk-encodings.md) and
+>   [commit and sync latency](docs/measurements/2.2-commit-latency.md).
 >
 > | [Roadmap](docs/roadmap.md) section | Progress |
 > |---|---|
 > | 1. Specification settled | 8 of 8 done |
-> | 2. Measurements before building | 1 of 3 done, in progress |
+> | 2. Measurements before building | 2 of 3 done; gate 2.3 next |
 > | 3–10. Format and interface, log, delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 9 of 46 roadmap items are done.
+> 10 of 46 roadmap items are done, including 1 of 9 gates.
 
 ## Principles
+*What the specification requires of the engine, in brief:*
+
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-durable-dark.svg">
+    <img src="docs/assets/card-durable.svg" width="160" alt="Synced to disk before anything reacts">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-history-dark.svg">
+    <img src="docs/assets/card-history.svg" width="160" alt="Nothing deleted; corrections kept as revisions">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-losses-dark.svg">
+    <img src="docs/assets/card-losses.svg" width="160" alt="Losses reported, never silent">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-drilldown-dark.svg">
+    <img src="docs/assets/card-drilldown.svg" width="160" alt="Drill down from years to seconds">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-embedded-dark.svg">
+    <img src="docs/assets/card-embedded.svg" width="160" alt="Embedded library: no database service to run">
+  </picture>
+</p>
+
 From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 
 - **Durable before anything reacts.** A batch of readings is synced and the durable mark moved before adapters are
@@ -197,14 +228,15 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
    `f64`, but only about 1 % smaller when they are declared as scaled `i64`. On two non-decimal shapes it was 13 %
    smaller than the best Parquet variant on one and 23 % larger than Parquet's dictionary encoding on the other
    ([results](docs/measurements/2.1-chunk-encodings.md)). Whether compacted data stays in its own format or in
-   Parquet is decided at later gates.
+   Parquet is decided at later gates. Roadmap item 2.2 measured commit and sync latency, group commit, a failed
+   sync and a full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)).
 4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) will be
    built behind injectable clock and file-system seams and tested differentially against the model, with crash points,
    failed syncs and full disks injected.
 
-Design budgets, still to be measured: a reading delivered to an in-process consumer within p50 ≤ 2 ms and
-p99 ≤ 10 ms of acceptance on an SSD, sync included; a chart query at any zoom level within 50 ms; restart to serving within
-1 s ([`docs/design.md`](docs/design.md)).
+Design budgets, still to be met by the engine, cover delivery to an in-process consumer (sync included), chart
+queries at any zoom level, restart to serving and size on disk; the figures and the platforms they apply to are in
+[`docs/design.md`](docs/design.md#budgets-to-be-measured).
 
 ## Repository map
 
@@ -219,6 +251,8 @@ p99 ≤ 10 ms of acceptance on an SSD, sync included; a chart query at any zoom 
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |
 | [`model/OPEN-QUESTIONS.md`](model/OPEN-QUESTIONS.md) | Open questions in the specification, and where the model still differs from it |
 | [`spikes/encodings/`](spikes/encodings/) | The encoding spike behind roadmap item 2.1; not part of the engine |
+| [`spikes/commit/`](spikes/commit/) | The commit and sync spike behind roadmap item 2.2; not part of the engine |
+| [`docs/assets/`](docs/assets/) | Logo, banner and other images |
 
 ## Running the checks
 
@@ -227,6 +261,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked                  # the reference model
 cargo test --locked -p encodings     # the encoding spike
+cargo test --locked -p commit        # the commit and sync spike
 cargo run --example basic            # a small tour of the model
 ```
 
