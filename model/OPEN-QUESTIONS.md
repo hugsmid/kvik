@@ -9,7 +9,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 |---|---|---|
 | Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
 | Q-33 | §3 Recovery, §2.1, invariants 1 and 8 | Registry entries and derived files after a lost range |
-| Q-34 | §3, §8 Corrupt block, §11 | What `data_lost` and `possible_loss` mean beyond the report |
+| Q-34 (c) | §11 Health, §3 Recovery | Whether loss reports survive a restart, and whether they are latched until acknowledged |
 | Q-37 | §8 Generations, §8 Restore, §2.2 | Which manifest records a restore reads, and how generations begin |
 | Q-38 | §8 Restore step 1, §2.1, §7 | Segments beyond the restored end |
 | Q-39 | §8 Restore steps 2–4, §8 Deep | Failures during a restore, and when it ends |
@@ -21,6 +21,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
 | Q-49 | §8 Restore step 2, §5.1 density rule | What a series with no stored level serves during a restore |
 | Q-50 | §6 Old spans, §5.1 density rule, §12 D7 | Window edges over moved detail of a series with no stored 1-minute level |
+| Q-52 | §8 Corrupt block, invariant 10, §3 Recovery | Manifest records as single copies |
 | Q-60 | §5.1 density rule, §5.7, §2.1 parameters, invariant 8 | Calendar nodes when the expected interval changes |
 
 ## Q-16 — Which commits refresh live staleness
@@ -76,17 +77,43 @@ effect from its earliest fact contradicts §2.1, that new ids "above every id se
 site-zone entry was not covered.
 **Needed.** What happens to kept facts whose registry entries are lost, how derived files are re-verified, and how
 invariants 1 and 8 read with lost ranges.
+**Proposal.** After a lost range or a truncated tail the kept log is the whole truth: entries in the lost positions
+(definitions, parameter and site-zone changes, aliases, retirements, routing changes) no longer apply and are not
+appended again. A kept fact whose series has no definition in the kept log is an orphaned fact: kept in the log and
+in compaction, outside views, trees and delivery, counted per id and available for re-ingest. The lost-range record
+carries an id floor (the highest id in the registry file, the checkpoints, the kept log and every earlier floor,
+plus the number of positions in the range or, for a truncated tail, the tail's bytes divided by the smallest
+definition entry) and the registry entries and revised keys that derived files hold from the lost positions. It is
+synced before any derived file is changed; then everything derived from positions at or above the start of the loss
+is removed, or rebuilt from the newest checkpoint below it and the kept log after it. New ids are assigned above
+every floor, and invariant 8 reads "from the kept log entries, with the id floors of the manifest's lost-range
+records". Lost entries are issued again through the normal calls; a definition issued again is a new series. For
+`format.md`: entries of the registry file, revised-key index and version index carry the position they came from.
+**Objections.** (1) Nothing orders the cut-back of derived files before the mark is written, or makes a restart redo
+it: the mark is written and the process crashes on the same boot while the registry file still holds a definition
+from a lost position; rule 1 applies and the name maps to the lost definition. The derived-unverified label and the
+duplicate mode of §8 Restore step 2 are not persisted either. The same holds for a lost range found at run time
+under §8 Corrupt block. (2) Orphaned facts break invariant 2: a rule 2 lost range loses the definition at position
+d, and a consumer's cursor c lies between d and an orphaned fact f routed to it by explicit id. c is not below the
+lost range, so no `resync` is sent, and f is excluded from delivery. (3) For the owner: the truncated-tail bound
+assumes that acknowledged bytes reached the disk in some form. On a disk that returns from sync without writing, an
+id defined in the lost tail can be assigned again; either §2.1's "never reused" states that residual, or a batch
+holding a registry entry is acknowledged only after a mark sync.
 
-## Q-34 — What `data_lost` means beyond the report
-**Scenario.** (a) §8 Corrupt block says queries over a quarantined range return an error "until then", but a sealed
-log segment with no other copy is never replaced, so the error never ends; its valid batches stay unreadable. (b) A
-fact in a lost range may have superseded an earlier one, which then quietly becomes current again; current-view
-results carry no flag. (c) It is not said whether `data_lost` clears, and how. (d) Manifest records are single
-copies until uploaded, but neither §8 Corrupt block nor invariant 10 lists them.
-**Model.** A corrupt sealed segment with no other copy loses its whole range (`tests/rules.rs`
-`s8_corrupt_log_segment_with_no_other_copy_loses_range`).
-**Needed.** Whether valid batches of such a segment are kept and the quarantine lifted, how results over or after a
-lost range are flagged, and whether the state is latched until acknowledged.
+## Q-34 (c) — Whether loss reports survive a restart, and whether they are latched
+**Scenario.** It is not said whether `data_lost` and `possible_loss` clear, and how: a restart on the same boot
+right after a `possible_loss` may no longer report it, and nothing says whether health stays degraded. Parts (a) and
+(b) are settled (§8 Corrupt block, §11 Health); part (d) is Q-52.
+**Model.** Not modelled; the model records no lost ranges and does not report a truncated tail.
+**Proposal.** Both reports are read from manifest records at every start (for `possible_loss`, the truncated-tail
+record proposed in Q-48), so a restart does not clear them, the list is never shortened and the counts only rise;
+neither makes the store read-only. For the owner: whether they also hold health degraded until an operator
+acknowledges each loss. That needs a new manifest record type and a call such as `acknowledge_loss`, and changes
+operability rather than guarantees; since a power cut under load usually leaves a torn batch, most power cuts would
+need an acknowledgement.
+**Objection.** A reboot before any new batch commits recomputes the same K and F (the earlier record names positions
+up to F − 1), so a second record with the same lost range is written and `possible_loss` is counted twice for one
+loss.
 
 ## Q-37 — Which manifest records a restore reads, and how generations begin
 **Scenario.** (a) A restore claims generation g and crashes before writing its restore record. The next restore
@@ -209,6 +236,15 @@ reader receives nothing, and may skip the new fact or keep the lost one.
 **Model.** Not modelled; the mark is always exact.
 **Needed.** Whether readers can see that a tail was truncated (for example a recovery count in the mark or the
 manifest that they compare), or whether the residual risk is accepted and stated.
+**Proposal.** A reader that keeps a position for later use keeps with it the epoch it took before reading that
+position. Before continuing it reads the manifest: if a truncated-tail record (Q-48) has a later epoch and its K is
+below the kept position, everything the reader took above K is void, and it continues after K. `api.md`:
+`reader.epoch()` and `reader.truncated_since(epoch)`. Proposed addition: a row for an export continued by position
+after a power loss.
+**Objection.** §7 Manifest says each record has an epoch, but not that every record, including one that publishes no
+file, takes a strictly higher durable epoch. A reader can take epoch e from a record not yet synced; a power loss
+drops that record, the truncated-tail record written at recovery reuses e, and the reader's check finds no later
+record.
 
 ## Q-47 — How a consumer learns its recovered cursor, and what forgetting means
 **Scenario.** A consumer confirms position p; its cursor file, synced at most every second (§4 Consumer state), still
@@ -219,11 +255,28 @@ defined. Separately, "forget" is undefined for a consumer that keeps state outsi
 positions in the truncated tail may be the only copy of acknowledged facts that are now lost, and with an upsert
 keyed by position the new fact at p overwrites the lost one (see Q-34).
 **Model.** Not modelled; the mark is always exact.
-**Proposed.** `resync` after a truncated tail carries the consumer's recovered cursor. Alternatively, the engine
+**Earlier proposals.** `resync` after a truncated tail carries the consumer's recovered cursor. Alternatively, the engine
 delivers one value to every consumer: the first new position after recovery, since only positions at or above it
 (above the last kept batch, the synced cursors and the manifest records) can be reused; this is tighter than each
 consumer's recovered cursor and also serves readers (Q-46). What a consumer with outside state does with the lost
 facts is not proposed.
+**Proposal.** `resync` carries one value, `forget_from` = K + 1 of the lowest truncated-tail record (Q-48) whose F
+is above the consumer's cursor, or nothing. The consumer drops every position at or above it from its de-duplication
+memory, its own last confirmation included. Records it keeps outside the engine at those positions, and series ids
+first seen there, are copies of facts the store may no longer hold; the engine never asks for them to be deleted,
+and a consumer that needs them sets them aside before it accepts later deliveries. For the owner: whether the engine
+should protect such stores, which needs a position identity that changes across a truncation (for example an epoch
+inside the position), a new mechanism and a change to §2.2. The undefined `cursor` event is removed from §11.
+`api.md`: `Resync` carries `forget_from: Option<Position>`.
+**Objections.** (1) Recomputing `forget_from` in every session after every restart repeats it. Recovery gives K =
+100 and F = 105; consumer C replays to 100, receives `resync` with `forget_from` 101, receives live 105–200 and
+confirms 200, and its cursor file still names 100 when the process crashes on the same boot. On restart C receives
+`forget_from` 101 again and must drop the valid 105–200 from de-duplication, so it processes their replay twice;
+this repeats on every restart for a consumer whose routed series are rare. Only the first `resync` after a recovery
+should carry it, which needs a durable "forgot up to record R" in the cursor file. (2) A consumer with no cursor
+takes the lowest record of the current generation; since every reboot writes a record, a consumer whose cursor file
+was lost forgets almost the whole generation, which also conflicts with `start: position`. It should use the record
+that lists its cursor file as missing.
 
 ## Q-48 — The resync owed after a truncated tail is not durable
 **Scenario.** Recovery under §3 Recovery rule 3 resumes, and a new fact commits at a reused position p. The process
@@ -231,8 +284,31 @@ crashes on the same boot before consumer C has received its `resync`. On restart
 a truncated tail is sent, and §6 Restart and resume delivers the facts after C's cursor, p included, before its
 `resync`; C may drop the new fact at p as a repeat.
 **Model.** Not modelled; the mark is always exact.
-**Proposed.** Persist a "resync owed" flag, or a reuse floor, with the mark until each consumer has confirmed its
+**Earlier proposals.** Persist a "resync owed" flag, or a reuse floor, with the mark until each consumer has confirmed its
 `resync`.
+**Proposal.** Every §3 Recovery rule 3 recovery writes one manifest record, the truncated-tail record, and syncs it
+before the tail is truncated, before any derived file is changed and before the mark is written. It holds the boot
+id, the last position of the last kept batch (K), the first new position (F), the tail's length and readable commit
+blocks, any cursor file found missing or unreadable, and the id floor and derived-file contents of Q-33. The
+positions between K and F, if any, are its lost range, and it names no position at or above F. Only a repeat on the
+same boot with the same K and F writes no second record. Nothing is owed as state: whether a consumer needs a
+`resync` is recomputed at every start from its cursor file and these records. A consumer whose cursor, or `start`
+position, is below the F of such a record receives, for the lowest one, the facts after its cursor up to K flagged
+`replayed`, then `resync` carrying `forget_from` = K + 1 (Q-47), then the facts from F flagged `replayed`; no
+position at or above F reaches it before that `resync`. Proposed additions: an invariant to that effect and a row
+for a crash on the same boot after a rule 3 recovery, before a consumer received its `resync`. For `format.md`: the
+record's fields above, and every lost-range record carrying its cause, boot id, byte and position range and id
+floor; `api.md`: `store.lost_ranges()`.
+**Objections.** (1) F ignores positions named by derived files (the registry file, the revised-key and version
+indexes, a tree's "complete up to"): an acknowledged definition at K + 1 lies in the torn tail and the registry file
+holding it was synced, but no cursor names it, so F = K + 1, the lost range is empty and K + 1 is reused although a
+durable file named it. (2) Replay up to K, `resync`, then replay from F conflicts with §8 Behind consumers
+(`resync`, not replay; never download from deep): records pile up with every reboot, so the lowest record above a
+long-offline cursor can lie in evicted segments. (3) The record holds F yet names no position at or above F: if its
+F field counts towards the highest sequence among local manifest records, a repeated recovery computes F + 1 and the
+no-second-record rule breaks. (4) Objection 1 of Q-47 applies here too.
+Reviewers judged that this group (Q-33, Q-34 (c), Q-46–Q-48) needs one design round as a whole, best done with the
+log implementation (roadmap 4.5) where recovery is built concretely.
 
 ## Q-49 — What a series with no stored level serves during a restore
 **Scenario.** A gauge has an expected interval of 5 minutes, so the density rule (§5.1) stores no 1-minute or
@@ -255,6 +331,18 @@ node to evaluate its edge from.
 **Model.** Not modelled; both levels are stored for every series, and no window is flagged `approximate_edges`.
 **Needed.** Whether such an edge is evaluated at the finest stored level (and with no level, how), or its detail is
 fetched on demand as for other reads of moved detail (§8), and how the result is flagged in each case.
+
+## Q-52 — Manifest records as single copies
+**Scenario.** A manifest record not yet uploaded exists only on the hot tier. §8 Corrupt block names the open log
+segment and a sealed log segment not yet uploaded and not yet compacted as the only single copies, and invariant 10
+lists only their corruption as a loss; neither names manifest records. More would rest on them under the proposals
+of Q-33, Q-34 (c) and Q-48. With the current format, corruption of a record cannot be told from a torn manifest
+tail, and a record cannot be rebuilt.
+**Model.** Not modelled; manifest records are not corrupted.
+**Proposed.** Name a manifest record not yet uploaded as a single copy in §8 Corrupt block. A candidate rule for its
+corruption: fetch the record from deep when it has been uploaded, otherwise read-only with fatal health.
+**Needed.** A way to tell a torn manifest tail from a corrupt record, and what a corrupt record that was never
+uploaded does to the facts and positions it describes.
 
 ## Q-60 — Calendar nodes when the expected interval changes
 **Scenario.** A calendar node is stored only where the series' expected interval in force qualifies it for a stored
@@ -315,7 +403,7 @@ The specification wins where the documents differ. These follow from it, for the
   the `mark_sync_interval` configuration key and a `possible_loss` health reason with its counts; acknowledgement does
   not wait for the mark sync; test seams can inject a failed mark sync (§3). The manifest's lost-range record needs a
   cause, telling corruption (`data_lost`) from a truncated tail (`possible_loss`); A.10's recovery bullets and A.11's
-  tests need the stale-mark case. Whether `possible_loss` is latched until acknowledged is part of Q-34.
+  tests need the stale-mark case. Whether `possible_loss` is latched until acknowledged is part of Q-34 (c).
 - **F-12.** `format.md`: the parameter-change entry carries the retention class and period, taking effect at its position,
   not by event time. `api.md`: `SeriesSpec` gains the retention class and period, which do not count towards "same
   specification" and may change without a new series; a call to change them; the default period as a configuration key;
@@ -335,6 +423,8 @@ The specification wins where the documents differ. These follow from it, for the
   interval end; exports carry d or the interval end. `format.md`: the definition entry gains interval length and phase
   (i64 nanoseconds), which a parameter change may not carry; record on change is refused for interval series; A.8's
   `min_t` and `max_t` must allow for a reading's reach of d (§2.1, §6).
+- **F-15.** `format.md`: a log segment may follow, or be a copy that omits, a lost range (§8 Corrupt block); the
+  lost-range record carries the commit times of the batches on either side (§11 Health).
 
 ## Settled
 | ID | Question | Settled in |
@@ -370,6 +460,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction (open part: Q-40) |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open parts: Q-37, Q-39) |
+| Q-34 | What `data_lost` and `possible_loss` mean beyond the report, parts (a) and (b) | §8 Corrupt block (only the damaged region is lost; the valid batches of a sealed segment are copied to a new segment by one manifest record, which ends the error), §11 Health (each report carries what is known of its range; no flag on query results), row 11 (open parts: Q-34 (c), Q-52) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
 | Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (open parts: Q-49, Q-50, Q-60) |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b)–(d)) |
@@ -380,7 +471,7 @@ The specification wins where the documents differ. These follow from it, for the
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
-catch-up after overflow (§4), loss of a corrupt log segment with no other copy (§8), and generations, tree checkpoints
+catch-up after overflow (§4), loss of a corrupt log segment with no other copy (§8; the whole range, see the table), and generations, tree checkpoints
 and restore (§2.2, §8 Continuous backup, Generations, Restore drill, Restore steps 1–4 and the paragraph after them,
 rows 28, 28a and 28b; for 28a, a crash before the record, during step 1 or between later downloads, a download
 being atomic): a tree checkpoint carries the stored nodes, the registry and each series' latest recorded `t`
@@ -434,6 +525,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |
+| A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost and the quarantine stays | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; `resync` to every consumer after it | §3 Durable mark, §3 Recovery rule 3, §4 Resync, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
 | Segments beyond the restored end | §8 Restore step 1: quarantined, reported in health like a lost range, available for re-ingest (see Q-38) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery; not reported; their series ids are not reserved; reader epochs (§7) still read them | `tests/rules.rs` `s8_restored_end_before_first_gap` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1 (see Q-37) | The record is local; a restore reads every file in the bucket whatever its generation, so a second restore finds the first restore's gap again and sets aside the generation that restore started | `tests/open_questions.rs` `q37_…` |
