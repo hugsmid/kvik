@@ -6,7 +6,7 @@ default-members = ["model"]
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 rust-version = "1.100"
 publish = false
 

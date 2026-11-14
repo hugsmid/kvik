@@ -234,7 +234,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are made and [SECURITY.md
 vulnerabilities.
 
 ## Licence
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT licence](LICENSE-MIT) at your
-option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this
-work, as defined in the Apache-2.0 licence, shall be dual licensed as above, without any additional terms or
-conditions.
+kvik is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). It is free for personal,
+hobby, research, education and other non-commercial use, as the licence defines. Commercial use needs a separate
+commercial licence: open an issue on this repository to ask. Everything published before this change,
+including tag v0.2, was released under MIT OR Apache-2.0 and remains available under those terms.
