@@ -310,3 +310,43 @@ fn negative_counter_decrease_counts_as_reset() {
     };
     assert_eq!(resets, 1);
 }
+
+/// §3 Sealing: compaction never removes a log segment, so a consumer behind a
+/// compacted position is replayed from the log. The model's compaction
+/// retires its input segments: while a retired segment is still on the fast
+/// disk the consumer is replayed, but once it has left (uploaded, after the
+/// grace period) the consumer receives `resync` in place of the replay (§4
+/// Resync, as for a cursor older than the oldest local log segment).
+#[test]
+fn resync_replaces_replay_after_compaction() {
+    let (mut m, s) = model();
+    m.ingest(vec![num(s, m.wall, 1.0)]).unwrap();
+    m.drain().unwrap();
+    let cursor = m.disk.cursors[&C];
+    m.advance(SECOND);
+    m.ingest(vec![num(s, m.wall, 2.0)]).unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    let head = m.entries().unwrap().last().unwrap().position;
+    let session = |m: &Model, n: u32| -> Vec<_> {
+        m.received[&C]
+            .iter()
+            .filter(|r| r.session == n)
+            .map(|r| r.delivery.clone())
+            .collect()
+    };
+    m.reconnect(C).unwrap();
+    m.catch_up(C, 10).unwrap();
+    m.receive(C, 10).unwrap();
+    let got = session(&m, 2);
+    assert_eq!(got.len(), 2, "replayed, then resync");
+    assert!(got[0].replayed && got[1].resync().unwrap().replaced.is_none());
+    m.upload();
+    m.advance(HOUR);
+    m.housekeeping().unwrap();
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    let got = session(&m, 3);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].resync().unwrap().replaced, Some((cursor, head)));
+}

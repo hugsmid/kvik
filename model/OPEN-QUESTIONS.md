@@ -35,7 +35,9 @@ said whether staleness counts from its commit or from when it fell due, nor whet
 forward clock jump moves) or the monotonic clock (§4 Timers). (d) The monotonic clock restarts at boot, so after a
 restart there is no last-commit instant to measure from. (e) "Bad quality" may mean the supplied or the engine
 quality.
-**Model.** Stale-for conditions measure monotonic time since the last arrival of any reading.
+**Model.** Stale-for conditions measure monotonic time since the last arrival of any reading. A resume starts them
+unfired, so a latched-true stale-for condition is reported cleared, as a transition, in every `resync`
+(`q16_stale_for_resyncs_false_after_restart`).
 **Tried and rejected.** Counting from a staleness reference that restarts only when the live state's `t` rises past
 a high-water mark, for facts not flagged `late`, with "due" on the monotonic clock. Review found that this breaks
 principle 2 (when a fact fell due depends on a clock the log does not hold, so replay cannot rebuild it), that one
@@ -529,7 +531,14 @@ The specification wins where the documents differ. These follow from it, for the
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
-catch-up after overflow (§4), loss of a corrupt log segment with no other copy (§8; the whole range, see the table), and generations, tree checkpoints
+delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
+condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
+last committed position and a per-funnel sequence; one latch per condition funnel, moved when the consumer confirms;
+on every resume, after a restart, a recovery on a new boot or a consumer restart, a replay up to the last committed
+position followed by `resync` with the live state and the condition state now, a transition where it differs from
+the latch or there is no latch, or `resync` alone when the cursor is too far behind the local log segments; and
+catch-up after overflow from the last position enqueued in the session; rows 14–16 and 34, invariants 2, 3, 11, 13
+and 16; `tests/rules.rs` `s4_…` and `s6_…`), loss of a corrupt log segment with no other copy (§8; the whole range, see the table), and generations, tree checkpoints
 and restore (§2.2, §8 Continuous backup, Generations, Restore drill, Restore steps 1–4 and the paragraph after them,
 rows 28, 28a and 28b; for 28a, a crash before the record, during step 1 or between later downloads, a download
 being atomic): a tree checkpoint carries the stored nodes, the registry and each series' latest recorded `t`
@@ -563,18 +572,20 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Record on change | §2.6, row 17a | Keep-alive facts are ordinary facts from the adapter | `tests/edge_cases.rs` `row_17a_…` |
 | Effective-dated parameters and site zone | §2.1, §5.7, row 21 | One staleness limit per series; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
 | Low disk mark | §3: compaction pauses; tiering continues | Tiering pauses too | `low_mark_pauses_tiering_too` |
-| Routing changes as log entries; new-consumer start; cycles | §4, rows 33–34 | Fixed selections from configuration | — |
-| Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled | — |
+| New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |
+| Funnels with an operator and no condition; conditions over a selection of several series | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer) | — |
+| Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
+| Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |
+| Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any reading passed to the condition refreshes it | — |
+| Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it, and a resume restarts it unfired | `tests/open_questions.rs` `q16_stale_for_resyncs_false_after_restart` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
-| Latch and `resync` | §4, §6, rows 15–16, invariant 16 | Operator rebuilt from the tree; a true condition counts as fired | `restart_rebuilds_threshold_without_firing_again`, `consumer_down_for_a_day_resumes_from_cursor_replayed` |
-| Timer deliveries with per-funnel sequence | §4 | Conditions are tested apart from delivery | — |
+| Condition state on resume | §6 Restart and resume, invariant 16 (see Q-63) | The engine resumes conditions with `Runner::resume`, from the value now and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
 | Tree files and their checkpoint, density rule | §5.1, row 20a | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call); both levels, and calendar nodes, stored for every series | — |
 | Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
 | Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
 | Atomic manifest records | §7, row 10, invariant 14 | Publish and retirement are two records | `compaction_crash_after_publish_resumes_retirement` |
-| Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments; so where no backed-up log segment holds a position after the checkpoint, step 1 of a restore takes the first file in download order that holds it | `compaction_crash_after_publish_resumes_retirement` |
+| Inputs kept until verified; log segments kept 90 days | §3, §7, §8 | Compaction retires its input segments; so where no backed-up log segment holds a position after the checkpoint, step 1 of a restore takes the first file in download order that holds it, and a consumer resuming behind a compacted position whose retired segment has left the fast disk receives `resync` in place of the replay (§4 Resync) | `compaction_crash_after_publish_resumes_retirement`, `resync_replaces_replay_after_compaction` |
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | Files leave hot after the grace period; old epochs read remotely | `reader_epoch_survives_grace_then_reads_remotely` |
 | Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry; during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
 | Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
@@ -583,9 +594,9 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
-| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled | — |
+| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §4 Resync, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled, so no consumer receives `resync` for a cursor or `start` position below or inside a lost range | — |
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost and the quarantine stays | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
-| Timed mark sync; `possible_loss`; no reuse of positions after a truncation; `resync` to every consumer after it | §3 Durable mark, §3 Recovery rule 3, §4 Resync, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
+| Timed mark sync; `possible_loss`; no reuse of positions after a truncation; forgetting positions above the recovered cursor | §3 Durable mark, §3 Recovery rule 3, §4 At-least-once, Resync, row 7a | The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail; a truncation after a reboot is not reported. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
 | Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start; exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |
 | A failed retry of a restore | §8 Restore, the paragraph after step 4: a restart after the record resumes the restore in its generation | In `restart_restore`, a retry after a crash before the record that writes its record and then fails in step 1 is discarded and stays pending, so the next restart claims another generation | `tests/open_questions.rs` `q39_failed_restart_of_a_restore_is_reported` |
@@ -595,5 +606,4 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Window edges over detail that is not local | §6 Old spans, §8 Restore step 2: an edge moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, the error `detail_not_local`; no bound is refused for its resolution | No window is flagged `approximate_edges` and no edge moves; while restoring, a window bound inside a minute is refused with `Restoring` | `tests/open_questions.rs` `q39_no_sub_minute_query_or_checkpoint_while_restoring` |
 | Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
-| Consumers after a restore | §8 Restore step 2: every consumer "then" receives `generation_changed` and `resync` | Signals and fact deliveries are kept in separate lists (`signals`, `observed`), so the model cannot show that `generation_changed` follows the catch-up | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
-| Invariants 12–16 | §10 | Not checked yet | — |
+| Invariants 12, 14 and 15 | §10 | Not checked yet | — |

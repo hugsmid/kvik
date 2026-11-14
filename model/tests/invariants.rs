@@ -316,7 +316,6 @@ proptest! {
             apply_delivery(&mut m, &ids, op).map_err(TestCaseError::fail)?;
         }
         settle(&mut m);
-        m.drain().unwrap();
         let latches = m.disk.latches.clone();
         if by_reconnect {
             for d in delivery_consumers() {
