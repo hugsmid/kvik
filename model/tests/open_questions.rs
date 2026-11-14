@@ -723,3 +723,137 @@ fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
         ]
     );
 }
+
+/// Q-75 (a): "each local day uses the zone in force at its start" when the
+/// site zone moves to another offset. From Tokyo (+09) to New York (−04) at
+/// 00:00 UTC on 1 June, 1 June starts in force in either zone; the model
+/// takes New York, leaving 13 hours in no local day and no month. The other
+/// way round, 1 June starts in force in neither; the model keeps the old
+/// zone, and 13 hours fall in both 1 and 2 June, so June stores no month node.
+/// (b): the zone before the first entry is configuration, so a restart with
+/// another one re-takes the past days.
+#[test]
+fn q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap() {
+    use jiff::civil::Date;
+    use kvik_model::calendar::{Month, Period};
+    let day = |m: &Model, s, mo, d| {
+        let a = m
+            .calendar(s, Period::Day(Date::constant(2026, mo, d)))
+            .unwrap();
+        (a.from, a.to, a.node.count)
+    };
+    let readings = every(
+        utc("2026-05-30T00:00:00Z"),
+        utc("2026-06-03T00:00:00Z"),
+        HOUR,
+    );
+    let june = Month {
+        year: 2026,
+        month: 6,
+    };
+    let in_gap = |from: &str, to: &str| -> u64 {
+        let n = readings
+            .iter()
+            .filter(|(t, _)| utc(from) <= *t && *t < utc(to))
+            .count();
+        u64::try_from(n).unwrap()
+    };
+    // Tokyo to New York: a gap.
+    let (mut m, s) = calendar_model("Asia/Tokyo", utc("2026-06-04T00:00:00Z"), HOUR);
+    feed(&mut m, s, &readings);
+    m.set_site_zone("America/New_York", utc("2026-06-01T00:00:00Z"))
+        .unwrap();
+    let (_, may31_end, _) = day(&m, s, 5, 31);
+    let (jun1_start, _, _) = day(&m, s, 6, 1);
+    assert_eq!(may31_end, utc("2026-05-31T15:00:00Z"));
+    assert_eq!(jun1_start, utc("2026-06-01T04:00:00Z"));
+    let may = m
+        .calendar(
+            s,
+            Period::Month(Month {
+                year: 2026,
+                month: 5,
+            }),
+        )
+        .unwrap();
+    let jun = m.calendar(s, Period::Month(june)).unwrap();
+    assert_eq!((may.to, jun.from), (may31_end, jun1_start));
+    assert_eq!(in_gap("2026-05-31T15:00:00Z", "2026-06-01T04:00:00Z"), 13);
+    // New York to Tokyo: an overlap.
+    let cfg_zone = "America/New_York";
+    let (mut m, s) = calendar_model(cfg_zone, utc("2026-06-04T00:00:00Z"), HOUR);
+    feed(&mut m, s, &readings);
+    m.set_site_zone("Asia/Tokyo", utc("2026-06-01T00:00:00Z"))
+        .unwrap();
+    let jun1 = day(&m, s, 6, 1);
+    let jun2 = day(&m, s, 6, 2);
+    assert_eq!(
+        (jun1.0, jun1.1),
+        (utc("2026-06-01T04:00:00Z"), utc("2026-06-02T04:00:00Z"))
+    );
+    assert_eq!(
+        (jun2.0, jun2.1),
+        (utc("2026-06-01T15:00:00Z"), utc("2026-06-02T15:00:00Z"))
+    );
+    let both = in_gap("2026-06-01T15:00:00Z", "2026-06-02T04:00:00Z");
+    assert_eq!(both, 13);
+    assert!(!m.calendar_file(s).unwrap().months.contains_key(&june));
+    // The month result is the window over its span; day nodes that overlap
+    // an earlier input are not taken.
+    let jun = m.calendar(s, Period::Month(june)).unwrap();
+    let jun3 = day(&m, s, 6, 3);
+    assert_eq!(jun.inputs, vec![(jun1.0, jun1.1), (jun3.0, jun3.1)]);
+    let p = m.tree(s).unwrap().params;
+    let rs = kvik_model::oracle::readings(m.current().unwrap(), s);
+    assert_eq!(
+        jun.node,
+        kvik_model::oracle::window(&p, &rs, jun.from, jun.to, m.now)
+    );
+    let mut days = 0;
+    for d in june.dates().unwrap() {
+        days += day(&m, s, 6, d.day()).2;
+    }
+    assert_eq!(
+        days,
+        jun.node.count + both,
+        "the overlap counts twice in the days"
+    );
+    // (b) The days before the first entry follow the configured zone.
+    let (may30, _, _) = day(&m, s, 5, 30);
+    m.config.site_zone = "Europe/London".into();
+    m.restart();
+    assert_eq!(may30, utc("2026-05-30T04:00:00Z"));
+    assert_eq!(day(&m, s, 5, 30).0, utc("2026-05-29T23:00:00Z"));
+}
+
+/// Q-76: a tzdata change is logged by the engine, not recorded in the log.
+/// Between the change and the rebuild a build from the log uses the version
+/// the files were built with; a restart builds with the host's version and
+/// nothing is logged.
+#[test]
+fn q76_tzdata_change_is_not_in_the_log() {
+    use kvik_model::calendar::Tzdb;
+    let (mut m, s) = calendar_model("America/Santiago", utc("2026-04-12T00:00:00Z"), HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-04-01T00:00:00Z"),
+            utc("2026-04-11T00:00:00Z"),
+            41 * MINUTE,
+        ),
+    );
+    let rules = jiff::tz::TimeZone::posix("<-04>4<-03>,M8.2.6/24,M5.2.6/24").unwrap();
+    let db = Tzdb::bundled()
+        .with_rules("test-2", "America/Santiago", rules)
+        .unwrap();
+    let entries = m.entries().unwrap().len();
+    m.install_tzdb(db);
+    assert_eq!(m.entries().unwrap().len(), entries, "no log entry");
+    let rebuilt = m.rebuilt_calendars().unwrap();
+    assert_eq!(rebuilt[&s].tzdata, "bundled");
+    assert_eq!(&rebuilt, m.calendars().unwrap());
+    m.restart();
+    assert_eq!(m.calendar_file(s).unwrap().tzdata, "test-2");
+    assert!(m.calendar_log.is_empty());
+}

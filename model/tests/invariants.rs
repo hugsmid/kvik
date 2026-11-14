@@ -1702,3 +1702,255 @@ fn params_generator_covers_every_density_level() {
         assert!(c.iter().all(|n| *n > 20), "{kind:?}: {c:?}");
     }
 }
+
+// ----- calendar nodes and results (§5.7) -----
+
+/// Zones with DST in both hemispheres, 30- and 45-minute offsets, a 30-minute
+/// DST shift, and one with an offset off 15-minute boundaries before 1972.
+const CAL_ZONES: [&str; 8] = [
+    "Europe/London",
+    "America/New_York",
+    "Australia/Sydney",
+    "America/Santiago",
+    "Asia/Kolkata",
+    "Asia/Kathmandu",
+    "Australia/Lord_Howe",
+    "Africa/Monrovia",
+];
+
+/// Starts of four-day stretches around DST changes in 2026, and one in 1970.
+const CAL_BASES: [&str; 5] = [
+    "2026-03-27T00:00:00Z",
+    "2026-04-03T00:00:00Z",
+    "2026-10-02T00:00:00Z",
+    "2026-10-30T12:00:00Z",
+    "1970-05-30T00:00:00Z",
+];
+
+#[derive(Clone, Debug)]
+struct CalCase {
+    zone: usize,
+    base: usize,
+    readings: Vec<(Nanos, i32)>,
+    /// Site-zone entries: zone index and effective offset from the base.
+    changes: Vec<(usize, Nanos)>,
+    split: usize,
+    named: usize,
+}
+
+fn arb_cal_case() -> impl Strategy<Value = CalCase> {
+    (
+        0..CAL_ZONES.len(),
+        0..CAL_BASES.len(),
+        proptest::collection::btree_map((0i64..4 * 24 * 60, 0i64..60), -4i32..8, 0..40),
+        proptest::collection::vec((0..CAL_ZONES.len(), 0i64..4 * 24 * 4), 0..3),
+        0usize..40,
+        0..CAL_ZONES.len(),
+    )
+        .prop_map(|(zone, base, rs, changes, split, named)| CalCase {
+            zone,
+            base,
+            readings: rs
+                .into_iter()
+                .map(|((m, s), v)| (m * MINUTE + s * SECOND, v))
+                .collect(),
+            changes: changes
+                .into_iter()
+                .map(|(z, q)| (z, q * QUARTER + 7 * MINUTE * (q % 3)))
+                .collect(),
+            split,
+            named,
+        })
+}
+
+/// A store built from a case: the readings in two batches with the
+/// site-zone entries between them.
+fn cal_model(
+    c: &CalCase,
+) -> (
+    kvik_model::engine::Model,
+    kvik_model::types::SeriesId,
+    Nanos,
+) {
+    let base = utc(CAL_BASES[c.base]);
+    let (mut m, s) = calendar_model(
+        CAL_ZONES[c.zone],
+        base + 5 * kvik_model::types::DAY,
+        2 * kvik_model::types::HOUR,
+    );
+    let rs: Vec<(Nanos, f64)> = c
+        .readings
+        .iter()
+        .map(|(t, v)| (base + t, f64::from(*v) * 2.5))
+        .collect();
+    let split = c.split.min(rs.len());
+    feed(&mut m, s, &rs[..split]);
+    for (z, at) in &c.changes {
+        m.set_site_zone(CAL_ZONES[*z], base + at).unwrap();
+    }
+    feed(&mut m, s, &rs[split..]);
+    (m, s, base)
+}
+
+/// Every local date from the day before the base to five days after it.
+fn cal_dates(base: Nanos) -> Vec<jiff::civil::Date> {
+    let d0 = jiff::Timestamp::from_nanosecond(i128::from(base))
+        .unwrap()
+        .to_zoned(TimeZone::UTC)
+        .date();
+    (-1..6)
+        .map(|k| d0.checked_add(jiff::Span::new().days(k)).unwrap())
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// 5. Every stored calendar node is bitwise equal to its canonical
+    /// computation over the current view of its span, which falls on
+    /// 15-minute boundaries (§5.7), also after site-zone changes.
+    #[test]
+    fn inv05_calendar_nodes_equal_direct(c in arb_cal_case()) {
+        let (m, s, _) = cal_model(&c);
+        let p = m.tree(s).unwrap().params;
+        let rs = oracle::readings(m.current().unwrap(), s);
+        let file = m.calendar_file(s).unwrap();
+        for n in file.days.values().chain(file.months.values()) {
+            prop_assert!(kvik_model::calendar::aligned((n.start, n.end)));
+            prop_assert_eq!(&n.node, &oracle::node(&p, &rs, n.start, n.end));
+        }
+        for (d, n) in &file.days {
+            let day = m.site_zoning().unwrap().day(&m.tzdb, *d).unwrap();
+            prop_assert_eq!((n.start, n.end, n.zones.clone()), (day.start, day.end, vec![day.zone_id]));
+        }
+    }
+
+    /// 8. Calendar files rebuilt from the log alone equal the live ones,
+    /// after site-zone entries and late facts, and after a restart.
+    #[test]
+    fn inv08_calendar_rebuild_equals_live(c in arb_cal_case()) {
+        let (mut m, _, _) = cal_model(&c);
+        let live = m.calendars().unwrap().clone();
+        prop_assert_eq!(&live, &m.rebuilt_calendars().unwrap());
+        m.restart();
+        prop_assert_eq!(&live, m.calendars().unwrap());
+    }
+
+    /// 7. A calendar result, day or month, in the site zone or a named zone,
+    /// and a calendar window, equals the direct window computation over its
+    /// span; a day in a named zone spans its local midnights there, and the
+    /// local date turns to it exactly at its start.
+    #[test]
+    fn inv07_calendar_results_equal_direct(c in arb_cal_case()) {
+        use kvik_model::calendar::{CalendarWindow, Month, Period};
+        let (m, s, base) = cal_model(&c);
+        let p = m.tree(s).unwrap().params;
+        let rs = oracle::readings(m.current().unwrap(), s);
+        let named = CAL_ZONES[c.named];
+        let tz = TimeZone::get(named).unwrap();
+        let mut months = BTreeSet::new();
+        for d in cal_dates(base) {
+            months.insert(Month::of(d));
+            for zone in [None, Some(named)] {
+                let a = m.calendar_window(s, CalendarWindow::Period(Period::Day(d)), zone).unwrap();
+                prop_assert_eq!(&a.node, &oracle::window(&p, &rs, a.from, a.to, m.now));
+                if zone.is_some() {
+                    let start = d.to_zoned(tz.clone()).unwrap().timestamp();
+                    let end = d.tomorrow().unwrap().to_zoned(tz.clone()).unwrap().timestamp();
+                    let ns = |t: jiff::Timestamp| i64::try_from(t.as_nanosecond()).unwrap();
+                    prop_assert_eq!((a.from, a.to), (ns(start), ns(end).max(ns(start))));
+                    if a.from < a.to {
+                        let at = |x: Nanos| jiff::Timestamp::from_nanosecond(i128::from(x)).unwrap().to_zoned(tz.clone()).date();
+                        prop_assert_eq!(at(a.from), d);
+                        prop_assert!(at(a.from - 1) < d);
+                        prop_assert_eq!(at(a.to - 1), d);
+                    }
+                }
+            }
+        }
+        for mo in months {
+            for zone in [None, Some(named)] {
+                let a = m.calendar_window(s, CalendarWindow::Period(Period::Month(mo)), zone).unwrap();
+                prop_assert_eq!(&a.node, &oracle::window(&p, &rs, a.from, a.to, m.now));
+            }
+        }
+        for w in [CalendarWindow::SinceMidnight, CalendarWindow::ThisMonth, CalendarWindow::Day(-3), CalendarWindow::Month(-1)] {
+            for zone in [None, Some(named)] {
+                let a = m.calendar_window(s, w, zone).unwrap();
+                prop_assert_eq!(&a.node, &oracle::window(&p, &rs, a.from, a.to, m.now));
+            }
+        }
+    }
+
+    /// 17. For a counter, the increases of the local days of a month add up to
+    /// the month's increase, in a zone with a 30-minute DST shift.
+    #[test]
+    fn inv17_counter_days_add_up_to_their_month(
+        steps in proptest::collection::vec((1i64..30 * 60, 0u32..20), 1..60),
+        named in any::<bool>(),
+    ) {
+        use kvik_model::calendar::{Month, Period};
+        let zone = "Australia/Lord_Howe";
+        let cfg = kvik_model::engine::Config { site_zone: zone.into(), ..kvik_model::engine::Config::default() };
+        let mut m = kvik_model::engine::Model::new(cfg, vec![], utc("2026-11-03T00:00:00Z"));
+        let s = m.define_with(
+            "line-1/meter/energy", Kind::Counter, kvik_model::types::ValueType::Number, "Wh",
+            6 * kvik_model::types::HOUR, kvik_model::registry::SeriesOptions::expected(SECOND),
+        ).unwrap();
+        // Readings from late September into early November.
+        let mut t = utc("2026-09-29T00:00:00Z");
+        let mut v = 0.0;
+        let mut rs = Vec::new();
+        for (dt, inc) in steps {
+            t += dt * MINUTE;
+            v += f64::from(inc);
+            rs.push((t, v));
+        }
+        feed(&mut m, s, &rs);
+        let october = Month { year: 2026, month: 10 };
+        let zone = named.then_some(zone);
+        let month = m.calendar_window(s, kvik_model::calendar::CalendarWindow::Period(Period::Month(october)), zone).unwrap();
+        let increase = |n: &Node| match &n.body { Body::Counter { increase, .. } => increase.clone(), _ => unreachable!() };
+        let mut sum = Exact::from_integer(0.into());
+        let mut to = month.from;
+        for d in october.dates().unwrap() {
+            let a = m.calendar_window(s, kvik_model::calendar::CalendarWindow::Period(Period::Day(d)), zone).unwrap();
+            prop_assert_eq!(a.from, to, "days tile the month");
+            to = a.to;
+            sum += increase(&a.node);
+        }
+        prop_assert_eq!(to, month.to);
+        prop_assert_eq!(sum, increase(&month.node));
+    }
+
+    /// 22. For an interval series with d = 30 min in a +05:45 zone, the sums of
+    /// the local days of a month add up to the month's sum, though every day
+    /// edge apportions an interval.
+    #[test]
+    fn inv22_interval_days_add_up_to_their_month(
+        amounts in proptest::collection::btree_map(0i64..(33 * 48), 0i32..40, 0..80),
+        named in any::<bool>(),
+    ) {
+        use kvik_model::calendar::{Month, Period};
+        let zone = "Asia/Kathmandu";
+        let cfg = kvik_model::engine::Config { site_zone: if named { "UTC" } else { zone }.into(), ..kvik_model::engine::Config::default() };
+        let mut m = kvik_model::engine::Model::new(cfg, vec![], utc("2026-06-05T00:00:00Z"));
+        let s = m.define_with(
+            "line-1/meter/energy", Kind::Interval, kvik_model::types::ValueType::Number, "Wh",
+            None, kvik_model::registry::SeriesOptions::interval(30 * MINUTE, 0),
+        ).unwrap();
+        let first = utc("2026-04-30T00:00:00Z");
+        let rs: Vec<(Nanos, f64)> = amounts.iter().map(|(k, v)| (first + k * 30 * MINUTE, f64::from(*v) * 1.5)).collect();
+        feed(&mut m, s, &rs);
+        let may = Month { year: 2026, month: 5 };
+        let zone = named.then_some(zone);
+        let sum = |n: &Node| match &n.body { Body::Interval { sum, .. } => sum.clone(), _ => unreachable!() };
+        let month = m.calendar_window(s, kvik_model::calendar::CalendarWindow::Period(Period::Month(may)), zone).unwrap();
+        let mut total = Exact::from_integer(0.into());
+        for d in may.dates().unwrap() {
+            let a = m.calendar_window(s, kvik_model::calendar::CalendarWindow::Period(Period::Day(d)), zone).unwrap();
+            total += sum(&a.node);
+        }
+        prop_assert_eq!(total, sum(&month.node));
+    }
+}

@@ -5,6 +5,8 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use kvik_model::calendar::{Month, Period};
+
 use common::*;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -1488,30 +1490,49 @@ proptest! {
 
     /// Row 20: DST — the UTC tree is unaffected and local days have 92 to 100
     /// quarter-hours, in zones on several continents (see OPEN-QUESTIONS Q-06
-    /// for days outside that range).
+    /// for days outside that range). The stored day node is the merge of its
+    /// quarter-hours; the day's result is a window over its span, edge
+    /// stretches included, with the stored node as an input (§5.7).
     #[test]
     fn row_20_dst_days(
         zone in proptest::sample::select(vec![
-            "UTC", "Europe/Paris", "Europe/Berlin", "America/New_York", "America/Santiago",
+            "UTC", "Europe/Paris", "Europe/London", "America/New_York", "America/Santiago",
             "Australia/Sydney", "Asia/Kolkata", "Asia/Kathmandu", "Pacific/Chatham", "America/Havana",
             "Australia/Lord_Howe", "Asia/Tokyo", "Africa/Cairo", "America/Sao_Paulo",
         ]),
         day in 0i32..(366 * 6),
-        rs in arb_readings(Kind::Gauge, 20),
+        head in arb_readings(Kind::Gauge, 12),
+        tail in arb_readings(Kind::Gauge, 12),
+        late in 0i64..(2 * HOUR),
     ) {
+        use kvik_model::calendar::{CalendarFile, Tzdb, Zoning};
         let tz = TimeZone::get(zone).unwrap();
         let date = Date::constant(2024, 1, 1).checked_add(jiff::Span::new().days(day)).unwrap();
         let q = quarters_in_day(&tz, date).unwrap();
         prop_assert!((92..=100).contains(&q) && q % 2 == 0, "{} {} has {} quarter-hours", zone, date, q);
-        // Readings placed on this local day; day node from the tree = direct.
-        let (ds, _) = kvik_model::tree::day_span(&tz, date).unwrap();
-        let rs: Vec<(Nanos, Value)> = rs.into_iter().map(|(t, v)| (t - T0 + ds, v)).collect();
+        // Readings around both edges of this local day, some outside it.
+        let (ds, de) = kvik_model::tree::day_span(&tz, date).unwrap();
+        let mut rs: BTreeMap<Nanos, Value> = BTreeMap::new();
+        rs.extend(head.into_iter().map(|(t, v)| (t - T0 + ds - 20 * MINUTE, v)));
+        rs.extend(tail.into_iter().map(|(t, v)| (t - T0 + de - 20 * MINUTE, v)));
+        let rs: Vec<(Nanos, Value)> = rs.into_iter().collect();
         let p = Params {
             expected_interval: Some(SECOND),
             ..Params::new(Kind::Gauge, 7 * SECOND)
         };
         let tree = SeriesTree::build(p, &rs);
         prop_assert_eq!(tree.day(&tz, date).unwrap(), oracle::day(&p, &rs, &tz, date).unwrap());
+        let db = Tzdb::bundled();
+        let zoning = Zoning::Named(zone.into());
+        let file = CalendarFile::build(&tree, &zoning, &db).unwrap();
+        let d = zoning.day(&db, date).unwrap();
+        let now = de - HOUR + late;
+        let inputs = kvik_model::calendar::inputs(Some(&file), &db, &[d], None, ds, now.min(de));
+        let stored = file.days.get(&date).map(|n| n.node.clone());
+        prop_assert_eq!(stored.clone(), Some(tree.day(&tz, date).unwrap()).filter(|n| n.count > 0));
+        prop_assert_eq!(inputs.len(), usize::from(stored.is_some() && de <= now));
+        let got = kvik_model::calendar::evaluate(&tree, ds, de, now, &inputs);
+        prop_assert_eq!(got, oracle::window(&p, &rs, ds, de, now));
     }
 }
 
@@ -2014,4 +2035,424 @@ fn row_35_window_with_no_new_data_or_edge_in_open_minute() {
         w.aggregate(&Aggregate::Last),
         Some(AggValue::Value(Value::Num(4.0)))
     );
+}
+
+/// Row 20a through the engine: with no stored 15-minute level (a gauge whose
+/// expected interval is 2 minutes; an interval series with d = 30 min) the
+/// calendar file holds no node, and a day's or month's result is a window over
+/// its facts.
+#[test]
+fn row_20a_calendar_results_without_a_stored_level_are_windows_over_facts() {
+    let now = utc("2026-04-02T00:00:00Z");
+    let cfg = Config {
+        site_zone: "Europe/Paris".into(),
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], now);
+    let s = m
+        .define_with(
+            "line-1/meter/power",
+            Kind::Gauge,
+            ValueType::Number,
+            "W",
+            6 * MINUTE,
+            SeriesOptions::expected(2 * MINUTE),
+        )
+        .unwrap();
+    feed(
+        &mut m,
+        s,
+        &every(utc("2026-02-28T20:00:00Z"), now, 50 * MINUTE),
+    );
+    let p = m.tree(s).unwrap().params;
+    let rs = oracle::readings(m.current().unwrap(), s);
+    assert!(m.calendar_file(s).unwrap().days.is_empty());
+    assert!(m.calendar_file(s).unwrap().months.is_empty());
+    for period in [
+        Period::Day(Date::constant(2026, 3, 29)),
+        Period::Month(Month {
+            year: 2026,
+            month: 3,
+        }),
+    ] {
+        let a = m.calendar(s, period).unwrap();
+        assert!(a.inputs.is_empty());
+        assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, m.now));
+    }
+    // An interval series with d = 30 min in a +05:45 site zone.
+    let cfg = Config {
+        site_zone: "Asia/Kathmandu".into(),
+        ..Config::default()
+    };
+    let now = utc("2026-06-03T00:00:00Z");
+    let mut m = Model::new(cfg, vec![], now);
+    let s = m
+        .define_with(
+            "line-1/meter/energy",
+            Kind::Interval,
+            ValueType::Number,
+            "Wh",
+            None,
+            SeriesOptions::interval(30 * MINUTE, 0),
+        )
+        .unwrap();
+    let rs: Vec<(Nanos, f64)> = every(
+        utc("2026-05-31T00:00:00Z"),
+        utc("2026-06-02T12:00:00Z"),
+        30 * MINUTE,
+    )
+    .into_iter()
+    .map(|(t, _)| (t, 2.0))
+    .collect();
+    feed(&mut m, s, &rs);
+    assert!(m.calendar_file(s).unwrap().days.is_empty());
+    let a = m
+        .calendar(s, Period::Day(Date::constant(2026, 6, 1)))
+        .unwrap();
+    assert_eq!(
+        (a.from, a.to),
+        (utc("2026-05-31T18:15:00Z"), utc("2026-06-01T18:15:00Z"))
+    );
+    assert!(a.inputs.is_empty());
+    assert!(a.node.apportioned());
+    assert_eq!(
+        a.node.aggregate(&Aggregate::Sum),
+        Some(AggValue::Exact(exact(96.0)))
+    );
+    let p = m.tree(s).unwrap().params;
+    let rs = oracle::readings(m.current().unwrap(), s);
+    assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, m.now));
+}
+
+/// Row 21: "Site zone changed: calendar nodes rebuilt from the effective time
+/// only; logged." The site zone moves from Paris to Berlin (the same offsets
+/// in 2026, another zone) from local midnight of 20 May. Days before keep
+/// Paris; May's month node now covers days of both zones, so a query in
+/// Paris takes only its Paris days as inputs, and one in Berlin only its
+/// Berlin days (§5.7: "so not a month spanning a site-zone change").
+#[test]
+fn row_21_site_zone_change_rebuilds_from_its_effective_time() {
+    let now = utc("2026-06-03T00:00:00Z");
+    let (mut m, s) = calendar_model("Europe/Paris", now, HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-05-10T00:00:00Z"),
+            utc("2026-06-02T00:00:00Z"),
+            37 * MINUTE,
+        ),
+    );
+    let before = m.calendar_file(s).unwrap().clone();
+    let effective = utc("2026-05-19T22:00:00Z");
+    let position = m.set_site_zone("Europe/Berlin", effective).unwrap();
+    let after = m.calendar_file(s).unwrap().clone();
+    let changed = before.changed_days(&after);
+    let db = kvik_model::calendar::Tzdb::bundled();
+    let (paris, berlin) = (
+        db.id("Europe/Paris").unwrap(),
+        db.id("Europe/Berlin").unwrap(),
+    );
+    assert_ne!(paris, berlin);
+    let from_20 = Date::constant(2026, 5, 20);
+    assert_eq!(
+        changed,
+        after
+            .days
+            .range(from_20..)
+            .map(|(d, _)| *d)
+            .collect::<Vec<_>>()
+    );
+    for (d, n) in &after.days {
+        assert_eq!(
+            n.zones,
+            vec![if *d < from_20 { paris } else { berlin }],
+            "{d}"
+        );
+        if *d < from_20 {
+            assert_eq!(Some(n), before.days.get(d), "past days keep the old zone");
+        }
+    }
+    // Logged, with the position of the entry.
+    let log = m.calendar_log.last().unwrap();
+    assert_eq!(
+        log.cause,
+        kvik_model::engine::CalendarCause::SiteZone { position }
+    );
+    assert_eq!(log.days, changed);
+    let may = Month {
+        year: 2026,
+        month: 5,
+    };
+    let june = Month {
+        year: 2026,
+        month: 6,
+    };
+    assert_eq!(log.months, vec![may, june]);
+    let p = m.tree(s).unwrap().params;
+    let rs = oracle::readings(m.current().unwrap(), s);
+    let (from, to) = (utc("2026-04-30T22:00:00Z"), utc("2026-05-31T22:00:00Z"));
+    let site = m.calendar(s, Period::Month(may)).unwrap();
+    assert_eq!(
+        site.inputs,
+        vec![(from, to)],
+        "the month node, in the site zone"
+    );
+    let day_spans = |range: std::ops::Range<i8>| -> Vec<(Nanos, Nanos)> {
+        range
+            .map(|d| {
+                let n = &after.days[&Date::constant(2026, 5, d)];
+                (n.start, n.end)
+            })
+            .collect()
+    };
+    let in_paris = m
+        .calendar_in(s, Period::Month(may), "Europe/Paris")
+        .unwrap();
+    assert_eq!(in_paris.inputs, day_spans(10..20));
+    let in_berlin = m
+        .calendar_in(s, Period::Month(may), "Europe/Berlin")
+        .unwrap();
+    assert_eq!(in_berlin.inputs, day_spans(20..32));
+    for a in [&site, &in_paris, &in_berlin] {
+        assert_eq!((a.from, a.to), (from, to));
+        assert_eq!(a.node, oracle::window(&p, &rs, from, to, m.now));
+    }
+    // The rebuild equals a build from the log alone (invariant 8), also after
+    // a restart.
+    assert_eq!(m.calendars().unwrap(), &m.rebuilt_calendars().unwrap());
+    m.restart();
+    assert_eq!(m.calendar_file(s).unwrap(), &after);
+}
+
+/// Row 21: "tzdata changes its rules: calendar nodes rebuilt for the affected
+/// days only; logged." A later tzdata release moves Chile's DST to the
+/// second Saturday of August and May. Until the rebuild, the calendar file
+/// still holds the old version, so its nodes are no input (§5.7) and results
+/// follow the new rules from the UTC data; the rebuild changes only the days
+/// whose spans moved.
+#[test]
+fn row_21_tzdata_change_rebuilds_the_affected_days() {
+    use kvik_model::calendar::Tzdb;
+    let now = utc("2026-07-01T12:00:00Z");
+    let (mut m, s) = calendar_model("America/Santiago", now, HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-04-01T00:00:00Z"),
+            utc("2026-04-11T00:00:00Z"),
+            41 * MINUTE,
+        ),
+    );
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-06-01T06:00:00Z"),
+            utc("2026-06-04T00:00:00Z"),
+            41 * MINUTE,
+        ),
+    );
+    let old = m.calendar_file(s).unwrap().clone();
+    assert_eq!(old.tzdata, "bundled");
+    let rules = TimeZone::posix("<-04>4<-03>,M8.2.6/24,M5.2.6/24").unwrap();
+    let db = Tzdb::bundled()
+        .with_rules("test-2", "America/Santiago", rules)
+        .unwrap();
+    m.install_tzdb(db);
+    let p = m.tree(s).unwrap().params;
+    let rs = oracle::readings(m.current().unwrap(), s);
+    // 7 April: −04 under the old rules, still −03 under the new ones.
+    let apr7 = Period::Day(Date::constant(2026, 4, 7));
+    let pending = m.calendar(s, apr7).unwrap();
+    assert_eq!(
+        (pending.from, pending.to),
+        (utc("2026-04-07T03:00:00Z"), utc("2026-04-08T03:00:00Z"))
+    );
+    assert!(
+        pending.inputs.is_empty(),
+        "a node of another tzdata version"
+    );
+    assert_eq!(
+        pending.node,
+        oracle::window(&p, &rs, pending.from, pending.to, m.now)
+    );
+    let log = m.rebuild_calendars().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0].cause,
+        kvik_model::engine::CalendarCause::Tzdata {
+            from: "bundled".into(),
+            to: "test-2".into()
+        }
+    );
+    // 1–3 April and June keep their spans; 4 April (whose end moves) and
+    // 5–10 April are rebuilt.
+    let days: Vec<Date> = (4..=10).map(|d| Date::constant(2026, 4, d)).collect();
+    assert_eq!(log[0].days, days);
+    assert_eq!(
+        log[0].months,
+        vec![Month {
+            year: 2026,
+            month: 4
+        }]
+    );
+    let new = m.calendar_file(s).unwrap();
+    assert_eq!(new.tzdata, "test-2");
+    for d in old.days.keys().filter(|d| !days.contains(d)) {
+        assert_eq!(old.days.get(d), new.days.get(d), "{d} unaffected");
+    }
+    let rebuilt = m.calendar(s, apr7).unwrap();
+    assert_eq!(rebuilt.inputs, vec![(rebuilt.from, rebuilt.to)]);
+    assert_eq!(rebuilt.node, pending.node);
+    assert!(
+        m.rebuild_calendars().unwrap().is_empty(),
+        "nothing left to rebuild"
+    );
+    assert_eq!(m.calendar_log.len(), 1);
+}
+
+/// Row 21a: "Calendar query in a named zone whose offset is not a multiple of
+/// 15 minutes (historical offsets): days taken in that zone for the whole
+/// span; no stored calendar node used; evaluated as a window over the UTC
+/// data, with facts at its edges." Monrovia kept −00:44:30 until 1972 and
+/// Dublin −00:25:21 until 1916; a store in either site zone stores no day
+/// node for such days either (§5.7).
+#[test]
+fn row_21a_named_zone_with_a_historical_offset() {
+    for (zone, year, wall, from, step) in [
+        (
+            "Africa/Monrovia",
+            1970,
+            "1970-06-04T00:00:00Z",
+            "1970-05-31T00:00:00Z",
+            13 * SECOND,
+        ),
+        (
+            "Europe/Dublin",
+            1912,
+            "1912-06-04T00:00:00Z",
+            "1912-05-31T00:00:00Z",
+            11 * SECOND,
+        ),
+    ] {
+        for site in ["UTC", zone] {
+            let (mut m, s) = calendar_model(site, utc(wall), 10 * MINUTE);
+            feed(&mut m, s, &every(utc(from), utc(wall) - DAY, step));
+            let p = m.tree(s).unwrap().params;
+            let rs = oracle::readings(m.current().unwrap(), s);
+            let date = Date::constant(year, 6, 1);
+            let a = m.calendar_in(s, Period::Day(date), zone).unwrap();
+            assert_ne!(floor_to(a.from, QUARTER), a.from, "{zone}");
+            assert!(a.inputs.is_empty());
+            assert_eq!(
+                a.node,
+                oracle::window(&p, &rs, a.from, a.to, m.now),
+                "{zone} in {site}"
+            );
+            // Readings inside the partial minutes at both edges, and only
+            // those inside the span, count.
+            let inside = rs.iter().filter(|(t, _)| a.from <= *t && *t < a.to).count();
+            assert_eq!(a.node.count, u64::try_from(inside).unwrap());
+            let edge = |x: Nanos| {
+                rs.iter()
+                    .any(|(t, _)| *t < x && floor_to(*t, MINUTE) == floor_to(x, MINUTE))
+            };
+            assert!(edge(a.from) && edge(a.to));
+            if site == zone {
+                assert!(!m.calendar_file(s).unwrap().days.contains_key(&date));
+                assert_eq!(m.calendar(s, Period::Day(date)).unwrap(), a);
+            }
+            let month = m
+                .calendar_in(s, Period::Month(Month::of(date)), zone)
+                .unwrap();
+            assert!(month.inputs.is_empty());
+            assert_eq!(
+                month.node,
+                oracle::window(&p, &rs, month.from, month.to, m.now)
+            );
+        }
+    }
+}
+
+/// Row 21a for interval series: "on an interval series, a multiple of 15
+/// minutes but not of d (+05:45 with d = 30 min): an interval crossing a day
+/// edge is apportioned (§6)." With d = 1 min, which the density rule lets
+/// store the 15-minute level, the day edges in +05:45 are multiples of d, so
+/// the stored day node is an input and nothing is apportioned; in Monrovia's
+/// −00:44:30 the same series has its stored quarter-hours in the middle and
+/// apportioned edges.
+#[test]
+fn row_21a_interval_series_in_named_zones() {
+    let now = utc("2026-06-04T00:00:00Z");
+    let define = |m: &mut Model, d: Nanos| {
+        m.define_with(
+            &format!("line-1/meter-{}/energy", d / MINUTE),
+            Kind::Interval,
+            ValueType::Number,
+            "Wh",
+            None,
+            SeriesOptions::interval(d, 0),
+        )
+        .unwrap()
+    };
+    let cfg = Config {
+        site_zone: "Asia/Kathmandu".into(),
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], now);
+    let (s30, s1) = (define(&mut m, 30 * MINUTE), define(&mut m, MINUTE));
+    for (s, d) in [(s30, 30 * MINUTE), (s1, MINUTE)] {
+        let rs: Vec<(Nanos, f64)> =
+            every(utc("2026-05-30T00:00:00Z"), utc("2026-06-03T00:00:00Z"), d)
+                .into_iter()
+                .map(|(t, k)| (t, 1.0 + k % 4.0))
+                .collect();
+        feed(&mut m, s, &rs);
+    }
+    let date = Period::Day(Date::constant(2026, 6, 1));
+    let span = (utc("2026-05-31T18:15:00Z"), utc("2026-06-01T18:15:00Z"));
+    for (s, zone, stored) in [
+        (s30, "Asia/Kathmandu", false),
+        (s30, "Asia/Katmandu", false),
+        (s1, "Asia/Kathmandu", true),
+        (s1, "Asia/Katmandu", true),
+    ] {
+        let p = m.tree(s).unwrap().params;
+        let rs = oracle::readings(m.current().unwrap(), s);
+        let a = m.calendar_in(s, date, zone).unwrap();
+        assert_eq!((a.from, a.to), span);
+        assert_eq!(a.inputs, if stored { vec![span] } else { vec![] }, "{zone}");
+        assert_eq!(a.node.apportioned(), !stored);
+        assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, m.now));
+    }
+    // d = 1 min in a zone off 15-minute boundaries.
+    let cfg = Config {
+        site_zone: "Africa/Monrovia".into(),
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![], utc("1970-06-04T00:00:00Z"));
+    let s = define(&mut m, MINUTE);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("1970-05-31T12:00:00Z"),
+            utc("1970-06-02T12:00:00Z"),
+            MINUTE,
+        ),
+    );
+    let a = m
+        .calendar(s, Period::Day(Date::constant(1970, 6, 1)))
+        .unwrap();
+    assert_eq!(
+        (a.from, a.to),
+        (utc("1970-06-01T00:44:30Z"), utc("1970-06-02T00:44:30Z"))
+    );
+    assert!(a.inputs.is_empty());
+    assert!(a.node.apportioned());
+    let p = m.tree(s).unwrap().params;
+    let rs = oracle::readings(m.current().unwrap(), s);
+    assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, m.now));
 }
