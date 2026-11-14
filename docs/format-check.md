@@ -6,6 +6,15 @@ without guessing anything that ends up on disk? This document lists problems; it
 change `format.md`. Where a problem is already recorded in [`model/OPEN-QUESTIONS.md`](../model/OPEN-QUESTIONS.md)
 (the F-items under "For the format and interface documents", or a Q-item), it is cross-referenced, not restated.
 
+## Outcome at gate 3.3
+Gate 3.3 resolved every blocking item in [`format.md`](format.md), [`spec.md`](spec.md) and [`api.md`](api.md); each
+item below ends with a line saying where it was resolved, or the roadmap item it was deferred to. Q-97, Q-98 and Q-99
+are settled. Of the cross-referenced items: F-1, F-4, F-5, F-7, F-9, F-11, F-13, F-14, F-15 and F-17 are resolved in
+`format.md` A.2 and A.4–A.10; F-16 for the site-zone and tzdata entries (A.6), the calendar file deferred to 7.3;
+F-12's field ids are fixed (A.6), the interface deferred to 5.1; Q-52 (a) and (c) are settled (A.10, A.14), (b)
+deferred to 4.5; Q-76 and Q-48 were settled before the gate; Q-33 stays with 4.5; Q-61, Q-64, Q-70 and Q-71 stay
+with their items.
+
 ## Severity
 - **Blocks:** the document contradicts the specification or lacks a layout or rule that a section 4 item writes to
   disk. To be resolved at gate 3.3, before section 4 starts.
@@ -72,6 +81,7 @@ at that block.
 **Needed:** a rule that a block whose checksums hold and whose type is unknown and not skippable is a version
 refusal, never a torn tail or a lost range; and what `format_minor` means for a writer (whether a writer may append
 to a segment or store whose minor version is newer than its own).
+**Resolved at gate 3.3:** `format.md` common rules (critical and ignorable elements; an unknown critical element is a version refusal) and A.2.
 
 ### FC-2 — Unknown columns, fields and entry types are skipped even when they change meaning
 **Where:** A.3, A.5, A.6 · **Severity:** blocks (4.3) · **Relates to:** F-9, F-13, invariants 8 and 15
@@ -82,6 +92,7 @@ back to position, a replay with a lower `changed_at` becomes current, and duplic
 skipped `versioned` or `timing` field in a definition, or a skipped retirement entry.
 **Needed:** a way for a column, a field and an entry type to say whether it may be ignored (as a block's
 `skippable` does), or a rule that additions which change meaning need a new major version.
+**Resolved at gate 3.3:** `format.md` common rules: id ranges for critical and ignorable columns, entry types and fields; fact flag bits; block types by `skippable`.
 
 ### FC-3 — No store descriptor, creation procedure or directory layout
 **Where:** A.1, A.4 · **Severity:** blocks (4.1, 4.2) · **Relates to:** §5.7, §8 Generations, Q-75 (model), Q-76
@@ -94,6 +105,7 @@ a damaged store from a new one. The locations of the manifest, cursor files, lea
 calendar files and the local restore record are not given, so a reader process cannot find them (§7: "the documented
 layout").
 **Needed:** a store descriptor or an equivalent rule, the creation procedure, and the directory layout.
+**Resolved at gate 3.3:** `format.md` A.12 (layout, `STORE` descriptor of kind 7, creation and open procedure); `spec.md` §5.7 (the descriptor counts as the first site-zone and tzdata entries).
 
 ### FC-4 — File identity and names
 **Where:** A.1, A.4 · **Severity:** before 4.2 · **Relates to:** §7 Manifest, §8 Restore
@@ -104,6 +116,7 @@ file must not take an id one of them holds. On a case-insensitive file system tw
 a reader that matches names exactly misses segments written by another implementation.
 **Needed:** the scope of `file_id` (store, generation), how the next id is found after a restart and after a restore,
 and the exact name grammar.
+**Resolved at gate 3.3:** `format.md` A.12 (`file_id` per store and kind, never reused; next id after a restart and a restore; names).
 
 ### FC-5 — Alignment and what lengths include
 **Where:** A (common rules), A.5, A.6 · **Severity:** before 4.2 · **Relates to:** A.11 golden files and fuzzing
@@ -114,6 +127,7 @@ non-zero padding or reserved bytes are an error, or whether an encoding is canon
 mis-parses the other's fields. A fuzzer finds a block with non-zero padding: accept or reject?
 **Needed:** alignment of each structure as written, the coverage of each length field, and the treatment of non-zero
 padding and reserved bytes.
+**Resolved at gate 3.3:** `format.md` common rules (alignment, what each length covers, reserved fields and padding).
 
 ### FC-6 — Maximum sizes do not fit together
 **Where:** A.2, A.4, A.5, A.6 · **Severity:** before 4.3, 4.4 · **Relates to:** §2.1 (text ≤ 255 bytes, state u16),
@@ -133,6 +147,7 @@ in one facts block; whatever split it chooses becomes part of the golden files, 
 batch fits no segment at all.
 **Needed:** writer limits per block and per entry, a minimum segment size or maximum batch size, and the rule for a
 batch that does not fit.
+**Resolved at gate 3.3:** `format.md` common rules (sizes) and A.4 (segment size range, block and batch closing, call limits); `api.md` Writing (`TooLarge`).
 
 ## A.4 Log segment
 
@@ -152,6 +167,7 @@ block, so they look like the start of an incomplete batch.
   and whether more than one `.open` segment can exist.
 **Needed:** the seal procedure as a crash-safe sequence, recovery's handling of each intermediate state, and the
 segment life cycle across restarts.
+**Resolved at gate 3.3:** `format.md` A.4 (seal procedure, the states recovery may find and the action for each).
 
 ### FC-8 — What "truncate" means for a preallocated segment
 **Where:** A.4, A.10 · **Severity:** blocks (4.5) · **Relates to:** §3 Recovery rules 1 and 3
@@ -163,6 +179,7 @@ new batch can still parse as a complete batch whose sequences follow the new one
 takes back a batch that was never acknowledged.
 **Needed:** whether truncation sets the length or zero-fills, whether the zeroing is synced before new batches are
 written, and whether the segment is preallocated again afterwards.
+**Resolved at gate 3.3:** `format.md` A.4 (truncation is zero-filling, synced before any new batch; accepted limit stated).
 
 ### FC-9 — Redundant fields that may disagree
 **Where:** A.4, A.5, A.6, A.7 · **Severity:** before 4.3 · **Relates to:** §2.2 (`received_at` per batch)
@@ -174,6 +191,7 @@ valid. It is not said whether the batch is incomplete (torn tail or lost range),
 by one of the two.
 **Needed:** which value wins, which disagreements make a batch incomplete, and whether all blocks of a batch must
 carry the same `received_at`.
+**Resolved at gate 3.3:** `format.md` A.5 and A.6 (one `received_at` per batch) and A.7 (which disagreements make a batch incomplete).
 
 ## A.5 Facts block
 
@@ -187,6 +205,7 @@ text offset is relative to; text that is not UTF-8 or longer than 255 bytes; the
 rejects the block, a third reads it as corrupt and records a lost range.
 **Needed:** the mandatory columns and defaults, and for each validation failure whether it is corruption (§3) or a
 format error.
+**Resolved at gate 3.3:** `format.md` A.5 (presence per column, defaults, checks; a failure is an invalid region with cause invalid content).
 
 ### FC-11 — Run-length encoding has no canonical form
 **Where:** A.5 · **Severity:** before 4.3 · **Relates to:** A.11 golden files and fuzz target
@@ -195,6 +214,7 @@ sum to `row_count` are not addressed.
 **Scenario.** A writer emits a zero-length run between two runs of 2 for `row_count` 4. One reader accepts it, the
 A.11 fuzz target reports it, and the golden file fixes whatever the first implementation happened to do.
 **Needed:** which of these are invalid, and whether writers must produce one canonical form.
+**Resolved at gate 3.3:** `format.md` A.5 (canonical run-length form; writers use it exactly when smaller than plain).
 
 ### FC-12 — A segment cannot be decoded without the registry
 **Where:** A.5 · **Severity:** before 4.6 · **Relates to:** §7 Readers, F-9, F-14
@@ -204,6 +224,7 @@ segment or only in the registry file.
 **Scenario.** A reader process opens a sealed segment whose series were defined in a segment that has left hot; it
 can read `i64` values but not their scale.
 **Needed:** what "decoded" promises, or what a segment must carry to honour it.
+**Resolved at gate 3.3:** `format.md` A.5 (what decoding without the registry gives).
 
 ## A.6 Entries block
 
@@ -223,6 +244,7 @@ principle 2, invariant 8
 configured default, or a parameter change alters field 7: is S recomputed? If an absent field means "the default in
 force when read", a configuration change alters derived values of old series, against principle 2 and invariant 8.
 **Needed:** the encoding of every field, and whether defaults are resolved into the entry when it is written.
+**Resolved at gate 3.3:** `format.md` A.6 (encoding of every definition field; defaults resolved when written).
 
 ### FC-14 — Field ids are missing for parameters the specification defines
 **Where:** A.6 · **Severity:** blocks (4.3) for fields of a definition, can wait (5.1) for retention · **Relates to:**
@@ -243,6 +265,7 @@ on change, `wrap_at`, `reset_ceiling`) may change at all, which §2.1 does not f
 **Scenario.** A `day` interval series with a day start of 05:00 cannot be defined: the length tag, zone and day
 start have no ids, so two implementations choose different ones and cannot read each other's segments.
 **Needed:** the ids, and the complete list of fields a parameter change may carry.
+**Resolved at gate 3.3:** `format.md` A.6 (field ids 14–24; the fields a parameter change may carry).
 
 ### FC-15 — Entry types for the site zone and tzdata version are missing
 **Where:** A.6 · **Severity:** blocks (4.3) · **Relates to:** F-16, Q-76, §5.7, §2.1 interval starts
@@ -253,6 +276,7 @@ and that entry also fixes which version places interval starts (§2.1) and displ
 (invariant 8) builds calendar nodes in the old zone. After a host tzdata upgrade, a restart places interval starts
 by the new version while the live engine used the old one.
 **Needed:** the decision on Q-76, and entry types and fields for both.
+**Resolved at gate 3.3:** `format.md` A.6 (types 6 and 7 with encodings), A.12 (the descriptor's site zone and tzdata version); Q-76 was settled before the gate, and Q-93 at it.
 
 ### FC-16 — The routing change entry is defined nowhere
 **Where:** A.6 entry type 5 · **Severity:** can wait (5.2) · **Relates to:** §4 Routing, Q-61, Q-63, Q-78, `api-check.md`
@@ -264,6 +288,7 @@ emits.
 **Scenario.** A route added at run time is committed in a layout another build does not know, so catch-up in that
 build cannot apply it at its position.
 **Needed:** the serialised form of a funnel and of its removal.
+**Deferred at gate 3.3** to roadmap 5.2: entry type 5 stays reserved until funnel identity is settled (Q-61, Q-63, Q-78, Q-91).
 
 ## A.7 Commit block
 
@@ -277,6 +302,7 @@ breaks it.
 **Scenario.** Two implementations compute `batch_bytes` with and without the commit block's 16-byte header; each
 judges every batch of the other incomplete and truncates it.
 **Needed:** the exact byte range and the validation rules across files.
+**Resolved at gate 3.3:** `format.md` A.7 (`batch_bytes` range, `batch_crc32c` over store id, file id, offset and data block headers, completeness rules) and A.2 (resynchronisation).
 
 ## A.8, A.9 Segment index and trailer
 
@@ -288,6 +314,7 @@ at the end of a body" cannot extend a record without breaking older readers.
 **Scenario.** A reader seeks to `index_offset`, parses the body as a block header and fails the header checksum. A
 writer that adds a field to each per-series record shifts every record after the first for an older reader.
 **Needed:** what each offset points at, and how fixed-size records are extended within a major version.
+**Resolved at gate 3.3:** `format.md` A.8 (`record_size`; the rule for every fixed-size record array) and A.9 (offsets point at block headers).
 
 ### FC-19 — The segment index lists no entries
 **Where:** A.8 · **Severity:** before 4.4 · **Relates to:** §4 Routing (catch-up applies the routes in force at each
@@ -298,6 +325,7 @@ a site-zone entry.
 **Scenario.** A consumer catching up skips a segment by its index and misses a route added there; facts in later
 segments are delivered by the old routing table.
 **Needed:** whether, and where, the index records that a segment holds entries.
+**Resolved at gate 3.3:** `format.md` A.8 (`has_entries` flag; when a catching-up reader may skip a segment).
 
 ### FC-20 — When the file checksum is verified, and what a mismatch means
 **Where:** A.9 · **Severity:** before 4.5 · **Relates to:** §8 Corrupt block, row 11
@@ -307,6 +335,7 @@ sealed segment at open reads all of them), or whether a mismatch with valid bloc
 **Scenario.** A sealed segment has one flipped bit in padding, which no block checksum covers but `file_crc32c`
 does; one implementation quarantines the file, another keeps reading it.
 **Needed:** when it is verified and how a mismatch is handled.
+**Resolved at gate 3.3:** `format.md` A.9 (verified by the sealer, before upload or compaction and by the scrub; a mismatch with complete batches is copied, not reported).
 
 ## A.10 Durable mark
 
@@ -319,6 +348,7 @@ accesses to shared memory, which safe Rust cannot express. The specification its
 rejects the build.
 **Needed:** a decision between the specification's mechanism and the project rule; recorded as Q-97, since the
 mechanism is named in §3.
+**Resolved at gate 3.3:** `spec.md` §3 Durable mark and Sync primitive, §7 Readers; `format.md` A.10 (positional I/O, never mapped), A.13; `api.md` seams (no `mmap`). Q-97 settled.
 
 ### FC-22 — The mark on disk has no checksum
 **Where:** A.10 · **Severity:** blocks (4.4) · **Relates to:** §3 Recovery ("a missing, unreadable or half-updated
@@ -331,6 +361,7 @@ the new `file_id` and the old `offset`. After a power loss it is accepted as val
 region between the two as corruption below a valid mark (rule 2) or truncates at the wrong offset. Separately, a
 reader that finds `seq` odd because the writer died in an update has no rule for how long to retry.
 **Needed:** how a torn or damaged mark is detected on disk, and the reader's rule for a mark left odd.
+**Resolved at gate 3.3:** `format.md` A.10 (two checksummed slots with a counter and the store id; reader retry rule); `spec.md` §3 Recovery.
 
 ### FC-23 — The boot identity source per platform
 **Where:** A.10 · **Severity:** before 4.5 · **Relates to:** F-5, F-11, §3 Recovery, §7 Leases, roadmap 2.2
@@ -341,6 +372,7 @@ boot identity, or a virtual machine restored from a snapshot, is supported.
 **Scenario.** On a platform without a boot identifier, the mark is missing after a crash: A.10 says truncate to it,
 which is impossible, while F-5 says treat it as a different boot and keep complete batches.
 **Needed:** the source per platform, the fallback's rules, and the environments in which a boot identity is trusted.
+**Resolved at gate 3.3:** `format.md` A.10 (sources, fallback, trusted environments). **Deferred at gate 3.3** to roadmap 4.1 (the macOS dependency) and 4.5 (a Windows source); the fallback without one is stated.
 
 ### FC-24 — Same boot identity, page cache lost
 **Where:** A.10 · **Severity:** before 4.5 · **Relates to:** §3 Recovery rule 1, design "a crash at any point loses
@@ -351,6 +383,7 @@ unmounted and mounted again (or the disk reattached) without a reboot, so the ma
 `mark_sync_interval`. On restart the boot identity matches; rule 1 truncates batches that were synced and
 acknowledged after the mark's last sync.
 **Needed:** recorded as Q-98 (a specification question).
+**Resolved at gate 3.3:** `spec.md` §3 Recovery rule 1 (two or more complete batches beyond the mark on the same boot mean a stale mark; rule 3 applies; the one-batch limit is stated), invariant 10, `design.md` Requirements; `format.md` A.10. Q-98 settled.
 
 ### FC-25 — Reader processes and files the writer changes
 **Where:** A.4, A.10 · **Severity:** before 4.4 · **Relates to:** §7 Readers, roadmap 4.6
@@ -362,6 +395,7 @@ renaming a file that another process has mapped or opened without delete sharing
 for that failure.
 **Needed:** how readers access log segments, and what the writer does when truncation or rename fails because a
 reader holds the file.
+**Resolved at gate 3.3:** `format.md` A.13 (positional reads, shared handles, `SealBlocked` when a rename or length change fails).
 
 ## Platform rules
 
@@ -375,6 +409,7 @@ sync" holds.
 reaches the medium. The batch is damaged below the mark, which recovery then records as corruption (rule 2), not as
 a torn tail.
 **Needed:** the operation per platform and per object (segment, directory, mark), from the 2.2 measurements.
+**Resolved at gate 3.3:** `format.md` A.13 and `spec.md` §3 Sync primitive (Windows a development platform). **Deferred at gate 3.3** to roadmap 4.4 (Windows name durability) and 4.8 (device cache); neither decides whether Windows is accepted.
 
 ### FC-27 — What preallocation guarantees
 **Where:** A.4 · **Severity:** before 4.4 · **Relates to:** §3 Segments, Disk space, roadmap 2.2
@@ -386,6 +421,7 @@ that has not yet been written can make a data sync also write metadata, which ch
 for lack of space. §3 treats a write failure as fatal (read-only), although the critical mark was meant to make
 ingest wait first.
 **Needed:** the guarantee required of preallocation, and the rule when it cannot be given.
+**Resolved at gate 3.3:** `format.md` A.4 Creation (physical zeros; copy-on-write accepted; no space at creation waits, at a batch write it is a write failure); `spec.md` §3 Segments. The rest of Q-86 (b) is deferred to roadmap 4.5.
 
 ### FC-28 — The single-writer lock
 **Where:** A.4, layout · **Severity:** before 4.1 · **Relates to:** §3 Single writer, Q-99
@@ -395,6 +431,7 @@ stated.
 **Scenario.** On Windows the writer cannot take a `flock`; two writer processes open the same store and both append
 to the log.
 **Needed:** recorded as Q-99; the format then needs the lock file's name if one is used.
+**Resolved at gate 3.3:** `spec.md` §3 Single writer; `format.md` A.12 (`LOCK` and `File::try_lock`; network file systems not supported); `api.md` Handles. **Deferred at gate 3.3** to roadmap 4.1: verify the same-process refusal on all three platforms. Q-99 settled.
 
 ## B. Part B and section 4
 
@@ -409,6 +446,7 @@ the reader (4.6) reads an epoch from the manifest and writes a lease file (§7),
 record to the manifest, whose layout is not due until 6.3.
 **Needed:** before 4.5, the manifest's framing and lost-range record and the part of the cursor file recovery reads;
 before 4.6, the epoch and the lease file.
+**Resolved at gate 3.3:** the parts section 4 needs are now Part A: `format.md` A.14 (manifest framing, lost-range and acknowledgement records) and A.15 (cursor position, lease file).
 
 ### FC-30 — Manifest framing
 **Where:** B (manifest) · **Severity:** blocks (4.5) · **Relates to:** Q-52, Q-46 (objection), F-7, F-11, F-15, §8
@@ -421,6 +459,7 @@ plaintext and per-upload ciphertext SHA-256 (§8 Hashes); keying by generation.
 **Scenario.** After a power loss the last manifest record fails its checksum. If it is a torn tail it can be
 dropped; if it is a corrupt record that published files, dropping it changes which files are live (Q-52).
 **Needed:** Q-52's decision and the record framing; the record types can follow their items.
+**Resolved at gate 3.3:** `format.md` A.14 (records are blocks; every record takes a strictly higher epoch; record types and the lost-range fields). **Deferred at gate 3.3** to roadmap 6.3, 8.1 and 8.3: the publish, sealed-segment, tier, quarantine and restore records; to 4.5: fields for Q-33.
 
 ### FC-31 — Cursor file
 **Where:** B (cursor) · **Severity:** before 4.5 (position only), can wait (5.2) for the rest · **Relates to:** §4
@@ -433,6 +472,7 @@ Recovery must find the old cursor or the new one; on Windows the rename can fail
 (FC-25).
 **Needed:** the layout; for 4.5, at least how the last confirmed position is read and how an unreadable file is
 recognised.
+**Resolved at gate 3.3** (position part): `format.md` A.15 (appended blocks; the last valid block is the state; unreadable named in the recovery entry). **Deferred at gate 3.3** to roadmap 5.2: latches, the confirmed reset point and timer sequences (Q-61).
 
 ### FC-32 — File kinds missing from A.1
 **Where:** A.1, B · **Severity:** can wait (lease: blocks 4.6, FC-29) · **Relates to:** F-5, F-7, F-9, F-16, F-17,
@@ -445,6 +485,7 @@ deep tier's generation claim marker; the store descriptor (FC-3).
 **Scenario.** Item 4.6 writes a lease file. With no kind for it, the first implementation invents one that every
 later version must keep reading.
 **Needed:** a kind and layout for each, before the item that writes it.
+**Resolved at gate 3.3:** `format.md` A.1 kinds 7 (store descriptor) and 8 (lease), laid out in A.12 and A.15. **Deferred at gate 3.3**: kinds 9–14 are reserved and laid out by roadmap 7.1 and 7.3 (calendar, indexes, checkpoint bundle, chunk index) and 8.3 (local restore record); the claim marker by 8.2.
 
 ### FC-33 — Objects in the deep tier
 **Where:** none (not in `format.md`) · **Severity:** can wait (8.2) · **Relates to:** §8 Encryption, Hashes,
@@ -455,6 +496,7 @@ are specified nowhere. A restore by another build must be able to read them.
 **Scenario.** A store is restored from its bucket by a newer build, which must decrypt objects whose envelope was
 never written down.
 **Needed:** an object layout section before 8.2.
+**Deferred at gate 3.3** to roadmap 8.2 and 8.3 (needs the sink).
 
 ### FC-34 — Tree and calendar node layout
 **Where:** B (tree) · **Severity:** can wait (7.1) · **Relates to:** §5.2, §5.6 (bitwise reproducible nodes), Q-60
@@ -464,6 +506,7 @@ entries, the node version, the `summary_stale` flag and the checkpoint position.
 **Scenario.** Two builds serialise a node's `i128` sum differently and produce different tree files from the same
 facts; rebuild-equals-live compares them byte for byte.
 **Needed:** the layout before 7.1.
+**Deferred at gate 3.3** to roadmap 7.1 and 7.3 (needs the tree).
 
 ### FC-35 — The compacted segment depends on 2.1, and Parquet has no A.1 header
 **Where:** B (compacted segment) · **Severity:** can wait (6.1) · **Relates to:** roadmap 2.1, 10.2, §7, §8 Hashes
@@ -474,3 +517,4 @@ summaries and the chunk index must be described for Parquet files too.
 **Scenario.** Item 2.1 finds that the own format does not clearly beat Parquet. Compacted files become Parquet, and
 the store id check at open (A.1) has no header to read.
 **Needed:** after 2.1, either the kind 2 layout or the rules for Parquet files in place of A.1.
+**Deferred at gate 3.3** to roadmap 6.1. Roadmap 2.1 kept the own format, so A.1 applies to every stored file and Parquet is export only; the decided encodings are recorded in `format.md` Part B.

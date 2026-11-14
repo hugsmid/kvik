@@ -6,6 +6,12 @@ anything a caller depends on? This document lists problems; it proposes no signa
 Problems already recorded in [`model/OPEN-QUESTIONS.md`](../model/OPEN-QUESTIONS.md) (F-items and Q-items) are
 cross-referenced, not restated. Format problems are in [`format-check.md`](format-check.md) (FC-n).
 
+## Outcome at gate 3.3
+Gate 3.3 resolved every blocking item in [`api.md`](api.md); each item below ends with a line saying where it was
+resolved, or the roadmap item it was deferred to. Of the cross-referenced items: F-2, F-6 and F-11 are resolved in
+`api.md` (Errors, Writing, Reader processes, Configuration, Health); Q-34 (c), Q-47 and Q-48 were settled before the
+gate (crash recovery); Q-46 stays with 4.5 and 4.6; the rest stay with the items named in the table below.
+
 ## Severity
 - **Blocks:** the document contradicts the specification, or a type or rule needed by a section 4 item is absent.
   To be resolved at gate 3.3, before section 4 starts.
@@ -54,6 +60,7 @@ Periodic work has no stated owner: the mark sync (1 s), cursor writes (1 s), tre
 and every consumer stalls for the length of the sync.
 **Needed:** which runtime the engine targets (and whether its crates appear in the public interface), whether a
 dedicated writer thread is allowed, and how the caller provides and stops each periodic task.
+**Resolved at gate 3.3:** `api.md` Principles and Threads (engine-owned named threads `kvik-writer`, `kvik-maint`, `kvik-deliver`; runtime-neutral futures; no async runtime).
 
 ### AC-2 — The environment seams cannot be implemented as sketched
 **Where:** Environment seams · **Severity:** blocks (4.1) · **Relates to:** §4 Timers (monotonic clock), §2.5 clock
@@ -74,6 +81,7 @@ synchronisation, §2.1 and §5.7 (tzdata version in force), FC-21, FC-28
 mark written through a mapping, the seam never sees those writes.
 **Needed:** complete trait definitions, a monotonic time type tests can control, and seams for tzdata and
 randomness.
+**Resolved at gate 3.3:** `api.md` Environment seams (`Fs` without mapping, `FsFile`, `Monotonic`, `TzSource` giving one release at a time, `Entropy`).
 
 ### AC-3 — Core value types are undefined
 **Where:** throughout · **Severity:** blocks (4.1, 4.3) · **Relates to:** §2.1, §2.2, §6 Windows (offsets of either
@@ -87,6 +95,7 @@ value" (§2.5).
 its lower offset is negative and `Duration` is unsigned.
 **Needed:** the definitions, and whether a time library's types appear in the public interface (a semver
 commitment).
+**Resolved at gate 3.3:** `api.md` Core types. Whether an `f64` sent to a decimal series is refused or rounded awaits the owner.
 
 ### AC-4 — The error and refusal types are not listed
 **Where:** Principles ("errors are typed"), Writing · **Severity:** blocks (4.1) · **Relates to:** F-2, F-6, F-10,
@@ -102,6 +111,7 @@ proposal).
 **Scenario.** An adapter submits a 300-byte text reading. With no variant for it, the engine reuses another refusal,
 and the per-series counter (principle 5) cannot say why.
 **Needed:** the error and refusal enumerations, and which are per reading and which per call.
+**Resolved at gate 3.3:** `api.md` Errors (refusal, wait and fault kept apart; `OutcomeUnknown`).
 
 ### AC-5 — Handles, lifetimes, shutdown and drop
 **Where:** Principles, Opening · **Severity:** before 4.1 · **Relates to:** §3 Single writer, Write or sync failure
@@ -114,6 +124,7 @@ the lock; whether a second `Store::open` in the same process is refused.
 stated result. If the application drops the store instead, it is not said whether the mark is synced or the lock
 released.
 **Needed:** ownership and life-cycle rules for each handle.
+**Resolved at gate 3.3:** `api.md` Handles and life cycle.
 
 ### AC-6 — Create versus open, and the site zone at open
 **Where:** Opening · **Severity:** before 4.1 · **Relates to:** §5.7, Q-75 (model), F-16, FC-3, §8 Restore
@@ -125,6 +136,7 @@ restore (§8: a restart resumes it).
 **Scenario.** An operator restarts a store with `time_zone` set to another zone. The model refuses to open; an
 implementation following `api.md` alone might record a site-zone change effective now.
 **Needed:** the creation path and the meaning of `time_zone` at each open.
+**Resolved at gate 3.3:** `api.md` Opening (`create_if_missing`, the site zone at creation and at later opens, `set_site_zone`); `format.md` A.12.
 
 ### AC-7 — Configuration keys are not enumerated
 **Where:** Opening (`LogConfig`, `Limits`, `TierConfig`) · **Severity:** before 4.1 (log keys), can wait (others) ·
@@ -138,6 +150,7 @@ for a store.
 **Scenario.** Item 4.1 defines the configuration types. Without the list, `mark_sync_interval` and linger get names
 and units chosen ad hoc that every later item must keep.
 **Needed:** a table from each default to its key and type.
+**Resolved at gate 3.3:** `api.md` Configuration (the keys section 4 needs, with `log.min_sync_interval` and `log.mark_sync`); later keys are listed by their items.
 
 ## Writing
 
@@ -151,6 +164,7 @@ readings are not reported per reading.
 **Scenario.** An adapter submits five readings; the second is a duplicate and the fourth is refused. `first..last`
 spans three positions and nothing maps them to indices 0, 2 and 4.
 **Needed:** a per-reading outcome, or a stated reason why the specification's per-reading outcome is not offered.
+**Resolved at gate 3.3:** `api.md` Writing (`Ack.outcomes`, one `Outcome` per reading).
 
 ### AC-9 — What `try_emit` returns, and when outcomes are known
 **Where:** Writing · **Severity:** before 4.4 · **Relates to:** §4 Concurrency, F-2, §2.1 retirement
@@ -160,6 +174,7 @@ handle to await one.
 **Scenario.** A consumer emits derived readings with `try_emit` from its delivery loop, as §4 requires; one is
 refused at commit because its series was retired meanwhile, and the consumer cannot learn it except from statistics.
 **Needed:** what `try_emit` returns, and how its caller learns each reading's outcome.
+**Resolved at gate 3.3:** `api.md` Writing (`try_emit` returns `Pending`; outcomes decided at commit; when `emit` resolves).
 
 ### AC-10 — Back-pressure, cancellation and batch boundaries
 **Where:** Writing · **Severity:** blocks (4.4) · **Relates to:** §3 Back-pressure, Disk space (critical mark), §2.5
@@ -178,6 +193,7 @@ refused at commit because its series was retired meanwhile, and the consumer can
 and are acknowledged to no one. The adapter replays them; the duplicate rule absorbs the repeat only if the check can
 run (§2.4), and on a series that is not versioned an unchecked replay can revert a correction.
 **Needed:** back-pressure signalling, cancellation semantics and the relation between a call and a batch.
+**Resolved at gate 3.3:** `api.md` Writing (one call is one batch unit; call limits; back-pressure as a wait with its reason; cancellation).
 
 ## Reading and reader processes
 
@@ -194,6 +210,7 @@ in-process reader is obtained from the store; and Q-46's truncated-tail check.
 checkpoint. An exact answer needs an hour of log replayed; nothing says whether the reader does that or returns an
 older value.
 **Needed:** the reader's life cycle, its lease handling and what each read call costs in a reader process.
+**Resolved at gate 3.3:** `api.md` Reader processes (`ReaderConfig`, blocking open, `refresh`, lease renewal without a background task). **Deferred at gate 3.3** to roadmap 4.5 and 4.6: the check of a kept position (Q-46); to 5.4 and 7.1: `live` and windows in a reader process.
 
 ### AC-12 — Read calls are synchronous but may fetch, and some results are unbounded
 **Where:** Reading · **Severity:** before 4.6 (`facts`), can wait (others) · **Relates to:** §8 Restore step 2 and
@@ -204,6 +221,7 @@ any range, which can hold billions of rows.
 **Scenario.** A chart server calls `reader.facts(id, a_year, View::History)` from an asynchronous handler; the call
 blocks the runtime on a network fetch and then tries to hold a year of per-second rows in memory.
 **Needed:** which calls are asynchronous, and a bounded or streaming result for `facts`.
+**Resolved at gate 3.3:** `api.md` Reading (`facts` returns a streaming iterator; read calls are blocking). **Deferred at gate 3.3** to roadmap 8.2: whether `facts` fetches detail that is not local.
 
 ### AC-13 — Health and statistics types
 **Where:** Health and statistics · **Severity:** before 4.5 (loss reports), can wait (others) · **Relates to:** §11
@@ -217,6 +235,7 @@ per-consumer statistic fields; whether a reader process can see health.
 **Scenario.** After a reboot, recovery truncates a torn tail. The application polls `health()` and needs the byte
 count and readable commit blocks of `possible_loss`, which have no field.
 **Needed:** the types; loss reports first, since 4.5 produces them.
+**Resolved at gate 3.3:** `api.md` Health and statistics (`Health`, `Reason`, `LossReport`, `Stats`, `series_stats`); Q-34 (c) was settled before the gate.
 
 ### AC-14 — Views and ranges
 **Where:** Reading (`View`) · **Severity:** before 4.6 · **Relates to:** §2.3 Views, §11 Query ("as-of P or T"), F-10
@@ -225,6 +244,7 @@ range type of `facts` and `buckets` (half-open? inclusive?) is not given. Histor
 **Scenario.** An auditor asks what a series looked like at 09:00 yesterday. §2.3 defines as-of time T, but `View`
 offers only a position.
 **Needed:** the complete `View` and the range convention.
+**Resolved at gate 3.3:** `api.md` Reading (`View` with `AsOfTime`; half-open event-time ranges).
 
 ## Series
 
@@ -238,6 +258,7 @@ series or match a name pattern (needed by `Select::Names`). `SeriesInfo` has two
 **Scenario.** An adapter restarts with a new expected interval in its `SeriesSpec`. The call may return the old id
 silently (the new interval never applies), fail, or append a parameter change with an unstated effective time.
 **Needed:** the rules and the missing calls and types.
+**Deferred at gate 3.3** to roadmap 5.1 (series registry); the field ids are fixed in `format.md` A.6.
 
 ### AC-16 — Interval series calls
 **Where:** Series, Reading (`interval`) · **Severity:** can wait (5.4) · **Relates to:** §2.1, §5.4 displaced
@@ -249,6 +270,7 @@ the interval end (F-14, F-17).
 **Scenario.** A chart calls `interval(id, t)` for the `t` of a reading displaced by a tzdata change; that `t` is
 neither an interval start under the version in force nor without a reading.
 **Needed:** results and errors for each case.
+**Deferred at gate 3.3** to roadmap 5.1; `IntervalLength::Calendar.zone` is a `ZoneName` now.
 
 ## Windows and calendar results
 
@@ -263,6 +285,7 @@ flag) has no type; coverage needs seconds and a fraction. The bucket type of `bu
 **Scenario.** A decimal energy series sums whole days exactly in `i128`. Returned as `f64`, a year's sum loses the
 exactness §5.7 promises.
 **Needed:** the result types.
+**Deferred at gate 3.3** to roadmap 5.4 and 7.1 (live state and tree checkpoints).
 
 ### AC-18 — `calendar` and `calendar_in`
 **Where:** Reading · **Severity:** can wait (7.3) · **Relates to:** §5.7, §6 Windows, F-16, Q-75, Q-81
@@ -271,6 +294,7 @@ zone is unknown are not given. Calendar windows (since local midnight, this mont
 `Window` constructor (F-16). Which days `calendar` returns around a site-zone change is Q-75.
 **Scenario.** A report asks for March in a named zone. `calendar_in` takes a date, so it cannot ask for a month.
 **Needed:** the signatures and errors.
+**Deferred at gate 3.3** to roadmap 7.3 (calendar).
 
 ## Consumers
 
@@ -284,6 +308,7 @@ delivery does to the cursor, which is a position.
 **Scenario.** A supervisor restarts a crashed consumer while the old handle is still being dropped. Two handles for
 one name confirm different positions into one cursor file.
 **Needed:** the life cycle and the confirmation rules.
+**Deferred at gate 3.3** to roadmap 5.2 (needs funnel identity, Q-61, Q-63, Q-78, Q-91).
 
 ### AC-20 — Funnels and routes
 **Where:** Consuming (`route`) · **Severity:** can wait (5.2) · **Relates to:** §4 Funnel and Routing, Q-61, Q-63,
@@ -302,6 +327,7 @@ Q-78, F-13, F-14, FC-16
 **Scenario.** An application calls `route` at every start. After a hundred restarts the log holds a hundred routing
 entries for one funnel, and nothing says whether they are one funnel or a hundred.
 **Needed:** funnel identity, removal, persistence across restarts and the serialised form.
+**Deferred at gate 3.3** to roadmap 5.2 (needs funnel identity, Q-61, Q-63, Q-78, Q-91).
 
 ### AC-21 — Delivery types
 **Where:** Consuming (`DeliveryKind`) · **Severity:** can wait (5.2, 5.3) · **Relates to:** §4, §8 Restore step 2,
@@ -313,6 +339,7 @@ given.
 **Scenario.** A restore completes and every consumer must receive `generation_changed` (§8 Restore step 2), which
 `DeliveryKind` cannot represent.
 **Needed:** the delivery types.
+**Deferred at gate 3.3** to roadmap 5.2 (needs funnel identity, Q-61, Q-63, Q-78, Q-91).
 
 ### AC-22 — What `Resync` carries
 **Where:** Consuming · **Severity:** can wait (5.3; Q-47 settled by 4.5) · **Relates to:** §4 Resync, §3 Recovery rule
@@ -325,6 +352,7 @@ it receives a `Resync` (recovery, lost range, generation change, cursor behind t
 **Scenario.** A funnel selects `plant/*/power`, matching 20,000 series. After a recovery its `Resync` must carry the
 live state of each, in one delivery or many; neither the consumer queue (4,096) nor the delivery size bounds it.
 **Needed:** the `Resync` type and its size bound.
+**Resolved at gate 3.3:** `api.md` Consuming (`ResyncPart` with its cause, `forget_above`, parts and one `FunnelState` per funnel and series; `GenerationChanged`). **Deferred at gate 3.3** to roadmap 5.3: the remaining details.
 
 ## Backup, restore and export
 
@@ -339,6 +367,7 @@ and the key type of `Encryption::Key` are not defined, nor key rotation.
 **Scenario.** After a few years the bucket holds millions of objects. `list` returns every key under a prefix in one
 `Vec`, and a restore holds them all in memory.
 **Needed:** the trait's final shape.
+**Deferred at gate 3.3** to roadmap 8.2 (needs the sink); the stable-shapes and runtime-neutral principles apply.
 
 ### AC-24 — Restore, rebuild and export calls
 **Where:** Backup and restore · **Severity:** can wait (8.3) · **Relates to:** §8 Restore, Re-ingest, §11 Ingest
@@ -351,6 +380,7 @@ omits; the re-ingest entry point (F-8); whether `rebuild` runs while the store s
 **Scenario.** An operator restores onto an empty disk. `Store::restore` returns the restored end; the application
 must then open a directory part-way through a restore, which AC-6 leaves undefined.
 **Needed:** the restore life cycle and the export calls.
+**Deferred at gate 3.3** to roadmap 8.2 and 8.3.
 
 ### AC-25 — `attach_backup` and the mirror path
 **Where:** Backup and restore · **Severity:** can wait (8.1) · **Relates to:** §8 Continuous backup, Corrupt block
@@ -361,3 +391,4 @@ attaches, have no stated fate (queued for later? health degraded as for a stalle
 **Scenario.** An application opens the store and attaches the backup sink an hour later; segments sealed in that
 hour have no stated upload.
 **Needed:** what happens to sealed files while no sink is attached.
+**Deferred at gate 3.3** to roadmap 8.2 and 8.3.

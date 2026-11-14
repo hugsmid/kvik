@@ -12,24 +12,20 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
 | Q-44 (b) and (c) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series |
 | Q-46 | §7 Readers, §4 Resync (`start: position`), §8 Restore, row 7b | Checking a kept position against a later truncation or restore |
-| Q-52 | §7 Manifest, §8 Corrupt block, `format.md` A.10 | Rebuilding a corrupt manifest record that was never uploaded; a mark without a checksum |
+| Q-52 (b) | §7 Manifest, §3 Order of a start step 4 | Whether writing the last manifest record again in place makes the next sync write it |
 | Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
 | Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
-| Q-86 | §3 Write or sync failure, Disk space, Segments; `format.md` A.4 | No space when a log segment is created, or at a log write before any sync |
-| Q-87 | §3 Recovery rules 1 and 3, Order of a start, steps 3 and 6, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
+| Q-86 (b) | §3 Write or sync failure, Disk space | No space at a log write before any sync, checked on a file system that tracks pages |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
 | Q-90 | §8 Restore step 1, §8 Acknowledging a loss, §11 Health | Whether a restore record's set-aside report holds health degraded |
 | Q-91 | §4 Funnel, Routing, §6 Latch, `api.md` Consuming, row 16 | Funnel identity across configuration, run-time routes and restarts |
 | Q-92 | §2.4 revised-key index, §8 Restore step 2, invariant 8, principle 2 | The "incomplete" mark on a revised-key index entry |
-| Q-93 | §5.7 tzdata version in force, §7 Readers, §8 Restore drill | A store nobody can open after the host's tzdata changes, and a release name standing for its rules (for the owner) |
+| Q-93 (b) and (c) | §5.7 tzdata version in force, §7 Readers | A release name standing for its rules; a writer that cannot write, and values other than calendar results in a reader of another release |
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
-| Q-97 | §3 Durable mark, `format.md` A.10, `CONTRIBUTING.md` | A memory-mapped mark in a project that forbids unsafe code |
-| Q-98 | §3 Recovery rule 1, invariant 10 | Same boot identity after the page cache was lost |
-| Q-99 | §3 Single writer | An exclusive `flock` on the store directory on Windows |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -166,23 +162,17 @@ the stamp in a lost range, void above the position before it; (d) otherwise unkn
 one lower bound; that is not defeated by a stamp reset at restore; and that answers void or unknown when an entry
 named by the mark has been lost. Then the reader call, `start: position` (with what it forgets) and row 7b's rule,
 and whether the mark and the recovery entry carry a reset stamp and nonce. Only `format.md` A.6 field 41 is reserved
-for the entry; A.10's 64 bytes are full, so a stamp in the mark needs a larger mark and a version bump.
+for the entry; the mark (A.10, version 3) has 40 reserved bytes, so a stamp fits there without a new version.
 
-## Q-52 — Rebuilding a corrupt manifest record that was never uploaded; a mark without a checksum
-**Scenario.** Telling a torn manifest tail from a corrupt record, and the single-copy wording, are settled (§7
-Manifest, §8 Corrupt block, invariant 10; see Settled): a corrupt record is fetched from deep or the mirror path,
-and with no copy the store opens read-only with fatal health (`manifest_corrupt`), keeping every file the record
-described, so no fact is lost. A record corrupted before upload, with no mirror path, therefore stops the writer for
-good although the files it described are still local.
+## Q-52 (b) — Whether writing the last manifest record again in place makes the next sync write it
+**Scenario.** Parts (a) and (c) are settled at gate 3.3 (see Settled). §7 Manifest writes the last valid record's
+identical bytes again in place at every start, so that a record kept from the page cache after a failed sync is on
+disk before a successor is appended. Whether the next sync then writes those bytes, on each platform, was not
+measured by the roadmap 2.2 spike.
 **Model.** Not modelled; manifest records are not corrupted.
-**Needed.** (a) A way to rebuild such a record from the files it described; this needs Part B of `format.md` to make
-a compacted file name its inputs. (b) To check on each platform with roadmap 4.8: that writing the last valid record's
-identical bytes again in place at every start (§7 Manifest) makes the next sync write them on each platform; if not,
-the fallback is to rewrite the manifest to a new file and rename it. (c) The mark (`format.md` A.10) has no
-checksum: a reader accepts its fields when `seq` is even and unchanged, so damaged bytes with an even `seq` are read
-as a valid mark with a wrong boot id, offset or last position, where §3 Recovery treats an unreadable mark as a
-different boot. Whether the mark needs a checksum (it then becomes "unreadable" when damaged) is open.
-
+**Needed.** A check, with the page-tracking fault file system and on each platform, that the rewrite reaches the
+disk; if it does not, the fallback is to rewrite the manifest to a new file and rename it. To be settled on each
+platform with roadmap 4.8.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -241,7 +231,7 @@ does not apply, and No deletion says nothing of it.
 **Needed.** Whether such a loss is handled as Corrupt block with deep as the failed tier (compacted again from other
 files that hold its positions, the rest a lost range reported as `data_lost`), and how it is reported.
 
-## Q-86 — No space when a log segment is created, or at a log write before any sync
+## Q-86 (b) — No space at a log write before any sync
 Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
 **Scenario.** (a) Free space is above the critical mark at the last check; another process then fills the file
 system, and creating the next preallocated segment (§3 Segments) fails with `ENOSPC`, leaving a partial `.open`
@@ -259,6 +249,9 @@ retried when a free-space check passes. (b) stays fatal, as now: on a copy-on-wr
 as well surface at the sync, where the batch's fate is unknown, and the critical mark makes either rare. Recovery
 deletes an `.open` segment that holds no complete batch and is shorter than the preallocation or has an invalid
 header.
+**Settled at gate 3.3.** (a) as proposed: `spec.md` §3 Segments, `format.md` A.4 Creation and the states recovery
+may find. (b) stays a write failure (`spec.md` §3 Segments); what remains is to confirm with the page-tracking fault
+file system of roadmap 4.5 that no acknowledged byte or dirty page is lost.
 
 ## Q-87 — A mark lost on the same boot after a failed sync
 Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.5.
@@ -335,18 +328,19 @@ restore (see "Revised-key index outside a restore" in the table below).
 **Needed.** Whether the mark is derived state excepted from invariant 8 (and stated as such), and what completes an
 entry outside a restore and for detail left in deep.
 
-## Q-93 — A store nobody can open after the host's tzdata changes, and a release name standing for its rules
-**Scenario.** (a) Since Q-76 only a writer that can write adopts the host's release, by writing a tzdata entry at
-open; a reader process or a restore drill whose release is not the version in force is refused with
-`tzdata_mismatch`, and so is a writer that cannot write. After a host update, a store whose writer is read-only
-(after a failed sync, §3) or stopped cannot be opened by any process, not even to read or export, until the old
-release is installed again: an operator sees a store that will not open because of an unrelated system update.
+## Q-93 (b) and (c) — A release name standing for its rules; what else a reader of another release computes
+**Scenario.** Part (a) is settled at gate 3.3 by the owner (see Settled): readers never refuse a tzdata release, a
+reader computes calendar results with its own release from the UTC data, using a stored calendar node only where its
+recorded release is the reader's, and the writer adopts a new host release without a restart. What remains:
 (b) The version is a release name: a patched or partial build under the same name, or a vendor's build with other
 rules, is trusted as the release the log names, so the derived values of two hosts with the same name can differ.
+(c) The ruling covers readers and calendar results. Not said: which rules a writer that cannot write (read-only after
+a failed sync, §3) uses for its reads, and how a reader of another release gives the other values that depend on
+tzdata (interval starts and displaced readings of calendar-length series, §2.1, §5.4).
 **Model.** The model holds several releases and refuses nothing (see "Adopting a tzdata release" in the table below).
-**Needed (for the owner).** Whether a reader or a writer that cannot write may open with another release (and with
-which rules derived values are then reported), and whether the version must identify the rules (a fingerprint of the
-zones used) rather than the release name.
+**Needed.** (b) Whether the version must identify the rules (a fingerprint of the zones used) rather than the
+release name. (c) Whether a read-only writer reads as a reader does, and whether interval starts in a reader follow
+the version in force (named by the log) or the reader's own release.
 
 ## Q-94 — Compaction in position order when the next segment is not local or is quarantined
 **Scenario.** Since Q-71 compaction takes sealed log segments in position order, and a segment at or below the last
@@ -389,41 +383,6 @@ middle is not examined. One `resync` delivery carries the state of every funnel 
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
 
-## Q-97 — A memory-mapped mark in a project that forbids unsafe code
-**Scenario.** §3 requires a memory-mapped mark file with a sequence lock, read by reader processes; `format.md` A.10
-and `api.md` (`Fs::mmap`) follow it. Every crate of the project forbids unsafe code (`Cargo.toml`,
-`CONTRIBUTING.md`). Mapping a file into memory in Rust needs unsafe code, and reading a sequence lock that another
-process updates through a shared mapping needs atomic accesses to shared memory, which safe Rust cannot express. Writes
-through a mapping are also invisible to the file-system seam, so the tests of roadmap 4.5 cannot drop them at a
-simulated power loss.
-**Model.** Not modelled; the model has no files.
-**Needed.** Whether the mark must be memory-mapped (and the unsafe rule relaxed for it, in one audited place), or §3
-names only what the mark holds and when it is written and read, leaving the mechanism to `format.md`. Found by the
-format check (`docs/format-check.md` FC-21). Settle by gate 3.3, before 4.4.
-
-## Q-98 — Same boot identity after the page cache was lost
-**Scenario.** The store is on a removable or separately mounted disk. Batches are synced and acknowledged; the mark in
-memory covers them, but its last timed sync (§3, `mark_sync_interval`) was up to a second earlier. The process
-crashes, and the file system is unmounted and mounted again, or the disk detached and reattached, without a reboot.
-The page cache for the mark is gone and the mark on disk lags. On restart the boot identity matches the mark's, so
-rule 1 truncates everything after the stale mark, including batches that were synced and acknowledged. Invariant 10
-names no such loss, and the design requires that a crash loses nothing acknowledged.
-**Model.** Not modelled; the model's mark is exact on the same boot.
-**Needed.** Whether rule 1 may trust the boot identity alone (stating that the store's file system must stay mounted
-for the life of a boot), or needs a second identity that changes when the file system is mounted again, or keeps
-complete batches after the mark on the same boot as rule 3 does. Found by the format check (`docs/format-check.md`
-FC-24). Settle by 4.5.
-
-## Q-99 — An exclusive `flock` on the store directory on Windows
-**Scenario.** §3 Single writer requires "exclusive `flock` on the store directory; readers never take it". Roadmap
-items must pass on Windows, which has no `flock`; a lock there is taken on a file handle, and a directory is not opened
-as an ordinary file. The behaviour of such locks on network file systems is not stated either, nor whether a second
-open in the same process is refused.
-**Model.** Not modelled.
-**Needed.** Whether §3 names the mechanism or only the rule (one writer per store directory, enforced by an operating
-system lock released when the process ends; readers never take it), and whether network file systems are supported.
-Found by the format check (`docs/format-check.md` FC-28). Settle by 4.1.
-
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -431,7 +390,8 @@ by the roadmap item named here, before that item is done. Until then the model's
 one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/format.md` or calls to `docs/api.md`
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
-changes to both documents (see Settled).
+changes to both documents (see Settled). Q-87 and Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at
+gate 3.3.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -440,28 +400,27 @@ changes to both documents (see Settled).
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
 | Q-46 | 4.5 | With 4.6 (second-process reader): the check of a kept position, `start: position` and row 7b |
-| Q-52 | 3.1 | Rebuilding a corrupt record never uploaded needs Part B (a compacted file names its inputs); the in-place rewrite is checked on each platform with roadmap 4.8; whether the mark needs a checksum |
+| Q-52 (b) | 4.8 | The in-place rewrite, checked on each platform |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
-| Q-86 | 4.5 | Injected sync errors and full disk |
-| Q-87 | 4.5 | Recovery |
+| Q-86 (b) | 4.5 | Injected sync errors and full disk |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
 | Q-92 | 6.2 | Revised-key index; recorded after the tag, from the review of the Q-72 ruling |
-| Q-93 | 3.1 | For the owner, with the tzdata entry kind; recorded after the tag, from the review of the Q-76 ruling |
+| Q-93 (b) and (c) | 7.3 | Calendar; (a) settled at gate 3.3 by the owner |
 | Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 
-Not a question: the figures behind §3 Sync primitive, and the cost of the reader's identity check of the mark (§7
-Readers), are measured by roadmap 4.8 (the 2.2 spike measured sync costs on macOS only).
+Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
+on macOS only).
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
-`docs/api.md`:
+`docs/api.md`. Gate 3.3 resolved or deferred each of them; `docs/format-check.md` and `docs/api-check.md` say where.
 - **F-1.** `format.md` A.5: the fact row has one `quality` column, and a `no_value` row is forced to quality bad.
   Duplicate identity (§2.4) compares the adapter-supplied quality, which §2.2 keeps with the fact. Without it, the
   duplicate check and the revised-key index cannot be rebuilt from the log (invariants 8, 15).
@@ -624,6 +583,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-49 (b) | Conditions and live state with no local detail during a restore | §6 Conditions (the state is unknown, not false: the evaluation is skipped and counted, `evaluations_unknown`, the condition keeps its latched state, and the first evaluation with detail is delivered as a transition if it differs from the latched state, or there is none), §2.3 Live state (unknown, not none, for a series whose latest recorded `t` no local fact or stored node holds), §4 Resync and §6 Restart and resume (`resync` reports "unknown" for that funnel, no transition), §8 Restore step 2, invariant 16, §11 Health, `api.md` Consuming, Reading and statistics (`ConditionState::Unknown`, `Live::Unknown`) (open part: Q-84, a state that stays unknown) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
 | Q-52 | Manifest records as single copies, in part | §7 Manifest (a record appended only after the previous record's sync; the last valid record written again in place at every start; a torn tail, dropped, told from a corrupt record by a valid successor; the last record neither uploaded nor acted on irreversibly until a later record is synced; a corrupt record fetched from deep or the mirror path, else read-only with `manifest_corrupt` and no fact lost), §8 Corrupt block (a manifest record not yet uploaded is a single copy; `mirror_path` covers the manifest), invariant 10, `format.md` Part B (open part: Q-52, rebuilding a corrupt record never uploaded, and checking the in-place rewrite on each platform) |
+| Q-52 (a), (c) | Rebuilding a corrupt manifest record never uploaded; a mark without a checksum | §7 Manifest (not rebuilt automatically; every file self-describing; an operator call `rebuild_manifest`, roadmap 6.3; accepted limit), `format.md` A.10 (two checksummed slots), A.14 (open part: Q-52 (b)) |
 | Q-60 | Calendar nodes when the expected interval changes | §5.1 density rule (the levels a series stores are fixed by the expected interval its definition gives; a later change moves the staleness limit and keep-alive, never the levels), §5.1 table and §5.7 (calendar nodes for a series that stores the 15-minute level), §5.6 Canonical order (1-minute nodes computed for the merge where they are not stored), row 20a (open part: Q-83, node contents after a past-effective change of the staleness limit) |
 | Q-61 | Identity of a condition delivery, and where its sequence is kept | §4 Order (every condition delivery, on a fact or on the timer, is `(funnel, sequence)`; the sequence is in memory, from 1 at every engine start, and a consumer resuming at a start receives none before that start's `resync`), §4 At-least-once (never delivered twice; the identity holds until the consumer's next `resync`), `api.md` Consuming; no field in `format.md` |
 | Q-62 | Condition transitions while a consumer catches up after overflow | §4 Overflow (funnels evaluated but silent; the present state sent on re-attaching where it differs; transitions in between counted, `transitions_not_delivered`; catch-up reads hot and cold only and ends with `resync` where its next entry is on no local tier), §4 Resync, §8 Behind consumers, `api.md` Health and statistics |
@@ -635,12 +595,18 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-73 | Who leaves out the unchanged readings of a record-on-change series | §2.6 (the adapter leaves out unchanged readings between keep-alive facts; the engine records every reading it is given), as §2.4 identity including `t`, principle 5 and §11 already required |
 | Q-74 | One reading far ahead makes later on-time readings `late` | §2.2 `late` and the lateness reference (facts flagged neither `future` nor `unsynced_clock`; a reading up to 60 s ahead still raises it, an accepted limit; the latest recorded `t`, over all facts, stays for the §2.4 fast path, §8 Restore step 2 and statistics), §2.4 Fast path, §4 Future facts, §8 Deep, Continuous backup and Restore step 1 (each tree checkpoint carries both), invariant 24, rows 4 and 4a, `api.md` `SeriesInfo` (open part: Q-44 (c), far-future facts and the latest recorded `t`) |
 | Q-75 | Local days around a site-zone change to another offset | §5.7 (the local date is the date in the zone in force at each instant; the day of D starts at the first instant whose local date is D or later, so days and months tile; "today" is the latest date whose day has started; a change rebuilds from the start, under the old zone, of the local day containing the effective time), row 21, `api.md` Reading |
-| Q-76 | Whether a tzdata change is a log entry | §5.7 (the version in force is named by the latest tzdata entry, the first in a store's first batch; the engine reads one release at open, and a writer whose release differs writes a tzdata entry before ingest, newer or older; readers and drills of another release are refused with `tzdata_mismatch`), §2.1, §2.2, invariant 8, row 21, `format.md` A.4 and A.6, `api.md` Opening, Environment seams and Health |
+| Q-76 | Whether a tzdata change is a log entry | §5.7 (the version in force is named by the latest tzdata entry, the first in a store's first batch; the engine reads one release at open, and a writer whose release differs writes a tzdata entry before ingest, newer or older; readers and drills of another release are refused with `tzdata_mismatch`), §2.1, §2.2, invariant 8, row 21, `format.md` A.4 and A.6, `api.md` Opening, Environment seams and Health (the refusal of readers and drills, and adoption only at open, superseded by Q-93 (a)) |
 | Q-77 | A day whose midnight occurs twice | §5.7 (the day starts at the earlier instant), §2.1 `interval length` (a day start that occurs twice likewise; a reading at the later instant is refused off phase) |
 | Q-78 | How routing compilation knows the series a consumer emits | §4 Routing (a consumer declares `emits`, recorded with its routing changes, and emits through its own handle; the cycle test compares selections, at start, on every routing change and on an alias), §4 Concurrency, row 33, `api.md` Consuming, `format.md` A.6 (open part: Q-88, the pattern grammar) |
 | Q-79 | A lost range found by a recovery whose sync fails | §3 Order of a start, steps 3 and 4 (the kept segments are synced before anything is written; a failed sync writes nothing, and the range is reported as found and recorded once by the next start that can write), §3 Recovery rule 2 |
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
+| Q-86 (a) | No space when a log segment is created | §3 Segments (the partial file deleted, health critical, ingest waits, creation retried), `format.md` A.4 (open part: Q-86 (b)) |
+| Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3 (accepted limit, as damage from outside the engine) |
+| Q-93 (a) | A store nobody can open after the host's tzdata changes | §5.7 (readers and drills never refuse; calendar results computed with the reader's own release; a stored calendar node used only where its recorded release is the reader's; the writer checks the host release about once a minute and at each local midnight and adopts a new one without a restart, by a tzdata entry and a rebuild of the affected days), `api.md` Opening and Environment seams (open part: Q-93 (b), (c)) |
+| Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
+| Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |
+| Q-99 | An exclusive `flock` on the store directory on Windows | §3 Single writer (an operating-system lock on the file `LOCK`, released when the process ends; network file systems not supported), `format.md` A.12, `api.md` Handles |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
@@ -741,9 +707,8 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
 | Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
-| Adopting a tzdata release | §5.7: the engine reads one release at open and uses no other while it runs; a writer whose release is not the version in force writes a tzdata entry naming it before it accepts ingest, so a restart is the adoption; a reader or drill of another release is refused with `tzdata_mismatch` | The model holds several releases: installing one (`Model::install_tzdb`) writes nothing, results then follow the new rules before any entry names them, a restart keeps the version the log names, and `Model::rebuild_calendars` writes the tzdata entry and rebuilds when called; nothing is refused | `tests/open_questions.rs` `q76_tzdata_change_is_a_log_entry_written_by_the_rebuild` (its restart step), `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` (results between the install and the rebuild) |
+| Adopting a tzdata release | §5.7: the writer reads the host's release at open, about once a minute and at each local midnight, and whenever it is not the version in force writes a tzdata entry naming it and rebuilds the affected days, without a restart; readers and drills never refuse, and compute calendar results with their own release, using a stored node only where its recorded release is theirs (Q-93 (a)) | The model holds several releases: installing one (`Model::install_tzdb`) writes nothing, results then follow the new rules before any entry names them, a restart keeps the version the log names, and `Model::rebuild_calendars` writes the tzdata entry and rebuilds when called; nothing is refused | `tests/open_questions.rs` `q76_tzdata_change_is_a_log_entry_written_by_the_rebuild` (its restart step), `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` (results between the install and the rebuild) |
 | Local days around a site-zone change | §5.7: the day of date D starts at the first instant whose local date, in the zone in force at that instant, is D or later, so days and months tile; "today" is the latest date whose day has started | `calendar::Zoning::Site` takes a day in the latest entry's zone under which it starts at or after that entry's effective time, else in the store's zone, so a change to another offset leaves hours in no day or two days overlapping; a month node is stored only where its days are contiguous | `tests/open_questions.rs` `q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap` |
-| Entries at store creation | §5.7: a store's first batch holds its first site-zone entry and a tzdata entry; there is no store header | A store header beside the log, written at creation and carried by the bucket, holds the site zone and tzdata version before any entry, so that positions start at `0:1`; a start or restore configured with a zone other than the store's zone in force (its site-zone entry with the latest effective time, else the header's) is refused (`OpenRefused`, `SiteZoneMismatch`), a restore before it claims a generation | `tests/rules.rs` `s5_7_store_keeps_its_site_zone_and_refuses_another_at_open` |
 | New-consumer start; `emits` and cycles; name patterns | §4 New consumer, Routing (a consumer declares `emits` and emits through its own handle; a change that closes a cycle is refused), row 33; the pattern grammar is open (Q-88) | Consumers are declared when the model is created and start before the first position; a consumer declares no `emits` and emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected` |
 | Routes before a restore's checkpoint | §2.1, §4 Routing: routing changes are kept with their positions in the registry file, which every tree checkpoint carries, so a route is in force from step 1 of a restore, and after its log segment has left hot | Routes are taken from the entries that are local; a route added before the checkpoint is not in force until the file holding its entry is downloaded | `tests/open_questions.rs` `q64_route_before_checkpoint_not_in_force_until_its_entry_is_back` |
 | Identity of a condition delivery | §4 Order, At-least-once: `(funnel, sequence)`, the sequence in memory, from 1 at every engine start, valid until the consumer's next `resync`; nothing persisted | `(generation, funnel, sequence)`, the sequence kept on disk when the delivery is issued, never issued twice for a funnel within a generation | `tests/open_questions.rs` `q61_condition_delivery_sequence_survives_a_crash`, `q61_condition_delivery_identity_includes_the_generation`; `tests/rules.rs` `s4_condition_deliveries_unique_by_funnel_and_sequence` (unique across restarts), `s4_timer_deliveries_carry_last_position_and_funnel_sequence` (the generation in the id) |
@@ -777,7 +742,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2 and Order of a start, §4 Resync, §8 Corrupt block (reported when found; for the open segment, recorded by the next start that can write), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches. A lost range is not a reset point: the `resync` for a cursor below or inside it is the one every resume sends, after the kept facts above the range, where the specification delivers a `resync` carrying `forget_above` at the range, before them. `tests/edge_cases.rs` `row_11a_corrupt_block_inside_the_open_segment` now contradicts the specification on that order | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost, recorded as a lost range and reported as `data_lost`, so its positions are not issued again; the quarantine stays, with fatal health | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
-| Timed mark sync; recovery entries and reset points; `possible_loss`; `forget_above` | §3 Durable mark, Commit, Recovery rule 3 and Order of a start, §4 At-least-once, Resync, Overflow and Consumer state, §6 Restart and resume, §7 Readers, §8 Behind consumers, rows 7, 7a and 7c, invariants 25–27 (Q-47, Q-48) | Not yet supported; model support is due before roadmap 4.5. The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail. A recovery under rule 3 writes no recovery entry and takes no position; the mark carries no highest series id; `resync` carries no `forget_above` and no consumer waits for its confirmation; a truncation after a reboot is not reported; a reader does not void what it took above a recovery entry. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch. Since the specification puts the recovery entry at the first new position, these tests now contradict it: `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` (the new fact takes `0:7`, the entry's position, and the `resync` is at `0:6`), and `tests/edge_cases.rs` `row_11a_corrupt_block_below_an_old_boots_mark` and `row_11a_failed_recovery_sync_reports_the_range_as_found` (the next fact after a rule 3 recovery takes the position the entry would take) | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
+| Timed mark sync; recovery entries and reset points; `possible_loss`; `forget_above` | §3 Durable mark, Commit, Recovery rule 3 and Order of a start, §4 At-least-once, Resync, Overflow and Consumer state, §6 Restart and resume, §7 Readers, §8 Behind consumers, rows 7, 7a and 7c, invariants 25–27 (Q-47, Q-48) | Not yet supported; model support is due before roadmap 4.5. The mark is always exact (so neither a stale mark under rule 1 nor its one-batch limit arises), so no delivered position is reused and no cursor is at or above a truncated tail. A recovery under rule 3 writes no recovery entry and takes no position; the mark carries no highest series id; `resync` carries no `forget_above` and no consumer waits for its confirmation; a truncation after a reboot is not reported; a reader does not void what it took above a recovery entry. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch. Since the specification puts the recovery entry at the first new position, these tests now contradict it: `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` (the new fact takes `0:7`, the entry's position, and the `resync` is at `0:6`), and `tests/edge_cases.rs` `row_11a_corrupt_block_below_an_old_boots_mark` and `row_11a_failed_recovery_sync_reports_the_range_as_found` (the next fact after a rule 3 recovery takes the position the entry would take) | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
 | Acknowledging a loss | §8 Acknowledging a loss, §11 Health, invariant 27 (Q-34 (c)) | No acknowledgement call or record: a `data_lost` holds health degraded for ever, which agrees with the specification until a loss is acknowledged | `tests/edge_cases.rs` `row_11a_corrupt_block_inside_the_open_segment` |
 | Orphaned facts and id floors | §2.1, §3 Commit, invariants 2 and 4 (Q-33) | A batch holding anything but facts cannot be damaged, so no fact is orphaned and no id floor arises; a batch holding a definition is acknowledged at once, the mark being exact | `tests/edge_cases.rs` `row_11a_fault_injection_limits` |
 | Torn and corrupt manifest records | §7 Manifest, §8 Corrupt block, invariant 10 (Q-52) | Manifest records are written atomically and never corrupted; there is no empty record and no rewrite of the last record at start | — |

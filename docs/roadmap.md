@@ -25,7 +25,9 @@ again; nothing after a gate starts before it is passed.
 ## 3. Format and interface
 - [x] 3.1 `docs/format.md` checked for implementability; problems listed
 - [x] 3.2 `docs/api.md` checked for implementability; problems listed
-- [ ] 3.3 **Gate** — format and interface accepted
+- [x] 3.3 **Gate** — format and interface accepted (passed: format Part A and the interface are implementable; Part B
+  outline fixed by 2.1; remaining items deferred to named 4.x–8.x items in `docs/format-check.md` and
+  `docs/api-check.md`)
 
 ## 4. Log
 - [ ] 4.1 Crate skeleton: errors, configuration, injectable clock and file-system seams
