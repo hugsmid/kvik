@@ -1712,9 +1712,9 @@ fn row_17_series_goes_silent() {
 /// Row 17a: "Record-on-change series, value unchanged: keep-alive fact each
 /// expected interval; never stale while healthy." The series is declared
 /// record on change with a keep-alive interval of 20 s as its expected
-/// interval (§2.6), so S = 60 s; its source polls every 2 s. Whether the
-/// engine or the adapter leaves out the unchanged polls is Q-73; here the
-/// adapter emits only changes and keep-alive facts.
+/// interval (§2.6), so S = 60 s; its source polls every 2 s. The adapter
+/// leaves out the unchanged polls and emits only changes and keep-alive
+/// facts (§2.6, Q-73).
 #[test]
 fn row_17a_record_on_change_keep_alive_never_stale() {
     let (mut m, _) = model();
