@@ -11,8 +11,8 @@ use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, ConditionState, Event, Runner};
 use kvik_model::engine::{
     CompactionCrash, Config, ConsumerDecl, ConsumerId, CrashPoint, Error, FORMAT_VERSION, Fault,
-    FileClass, Funnel, FunnelId, Level, Model, Reason, Refusal, Selection, TriggerCause, Wait,
-    WriteOutcome,
+    FileClass, FileId, Funnel, FunnelId, Level, Locality, Model, Reason, Refusal, Selection,
+    TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::registry::{ChangedAtKind, SeriesOptions, Timing};
@@ -555,7 +555,9 @@ fn row_09_failed_recovery_sync_discards_nothing() {
     assert_eq!((m.counters.compaction_discarded, &m.disk.hot), (0, &hot));
     m.restart();
     assert!(!m.is_read_only());
-    assert_eq!(m.counters.compaction_discarded, 2);
+    // A current and a revision chunk for the series, and one for the
+    // registry entry.
+    assert_eq!(m.counters.compaction_discarded, 3);
     // No segment is open, yet recovery stamped the mark with the new boot.
     assert_eq!(m.disk.mark.unwrap().boot, m.boot);
 }
@@ -570,9 +572,60 @@ fn row_09_crash_during_compaction() {
         Err(Error::Crashed)
     );
     m.restart();
-    assert_eq!(m.counters.compaction_discarded, 2);
+    assert_eq!(m.counters.compaction_discarded, 3);
     assert_eq!(m.disk.listed_at(m.open_reader().epoch), inputs);
     assert_eq!(durable(&m), before);
+}
+
+/// Five compactions of one series in one 15-minute span: their current
+/// chunks are merged (§7 Policy). Returns the model and those chunks.
+fn crowded_model() -> (Model, Vec<FileId>) {
+    let (mut m, s) = model();
+    let mut chunks = Vec::new();
+    for i in 0..5 {
+        m.ingest(vec![num(s, T0 + i * SECOND, i as f64)]).unwrap();
+        m.seal_active();
+        chunks.extend(m.compact(None).unwrap().into_iter().filter(|f| {
+            m.disk.files[f].class == FileClass::Current
+                && m.disk.files[f].entries().any(|e| e.fact().is_some())
+        }));
+    }
+    (m, chunks)
+}
+
+/// Row 10: "Crash around the manifest record: before: output discarded.
+/// After: inputs retired. Never both live." Compaction of compacted files
+/// publishes its outputs and retires its inputs in one record (§7).
+#[test]
+fn row_10_crash_around_the_manifest_record() {
+    let live = |m: &Model| m.disk.listed_at(m.disk.latest_epoch());
+    let (mut m, inputs) = crowded_model();
+    let before = durable(&m);
+    let listed = live(&m);
+    assert_eq!(
+        m.merge_chunks(Some(CompactionCrash::AfterWrite)),
+        Err(Error::Crashed)
+    );
+    m.restart();
+    assert_eq!(live(&m), listed, "outputs discarded, inputs live");
+    assert_eq!(m.counters.compaction_discarded, 1);
+    assert_eq!(durable(&m), before);
+    let (mut m, inputs2) = crowded_model();
+    assert_eq!(inputs, inputs2);
+    assert_eq!(
+        m.merge_chunks(Some(CompactionCrash::AfterPublish)),
+        Err(Error::Crashed)
+    );
+    m.restart();
+    let now = live(&m);
+    assert!(inputs.iter().all(|f| !now.contains(f)), "inputs retired");
+    assert!(m.disk.retired().keys().copied().collect::<Vec<_>>() == inputs);
+    assert_eq!(durable(&m), before);
+    assert_eq!(
+        m.merge_chunks(None).unwrap(),
+        Vec::new(),
+        "not merged twice"
+    );
 }
 
 #[test]
@@ -1152,6 +1205,53 @@ fn row_25_series_retired_at_t_r() {
     assert_eq!(m.registry().unwrap().live().count(), 0, "hidden");
     assert!(m.registry().unwrap().get(s).is_some(), "reachable by id");
     assert_eq!(m.facts().unwrap().len(), 2, "facts stay");
+}
+
+/// Row 26: "Reader holds an old epoch: its files stay while its lease names
+/// that epoch and its counter keeps changing; leases of a different boot are
+/// void."
+#[test]
+fn row_26_reader_holds_an_old_epoch() {
+    let (mut m, inputs) = crowded_model();
+    let reader = m.lease_reader();
+    let (_, facts) = m.read(&reader).unwrap();
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    // The reader refreshes every 30 minutes, keeping its epoch.
+    let mut reader = reader;
+    for _ in 0..6 {
+        m.advance(30 * MINUTE);
+        reader = m.refresh_reader(&reader, false);
+        m.housekeeping().unwrap();
+        assert!(inputs.iter().all(|f| m.disk.hot.contains(f)), "files stay");
+        let (loc, again) = m.read(&reader).unwrap();
+        assert!(loc.iter().all(|(_, l)| *l == Locality::Hot));
+        assert_eq!(again, facts);
+    }
+    // It stops refreshing: an hour later its lease has expired.
+    m.advance(HOUR);
+    m.housekeeping().unwrap();
+    assert!(inputs.iter().all(|f| !m.disk.hot.contains(f)));
+    // A lease of another boot is void at once.
+    let (mut m, inputs) = crowded_model();
+    let reader = m.lease_reader();
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    m.power_loss();
+    m.restart();
+    m.advance(HOUR);
+    let _ = reader;
+    m.housekeeping().unwrap();
+    assert!(inputs.iter().all(|f| !m.disk.hot.contains(f)));
+    // A reader that takes the latest epoch no longer holds the inputs.
+    let (mut m, inputs) = crowded_model();
+    let reader = m.lease_reader();
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    m.refresh_reader(&reader, true);
+    m.advance(HOUR);
+    m.housekeeping().unwrap();
+    assert!(inputs.iter().all(|f| !m.disk.hot.contains(f)));
 }
 
 #[test]

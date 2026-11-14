@@ -25,6 +25,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-63 | §6 Restart and resume, Conditions, Latch, invariant 16 | Condition state now, for conditions with memory |
 | Q-64 | §4 Routing, §8 Continuous backup, §8 Restore step 1 | Routing changes before a restore's checkpoint |
 | Q-70 | §5.6, §8 Restore step 3, §8 Tiers | Chunk indexes after a restore |
+| Q-71 | §7 Manifest, §7 inputs kept, §8 Tiers, invariant 14 | A log segment and the chunks compacted from it hold the same positions in one epoch |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -413,6 +414,19 @@ edge's detail is off the machine.
 **Needed.** Where chunk indexes come from after a restore (carried by the tree checkpoint, listed with the files in
 the restore record, or downloaded in step 1 or step 3), and what holds until they are local.
 
+## Q-71 — A log segment and the chunks compacted from it hold the same positions in one epoch
+**Scenario.** Log segment L holds positions 1–10 and is sealed. Compaction writes a current chunk C and a revision chunk
+R from it and publishes them in one record (§7). Log segments are never retired by compaction (§7) and stay on hot for
+90 days (§8 Tiers, Eviction at 90 days), so the epoch of that record lists L, C and R, and position 3 is held by L and
+by C or R. §7 Manifest and invariant 14 say that an epoch never lists two live files holding the same position. A
+restore installs log segments and chunks compacted from them in the same way (§8 Restore step 3: "A position present
+in two files is one fact").
+**Model.** Invariant 14 is checked among compacted files (current and revision chunks) at every epoch; log segments
+stay listed beside the chunks compacted from them. A sealed segment whose positions live chunks hold, or after a
+restore the chunks it will bring back, is not compacted again (`q71_log_segment_and_its_chunks_listed_in_one_epoch`).
+**Proposal.** §7 Manifest and invariant 14: "No manifest epoch lists two live compacted files holding the same
+position. A log segment holds the same positions as the chunks compacted from it until it leaves (§8)."
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
@@ -544,7 +558,15 @@ every reading of a versioned series and refused on any other, `revise` refused t
 in every view, identity including `changed_at`, the version index, carried by each tree checkpoint and exact while a
 restore brings detail back; §4: an outranked fact delivered flagged `outranked`, live and in catch-up, counted, and
 never fed to a condition or refreshing stale-for; §5.6: it changes no node; invariants 4, 15 and 19, rows 2c, 2d and
-37), the late and future
+37), compaction and files (§7: per-series current and revision chunks, ranked within the compaction's inputs, and a
+chunk of the registry and routing entries; one manifest record that adds, retires and moves files atomically;
+compaction of compacted files publishing its outputs and retiring its inputs in one record; retired files removed
+locally only after the grace period on the writer's monotonic clock since the later of the record and the writer's
+start, once their replacements are verified in another tier and no live lease names an older epoch, and, for
+invariant 12, once the retired file itself has a verified copy in another tier; reader leases with boot id and
+refresh counter, expired on the writer's monotonic clock, first observed at the writer's start, void on another boot;
+a restore leaves out files retired by a record whose added files are in the bucket; invariant 14 (see Q-71), rows 10
+and 26; `tests/rules.rs` `s7_…`), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
 delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
 condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
@@ -599,9 +621,9 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Tree files and their checkpoint, density rule | §5.1, row 20a | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call); both levels, and calendar nodes, stored for every series | — |
 | Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
 | Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
-| Atomic manifest records | §7, row 10, invariant 14 | Each compaction output is published by a record of its own, with no crash point between them; compaction retires nothing, and merging compacted files is not modelled | `compaction_crash_after_publish_keeps_inputs_and_outputs` |
+| Compaction of compacted files | §7 Policy: merge when a series' chunks overlapping any 15-minute span exceed 4 | Counts and merges the live current chunks of a series on the fast disk only; revision chunks are never merged | `tests/rules.rs` `s7_merge_publishes_outputs_and_retires_inputs_in_one_record` |
+| Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
-| Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | No file is retired, so no grace period applies; a reader's files leave hot only by eviction, and it then reads them remotely | `reader_epoch_reads_remotely_after_eviction` |
 | Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry (they carry the version index); during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
 | Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
 | Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Timing is recorded with the definition, and a forecast series must be versioned with `changed_at` kind `time`; otherwise every series is treated as observed (`future` and `late` flags, live state, staleness, delivery, cadence and the credit limit `now`) | — |
@@ -620,4 +642,4 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Window edges over detail that is not local | §6 Old spans, §8 Restore step 2: an edge moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, the error `detail_not_local`; no bound is refused for its resolution | No window is flagged `approximate_edges` and no edge moves; while restoring, a window bound inside a minute is refused with `Restoring` | `tests/open_questions.rs` `q39_no_sub_minute_query_or_checkpoint_while_restoring` |
 | Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
-| Invariants 12 and 14 | §10 | Not checked yet | — |
+| Invariant 12 | §10 | Not checked yet | — |

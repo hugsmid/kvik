@@ -732,6 +732,35 @@ proptest! {
         }
     }
 
+    /// 14. "No manifest epoch lists two live files holding the same
+    /// position" (§7 Manifest), checked at every epoch after every
+    /// operation, among compacted files (Q-71: log segments stay listed
+    /// beside the chunks compacted from them), with compaction, compaction
+    /// of compacted files and crashes on either side of their records (row
+    /// 10); and in a store restored from the bucket afterwards.
+    #[test]
+    fn inv14_no_epoch_lists_two_files_with_one_position(ops in proptest::collection::vec(arb_files_op(), 1..80)) {
+        let (mut m, ids) = machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(inv14_overlap(&m), None, "after {:?}", op);
+        }
+        settle(&mut m);
+        m.seal_active();
+        let _ = m.compact(None);
+        let _ = m.merge_chunks(None);
+        m.disk.bucket.reachable = true;
+        m.upload();
+        prop_assert_eq!(inv14_overlap(&m), None);
+        if !m.disk.bucket.objects.is_empty() {
+            let mut r = kvik_model::engine::Model::restore_from(m.config.clone(), consumers(), &mut m.disk.bucket, m.wall, false).unwrap();
+            prop_assert_eq!(inv14_overlap(&r), None, "restored");
+            r.seal_active();
+            let _ = r.compact(None);
+            prop_assert_eq!(inv14_overlap(&r), None, "compacted after the restore");
+        }
+    }
+
     /// 10. No operation reduces the set of facts.
     #[test]
     fn inv10_no_operation_reduces_facts(ops in proptest::collection::vec(arb_op(), 1..120)) {
@@ -811,6 +840,7 @@ fn generator_coverage() {
         (0usize, 0u64, 0u64, 0usize, 0usize, 0usize);
     let (mut tails, mut kept_after_reboot, mut recovery_failed) = (0usize, 0usize, 0usize);
     let mut outranked = 0u64;
+    let (mut retired, mut leases) = (0usize, 0usize);
     for _ in 0..200 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let (mut m, ids) = machine();
@@ -845,14 +875,41 @@ fn generator_coverage() {
             .count();
         uploaded += m.disk.bucket.objects.len();
         outranked += m.counters.outranked_on_arrival;
+        retired += m.disk.retired().len();
+        leases += m.disk.leases.len();
     }
     eprintln!(
-        "facts {facts} revisions {revisions} discarded {discarded} overflows {overflows} compacted {compacted} uploaded {uploaded} tails {tails} kept-after-reboot {kept_after_reboot} recovery-failed {recovery_failed} outranked {outranked}"
+        "facts {facts} revisions {revisions} discarded {discarded} overflows {overflows} compacted {compacted} uploaded {uploaded} tails {tails} kept-after-reboot {kept_after_reboot} recovery-failed {recovery_failed} outranked {outranked} retired {retired} leases {leases}"
     );
+    assert!(retired > 10 && leases > 50);
     assert!(facts > 1000 && revisions > 50 && discarded > 10 && overflows > 10);
     assert!(outranked > 20);
     assert!(compacted > 20 && uploaded > 20);
     assert!(tails > 50 && kept_after_reboot > 15 && recovery_failed > 5);
+}
+
+/// Guards the files generator: its histories must merge compacted files,
+/// remove retired files from the fast disk and keep leases.
+#[test]
+fn files_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = proptest::collection::vec(arb_files_op(), 60..80);
+    let (mut retired, mut gone, mut leases) = (0usize, 0usize, 0usize);
+    for _ in 0..200 {
+        let ops = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, ids) = machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).unwrap();
+        }
+        let r = m.disk.retired();
+        retired += r.len();
+        gone += r.keys().filter(|f| !m.disk.hot.contains(f)).count();
+        leases += m.disk.leases.len();
+    }
+    eprintln!("retired {retired} removed {gone} leases {leases}");
+    assert!(retired > 200 && gone > 15 && leases > 30);
 }
 
 /// Guards invariant 2's exception: a `resync` in place of a replay is

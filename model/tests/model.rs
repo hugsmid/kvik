@@ -9,9 +9,7 @@ use common::*;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, Event, Runner};
-use kvik_model::engine::{
-    CompactionCrash, Config, ConsumerDecl, ConsumerId, Error, FileClass, Locality, Model, Selection,
-};
+use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Error, Model, Selection};
 use kvik_model::oracle;
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
@@ -42,51 +40,6 @@ fn model() -> (Model, SeriesId) {
 
 fn num(s: SeriesId, t: Nanos, v: f64) -> Reading {
     Reading::num(s, t, v)
-}
-
-fn sealed_model() -> (Model, SeriesId) {
-    let (mut m, s) = model();
-    let base = m.wall - 10 * SECOND;
-    for i in 0..5 {
-        m.ingest(vec![num(s, base + i * SECOND, i as f64)]).unwrap();
-    }
-    m.ingest(vec![num(s, base, 100.0)]).unwrap(); // a revision
-    m.seal_active();
-    (m, s)
-}
-
-/// §7 Manifest: one record may add files and retire files atomically. The
-/// model publishes each compaction output by a record of its own (with no
-/// crash point between them); a crash after publishing leaves inputs and
-/// outputs listed, and the input log segments are never retired (§7).
-#[test]
-fn compaction_crash_after_publish_keeps_inputs_and_outputs() {
-    let (mut m, _) = sealed_model();
-    let before = durable(&m);
-    assert_eq!(
-        m.compact(Some(CompactionCrash::AfterPublish)),
-        Err(Error::Crashed)
-    );
-    // Both inputs and outputs are listed and readable.
-    let r = m.open_reader();
-    let classes: Vec<FileClass> = r.files.iter().map(|f| m.disk.files[f].class).collect();
-    assert!(classes.contains(&FileClass::Segment) && classes.contains(&FileClass::Current));
-    let (_, facts) = m.read(&r).unwrap();
-    assert_eq!(facts.len(), before.len());
-    m.restart();
-    let listed = m.disk.listed_at(m.open_reader().epoch);
-    assert!(
-        listed
-            .iter()
-            .any(|f| m.disk.files[f].class == FileClass::Segment)
-    );
-    assert!(
-        listed
-            .iter()
-            .any(|f| m.disk.files[f].class == FileClass::Current)
-    );
-    assert_eq!(m.compact(None).unwrap(), Vec::new(), "not compacted twice");
-    assert_eq!(durable(&m), before);
 }
 
 #[test]
@@ -201,31 +154,6 @@ fn calendar_depends_on_zone_utc_levels_do_not() {
             "UTC levels untouched"
         );
     }
-}
-
-/// §7: retired files leave the fast disk after the grace period while a
-/// reader's lease names an older epoch. The model retires no file (merging
-/// compacted files is not modelled) and has no leases: a reader's files leave
-/// the fast disk only by eviction (§8), and it then reads them remotely.
-#[test]
-fn reader_epoch_reads_remotely_after_eviction() {
-    let (mut m, _) = sealed_model();
-    let reader = m.open_reader();
-    let (_, facts) = m.read(&reader).unwrap();
-    m.compact(None).unwrap();
-    m.upload();
-    m.advance(HOUR);
-    assert!(m.housekeeping().unwrap().is_empty(), "nothing retired");
-    let (loc, again) = m.read(&reader).unwrap();
-    assert!(loc.iter().all(|(_, l)| *l == Locality::Hot));
-    assert_eq!(again, facts);
-    m.advance(90 * DAY);
-    let removed = m.housekeeping().unwrap();
-    assert!(!removed.is_empty());
-    let (loc, again) = m.read(&reader).unwrap();
-    assert!(loc.iter().all(|(_, l)| *l != Locality::Missing));
-    assert!(loc.iter().any(|(_, l)| *l == Locality::Remote));
-    assert_eq!(again, facts);
 }
 
 /// §3 Disk space: below the low mark the specification pauses compaction only;

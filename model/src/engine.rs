@@ -39,8 +39,15 @@ pub struct Config {
     pub seal_after_batches: usize,
     /// Seal the active segment after this much wall time (§3: 5 minutes).
     pub seal_interval: Nanos,
-    /// Grace period before a retired file may leave the fast disk (§7: 1 hour).
+    /// Grace period before a retired file may be removed locally, on the
+    /// writer's monotonic clock (§7: 1 hour).
     pub grace: Nanos,
+    /// A lease whose counter has not changed for this long on the writer's
+    /// monotonic clock expires (§7: 1 hour).
+    pub lease_expiry: Nanos,
+    /// Compacted chunks of a series overlapping one 15-minute span are
+    /// merged when they number more than this (§7: 4).
+    pub merge_threshold: usize,
     /// Age after which revision chunks and sealed segments leave the fast disk
     /// (§8: 90 days).
     pub eviction_age: Nanos,
@@ -69,6 +76,8 @@ impl Default for Config {
             seal_after_batches: 8,
             seal_interval: 5 * MINUTE,
             grace: HOUR,
+            lease_expiry: HOUR,
+            merge_threshold: 4,
             eviction_age: 90 * 24 * HOUR,
             disk_bytes: 1 << 40,
             entry_bytes: 64,
@@ -301,25 +310,54 @@ pub struct ManifestRecord {
     pub op: ManifestOp,
 }
 
+/// A tier (§8 Tiers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tier {
+    /// Fast local disk.
+    Hot,
+    /// Another local path.
+    Cold,
+    /// The bucket.
+    Deep,
+}
+
+/// A file a manifest record adds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Added {
+    /// File.
+    pub file: FileId,
+    /// Hash of the file as stored.
+    pub hash: u64,
+    /// Log segments compacted into this file and the others the record adds;
+    /// they are not retired (§7: log segments are never retired by
+    /// compaction).
+    pub from: Vec<FileId>,
+}
+
+/// A file a manifest record moves between tiers (§7: a tier move keeps the
+/// file's identity and changes its location).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Moved {
+    /// File.
+    pub file: FileId,
+    /// The tier it leaves.
+    pub from: Tier,
+    /// Where its verified copy is.
+    pub to: Tier,
+}
+
 /// Manifest operation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ManifestOp {
-    /// A file is published; once published, `replaces` are to be retired.
-    Add {
-        /// File.
-        file: FileId,
-        /// Inputs this file replaces.
-        replaces: Vec<FileId>,
-        /// Log segments compacted into this file and its siblings; they are
-        /// not retired (§7: log segments are never retired by compaction).
-        from: Vec<FileId>,
-        /// Hash of the file as stored.
-        hash: u64,
-    },
-    /// A file is retired.
-    Retire {
-        /// File.
-        file: FileId,
+    /// Adds files, retires files and moves files between tiers, atomically
+    /// (§7 Manifest).
+    Publish {
+        /// Files added.
+        added: Vec<Added>,
+        /// Files retired: replaced by the files added.
+        retired: Vec<FileId>,
+        /// Files moved between tiers.
+        moved: Vec<Moved>,
     },
     /// A segment is sealed; records the hash of the file as stored.
     Seal {
@@ -422,6 +460,11 @@ pub struct Bucket {
     pub claims: BTreeSet<u32>,
     /// Tree checkpoints by position (§8 Continuous backup).
     pub checkpoints: BTreeMap<Position, Checkpoint>,
+    /// Files retired by a manifest record whose added files are all in the
+    /// bucket. The model uploads no manifest records (§8 Continuous backup);
+    /// this set stands in for what they say, so that a restore does not
+    /// restore a file and the file that replaced it.
+    pub retired: BTreeSet<FileId>,
 }
 
 /// Outcome of a batch that was written but not synced when the machine stopped.
@@ -896,6 +939,20 @@ pub struct Reader {
     pub epoch: u64,
     /// Files listed at that epoch.
     pub files: Vec<FileId>,
+    /// Its lease file, if it is a reader process.
+    pub lease: Option<u64>,
+}
+
+/// A reader's lease file (§7 Leases).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lease {
+    /// The epoch the reader holds.
+    pub epoch: u64,
+    /// Boot id of the machine when the reader wrote it, from the same source
+    /// as the mark's.
+    pub boot: u64,
+    /// Incremented by the reader at every refresh.
+    pub counter: u64,
 }
 
 /// Where a reader found a file.
@@ -971,6 +1028,10 @@ pub struct Disk {
     /// Why the last attempt to start or resume a restore failed; the engine
     /// stays down meanwhile.
     pub restore_failed: Option<Error>,
+    /// Lease files of reader processes, by id (§7 Leases).
+    pub leases: BTreeMap<u64, Lease>,
+    /// Next lease id.
+    pub next_lease: u64,
     /// Other bytes in use on the fast disk (fault injection for disk fill).
     pub other_bytes: u64,
     /// Next file id.
@@ -1043,23 +1104,36 @@ impl Disk {
         self.manifest.last().map_or(1, |r| r.epoch + 1)
     }
 
-    fn add(&mut self, at: Nanos, file: FileId, replaces: Vec<FileId>) {
-        self.add_from(at, file, replaces, Vec::new());
-    }
-
-    fn add_from(&mut self, at: Nanos, file: FileId, replaces: Vec<FileId>, from: Vec<FileId>) {
-        let hash = self.files[&file].hash();
+    /// Appends one record that adds `added` (each with `from`), retires
+    /// `retired` and moves `moved`, atomically (§7 Manifest). Returns its
+    /// epoch.
+    fn publish(
+        &mut self,
+        at: Nanos,
+        added: &[FileId],
+        from: Vec<FileId>,
+        retired: Vec<FileId>,
+        moved: Vec<Moved>,
+    ) -> u64 {
         let epoch = self.epoch();
+        let added = added
+            .iter()
+            .map(|f| Added {
+                file: *f,
+                hash: self.files[f].hash(),
+                from: from.clone(),
+            })
+            .collect();
         self.manifest.push(ManifestRecord {
             epoch,
             at,
-            op: ManifestOp::Add {
-                file,
-                replaces,
-                from,
-                hash,
+            op: ManifestOp::Publish {
+                added,
+                retired,
+                moved,
             },
         });
+        epoch
     }
 
     /// Log segments already compacted (§7).
@@ -1067,62 +1141,56 @@ impl Disk {
         self.manifest
             .iter()
             .flat_map(|r| match &r.op {
-                ManifestOp::Add { from, .. } => from.clone(),
+                ManifestOp::Publish { added, .. } => {
+                    added.iter().flat_map(|a| a.from.clone()).collect()
+                }
                 _ => Vec::new(),
             })
             .collect()
-    }
-
-    fn retire(&mut self, at: Nanos, file: FileId) {
-        let epoch = self.epoch();
-        self.manifest.push(ManifestRecord {
-            epoch,
-            at,
-            op: ManifestOp::Retire { file },
-        });
     }
 
     /// Files ever published.
     pub fn published(&self) -> BTreeSet<FileId> {
         self.manifest
             .iter()
-            .filter_map(|r| match r.op {
-                ManifestOp::Add { file, .. } => Some(file),
-                ManifestOp::Retire { .. }
-                | ManifestOp::Seal { .. }
-                | ManifestOp::Restore { .. } => None,
+            .flat_map(|r| match &r.op {
+                ManifestOp::Publish { added, .. } => added.iter().map(|a| a.file).collect(),
+                ManifestOp::Seal { .. } | ManifestOp::Restore { .. } => Vec::new(),
             })
             .collect()
     }
 
-    /// Retired files with the wall time of retirement.
-    pub fn retired(&self) -> BTreeMap<FileId, Nanos> {
-        self.manifest
-            .iter()
-            .filter_map(|r| match r.op {
-                ManifestOp::Retire { file } => Some((file, r.at)),
-                ManifestOp::Add { .. } | ManifestOp::Seal { .. } | ManifestOp::Restore { .. } => {
-                    None
+    /// Retired files, each with the record that retired it: its epoch and
+    /// the files that replaced it (added by the same record).
+    pub fn retired(&self) -> BTreeMap<FileId, (u64, Vec<FileId>)> {
+        let mut out = BTreeMap::new();
+        for r in &self.manifest {
+            if let ManifestOp::Publish { added, retired, .. } = &r.op {
+                for f in retired {
+                    out.insert(*f, (r.epoch, added.iter().map(|a| a.file).collect()));
                 }
-            })
-            .collect()
+            }
+        }
+        out
     }
 
     /// Files listed (published and not retired) at `epoch`.
     pub fn listed_at(&self, epoch: u64) -> Vec<FileId> {
         let mut set = BTreeSet::new();
         for r in self.manifest.iter().take_while(|r| r.epoch <= epoch) {
-            match r.op {
-                ManifestOp::Add { file, .. } => {
-                    set.insert(file);
+            if let ManifestOp::Publish { added, retired, .. } = &r.op {
+                set.extend(added.iter().map(|a| a.file));
+                for f in retired {
+                    set.remove(f);
                 }
-                ManifestOp::Retire { file } => {
-                    set.remove(&file);
-                }
-                ManifestOp::Seal { .. } | ManifestOp::Restore { .. } => {}
             }
         }
         set.into_iter().collect()
+    }
+
+    /// The latest epoch, or 0 before the first record.
+    pub fn latest_epoch(&self) -> u64 {
+        self.manifest.last().map_or(0, |r| r.epoch)
     }
 
     /// Whether a verified copy exists outside the fast disk.
@@ -1141,10 +1209,9 @@ impl Disk {
 
     /// The latest hash the manifest records for a file.
     pub fn manifest_hash(&self, f: FileId) -> Option<u64> {
-        self.manifest.iter().rev().find_map(|r| match r.op {
-            ManifestOp::Add { file, hash, .. } | ManifestOp::Seal { file, hash } if file == f => {
-                Some(hash)
-            }
+        self.manifest.iter().rev().find_map(|r| match &r.op {
+            ManifestOp::Seal { file, hash } if *file == f => Some(*hash),
+            ManifestOp::Publish { added, .. } => added.iter().find(|a| a.file == f).map(|a| a.hash),
             _ => None,
         })
     }
@@ -1304,6 +1371,14 @@ struct Volatile {
     skew_run: BTreeMap<SeriesId, u32>,
     /// While a restore is bringing detail back (§8 Restore steps 2–4).
     restore: Option<RestoreRt>,
+    /// The writer's monotonic clock at its start (§7 grace and leases).
+    started: Nanos,
+    /// The monotonic instant of each retiring record written since the start,
+    /// by epoch (§7 Retired files).
+    retired_mono: BTreeMap<u64, Nanos>,
+    /// Per lease, the counter last observed and when the writer first
+    /// observed it (§7 Leases).
+    leases_seen: BTreeMap<u64, (u64, Nanos)>,
 }
 
 /// Volatile state derived from the disk alone.
@@ -1588,6 +1663,17 @@ impl Model {
             sync_failed,
             skew_run: BTreeMap::new(),
             restore: d.restore,
+            started: self.mono,
+            retired_mono: BTreeMap::new(),
+            // At writer start, every lease of the current boot counts as
+            // first observed then (§7 Leases).
+            leases_seen: self
+                .disk
+                .leases
+                .iter()
+                .filter(|(_, l)| l.boot == self.boot)
+                .map(|(id, l)| (*id, (l.counter, self.mono)))
+                .collect(),
         });
         for (i, cursor) in resuming {
             self.begin_resume(i, cursor);
@@ -1757,8 +1843,9 @@ impl Model {
         (trees, rt)
     }
 
-    /// Discards unpublished compaction outputs and resumes retirements of
-    /// files whose replacements are published (§3 Recovery).
+    /// Discards unpublished compaction outputs (§9 rows 9 and 10). A
+    /// record publishes outputs and retires inputs atomically, so nothing
+    /// else is left to finish.
     fn clean_up_files(&mut self) {
         let published = self.disk.published();
         let orphans: Vec<FileId> = self
@@ -1771,23 +1858,6 @@ impl Model {
         for f in orphans {
             self.disk.hot.remove(&f);
             self.counters.compaction_discarded += 1;
-        }
-        let retired = self.disk.retired();
-        let pending: Vec<FileId> = self
-            .disk
-            .manifest
-            .iter()
-            .flat_map(|r| match &r.op {
-                ManifestOp::Add { replaces, .. } => replaces.clone(),
-                ManifestOp::Retire { .. }
-                | ManifestOp::Seal { .. }
-                | ManifestOp::Restore { .. } => Vec::new(),
-            })
-            .filter(|f| !retired.contains_key(f))
-            .collect();
-        for f in pending {
-            let at = self.wall;
-            self.disk.retire(at, f);
         }
     }
 
@@ -2346,7 +2416,8 @@ impl Model {
                 },
             );
             self.disk.hot.insert(id);
-            self.disk.add(self.wall, id, Vec::new());
+            self.disk
+                .publish(self.wall, &[id], Vec::new(), Vec::new(), Vec::new());
             self.disk.active = Some(id);
         }
     }
@@ -3365,59 +3436,75 @@ impl Model {
 
     // ----- compaction, manifest, tiers -----
 
-    /// Compacts all sealed, unretired segments into a current chunk and a
-    /// revision chunk (§7). Returns the new files.
-    pub fn compact(&mut self, crash: Option<CompactionCrash>) -> Result<Vec<FileId>, Error> {
-        self.vol()?;
-        if self.free_bytes() < self.config.low_mark {
-            self.counters.paused += 1;
-            return Err(Error::Paused);
+    /// Whether a position is set aside beyond a restored end (§8 Restore
+    /// step 1).
+    fn set_aside(&self, p: Position) -> bool {
+        self.disk
+            .restored_end
+            .is_some_and(|end| p.generation < self.disk.generation && p > end)
+    }
+
+    /// Positions held by live compacted files, and while a restore brings
+    /// detail back, by the compacted files it will bring back: a log segment
+    /// whose positions they hold is not compacted again.
+    fn chunk_positions(&self) -> BTreeSet<Position> {
+        let mut out = BTreeSet::new();
+        for f in self.disk.listed_at(self.disk.latest_epoch()) {
+            let file = &self.disk.files[&f];
+            if file.class != FileClass::Segment {
+                out.extend(file.entries().map(|e| e.position));
+            }
         }
-        let retired = self.disk.retired();
-        let compacted = self.disk.compacted_segments();
-        let inputs: Vec<FileId> = self
-            .disk
-            .published()
-            .into_iter()
-            .filter(|f| {
-                let file = &self.disk.files[f];
-                file.class == FileClass::Segment
-                    && file.sealed
-                    && !retired.contains_key(f)
-                    && !compacted.contains(f)
-            })
-            .collect();
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let current = self.current()?.clone();
-        let mut cur_entries = Vec::new();
-        let mut rev_entries = Vec::new();
-        for f in &inputs {
-            for e in self.disk.files[f].entries() {
-                match e.fact() {
-                    Some(fact) if current[&(fact.series, fact.t)].position != fact.position => {
-                        rev_entries.push(e.clone());
-                    }
-                    _ => cur_entries.push(e.clone()),
+        if let Some(r) = self.disk.restore.as_ref().filter(|_| self.restoring()) {
+            for f in &r.sources {
+                let file = &self.disk.bucket.objects[f].1;
+                if file.class != FileClass::Segment {
+                    out.extend(file.entries().map(|e| e.position));
                 }
             }
         }
-        let mut outputs = Vec::new();
-        for (class, entries) in [
-            (FileClass::Current, cur_entries),
-            (FileClass::Revision, rev_entries),
-        ] {
-            if entries.is_empty() {
-                continue;
+        out
+    }
+
+    /// Writes the chunks for `entries` (§7): facts outranked by a fact among
+    /// the same entries go to revision chunks, every other fact to current
+    /// chunks, one of each per series; facts set aside beyond a restored
+    /// end take no part in the ranking and go to current chunks; other
+    /// entries (registry and routing) go to one chunk of their own. Returns
+    /// the new files, unpublished.
+    fn write_chunks(&mut self, entries: Vec<Entry>) -> Vec<FileId> {
+        let mut best: BTreeMap<(SeriesId, Nanos), (u64, Position)> = BTreeMap::new();
+        for f in entries.iter().filter_map(Entry::fact) {
+            if !self.set_aside(f.position) {
+                let b = best.entry((f.series, f.t)).or_insert(f.rank());
+                *b = (*b).max(f.rank());
             }
+        }
+        let mut groups: BTreeMap<(Option<SeriesId>, u8), Vec<Entry>> = BTreeMap::new();
+        for e in entries {
+            let group = match e.fact() {
+                Some(f) if !self.set_aside(f.position) && best[&(f.series, f.t)] != f.rank() => {
+                    (Some(f.series), 1)
+                }
+                Some(f) => (Some(f.series), 0),
+                None => (None, 0),
+            };
+            groups.entry(group).or_default().push(e);
+        }
+        let mut outputs = Vec::new();
+        for ((_, class), mut entries) in groups {
+            entries.sort_by_key(|e| e.position);
             let id = FileId(self.disk.next_file);
             self.disk.next_file += 1;
             self.disk.files.insert(
                 id,
                 StoredFile {
                     id,
-                    class,
+                    class: if class == 0 {
+                        FileClass::Current
+                    } else {
+                        FileClass::Revision
+                    },
                     version: FORMAT_VERSION,
                     batches: vec![entries],
                     sealed: true,
@@ -3428,15 +3515,13 @@ impl Model {
             self.disk.hot.insert(id);
             outputs.push(id);
         }
-        if crash == Some(CompactionCrash::AfterWrite) {
-            self.crash();
-            return Err(Error::Crashed);
-        }
-        // Verify: same multiset of entries in and out.
-        let mut ins: Vec<&Entry> = inputs
-            .iter()
-            .flat_map(|f| self.disk.files[f].entries())
-            .collect();
+        outputs
+    }
+
+    /// Verifies compaction outputs against their inputs: the same entries,
+    /// each with identical content (§7: fact count and per-series checksum).
+    fn verify_chunks(&self, inputs: &[Entry], outputs: &[FileId]) {
+        let mut ins: Vec<&Entry> = inputs.iter().collect();
         let mut outs: Vec<&Entry> = outputs
             .iter()
             .flat_map(|f| self.disk.files[f].entries())
@@ -3444,16 +3529,53 @@ impl Model {
         ins.sort_by_key(|e| e.position);
         outs.sort_by_key(|e| e.position);
         assert_eq!(ins, outs, "compaction verification");
-        // Publish. The input log segments stay: compaction never retires a
-        // log segment (§7); they leave the fast disk only by eviction (§8).
-        for (i, f) in outputs.iter().enumerate() {
-            let from = if i + 1 == outputs.len() {
-                inputs.clone()
-            } else {
-                Vec::new()
-            };
-            self.disk.add_from(self.wall, *f, Vec::new(), from);
+    }
+
+    /// Compacts the sealed log segments not yet compacted into per-series
+    /// current and revision chunks, and publishes them all with one manifest
+    /// record (§7). Facts are ranked within these inputs only, so a current
+    /// chunk may hold a fact outranked later or by a fact in another file.
+    /// The input segments stay listed: compaction never retires a log
+    /// segment (§7, §8). Returns the new files.
+    pub fn compact(&mut self, crash: Option<CompactionCrash>) -> Result<Vec<FileId>, Error> {
+        self.vol()?;
+        if self.free_bytes() < self.config.low_mark {
+            self.counters.paused += 1;
+            return Err(Error::Paused);
         }
+        let retired = self.disk.retired();
+        let compacted = self.disk.compacted_segments();
+        let covered = self.chunk_positions();
+        let inputs: Vec<FileId> = self
+            .disk
+            .published()
+            .into_iter()
+            .filter(|f| {
+                let file = &self.disk.files[f];
+                file.class == FileClass::Segment
+                    && file.sealed
+                    && !retired.contains_key(f)
+                    && !compacted.contains(f)
+                    && !file.entries().all(|e| covered.contains(&e.position))
+            })
+            .collect();
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries: Vec<Entry> = inputs
+            .iter()
+            .flat_map(|f| self.disk.files[f].entries())
+            .filter(|e| !covered.contains(&e.position))
+            .cloned()
+            .collect();
+        let outputs = self.write_chunks(entries.clone());
+        if crash == Some(CompactionCrash::AfterWrite) {
+            self.crash();
+            return Err(Error::Crashed);
+        }
+        self.verify_chunks(&entries, &outputs);
+        self.disk
+            .publish(self.wall, &outputs, inputs, Vec::new(), Vec::new());
         if crash == Some(CompactionCrash::AfterPublish) {
             self.crash();
             return Err(Error::Crashed);
@@ -3461,13 +3583,200 @@ impl Model {
         Ok(outputs)
     }
 
-    /// Opens a reader at the latest manifest epoch.
+    /// The series of a compacted chunk, and the span `[first t, last t]` of
+    /// its facts.
+    fn chunk_span(&self, f: FileId) -> Option<(SeriesId, Nanos, Nanos)> {
+        let mut facts = self.disk.files[&f].entries().filter_map(Entry::fact);
+        let first = facts.next()?;
+        let (lo, hi) = facts.fold((first.t, first.t), |(lo, hi), x| (lo.min(x.t), hi.max(x.t)));
+        Some((first.series, lo, hi))
+    }
+
+    /// Compaction of compacted files (§7): for each series whose live
+    /// current chunks on the fast disk overlapping some 15-minute span
+    /// number more than `merge_threshold`, merges the chunks overlapping
+    /// such a span into new current and revision chunks (ranked within the
+    /// merged chunks), and publishes the outputs and retires the inputs in
+    /// one manifest record. Returns the new files.
+    pub fn merge_chunks(&mut self, crash: Option<CompactionCrash>) -> Result<Vec<FileId>, Error> {
+        self.vol()?;
+        if self.free_bytes() < self.config.low_mark {
+            self.counters.paused += 1;
+            return Err(Error::Paused);
+        }
+        let mut by_series: BTreeMap<SeriesId, Vec<(FileId, Nanos, Nanos)>> = BTreeMap::new();
+        for f in self.disk.listed_at(self.disk.latest_epoch()) {
+            if self.disk.files[&f].class == FileClass::Current
+                && self.disk.locality(f) == Locality::Hot
+                && let Some((s, lo, hi)) = self.chunk_span(f)
+            {
+                by_series.entry(s).or_default().push((f, lo, hi));
+            }
+        }
+        let mut all = Vec::new();
+        for chunks in by_series.into_values() {
+            let mut count: BTreeMap<Nanos, usize> = BTreeMap::new();
+            for (_, lo, hi) in &chunks {
+                let mut q = floor_to(*lo, QUARTER);
+                while q <= *hi {
+                    *count.entry(q).or_default() += 1;
+                    q += QUARTER;
+                }
+            }
+            let crowded: BTreeSet<Nanos> = count
+                .into_iter()
+                .filter(|(_, n)| *n > self.config.merge_threshold)
+                .map(|(q, _)| q)
+                .collect();
+            let inputs: Vec<FileId> = chunks
+                .iter()
+                .filter(|(_, lo, hi)| crowded.range(floor_to(*lo, QUARTER)..=*hi).next().is_some())
+                .map(|(f, _, _)| *f)
+                .collect();
+            if inputs.is_empty() {
+                continue;
+            }
+            let entries: Vec<Entry> = inputs
+                .iter()
+                .flat_map(|f| self.disk.files[f].entries())
+                .cloned()
+                .collect();
+            let outputs = self.write_chunks(entries.clone());
+            if crash == Some(CompactionCrash::AfterWrite) {
+                self.crash();
+                return Err(Error::Crashed);
+            }
+            self.verify_chunks(&entries, &outputs);
+            let epoch = self
+                .disk
+                .publish(self.wall, &outputs, Vec::new(), inputs, Vec::new());
+            let mono = self.mono;
+            self.vol_mut()?.retired_mono.insert(epoch, mono);
+            if crash == Some(CompactionCrash::AfterPublish) {
+                self.crash();
+                return Err(Error::Crashed);
+            }
+            all.extend(outputs);
+        }
+        Ok(all)
+    }
+
+    /// The latest manifest epoch and the files it lists, with no lease: an
+    /// inspection of the manifest, not a reader process (see
+    /// [`Model::lease_reader`]).
     pub fn open_reader(&self) -> Reader {
-        let epoch = self.disk.epoch() - 1;
+        let epoch = self.disk.latest_epoch();
         Reader {
             epoch,
             files: self.disk.listed_at(epoch),
+            lease: None,
         }
+    }
+
+    /// A reader process (§7 Readers): takes the latest epoch and writes a
+    /// lease file naming it, with this machine's boot id and a refresh
+    /// counter. It needs nothing from the writer's memory, so it works while
+    /// the writer is down.
+    pub fn lease_reader(&mut self) -> Reader {
+        let id = self.disk.next_lease;
+        self.disk.next_lease += 1;
+        let epoch = self.disk.latest_epoch();
+        self.disk.leases.insert(
+            id,
+            Lease {
+                epoch,
+                boot: self.boot,
+                counter: 0,
+            },
+        );
+        Reader {
+            epoch,
+            files: self.disk.listed_at(epoch),
+            lease: Some(id),
+        }
+    }
+
+    /// A reader refreshes its lease (§7: at least every 30 minutes): it
+    /// increments the refresh counter and, with `latest`, takes the latest
+    /// epoch, which the lease then names. A reader without a lease file is
+    /// returned unchanged.
+    pub fn refresh_reader(&mut self, r: &Reader, latest: bool) -> Reader {
+        let Some(lease) = r.lease.and_then(|id| self.disk.leases.get_mut(&id)) else {
+            return r.clone();
+        };
+        if latest {
+            lease.epoch = self.disk.manifest.last().map_or(0, |x| x.epoch);
+        }
+        lease.counter += 1;
+        lease.boot = self.boot;
+        let epoch = lease.epoch;
+        Reader {
+            epoch,
+            files: self.disk.listed_at(epoch),
+            lease: r.lease,
+        }
+    }
+
+    /// A reader ends and removes its lease file.
+    pub fn close_reader(&mut self, r: &Reader) {
+        if let Some(id) = r.lease {
+            self.disk.leases.remove(&id);
+        }
+    }
+
+    /// The reader processes with a lease file.
+    pub fn readers(&self) -> Vec<Reader> {
+        self.disk
+            .leases
+            .iter()
+            .map(|(id, l)| Reader {
+                epoch: l.epoch,
+                files: self.disk.listed_at(l.epoch),
+                lease: Some(*id),
+            })
+            .collect()
+    }
+
+    /// The writer reads the lease files (§7 Leases): a lease of another boot
+    /// is void; a lease whose counter differs from the value last observed is
+    /// observed now.
+    fn observe_leases(&mut self) {
+        let (boot, mono) = (self.boot, self.mono);
+        let Some(v) = self.vol.as_mut() else { return };
+        v.leases_seen
+            .retain(|id, _| self.disk.leases.get(id).is_some_and(|l| l.boot == boot));
+        for (id, l) in &self.disk.leases {
+            if l.boot != boot {
+                continue;
+            }
+            match v.leases_seen.get(id) {
+                Some((counter, _)) if *counter == l.counter => {}
+                _ => {
+                    v.leases_seen.insert(*id, (l.counter, mono));
+                }
+            }
+        }
+    }
+
+    /// Epochs named by live leases: of this boot, with a counter that has
+    /// changed within `lease_expiry` of the writer's monotonic clock since it
+    /// was first observed (§7 Leases).
+    pub fn live_lease_epochs(&mut self) -> Vec<u64> {
+        self.observe_leases();
+        let Some(v) = self.vol.as_ref() else {
+            return Vec::new();
+        };
+        self.disk
+            .leases
+            .iter()
+            .filter(|(id, l)| {
+                l.boot == self.boot
+                    && v.leases_seen
+                        .get(id)
+                        .is_some_and(|(_, at)| self.mono - at < self.config.lease_expiry)
+            })
+            .map(|(_, l)| l.epoch)
+            .collect()
     }
 
     /// Reads every file a reader's epoch lists: where each was found, and the
@@ -3527,6 +3836,15 @@ impl Model {
             self.disk.bucket.objects.insert(f, (want, content));
             n += 1;
         }
+        // After its files, each manifest record (§8 Continuous backup).
+        for r in &self.disk.manifest {
+            if let ManifestOp::Publish { added, retired, .. } = &r.op
+                && !retired.is_empty()
+                && added.iter().all(|a| self.disk.in_bucket(a.file))
+            {
+                self.disk.bucket.retired.extend(retired.iter().copied());
+            }
+        }
         n
     }
 
@@ -3544,22 +3862,52 @@ impl Model {
             self.counters.paused += 1;
             return Err(Error::Paused);
         }
+        self.vol()?;
         let mut removed = Vec::new();
         let retired = self.disk.retired();
+        // Retired files (§7): removed locally only after the grace period on
+        // the writer's monotonic clock since the later of the retirement
+        // record and the writer's start, once the files that replaced them
+        // are verified in another tier, and when no live lease names an
+        // older epoch. A copy leaves a tier only when another tier holds a
+        // verified copy (§1.4, invariant 12).
+        let leases = self.live_lease_epochs();
+        let v = self.vol()?;
+        let removable: Vec<FileId> = retired
+            .iter()
+            .filter(|(f, (epoch, replacements))| {
+                let since = v.retired_mono.get(epoch).copied().unwrap_or(v.started);
+                (self.disk.hot.contains(f) || self.disk.cold.contains(f))
+                    && self.mono - since >= self.config.grace
+                    && replacements
+                        .iter()
+                        .all(|r| self.disk.verified_elsewhere(*r))
+                    && !leases.iter().any(|e| e < epoch)
+            })
+            .map(|(f, _)| *f)
+            .collect();
+        for f in removable {
+            if self.disk.hot.contains(&f) && self.disk.verified_elsewhere(f) {
+                self.disk.hot.remove(&f);
+                removed.push(f);
+            }
+            if self.disk.cold.contains(&f) && self.disk.in_bucket(f) {
+                self.disk.cold.remove(&f);
+            }
+        }
         let hot: Vec<FileId> = self.disk.hot.iter().copied().collect();
         for f in hot {
-            if !self.disk.verified_elsewhere(f) || self.disk.active == Some(f) {
+            if !self.disk.verified_elsewhere(f)
+                || self.disk.active == Some(f)
+                || retired.contains_key(&f)
+            {
                 continue;
             }
             let file = &self.disk.files[&f];
-            let remove = if let Some(at) = retired.get(&f) {
-                self.wall - at >= self.config.grace
-            } else {
-                matches!(file.class, FileClass::Revision | FileClass::Segment)
-                    && file
-                        .sealed_at
-                        .is_some_and(|s| self.wall - s >= self.config.eviction_age)
-            };
+            let remove = matches!(file.class, FileClass::Revision | FileClass::Segment)
+                && file
+                    .sealed_at
+                    .is_some_and(|s| self.wall - s >= self.config.eviction_age);
             if remove {
                 self.disk.hot.remove(&f);
                 removed.push(f);
@@ -3898,7 +4246,12 @@ impl Model {
             generation,
             restored_end: end,
             checkpoint,
-            sources: bucket.objects.keys().copied().collect(),
+            sources: bucket
+                .objects
+                .keys()
+                .filter(|f| !bucket.retired.contains(f))
+                .copied()
+                .collect(),
             latest_t,
             verified: BTreeSet::new(),
             differences: Vec::new(),
@@ -4102,17 +4455,9 @@ impl Model {
         self.disk.next_file = self.disk.next_file.max(id.0 + 1);
         self.disk.files.insert(id, content);
         self.disk.hot.insert(id);
-        let epoch = self.disk.epoch();
-        self.disk.manifest.push(ManifestRecord {
-            epoch,
-            at: self.wall,
-            op: ManifestOp::Add {
-                file: id,
-                replaces: Vec::new(),
-                from: Vec::new(),
-                hash,
-            },
-        });
+        debug_assert_eq!(hash, self.disk.files[&id].hash());
+        self.disk
+            .publish(self.wall, &[id], Vec::new(), Vec::new(), Vec::new());
         Ok(())
     }
 

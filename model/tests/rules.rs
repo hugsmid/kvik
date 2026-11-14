@@ -3,23 +3,24 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use kvik_model::condition::{Condition, ConditionState};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
-    Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, ManifestOp, Model, Operator, Reason,
-    Refusal, Selection, Signal, TriggerCause, Wait, WriteOutcome,
+    Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, Locality, ManifestOp, Model,
+    Operator, Reason, Refusal, Selection, Signal, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
 use kvik_model::registry::{ChangedAtKind, RegistryError, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
-    DAY, HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId, Value, ValueType,
-    exact,
+    DAY, Fact, HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId, Value,
+    ValueType, exact,
 };
+use kvik_model::view;
 
 fn model(staleness: Nanos) -> (Model, SeriesId) {
     let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
@@ -994,8 +995,8 @@ fn s8_restore_record_written_before_ingest() {
         .manifest
         .iter()
         .position(|x| {
-            matches!(x.op, ManifestOp::Add { file, .. }
-                if r.disk.files[&file].entries().any(|e| e.position == Position::new(1, 1)))
+            matches!(&x.op, ManifestOp::Publish { added, .. }
+                if added.iter().any(|a| r.disk.files[&a.file].entries().any(|e| e.position == Position::new(1, 1))))
         })
         .unwrap();
     assert!(at < first_new);
@@ -1176,9 +1177,15 @@ fn s8_download_order_current_then_revision_then_log() {
     while let Some(f) = r.restore_step().unwrap() {
         order.push(r.disk.files[&f].class);
     }
+    // Current chunks of the registry entries and of the series.
     assert_eq!(
         order,
-        vec![FileClass::Current, FileClass::Revision, FileClass::Segment]
+        vec![
+            FileClass::Current,
+            FileClass::Current,
+            FileClass::Revision,
+            FileClass::Segment
+        ]
     );
     assert!(!r.restoring());
 }
@@ -1215,7 +1222,8 @@ fn s8_detail_back_verifies_checkpoint_and_removes_label() {
     let (mut m, s, _) = checkpointed_model();
     let mut r = restore_in_progress(&mut m, &BTreeMap::new());
     assert!(r.checkpoint_unverified());
-    r.restore_step().unwrap(); // current chunk
+    r.restore_step().unwrap(); // current chunk of the registry entries
+    r.restore_step().unwrap(); // current chunk of the series
     assert!(r.checkpoint_unverified(), "a revision is still remote");
     r.restore_step().unwrap(); // revision chunk: every fact of the span is local
     assert!(!r.checkpoint_unverified());
@@ -1258,7 +1266,7 @@ fn s8_restart_after_record_resumes_in_its_generation() {
     r.restart();
     assert_eq!(r.disk.generation, 1);
     assert!(r.restoring());
-    assert_eq!(r.restore_queue().len(), 2);
+    assert_eq!(r.restore_queue().len(), 3);
     r.restore_rest().unwrap();
     assert_eq!(r.current().unwrap(), m.current().unwrap());
     assert!(r.tree(s).unwrap().same_summaries(m.tree(s).unwrap()));
@@ -2317,4 +2325,253 @@ fn s8_version_index_ranks_facts_while_restoring() {
     r.restore_rest().unwrap();
     assert_eq!(r.current().unwrap()[&(s, T0)].value, n(4.0));
     assert_eq!(r.current().unwrap()[&(s, T0 + SECOND)].value, n(3.0));
+}
+
+// ----- compaction and files (§7) -----
+
+/// A store with `n` compactions, each of one log segment holding one fact of
+/// series `s` in the first 15 minutes after `T0`. Returns the current chunks
+/// of `s` in order.
+fn chunked_model(n: i64) -> (Model, SeriesId, Vec<FileId>) {
+    let (mut m, s) = model(10 * SECOND);
+    let mut chunks = Vec::new();
+    for i in 0..n {
+        m.ingest(vec![Reading::num(s, T0 + i * SECOND, i as f64)])
+            .unwrap();
+        m.seal_active();
+        for f in m.compact(None).unwrap() {
+            if m.disk.files[&f].class == FileClass::Current
+                && m.disk.files[&f].entries().any(|e| e.fact().is_some())
+            {
+                chunks.push(f);
+            }
+        }
+    }
+    (m, s, chunks)
+}
+
+/// The record that added `f`.
+fn record_adding(m: &Model, f: FileId) -> &kvik_model::engine::ManifestRecord {
+    m.disk
+        .manifest
+        .iter()
+        .find(|r| matches!(&r.op, ManifestOp::Publish { added, .. } if added.iter().any(|a| a.file == f)))
+        .unwrap()
+}
+
+/// §7: "Compaction rearranges facts from whole sealed log segments into
+/// per-series chunks"; "Current facts and revisions go to separate chunks";
+/// "One record may add files, retire files and move files between tiers
+/// atomically"; "Log segments are never retired by compaction".
+#[test]
+fn s7_compaction_publishes_per_series_chunks_in_one_record() {
+    let (mut m, a) = model(10 * SECOND);
+    let b = m
+        .define(
+            "vehicle/8/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "km/h",
+            10 * SECOND,
+        )
+        .unwrap();
+    m.ingest(vec![Reading::num(a, T0, 1.0), Reading::num(b, T0, 2.0)])
+        .unwrap();
+    m.ingest(vec![Reading::num(a, T0, 3.0)]).unwrap();
+    m.seal_active();
+    let segments = m.disk.listed_at(m.disk.latest_epoch());
+    let out = m.compact(None).unwrap();
+    // Current and revision chunks of `a`, the current chunk of `b`, and the
+    // chunk of the registry entries.
+    assert_eq!(out.len(), 4);
+    let record = record_adding(&m, out[0]);
+    let ManifestOp::Publish { added, retired, .. } = &record.op else {
+        unreachable!()
+    };
+    assert_eq!(added.iter().map(|x| x.file).collect::<Vec<_>>(), out);
+    assert!(added.iter().all(|x| x.from == segments));
+    assert!(retired.is_empty());
+    for f in &out {
+        let series: BTreeSet<SeriesId> = m.disk.files[f]
+            .entries()
+            .filter_map(|e| e.fact().map(|x| x.series))
+            .collect();
+        assert!(series.len() <= 1, "one series per chunk");
+    }
+    let listed = m.disk.listed_at(m.disk.latest_epoch());
+    assert!(segments.iter().all(|f| listed.contains(f)));
+}
+
+/// §7: "A revision chunk holds only facts outranked by a fact within the same
+/// compaction's inputs, so the current view never needs revision chunks. A
+/// current chunk may hold facts outranked later or by a fact in another file;
+/// readers resolve the current view across current chunks by rank."
+#[test]
+fn s7_revision_chunks_hold_only_facts_outranked_within_the_inputs() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.seal_active();
+    m.ingest(vec![Reading::num(s, T0, 2.0)]).unwrap();
+    m.seal_active();
+    // Both segments in one compaction: the first fact is a revision.
+    let mut one = m.clone();
+    let out = one.compact(None).unwrap();
+    let revisions: Vec<FileId> = out
+        .iter()
+        .copied()
+        .filter(|f| one.disk.files[f].class == FileClass::Revision)
+        .collect();
+    assert_eq!(revisions.len(), 1);
+    // Each segment compacted alone: no revision chunk; the outranked fact
+    // stays in a current chunk and the current view is still by rank.
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.ingest(vec![Reading::num(s, T0, 2.0)]).unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    assert!(
+        m.disk
+            .files
+            .values()
+            .all(|f| f.class != FileClass::Revision)
+    );
+    let r = m.open_reader();
+    let chunks: Vec<Fact> = r
+        .files
+        .iter()
+        .filter(|f| m.disk.files[*f].class == FileClass::Current)
+        .flat_map(|f| m.disk.files[f].entries().filter_map(|e| e.fact().cloned()))
+        .collect();
+    assert_eq!(view::current(chunks.iter())[&(s, T0)].value, n(2.0));
+    m.restart();
+    assert_eq!(m.current().unwrap()[&(s, T0)].value, n(2.0));
+}
+
+/// §7: "Compaction of compacted files (merging overlapping chunks created by
+/// late data) publishes outputs and retires inputs in one record. Policy:
+/// merge when a series' chunks overlapping any 15-minute span exceed 4."
+#[test]
+fn s7_merge_publishes_outputs_and_retires_inputs_in_one_record() {
+    let (mut m, s, chunks) = chunked_model(4);
+    assert_eq!(
+        m.merge_chunks(None).unwrap(),
+        Vec::new(),
+        "four do not exceed 4"
+    );
+    m.ingest(vec![Reading::num(s, T0, 100.0)]).unwrap(); // a correction
+    m.seal_active();
+    let mut chunks = chunks;
+    chunks.extend(
+        m.compact(None)
+            .unwrap()
+            .into_iter()
+            .filter(|f| m.disk.files[f].class == FileClass::Current),
+    );
+    let before = durable(&m);
+    let out = m.merge_chunks(None).unwrap();
+    let record = record_adding(&m, out[0]);
+    let ManifestOp::Publish { added, retired, .. } = &record.op else {
+        unreachable!()
+    };
+    assert_eq!(added.iter().map(|x| x.file).collect::<Vec<_>>(), out);
+    let mut retired = retired.clone();
+    retired.sort();
+    assert_eq!(retired, chunks);
+    // The outputs: one current chunk, and a revision chunk for the corrected
+    // fact, which is now outranked within the merged inputs.
+    let classes: Vec<FileClass> = out.iter().map(|f| m.disk.files[f].class).collect();
+    assert_eq!(classes, vec![FileClass::Current, FileClass::Revision]);
+    assert_eq!(durable(&m), before);
+    assert_eq!(m.current().unwrap()[&(s, T0)].value, n(100.0));
+}
+
+/// §7: "Retired files are removed locally only after the grace period (1 hour
+/// of the writer's monotonic clock since the later of the retirement record
+/// and the writer's start), once the files that replaced them are verified in
+/// another tier". A jump of the wall clock does not count, and a restart
+/// starts the hour again.
+#[test]
+fn s7_retired_files_removed_after_grace_on_the_monotonic_clock() {
+    let (mut m, _, chunks) = chunked_model(5);
+    let out = m.merge_chunks(None).unwrap();
+    m.advance(2 * HOUR);
+    assert!(
+        m.housekeeping().unwrap().is_empty(),
+        "replacements not verified elsewhere"
+    );
+    m.upload();
+    assert!(out.iter().all(|f| m.disk.in_bucket(*f)));
+    // A merge after the upload: its inputs are the fresh chunk only after
+    // the grace period.
+    let (mut m, _, chunks2) = chunked_model(5);
+    let old = m.open_reader();
+    let (_, facts) = m.read(&old).unwrap();
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    m.jump_wall(2 * HOUR);
+    assert!(
+        m.housekeeping().unwrap().is_empty(),
+        "the wall clock does not count"
+    );
+    m.advance(HOUR - 1);
+    m.crash();
+    m.restart();
+    m.advance(1);
+    assert!(
+        m.housekeeping().unwrap().is_empty(),
+        "a restart starts the hour again"
+    );
+    m.advance(HOUR - 1);
+    let mut gone = m.housekeeping().unwrap();
+    gone.sort();
+    assert_eq!(gone, chunks2);
+    assert_eq!(chunks.len(), chunks2.len());
+    // Removed locally, the files still read from the bucket.
+    let (loc, again) = m.read(&old).unwrap();
+    assert!(loc.iter().any(|(_, l)| *l == Locality::Remote));
+    assert!(loc.iter().all(|(_, l)| *l != Locality::Missing));
+    assert_eq!(again, facts);
+}
+
+/// §7 Leases: "The writer expires a lease when its counter has not changed for
+/// 1 hour of the writer's monotonic clock since the writer first observed
+/// that value; at writer start, every lease of the current boot counts as
+/// first observed then. A lease with a different boot id is void."
+#[test]
+fn s7_leases_expire_on_the_writers_monotonic_clock() {
+    let (mut m, _, _) = chunked_model(5);
+    let reader = m.lease_reader();
+    let epoch = reader.epoch;
+    // The writer observes the lease when it reads the lease files.
+    assert_eq!(m.live_lease_epochs(), vec![epoch]);
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    m.advance(HOUR - 1);
+    assert_eq!(m.live_lease_epochs(), vec![epoch]);
+    m.advance(1);
+    assert!(m.live_lease_epochs().is_empty(), "unchanged for an hour");
+    // A refresh is observed and makes the lease live again.
+    let reader = m.refresh_reader(&reader, false);
+    assert_eq!(m.live_lease_epochs(), vec![epoch]);
+    m.advance(HOUR - 1);
+    m.crash();
+    m.restart();
+    m.advance(HOUR - 1);
+    assert_eq!(
+        m.live_lease_epochs(),
+        vec![epoch],
+        "first observed at the writer's start"
+    );
+    m.advance(1);
+    assert!(m.live_lease_epochs().is_empty());
+    m.refresh_reader(&reader, false);
+    assert_eq!(m.live_lease_epochs(), vec![epoch]);
+    m.power_loss();
+    m.restart();
+    assert!(
+        m.live_lease_epochs().is_empty(),
+        "a lease of another boot is void"
+    );
 }

@@ -176,10 +176,26 @@ pub enum Op {
     },
     Seal,
     Compact(Option<CompactionCrash>),
+    /// Compaction of compacted files (§7).
+    Merge(Option<CompactionCrash>),
     Upload,
     Bucket(bool),
     CopyCold,
     Housekeeping,
+    /// A reader process takes a lease (§7 Readers).
+    OpenReader,
+    /// A reader refreshes its lease, taking the latest epoch or not.
+    RefreshReader(proptest::sample::Index, bool),
+    /// A reader ends.
+    CloseReader(proptest::sample::Index),
+}
+
+pub fn arb_compaction_crash() -> impl Strategy<Value = Option<CompactionCrash>> {
+    prop_oneof![
+        4 => Just(None),
+        1 => Just(Some(CompactionCrash::AfterWrite)),
+        1 => Just(Some(CompactionCrash::AfterPublish))
+    ]
 }
 
 pub fn arb_fault() -> impl Strategy<Value = Option<Fault>> {
@@ -200,8 +216,9 @@ pub fn arb_fault() -> impl Strategy<Value = Option<Fault>> {
     ]
 }
 
-pub fn arb_op() -> impl Strategy<Value = Op> {
-    let emit = (0usize..=VERSIONED)
+/// A reading for one of [`machine`]'s series.
+pub fn arb_emit() -> impl Strategy<Value = Op> {
+    (0usize..=VERSIONED)
         .prop_flat_map(|s| {
             (
                 Just(s),
@@ -225,7 +242,11 @@ pub fn arb_op() -> impl Strategy<Value = Op> {
             bad,
             revise,
             changed_at,
-        });
+        })
+}
+
+pub fn arb_op() -> impl Strategy<Value = Op> {
+    let emit = arb_emit();
     prop_oneof![
         20 => emit,
         8 => arb_fault().prop_map(Op::Commit),
@@ -240,16 +261,31 @@ pub fn arb_op() -> impl Strategy<Value = Op> {
         3 => (0usize..2, 1usize..5).prop_map(|(c, n)| Op::CatchUp { c, n }),
         1 => (0usize..2).prop_map(|c| Op::Reconnect { c }),
         1 => Just(Op::Seal),
-        2 => prop_oneof![
-            4 => Just(None),
-            1 => Just(Some(CompactionCrash::AfterWrite)),
-            1 => Just(Some(CompactionCrash::AfterPublish))
-        ]
-        .prop_map(Op::Compact),
+        3 => arb_compaction_crash().prop_map(Op::Compact),
+        2 => arb_compaction_crash().prop_map(Op::Merge),
         2 => Just(Op::Upload),
         1 => any::<bool>().prop_map(Op::Bucket),
         1 => Just(Op::CopyCold),
         2 => Just(Op::Housekeeping),
+        1 => Just(Op::OpenReader),
+        1 => (any::<proptest::sample::Index>(), any::<bool>()).prop_map(|(i, l)| Op::RefreshReader(i, l)),
+        1 => any::<proptest::sample::Index>().prop_map(Op::CloseReader),
+    ]
+}
+
+/// [`arb_op`] with more sealing, compaction and compaction of compacted
+/// files, for the invariants about files (12 and 14).
+pub fn arb_files_op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        6 => arb_op(),
+        6 => arb_emit(),
+        3 => Just(Op::Commit(None)),
+        2 => Just(Op::Seal),
+        2 => arb_compaction_crash().prop_map(Op::Compact),
+        2 => arb_compaction_crash().prop_map(Op::Merge),
+        2 => Just(Op::Upload),
+        2 => Just(Op::Housekeeping),
+        1 => Just(Op::Advance(2 * HOUR)),
     ]
 }
 
@@ -281,6 +317,7 @@ pub const NAMES: [&str; 4] = [
 pub fn machine() -> (Model, Vec<SeriesId>) {
     let cfg = Config {
         seal_after_batches: 3,
+        merge_threshold: 1,
         ..Config::default()
     };
     let mut m = Model::new(cfg, consumers(), T0 + 3600 * SECOND);
@@ -328,6 +365,9 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             | Op::Advance(_)
             | Op::JumpWall(_)
             | Op::Bucket(_)
+            | Op::OpenReader
+            | Op::RefreshReader(..)
+            | Op::CloseReader(_)
     );
     if needs_up && !m.is_up() {
         m.restart();
@@ -387,6 +427,24 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
         Op::Seal => m.seal_active(),
         Op::Compact(c) => {
             let _ = m.compact(*c);
+        }
+        Op::Merge(c) => {
+            let _ = m.merge_chunks(*c);
+        }
+        Op::OpenReader => {
+            m.lease_reader();
+        }
+        Op::RefreshReader(i, latest) => {
+            let readers = m.readers();
+            if !readers.is_empty() {
+                m.refresh_reader(i.get(&readers), *latest);
+            }
+        }
+        Op::CloseReader(i) => {
+            let readers = m.readers();
+            if !readers.is_empty() {
+                m.close_reader(i.get(&readers));
+            }
         }
         Op::Upload => {
             m.upload();
@@ -1011,4 +1069,26 @@ pub fn condition_now(m: &Model, f: &Funnel, latch: Option<&ConditionState>) -> C
             ConditionState::Active(last.is_some_and(|r| m.wall - r >= staleness + n))
         }
     }
+}
+
+/// Invariant 14: the first position, if any, that two live compacted files
+/// listed at one epoch both hold. Log segments are left out: they stay listed
+/// beside the chunks compacted from them (see `OPEN-QUESTIONS.md` Q-71).
+pub fn inv14_overlap(m: &Model) -> Option<(u64, Position)> {
+    use kvik_model::engine::FileClass;
+    for r in &m.disk.manifest {
+        let mut seen = BTreeSet::new();
+        for f in m.disk.listed_at(r.epoch) {
+            let file = &m.disk.files[&f];
+            if file.class == FileClass::Segment {
+                continue;
+            }
+            for e in file.entries() {
+                if !seen.insert(e.position) {
+                    return Some((r.epoch, e.position));
+                }
+            }
+        }
+    }
+    None
 }

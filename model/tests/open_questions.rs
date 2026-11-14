@@ -130,7 +130,8 @@ fn q39_nothing_local_before_the_record() {
 fn q39_restoring_ends_when_every_file_is_local() {
     let (mut m, _, _) = checkpointed_model();
     let mut r = restore_in_progress(&mut m, &BTreeMap::new());
-    r.restore_step().unwrap(); // current chunk
+    r.restore_step().unwrap(); // current chunk of the registry entries
+    r.restore_step().unwrap(); // current chunk of the series
     r.restore_step().unwrap(); // revision chunk
     assert!(!r.checkpoint_unverified());
     assert!(r.restoring(), "a log segment is still remote");
@@ -151,8 +152,10 @@ fn q39_revised_key_index_back_with_current_chunks() {
     let p = before.ingest(vec![replay.clone()]).unwrap();
     assert_eq!(p.positions.len(), 1, "recorded unchecked");
     assert_eq!(before.counters.duplicates_unchecked, 1);
-    let f = r.restore_step().unwrap().unwrap();
-    assert_eq!(r.disk.files[&f].class, FileClass::Current);
+    for _ in 0..2 {
+        let f = r.restore_step().unwrap().unwrap();
+        assert_eq!(r.disk.files[&f].class, FileClass::Current);
+    }
     let p = r.ingest(vec![replay]).unwrap();
     assert_eq!((p.positions.len(), p.duplicates), (0, 1));
     assert_eq!(r.counters.duplicates_unchecked, 0);
@@ -558,4 +561,43 @@ fn q64_route_before_checkpoint_not_in_force_until_its_entry_is_back() {
     let q = r.ingest(vec![Reading::num(s, now, 6.0)]).unwrap().positions[0];
     r.drain().unwrap();
     assert!(observed_positions(&r, C.0).contains(&q));
+}
+
+/// Q-71: a log segment stays listed beside the chunks compacted from it, so
+/// one epoch lists two live files holding the same position. The model
+/// checks invariant 14 among compacted files only, and does not compact a
+/// segment again whose positions live chunks hold (also after a restore).
+#[test]
+fn q71_log_segment_and_its_chunks_listed_in_one_epoch() {
+    let (mut m, s, _) = checkpointed_model();
+    let p = Position::new(0, 2);
+    let epoch = m.disk.latest_epoch();
+    let holding: Vec<FileClass> = m
+        .disk
+        .listed_at(epoch)
+        .into_iter()
+        .filter(|f| m.disk.files[f].entries().any(|e| e.position == p))
+        .map(|f| m.disk.files[&f].class)
+        .collect();
+    assert_eq!(holding, vec![FileClass::Segment, FileClass::Current]);
+    assert_eq!(inv14_overlap(&m), None);
+    let mut r = Model::restore_from(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        m.wall,
+        false,
+    )
+    .unwrap();
+    r.ingest(vec![Reading::num(s, T0 + HOUR, 1.0)]).unwrap();
+    r.seal_active();
+    let out = r.compact(None).unwrap();
+    // The segment never compacted before the restore is compacted now; the
+    // one compacted into the restored chunks is not.
+    assert!(!out.is_empty());
+    assert!(
+        out.iter()
+            .all(|f| r.disk.files[f].entries().all(|e| e.position != p))
+    );
+    assert_eq!(inv14_overlap(&r), None);
 }
