@@ -49,7 +49,7 @@ sources must be acted on quickly, kept for years and restored to a known, record
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-losses-dark.svg">
-    <img src="docs/assets/card-losses.svg" width="160" alt="Losses reported, never silent">
+    <img src="docs/assets/card-losses.svg" width="160" alt="Losses reported, not hidden">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/card-drilldown-dark.svg">
@@ -73,7 +73,9 @@ From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 - **Data moves; the engine never deletes it.** A file leaves fast local disk for cold or deep storage only after a
   hash-verified copy exists there, and there is no purge. Losses the engine cannot prevent, such as a corrupt block
   with no other copy or a file the bucket has lost when a restore reads it, are recorded as lost ranges and reported as `data_lost`.
-- **No silent loss.** Anything refused, repeated, flagged or delayed is counted and visible.
+- **No silent loss.** Anything refused, repeated, flagged or delayed is counted and visible. The one accepted
+  exception, a write that was never acknowledged or delivered and left no trace after a recovery, is set out in
+  [spec §1](docs/spec.md#1-principles).
 - **Restore to a known point.** A restore from the bucket starts a new generation and is restored to a known,
   recorded point. Positions beyond it that reached the bucket are set aside: kept and exportable, never silently
   mixed in. Facts in files that were never backed up are lost.
