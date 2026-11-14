@@ -498,6 +498,32 @@ fn zeros_below_the_mark_are_not_the_end_of_data() {
     }
 }
 
+#[test]
+fn zeros_running_to_the_mark_are_an_invalid_region() {
+    // `format.md` A.2: zeros are the end of data only when the limit is the end of the file. Up to a mark's offset
+    // they are an invalid region, also when nothing else follows them below it.
+    let (mut s, offsets) = segment(ID, 2048, 1, &three_batches());
+    let e = ends(s.bytes(), &offsets);
+    put(
+        s.bytes_mut(),
+        offsets[2],
+        &vec![0; (e[2] - offsets[2]) as usize],
+    );
+    let r = scan(s.bytes(), &ID, ScanLimit::Mark(e[2])).unwrap();
+    assert_eq!(
+        r.batches.iter().map(|b| b.offset).collect::<Vec<_>>(),
+        [offsets[0], offsets[1]]
+    );
+    assert_eq!(r.regions.len(), 1);
+    assert_eq!((r.regions[0].start, r.regions[0].end), (offsets[2], e[2]));
+    assert_eq!(r.regions[0].first_sequence_after, None);
+    // Scanned to the end of the file, the same zeros are a clean end of data.
+    let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();
+    assert_eq!(r.batches.len(), 2);
+    assert!(r.regions.is_empty());
+    assert!(matches!(r.tail, Some(Tail::Clean { offset }) if offset == offsets[2]));
+}
+
 fn sealed(len_after: Option<u64>) -> (SegmentImage, u64) {
     let (mut s, _) = segment(ID, 2048, 1, &three_batches());
     let records = vec![IndexRecord {

@@ -123,7 +123,8 @@ pub enum OpenError { Locked, NotAStore, StoreIdMismatch { file }, UnsupportedFor
     SiteZoneMismatch { configured, in_force }, UnknownZone, Corrupt { file }, UnsupportedPlatform { reason },
     MarkUnreadable, Config { key, reason }, Io { path, source } }     // MarkUnreadable: Reader::open only (format.md A.10)
 pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { epoch }, NoSpace { path } }
-pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault) }      // any call that appends an entry
+pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault),      // any call that appends an entry
+    NotFinal }                     // acknowledge_manifest_rebuild while the rebuild is provisional (spec §7 Manifest)
 pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid { field, reason }, UnknownZone,
     UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 }, Write(WriteError) }
 pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timestamp> }, AggregateRefused { reason },
@@ -367,8 +368,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   `manifest.rebuild_wait`, counted from each start once deep has been asked and failed. When the wait ends, or deep
   answers first, the store leaves `ReadOnly` by itself, the one fault that ends without a restart (it comes from no
   failed write). After the wait the manifest is rebuilt provisionally (`ManifestRebuilt { provisional: true }`), all
-  uploads, evictions and removals are held until deep answers, and `acknowledge_manifest_rebuild` is refused until
-  the rebuild is final (spec §7 Manifest). A corrupt restore record with no copy stays `ManifestCorrupt`.
+  uploads, evictions and removals are held until deep answers, and `acknowledge_manifest_rebuild` is refused with
+  `WriteError::NotFinal` until the rebuild is final (spec §7 Manifest). A corrupt restore record with no copy stays `ManifestCorrupt`.
   `LossCause::Unknown` is the cause of a loss that a manifest rebuild found again with no cause given by a valid
   record or recovery entry. Losses that a rebuild lists under their first missing position because no valid record
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).

@@ -215,6 +215,10 @@ pub enum WriteError {
     /// The entry may or may not be stored.
     #[error("outcome unknown: {0}")]
     OutcomeUnknown(Fault),
+    /// `acknowledge_manifest_rebuild` while the rebuild is provisional: refused until it is final (spec §7
+    /// Manifest).
+    #[error("the manifest rebuild is provisional and cannot be acknowledged until it is final")]
+    NotFinal,
 }
 
 /// The error of a series definition or change.

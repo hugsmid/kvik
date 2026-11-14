@@ -760,6 +760,11 @@ mod tests {
             let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
             assert!(r.batches.is_empty());
             let images: u64 = (0..n).map(|i| 80 * (n - i)).sum();
+            // Every image passes the header checks and is read in full: the construction reaches the cost.
+            assert!(
+                hashed >= images - 16 * n,
+                "{hashed} bytes hashed for {n} nested images ({images} bytes of images)"
+            );
             assert!(
                 hashed <= images + 64 * bytes.len() as u64,
                 "{hashed} bytes hashed for {n} nested images ({images} bytes of images)"

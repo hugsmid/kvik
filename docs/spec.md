@@ -566,14 +566,17 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   asked deep and failed; a restart starts it again. Accepted limit: a process that restarts more often than the wait
   stays read-only; the operator call `rebuild_manifest` is the way out. When the wait ends, or deep answers first,
   the store leaves the read-only state by itself, without a restart, and the start resumes from step 4 (§3 Order of a
-  start): the one exception to §3 Write or sync failure, as this read-only state comes from no failed write. After
+  start): the one exception to §3 Write or sync failure, as this read-only state comes from no failed write. Steps 1
+  to 3 of that start (the scan, any truncation under rule 1 and the sync of the kept segments) run before the wait;
+  a failed sync among them is a fault as usual and ends the start. The start pauses before step 4, which repairs
+  the manifest, and writes nothing while it waits. After
   the wait the writer rebuilds as above, **provisionally**, and continues with health degraded (`manifest_rebuilt`,
   provisional). While provisional it uploads nothing (deep cannot be reached then anyway), evicts and removes no file
   and acts on no retirement, so nothing irreversible rests on the reconstruction. A loss whose own record was the
   corrupt one and whose file has already left the local tiers (§8 Eviction at 90 days) cannot be found again from the
   local files, so `losses()` lacks it until deep answers. When deep answers with a copy of the corrupt record, the
   copy replaces what was reconstructed, by appended records; when deep answers that it holds none, the rebuild is
-  final. A provisional rebuild cannot be acknowledged: `acknowledge_manifest_rebuild` is refused until the rebuild is
+  final. A provisional rebuild cannot be acknowledged: `acknowledge_manifest_rebuild` is refused (`api.md` `WriteError::NotFinal`) until the rebuild is
   final, and one acknowledgement is given then.
 - Compaction of compacted files (merging overlapping chunks created by late data) publishes outputs and retires
   inputs in one record. Policy: merge when a series' chunks overlapping any 15-minute span exceed 4.

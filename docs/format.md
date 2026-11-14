@@ -66,9 +66,11 @@ writes it.
 
 The body follows immediately and is padded with zeros to the next multiple of 8. The next block starts there.
 
-**Reading blocks.** Sixteen zero bytes at a block boundary are *end of data* only if every byte from there to the
-reader's limit (the mark's offset, the seal blocks, or the end of the file) is zero; otherwise they start an invalid
-region. Recovery scans an unsealed segment to its end regardless (`spec.md` §3). A block is **valid** when its header checksum matches,
+**Reading blocks.** Sixteen zero bytes at a block boundary are *end of data* only when the reader's limit is the end
+of the file (an `.open` segment scanned without a mark) and every byte from there to the end is zero. Below the mark's
+offset, or before the seal blocks of a sealed segment, zeros start an invalid region, as any bytes that are not a
+complete batch do, also when they run to that limit. Recovery scans an unsealed segment to its end regardless
+(`spec.md` §3). A block is **valid** when its header checksum matches,
 `body_len` fits in the file, the body checksum matches, its type is known and its body passes the checks of its type
 (A.5, A.6). A checksum-valid block of unknown type is skipped if `skippable`, else refused (common rules). Anything
 else starts an **invalid region**. Outside a log segment, an invalid region ends the readable part of the file
