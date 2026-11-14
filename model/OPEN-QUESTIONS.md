@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-102 | §2.1 `decimal scale`, §2.5 | A finite value too large for `i64` at the series' scale |
 | Q-103 | §7 Manifest, §8 Generations, Tiers | What an automatic manifest rebuild cannot recover from local files |
 | Q-104 | §2.5, §2.4 | A supplied `Absent` value with a quality other than bad |
+| Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -476,6 +477,36 @@ then one of bad quality at the same `t` is dropped as a duplicate.
 **Proposal.** Treat it as NaN is treated: recorded as quality bad with no value, flagged and counted, with its supplied
 quality kept for the duplicate rule (one more arm beside NaN and ±∞ in `Model::commit`, `model/src/engine.rs`).
 
+## Q-105 — Reading a segment: points `format.md` Part A leaves open
+Found while building the segment reader (roadmap 4.2, crate `kvik-log`). Each part names the reading implemented
+for now; tests in `log/tests/segment.rs` pin it.
+**Scenario.** (a) *Zeros below the mark.* A.2 says sixteen zero bytes at a block boundary are the end of data for a
+reader. A.4's accepted limit leaves a zeroed hole with kept batches after it (a power loss during a zero-fill); the
+next recovery keeps those batches, records the hole as a lost range and moves the mark past them. A reader process
+that stops at the hole never reads the kept batches below the mark. (b) *An unknown skippable block inside a batch.*
+A.7 counts "data blocks" in `block_count` and hashes "the headers of the batch's data blocks"; whether a skipped block
+of unknown type (A.2) between a batch's data blocks is one of them is not said, nor whether it takes sequences. (c)
+*A refusal while resynchronising.* The common rules make an unknown critical element in any checksum-valid block a
+version refusal. While stepping through an invalid region (A.2), a checksum-valid block image can appear inside a
+text value or other bytes that are not a block; read literally, a crafted value in a damaged region makes the whole
+segment unreadable, although such an image is never accepted as a batch. (d) *The first batch against
+`base_sequence`.* A.7: "the first batch of a file starts at `base_sequence`"; but A.4 lets a recovery batch be the
+first batch of a segment and rewrites the header with F only afterwards, so a crash between the two leaves a first
+batch above `base_sequence`; A.4 Gaps lets a reader accept any gap. (e) *A header that disagrees with its name.*
+Batches are checked against the file id and generation from the file name (needed when the header is invalid, A.4);
+a valid header naming another file id or generation is not covered.
+**Implemented.** (a) Zeros at a block boundary are the end of data only if every byte up to the limit is zero;
+below the mark (and before the seal blocks of a sealed segment) they start an invalid region, and resynchronisation
+continues, as recovery's scan does. (b) Every block before the commit block is counted in `block_count`,
+`batch_bytes` and `batch_crc32c`; a skipped block takes no sequence (a block that took sequences could not be
+skipped without losing entries) and has no `received_at` to compare. (c) At a block boundary reached from a valid
+position the refusal is immediate, as written; at a candidate offset while resynchronising it applies only if the
+rest of the batch checks out (its commit block, `block_count`, `batch_bytes`, generation and `batch_crc32c`), and
+otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the last kept sequence + 1: the first
+batch may start at or above it, never below. (e) Refused (`FormatError::HeaderMismatch`); the file is not read.
+**Needed.** Confirmation of, or a rule for, each part; for (a), whether A.2's end-of-data sentence applies to a
+reader below the mark at all. To be settled by roadmap 4.5 (recovery), (a) and (c) with 4.6 (second-process reader).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -513,6 +544,7 @@ Q-87 was reopened there.
 | Q-102 | 5.1 | Series registry; recorded at the gate 3.3 review |
 | Q-103 | 6.3 | Manifest rebuild; (a) and (b) with 8.2 and 8.3; recorded at the gate 3.3 review |
 | Q-104 | 4.3 | Arrival batches; recorded after gate 3.3, from the interface crate |
+| Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).

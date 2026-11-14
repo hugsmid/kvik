@@ -34,10 +34,10 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 1. Specification settled | 8 of 8 done |
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
-> | 4. Log | 1 of 9 done (the interface crate, on the reference model) |
+> | 4. Log | 2 of 9 done (the interface crate, on the reference model; the segment container) |
 > | 5–10. Delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 15 of 47 roadmap items are done, including 3 of 9 gates.
+> 16 of 47 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -259,6 +259,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`docs/measurements/`](docs/measurements/) | Recorded measurements |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Plan for comparative benchmarks against other tools; not yet run |
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |
+| [`log/`](log/) | `kvik-log`: the on-disk log format (segment container, checksums, the reader up to the durable mark, the mark's slots), with golden files, property tests and a fuzz target |
 | [`model/OPEN-QUESTIONS.md`](model/OPEN-QUESTIONS.md) | Open questions in the specification, and where the model still differs from it |
 | [`spikes/encodings/`](spikes/encodings/) | The encoding spike behind roadmap item 2.1; not part of the engine |
 | [`spikes/commit/`](spikes/commit/) | The commit and sync spike behind roadmap item 2.2; not part of the engine |
@@ -269,7 +270,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 ```bash
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked                  # the reference model
+cargo test --locked                  # the reference model, the interface and the log format
 cargo test --locked -p encodings     # the encoding spike
 cargo test --locked -p commit        # the commit and sync spike
 cargo run --example basic            # a small tour of the model
