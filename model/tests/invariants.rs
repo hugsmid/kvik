@@ -189,9 +189,9 @@ proptest! {
 
     /// 3. For any consumer, deliveries are in position order (strictly
     /// increasing within a session; a new session resumes at or before the
-    /// cursor + 1), also with lost ranges in the open segment (row 11a).
+    /// cursor + 1).
     #[test]
-    fn inv03_delivery_in_position_order(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+    fn inv03_delivery_in_position_order(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
         m.drain().unwrap();
@@ -364,10 +364,10 @@ proptest! {
 
     /// 4. The current view equals "highest rank per `(series, t)`" (§2.2:
     /// the position, or in a versioned series `(changed_at, position)`) over
-    /// all facts in all tiers, also with lost ranges (row 11a). Checked
-    /// against the view module and against a naive maximum computed here.
+    /// all facts in all tiers. Checked against the view module and against a
+    /// naive maximum computed here.
     #[test]
-    fn inv04_current_view_over_all_tiers(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+    fn inv04_current_view_over_all_tiers(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, ids) = run(&ops)?;
         settle(&mut m);
         let all = m.disk.all_facts();
@@ -391,9 +391,9 @@ proptest! {
     }
 
     /// 5. Every tree node equals the direct computation over the current view
-    /// of its span, also after a lost range (row 11a).
+    /// of its span.
     #[test]
-    fn inv05_tree_nodes_equal_direct(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+    fn inv05_tree_nodes_equal_direct(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
         let cur = m.current().unwrap().clone();
@@ -536,9 +536,9 @@ proptest! {
 
     /// 11. No reader or consumer observes a position beyond the durable mark,
     /// whether the writer is up or down: a reader gets exactly the listed
-    /// files' content up to the mark, also with lost ranges (row 11a).
+    /// files' content up to the mark.
     #[test]
-    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, ids) = machine();
         for op in &ops {
             apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
@@ -627,9 +627,9 @@ proptest! {
     }
 
     /// 8. Rebuilding derived structures from facts yields exactly the live
-    /// structures, also after a lost range of facts (row 11a).
+    /// structures.
     #[test]
-    fn inv08_rebuild_equals_live(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+    fn inv08_rebuild_equals_live(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, _) = run(&ops)?;
         settle(&mut m);
         let rebuilt = m.rebuild_trees().unwrap();
@@ -2319,6 +2319,124 @@ proptest! {
             prop_assert!(h.reasons.contains(&Reason::DataLost(from, to)));
         }
         prop_assert!(!m.is_read_only());
+    }
+
+    /// 3 with lost ranges in the open segment (row 11a): the property of
+    /// `inv03_delivery_in_position_order` over `arb_lossy_op`. The plain
+    /// version keeps the usual operations at full weight.
+    #[test]
+    fn inv03_delivery_in_position_order_with_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, _) = run(&ops)?;
+        settle(&mut m);
+        m.drain().unwrap();
+        for c in [0u32, 1] {
+            let obs = m.observed.get(&ConsumerId(c)).cloned().unwrap_or_default();
+            let mut by_session: BTreeMap<u32, Vec<kvik_model::types::Position>> = BTreeMap::new();
+            for o in obs { by_session.entry(o.session).or_default().push(o.position); }
+            for (s, ps) in by_session {
+                prop_assert!(ps.windows(2).all(|w| w[0] < w[1]), "consumer {} session {}: {:?}", c, s, ps);
+            }
+        }
+    }
+
+    /// 4 with lost ranges in the open segment (row 11a): the property of
+    /// `inv04_current_view_over_all_tiers` over `arb_lossy_op`. The plain
+    /// version keeps the usual operations at full weight.
+    #[test]
+    fn inv04_current_view_over_all_tiers_with_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, ids) = run(&ops)?;
+        settle(&mut m);
+        let all = m.disk.all_facts();
+        prop_assert_eq!(m.current().unwrap(), &view::current(all.iter()));
+        let mut naive: BTreeMap<_, kvik_model::types::Fact> = BTreeMap::new();
+        for f in &all {
+            let key = (f.series, f.t);
+            let better = naive.get(&key).is_none_or(|g| {
+                let c = |x: &kvik_model::types::Fact| if x.series == ids[VERSIONED] { x.changed_at.unwrap() } else { 0 };
+                c(f) > c(g) || (c(f) == c(g) && f.position > g.position)
+            });
+            if better {
+                naive.insert(key, f.clone());
+            }
+        }
+        prop_assert_eq!(m.current().unwrap(), &naive);
+        // Order and repetition of the input do not matter.
+        let mut shuffled: Vec<_> = all.iter().rev().cloned().collect();
+        shuffled.extend(all.iter().cloned());
+        prop_assert_eq!(view::current(shuffled.iter()), view::current(all.iter()));
+    }
+
+    /// 5 with lost ranges in the open segment (row 11a): the property of
+    /// `inv05_tree_nodes_equal_direct` over `arb_lossy_op`. The plain
+    /// version keeps the usual operations at full weight.
+    #[test]
+    fn inv05_tree_nodes_equal_direct_with_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, _) = run(&ops)?;
+        settle(&mut m);
+        let cur = m.current().unwrap().clone();
+        for (s, tree) in m.trees().unwrap() {
+            let rs = oracle::readings(&cur, *s);
+            for (level, width) in LEVELS.iter().enumerate() {
+                // Only the levels the density rule keeps are stored (§5.1).
+                prop_assert!(tree.stores(level) || tree.stored(level).next().is_none());
+                let mut starts: BTreeSet<Nanos> = tree.stored(level).map(|n| n.start).collect();
+                // Also some empty nodes next to stored ones.
+                let extra: Vec<Nanos> = starts.iter().map(|s| s + width).collect();
+                starts.extend(extra);
+                for st in starts {
+                    let want = oracle::node(&tree.params, &rs, st, st + width);
+                    prop_assert_eq!(tree.node(level, st), want, "series {} level {} start {}", s, level, st);
+                }
+            }
+        }
+    }
+
+    /// 8 with lost ranges in the open segment (row 11a): the property of
+    /// `inv08_rebuild_equals_live` over `arb_lossy_op`. The plain
+    /// version keeps the usual operations at full weight.
+    #[test]
+    fn inv08_rebuild_equals_live_with_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, _) = run(&ops)?;
+        settle(&mut m);
+        let rebuilt = m.rebuild_trees().unwrap();
+        let live = m.trees().unwrap();
+        prop_assert_eq!(rebuilt.len(), live.len());
+        for (s, t) in live {
+            prop_assert!(t.same_summaries(&rebuilt[s]), "series {} differs", s);
+        }
+        // And after a restart (everything volatile rebuilt from disk).
+        let before = m.trees().unwrap().clone();
+        let cur = m.current().unwrap().clone();
+        m.restart();
+        prop_assert_eq!(m.current().unwrap(), &cur);
+        for (s, t) in &before {
+            prop_assert!(t.same_summaries(&m.trees().unwrap()[s]));
+        }
+    }
+
+    /// 11 with lost ranges in the open segment (row 11a): the property of
+    /// `inv11_nothing_observed_beyond_mark` over `arb_lossy_op`. The plain
+    /// version keeps the usual operations at full weight.
+    #[test]
+    fn inv11_nothing_observed_beyond_mark_with_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
+        let (mut m, ids) = machine();
+        for op in &ops {
+            apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
+            let last = m.disk.mark.map_or(kvik_model::types::Position::ORIGIN, |k| k.last);
+            let r = m.open_reader();
+            let got: BTreeSet<kvik_model::types::Position> = m.read(&r).unwrap().1.iter().map(|f| f.position).collect();
+            // The raw content, including batches past the mark.
+            let raw: BTreeSet<kvik_model::types::Position> = r
+                .files
+                .iter()
+                .filter(|f| m.disk.locality(**f) != Locality::Missing)
+                .flat_map(|f| m.disk.files[f].entries().filter_map(|e| e.fact().map(|x| x.position)))
+                .collect();
+            prop_assert_eq!(&got, &raw.iter().copied().filter(|p| *p <= last).collect::<BTreeSet<_>>());
+            for obs in m.observed.values() {
+                prop_assert!(obs.iter().all(|o| o.position <= last));
+            }
+        }
     }
 }
 

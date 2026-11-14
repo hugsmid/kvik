@@ -588,7 +588,9 @@ just failed a sync, against §3 Write or sync failure), or waits for a recovery 
 **Settled by the text.** `data_lost` is reported in health as found, while read-only.
 **Model.** It reports `data_lost` as found, writes no record while read-only (a read-only engine writes nothing, not
 even a seal), and the next recovery that can write records the range once; new positions continue above it
-(`tests/edge_cases.rs` `row_11a_failed_recovery_sync_reports_the_range_as_found`).
+(`tests/edge_cases.rs` `row_11a_failed_recovery_sync_reports_the_range_as_found`). A scrub that finds a corrupt
+sealed segment with no other copy while the engine is read-only or stopped does the same (`tests/rules.rs`
+`s8_corrupt_log_segment_found_while_read_only_or_stopped_is_recorded_later`).
 **Needed.** Whether a recovery whose sync fails writes the lost-range record.
 **Proposal.** §3 Recovery rule 4: "If that sync fails, the engine stays read-only, leaves the old mark and writes
 nothing; lost ranges it found are reported in health as found, and recorded by the next recovery."

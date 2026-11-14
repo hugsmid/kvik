@@ -32,7 +32,9 @@ it differs, and the open questions in the specification itself.
 
 ## Coverage
 
-Every invariant has a property test and every edge-case row a test whose doc comment cites it. "Pins" names the
+Every invariant has a property test and every edge-case row a test whose doc comment cites it. Properties over
+`arb_op` are guarded by `generator_coverage`; those over `arb_lossy_op` (the properties whose names mention lost
+ranges, kept beside their plain versions) by `lossy_generator_coverage`. "Pins" names the
 open question ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) whose answer a test fixes for now; "Not shown in the model"
 names the clauses the model cannot show, why, and the roadmap item that tests them in the engine.
 
@@ -42,15 +44,15 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 |---|---|---|---|---|---|
 | 1 | `inv01_positions_gap_free_across_restarts`, `inv01_only_restore_starts_generation`, `inv01_gap_free_except_lost_ranges` | `invariants.rs` | `generator_coverage`, `restore_generator_coverage`, `lossy_generator_coverage` |  | A lost range for a tail truncated by §3 Recovery rule 3: the model's mark is exact, so it never arises (power-loss rig, roadmap 4.5) |
 | 2 | `inv02_delivered_iff_durable`, `inv02_routed_positions_delivered_or_resynced`, `inv02_resync_excused_by_locality_when_issued`, `inv02_delivered_iff_durable_except_lost_ranges` | `invariants.rs` | `generator_coverage`, `delivery_generator_coverage`, `lossy_generator_coverage` |  | The exception for a tail truncated by rule 3, as for 1 (roadmap 4.5) |
-| 3 | `inv03_delivery_in_position_order`, `inv03_fact_deliveries_in_order_among_other_deliveries` | `invariants.rs` | `generator_coverage`, `delivery_generator_coverage`, `lossy_generator_coverage` |  |  |
-| 4 | `inv04_current_view_over_all_tiers` | `invariants.rs` | `generator_coverage`, `lossy_generator_coverage` |  |  |
-| 5 | `inv05_tree_nodes_equal_direct`, `inv05_stored_levels_follow_the_density_rule`, `inv05_interval_levels_stored_only_where_no_interval_crosses_an_edge`, `inv05_calendar_nodes_equal_direct` | `invariants.rs` | `generator_coverage`, `params_generator_covers_every_density_level`, `interval_generator_coverage`, `calendar_generator_coverage`, `lossy_generator_coverage` |  |  |
+| 3 | `inv03_delivery_in_position_order`, `inv03_fact_deliveries_in_order_among_other_deliveries`, `inv03_delivery_in_position_order_with_lost_ranges` | `invariants.rs` | `generator_coverage`, `delivery_generator_coverage`, `lossy_generator_coverage` |  |  |
+| 4 | `inv04_current_view_over_all_tiers`, `inv04_current_view_over_all_tiers_with_lost_ranges` | `invariants.rs` | `generator_coverage`, `lossy_generator_coverage` |  |  |
+| 5 | `inv05_tree_nodes_equal_direct`, `inv05_tree_nodes_equal_direct_with_lost_ranges`, `inv05_stored_levels_follow_the_density_rule`, `inv05_interval_levels_stored_only_where_no_interval_crosses_an_edge`, `inv05_calendar_nodes_equal_direct` | `invariants.rs` | `generator_coverage`, `params_generator_covers_every_density_level`, `interval_generator_coverage`, `calendar_generator_coverage`, `lossy_generator_coverage` |  |  |
 | 6 | `inv06_merge_associative_and_direct` | `invariants.rs` | `params_generator_covers_every_density_level` |  |  |
 | 7 | `inv07_windows_equal_direct`, `inv07_calendar_results_equal_direct`, `inv07_window_examples_at_quarter_edges` | `invariants.rs` | `params_generator_covers_every_density_level`, `calendar_generator_coverage` |  | Results flagged `approximate_edges`: no edge moves in the model (see `OPEN-QUESTIONS.md`; roadmap 7.3 and 8.3) |
-| 8 | `inv08_rebuild_equals_live`, `inv08_calendar_rebuild_equals_live` | `invariants.rs` | `generator_coverage`, `calendar_generator_coverage`, `lossy_generator_coverage` | Q-76 (`q76_…`) | A lost range holding a registry entry (Q-33): refused by the fault injection |
+| 8 | `inv08_rebuild_equals_live`, `inv08_rebuild_equals_live_with_lost_ranges`, `inv08_calendar_rebuild_equals_live` | `invariants.rs` | `generator_coverage`, `calendar_generator_coverage`, `lossy_generator_coverage` | Q-76 (`q76_…`) | A lost range holding a registry entry (Q-33): refused by the fault injection |
 | 9 | `inv09_tiering_backup_restore_preserve_facts`, `inv09_stepwise_restore_from_checkpoint`, `inv09_files_preserve_positions_outside_lost_ranges`; `s10_9_restore_preserves_backed_up_positions` | `invariants.rs`; `rules.rs` | `generator_coverage`, `restore_generator_coverage`, `lossy_generator_coverage` |  | A restore across a lost range: the bucket does not carry lost-range records, so the model reads a gap (see `OPEN-QUESTIONS.md`; restore, roadmap 8.3) |
 | 10 | `inv10_no_operation_reduces_facts`, `inv10_only_lost_ranges_remove_facts` | `invariants.rs` | `generator_coverage`, `lossy_generator_coverage` | Q-34 (c) (`row_11a_corrupt_block_inside_the_open_segment`) | A tail truncated by rule 3 and `possible_loss`, as for 1 (roadmap 4.5) |
-| 11 | `inv11_nothing_observed_beyond_mark`, `inv11_no_delivery_of_any_kind_beyond_mark` | `invariants.rs` | `generator_coverage`, `delivery_generator_coverage`, `lossy_generator_coverage` |  |  |
+| 11 | `inv11_nothing_observed_beyond_mark`, `inv11_nothing_observed_beyond_mark_with_lost_ranges`, `inv11_no_delivery_of_any_kind_beyond_mark` | `invariants.rs` | `generator_coverage`, `delivery_generator_coverage`, `lossy_generator_coverage` |  |  |
 | 12 | `inv12_no_file_leaves_a_tier_without_a_verified_copy` | `invariants.rs` | `files_generator_coverage` |  |  |
 | 13 | `inv13_cursor_and_latch_never_ahead_of_confirmation`; `s6_latch_moves_on_confirmation_only` | `invariants.rs`; `rules.rs` | `delivery_generator_coverage` |  | The cursor file synced at most every 1 s: the model writes it at once (roadmap 5.2) |
 | 14 | `inv14_no_epoch_lists_two_files_with_one_position`; `q71_log_segment_and_its_chunks_listed_in_one_epoch` | `invariants.rs`; `open_questions.rs` | `files_generator_coverage` | Q-71 |  |
@@ -82,7 +84,7 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 8 | `row_08_crash_after_sync_before_delivery`, `row_08_crash_during_delivery_after_mark` | `edge_cases.rs` |  |  |
 | 9 | `row_09_crash_during_compaction`, `row_09_failed_recovery_sync_discards_nothing` | `edge_cases.rs` |  | Crash points in real files (kill loop, roadmap 6.2) |
 | 10 | `row_10_crash_around_the_manifest_record` | `edge_cases.rs` |  | Crash points in real files (kill loop, roadmap 6.3) |
-| 11 | `row_11_corrupt_sealed_file_quarantined_and_restored_from_tier`; `s8_corrupt_log_segment_with_no_other_copy_loses_range` | `edge_cases.rs`; `rules.rs` |  | Losing only the damaged region and copying the valid batches to a new segment, which ends the error: the model loses the whole segment (recorded as a lost range, `data_lost`) and its quarantine stays fatal; compacting again from kept inputs (roadmap 6.3 and 8.1) |
+| 11 | `row_11_corrupt_sealed_file_quarantined_and_restored_from_tier`; `s8_corrupt_log_segment_with_no_other_copy_loses_range`, `s8_corrupt_log_segment_found_while_read_only_or_stopped_is_recorded_later` | `edge_cases.rs`; `rules.rs` | Q-79 | Losing only the damaged region and copying the valid batches to a new segment, which ends the error: the model loses the whole segment (recorded as a lost range, `data_lost`) and its quarantine stays fatal; compacting again from kept inputs (roadmap 6.3 and 8.1) |
 | 11a | `row_11a_corrupt_block_inside_the_open_segment`, `row_11a_corrupt_block_below_an_old_boots_mark`, `row_11a_failed_recovery_sync_reports_the_range_as_found`, `row_11a_fault_injection_limits` | `edge_cases.rs` | Q-33, Q-34 (c), Q-79 | A block found corrupt at run time ("recorded when found"); damaged bytes in real files (fault injection, roadmap 4.5) |
 | 12 | `row_12_sync_error_read_only_fatal_restart_truncates` | `edge_cases.rs` |  | Injected sync errors in real files (roadmap 4.5) |
 | 13 | `row_13_disk_fills_degrade_then_ingest_waits_nothing_deleted` | `edge_cases.rs` |  | ENOSPC from compaction: the model pauses at the low mark first (fault injection, roadmap 4.5) |

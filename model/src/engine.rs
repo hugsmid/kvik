@@ -1126,6 +1126,10 @@ pub struct Disk {
     /// injection), each with the first and last position it held; the next
     /// recovery finds them (§3 Recovery rule 2).
     pub damaged: BTreeMap<(FileId, usize), (Position, Position)>,
+    /// Lost ranges of sealed segments found while the engine could not write
+    /// (read-only or stopped): reported as found, recorded by the next
+    /// recovery that can write (Q-79).
+    pub found_lost: Vec<(Position, Position)>,
     /// Deep tier.
     pub bucket: Bucket,
     /// Manifest.
@@ -2223,10 +2227,12 @@ impl Model {
     /// neighbours are valid, and do not repeat an earlier lost range next to it.
     /// A recovery whose sync fails writes no record (Q-79), but reports the
     /// ranges it found as `data_lost` (§8 "recorded when found"); the next
-    /// recovery that can write records them.
+    /// recovery that can write records them, with any a scrub found while the
+    /// engine could not write.
     fn record_lost_ranges(&mut self) {
         let at = self.wall;
-        for (from, to) in self.disk.damaged_runs() {
+        let found = std::mem::take(&mut self.disk.found_lost);
+        for (from, to) in found.into_iter().chain(self.disk.damaged_runs()) {
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
                 epoch,
@@ -4157,14 +4163,14 @@ impl Model {
         for f in &self.disk.quarantined {
             raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
         }
-        // Not read-only (§3 Recovery rule 2). Damage still pending while the
-        // engine is up was found by a recovery whose sync failed: reported as
+        // Not read-only (§3 Recovery rule 2). Ranges found while the engine
+        // could not write (by a scrub, or by a recovery whose sync failed, the
+        // only way damage is still pending while it is up) are reported as
         // found, not yet recorded (Q-79).
-        let pending = if self.vol.is_some() {
-            self.disk.damaged_runs()
-        } else {
-            Vec::new()
-        };
+        let mut pending = self.disk.found_lost.clone();
+        if self.vol.is_some() {
+            pending.extend(self.disk.damaged_runs());
+        }
         for (from, to) in self.disk.lost_ranges().into_iter().chain(pending) {
             raise(Level::Degraded, Reason::DataLost(from, to), &mut reasons);
         }
@@ -4816,9 +4822,12 @@ impl Model {
         // §8 Corrupt block: a sealed log segment with no other copy loses
         // its positions that no other file holds, recorded as lost ranges
         // and reported as `data_lost`, so they are not issued again. The
-        // model damages a whole file, so the whole segment is lost.
+        // model damages a whole file, so the whole segment is lost. A
+        // read-only or stopped engine writes no record: the range is reported
+        // as found and recorded by the next recovery that can write (Q-79).
         let held: BTreeSet<Position> = self.disk.all_entries().into_keys().collect();
         let at = self.wall;
+        let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
         for f in &bad {
             let file = &self.disk.files[f];
             if file.class != FileClass::Segment || !file.sealed {
@@ -4827,7 +4836,11 @@ impl Model {
             let lost: Vec<Position> = file
                 .entries()
                 .map(|e| e.position)
-                .filter(|p| !held.contains(p) && !self.disk.is_lost(*p))
+                .filter(|p| {
+                    !held.contains(p)
+                        && !self.disk.is_lost(*p)
+                        && !self.disk.found_lost.iter().any(|(a, b)| a <= p && p <= b)
+                })
                 .collect();
             let mut runs: Vec<(Position, Position)> = Vec::new();
             for p in lost {
@@ -4837,6 +4850,10 @@ impl Model {
                 }
             }
             for (from, to) in runs {
+                if !writable {
+                    self.disk.found_lost.push((from, to));
+                    continue;
+                }
                 let epoch = self.disk.epoch();
                 self.disk.manifest.push(ManifestRecord {
                     epoch,

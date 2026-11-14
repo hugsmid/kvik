@@ -758,6 +758,53 @@ fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     assert!(m.health().reasons.contains(&Reason::DataLost(p, p)));
 }
 
+/// §8 Corrupt block with the engine read-only, then stopped: a scrub that
+/// finds a corrupt sealed segment with no other copy reports `data_lost` as
+/// found but writes no manifest record (§3 Write or sync failure); the next
+/// recovery that can write records the range once (Q-79), and its positions
+/// are not issued again.
+#[test]
+fn s8_corrupt_log_segment_found_while_read_only_or_stopped_is_recorded_later() {
+    for stopped in [false, true] {
+        let (mut m, s) = model(10 * SECOND);
+        m.seal_active();
+        let now = m.wall;
+        let p = m.ingest(vec![Reading::num(s, now, 1.0)]).unwrap().positions[0];
+        m.seal_active();
+        let f = *m
+            .disk
+            .hot
+            .iter()
+            .find(|f| m.disk.files[f].entries().any(|e| e.position == p))
+            .unwrap();
+        if stopped {
+            m.crash();
+        } else {
+            m.emit(Reading::num(s, now + SECOND, 2.0)).unwrap();
+            let fault = Fault::SyncError(WriteOutcome::Survived);
+            assert_eq!(m.commit(Some(fault)), Err(Error::SyncFailed));
+            assert!(m.is_read_only());
+        }
+        let records = m.disk.manifest.len();
+        m.corrupt_hot(f);
+        assert_eq!(m.scrub(), vec![f]);
+        assert_eq!(m.disk.manifest.len(), records, "no record written");
+        assert!(
+            m.health().reasons.contains(&Reason::DataLost(p, p)),
+            "reported as found"
+        );
+        m.restart();
+        assert_eq!(m.disk.lost_ranges(), vec![(p, p)]);
+        m.restart();
+        assert_eq!(m.disk.lost_ranges().len(), 1, "recorded once");
+        let next = m
+            .ingest(vec![Reading::num(s, now + 2 * SECOND, 3.0)])
+            .unwrap()
+            .positions[0];
+        assert_eq!(next, p.next(), "positions not reused");
+    }
+}
+
 /// §10 invariant 9: a restore preserves the positions held in sealed,
 /// backed-up files; facts committed after the last upload are lost (§8).
 #[test]
