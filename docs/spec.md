@@ -507,7 +507,7 @@ gap until they are re-ingested.
 | Ingest | `emit(reading, t_source, intent: normal | revise, changed_at)` → recorded(position) / duplicate / refused(reason); waits under back-pressure. Exports carry `changed_at` |
 | Query | current, as-of P or T, history, tree level for a span, window evaluation; each result carries coverage and flags |
 | Consumers | register(start), deliveries, confirm(position), latches; `resync`, `generation_changed`, `cursor` events |
-| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), each series' latest recorded `t`, persisted with the checkpoint on a best-effort basis; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
+| Health | counters (duplicates, unchecked, refused, regressions, outranked on arrival, back-pressure wait, lag), persisted with the checkpoint on a best-effort basis; each series' latest recorded `t`; each jump of the system clock measured against the monotonic clock, with its size; degraded/fatal states; `data_lost` for each lost range caused by corruption (§3 Recovery rule 2, §8 Corrupt block), which does not make the store read-only; `possible_loss` for each tail truncated by §3 Recovery rule 3, after a reboot or with the mark lost |
 
 Every default in this document is a configuration key, with its unit where it is defined; the decided choices D1–D7
 (§12) are rules, not configuration keys. Byte-level format,

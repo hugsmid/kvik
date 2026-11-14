@@ -165,7 +165,7 @@ a truncated tail is sent, and §6 Restart and resume delivers the facts after C'
 
 ## Q-49 — What a series with no stored level serves during a restore
 **Scenario.** A gauge has an expected interval of 5 minutes, so the density rule (§5.1) stores no 1-minute or
-15-minute level and, since Q-36, no calendar node; the tree checkpoint holds nothing for it. After a restore onto an
+15-minute level and, since Q-36, no calendar node; the tree checkpoint holds no node for it. After a restore onto an
 empty disk, §8 Restore step 2 serves queries "at ≥ 1-minute resolution" from the checkpoint, flagged `restoring`,
 while its facts come back only in step 3. A query for yesterday's daily mean of this series during step 2 has
 neither a node nor a fact to answer from, and row 28 ("queries at ≥ 1 min from the checkpoint") does not say what it
@@ -176,12 +176,12 @@ its detail), how the result is flagged, and whether the detail of series with no
 
 ## Q-50 — Window edges over moved detail of a series with no stored 1-minute level
 **Scenario.** §6 Old spans evaluates an edge whose raw detail is not local "at 1-minute precision", flagged
-`approximate_edges`, and §12 D7 keeps the 1-minute level hot for that purpose. The density rule (§5.1) stores the
-1-minute level only for series whose expected interval is 5 s or shorter. A gauge with a 60 s expected interval has
-only the 15-minute level; one with a 5-minute expected interval has none. When their detail has moved off the machine
-(§8 Fill pressure, or a diagnostic retention class), a rolling 24-hour window whose start falls in that span has no
-1-minute node to evaluate its edge from.
-**Model.** Not modelled; both levels are stored for every series, and detail is read from whichever tier holds it.
+`approximate_edges`, and §12 D7 keeps the 1-minute level hot. The density rule (§5.1) stores the 1-minute level only
+for series whose expected interval is 5 s or shorter. A gauge with a 60 s expected interval has only the 15-minute
+level; one with a 5-minute expected interval has none. When their detail has moved off the machine (§8 Fill
+pressure, or a diagnostic retention class), a rolling 24-hour window whose start falls in that span has no 1-minute
+node to evaluate its edge from.
+**Model.** Not modelled; both levels are stored for every series, and no window is flagged `approximate_edges`.
 **Needed.** Whether such an edge is evaluated at the finest stored level (and with no level, how), or its detail is
 fetched on demand as for other reads of moved detail (§8), and how the result is flagged in each case.
 
