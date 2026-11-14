@@ -25,15 +25,15 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > - A slow, exact [reference model](model/) of its semantics exists, with property tests and edge-case tests; a few
 >   newer rules are not yet modelled ([coverage table](model/README.md#coverage)).
 > - Two measurements are recorded: [chunk encodings against Parquet](docs/measurements/2.1-chunk-encodings.md) and
->   [commit and sync latency](docs/measurements/2.2-commit-latency.md).
+>   [commit and sync latency](docs/measurements/2.2-commit-latency.md); gate 2.3 has looked at both.
 >
 > | [Roadmap](docs/roadmap.md) section | Progress |
 > |---|---|
 > | 1. Specification settled | 8 of 8 done |
-> | 2. Measurements before building | 2 of 3 done; gate 2.3 next |
+> | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3–10. Format and interface, log, delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 10 of 46 roadmap items are done, including 1 of 9 gates.
+> 11 of 46 roadmap items are done, including 2 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
