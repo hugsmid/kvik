@@ -22,6 +22,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
+| Q-91 | §4 Funnel, Routing, §6 Latch, `api.md` Consuming, row 16 | Funnel identity across configuration, run-time routes and restarts |
+| Q-92 | §2.4 revised-key index, §8 Restore step 2, invariant 8, principle 2 | The "incomplete" mark on a revised-key index entry |
+| Q-93 | §5.7 tzdata version in force, §7 Readers, §8 Restore drill | A store nobody can open after the host's tzdata changes, and a release name standing for its rules (for the owner) |
+| Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
+| Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
+| Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -343,6 +349,88 @@ wildcards within a segment.
 two patterns overlap when, in each segment, they are equal or either is `*`; an id overlaps a pattern when any name
 of its series matches it.
 
+## Q-91 — Funnel identity across configuration, run-time routes and restarts
+**Scenario.** Since Q-64 the routes in force are those the registry holds, and a funnel declared in configuration
+that the registry does not hold, or holds differently, is first written as a routing change at start (§4 Routing).
+(a) The registry does not record whether a funnel came from configuration or was added at run time, so it is not
+said what removing a funnel from configuration does: nothing (the log still names it), or a removing routing change,
+which would also remove every run-time route at the next start. (b) A funnel whose condition is changed in
+configuration is written as a routing change at start: it is not said whether it is the same funnel, keeping its
+latch (§6 Latch: "a latch belongs to one incarnation of a funnel"), or a new incarnation, which has none and sends no
+`resync` (Q-63). (c) `api.md` gives a `Funnel` no id: an application that calls `consumer.route()` at every start,
+as the example does, would either add a second funnel or, matched as "held differently", replace the funnel and
+drop its latch, so a condition that became true while the consumer was down is no longer delivered as a transition
+on resume (row 16).
+**Model.** Funnels are added with an id chosen by the test (`Model::add_route`); there is no configuration, and a
+removed funnel's latch is dropped.
+**Needed.** What identifies a funnel across starts; whether configuration can remove or change one; and whether a
+changed funnel keeps its latch.
+
+## Q-92 — The "incomplete" mark on a revised-key index entry
+**Scenario.** Since Q-72 an entry of the revised-key index is incomplete when it was started by an unchecked fact or
+rebuilt during a restore while an earlier fact of its key was not local (§2.4). Whether an entry is incomplete
+depends on which tier held a fact when another arrived, which the log does not record, so a rebuild from the log
+(invariant 8, principle 2) cannot give the same mark; it is the same kind of exception as "completed when its chunk
+is back" (§8 Restore step 2), but now outside a restore too. Nothing is said to complete an entry outside a restore,
+or for a chunk that stays in deep after one: §2.4 says "until the detail is fetched and completes it", but a fetch on
+demand for a read is not said to update the index, and a key whose earlier fact is never read stays incomplete for
+good, so a replay of its earlier value can revert a correction indefinitely (row 2a).
+**Model.** A full in-memory history of every key stands in for the index, so no entry is incomplete outside a
+restore (see "Revised-key index outside a restore" in the table below).
+**Needed.** Whether the mark is derived state excepted from invariant 8 (and stated as such), and what completes an
+entry outside a restore and for detail left in deep.
+
+## Q-93 — A store nobody can open after the host's tzdata changes, and a release name standing for its rules
+**Scenario.** (a) Since Q-76 only a writer that can write adopts the host's release, by writing a tzdata entry at
+open; a reader process or a restore drill whose release is not the version in force is refused with
+`tzdata_mismatch`, and so is a writer that cannot write. After a host update, a store whose writer is read-only
+(after a failed sync, §3) or stopped cannot be opened by any process, not even to read or export, until the old
+release is installed again: an operator sees a store that will not open because of an unrelated system update.
+(b) The version is a release name: a patched or partial build under the same name, or a vendor's build with other
+rules, is trusted as the release the log names, so the derived values of two hosts with the same name can differ.
+**Model.** The model holds several releases and refuses nothing (see "Adopting a tzdata release" in the table below).
+**Needed (for the owner).** Whether a reader or a writer that cannot write may open with another release (and with
+which rules derived values are then reported), and whether the version must identify the rules (a fingerprint of the
+zones used) rather than the release name.
+
+## Q-94 — Compaction in position order when the next segment is not local or is quarantined
+**Scenario.** Since Q-71 compaction takes sealed log segments in position order, and a segment at or below the last
+position held by a live compacted file counts as compacted (§7). While compaction is paused at the low mark (§3 Disk
+space), fill pressure (§8) moves verified sealed segments to cold or deep, uncompacted ones included; and a segment
+can be quarantined (§8 Corrupt block). When compaction resumes, the next segment in position order is not local, or
+is quarantined. It is not said whether compaction stalls until the segment is local, fetches it from deep, or skips
+it; skipping and compacting a later segment would put the skipped positions below the mark, so they would count as
+compacted although no chunk holds them.
+**Model.** Compaction takes every sealed segment not yet compacted, wherever it is held: the model reads entries from
+any tier.
+**Needed.** What compaction does when the next segment in position order is not local or is quarantined.
+
+## Q-95 — A consumer with no cursor file at a same-boot restart, and one that registers again during a run
+**Scenario.** (a) The engine restarts on the same boot and a consumer's cursor file is missing (it was never written:
+cursor files are synced at most every 1 s, §4 Consumer state). §3 Recovery rule 3 treats a missing cursor file as no
+cursor after a reboot, but on the same boot it is not said whether the consumer is new (`start`, §4 New consumer) or
+resumes, what first condition state it receives, and whether its funnels' latches, kept in the same file, start
+empty. (b) A consumer registers again during a run under a name that has a cursor (its process restarted, the engine
+did not): it is not said whether it resumes from its cursor with a replay and `resync`, as after downtime (§6 Restart
+and resume), whether its latches are kept, and whether its condition delivery sequences continue (Q-61: "starts at 1
+at every engine start").
+**Model.** The cursor and the latches are durable at once on confirmation (see "Cursor file synced at most every 1 s"
+in the table below); a consumer restart resumes from the cursor with a replay and `resync`.
+**Needed.** The first state, the latches and the delivery identity in both cases.
+
+## Q-96 — A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer
+**Scenario.** (a) A consumer resumes after its cursor (§6 Restart and resume) and the log segments after it are local
+except one in the middle, moved to deep by fill pressure (§8). §4 Resync and §8 Behind consumers cover a cursor older
+than the oldest local log segment; a gap in the middle is not covered: the replay cannot deliver the missing
+positions without a download, which §8 forbids for catch-up. (b) §6 Restart and resume has "the funnel then sends
+`resync`", one per funnel, while §4 Resync describes one `resync` delivery carrying the state of every funnel of the
+consumer; a consumer with several funnels would see one `resync` or several, and Q-61's "forgets the condition
+deliveries it has seen" on `resync` depends on which.
+**Model.** A consumer whose cursor is too far behind the local log segments receives `resync` alone; a gap in the
+middle is not examined. One `resync` delivery carries the state of every funnel in force (`engine::Resync`).
+**Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
+consumer or per funnel.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -368,6 +456,12 @@ request, and noted in the question.
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
+| Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
+| Q-92 | 6.2 | Revised-key index; recorded after the tag, from the review of the Q-72 ruling |
+| Q-93 | 3.1 | For the owner, with the tzdata entry kind; recorded after the tag, from the review of the Q-76 ruling |
+| Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
+| Q-95 | 5.2 | Durable cursors; recorded after the tag |
+| Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -530,7 +624,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-61 | Identity of a condition delivery, and where its sequence is kept | §4 Order (every condition delivery, on a fact or on the timer, is `(funnel, sequence)`; the sequence is in memory, from 1 at every engine start, and a consumer resuming at a start receives none before that start's `resync`), §4 At-least-once (never delivered twice; the identity holds until the consumer's next `resync`), `api.md` Consuming; no field in `format.md` |
 | Q-62 | Condition transitions while a consumer catches up after overflow | §4 Overflow (funnels evaluated but silent; the present state sent on re-attaching where it differs; transitions in between counted, `transitions_not_delivered`; catch-up reads hot and cold only and ends with `resync` where its next entry is on no local tier), §4 Resync, §8 Behind consumers, `api.md` Health and statistics |
 | Q-63 | Condition state now, for conditions with memory | §6 Restart and resume (state now: a threshold between its levels keeps the latched state, false with no latch; on change compared with the latch by the dead-band), §6 Latch (a latch belongs to one incarnation of a funnel; a funnel added at run time has none and sends no `resync`), invariant 16 |
-| Q-64 | Routing changes before a restore's checkpoint | §2.1 (routing changes, site-zone and tzdata entries are kept with their positions in the registry file, which every tree checkpoint carries), §4 Routing (built at start from the registry; a funnel declared in configuration that the registry does not hold, or holds differently, is first written as a routing change), `format.md` Part B Registry |
+| Q-64 | Routing changes before a restore's checkpoint | §2.1 (routing changes, site-zone and tzdata entries are kept with their positions in the registry file, which every tree checkpoint carries), §4 Routing (built at start from the registry, so a route is in force from step 1 of a restore and after its log segment has left hot), `format.md` Part B Registry (open part: Q-91, how a funnel declared in configuration is matched with the registry, and what removing or changing one does) |
 | Q-70 | Chunk indexes after a restore | §8 Restore steps 1 and 3 (step 1 downloads the chunk index of every compacted file the restore record lists, before ingest is accepted), §5.6, `format.md` Part B Compacted segment; the loss of such an index in the bucket follows §8 Restore, Failures and end (Q-39 (e)) |
 | Q-71 | A log segment and the chunks compacted from it hold the same positions in one epoch | §7 (sealed segments compacted in position order, each once: a segment at or below the last position of a live compacted file is not compacted again, except to replace a quarantined file), §7 Manifest, invariant 14 (live compacted files) |
 | Q-72 | Whether the revised-key index is consulted when the current fact is off the machine | §2.4 (a match with the key's entry in the revised-key index is a duplicate wherever the facts are; unchecked only for a key with a single fact off the machine and for an incomplete entry), §5.4 Displaced readings, §8 Retention class and Restore step 2, §12 D5, rows 2b, 2c and 40 |
