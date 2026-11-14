@@ -33,6 +33,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-103 | §7 Manifest, §8 Generations, Tiers | What an automatic manifest rebuild cannot recover from local files |
 | Q-104 | §2.5, §2.4 | A supplied `Absent` value with a quality other than bad |
 | Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
+| Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -511,6 +512,40 @@ batch may start at or above it, never below. (e) Refused (`FormatError::HeaderMi
 **Needed.** Confirmation of, or a rule for, each part; for (a), whether A.2's end-of-data sentence applies to a
 reader below the mark at all. To be settled by roadmap 4.5 (recovery), (a) and (c) with 4.6 (second-process reader).
 
+## Q-106 — Decoding batch bodies: points `format.md` A.5 and A.6 leave open
+Found while building the batch codecs (roadmap 4.3, crate `kvik-log`: `facts`, `entries`, `content`). Each part names
+the reading implemented for now; tests in `log/tests/batches.rs` pin it.
+**Scenario.** (a) *Canonical form against the checks.* The common rules require a v1 writer to produce one byte
+sequence for given content, and list the checks a reader applies; they do not say whether a block that passes every
+check but is not canonical (run-length where plain is not larger, an optional column holding only defaults, non-zero
+padding or reserved bytes, bytes after the last payload or entry, readings split over more blocks than A.4 allows) is
+invalid. (b) *The text heap.* Canonical writing names field order, run-length form and block splitting, not the heap
+layout: whether texts are in row order, whether equal texts may share bytes, and where a zero-length text points. (c)
+*"Smaller than plain".* Whether the run-length choice compares payload lengths before or after padding to 8, and
+which wins a tie. (d) *Field presence.* The definition table's "Present" column, field 27 with field 8, field 20 in a
+parameter change and the recovery entry's fields say when a field is carried, but A.6's checks list only overruns,
+order, repetition and ranges; a definition without a name, or with a scale on an `f64` series, is not named as
+invalid. Whether a named-state series may declare no state names, and whether kind and value type must agree (a gauge
+of text), is not said. (e) *Entries block splitting.* A.4 states how readings fill facts blocks, not how entries fill
+entries blocks. (f) *Reserved ids.* Entry type 5 is reserved until roadmap 5.2 and field 41 of a recovery entry is
+reserved; what a reader does on meeting either is not said. (g) *Parameter change.* Whether fields 25 and 26 may be
+carried is open (Q-100); no range is given for fields 11, 12, 24 and 20 or for `wrap_at`; whether a change carrying
+only field 1 is valid is not said. (h) *The recovery entry alone.* "The only entry of its batch" is not among the
+checks, so a batch that breaks it is not named invalid.
+**Implemented.** (a) The reader applies the listed checks only, so a valid but non-canonical block is read;
+`decode_canonical` (facts, entries and whole batches) also requires the canonical bytes, for writer output, golden
+files and a later scrub. (b) Texts in row order, each appended to the heap, none shared; a zero-length text points at
+the heap's length at that row; a no-value text row holds 0. The reader accepts any offsets inside the heap. (c)
+Unpadded payload lengths; plain wins a tie. (d) Presence is checked: a missing applicable field or a present
+non-applicable one is invalid content (`ContentError::FieldPresence`); a named-state series needs at least one name;
+kind and value type are not compared. (e) Consecutive entries share one entries block until the next would take its
+body past 16 MiB, which no batch of at most 8 MiB reaches. (f) Entry type 5 is refused as an unknown critical type
+(`UnsupportedFormat`); field 41 is skipped. (g) Fields 25 and 26 in a parameter change are invalid content ("no other
+field is allowed"); fields without a stated range take any value; a change with only field 1 is accepted. (h) The
+reader treats it as invalid content, and the encoder refuses it.
+**Needed.** A rule for each part; for (a), whether non-canonical blocks are invalid content for a reader. To be
+settled at gate 4.9; (g) with roadmap 5.1 (Q-100), (f) with 5.2.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -549,6 +584,7 @@ Q-87 was reopened there.
 | Q-103 | 6.3 | Manifest rebuild; (a) and (b) with 8.2 and 8.3; recorded at the gate 3.3 review |
 | Q-104 | 4.3 | Arrival batches; recorded after gate 3.3, from the interface crate |
 | Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
+| Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).

@@ -9,9 +9,11 @@ durable mark's slots and segment file names.
   tail and the seal state. Damage is never an error; a version refusal is.
 - `segment` produces every state of a segment's life cycle as bytes (created ahead and zero-filled, in use, sealed,
   zero-filled from a truncation offset) and classifies the states recovery may find (A.4).
-- The bodies of facts and entries blocks are opaque here apart from their 24-byte prefix; they are encoded and
-  checked by the batch layer (roadmap 4.3).
+- `facts`, `entries` and `content` encode and decode arrival batches as typed values (A.5, A.6, A.7): canonical
+  encoders, decoders that apply every check, and canonical decoders that also require the canonical bytes. The
+  reader applies the body checks to every batch it accepts.
 
-Tests: unit tests, behaviour tests (`tests/segment.rs`), golden files (`tests/golden/`, see its README), property
+Tests: unit tests, behaviour tests (`tests/segment.rs`), batch codec tests (`tests/batches.rs`), a differential test
+against the reference model (`tests/model_differential.rs`), golden files (`tests/golden/`, see its README), property
 tests (`tests/properties.rs`) and the fuzz entry point run over generated inputs (`tests/fuzz_inputs.rs`). The
 fuzz targets are in [`fuzz/`](fuzz/).

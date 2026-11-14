@@ -683,7 +683,7 @@ fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
         };
         entries.push(entry(t, &parsed)?);
     }
-    // Bytes after the last entry are not checked here (Q-106 (h)); the canonical decoder rejects them.
+    // Bytes after the last entry are not checked here (Q-106 (a)); the canonical decoder rejects them.
     Ok(EntriesBlock {
         first_sequence: p.first_sequence,
         received_at: p.received_at,

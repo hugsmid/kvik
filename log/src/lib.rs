@@ -5,6 +5,9 @@
 //! - [`block`]: block framing and checksums (A.2).
 //! - [`body`]: the bodies the container reads itself: the data block prefix, commit, segment index, trailer and end
 //!   marker (A.5 to A.9).
+//! - [`facts`], [`entries`]: typed facts and entries bodies, their canonical encoders and checked decoders (A.5,
+//!   A.6).
+//! - [`content`]: a batch as typed content, split into blocks canonically and decoded back (A.4, A.7).
 //! - [`batch`]: framing a batch and deciding whether one is complete (A.4, A.7).
 //! - [`scan`]: reading a segment up to the durable mark or to its end, with resynchronisation past invalid regions,
 //!   the tail and the seal (A.2, A.4, A.9).
@@ -12,8 +15,7 @@
 //! - [`mark`]: the durable mark's slots (A.10).
 //! - [`name`]: segment file names (A.12).
 //!
-//! The columns of facts blocks and the entries of entries blocks are encoded and checked by the batch layer
-//! (roadmap 4.3); file operations go through the file-system seam (roadmap 4.4).
+//! File operations go through the file-system seam (roadmap 4.4).
 //!
 //! ```
 //! use kvik_log::batch::{BatchBuilder, SegmentIdentity};

@@ -33,7 +33,7 @@ again; nothing after a gate starts before it is passed.
 - [x] 4.1 Crate skeleton: errors, configuration, injectable clock and file-system seams (started early, before gate 3.3,
   on a reference-model backend so that an application can integrate; aligned with the gate 3.3 interface)
 - [x] 4.2 Segment container: header, blocks, checksums; reader up to the durable mark; golden files; fuzz target
-- [ ] 4.3 Arrival batches: encode, decode, round-trip property tests
+- [x] 4.3 Arrival batches: encode, decode, round-trip property tests
 - [ ] 4.4 Commit path: group commit, sync, durable mark, positions
 - [ ] 4.5 Recovery: boot identity rule, torn tail; kill-loop harness; injected sync errors and full disk
 - [ ] 4.6 Second-process reader and leases
