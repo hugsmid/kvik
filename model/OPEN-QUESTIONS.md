@@ -26,9 +26,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
-| Q-100 | §2.1 `decimal scale`, `excess precision`, §5.2, §5.6 | Where the largest stored magnitude is kept, whether the policy may change, stored nodes across a scale raise, and a lost raise |
-| Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise, rounded or not |
-| Q-102 | §2.1 `decimal scale`, §2.5 | A finite value too large for `i64` at the series' scale |
 | Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
 | Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
 | Q-107 | §7 Manifest (Deep unreachable), §3 Write or sync failure, §11 Health, `api.md` Health | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild |
@@ -380,46 +377,6 @@ middle is not examined. One `resync` delivery carries the state of every funnel 
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
 
-## Q-100 — Where the largest stored magnitude is kept, whether the policy may change, stored nodes across a scale raise, and a lost raise
-**Scenario.** The decimal ruling (§2.1 `decimal scale`, `excess precision`): a raise is refused if the largest
-magnitude stored so far for the series would overflow `i64` at the new scale; as proposed, that magnitude would be
-kept per series in the manifest. (a) Manifest records are appended when files are published, retired, moved or lost
-(§7 Manifest), and the last record is not acted on until a successor is synced; the largest magnitude changes with
-facts, at any commit. Recording it there needs a record per new maximum, or a value that lags the log, which the range
-check cannot use. It can also be derived from the facts (§1 principle 2), for example from the per-series index of
-sealed segments and the summaries of compacted chunks and nodes, with the open segment scanned at start. (b) The
-policy (`round`, `refuse`, `auto-raise` with its maximum) is a definition field; whether a parameter change may
-change it, and from which position or time, is not said. (c) Stored summary nodes of a decimal series hold exact
-`i128` sums (§5.6, bitwise reproducible): at which scale a node is held when the facts it covers were stored at
-different scales, and how rebuild-equals-live holds across a raise (for example, at the highest scale among its
-facts), is not said. (d) A lost raise: the scale is raised from 4 to 5, facts are stored at 5, and the raise entry
-falls in a lost range; it is not appended again (§2.1). The registry then says 4 while kept facts carry 5, and
-rescaling them to the current scale cannot be exact.
-**Model.** Not modelled; the model has no decimal series (see the table below).
-**Needed.** (a) Where the magnitude is kept, or confirmation of the manifest with the record it needs. (b) Whether
-the policy may change after definition. (c) The scale of a stored node. (d) The series' scale after a lost raise (for
-example, the highest scale among its kept facts). To be settled by roadmap 5.1, (c)
-by 7.1.
-
-## Q-101 — A replay across a scale raise, rounded or not
-**Scenario.** A series at scale 4 with the policy `round` receives 0.12345, stored as 0.1234 (half to even) and
-flagged `rounded`. The scale is raised to 5. The adapter replays the same reading: it is now stored as 0.12345, which
-is not identical to the stored fact (§2.4 compares values), so it is recorded as a new fact for the same `t` and
-becomes the current value, a correction nobody made. The same follows from `auto-raise` between a reading and its
-replay. A replay with no rounding is affected too: 1.2 stored as 12000 at scale 4, replayed after a raise to 5 as
-120000, is not identical "as stored" and is recorded as a new fact.
-**Model.** Not modelled; the model has no decimal series.
-**Needed.** Whether duplicate identity compares decimal values by their exact value (12000 at scale 4 equals 120000 at
-scale 5), and a rounded fact against the replay rounded to the stored fact's scale, or the replay is recorded. To be settled by roadmap 5.1.
-
-## Q-102 — A finite value too large for `i64` at the series' scale
-**Scenario.** A decimal series at scale 4 receives 1e300 (finite, so not "no value" under §2.5). Its shortest decimal
-representation does not fit `i64` at scale 4, and rounding does not help. No rule says whether it is refused (no
-`Refusal` variant names it), recorded as no value with quality bad as NaN is, or triggers `auto-raise` (which can only
-make it worse).
-**Model.** Not modelled; the model has no decimal series.
-**Needed.** The outcome and its counter. To be settled by roadmap 5.1.
-
 ## Q-107 — The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild
 Recorded when Q-103 (d) was settled. To be settled by roadmap item 6.3.
 **Scenario.** A start finds a corrupt manifest record; the mirror path holds no copy and deep does not answer. The
@@ -517,7 +474,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87, Q-103 and Q-104 were settled after gate 3.3 by the owner's rulings; Q-107 was recorded then.
+Q-87 was reopened there. Q-87 and Q-100 to Q-104 were settled after gate 3.3 by the owner's rulings; Q-107 was recorded then.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -540,9 +497,6 @@ Q-87 was reopened there. Q-87, Q-103 and Q-104 were settled after gate 3.3 by th
 | Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
-| Q-100 | 5.1 | Series registry; (c) by 7.1; recorded after gate 3.3, from the owner's decimal ruling |
-| Q-101 | 5.1 | Series registry and duplicates; recorded after gate 3.3, from the owner's decimal ruling |
-| Q-102 | 5.1 | Series registry; recorded at the gate 3.3 review |
 | Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
 | Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
 | Q-107 | 6.3 | Manifest rebuild; recorded when Q-103 was settled |
@@ -740,6 +694,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
 | Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |
 | Q-99 | An exclusive `flock` on the store directory on Windows | §3 Single writer (an operating-system lock on the file `LOCK`, released when the process ends; network file systems not supported), `format.md` A.12, `api.md` Handles |
+| Q-100 | Where the largest stored magnitude is kept, whether the policy may change, stored nodes across a scale raise, and a lost raise | §2.1 `decimal scale` ((a) the largest magnitude a per-series function of the log, carried by tree checkpoints with the highest stored scale and brought up to date by replay; units limited to ±(2^63 − 1), `i64::MIN` out of range; (d) the scale in force is the highest of the defined scale, the kept raise entries and the highest stored scale among kept facts, and a lost raise is not written again), `excess precision` and the paragraph under the table ((b) the policy and its maximum changed by a parameter change effective at its position), §5.6 ((c) a node records the highest stored scale among the current facts it covers that are not bad; a merge takes the higher), §8 Deep, Continuous backup and Restore step 1 (checkpoint contents), `format.md` A.5 (`i64::MIN`), A.6 (fields 23–26 in a parameter change) and Part B (the scale of a chunk summary and a tree node), `api.md` Series (`set_excess_precision`). Model property tests (the tracked magnitude equals the maximum over the log after any history, restart and restore, a raise refused exactly when a fact would not fit; each value handled by the policy in force at its position; rebuild equals live and merges in any grouping bitwise equal across raises; after any lost range every kept fact rescales exactly to the scale in force) wait for decimal values in the model (before roadmap 5.1; (c) before 7.1); engine: a node spanning a raise, the batch holding a raise corrupted |
+| Q-101 | A replay across a scale raise, rounded or not | §2.4 (decimal values compare by exact numeric value; a fact flagged `rounded` also matches a value that rounds to it at its stored scale; the check runs on the value as submitted, before the excess-precision policy; a correction inside a rounding is dropped as a duplicate unless sent with `revise` or a higher `changed_at`; the revised-key index holds each fact's stored scale and `rounded` flag), `api.md` Core types. Model property test (replaying any recorded history after any raises and policy changes records nothing, writes no raise entry, counts no refusal and changes no current fact) and unit tests (reading, correction, raise, replay; an unflagged 0.1234 then 0.12345 is recorded) wait for decimal values in the model (before roadmap 5.1) |
+| Q-102 | A finite value too large for `i64` at the series' scale | §2.5 (out of range, `i64::MIN` units included: recorded as quality bad with no value whatever the policy, counted `out_of_range`, and reported in the reading's outcome while the call succeeds; `auto-raise` never raises for it), §2.1 `excess precision`, §2.4 (compares as "no value"), row 31, §11 Ingest, `api.md` Core types, Writing (`Outcome::Recorded.out_of_range`) and `series_stats` (`out_of_range`). Model property test (values across the `i64` boundary at every scale 0 to 18: none panics, each recorded exactly or out of range) and a unit test (`auto-raise` does not move the scale for 1e300) wait for decimal values in the model (before roadmap 5.1) |
 | Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (open details: Q-107)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 `file_id` floor and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
 | Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
 
@@ -843,7 +800,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
 | Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
 | Adopting a tzdata release | §5.7: the writer reads the host's release at open, about once a minute and at each local midnight, and whenever it is not the version in force writes a tzdata entry naming it and rebuilds the affected days, without a restart; readers and drills never refuse, and compute calendar results with their own release, using a stored node only where its recorded release is theirs (Q-93 (a)) | The model holds several releases: installing one (`Model::install_tzdb`) writes nothing, results then follow the new rules before any entry names them, a restart keeps the version the log names, and `Model::rebuild_calendars` writes the tzdata entry and rebuilds when called; nothing is refused | `tests/open_questions.rs` `q76_tzdata_change_is_a_log_entry_written_by_the_rebuild` (its restart step), `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` (results between the install and the rebuild) |
-| Decimal series | §2.1 `decimal scale` (default 4, raised by an entry, never lowered; range check), `excess precision` (`round` flagged `rounded`, `refuse`, `auto-raise`; `f64` input converted to its shortest decimal first), row 24 | Values are `f64` only (`ValueType::Number`): there is no scale, raise, policy or `rounded` flag | `tests/edge_cases.rs` `row_24_unit_or_kind_change_is_new_series` |
+| Decimal series | §2.1 `decimal scale` (default 4, raised by an entry, never lowered; range check against the largest magnitude, a function of the log; the scale in force after a lost raise, Q-100), `excess precision` (`round` flagged `rounded`, `refuse`, `auto-raise`; `f64` input converted to its shortest decimal first; the policy changed at a position, Q-100), §2.4 (exact numeric comparison and rounded facts, Q-101), §2.5 (out of range, Q-102), §5.6 (node scale, Q-100), row 24 | Values are `f64` only (`ValueType::Number`): there is no scale, raise, policy, `rounded` flag or out-of-range value. The model property tests of Q-100 to Q-102 wait for decimal values in the model (before roadmap 5.1; Q-100 (c) before 7.1) | `tests/edge_cases.rs` `row_24_unit_or_kind_change_is_new_series` |
 | Local days around a site-zone change | §5.7: the day of date D starts at the first instant whose local date, in the zone in force at that instant, is D or later, so days and months tile; "today" is the latest date whose day has started | `calendar::Zoning::Site` takes a day in the latest entry's zone under which it starts at or after that entry's effective time, else in the store's zone, so a change to another offset leaves hours in no day or two days overlapping; a month node is stored only where its days are contiguous | `tests/open_questions.rs` `q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap` |
 | New-consumer start; `emits` and cycles; name patterns | §4 New consumer, Routing (a consumer declares `emits` and emits through its own handle; a change that closes a cycle is refused), row 33; the pattern grammar is open (Q-88) | Consumers are declared when the model is created and start before the first position; a consumer declares no `emits` and emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected` |
 | Routes before a restore's checkpoint | §2.1, §4 Routing: routing changes are kept with their positions in the registry file, which every tree checkpoint carries, so a route is in force from step 1 of a restore, and after its log segment has left hot | Routes are taken from the entries that are local; a route added before the checkpoint is not in force until the file holding its entry is downloaded | `tests/open_questions.rs` `q64_route_before_checkpoint_not_in_force_until_its_entry_is_back` |

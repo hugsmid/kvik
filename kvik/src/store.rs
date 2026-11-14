@@ -19,7 +19,7 @@ use crate::read::{
     Aggregate, CalendarPeriod, CalendarWindow, ChartData, Facts, Live, ReaderState, Resolution,
     View, Window, WindowResult,
 };
-use crate::series::{ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
+use crate::series::{ExcessPrecision, ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
 use crate::time::{TimeRange, Timestamp, ZoneName};
 use crate::types::{Ack, Fact, FactRow, Intent, Pending, Position, Reading, SeriesId};
 
@@ -131,6 +131,19 @@ impl Store {
     pub async fn raise_scale(&self, id: SeriesId, scale: u8) -> Result<(), DefineError> {
         self.shared()
             .with(|s| s.raise_scale(self.epoch(), id, scale))
+            .map_err(|e| e.define(self.dir_path()))
+    }
+
+    /// Changes a decimal series' excess-precision policy from this entry's
+    /// position on (spec §2.1 `excess precision`). Not supported by the model
+    /// backend, which has no decimal series.
+    pub async fn set_excess_precision(
+        &self,
+        id: SeriesId,
+        policy: ExcessPrecision,
+    ) -> Result<(), DefineError> {
+        self.shared()
+            .with(|s| s.set_excess_precision(self.epoch(), id, policy))
             .map_err(|e| e.define(self.dir_path()))
     }
 

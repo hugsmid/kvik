@@ -184,6 +184,9 @@ pub enum Outcome {
         unchecked: bool,
         /// A decimal value rounded to the series' scale.
         rounded: bool,
+        /// A decimal value that does not fit `i64` units at the series'
+        /// scale, recorded with quality bad and no value (spec §2.5).
+        out_of_range: bool,
     },
     /// An identical repeat, dropped (spec §2.4).
     Duplicate,

@@ -54,10 +54,11 @@ What the model backend supports, each with a test in [`tests/`](tests/) or the c
 Not supported by the model backend:
 
 - **Decimal series** (`ValueType::Decimal`, `ValueType::decimal()`), so also `raise_scale`, the excess-precision
-  policy and `Refusal::ExcessPrecision`: defining one returns `DefineError::NotSupportedYet`. The reference model has
+  policy, `set_excess_precision` and `Refusal::ExcessPrecision`: defining one, raising a scale or changing a policy
+  returns `DefineError::NotSupportedYet`. The reference model has
   no exact decimal values, and storing decimals as `f64` would not give the exact sums the specification promises.
-  `Value::Decimal` on an `f64` series is refused `WrongType`; `Outcome::Recorded.rounded` and the `rounded` fact flag
-  are never set.
+  `Value::Decimal` on an `f64` series is refused `WrongType`; `Outcome::Recorded.rounded`, `Outcome::Recorded.out_of_range` and the
+  `rounded` fact flag are never set, and the `out_of_range` count stays 0.
 - **Calendar-length interval series** (a local day or month, with a day start): `DefineError::NotSupportedYet`.
 - **Parameter changes** other than the retention class: `DefineError::NotSupportedYet`.
 - **A new consumer starting at a position or a time**, and **a consumer that emits** (`emits` other than

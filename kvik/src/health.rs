@@ -301,6 +301,8 @@ pub struct SeriesStats {
     /// Readings submitted as `Value::Absent`, recorded with quality bad
     /// whatever quality was supplied (spec §2.5).
     pub absent_supplied: u64,
+    /// Decimal values out of range, recorded with quality bad (spec §2.5).
+    pub out_of_range: u64,
     /// The greatest `t` over its recorded facts (an addition).
     pub latest_t: Option<Timestamp>,
     /// Counter regressions (spec §5.5; an addition).

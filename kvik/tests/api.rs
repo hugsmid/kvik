@@ -11,11 +11,11 @@ use kvik::env::ManualClock;
 use kvik::{
     Ack, Aggregate, BackupError, CalendarPeriod, CalendarUnit, ChangedAtKind, ChartData, Condition,
     ConditionState, Consumer, ConsumerError, DefineError, Delivery, DeliveryFlags, DeliveryId,
-    DeliveryKind, EmitError, Fact, Funnel, Health, Intent, IntervalLength, Kind, Live, LocalDate,
-    LocalTime, OpenError, Operator, Outcome, ParameterChange, Position, Quality, QueryError,
-    Reader, ReaderConfig, Reading, Reason, Refusal, Resolution, ResyncCause, ResyncPart,
-    RetentionClass, Select, SeriesId, SeriesSpec, Span, Start, StateValues, Store, TimeRange,
-    Timing, TriggerCause, Value, ValueType, View, Wait, Window, ZoneName,
+    DeliveryKind, EmitError, ExcessPrecision, Fact, Funnel, Health, Intent, IntervalLength, Kind,
+    Live, LocalDate, LocalTime, OpenError, Operator, Outcome, ParameterChange, Position, Quality,
+    QueryError, Reader, ReaderConfig, Reading, Reason, Refusal, Resolution, ResyncCause,
+    ResyncPart, RetentionClass, Select, SeriesId, SeriesSpec, Span, Start, StateValues, Store,
+    TimeRange, Timing, TriggerCause, Value, ValueType, View, Wait, Window, ZoneName,
 };
 
 fn gauge(name: &str, expected: u64) -> SeriesSpec {
@@ -137,6 +137,7 @@ fn define_emit_and_read() {
             outranked: false,
             unchecked: false,
             rounded: false,
+            out_of_range: false,
             ..
         }
     ));
@@ -878,6 +879,10 @@ fn unsupported_items_say_so() {
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     assert!(matches!(
         block_on(s.raise_scale(g, 6)),
+        Err(DefineError::NotSupportedYet { .. })
+    ));
+    assert!(matches!(
+        block_on(s.set_excess_precision(g, ExcessPrecision::Round)),
         Err(DefineError::NotSupportedYet { .. })
     ));
     let change = ParameterChange::default().expected_interval(Duration::from_secs(5));

@@ -101,8 +101,11 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
   `Absent` is "no value" (spec §2.5): it is recorded with quality bad whatever quality is supplied, and the supplied
   quality is kept for the duplicate rule; to record that a state is unknown, declare a state name for it. NaN and
   ±∞ are recorded as quality bad with no value, flagged and counted (spec §2.5), on a decimal series as on any
-  other. A finite value too large for `i64` at the series' scale is open
-  (Q-102 in `model/OPEN-QUESTIONS.md`).
+  other. A finite value that, rounded to the series' current scale, does not fit ±(2^63 − 1) units (a `Decimal`
+  with units `i64::MIN` included) is recorded as quality bad with no value, counted (`out_of_range`) and reported
+  in its outcome (`Outcome::Recorded.out_of_range`, spec §2.5). In the duplicate rule decimal values compare by exact
+  numeric value, and a fact flagged `rounded` also matches a value that rounds to it at its stored scale (spec
+  §2.4), so a correction inside a rounding is sent with `Intent::Revise`.
 - Configuration durations are `std::time::Duration`; `Span` is used only where a sign is needed.
 
 ## Errors (accepted at gate 3.3)
@@ -152,6 +155,7 @@ let id: SeriesId = store.define_series(
 ).await?;
 store.set_parameters(id, effective_from, ParameterChange::default().staleness(s)).await?;
 store.raise_scale(id, 3).await?;              // from this entry's position on; never lowered
+store.set_excess_precision(id, ExcessPrecision::AutoRaise { max_scale: 6 }).await?;   // from this entry's position on
 store.alias(id, "plant/line-1/temp").await?;
 store.retire(id, t_r).await?;
 let info = store.series(id)?;                 // also by name
@@ -163,7 +167,9 @@ returns its id. A different kind, value type or unit, or a lower scale, under th
 retires and defines anew. A higher scale is set with `raise_scale`, which appends a scale raise entry (spec §2.1
 `decimal scale`); it fails with `ScaleNotRaised` unless the new scale is higher, and with `ScaleOverflow` if the
 largest magnitude stored so far would overflow `i64` at it. Earlier facts keep their scale and are returned rescaled
-exactly to the current one.
+exactly to the current one. `set_excess_precision(id, policy) -> Result<(), DefineError>` appends a parameter change
+that takes effect at its position (spec §2.1 `excess precision`); a maximum scale below the current scale is
+`DefineError::Invalid`.
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
 series; a day may start at a declared local time instead of midnight:
@@ -183,7 +189,8 @@ pub async fn emit(&self, readings: &[Reading]) -> Result<Ack, EmitError>;       
 pub fn try_emit(&self, readings: &[Reading]) -> Result<Pending, EmitError>;         // never waits; Err(Busy(w))
 pub struct Pending;  /* impl Future<Output = Result<Ack, EmitError>> */              // may be dropped
 pub struct Ack { pub outcomes: Vec<Outcome> }                                        // one per reading, by index
-pub enum Outcome { Recorded { position: Position, outranked: bool, unchecked: bool, rounded: bool }, Duplicate, Refused(Refusal) }
+pub enum Outcome { Recorded { position: Position, outranked: bool, unchecked: bool, rounded: bool, out_of_range: bool },
+                   Duplicate, Refused(Refusal) }
 impl Ack { pub fn first(&self) -> Option<Position>; pub fn last(&self) -> Option<Position>;
            pub fn duplicates_dropped(&self) -> u32; pub fn refused(&self) -> impl Iterator<Item = (usize, Refusal)>; }
 pub struct Reading { pub series: SeriesId, pub t: Timestamp, pub value: Value, pub quality: Quality,
@@ -197,7 +204,8 @@ store.emit_with(&readings, Intent::Revise).await?;
   resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
   the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
   a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
-- Individual readings may be refused (`Refusal`, reported per index); a non-finite value is recorded, not refused.
+- Individual readings may be refused (`Refusal`, reported per index); a non-finite value is recorded, not refused,
+  and so is a decimal value out of range, whose outcome says so (`out_of_range`, spec §2.5).
   A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`.
 - **Back-pressure** is a wait, with its reason: `try_emit` returns `Busy(Wait)`, including `UnsyncedClock` when the
   call holds a host-stamped reading; `emit` waits, and `stats().ingest.waiting` and health name the reason. There is
@@ -345,7 +353,7 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //            open_file_id, sealed_segments, bytes, manifest_rebuilds }   ClockStats { jumps, last: Option<ClockJump> }
 pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, duplicates_dropped, duplicates_unchecked,
                                                                    // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts,
-                                                                   // rounded, scale_raises, absent_supplied
+                                                                   // rounded, scale_raises, absent_supplied, out_of_range
 let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), for re-ingest
 ```
 - A loss's identity is the first position of its range when it was first reported. Reports are read from the

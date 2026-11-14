@@ -198,7 +198,8 @@ and ignorable rule.
 | 8 | `changed_at` | u64 | exactly when a row has flag bit 6 | plain |
 | 9 | `scale` | u8, 0–18 | exactly when a row has `value_type = 2` | plain, run-length |
 
-- `value` holds the IEEE-754 bit pattern (f64), the two's-complement integer (i64), the index or 0/1 in the low
+- `value` holds the IEEE-754 bit pattern (f64), the two's-complement integer (i64; never `i64::MIN`, which is out of
+  range, `spec.md` §2.1), the index or 0/1 in the low
   bytes with zero upper bytes (state, bool), or for text a `u32` offset and a `u32` length relative to the start of
   the heap payload (at most 255 bytes, UTF-8).
 - `quality` holds the **adapter-supplied** quality, also on a `no_value` row. The engine's quality is derived, never
@@ -243,7 +244,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | Entry type | Fields |
 |---:|---|
 | 1 series definition | the table below |
-| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life; whether 25 and 26 may change is open, Q-100). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
+| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 to 26 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20 (26 only with 25 = 2, at least the scale in force). No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
 | 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
@@ -523,9 +524,9 @@ to every stored file.
   positions and `i64`; scaled decimal with per-value exceptions and a zstd-compressed XOR fallback; run-length for
   quality, flags and states; 4,096-row blocks behind a directory of first and last `t`. The layout, the per-batch
   `received_at` table and the self-description fields are written by roadmap 6.1. A chunk of a decimal series
-  records its own scale; how that scale relates to the scales of its facts is open (Q-100, Q-101). The index can be
-  fetched without
-  the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
+  keeps the per-fact scale column of A.5, and its summary, like a tree node of a decimal series, carries a `u8`
+  scale: the highest stored scale among the current facts it covers that are not bad (`spec.md` §5.6). The index can
+  be fetched without the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
 - **Chunk index (`kind = 14`).** Carries the compacted file's self-description (A.14: kind, class, `file_id`,
   generation, position range, input `file_id`s, plaintext hash), so that a manifest rebuild can read the inputs of a
   file that is not local (`spec.md` §7 Manifest).
@@ -540,6 +541,7 @@ to every stored file.
 - **Cursor (`kind = 4`).** A.15; latches and sequences are added by roadmap 5.2.
 - **Registry (`kind = 5`).** The compacted registry: series entries, site-zone and tzdata entries, routing
   changes and recovery entries, each with its position.
-- **Tree (`kind = 6`).** Per-series stored summary levels with the position up to which they are complete.
+- **Tree (`kind = 6`).** Per-series stored summary levels with the position up to which they are complete; each node
+  of a decimal series carries its `u8` scale (`spec.md` §5.6).
 
 Each is specified in this document before the roadmap section that implements it.

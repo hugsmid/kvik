@@ -39,8 +39,8 @@ use crate::read::{
     ReaderState, Resolution, ResultFlags, View, Window, WindowResult,
 };
 use crate::series::{
-    IntervalLength, Kind, ParameterChange, RetentionClass, SeriesInfo, SeriesKey, SeriesSpec,
-    StateValues, Timing,
+    ExcessPrecision, IntervalLength, Kind, ParameterChange, RetentionClass, SeriesInfo, SeriesKey,
+    SeriesSpec, StateValues, Timing,
 };
 use crate::time::{Span, TimeRange, Timestamp};
 use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
@@ -498,6 +498,19 @@ impl Slot {
         ))
     }
 
+    pub(crate) fn set_excess_precision(
+        &mut self,
+        epoch: u64,
+        id: SeriesId,
+        _policy: ExcessPrecision,
+    ) -> Result<()> {
+        self.writable(epoch)?;
+        self.spec(id)?;
+        Err(Error::NotSupportedYet(
+            "decimal series and their excess-precision policy: the reference model has no exact decimal values",
+        ))
+    }
+
     pub(crate) fn set_parameters(
         &mut self,
         epoch: u64,
@@ -836,6 +849,7 @@ impl Slot {
                 outranked,
                 unchecked: false,
                 rounded: false,
+                out_of_range: false,
             });
         }
         let outcomes: Vec<Outcome> = outcomes
