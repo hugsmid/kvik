@@ -9,7 +9,7 @@ use kvik_model::engine::{
 };
 use kvik_model::summary::Params;
 use kvik_model::types::{
-    Fact, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId, Value,
+    Fact, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId, Value,
     ValueType,
 };
 use proptest::prelude::*;
@@ -407,4 +407,54 @@ pub fn seqs(positions: impl IntoIterator<Item = Position>) -> Vec<u64> {
             p.sequence
         })
         .collect()
+}
+
+/// A store with a tree checkpoint at `0:6`: facts at `T0` + 0, 20, 40 and
+/// 130 s and a revision of the one at 20 s, compacted into a current and a
+/// revision chunk; then facts at 150 s (the minute of the one at 130 s) and
+/// 200 s after the checkpoint (`0:7`, `0:8`). Everything is sealed and backed
+/// up, and the checkpoint is uploaded.
+pub fn checkpointed_model() -> (Model, SeriesId, Position) {
+    let c = ConsumerDecl {
+        id: ConsumerId(1),
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![c], T0 + HOUR);
+    let s = m
+        .define(
+            "plant/line-1/temperature",
+            Kind::Gauge,
+            ValueType::Number,
+            "degC",
+            2 * MINUTE,
+        )
+        .unwrap();
+    for (t, v) in [(0, 0.0), (20, 1.0), (40, 2.0), (130, 3.0), (20, 100.0)] {
+        m.ingest(vec![Reading::num(s, T0 + t * SECOND, v)]).unwrap();
+    }
+    m.seal_active();
+    m.compact(None).unwrap();
+    let cp = m.checkpoint().unwrap();
+    assert_eq!(cp, Position::new(0, 6));
+    for (t, v) in [(150, 4.0), (200, 5.0)] {
+        m.ingest(vec![Reading::num(s, T0 + t * SECOND, v)]).unwrap();
+    }
+    m.seal_active();
+    assert_eq!(m.upload_checkpoints(), 1);
+    (m, s, cp)
+}
+
+/// A restore of `m`'s bucket that returns as soon as it accepts ingest.
+pub fn restore_in_progress(m: &mut Model, cursors: &BTreeMap<ConsumerId, Position>) -> Model {
+    Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        cursors,
+        m.wall,
+        true,
+        false,
+    )
+    .unwrap()
 }

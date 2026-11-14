@@ -844,56 +844,6 @@ fn s8_restored_end_starts_at_generation_0() {
     assert!(r2.facts().unwrap().is_empty());
 }
 
-/// A store with a tree checkpoint at `0:6`: facts at `T0` + 0, 20, 40 and
-/// 130 s and a revision of the one at 20 s, compacted into a current and a
-/// revision chunk; then facts at 150 s (the minute of the one at 130 s) and
-/// 200 s after the checkpoint (`0:7`, `0:8`). Everything is sealed and backed
-/// up, and the checkpoint is uploaded.
-fn checkpointed_model() -> (Model, SeriesId, Position) {
-    let c = ConsumerDecl {
-        id: ConsumerId(1),
-        selection: Selection::All,
-        capacity: 100,
-    };
-    let mut m = Model::new(Config::default(), vec![c], T0 + HOUR);
-    let s = m
-        .define(
-            "plant/line-1/temperature",
-            Kind::Gauge,
-            ValueType::Number,
-            "degC",
-            2 * MINUTE,
-        )
-        .unwrap();
-    for (t, v) in [(0, 0.0), (20, 1.0), (40, 2.0), (130, 3.0), (20, 100.0)] {
-        m.ingest(vec![Reading::num(s, T0 + t * SECOND, v)]).unwrap();
-    }
-    m.seal_active();
-    m.compact(None).unwrap();
-    let cp = m.checkpoint().unwrap();
-    assert_eq!(cp, Position::new(0, 6));
-    for (t, v) in [(150, 4.0), (200, 5.0)] {
-        m.ingest(vec![Reading::num(s, T0 + t * SECOND, v)]).unwrap();
-    }
-    m.seal_active();
-    assert_eq!(m.upload_checkpoints(), 1);
-    (m, s, cp)
-}
-
-/// A restore of `m`'s bucket that returns as soon as it accepts ingest.
-fn restore_in_progress(m: &mut Model, cursors: &BTreeMap<ConsumerId, Position>) -> Model {
-    Model::restore_with_cursors(
-        m.config.clone(),
-        m.consumers.clone(),
-        &mut m.disk.bucket,
-        cursors,
-        m.wall,
-        true,
-        false,
-    )
-    .unwrap()
-}
-
 /// The bucket's log segment holding `p`.
 fn segment_holding(m: &Model, p: Position) -> FileId {
     *m.disk
@@ -1082,10 +1032,6 @@ fn s8_restoring_queries_at_one_minute_resolution() {
             .unwrap()
             .summary_stale
     );
-    assert_eq!(
-        r.query_window(s, T0 + SECOND, T0 + MINUTE),
-        Err(Error::Restoring)
-    );
     r.restore_rest().unwrap();
     let c = r.query_window(s, T0 + SECOND, T0 + 4 * MINUTE).unwrap();
     assert!(!c.restoring);
@@ -1147,16 +1093,6 @@ fn s8_duplicates_unchecked_until_revised_key_index_back() {
     // At or before it and matching no local fact: recorded and counted.
     let p = r.ingest(vec![Reading::num(s, T0, 0.0)]).unwrap();
     assert_eq!((p.positions.len(), r.counters.duplicates_unchecked), (1, 1));
-    // With the current chunk back, the revised-key index is back: a replay of
-    // a revised key's earlier value is dropped although the revision chunk
-    // holding it is still remote.
-    let f = r.restore_step().unwrap().unwrap();
-    assert_eq!(r.disk.files[&f].class, FileClass::Current);
-    let p = r
-        .ingest(vec![Reading::num(s, T0 + 20 * SECOND, 1.0)])
-        .unwrap();
-    assert_eq!((p.positions.len(), p.duplicates), (0, 1));
-    assert_eq!(r.counters.duplicates_unchecked, 1);
 }
 
 /// §8 Restore step 3: "Download current chunks and the revised-key index,
