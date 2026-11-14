@@ -187,6 +187,19 @@ fn read_back(bytes: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
     out
 }
 
+/// The zero padding after each block body of a batch.
+fn padding(e: &Expected) -> Vec<std::ops::Range<u64>> {
+    let mut at = e.offset;
+    let mut out = Vec::new();
+    for (_, _, body) in &e.blocks {
+        let body_end = at + 16 + body.len() as u64;
+        let next = at + 16 + (body.len() as u64).div_ceil(8) * 8;
+        out.push(body_end..next);
+        at = next;
+    }
+    out
+}
+
 fn got(r: &ScanReport<'_>) -> Vec<Expected> {
     r.batches
         .iter()
@@ -263,6 +276,18 @@ proptest! {
             // Every batch the flip did not touch is still found.
             for e in expected.iter().filter(|e| !(e.offset..e.end).contains(&byte)) {
                 prop_assert!(got.contains(e), "lost an untouched batch at {}", e.offset);
+            }
+            // The batch the flip touched is reported as damage, unless the flip is in the zero padding after a
+            // block body: padding is not covered by the batch's checksums, so such a flip is accepted by design
+            // (`format.md` A, common rules; a sealed file's `file_crc32c` covers it).
+            if let Some(e) = expected.iter().find(|e| (e.offset..e.end).contains(&byte)) {
+                if got.contains(e) {
+                    prop_assert!(padding(e).iter().any(|p| p.contains(&byte)), "flip at {} accepted", byte);
+                } else {
+                    let in_region = r.regions.iter().any(|g| g.start <= byte && byte < g.end);
+                    let in_tail = matches!(r.tail, Some(Tail::Torn { start, .. }) if start <= byte);
+                    prop_assert!(in_region || in_tail, "damage at {} not reported", byte);
+                }
             }
         }
     }
