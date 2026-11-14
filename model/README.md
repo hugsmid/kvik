@@ -134,7 +134,8 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 46 | — | — |  | Calendar-length interval series (Q-45): not yet modelled (follow-up item) |
 
 ```bash
-cargo test --release                  # faster
-PROPTEST_CASES=10000 cargo test --release
+cargo test --release                         # faster
+PROPTEST_CASES=10000 cargo test --release    # the deep CI cases on pull requests (40,000 nightly)
+../.github/deep-shards.sh run invariants-5   # one shard of that run; set PROPTEST_CASES the same way
 cargo run --example basic
 ```

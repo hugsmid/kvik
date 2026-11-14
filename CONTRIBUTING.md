@@ -9,8 +9,10 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
-CI checks formatting, lints and documentation on Linux, runs the tests on Linux, macOS and Windows, and runs
-longer property tests on Linux on every change and nightly.
+CI checks formatting, lints and documentation on Linux, runs the tests on Linux, macOS and Windows, and runs the
+property tests in release mode with many more cases on Linux: 10,000 on every change and 40,000 nightly, split into
+the shards listed in `.github/deep-shards.sh`. Each deep job checks that every test is in exactly one shard; tests
+of a new invariant go to the last invariants shard unless the table names them, so give a slow group a place there.
 
 ## Guidelines
 - **Specification first.** A change to behaviour starts as a change to `docs/spec.md`. The reference model then

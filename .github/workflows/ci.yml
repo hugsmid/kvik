@@ -73,24 +73,59 @@ jobs:
           PROPTEST_CASES: "1024"
       - run: cargo run --locked --example basic
 
+  deep-shards:
+    # The deep job's matrix, generated from the table in .github/deep-shards.sh.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: shards
+        run: |
+          shards=$(bash .github/deep-shards.sh matrix)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
   deep:
-    # Many more random cases, one job per property-test file, in release mode.
-    # Measured on the runner: with 100,000 cases the slowest file
-    # (invariants) runs its tests in about 100 s, the whole job in about
-    # 2 minutes, well inside the limit.
-    name: deep (${{ matrix.suite }})
+    # Many more random cases, in release mode, one job per shard: the
+    # invariants file is split by invariant number into 8 shards, each other
+    # property-test file is one shard (.github/deep-shards.sh). Each job first
+    # checks that the shards of its file select every test exactly once.
+    #
+    # Durations. Measured on the runner: invariants as one job at 10,000
+    # cases took 18 minutes (build included, 4 test threads). The same tests
+    # one at a time on a faster machine take 139 s per 1,000 cases, 1,390 s
+    # at 10,000, so runner wall time is about 0.78 times the local serial
+    # sum. The slowest invariants shard sums to at most 20.5 s per 1,000
+    # cases, so about 16 s per 1,000 on the runner; its slowest test
+    # (inv09_stepwise_restore_from_checkpoint, 6.8 s per 1,000 locally)
+    # takes 0.8 to 3.1 times that on the runner, depending on how much the
+    # threads slow each other. rules (12.6 s per 1,000 locally) and
+    # edge_cases (10.7 s) are lighter than any invariants shard.
+    #   - Pull requests, 10,000 cases: slowest shard about 3 minutes plus
+    #     the build.
+    #   - Nightly, 40,000 cases: slowest shard about 11 minutes plus the
+    #     build; even if its slowest test were 3.1 times slower than locally
+    #     and ran last, about 21 minutes plus the build. Both inside the
+    #     30-minute limit; the first is about half of it.
+    # These are projections from the local timings; compare them with the
+    # nightly run and rebalance the table when a shard grows.
+    name: deep (${{ matrix.shard }})
+    needs: deep-shards
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        suite: [invariants, edge_cases, rules, open_questions, model]
+        shard: ${{ fromJSON(needs.deep-shards.outputs.shards) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: deep
-      - run: cargo test --locked --release -p kvik-model --test ${{ matrix.suite }}
+      - name: Check that the shards cover every test of the file once
+        run: bash .github/deep-shards.sh check ${{ matrix.shard }}
+      - run: bash .github/deep-shards.sh run ${{ matrix.shard }}
         env:
-          PROPTEST_CASES: ${{ inputs.cases || (github.event_name == 'schedule' && '100000' || '10000') }}
+          PROPTEST_CASES: ${{ inputs.cases || (github.event_name == 'schedule' && '40000' || '10000') }}
