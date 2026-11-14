@@ -47,7 +47,10 @@ store.alias(id, "plant/line-1/temp").await?;
 store.retire(id, t_r).await?;
 let info = store.series(id)?;                 // also by name
 ```
-Defining a series that already exists with the same specification returns its id. A different kind, value type,
+These calls, and route changes, resolve only after the durable mark has been synced past their entry (spec §3
+Commit). The writer forces that mark sync at once rather than waiting for `mark_sync_interval`, so each call waits
+for one mark sync, not for up to the interval. Defining a series that already exists with the same specification
+returns its id. A different kind, value type,
 scale or unit under the same name is an error; the caller retires and defines anew.
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
@@ -69,7 +72,9 @@ let ack: Ack = store.emit(&[Reading { series: id, t, value, quality, source: Tim
 store.try_emit(&readings)?;                   // never waits; Err(Busy) under back-pressure
 store.emit_with(&readings, Intent::Revise).await?;
 ```
-- `emit` resolves only after the batch is synced and the durable mark has moved. It waits under back-pressure.
+- `emit` resolves only after the batch is synced and the durable mark has moved. Batches resolve in commit order, so
+  a batch of facts committed after a batch holding any other entry also waits for that batch's mark sync, which is
+  forced at once (spec §3 Commit). It waits under back-pressure.
 - A batch is all-or-nothing for durability, but individual readings may be refused (invalid series, retired
   series, a non-finite value recorded as bad quality is not a refusal). Refusals are reported per index.
 - Readings in one call keep their order; calls from different tasks are ordered by commit.
@@ -88,11 +93,12 @@ while let Some(d) = consumer.next().await {
     match d.kind {
         DeliveryKind::Fact(f) => { /* f.position, f.series, f.t, f.value */ }
         DeliveryKind::Trigger(t) => { /* t.funnel, t.state, t.value, t.coverage */ }
-        DeliveryKind::Resync(s) => { /* live and condition state now; forget positions above the recovered cursor */ }
+        DeliveryKind::Resync(s) => { /* drop positions above s.forget_above, durably; then confirm */ }
     }
     consumer.confirm(d.id).await?;            // advances the durable cursor
 }
-// Resync { funnels: Vec<FunnelState { funnel, live: Live, condition: Option<ConditionState> }> }
+// Resync { forget_above: Option<Position>, funnels: Option<Vec<FunnelState { funnel, live: Live, condition: Option<ConditionState> }>> }
+// funnels is Some only on the resync that ends a resume (spec §4 Resync)
 enum ConditionState { True, False, Unknown }
 enum Live { Value(Fact), None, Unknown }
 ```
@@ -103,10 +109,16 @@ enum Live { Value(Fact), None, Unknown }
 - A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
   or on the timer, valid until the next `Resync`), `flags` (`replayed`,
   `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
-- `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.
-- On `Resync` the consumer must forget every position it has seen above its durable cursor as recovered, which can
-  lag its last confirmation: after a power loss such a position can name a different fact (spec §3 Recovery rule 3,
-  §4 At-least-once).
+- `Start::Position(p)` begins with a `Resync` whose `forget_above` is `p`; how `p` is checked against a truncation or
+  restore after it was read is open (Q-46 in `model/OPEN-QUESTIONS.md`).
+- `confirm` is cheap and batched; the cursor is written at most once a second, on shutdown and when a `Resync`
+  carrying `forget_above` is confirmed.
+- A `Resync` may carry `forget_above` = X: the consumer must drop every position above X from its de-duplication
+  memory, its own last confirmation included, because such a position can now name a different fact (spec §3
+  Recovery rule 3, §4 At-least-once). It confirms that `Resync` only when the forgetting is durable wherever that
+  memory is kept; nothing further is delivered until it does. Records it keeps outside the engine at those positions
+  are copies of facts the store may no longer hold; the engine never asks for them to be deleted and does not protect
+  them. A `Resync` without `forget_above` requires no forgetting of positions.
 - A consumer that emits readings uses its own handle, `consumer.try_emit(&readings)`, or its own task, never the
   delivery callback. A reading on a series outside the consumer's `emits` is refused with `Refusal::NotDeclared` and
   counted.
@@ -138,6 +150,8 @@ let (start, end) = reader.interval(id, t)?;                 // the interval of a
   interval series it also carries `apportioned` and `displaced` (spec §5.4, §6).
   `facts` over detail that is not local, also during a restore, fetches it on demand.
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
+- A reader that reads a recovery entry drops what it took above the entry's `after` (spec §7 Readers). A call that
+  checks a position kept for later use against a later truncation or restore is open (Q-46 in `model/OPEN-QUESTIONS.md`).
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 
 ## Health and statistics
@@ -145,6 +159,10 @@ let (start, end) = reader.interval(id, t)?;                 // the interval of a
 let h: Health = store.health();     // Ok, Degraded { reasons }, ReadOnly { cause }
 let s: Stats = store.stats();       // per series and per consumer counters, commit latency, queue depths,
                                     // time behind, disk marks, backup lag
+let l: Vec<Loss> = store.losses();  // every loss ever reported: kind (data_lost, possible_loss), range, bytes,
+                                    // cause, commit times, boot id, acknowledged
+store.acknowledge_losses(&[loss_id]).await?;   // LossId: first position of the range when first reported
+let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), for re-ingest
 ```
 Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
 calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,
@@ -153,7 +171,11 @@ per condition funnel `transitions_not_delivered` while its consumer caught up (s
 include `restore_failed` (naming the file), the set-aside range of each restore record, a tzdata change with both
 versions and the days rebuilt, and a series whose interval zone the tzdata version in force does not know (spec §2.1,
 §5.7); statistics include restore progress (files and bytes remaining), which is not a health condition (spec §8
-Restore).
+Restore). Statistics include `orphaned_facts` per id (spec §2.1). Health reasons include `unacknowledged_loss`, one
+per `data_lost` not yet acknowledged, and `manifest_corrupt` (fatal, spec §7 Manifest). `Loss.acknowledged` applies
+to `data_lost` only: a `possible_loss` is listed and counted, never holds health degraded and needs no
+acknowledgement (spec §8 Acknowledging a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a
+drill.
 
 ## Backup and restore
 ```rust

@@ -2291,9 +2291,12 @@ fn s4_resync_replaces_replay_when_cursor_too_far_behind() {
 }
 
 /// §3 Recovery rule 3 and §4 Resync: after a recovery on a new boot, every
-/// consumer receives `resync` "before any position above the last kept batch
-/// is delivered to it"; §6: "this replay stops at the last kept batch, and the
-/// one `resync` that follows serves both rules."
+/// consumer receives `resync` before any position above the last kept batch.
+/// The model writes no recovery entry, so the replay stops at the last kept
+/// batch and the resume's `resync` serves as the reset point; the
+/// specification now puts a recovery entry at the first new position, where
+/// that `resync` is, so the later fact takes the next one (see
+/// `OPEN-QUESTIONS.md`).
 #[test]
 fn s4_resync_after_rule_3_recovery_before_later_positions() {
     let (mut m, a, _) = routed_model(100);
@@ -2732,8 +2735,9 @@ proptest::proptest! {
 
     /// §4 Resync and §6 Restart and resume: on resume the replay stops at the
     /// position the `resync` names, and no fact above it is delivered before
-    /// the `resync` (after a §3 Recovery rule 3 recovery, the last kept
-    /// batch); a `generation_changed` comes just before its `resync`.
+    /// the `resync` (after a §3 Recovery rule 3 recovery, the last kept batch
+    /// in the model; the recovery entry in the specification); a
+    /// `generation_changed` comes just before its `resync`.
     #[test]
     fn s4_resync_separates_replay_from_later_positions(
         ops in proptest::collection::vec(arb_delivery_op(), 1..100)

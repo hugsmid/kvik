@@ -187,13 +187,13 @@ demand for fact reads, never for windows or consumer catch-up. The engine never 
 | Concept | Meaning |
 |---|---|
 | Fact | One recorded reading: series, event time `t`, value, quality, flags, position. Never edited or deleted |
-| Position | `(generation, sequence)`, gap-free within a generation except recorded lost ranges; orders every log entry |
+| Position | `(generation, sequence)`, gap-free within a generation except lost ranges, recorded or described by a recovery entry; orders every log entry |
 | Series | A named stream with a fixed kind (gauge, counter, state, text, interval), value type and unit |
 | Versioned series | A series whose source revises readings; each carries `changed_at`, and the highest revision wins |
 | Window | A rolling or calendar span evaluated in event time; every result carries coverage and flags |
 | Calendar result | A local day or month in a configured or named time zone, evaluated as a window over UTC data |
 | Consumer | In-process code fed by funnels (selection, optional windowed operator, condition), with a durable cursor |
-| Resync | A delivery carrying the present live and condition state, sent where a replay would be wrong or impossible |
+| Resync | A delivery sent where a replay would be wrong or impossible: at the end of a resume it carries the present live and condition state; after a power loss or a lost range it names the positions the consumer must forget |
 | Tier | Hot local disk, optional cold path, deep bucket; files move between them only after a verified copy |
 
 ### Planned interface

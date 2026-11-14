@@ -24,7 +24,7 @@ measurements in the roadmap.
 | 8 | 4 | `flags` | reserved |
 | 12 | 4 | `generation` | |
 | 16 | 8 | `file_id` | segment id for log and compacted segments; unique per kind |
-| 24 | 8 | `base_sequence` | log: sequence of the first entry this file may hold; otherwise 0 |
+| 24 | 8 | `base_sequence` | log: sequence of the first entry this file may hold (for a segment opened by a recovery batch, its F, `spec.md` §3); otherwise 0 |
 | 32 | 8 | `created_at` | |
 | 40 | 16 | `store_id` | random, fixed for the life of a store; a file with a different id is refused |
 | 56 | 4 | reserved | |
@@ -44,7 +44,9 @@ The body follows immediately and is padded with zeros to the next multiple of 8.
 
 **Reading blocks.** At a block boundary: sixteen zero bytes mean *end of data* (unwritten preallocated space).
 Otherwise the header checksum must match, the type must be known or skippable, `body_len` must fit in the file,
-and the body checksum must match. The first failure ends the readable part of the file; nothing after it is used.
+and the body checksum must match. The first failure ends the readable part of the file; nothing after it is used,
+except in a log segment, where a complete batch after an invalid region is still used (`spec.md` §3 Recovery rule 2;
+how the next batch is found is checked at roadmap 3.1, `model/OPEN-QUESTIONS.md` F-5).
 
 ### A.3 Versioning
 - A reader refuses a file whose `format_major` is greater than it supports, with an error that names both
@@ -63,15 +65,16 @@ file to its written length, syncs it, renames it to `.kvl`, and syncs the direct
 | Type | Name | Skippable | Role |
 |---:|---|---|---|
 | `0x01` | facts | no | readings, in arrival order |
-| `0x02` | entries | no | definitions, parameters, aliases, retirements, site-zone and tzdata entries, routing changes |
+| `0x02` | entries | no | definitions, parameters, aliases, retirements, site-zone and tzdata entries, routing changes, recovery entries |
 | `0x0F` | commit | no | ends a batch |
 | `0x10` | segment index | yes | written at seal: which series the segment holds |
 | `0x7F` | trailer | no | written at seal: marks the file as sealed |
 
 **Sequence assignment.** Entries take consecutive sequences in the order they appear: block by block, and row
-by row inside a block. The first entry of a batch has the sequence after the previous batch's last; the first
-entry of a file has `base_sequence`. An `entries` block that defines a series must come before any `facts`
-block that uses it.
+by row inside a block. The first entry of a batch has the sequence after the previous complete batch's last, or
+after the end of a lost range that lies between them (`spec.md` §3 Recovery rule 2), except that a batch holding a
+recovery entry may start higher (A.7); the first entry of a file has `base_sequence`. An `entries` block that
+defines a series must come before any `facts` block that uses it.
 
 ### A.5 Facts block body
 | Offset | Size | Field |
@@ -127,6 +130,7 @@ are a list of `field_id: u16`, `field_len: u16`, bytes (padded to 4). Unknown fi
 | 5 routing change | defined with the interface document; carries the consumer's `emits` selection |
 | 6 site zone | 30 zone name; 20 effective time |
 | 7 tzdata | 31 version (UTF-8 release name) |
+| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reserved; 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable or half-updated); 46 id floor `u32`; 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
 
 Durations are `i64` nanoseconds. Strings are UTF-8 without a terminator.
 
@@ -143,8 +147,10 @@ Durations are `i64` nanoseconds. Strings are UTF-8 without a terminator.
 | 44 | 4 | reserved | |
 
 A batch is **complete** when every data block is valid, the commit block is valid, `block_count` and
-`batch_bytes` match what precedes it, and the sequences are consecutive with the previous batch. Readers use
-only complete batches.
+`batch_bytes` match what precedes it, and its first sequence follows the previous complete batch's last, or the end
+of a lost range between them after an invalid region (`spec.md` §3 Recovery rule 2), except that a batch holding a
+recovery entry may start higher; its `after` is the previous batch's last sequence or the end of a lost range at the
+tail, and it may follow an invalid region at the tail. Readers use only complete batches.
 
 ### A.8 Segment index body (written at seal)
 `series_count: u32`, reserved `u32`, then per series, sorted by id: `series_id: u32`, `fact_count: u32`,
@@ -166,15 +172,15 @@ only complete batches.
 The last 16 bytes of a sealed file are `trailer_offset: u64` and the ASCII bytes `KVIKEND` followed by a zero
 byte. A file is sealed only if these are present and the trailer is valid.
 
-## A.10 Durable mark (`log/MARK`, 64 bytes, memory-mapped, not synced)
+## A.10 Durable mark (`log/MARK`, 64 bytes, memory-mapped, synced on the timer, at once after a batch holding an entry that is not a fact, at clean shutdown and by recovery)
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 8 | `magic` | ASCII `KVIKMARK` |
-| 8 | 4 | `version` | 1 |
+| 8 | 4 | `version` | 2 |
 | 12 | 4 | `seq` | odd while the writer is updating |
 | 16 | 16 | `boot_id` | changes on every boot of the machine |
 | 32 | 4 | `generation` | |
-| 36 | 4 | reserved | |
+| 36 | 4 | `max_series_id` | the highest series id assigned |
 | 40 | 8 | `file_id` | the segment the mark points into |
 | 48 | 8 | `offset` | just past the last durable commit block, including padding |
 | 56 | 8 | `last_sequence` | |
@@ -184,16 +190,21 @@ byte. A file is sealed only if these are present and the trailer is valid.
 - A reader copies the fields and accepts them only if `seq` was even and unchanged before and after the copy.
 - Readers of an unsealed segment never read past `offset`. Sealed segments are read whole.
 - Recovery follows `spec.md` §3: same `boot_id` as the running machine, truncate the open segment to the mark;
-  different `boot_id`, keep complete batches, sync, then advance the mark.
+  different `boot_id`: keep complete batches, sync, write or adopt the recovery entry, sync, then update the mark in
+  place and sync it.
+- The mark file is updated in place and never replaced while it exists; a new file is created only when none
+  exists.
 - On a platform that cannot supply a boot identifier, the mark file is synced after every update instead, and
   recovery always truncates to it.
 
 ## A.11 What an implementation must test
 - Round trip of every block type, with property tests over row counts, encodings and field combinations.
-- Golden files for v1, including an unsealed segment with a torn final batch.
+- Golden files for v1, including an unsealed segment with a torn final batch, and segments with a recovery entry,
+  with a gap before a recovery entry, and with an adopted recovery entry followed by the rest of a torn tail.
 - A fuzz target for the block reader and for each body decoder: no input may cause a panic, an out-of-bounds
   read or an allocation larger than the declared `body_len`.
-- Truncation at every byte offset of a batch: the reader returns exactly the complete batches before it.
+- Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
+  batches before it.
 
 ## B. Outline of the remaining files (not yet normative)
 
@@ -203,11 +214,15 @@ byte. A file is sealed only if these are present and the trailer is valid.
   run-length for quality, flags and rarely changing values. The layout and encodings are fixed after the
   encoding measurements. Compacted data uses this own format; Parquet is the export format. The index can be fetched
   without the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
-- **Manifest (`kind = 3`).** An append-only sequence of checksummed records; one record publishes a set of
-  files and retires another set atomically, with an epoch.
+- **Manifest (`kind = 3`).** An append-only sequence of checksummed records, each starting at an 8-byte boundary;
+  one record publishes a set of files and retires another set atomically, with an epoch. Other records: lost range
+  (identity, position range, byte range, cause, boot id, id floor, commit times on either side); acknowledgement (a
+  list of identities with first and last positions, `spec.md` §8 Acknowledging a loss); empty (`spec.md` §7
+  Manifest); restore, which also carries the lost ranges, acknowledgements and recovery-entry loss reports of the
+  generations it restores from.
 - **Cursor (`kind = 4`).** Per consumer: last confirmed position and one latch per condition funnel.
-- **Registry (`kind = 5`).** The compacted registry: series entries, site-zone and tzdata entries and routing
-  changes, each with its position.
+- **Registry (`kind = 5`).** The compacted registry: series entries, site-zone and tzdata entries, routing
+  changes and recovery entries, each with its position.
 - **Tree (`kind = 6`).** Per-series stored summary levels with the position up to which they are complete.
 
 Each is specified in this document before the roadmap section that implements it.

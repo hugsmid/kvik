@@ -8,22 +8,19 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | ID | Section | Question |
 |---|---|---|
 | Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
-| Q-33 | §3 Recovery, §2.1, invariants 1 and 8 | Registry entries and derived files after a lost range |
-| Q-34 (c) | §11 Health, §3 Recovery | Whether loss reports survive a restart, and whether they are latched until acknowledged |
+| Q-33 | §2.1, §3 Recovery, invariants 5 and 8 | The Derived check: derived files after a lost range |
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
 | Q-44 (b) and (c) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series |
-| Q-46 | §3 Recovery rule 3, §7 Readers | Positions kept by a reader process, after a truncated tail |
-| Q-47 | §4 At-least-once, Resync, §11 Consumers | How a consumer learns its recovered cursor, and what forgetting means |
-| Q-48 | §3 Recovery rules 1 and 3, §4 Resync, §6 Restart and resume | The resync owed after a truncated tail is not durable |
-| Q-52 | §8 Corrupt block, invariant 10, §3 Recovery | Manifest records as single copies |
-| Q-79 | §3 Recovery rules 2 and 4, §11 Health, row 11a | A lost range found by a recovery whose sync fails |
+| Q-46 | §7 Readers, §4 Resync (`start: position`), §8 Restore, row 7b | Checking a kept position against a later truncation or restore |
+| Q-52 | §7 Manifest, §8 Corrupt block, `format.md` A.10 | Rebuilding a corrupt manifest record that was never uploaded; a mark without a checksum |
 | Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
 | Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
 | Q-86 | §3 Write or sync failure, Disk space, Segments; `format.md` A.4 | No space when a log segment is created, or at a log write before any sync |
-| Q-87 | §3 Recovery rules 1, 3 and 4, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
+| Q-87 | §3 Recovery rules 1 and 3, Order of a start, steps 3 and 6, Write or sync failure; principle 3 | A mark lost on the same boot after a failed sync |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
+| Q-90 | §8 Restore step 1, §8 Acknowledging a loss, §11 Health | Whether a restore record's set-aside report holds health degraded |
 | Q-91 | §4 Funnel, Routing, §6 Latch, `api.md` Consuming, row 16 | Funnel identity across configuration, run-time routes and restarts |
 | Q-92 | §2.4 revised-key index, §8 Restore step 2, invariant 8, principle 2 | The "incomplete" mark on a revised-key index entry |
 | Q-93 | §5.7 tzdata version in force, §7 Readers, §8 Restore drill | A store nobody can open after the host's tzdata changes, and a release name standing for its rules (for the owner) |
@@ -76,66 +73,39 @@ before the live-state `t` changes staleness without changing `t`, against the pr
 in force at `t` or at `now` applies is not stated. (5) Already so in the current text: a reader process (§7) has no
 refresh instant, since the writer's monotonic clock is not in the log.
 
-## Q-33 — Registry entries and derived files after a lost range
-**Scenario.** A lost range (§3 Recovery) holds the definition of a series, a parameter change, an alias, a routing
-change, or a site-zone or tzdata entry (registry entries since Q-64 and Q-76, §2.1); later complete batches, which
-are kept, hold facts of that series. The registry file is compacted from the
-log and may not hold the lost entry. Tree files and the revised-key index were built over facts that are now lost,
-so rebuilding from the log no longer equals the live structures (invariant 8). The same holds for a lost range that a
-restore records when the bucket has lost or corrupted a listed file (§8 Restore, Failures and end). A lost log segment
-whose facts were already compacted loses only its non-fact entries: a scattered set of positions, not a range between
-batches, so the report's bytes and commit times on either side (§11 Health) are undefined for it, and the batch
-`commit_time` that as-of-time queries over the surviving facts need (§2.3) is lost with it.
+## Q-33 — The Derived check: derived files after a lost range
+**Scenario.** The kept-log principle, orphaned facts and id floors are settled (§2.1; see Settled). A lost range
+(§3 Recovery) held a definition, parameter change, alias, routing change, site-zone or tzdata entry, or facts that tree files and
+the revised-key and version indexes were built over. The registry file may still hold the lost entry and the derived
+files the lost facts, so rebuilding from the kept log no longer equals the live structures (invariants 5 and 8). The
+same holds for a lost range that a restore records when the bucket has lost or corrupted a listed file (§8 Restore,
+Failures and end). A lost log segment whose facts were already compacted loses only its non-fact entries: a scattered
+set of positions, not a range between batches, so the report's bytes and commit times on either side (§11 Health)
+are undefined for it, the batch `commit_time` that as-of-time queries over the surviving facts need (§2.3) is lost
+with it, and which definitions count as lost is not said (a chunk or the registry file may still hold one).
 **Model.** Not modelled: a lost range comes only from a damaged batch of facts in the open segment (row 11a), and
 `Model::corrupt_open_batch` refuses a batch holding a registry, routing or zone entry
 (`tests/edge_cases.rs` `row_11a_fault_injection_limits`).
 **Tried and rejected.** Syncing every non-fact entry to the registry file and re-appending lost ones to the log with
-their original positions; keeping facts of undefined series apart until a definition names their id. Review found
-that re-appended entries put lower sequences after higher ones (§2.2, `format.md` A.4), that a definition taking
-effect from its earliest fact contradicts §2.1, that new ids "above every id seen" can reuse a lost id, and that the
-site-zone entry was not covered.
-**Needed.** What happens to kept facts whose registry entries are lost, how derived files are re-verified, and how
-invariants 1 and 8 read with lost ranges.
-**Proposal.** After a lost range or a truncated tail the kept log is the whole truth: entries in the lost positions
-(definitions, parameter and site-zone changes, tzdata entries, aliases, retirements, routing changes) no longer apply and are not
-appended again. A kept fact whose series has no definition in the kept log is an orphaned fact: kept in the log and
-in compaction, outside views, trees and delivery, counted per id and available for re-ingest. The lost-range record
-carries an id floor (the highest id in the registry file, the checkpoints, the kept log and every earlier floor,
-plus the number of positions in the range or, for a truncated tail, the tail's bytes divided by the smallest
-definition entry) and the registry entries and revised keys that derived files hold from the lost positions. It is
-synced before any derived file is changed; then everything derived from positions at or above the start of the loss
-is removed, or rebuilt from the newest checkpoint below it and the kept log after it. New ids are assigned above
-every floor, and invariant 8 reads "from the kept log entries, with the id floors of the manifest's lost-range
-records". Lost entries are issued again through the normal calls; a definition issued again is a new series. For
-`format.md`: entries of the registry file, revised-key index and version index carry the position they came from.
-**Objections.** (1) Nothing orders the cut-back of derived files before the mark is written, or makes a restart redo
-it: the mark is written and the process crashes on the same boot while the registry file still holds a definition
-from a lost position; rule 1 applies and the name maps to the lost definition. The derived-unverified label and the
-duplicate mode of §8 Restore step 2 are not persisted either. The same holds for a lost range found at run time
-under §8 Corrupt block. (2) Orphaned facts break invariant 2: a rule 2 lost range loses the definition at position
-d, and a consumer's cursor c lies between d and an orphaned fact f routed to it by explicit id. c is not below the
-lost range, so no `resync` is sent, and f is excluded from delivery. (3) For the owner: the truncated-tail bound
-assumes that acknowledged bytes reached the disk in some form. On a disk that returns from sync without writing, an
-id defined in the lost tail can be assigned again; either §2.1's "never reused" states that residual, or a batch
-holding a registry entry is acknowledged only after a mark sync.
-
-## Q-34 (c) — Whether loss reports survive a restart, and whether they are latched
-**Scenario.** It is not said whether `data_lost` and `possible_loss` clear, and how: a restart on the same boot
-right after a `possible_loss` may no longer report it, and nothing says whether health stays degraded. Parts (a) and
-(b) are settled (§8 Corrupt block, §11 Health); part (d) is Q-52. The same question applies to the set-aside range
-each restore record reports (§8 Restore step 1), which is derived from the record at every start.
-**Model.** `data_lost` is read from the manifest's lost-range records, so it is reported after every start, never
-cleared, and holds health degraded without making the store read-only (`tests/edge_cases.rs`
-`row_11a_corrupt_block_inside_the_open_segment`); a truncated tail is not reported.
-**Proposal.** Both reports are read from manifest records at every start (for `possible_loss`, the truncated-tail
-record proposed in Q-48), so a restart does not clear them, the list is never shortened and the counts only rise;
-neither makes the store read-only. For the owner: whether they also hold health degraded until an operator
-acknowledges each loss. That needs a new manifest record type and a call such as `acknowledge_loss`, and changes
-operability rather than guarantees; since a power cut under load usually leaves a torn batch, most power cuts would
-need an acknowledgement.
-**Objection.** A reboot before any new batch commits recomputes the same K and F (the earlier record names positions
-up to F − 1), so a second record with the same lost range is written and `possible_loss` is counted twice for one
-loss.
+their original positions; keeping facts of undefined series apart until a definition names their id (review found
+that re-appended entries put lower sequences after higher ones, §2.2, `format.md` A.4, and that a definition taking
+effect from its earliest fact contradicts §2.1). A stamp recorded with each lost range and compared with the stamp
+each derived file was built under (`loss_stamp`) fails on requirements 1 to 3 below.
+**Needed.** How the registry file, trees and indexes are brought back to a function of the kept log after a lost
+range (the Derived check). Whatever is designed must hold these:
+1. It covers the writer's memory, not only files: a lost range found at run time below the in-memory applied position
+   must not be checkpointed under a fresh stamp. Candidate: the writer restarts recovery when it records one.
+2. It names a rebuild base that exists when the range lies below the newest uploaded checkpoint, as for a range
+   recorded by a restore (§8 Restore, Failures and end).
+3. It covers a lost segment whose facts were already compacted: the non-fact positions lost are scattered, the
+   report's bytes and commit times are undefined, and series still held by chunks must not be orphaned by dropping
+   their definition from the registry file. Candidate: a definition is lost only if no local file holds it.
+4. No fact is accepted for a series between a run-time lost-range record and the registry correction.
+5. It is recomputed at every start, rule 1 included, with no stored label: the cut-back of derived files must not
+   depend on a step a crash can skip (the mark written and the process crashing on the same boot while the registry
+   file still holds a definition from a lost position).
+Until then invariants 5 and 8 hold "lost ranges excepted" (§10), as the model has it (damage only to batches of
+facts).
 
 ## Q-39 (f) — A crash while the restore record is written
 **Scenario.** A restore claims generation g and crashes while writing its restore record locally, leaving a torn
@@ -169,115 +139,47 @@ observed series: since Q-74 the lateness reference leaves out a `future` fact, b
 includes it, so a device glitch to 2099 disables the fast path for good and makes Restore step 2 count every fact of
 the series `duplicates_unchecked`.
 
-## Q-46 — Positions kept by a reader process, after a truncated tail
-**Scenario.** A reader process (§7) reads position p from the log up to the mark and keeps it, for example in an
-export it continues by position. Power is lost before the mark sync, the tail holding p is truncated and p is
-assigned to a new fact (§3 Recovery rule 3). Consumers receive `resync` and forget unconfirmed positions (§4); a
-reader receives nothing, and may skip the new fact or keep the lost one.
-**Model.** Not modelled; the mark is always exact.
-**Needed.** Whether readers can see that a tail was truncated (for example a recovery count in the mark or the
-manifest that they compare), or whether the residual risk is accepted and stated.
-**Proposal.** A reader that keeps a position for later use keeps with it the epoch it took before reading that
-position. Before continuing it reads the manifest: if a truncated-tail record (Q-48) has a later epoch and its K is
-below the kept position, everything the reader took above K is void, and it continues after K. `api.md`:
-`reader.epoch()` and `reader.truncated_since(epoch)`. Proposed addition: a row for an export continued by position
-after a power loss.
-**Objection.** §7 Manifest says each record has an epoch, but not that every record, including one that publishes no
-file, takes a strictly higher durable epoch. A reader can take epoch e from a record not yet synced; a power loss
-drops that record, the truncated-tail record written at recovery reuses e, and the reader's check finds no later
-record.
+## Q-46 — Checking a kept position against a later truncation or restore
+**Scenario.** Recovery entries, reset points and `forget_above` are settled for consumers (§3 Recovery rule 3, §4
+Resync; see Q-47 and Q-48 under Settled), and a reader that reads a recovery entry voids what it took above its
+`after` (§7 Readers). A reader process that keeps a position for later use (an export continued by position, row
+7b), and a consumer registering with `start: position`, need a check against truncations and restores that happened
+after the position was read. A proposed check kept with each position the mark's reset stamp (`reset_sequence`,
+`reset_nonce`) and judged it against the recovery entries of its generation in four branches: (a) above a restored
+end, void above it; (b) the stamp's entry found, void above the `after` of the first entry above it, else kept; (c)
+the stamp in a lost range, void above the position before it; (d) otherwise unknown. Review found it unsound:
+1. A restore of a store with recovery entries: point (g, 140, stamp zero), an entry at 101 (`after` 100) and
+   restored end 110. Branch (a) gives void above 110, though 101–110 now name different facts from those read; (a)
+   and (b) must combine to the lower bound, void above 100. A consumer registering with `start: position` 140 would
+   start after 110 with stale de-duplication memory for 101–110.
+2. "Same stamp: kept" is tested before (a), and a restore resets the stamp to zero, so a point (g, 140, zero) from a
+   store that never lost power, restored with end 95, is kept although 96–140 are set aside. The stamp carries no
+   generation (the interface's point did).
+3. An entry later swallowed by a corrupt range [95, 105]: a point (130, zero) finds no entry above its stamp and is
+   kept, while §4 treats that range as a reset point; a mark whose reset sequence is above the stamp with no entry
+   found should give void or unknown.
+**Model.** Not modelled; the mark is always exact and there are no recovery entries.
+**Needed.** A check that combines the restored ends, the recovery entries and the lost ranges of a generation into
+one lower bound; that is not defeated by a stamp reset at restore; and that answers void or unknown when an entry
+named by the mark has been lost. Then the reader call, `start: position` (with what it forgets) and row 7b's rule,
+and whether the mark and the recovery entry carry a reset stamp and nonce. Only `format.md` A.6 field 41 is reserved
+for the entry; A.10's 64 bytes are full, so a stamp in the mark needs a larger mark and a version bump.
 
-## Q-47 — How a consumer learns its recovered cursor, and what forgetting means
-**Scenario.** A consumer confirms position p; its cursor file, synced at most every second (§4 Consumer state), still
-names an earlier position when power is lost. The tail holding p is truncated and p is assigned to a new fact
-(§3 Recovery rule 3). On `resync` the consumer must forget the positions it has seen above its recovered cursor
-(§4 At-least-once), p included, but nothing tells it which cursor was recovered; the `cursor` event in §11 is not
-defined. Separately, "forget" is undefined for a consumer that keeps state outside the engine keyed by position:
-positions in the truncated tail may be the only copy of acknowledged facts that are now lost, and with an upsert
-keyed by position the new fact at p overwrites the lost one (see Q-34).
-**Model.** Not modelled; the mark is always exact.
-**Earlier proposals.** `resync` after a truncated tail carries the consumer's recovered cursor. Alternatively, the engine
-delivers one value to every consumer: the first new position after recovery, since only positions at or above it
-(above the last kept batch, the synced cursors and the manifest records) can be reused; this is tighter than each
-consumer's recovered cursor and also serves readers (Q-46). What a consumer with outside state does with the lost
-facts is not proposed.
-**Proposal.** `resync` carries one value, `forget_from` = K + 1 of the lowest truncated-tail record (Q-48) whose F
-is above the consumer's cursor, or nothing. The consumer drops every position at or above it from its de-duplication
-memory, its own last confirmation included. Records it keeps outside the engine at those positions, and series ids
-first seen there, are copies of facts the store may no longer hold; the engine never asks for them to be deleted,
-and a consumer that needs them sets them aside before it accepts later deliveries. For the owner: whether the engine
-should protect such stores, which needs a position identity that changes across a truncation (for example an epoch
-inside the position), a new mechanism and a change to §2.2. The undefined `cursor` event is removed from §11.
-`api.md`: `Resync` carries `forget_from: Option<Position>`.
-**Objections.** (1) Recomputing `forget_from` in every session after every restart repeats it. Recovery gives K =
-100 and F = 105; consumer C replays to 100, receives `resync` with `forget_from` 101, receives live 105–200 and
-confirms 200, and its cursor file still names 100 when the process crashes on the same boot. On restart C receives
-`forget_from` 101 again and must drop the valid 105–200 from de-duplication, so it processes their replay twice;
-this repeats on every restart for a consumer whose routed series are rare. Only the first `resync` after a recovery
-should carry it, which needs a durable "forgot up to record R" in the cursor file. (2) A consumer with no cursor
-takes the lowest record of the current generation; since every reboot writes a record, a consumer whose cursor file
-was lost forgets almost the whole generation, which also conflicts with `start: position`. It should use the record
-that lists its cursor file as missing.
-
-## Q-48 — The resync owed after a truncated tail is not durable
-**Scenario.** Recovery under §3 Recovery rule 3 resumes, and a new fact commits at a reused position p. The process
-crashes on the same boot before consumer C has received its `resync`. On restart rule 1 applies, so no `resync` for
-a truncated tail is sent, and §6 Restart and resume delivers the facts after C's cursor, p included, before its
-`resync`; C may drop the new fact at p as a repeat.
-**Model.** Not modelled; the mark is always exact.
-**Earlier proposals.** Persist a "resync owed" flag, or a reuse floor, with the mark until each consumer has confirmed its
-`resync`.
-**Proposal.** Every §3 Recovery rule 3 recovery writes one manifest record, the truncated-tail record, and syncs it
-before the tail is truncated, before any derived file is changed and before the mark is written. It holds the boot
-id, the last position of the last kept batch (K), the first new position (F), the tail's length and readable commit
-blocks, any cursor file found missing or unreadable, and the id floor and derived-file contents of Q-33. The
-positions between K and F, if any, are its lost range, and it names no position at or above F. Only a repeat on the
-same boot with the same K and F writes no second record. Nothing is owed as state: whether a consumer needs a
-`resync` is recomputed at every start from its cursor file and these records. A consumer whose cursor, or `start`
-position, is below the F of such a record receives, for the lowest one, the facts after its cursor up to K flagged
-`replayed`, then `resync` carrying `forget_from` = K + 1 (Q-47), then the facts from F flagged `replayed`; no
-position at or above F reaches it before that `resync`. Proposed additions: an invariant to that effect and a row
-for a crash on the same boot after a rule 3 recovery, before a consumer received its `resync`. For `format.md`: the
-record's fields above, and every lost-range record carrying its cause, boot id, byte and position range and id
-floor; `api.md`: `store.lost_ranges()`.
-**Objections.** (1) F ignores positions named by derived files (the registry file, the revised-key and version
-indexes, a tree's "complete up to"): an acknowledged definition at K + 1 lies in the torn tail and the registry file
-holding it was synced, but no cursor names it, so F = K + 1, the lost range is empty and K + 1 is reused although a
-durable file named it. (2) Replay up to K, `resync`, then replay from F conflicts with §8 Behind consumers
-(`resync`, not replay; never download from deep): records pile up with every reboot, so the lowest record above a
-long-offline cursor can lie in evicted segments. (3) The record holds F yet names no position at or above F: if its
-F field counts towards the highest sequence among local manifest records, a repeated recovery computes F + 1 and the
-no-second-record rule breaks. (4) Objection 1 of Q-47 applies here too.
-Reviewers judged that this group (Q-33, Q-34 (c), Q-46–Q-48) needs one design round as a whole, best done with the
-log implementation (roadmap 4.5) where recovery is built concretely.
-
-## Q-52 — Manifest records as single copies
-**Scenario.** A manifest record not yet uploaded exists only on the hot tier. §8 Corrupt block names the open log
-segment and a sealed log segment not yet uploaded and not yet compacted as the only single copies, and invariant 10
-lists only their corruption as a loss; neither names manifest records. More would rest on them under the proposals
-of Q-33, Q-34 (c) and Q-48. With the current format, corruption of a record cannot be told from a torn manifest
-tail, and a record cannot be rebuilt.
+## Q-52 — Rebuilding a corrupt manifest record that was never uploaded; a mark without a checksum
+**Scenario.** Telling a torn manifest tail from a corrupt record, and the single-copy wording, are settled (§7
+Manifest, §8 Corrupt block, invariant 10; see Settled): a corrupt record is fetched from deep or the mirror path,
+and with no copy the store opens read-only with fatal health (`manifest_corrupt`), keeping every file the record
+described, so no fact is lost. A record corrupted before upload, with no mirror path, therefore stops the writer for
+good although the files it described are still local.
 **Model.** Not modelled; manifest records are not corrupted.
-**Proposed.** Name a manifest record not yet uploaded as a single copy in §8 Corrupt block. A candidate rule for its
-corruption: fetch the record from deep when it has been uploaded, otherwise read-only with fatal health.
-**Needed.** A way to tell a torn manifest tail from a corrupt record, and what a corrupt record that was never
-uploaded does to the facts and positions it describes.
+**Needed.** (a) A way to rebuild such a record from the files it described; this needs Part B of `format.md` to make
+a compacted file name its inputs. (b) To check on each platform with roadmap 4.8: that writing the last valid record's
+identical bytes again in place at every start (§7 Manifest) makes the next sync write them on each platform; if not,
+the fallback is to rewrite the manifest to a new file and rename it. (c) The mark (`format.md` A.10) has no
+checksum: a reader accepts its fields when `seq` is even and unchanged, so damaged bytes with an even `seq` are read
+as a valid mark with a wrong boot id, offset or last position, where §3 Recovery treats an unreadable mark as a
+different boot. Whether the mark needs a checksum (it then becomes "unreadable" when damaged) is open.
 
-## Q-79 — A lost range found by a recovery whose sync fails
-**Scenario.** After a power loss, recovery finds a corrupt batch below the old boot's mark (rule 2: record a lost
-range in the manifest, report `data_lost`), then the sync of rule 4 fails, so the engine stays read-only and leaves
-the old mark. The rules apply in order and §8 records a loss "when found", so `data_lost` is reported at once; but
-rule 2 does not say whether the lost-range record is still written to the manifest (a write on an engine that has
-just failed a sync, against §3 Write or sync failure), or waits for a recovery that can write.
-**Settled by the text.** `data_lost` is reported in health as found, while read-only.
-**Model.** It reports `data_lost` as found, writes no record while read-only (a read-only engine writes nothing, not
-even a seal), and the next recovery that can write records the range once; new positions continue above it
-(`tests/edge_cases.rs` `row_11a_failed_recovery_sync_reports_the_range_as_found`). A scrub that finds a corrupt
-sealed segment with no other copy while the engine is read-only or stopped does the same (`tests/rules.rs`
-`s8_corrupt_log_segment_found_while_read_only_or_stopped_is_recorded_later`).
-**Needed.** Whether a recovery whose sync fails writes the lost-range record.
-**Proposal.** §3 Recovery rule 4: "If that sync fails, the engine stays read-only, leaves the old mark and writes
-nothing; lost ranges it found are reported in health as found, and recorded by the next recovery."
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -361,9 +263,9 @@ Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by
 (§3). After a failed writeback Linux (ext4, XFS) marks the pages clean without writing them: the page cache holds b
 complete, the disk does not, and a later sync of the file returns success without writing it. Before the restart,
 and without a reboot, the mark file is lost or unreadable. Rule 3 treats a missing mark as a different boot: b is
-complete in the cache and kept, rule 4's sync succeeds without writing it, and b is delivered as durable although it
-is not on disk (principle 3). A later power loss removes it; nothing reports it as `possible_loss`, since it was
-never acknowledged and the next recovery has no record of it.
+complete in the cache and kept, the sync of the kept segments (§3 Order of a start, step 3) succeeds without
+writing it, and b is delivered as durable although it is not on disk (principle 3). A later power loss removes it;
+nothing reports it as `possible_loss`, since it was never acknowledged and the next recovery has no record of it.
 **Spike.** `spikes/commit/tests/faults.rs`
 `with_the_mark_lost_after_a_failed_sync_recovery_keeps_a_batch_that_is_not_on_disk`, on a simulated file system
 with the Linux behaviour.
@@ -387,6 +289,17 @@ wildcards within a segment.
 **Proposal.** A pattern has the three segments of a name, each a literal or `*`, which matches any one whole segment;
 two patterns overlap when, in each segment, they are equal or either is `*`; an id overlaps a pattern when any name
 of its series matches it.
+
+## Q-90 — Whether a restore record's set-aside report holds health degraded
+**Scenario.** Q-38 left clearing the set-aside report to Q-34 (c). Q-34 (c) settled only the loss reports:
+`data_lost` holds health degraded until acknowledged and `possible_loss` does not (§11 Health, §8 Acknowledging a
+loss). Each restore record's set-aside range (§8 Restore step 1) is derived from the record at every start, so a
+restart does not clear it, and `api.md` lists it among the health reasons. After the operator has exported the
+set-aside facts and re-ingested what is wanted, nothing ends that report, so a store restored once would report
+degraded health for ever; and it is not said whether the report degrades health at all.
+**Model.** Not reported (see the table below).
+**Needed.** Whether the set-aside report holds health degraded, and if so what ends it (for example
+`acknowledge_losses` naming the range's first position).
 
 ## Q-91 — Funnel identity across configuration, run-time routes and restarts
 **Scenario.** Since Q-64 the routes in force are those the registry holds, and a funnel declared in configuration
@@ -455,6 +368,9 @@ and resume), whether its latches are kept, and whether its condition delivery se
 at every engine start").
 **Model.** The cursor and the latches are durable at once on confirmation (see "Cursor file synced at most every 1 s"
 in the table below); a consumer restart resumes from the cursor with a replay and `resync`.
+**Settled since.** For (a), what the consumer forgets: §4 Resync gives a consumer with no cursor file, before its
+first delivery, a `resync` with `forget_above` = the position before its start (the mark's last position for `start:
+now`, before the first fact at or after T for `start: time`, P for `start: position` P).
 **Needed.** The first state, the latches and the delivery identity in both cases.
 
 ## Q-96 — A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer
@@ -474,22 +390,19 @@ consumer or per funnel.
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
 by the roadmap item named here, before that item is done. Until then the model's choice, where a test pins it, is the
-one named in the question. Settling Q-33, Q-34 (c), Q-46 to Q-48 or Q-88 may add fields to `docs/format.md` or
-calls to `docs/api.md` after gate 3.3; such a change is made by the item that settles the question, in its own pull
-request, and noted in the question.
+one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/format.md` or calls to `docs/api.md`
+after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
+the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
+changes to both documents (see Settled).
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
 | Q-16 | 5.4 | Live state and staleness are built there |
-| Q-33 | 4.5 | Recovery with lost ranges |
-| Q-34 (c) | 4.5 | Recovery and health reports |
+| Q-33 | 4.5 | The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-46 | 4.5 | One design round with Q-33, Q-34 (c), Q-47 and Q-48 |
-| Q-47 | 4.5 | Recovery, with 5.3 (resync) |
-| Q-48 | 4.5 | Recovery |
-| Q-52 | 3.1 | Telling a torn manifest tail from a corrupt record needs a format change |
-| Q-79 | 4.5 | Recovery |
+| Q-46 | 4.5 | With 4.6 (second-process reader): the check of a kept position, `start: position` and row 7b |
+| Q-52 | 3.1 | Rebuilding a corrupt record never uploaded needs Part B (a compacted file names its inputs); the in-place rewrite is checked on each platform with roadmap 4.8; whether the mark needs a checksum |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
@@ -497,12 +410,16 @@ request, and noted in the question.
 | Q-86 | 4.5 | Injected sync errors and full disk |
 | Q-87 | 4.5 | Recovery |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
+| Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
 | Q-92 | 6.2 | Revised-key index; recorded after the tag, from the review of the Q-72 ruling |
 | Q-93 | 3.1 | For the owner, with the tzdata entry kind; recorded after the tag, from the review of the Q-76 ruling |
 | Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
+
+Not a question: the figures behind §3 Sync primitive, and the cost of the reader's identity check of the mark (§7
+Readers), are measured by roadmap 4.8 (the 2.2 spike measured sync costs on macOS only).
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -533,7 +450,8 @@ The specification wins where the documents differ. These follow from it, for the
   `min`, `max`, §6).
 - **F-7.** `format.md`: a segment's first sequence is at least 1, and a last sequence of 0 means empty (§2.2). Part B
   needs a "restore" manifest record (generation, checkpoint, restored end, the restored ends carried from the record
-  it read, each with its generation, and every file it restores from, set-aside segments included, each with hash,
+  it read, each with its generation, the lost ranges, acknowledgements and recovery-entry loss reports of the
+  generations it restores from (since Q-34 (c)), and every file it restores from, set-aside segments included, each with hash,
   tier and position range), uploaded before any other file of its generation, and manifest records keyed by
   generation; the deep tier holds generation claim markers; a tree checkpoint bundles the registry file, each series'
   latest recorded `t` and lateness reference (F-17), the revised-key index and the version index (§8 Continuous
@@ -552,12 +470,14 @@ The specification wins where the documents differ. These follow from it, for the
   change of either is an error like a change of unit; refusals gain `changed_at` missing, `changed_at` unexpected and
   `revise` on a versioned series; fact deliveries and history results carry `changed_at`; deliveries gain the flag
   `outranked`; `Ack` and health gain an outranked count (§2.2, §2.4, §4, §11).
-- **F-11.** `format.md` A.10: the mark file is synced on a timer (`mark_sync_interval`) and at clean shutdown, not never;
-  recovery reads the highest position named by cursor files and manifest records before assigning positions. `api.md`:
-  the `mark_sync_interval` configuration key and a `possible_loss` health reason with its counts; acknowledgement does
-  not wait for the mark sync; test seams can inject a failed mark sync (§3). The manifest's lost-range record needs a
-  cause, telling corruption (`data_lost`) from a truncated tail (`possible_loss`); A.10's recovery bullets and A.11's
-  tests need the stale-mark case. Whether `possible_loss` is latched until acknowledged is part of Q-34 (c).
+- **F-11.** `format.md` A.10: the mark file is synced on a timer (`mark_sync_interval`), at once after a batch holding
+  an entry that is not a fact, at clean shutdown and by recovery; recovery reads the highest position named by cursor
+  files, manifest records and derived files before it writes the recovery entry. `api.md`: the `mark_sync_interval`
+  configuration key and `possible_loss` among the losses with its counts; acknowledgement of a batch of facts does not
+  wait for the mark sync, while a batch holding any other entry does, and the writer forces that mark sync at once
+  (§3 Commit); test seams can inject a failed mark sync (§3). A.6, A.10, A.11 and Part B now carry the
+  recovery entry, the mark's highest series id, and the lost-range record's identity and cause; since Q-34 (c)
+  `possible_loss` never holds health degraded.
 - **F-12.** `format.md`: the parameter-change entry carries the retention class and period, taking effect at its position,
   not by event time. `api.md`: `SeriesSpec` gains the retention class and period, which do not count towards "same
   specification" and may change without a new series; a call to change them; the default period as a configuration key;
@@ -631,7 +551,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-17 | Identity of a reading recorded without a value | §2.4 |
 | Q-18 | Rate flagged in windows without a gap | §6 Aggregates (replaces the Q-05 flag condition) |
 | Q-19 | A corrupt compacted file whose inputs are still local | §8 Corrupt block, row 11 |
-| Q-20 | A corrupt block inside the open segment after a reboot | §3 Recovery, §8 Corrupt block, §11 Health, rows 11 and 11a, invariants 1, 9 and 10 (open parts: Q-33, Q-34) |
+| Q-20 | A corrupt block inside the open segment after a reboot | §3 Recovery, §8 Corrupt block, §11 Health, rows 11 and 11a, invariants 1, 9 and 10 (open part: Q-33, the Derived check) |
 | Q-21 | Which clock measures lease expiry | §7 Leases (refresh counter and boot id; grace period on the writer's monotonic clock), row 26 |
 | Q-22 | Negative counter values if D1 changes | §2.5 |
 | Q-23 | Stored calendar nodes for days off 15-minute boundaries | §5.7 |
@@ -644,23 +564,28 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
 | Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open part: Q-39 (f)) |
-| Q-34 | What `data_lost` and `possible_loss` mean beyond the report, parts (a) and (b) | §8 Corrupt block (only the damaged region is lost; the valid batches of a sealed segment are copied to a new segment by one manifest record, which ends the error), §11 Health (each report carries what is known of its range; no flag on query results), row 11 (open parts: Q-34 (c), Q-52) |
+| Q-33 | Registry entries after a lost range, in part: the kept log, orphaned facts and id floors | §2.1 (only the kept log applies; a lost registry entry is issued again through the normal calls, a definition issued again being a new series; orphaned facts kept, outside views, trees, indexes, routing and delivery, counted and exported; id floors; the residual on a disk that loses synced data), §2.1 `id`, §3 Commit (a batch holding an entry that is not a fact is acknowledged only after a mark sync), §3 Durable mark (highest series id assigned), §11 Health, invariants 2 and 4, `format.md` A.6 and A.10, `api.md` `export_orphaned` and `orphaned_facts`, as the owner decided (open part: Q-33, the Derived check, with invariants 5 and 8 across a lost range) |
+| Q-34 | What `data_lost` and `possible_loss` mean beyond the report, parts (a) and (b) | §8 Corrupt block (only the damaged region is lost; the valid batches of a sealed segment are copied to a new segment by one manifest record, which ends the error), §11 Health (each report carries what is known of its range; no flag on query results), row 11 (Q-34 (c) since settled; open part: Q-52, rebuilding a corrupt manifest record never uploaded) |
+| Q-34 (c) | Whether loss reports survive a restart, and whether they are latched | §11 Health (one report per loss, read from the manifest and the recovery entries at every start, never cleared, each counted once; `data_lost` holds health degraded until acknowledged, while `possible_loss` is listed and counted and does not), §8 Acknowledging a loss (an acknowledgement record; the list of losses kept for ever; a range that grows needs a new acknowledgement; carried by a restore record), §3 Order of a start step 4 (a loss keeps one identity, the first position of its range when first reported, extended upward or downward, not repeated; recovery-entry loss reports carried by a restore record), invariant 27, `format.md` Part B, `api.md` `losses` and `acknowledge_losses`, as the owner decided (open part: Q-90, the set-aside report) |
 | Q-35 | Loss above a stale mark after a power loss is not reported | §3 Durable mark (timed sync), §3 Recovery rule 3 (`possible_loss`, no reuse of positions), §11 Health, rows 7 and 7a, invariant 10 |
 | Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (the levels fixed by the definition since Q-60) |
 | Q-37 | Which manifest records a restore reads, and how generations begin | §8 Generations (generation 0 counts as claimed; each generation above 0 begins with a self-contained restore record listing the files it restores from and carrying the earlier restored ends, uploaded before any other file of its generation, after which the claims are read again; a restore reads the highest generation below its own that has records, and keeps the store id), §8 Restore step 1 (a position set aside once stays so) and the paragraph after step 4, invariant 9, row 28b |
-| Q-38 | Segments beyond the restored end | §8 Restore step 1 (positions set aside, a term distinct from Corrupt block's quarantine: excluded by position everywhere, also in reader processes, with no query error; a set-aside definition keeps its id reserved; the set-aside range reported in health from the record at every start; re-ingested only by the operator, through export and Re-ingest), §2.1 `id`, §11 Health, invariants 4 and 9, row 28, `api.md` Backup and restore (open part: Q-34 (c), for clearing the report) |
+| Q-38 | Segments beyond the restored end | §8 Restore step 1 (positions set aside, a term distinct from Corrupt block's quarantine: excluded by position everywhere, also in reader processes, with no query error; a set-aside definition keeps its id reserved; the set-aside range reported in health from the record at every start; re-ingested only by the operator, through export and Re-ingest), §2.1 `id`, §11 Health, invariants 4 and 9, row 28, `api.md` Backup and restore (open part: Q-90, whether the report holds health degraded) |
 | Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart, and later failures are retried with degraded health, except a listed file the bucket has lost or corrupted, part (e); the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed, or since (e) replaced or recorded lost), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (open part: Q-39 (f)) |
-| Q-39 (e) | What ends a restore when the bucket has lost or corrupted a listed object | §8 Restore, Failures and end (a listed file that the bucket no longer holds, or has corrupted, in step 1 or later, is treated as Corrupt block with deep as the failed tier: compacted again from the other listed files, the positions no other listed file holds becoming a lost range reported as `data_lost`, and the restore completes; facts of a lost log segment held by other listed files fetched in step 1; a lost tree checkpoint replaced by an earlier one or the whole sealed log; `restoring` ends when every file step 3 brings back is installed, replaced or recorded lost), §8 Corrupt block and No deletion (the exception for a restore), invariants 2, 9 and 10, §11 Health and the set-aside report (open parts: Q-85, a loss in the bucket found outside a restore; Q-33, a definition entry lost this way; Q-82, how a loss in the bucket is told from a transient fault, a damaged download or a wrong key; a content conflict between two listed files still waits for an operator) |
+| Q-39 (e) | What ends a restore when the bucket has lost or corrupted a listed object | §8 Restore, Failures and end (a listed file that the bucket no longer holds, or has corrupted, in step 1 or later, is treated as Corrupt block with deep as the failed tier: compacted again from the other listed files, the positions no other listed file holds becoming a lost range reported as `data_lost`, and the restore completes; facts of a lost log segment held by other listed files fetched in step 1; a lost tree checkpoint replaced by an earlier one or the whole sealed log; `restoring` ends when every file step 3 brings back is installed, replaced or recorded lost), §8 Corrupt block and No deletion (the exception for a restore), invariants 2, 9 and 10, §11 Health and the set-aside report (open parts: Q-85, a loss in the bucket found outside a restore; Q-33, the Derived check after a definition entry lost this way; Q-82, how a loss in the bucket is told from a transient fault, a damaged download or a wrong key; a content conflict between two listed files still waits for an operator) |
 | Q-40 | Ranking facts of versioned series during a restore | §2.4 Version index, §8 Continuous backup and Deep, §8 Restore steps 1–2 (each tree checkpoint carries the version index, and step 1's replay brings it to the restored end before ingest opens), §13 |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b) and (c)) |
 | Q-42 | Readings that cover an interval, not an instant | §2.1 `kind` `interval`, `interval length` and `phase`; §2.2; §5.2; §5.4; §6 Aggregates (`apportioned`); invariants 18 and 22; rows 40–42 (calendar lengths: Q-45) |
-| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (on `resync` consumers forget positions seen above their recovered cursor), §4 Resync (every consumer, after every §3 Recovery rule 3 recovery), §3 Recovery rule 3, row 7a; no margin of skipped positions (open parts: Q-46 to Q-48) |
+| Q-43 | Positions delivered but not confirmed, after a truncated tail | §4 At-least-once (a `resync` carrying `forget_above` = X: the consumer drops every position above X from its de-duplication memory and confirms only when that is durable), §4 Resync (reset points: a recovery entry and a lost range not described by one, each applying to a consumer whose position is below its id), §3 Recovery rule 3 (a recovery entry at F, positions above K assigned again), row 7a; no margin of skipped positions (as refined by Q-47 and Q-48; open part: Q-46, positions kept by readers) |
 | Q-44 | Gaps left by scheduled and forecast series, part (a): a silent feed | §2.1 `timing` (a silent forecast source is reported by stale-for on the observed series its adapter emits on each successful fetch), row 37b (open parts: Q-44 (b) and (c)) |
 | Q-44 (d) | Forecast accuracy | Not served by the engine in v1: history keeps every issue with its `changed_at`, so a reader computes "known as of issue X" from `View::History` and compares it with the outcome series; `api.md` Not in v1 (a view as of an issue time, forecast-accuracy operators) (open parts: Q-44 (b) and (c)) |
 | Q-45 | Intervals of varying length | §2.1 `interval length`, `interval zone` and `day start` (a calendar length, `day` with a day start or `month`, in a zone fixed for the series, its interval starts taken under the tzdata version in force), §2.2, §5.1, §5.4 (no stored level; displaced readings), §5.7, §6 Aggregates, invariants 21–23, rows 20a, 40 and 43–46, `api.md` Series and Not in v1 (irregular billing periods) (the tzdata version in force, a day start that occurs twice, an interval zone unknown or become a link, and count, min, max and last when an edge cuts an interval were settled later by Q-76, Q-77, Q-80 and Q-81) |
+| Q-47 | How a consumer learns its recovered cursor, and what forgetting means | §4 At-least-once (`resync` carries `forget_above`; the consumer confirms it only when the forgetting is durable; records kept outside the engine are the consumer's duty, never deleted or protected by the engine, as the owner decided), §4 Resync (reset points; consecutive ones delivered as one; a consumer with no cursor file; what `start: position` forgets), §4 Consumer state, §11 Consumers (the `cursor` event removed), `api.md` Consuming |
+| Q-48 | The resync owed after a truncated tail is not durable | §3 Recovery rule 3 (a recovery entry at F in the log, adopted on a repeat; nothing owed as state), §3 Order of a start, §3 Durable mark (no file written naming a position above the last synced mark), §4 Resync and Overflow (reset points on resume, in a session and in catch-up), §6 Restart and resume, §8 Behind consumers, §2.2, §8 Restore step 1 (a gap followed by its recovery entry is not a gap), rows 7a and 7c, invariants 1, 16, 25 and 26, `format.md` A.1, A.4, A.6, A.7, A.10 and A.11 |
 | Q-49 | What a series with no stored level serves during a restore, part (a): queries | §8 Restore step 2 and §6 Old spans (window edges move to where detail is local, the error `detail_not_local` only when no span is left, never an empty result; reads of facts fetch on demand; no priority download), row 28 |
 | Q-49 (b) | Conditions and live state with no local detail during a restore | §6 Conditions (the state is unknown, not false: the evaluation is skipped and counted, `evaluations_unknown`, the condition keeps its latched state, and the first evaluation with detail is delivered as a transition if it differs from the latched state, or there is none), §2.3 Live state (unknown, not none, for a series whose latest recorded `t` no local fact or stored node holds), §4 Resync and §6 Restart and resume (`resync` reports "unknown" for that funnel, no transition), §8 Restore step 2, invariant 16, §11 Health, `api.md` Consuming, Reading and statistics (`ConditionState::Unknown`, `Live::Unknown`) (open part: Q-84, a state that stays unknown) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
+| Q-52 | Manifest records as single copies, in part | §7 Manifest (a record appended only after the previous record's sync; the last valid record written again in place at every start; a torn tail, dropped, told from a corrupt record by a valid successor; the last record neither uploaded nor acted on irreversibly until a later record is synced; a corrupt record fetched from deep or the mirror path, else read-only with `manifest_corrupt` and no fact lost), §8 Corrupt block (a manifest record not yet uploaded is a single copy; `mirror_path` covers the manifest), invariant 10, `format.md` Part B (open part: Q-52, rebuilding a corrupt record never uploaded, and checking the in-place rewrite on each platform) |
 | Q-60 | Calendar nodes when the expected interval changes | §5.1 density rule (the levels a series stores are fixed by the expected interval its definition gives; a later change moves the staleness limit and keep-alive, never the levels), §5.1 table and §5.7 (calendar nodes for a series that stores the 15-minute level), §5.6 Canonical order (1-minute nodes computed for the merge where they are not stored), row 20a (open part: Q-83, node contents after a past-effective change of the staleness limit) |
 | Q-61 | Identity of a condition delivery, and where its sequence is kept | §4 Order (every condition delivery, on a fact or on the timer, is `(funnel, sequence)`; the sequence is in memory, from 1 at every engine start, and a consumer resuming at a start receives none before that start's `resync`), §4 At-least-once (never delivered twice; the identity holds until the consumer's next `resync`), `api.md` Consuming; no field in `format.md` |
 | Q-62 | Condition transitions while a consumer catches up after overflow | §4 Overflow (funnels evaluated but silent; the present state sent on re-attaching where it differs; transitions in between counted, `transitions_not_delivered`; catch-up reads hot and cold only and ends with `resync` where its next entry is on no local tier), §4 Resync, §8 Behind consumers, `api.md` Health and statistics |
@@ -675,6 +600,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-76 | Whether a tzdata change is a log entry | §5.7 (the version in force is named by the latest tzdata entry, the first in a store's first batch; the engine reads one release at open, and a writer whose release differs writes a tzdata entry before ingest, newer or older; readers and drills of another release are refused with `tzdata_mismatch`), §2.1, §2.2, invariant 8, row 21, `format.md` A.4 and A.6, `api.md` Opening, Environment seams and Health |
 | Q-77 | A day whose midnight occurs twice | §5.7 (the day starts at the earlier instant), §2.1 `interval length` (a day start that occurs twice likewise; a reading at the later instant is refused off phase) |
 | Q-78 | How routing compilation knows the series a consumer emits | §4 Routing (a consumer declares `emits`, recorded with its routing changes, and emits through its own handle; the cycle test compares selections, at start, on every routing change and on an alias), §4 Concurrency, row 33, `api.md` Consuming, `format.md` A.6 (open part: Q-88, the pattern grammar) |
+| Q-79 | A lost range found by a recovery whose sync fails | §3 Order of a start, steps 3 and 4 (the kept segments are synced before anything is written; a failed sync writes nothing, and the range is reported as found and recorded once by the next start that can write), §3 Recovery rule 2 |
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 
@@ -810,10 +736,13 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Lateness reference | §2.2, §4 Future facts, §8 tree checkpoints, row 4a, invariant 24 (Q-74) | The first clause of `late` compares with the latest recorded `t`, `future` facts included, and a tree checkpoint carries only the latest recorded `t`; not modelled yet | `tests/open_questions.rs` `q74_…` (expects the model's result) |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
-| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2, §4 Resync, §8 Corrupt block ("recorded when found"), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches; the `resync` for a cursor below or inside it is the one every resume sends | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
+| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2 and Order of a start, §4 Resync, §8 Corrupt block (reported when found; for the open segment, recorded by the next start that can write), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches. A lost range is not a reset point: the `resync` for a cursor below or inside it is the one every resume sends, after the kept facts above the range, where the specification delivers a `resync` carrying `forget_above` at the range, before them. `tests/edge_cases.rs` `row_11a_corrupt_block_inside_the_open_segment` now contradicts the specification on that order | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost, recorded as a lost range and reported as `data_lost`, so its positions are not issued again; the quarantine stays, with fatal health | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
-| Timed mark sync; `possible_loss`; no reuse of positions after a truncation; forgetting positions above the recovered cursor | §3 Durable mark, §3 Recovery rule 3, §4 At-least-once, Resync, row 7a | The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail; a truncation after a reboot is not reported. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
-| Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start; exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
+| Timed mark sync; recovery entries and reset points; `possible_loss`; `forget_above` | §3 Durable mark, Commit, Recovery rule 3 and Order of a start, §4 At-least-once, Resync, Overflow and Consumer state, §6 Restart and resume, §7 Readers, §8 Behind consumers, rows 7, 7a and 7c, invariants 25–27 (Q-47, Q-48) | Not yet supported; model support is due before roadmap 4.5. The mark is always exact, so no delivered position is reused and no cursor is at or above a truncated tail. A recovery under rule 3 writes no recovery entry and takes no position; the mark carries no highest series id; `resync` carries no `forget_above` and no consumer waits for its confirmation; a truncation after a reboot is not reported; a reader does not void what it took above a recovery entry. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch. Since the specification puts the recovery entry at the first new position, these tests now contradict it: `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` (the new fact takes `0:7`, the entry's position, and the `resync` is at `0:6`), and `tests/edge_cases.rs` `row_11a_corrupt_block_below_an_old_boots_mark` and `row_11a_failed_recovery_sync_reports_the_range_as_found` (the next fact after a rule 3 recovery takes the position the entry would take) | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
+| Acknowledging a loss | §8 Acknowledging a loss, §11 Health, invariant 27 (Q-34 (c)) | No acknowledgement call or record: a `data_lost` holds health degraded for ever, which agrees with the specification until a loss is acknowledged | `tests/edge_cases.rs` `row_11a_corrupt_block_inside_the_open_segment` |
+| Orphaned facts and id floors | §2.1, §3 Commit, invariants 2 and 4 (Q-33) | A batch holding anything but facts cannot be damaged, so no fact is orphaned and no id floor arises; a batch holding a definition is acknowledged at once, the mark being exact | `tests/edge_cases.rs` `row_11a_fault_injection_limits` |
+| Torn and corrupt manifest records | §7 Manifest, §8 Corrupt block, invariant 10 (Q-52) | Manifest records are written atomically and never corrupted; there is no empty record and no rewrite of the last record at start | — |
+| Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start (see Q-90); exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, except files retired by a record whose added files are all in the bucket, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |
 | A failed retry of a restore | §8 Restore, the paragraph after step 4: a restart after the record resumes the restore in its generation | In `restart_restore`, a retry after a crash before the record that writes its record and then fails in step 1 is discarded and stays pending, so the next restart claims another generation | `tests/open_questions.rs` `q39_failed_restart_of_a_restore_is_reported` |
 | Failures after step 1 | §8 Restore, Failures and end: a file that cannot be fetched, or whose plaintext hash fails, is retried with degraded health naming it; a content conflict is named in health with both files | Downloads do not fail; a conflicting file is not installed and the step returns `Conflict`, with no health reason | `tests/open_questions.rs` `q39_conflicting_file_leaves_restore_in_progress` |

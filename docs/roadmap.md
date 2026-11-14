@@ -18,7 +18,9 @@ again; nothing after a gate starts before it is passed.
 ## 2. Measurements before building
 - [x] 2.1 Spike: candidate chunk encodings against the Parquet reader — size and scan speed on synthetic per-second data; results in `docs/measurements/`
 - [x] 2.2 Spike: commit and sync latency, group commit, behaviour on sync failure and a full disk; results in `docs/measurements/`
-- [ ] 2.3 **Gate** — measurements looked at
+- [x] 2.3 **Gate** — measurements looked at (passed: the own chunk format is kept, with per-value decimal exceptions and a
+  compressed XOR fallback, no larger than Parquet with ALP; delivery budgets set per platform, with Linux measured in
+  4.8; syncs bounded by `min_sync_interval`; the mark synced on the writer thread)
 
 ## 3. Format and interface
 - [ ] 3.1 `docs/format.md` checked for implementability; problems listed
