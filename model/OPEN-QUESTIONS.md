@@ -539,7 +539,12 @@ The specification wins where the documents differ. These follow from it, for the
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), the duplicate rule with `revise` (§2.4: identity by value and
 adapter-supplied quality; a fact whose key's current fact is on no local tier, hot or cold, is recorded and counted
-`duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), the late and future
+`duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), versioned series (§2.1–§2.4: `changed_at` required on
+every reading of a versioned series and refused on any other, `revise` refused there, rank `(changed_at, position)`
+in every view, identity including `changed_at`, the version index, carried by each tree checkpoint and exact while a
+restore brings detail back; §4: an outranked fact delivered flagged `outranked`, live and in catch-up, counted, and
+never fed to a condition or refreshing stale-for; §5.6: it changes no node; invariants 4, 15 and 19, rows 2c, 2d and
+37), the late and future
 flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
 delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
 condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
@@ -597,11 +602,10 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Atomic manifest records | §7, row 10, invariant 14 | Each compaction output is published by a record of its own, with no crash point between them; compaction retires nothing, and merging compacted files is not modelled | `compaction_crash_after_publish_keeps_inputs_and_outputs` |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
 | Reader leases: refresh counter and boot id, expiry and grace on the writer's monotonic clock | §7, row 26 | No file is retired, so no grace period applies; a reader's files leave hot only by eviction, and it then reads them remotely | `reader_epoch_reads_remotely_after_eviction` |
-| Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry; during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
+| Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry (they carry the version index); during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
 | Retention class | §2.1, §8 Retention class | Not modelled; detail moves only under the model's tier rules | — |
-| Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Not modelled; every series is observed | — |
+| Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Timing is recorded with the definition, and a forecast series must be versioned with `changed_at` kind `time`; otherwise every series is treated as observed (`future` and `late` flags, live state, staleness, delivery, cadence and the credit limit `now`) | — |
 | Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
-| Versioned series | §2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 2c and 2d | Not modelled; every series ranks by position | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery, §4 Resync, §11, rows 11 and 11a, invariant 10 | Only a torn last batch is modelled, so no consumer receives `resync` for a cursor or `start` position below or inside a lost range | — |

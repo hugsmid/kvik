@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use common::*;
 use kvik_model::condition::{Condition, ConditionState};
 use kvik_model::engine::{
-    Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Error,
-    Fault, FileClass, FileId, Funnel, FunnelId, Level, ManifestOp, Model, Operator, Reason,
-    Selection, Signal, TriggerCause, Wait, WriteOutcome,
+    Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
+    Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, ManifestOp, Model, Operator, Reason,
+    Refusal, Selection, Signal, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
+use kvik_model::registry::{ChangedAtKind, RegistryError, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
@@ -2052,4 +2053,268 @@ proptest::proptest! {
             }
         }
     }
+}
+
+// ----- versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §8) -----
+
+/// A store with a consumer of every series and one versioned gauge whose
+/// `changed_at` is an opaque counter.
+fn versioned_model() -> (Model, SeriesId) {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
+    let s = m
+        .define_with(
+            "site/forecast-1/load",
+            Kind::Gauge,
+            ValueType::Number,
+            "kW",
+            10 * SECOND,
+            SeriesOptions::versioned(ChangedAtKind::Version),
+        )
+        .unwrap();
+    (m, s)
+}
+
+/// §2.2: "A reading on a versioned series without it, or with it on any other
+/// series, is refused and counted." §2.4: "On a versioned series `revise` is
+/// refused and counted."
+#[test]
+fn s2_2_changed_at_on_versioned_series_only() {
+    let (mut m, v) = versioned_model();
+    let g = m
+        .define(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    assert_eq!(
+        m.emit(Reading::num(v, T0, 1.0)),
+        Err(Refusal::ChangedAtMissing.into())
+    );
+    assert_eq!(
+        m.emit(Reading::versioned(g, T0, 1.0, 1)),
+        Err(Refusal::ChangedAtUnexpected.into())
+    );
+    assert_eq!(
+        m.emit_revise(Reading::versioned(v, T0, 1.0, 1)),
+        Err(Refusal::ReviseOnVersioned.into())
+    );
+    for r in [
+        Refusal::ChangedAtMissing,
+        Refusal::ChangedAtUnexpected,
+        Refusal::ReviseOnVersioned,
+    ] {
+        assert_eq!(m.counters.refused[&r], 1);
+    }
+    m.ingest(vec![Reading::versioned(v, T0, 1.0, 1)]).unwrap();
+    assert_eq!(m.current().unwrap()[&(v, T0)].changed_at, Some(1));
+}
+
+/// §2.1 `timing`: a forecast series "must be versioned with `changed_at kind`
+/// `time`".
+#[test]
+fn s2_1_forecast_series_versioned_with_time() {
+    let (mut m, _) = versioned_model();
+    let forecast = |versioned| SeriesOptions {
+        versioned,
+        timing: Timing::Forecast,
+    };
+    for versioned in [None, Some(ChangedAtKind::Version)] {
+        assert_eq!(
+            m.define_with(
+                "site/forecast-2/load",
+                Kind::Gauge,
+                ValueType::Number,
+                "kW",
+                None,
+                forecast(versioned)
+            ),
+            Err(Error::Registry(RegistryError::ForecastNotVersioned))
+        );
+    }
+    m.define_with(
+        "site/forecast-2/load",
+        Kind::Gauge,
+        ValueType::Number,
+        "kW",
+        None,
+        forecast(Some(ChangedAtKind::Time)),
+    )
+    .unwrap();
+}
+
+/// §2.2 Rank: "a fact's position, or in a versioned series `(changed_at,
+/// position)`, compared lexicographically"; §2.4: "A fact whose `changed_at`
+/// is above that of every fact in its key's history is never a duplicate,
+/// even when its value returns to an earlier one", and a fact with equal
+/// `changed_at` takes the tie by position.
+#[test]
+fn s2_2_rank_by_changed_at_then_position() {
+    let (mut m, s) = versioned_model();
+    m.ingest(vec![Reading::versioned(s, T0, 1.0, 5)]).unwrap();
+    m.ingest(vec![Reading::versioned(s, T0, 2.0, 7)]).unwrap();
+    // A return to the first value with a higher `changed_at`.
+    let r = m.ingest(vec![Reading::versioned(s, T0, 1.0, 9)]).unwrap();
+    assert_eq!(r.positions.len(), 1);
+    assert_eq!(m.current().unwrap()[&(s, T0)].changed_at, Some(9));
+    // The same `changed_at` and value: a duplicate. The same `changed_at`
+    // with another value: recorded, and current by position.
+    assert_eq!(
+        m.ingest(vec![Reading::versioned(s, T0, 1.0, 9)])
+            .unwrap()
+            .duplicates,
+        1
+    );
+    let p = m
+        .ingest(vec![Reading::versioned(s, T0, 3.0, 9)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(m.current().unwrap()[&(s, T0)].position, p);
+    // Identity includes `changed_at`: value 2.0 with `changed_at` 8 is new,
+    // and outranked.
+    let r = m.ingest(vec![Reading::versioned(s, T0, 2.0, 8)]).unwrap();
+    assert_eq!(r.positions.len(), 1);
+    assert_eq!(m.current().unwrap()[&(s, T0)].position, p);
+    assert_eq!(m.counters.outranked_on_arrival, 1);
+}
+
+/// §4 Outranked facts: "A fact outranked at commit (§2.3) is delivered in
+/// position order, flagged `outranked`, and counted per series
+/// (`outranked_on_arrival`). It does not change live state or staleness, is
+/// never fed to an operator or condition and must not be acted on." The flag
+/// is a function of the log: a replay in catch-up carries it too.
+#[test]
+fn s4_outranked_fact_delivered_flagged_never_fed_to_a_condition() {
+    let (mut m, s) = versioned_model();
+    m.add_route(C, F, Funnel::condition(s, None, threshold()))
+        .unwrap();
+    let now = m.wall;
+    m.ingest(vec![Reading::versioned(s, now, 10.0, 2)]).unwrap();
+    let p = m
+        .ingest(vec![Reading::versioned(s, now, 99.0, 1)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(m.counters.outranked_on_arrival, 1);
+    assert_eq!(m.latest(s).unwrap().unwrap().value, n(10.0));
+    m.drain().unwrap();
+    let flagged: Vec<(Position, bool)> = m.received[&C]
+        .iter()
+        .filter(|r| r.delivery.fact().is_some())
+        .map(|r| (r.delivery.position, r.delivery.outranked))
+        .collect();
+    assert_eq!(flagged.last(), Some(&(p, true)));
+    assert_eq!(flagged.iter().filter(|(_, o)| *o).count(), 1);
+    assert!(
+        m.received[&C]
+            .iter()
+            .all(|r| r.delivery.trigger().is_none()),
+        "99 above the threshold was never fed to the condition"
+    );
+    // Replayed after a restart from an earlier cursor, still flagged.
+    m.crash();
+    m.disk.cursors.insert(C, Position::ORIGIN);
+    m.restart();
+    m.drain().unwrap();
+    let replayed: Vec<&Envelope> = m.received[&C]
+        .iter()
+        .filter(|r| r.session == 2 && r.delivery.position == p && r.delivery.fact().is_some())
+        .map(|r| &r.delivery)
+        .collect();
+    assert!(replayed.len() == 1 && replayed[0].replayed && replayed[0].outranked);
+}
+
+/// §5.6: "Each node carries a version incremented on change. An outranked
+/// fact (§2.3) changes no node."
+#[test]
+fn s5_6_outranked_fact_changes_no_node() {
+    let (mut m, s) = versioned_model();
+    m.ingest(vec![Reading::versioned(s, T0, 1.0, 2)]).unwrap();
+    let before = m.tree(s).unwrap().clone();
+    let q = T0 - T0.rem_euclid(15 * MINUTE);
+    m.ingest(vec![Reading::versioned(s, T0, 50.0, 1)]).unwrap();
+    m.ingest(vec![Reading::versioned(s, T0 + SECOND, 50.0, 0)])
+        .unwrap();
+    let r = m
+        .ingest(vec![Reading::versioned(s, T0 + SECOND, 60.0, 0)])
+        .unwrap();
+    assert_eq!(r.positions.len(), 1);
+    let after = m.tree(s).unwrap();
+    assert_eq!(
+        after.version(q),
+        before.version(q) + 2,
+        "only the two facts of a new key"
+    );
+    assert_eq!(after.node(0, T0 - T0.rem_euclid(MINUTE)).count, 2);
+}
+
+/// §2.4 Version index: "for every key of a versioned series, its highest
+/// recorded `changed_at`. The rank of an arriving fact is therefore known
+/// whenever the index is local." §8 Restore step 2: "The rank of an arriving
+/// fact on a versioned series is known from step 1 on, the version index being
+/// exact at the restored end (from the checkpoint and the replay)." A fact
+/// below the index is outranked while the fact that outranks it is still in
+/// the bucket, also after a restart.
+#[test]
+fn s8_version_index_ranks_facts_while_restoring() {
+    let (mut m, s) = versioned_model();
+    for (t, v, c) in [(0, 1.0, 3), (1, 2.0, 1), (0, 4.0, 5)] {
+        m.ingest(vec![Reading::versioned(s, T0 + t * SECOND, v, c)])
+            .unwrap();
+    }
+    m.seal_active();
+    m.compact(None).unwrap();
+    let cp = m.checkpoint().unwrap();
+    assert_eq!(m.disk.checkpoints.last().unwrap().versions[&(s, T0)], 5);
+    m.ingest(vec![Reading::versioned(s, T0 + SECOND, 3.0, 2)])
+        .unwrap();
+    m.seal_active();
+    assert_eq!(m.upload_checkpoints(), 1);
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert!(r.restoring());
+    assert!(
+        r.disk
+            .restore
+            .as_ref()
+            .unwrap()
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .position
+            == cp
+    );
+    // The fact with `changed_at` 5 is in a current chunk not yet back.
+    let p = r
+        .ingest(vec![Reading::versioned(s, T0, 9.0, 4)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(r.counters.outranked_on_arrival, 1);
+    assert!(
+        r.current()
+            .unwrap()
+            .get(&(s, T0))
+            .is_none_or(|f| f.position != p)
+    );
+    // From the replay after the checkpoint: `changed_at` 2 at `T0 + 1 s`.
+    r.ingest(vec![Reading::versioned(s, T0 + SECOND, 8.0, 1)])
+        .unwrap();
+    assert_eq!(r.counters.outranked_on_arrival, 2);
+    r.crash();
+    r.restart();
+    assert!(
+        r.current()
+            .unwrap()
+            .get(&(s, T0))
+            .is_none_or(|f| f.position != p)
+    );
+    assert_eq!(r.current().unwrap()[&(s, T0 + SECOND)].changed_at, Some(2));
+    r.restore_rest().unwrap();
+    assert_eq!(r.current().unwrap()[&(s, T0)].value, n(4.0));
+    assert_eq!(r.current().unwrap()[&(s, T0 + SECOND)].value, n(3.0));
 }

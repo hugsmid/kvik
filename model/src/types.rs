@@ -247,6 +247,9 @@ pub struct Reading {
     pub value: Value,
     /// Quality as reported by the source.
     pub quality: Quality,
+    /// The source's revision time or version (§2.2): carried by every
+    /// reading of a versioned series and by no other.
+    pub changed_at: Option<u64>,
 }
 
 impl Reading {
@@ -257,6 +260,15 @@ impl Reading {
             t,
             value: Value::Num(v),
             quality: Quality::Good,
+            changed_at: None,
+        }
+    }
+
+    /// A good-quality numeric reading of a versioned series (§2.1).
+    pub fn versioned(series: SeriesId, t: Nanos, v: f64, changed_at: u64) -> Self {
+        Reading {
+            changed_at: Some(changed_at),
+            ..Reading::num(series, t, v)
         }
     }
 }
@@ -279,11 +291,21 @@ pub struct Fact {
     /// Quality as the adapter supplied it, kept for the duplicate rule
     /// (§2.2, §2.4): the engine may lower `quality`, never this.
     pub supplied_quality: Quality,
+    /// The source's revision time or version, in a versioned series (§2.2).
+    pub changed_at: Option<u64>,
     /// Engine flags.
     pub flags: Flags,
 }
 
 impl Fact {
+    /// Rank (§2.2): the position, or in a versioned series
+    /// `(changed_at, position)`, compared lexicographically. A series is
+    /// versioned for its whole life, so within one `(series, t)` either every
+    /// fact carries `changed_at` or none does.
+    pub fn rank(&self) -> (u64, Position) {
+        (self.changed_at.unwrap_or(0), self.position)
+    }
+
     /// Whether this fact takes part in summaries (§2.3: bad quality is excluded).
     pub fn summarised(&self) -> bool {
         self.quality != Quality::Bad

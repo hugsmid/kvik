@@ -9,6 +9,7 @@ use kvik_model::engine::{
     Envelope, Fault, Funnel, FunnelId, Model, Operator, RouteChange, Selection, WriteOutcome,
 };
 use kvik_model::oracle;
+use kvik_model::registry::{ChangedAtKind, SeriesOptions};
 use kvik_model::summary::Aggregate;
 use kvik_model::summary::Params;
 use kvik_model::types::{
@@ -134,6 +135,10 @@ pub fn value_type(kind: Kind) -> ValueType {
 
 pub const KINDS: [Kind; 3] = [Kind::Gauge, Kind::Counter, Kind::State];
 
+/// Index in [`machine`]'s series of a versioned gauge (§2.1), whose readings
+/// carry `changed_at` from a small pool.
+pub const VERSIONED: usize = 3;
+
 #[derive(Clone, Debug)]
 pub enum Op {
     Emit {
@@ -143,6 +148,8 @@ pub enum Op {
         bad: bool,
         /// Submitted with `revise` intent (§2.4).
         revise: bool,
+        /// `changed_at`, used for the versioned series only.
+        changed_at: u64,
     },
     Commit(Option<Fault>),
     Crash,
@@ -194,22 +201,30 @@ pub fn arb_fault() -> impl Strategy<Value = Option<Fault>> {
 }
 
 pub fn arb_op() -> impl Strategy<Value = Op> {
-    let emit = (0usize..3)
+    let emit = (0usize..=VERSIONED)
         .prop_flat_map(|s| {
             (
                 Just(s),
-                prop_oneof![3 => arb_pool_offset(), 1 => arb_offset()],
-                arb_value(KINDS[s]),
+                // The versioned series revisits a few keys, so that facts are
+                // outranked.
+                if s == VERSIONED {
+                    proptest::sample::select(vec![0, SECOND, MINUTE]).boxed()
+                } else {
+                    prop_oneof![3 => arb_pool_offset(), 1 => arb_offset()].boxed()
+                },
+                arb_value(KINDS[s % KINDS.len()]),
                 proptest::bool::weighted(0.1),
                 proptest::bool::weighted(0.05),
+                0u64..4,
             )
         })
-        .prop_map(|(series, t, value, bad, revise)| Op::Emit {
+        .prop_map(|(series, t, value, bad, revise, changed_at)| Op::Emit {
             series,
             t: T0 + t,
             value,
             bad,
             revise,
+            changed_at,
         });
     prop_oneof![
         20 => emit,
@@ -253,11 +268,13 @@ pub fn consumers() -> Vec<ConsumerDecl> {
     ]
 }
 
-/// Series names from several fields, one per kind in [`KINDS`].
-pub const NAMES: [&str; 3] = [
+/// Series names from several fields, one per kind in [`KINDS`], then the
+/// versioned series.
+pub const NAMES: [&str; 4] = [
     "plant/line-1/temperature",
     "site/pump-2/volume",
     "vehicle/7/gear",
+    "site/forecast-1/load",
 ];
 
 /// A model with three series (gauge, counter, state), wall clock at T0 + 1 h.
@@ -267,7 +284,7 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
         ..Config::default()
     };
     let mut m = Model::new(cfg, consumers(), T0 + 3600 * SECOND);
-    let ids = KINDS
+    let mut ids: Vec<SeriesId> = KINDS
         .iter()
         .enumerate()
         .map(|(i, k)| {
@@ -275,6 +292,17 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
                 .unwrap()
         })
         .collect();
+    ids.push(
+        m.define_with(
+            NAMES[VERSIONED],
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            5 * SECOND,
+            SeriesOptions::versioned(ChangedAtKind::Version),
+        )
+        .unwrap(),
+    );
     (m, ids)
 }
 
@@ -312,12 +340,14 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
             value,
             bad,
             revise,
+            changed_at,
         } => {
             let r = Reading {
                 series: ids[*series],
                 t: *t,
                 value: value.clone(),
                 quality: if *bad { Quality::Bad } else { Quality::Good },
+                changed_at: (*series == VERSIONED).then_some(*changed_at),
             };
             let _ = if *revise { m.emit_revise(r) } else { m.emit(r) };
         }

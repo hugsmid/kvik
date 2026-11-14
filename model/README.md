@@ -7,8 +7,8 @@ computation for exact equality.
 
 | Area | Module |
 |---|---|
-| Series registry, kinds, aliases, retirement | `registry` |
-| Facts, quality, flags, positions | `types` |
+| Series registry, kinds, aliases, retirement, versioned series, timing | `registry` |
+| Facts, quality, flags, positions, rank | `types` |
 | Current, as-of and history views (direct scans) | `view` |
 | Summary nodes, direct computation, `merge`, window edge stretches | `summary` |
 | Summary tree (stored 1-minute and 15-minute levels), calendar days, windows, sliding cache | `tree` |
@@ -23,14 +23,14 @@ it differs, and the open questions in the specification itself.
 
 | File | Covers |
 |---|---|
-| `tests/invariants.rs` | Property tests for specification invariants 1–11, 13, 15, 16, 17 and 18, at least one test per invariant, named after it; invariants 2, 3 and 11 also over a delivery machine with run-time routes, condition funnels and timers |
-| `tests/edge_cases.rs` | Edge-case rows 1, 2, 2a, 2b, 3–7, 7a, 8, 9, 11–17, 17a, 18, 18a, 19, 20, 22–25, 27, 29–32, 34 and 35, one test (or property) each, named after the row |
-| `tests/rules.rs` | Other rules, named after their section; the `s4_…` and `s6_…` delivery tests cover run-time routes, `resync` on resume, after a recovery on a new boot, after a restore and in place of a replay that is too far behind, condition deliveries and latches, with properties for delivery identity, resync order and no gap within a session; the `s8_…` tests cover tree checkpoints, generations and restore steps 1–4, including rows 28 and 28b, and row 28a at three points: before the record, during step 1, and between later downloads (a download is atomic in the model) |
+| `tests/invariants.rs` | Property tests for specification invariants 1–11, 13, 15–19, at least one test per invariant, named after it; invariants 2, 3 and 11 also over a delivery machine with run-time routes, condition funnels and timers |
+| `tests/edge_cases.rs` | Edge-case rows 1, 2, 2a–2d, 3–7, 7a, 8, 9, 11–17, 17a, 18, 18a, 19, 20, 22–25, 27, 29–32, 34, 35 and 37, one test (or property) each, named after the row |
+| `tests/rules.rs` | Other rules, named after their section; the `s2_…`, `s4_outranked_…`, `s5_6_…` and `s8_version_index_…` tests cover the duplicate rule and versioned series (rank, refusals, outranked facts in delivery and the tree, the version index during a restore); the `s4_…` and `s6_…` delivery tests cover run-time routes, `resync` on resume, after a recovery on a new boot, after a restore and in place of a replay that is too far behind, condition deliveries and latches, with properties for delivery identity, resync order and no gap within a session; the `s8_…` tests cover tree checkpoints, generations and restore steps 1–4, including rows 28 and 28b, and row 28a at three points: before the record, during step 1, and between later downloads (a download is atomic in the model) |
 | `tests/open_questions.rs` | One test per open question that the model can show |
 | `tests/model.rs` | Model behaviour where it implements a simpler rule than the specification |
 
-Not yet covered: edge-case rows 2c, 2d, 10, 11a, 21, 21a, 22a, 26, 33 and 36–42, and invariants 12, 14 and
-19–22 (see `OPEN-QUESTIONS.md`).
+Not yet covered: edge-case rows 10, 11a, 21, 21a, 22a, 26, 33, 36, 37b and 38–42, and invariants 12, 14 and
+20–22 (see `OPEN-QUESTIONS.md`).
 
 ```bash
 cargo test --release                  # faster

@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::*;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -13,6 +15,7 @@ use kvik_model::engine::{
     WriteOutcome,
 };
 use kvik_model::oracle;
+use kvik_model::registry::{ChangedAtKind, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Params};
 use kvik_model::tree::{SeriesTree, quarters_in_day};
 use kvik_model::types::{
@@ -187,6 +190,147 @@ fn row_02b_repeat_whose_current_fact_is_off_every_local_tier() {
     let r = m.ingest(vec![num(s, T0 + 1, 1.0)]).unwrap();
     assert_eq!(r.duplicates, 1);
     assert_eq!(m.counters.duplicates_unchecked, 2);
+}
+
+/// A store with a consumer of every series and one versioned gauge, with
+/// `changed_at` of the given kind and timing.
+fn versioned_model(options: SeriesOptions) -> (Model, SeriesId) {
+    let (mut m, _) = model();
+    let v = m
+        .define_with(
+            "site/forecast-1/load",
+            Kind::Gauge,
+            ValueType::Number,
+            "kW",
+            10 * SECOND,
+            options,
+        )
+        .unwrap();
+    (m, v)
+}
+
+/// Moves every file holding `p` off the local tiers (they are in the bucket).
+fn move_off_machine(m: &mut Model, p: Position) {
+    m.seal_active();
+    m.upload();
+    for f in m.disk.hot.clone() {
+        if m.disk.files[&f].entries().any(|e| e.position == p) {
+            assert!(m.disk.in_bucket(f));
+            m.disk.hot.remove(&f);
+            m.disk.cold.remove(&f);
+        }
+    }
+}
+
+proptest! {
+    /// Row 2c: "Versioned series: revision A (`changed_at` 1), correction B
+    /// (2), then a replay of A, also with A's detail off every tier: replay
+    /// is a duplicate or recorded unchecked; B stays current. A later
+    /// revision (3) with A's value is recorded and current."
+    #[test]
+    fn row_02c_replay_never_reverts_a_versioned_correction(
+        a in -3i32..3, b in -3i32..3, off in any::<bool>(), compact in any::<bool>(),
+    ) {
+        prop_assume!(a != b);
+        let (mut m, v) = versioned_model(SeriesOptions::versioned(ChangedAtKind::Version));
+        let (a, b) = (f64::from(a), f64::from(b));
+        let pa = m.ingest(vec![Reading::versioned(v, T0, a, 1)]).unwrap().positions[0];
+        if compact {
+            m.seal_active();
+            m.compact(None).unwrap();
+        }
+        let pb = m.ingest(vec![Reading::versioned(v, T0, b, 2)]).unwrap().positions[0];
+        if off {
+            move_off_machine(&mut m, pa);
+        }
+        let r = m.ingest(vec![Reading::versioned(v, T0, a, 1)]).unwrap();
+        if off {
+            prop_assert_eq!((r.positions.len(), m.counters.duplicates_unchecked), (1, 1));
+            prop_assert_eq!(m.counters.outranked_on_arrival, 1);
+        } else {
+            prop_assert_eq!((r.positions.len(), r.duplicates), (0, 1));
+        }
+        prop_assert_eq!(m.current().unwrap()[&(v, T0)].position, pb);
+        let p3 = m.ingest(vec![Reading::versioned(v, T0, a, 3)]).unwrap().positions[0];
+        let cur = &m.current().unwrap()[&(v, T0)];
+        prop_assert_eq!((cur.position, cur.value.clone()), (p3, Value::Num(a)));
+    }
+
+    /// Row 2d: "Versioned series: a fact with a lower `changed_at` than the
+    /// current one and a new value: recorded, delivered flagged `outranked`,
+    /// counted; no node, live-state or condition change."
+    #[test]
+    fn row_02d_lower_changed_at_is_outranked(
+        (cur, lower) in (1u64..5).prop_flat_map(|c| (Just(c), 0..c)),
+        a in -3i32..3,
+        d in 1i32..4,
+    ) {
+        let b = a + d;
+        let (mut m, v) = versioned_model(SeriesOptions::versioned(ChangedAtKind::Version));
+        m.add_route(C, FunnelId(1), Funnel::condition(v, None, Condition::OnChange { deadband: 0.0 })).unwrap();
+        let now = m.wall;
+        m.ingest(vec![Reading::versioned(v, now, f64::from(a), cur)]).unwrap();
+        m.drain().unwrap();
+        let tree = m.tree(v).unwrap().clone();
+        let live = m.latest(v).unwrap();
+        let received = m.received[&C].len();
+        let p = m.ingest(vec![Reading::versioned(v, now, f64::from(b), lower)]).unwrap().positions[0];
+        prop_assert_eq!(m.counters.outranked_on_arrival, 1);
+        prop_assert_eq!(m.tree(v).unwrap(), &tree);
+        prop_assert_eq!(m.latest(v).unwrap(), live);
+        m.drain().unwrap();
+        let new: Vec<_> = m.received[&C][received..].iter().map(|r| &r.delivery).collect();
+        prop_assert_eq!(new.len(), 1, "only the fact, no condition delivery");
+        prop_assert!(new[0].position == p && new[0].outranked);
+    }
+
+    /// Row 37: "Forecast re-issued: the higher `changed_at` is current;
+    /// earlier issues stay in history; a replay of an old issue is a
+    /// duplicate or outranked." Each issue covers some valid times, with the
+    /// issue time as `changed_at`.
+    #[test]
+    fn row_37_forecast_reissued(
+        issues in proptest::collection::vec(proptest::collection::btree_map(0i64..6, -3i32..3, 1..6), 1..5),
+        replays in proptest::collection::vec((any::<proptest::sample::Index>(), any::<proptest::sample::Index>()), 0..6),
+    ) {
+        let options = SeriesOptions { versioned: Some(ChangedAtKind::Time), timing: Timing::Forecast };
+        let (mut m, v) = versioned_model(options);
+        let valid = |h: i64| m.wall + h * HOUR;
+        let valid: Vec<Nanos> = (0..6).map(valid).collect();
+        let mut want: BTreeMap<Nanos, (u64, f64)> = BTreeMap::new();
+        let mut issued = 0usize;
+        for issue in &issues {
+            let at = u64::try_from(m.wall).unwrap();
+            let readings: Vec<Reading> = issue.iter()
+                .map(|(h, x)| Reading::versioned(v, valid[*h as usize], f64::from(*x), at))
+                .collect();
+            issued += readings.len();
+            m.ingest(readings).unwrap();
+            for (h, x) in issue {
+                want.insert(valid[*h as usize], (at, f64::from(*x)));
+            }
+            m.advance(MINUTE);
+        }
+        let check = |m: &Model| -> Result<(), TestCaseError> {
+            for (t, (at, x)) in &want {
+                let f = &m.current().unwrap()[&(v, *t)];
+                prop_assert_eq!((f.changed_at, f.value.clone()), (Some(*at), Value::Num(*x)));
+            }
+            Ok(())
+        };
+        check(&m)?;
+        prop_assert_eq!(m.facts().unwrap().len(), issued, "every issue stays in history");
+        for (i, j) in &replays {
+            let k = i.index(issues.len());
+            let issue = &issues[k];
+            let (h, x) = issue.iter().nth(j.index(issue.len())).unwrap();
+            let at = u64::try_from(T0 + HOUR + k as i64 * MINUTE).unwrap();
+            let outranked = m.counters.outranked_on_arrival;
+            let r = m.ingest(vec![Reading::versioned(v, valid[*h as usize], f64::from(*x), at)]).unwrap();
+            prop_assert!(r.duplicates == 1 || m.counters.outranked_on_arrival == outranked + 1);
+            check(&m)?;
+        }
+    }
 }
 
 #[test]

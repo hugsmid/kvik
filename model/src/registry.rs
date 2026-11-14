@@ -5,6 +5,49 @@ use std::collections::BTreeMap;
 
 use crate::types::{Kind, Nanos, SeriesId, ValueType};
 
+/// What `changed_at` holds in a versioned series (§2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChangedAtKind {
+    /// UTC nanoseconds: the revision or issue time.
+    Time,
+    /// An opaque counter.
+    Version,
+}
+
+/// When a series' values apply (§2.1 `timing`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Timing {
+    /// Values observed at their `t`.
+    #[default]
+    Observed,
+    /// Values known in advance that take effect at their `t`.
+    Scheduled,
+    /// Values about future times, re-issued over time; versioned with
+    /// `changed_at` kind `time`.
+    Forecast,
+}
+
+/// Definition fields fixed for the life of a series beyond kind, type and
+/// unit (§2.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SeriesOptions {
+    /// `Some` for a versioned series, with what its `changed_at` holds.
+    pub versioned: Option<ChangedAtKind>,
+    /// Timing. The model checks only that a forecast series is versioned
+    /// with `changed_at` kind `time`; every series is otherwise observed.
+    pub timing: Timing,
+}
+
+impl SeriesOptions {
+    /// A versioned series whose `changed_at` is of the given kind.
+    pub fn versioned(kind: ChangedAtKind) -> Self {
+        SeriesOptions {
+            versioned: Some(kind),
+            ..SeriesOptions::default()
+        }
+    }
+}
+
 /// A registry event, recorded in the log.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RegistryEvent {
@@ -22,6 +65,8 @@ pub enum RegistryEvent {
         unit: String,
         /// Staleness limit (§2.1); recorded so that rebuild is deterministic.
         staleness: Option<Nanos>,
+        /// Versioned and timing (§2.1).
+        options: SeriesOptions,
     },
     /// An additional name for an existing series (rename).
     Alias {
@@ -55,6 +100,8 @@ pub struct SeriesDef {
     pub unit: String,
     /// Staleness limit; `None` means valid until the next reading.
     pub staleness: Option<Nanos>,
+    /// Versioned and timing (§2.1).
+    pub options: SeriesOptions,
     /// Whether the series is retired.
     pub retired: bool,
     /// Effective time of the retirement, if retired.
@@ -82,6 +129,10 @@ pub enum RegistryError {
     /// Staleness limit must be positive.
     #[error("staleness limit must be positive")]
     BadStaleness,
+    /// A forecast series must be versioned with `changed_at` kind `time`
+    /// (§2.1 `timing`).
+    #[error("a forecast series must be versioned with changed_at kind time")]
+    ForecastNotVersioned,
 }
 
 /// The registry.
@@ -101,6 +152,7 @@ impl Registry {
                 value_type,
                 unit,
                 staleness,
+                options,
             } => {
                 self.series.insert(
                     *id,
@@ -111,6 +163,7 @@ impl Registry {
                         value_type: *value_type,
                         unit: unit.clone(),
                         staleness: *staleness,
+                        options: *options,
                         retired: false,
                         retired_at: None,
                     },
@@ -160,6 +213,7 @@ impl Registry {
 
     /// Validates a definition and returns the event to record, or the id of
     /// an identical live series (defining is idempotent).
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_define(
         &self,
         name: &str,
@@ -167,6 +221,7 @@ impl Registry {
         value_type: ValueType,
         unit: &str,
         staleness: Option<Nanos>,
+        options: SeriesOptions,
         ceiling: usize,
     ) -> Result<Result<RegistryEvent, SeriesId>, RegistryError> {
         if !kind.accepts(value_type) {
@@ -175,8 +230,15 @@ impl Registry {
         if staleness.is_some_and(|s| s <= 0) {
             return Err(RegistryError::BadStaleness);
         }
+        if options.timing == Timing::Forecast && options.versioned != Some(ChangedAtKind::Time) {
+            return Err(RegistryError::ForecastNotVersioned);
+        }
         if let Some(d) = self.resolve(name) {
-            if d.kind == kind && d.value_type == value_type && d.unit == unit {
+            if d.kind == kind
+                && d.value_type == value_type
+                && d.unit == unit
+                && d.options == options
+            {
                 return Ok(Err(d.id));
             }
             return Err(RegistryError::NameInUse(name.to_string()));
@@ -191,6 +253,7 @@ impl Registry {
             value_type,
             unit: unit.to_string(),
             staleness,
+            options,
         }))
     }
 }

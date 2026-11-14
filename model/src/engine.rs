@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
-use crate::registry::{Registry, RegistryError, RegistryEvent, SeriesDef};
+use crate::registry::{Registry, RegistryError, RegistryEvent, SeriesDef, SeriesOptions};
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{SeriesTree, TreeError};
 use crate::types::{
@@ -351,6 +351,9 @@ pub struct Checkpoint {
     pub registry: Registry,
     /// Each series' latest recorded `t` as of the position.
     pub latest_t: BTreeMap<SeriesId, Nanos>,
+    /// The version index as of the position (§2.4, §8 Continuous backup):
+    /// the highest recorded `changed_at` of every key of a versioned series.
+    pub versions: BTreeMap<(SeriesId, Nanos), u64>,
     /// Stored nodes per series, without readings.
     pub trees: BTreeMap<SeriesId, SeriesTree>,
 }
@@ -519,6 +522,16 @@ pub enum Refusal {
     /// Text longer than 255 bytes.
     #[error("text too long")]
     TextTooLong,
+    /// A reading of a versioned series without `changed_at` (§2.2).
+    #[error("changed_at missing on a versioned series")]
+    ChangedAtMissing,
+    /// A reading with `changed_at` on a series that is not versioned (§2.2).
+    #[error("changed_at on a series that is not versioned")]
+    ChangedAtUnexpected,
+    /// `revise` intent on a versioned series (§2.4): a return to an earlier
+    /// value there is a fact with a higher `changed_at`.
+    #[error("revise on a versioned series")]
+    ReviseOnVersioned,
 }
 
 /// Engine errors.
@@ -646,6 +659,9 @@ pub struct Counters {
     /// Restored spans whose recomputed nodes differed from the checkpoint
     /// (§8 Restore step 4).
     pub checkpoint_differences: u64,
+    /// Facts of versioned series outranked when they were committed (§4
+    /// Outranked facts).
+    pub outranked_on_arrival: u64,
 }
 
 /// A delivery to a consumer.
@@ -657,6 +673,8 @@ pub struct Delivery {
     pub fact: Fact,
     /// Produced during catch-up (§4).
     pub replayed: bool,
+    /// Outranked when it was committed (§4 Outranked facts).
+    pub outranked: bool,
 }
 
 /// What a consumer saw, recorded by the model as an outside observer.
@@ -789,6 +807,9 @@ pub struct Envelope {
     pub position: Position,
     /// Produced during catch-up (§4 Replay); facts only.
     pub replayed: bool,
+    /// A fact outranked when it was committed (§4 Outranked facts): it must
+    /// not be acted on.
+    pub outranked: bool,
     /// Content.
     pub kind: DeliveryKind,
 }
@@ -1265,6 +1286,9 @@ struct Volatile {
     newest_t: BTreeMap<SeriesId, Nanos>,
     /// Every recorded fact's identity per key, for the duplicate rule.
     history: History,
+    /// The version index (§2.4), exact also while a restore brings detail
+    /// back (from the checkpoint and the replay, §8 Restore step 2).
+    versions: Versions,
     trees: BTreeMap<SeriesId, SeriesTree>,
     /// Queued readings with their `revise` intent.
     queue: VecDeque<(Reading, bool)>,
@@ -1290,17 +1314,20 @@ struct Derived {
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
     history: History,
+    versions: Versions,
     trees: BTreeMap<SeriesId, SeriesTree>,
     restore: Option<RestoreRt>,
 }
 
-/// What the duplicate rule compares of a recorded fact (§2.4): its value and
-/// adapter-supplied quality, with its position to tell whether it is local.
+/// What the duplicate rule compares of a recorded fact (§2.4): its value,
+/// adapter-supplied quality and `changed_at`, with its position to tell
+/// whether it is local and how it ranks.
 #[derive(Clone, Debug, PartialEq)]
 struct Known {
     position: Position,
     value: Value,
     quality: Quality,
+    changed_at: Option<u64>,
 }
 
 impl Known {
@@ -1309,6 +1336,7 @@ impl Known {
             position: f.position,
             value: f.value.clone(),
             quality: f.supplied_quality,
+            changed_at: f.changed_at,
         }
     }
 
@@ -1316,6 +1344,23 @@ impl Known {
         self.value.identical(value) && self.quality == quality
     }
 }
+
+/// Whether a fact was outranked when it was committed (§2.3): a fact of its
+/// key with a lower position has a higher `changed_at`. A function of the
+/// log, so live delivery and catch-up agree on it.
+fn outranked_at_commit(history: &History, f: &Fact) -> bool {
+    let Some(c) = f.changed_at else {
+        return false;
+    };
+    history.get(&(f.series, f.t)).is_some_and(|ks| {
+        ks.iter()
+            .any(|k| k.position < f.position && k.changed_at.is_some_and(|kc| kc > c))
+    })
+}
+
+/// The version index (§2.4): the highest recorded `changed_at` of every key
+/// of a versioned series.
+type Versions = BTreeMap<(SeriesId, Nanos), u64>;
 
 /// The recorded facts of each key, as the duplicate rule sees them.
 type History = BTreeMap<(SeriesId, Nanos), Vec<Known>>;
@@ -1533,6 +1578,7 @@ impl Model {
             current: d.current,
             newest_t: d.newest_t,
             history: d.history,
+            versions: d.versions,
             trees: d.trees,
             queue: VecDeque::new(),
             next_position,
@@ -1570,7 +1616,21 @@ impl Model {
                 EntryBody::Fact(f) => facts.push(f.clone()),
             }
         }
-        let current = view::current(facts.iter());
+        // The version index: from the checkpoint and the facts after it
+        // while restoring, so the rank of a fact whose outranking fact is
+        // not yet local is still known (§8 Restore step 2).
+        let mut versions = cp.map_or_else(BTreeMap::new, |c| c.versions.clone());
+        for f in &facts {
+            if let Some(c) = f.changed_at {
+                let v = versions.entry((f.series, f.t)).or_insert(c);
+                *v = (*v).max(c);
+            }
+        }
+        let current = view::current(
+            facts
+                .iter()
+                .filter(|f| f.changed_at.is_none_or(|c| c >= versions[&(f.series, f.t)])),
+        );
         let mut newest_t = restoring.map_or_else(BTreeMap::new, |r| r.latest_t.clone());
         let mut history: History = BTreeMap::new();
         for f in &facts {
@@ -1608,6 +1668,7 @@ impl Model {
             current,
             newest_t,
             history,
+            versions,
             trees,
             restore,
         }
@@ -1624,6 +1685,7 @@ impl Model {
             v.current = d.current;
             v.newest_t = d.newest_t;
             v.history = d.history;
+            v.versions = d.versions;
             v.trees = d.trees;
             v.restore = d.restore;
         }
@@ -1838,12 +1900,34 @@ impl Model {
         unit: &str,
         staleness: impl Into<Option<Nanos>>,
     ) -> Result<SeriesId, Error> {
+        self.define_with(
+            name,
+            kind,
+            value_type,
+            unit,
+            staleness,
+            SeriesOptions::default(),
+        )
+    }
+
+    /// Defines a series with the definition fields beyond kind, type and
+    /// unit (§2.1: versioned, timing), or returns the id of an identical live
+    /// one.
+    pub fn define_with(
+        &mut self,
+        name: &str,
+        kind: Kind,
+        value_type: ValueType,
+        unit: &str,
+        staleness: impl Into<Option<Nanos>>,
+        options: SeriesOptions,
+    ) -> Result<SeriesId, Error> {
         let staleness = staleness.into();
         let ceiling = self.config.series_ceiling;
         let plan = self
             .vol()?
             .registry
-            .plan_define(name, kind, value_type, unit, staleness, ceiling)?;
+            .plan_define(name, kind, value_type, unit, staleness, options, ceiling)?;
         match plan {
             Err(existing) => Ok(existing),
             Ok(ev) => {
@@ -1935,7 +2019,7 @@ impl Model {
     }
 
     fn emit_with(&mut self, r: Reading, revise: bool) -> Result<(), EmitError> {
-        let res = self.check(&r);
+        let res = self.check(&r, revise);
         match res {
             Ok(()) => {
                 self.vol
@@ -1956,7 +2040,7 @@ impl Model {
         }
     }
 
-    fn check(&self, r: &Reading) -> Result<(), EmitError> {
+    fn check(&self, r: &Reading, revise: bool) -> Result<(), EmitError> {
         let v = self.vol.as_ref().ok_or(Refusal::Down)?;
         if v.read_only {
             return Err(Refusal::ReadOnly.into());
@@ -1967,6 +2051,12 @@ impl Model {
         let d = v.registry.get(r.series).ok_or(Refusal::UnknownSeries)?;
         if d.retired_at.is_some_and(|at| r.t >= at) {
             return Err(Refusal::Retired.into());
+        }
+        match (d.options.versioned.is_some(), r.changed_at.is_some()) {
+            (true, false) => return Err(Refusal::ChangedAtMissing.into()),
+            (false, true) => return Err(Refusal::ChangedAtUnexpected.into()),
+            (true, true) if revise => return Err(Refusal::ReviseOnVersioned.into()),
+            _ => {}
         }
         let non_finite = matches!(r.value, Value::Num(x) if !x.is_finite());
         if !non_finite && !r.value.fits(d.value_type) {
@@ -2010,8 +2100,16 @@ impl Model {
         // off-machine data: if the current fact of the key is on no local
         // tier, the reading is recorded and counted `duplicates_unchecked`
         // (§2.4, §12 D5).
+        //
+        // In a versioned series identity also includes `changed_at`; a fact
+        // whose `changed_at` is above every one of its key's (the version
+        // index) is never a duplicate; one whose `changed_at` equals that of
+        // a fact off every local tier is recorded and counted unchecked. A
+        // fact below the version index is outranked (§2.3, §4).
         let mut batch: Vec<Entry> = Vec::new();
         let mut batch_history: History = BTreeMap::new();
+        let mut batch_versions: Versions = BTreeMap::new();
+        let mut outranked: BTreeSet<Position> = BTreeSet::new();
         let mut batch_newest: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
         let mut duplicates = 0;
         let mut unchecked = 0;
@@ -2032,19 +2130,52 @@ impl Model {
                 quality = quality.worst(Quality::Suspect);
             }
             let key = (r.series, r.t);
-            let off_machine = local.as_ref().is_some_and(|local| {
-                !batch_history.contains_key(&key)
-                    && v.current
-                        .get(&key)
-                        .is_some_and(|c| !local.contains(&c.position))
-            });
-            let seen = v
+            let is_local = |k: &Known| local.as_ref().is_none_or(|l| l.contains(&k.position));
+            let recorded: Vec<(&Known, bool)> = v
                 .history
                 .get(&key)
                 .into_iter()
-                .chain(batch_history.get(&key))
                 .flatten()
-                .any(|k| k.identical(&value, supplied));
+                .map(|k| (k, is_local(k)))
+                .chain(
+                    batch_history
+                        .get(&key)
+                        .into_iter()
+                        .flatten()
+                        .map(|k| (k, true)),
+                )
+                .collect();
+            let top = v
+                .versions
+                .get(&key)
+                .copied()
+                .max(batch_versions.get(&key).copied());
+            // Whether the check is needed at all (§2.4).
+            let checked = match r.changed_at {
+                None => true,
+                Some(c) => top.is_some_and(|top| c <= top),
+            };
+            let (seen, off_machine) = match r.changed_at {
+                None => {
+                    let off = local.is_some()
+                        && !batch_history.contains_key(&key)
+                        && v.current
+                            .get(&key)
+                            .is_some_and(|c| !is_local(&Known::of(c)));
+                    let seen = recorded.iter().any(|(k, _)| k.identical(&value, supplied));
+                    (seen, off)
+                }
+                Some(c) => {
+                    let same: Vec<&(&Known, bool)> = recorded
+                        .iter()
+                        .filter(|(k, _)| k.changed_at == Some(c))
+                        .collect();
+                    let seen = same
+                        .iter()
+                        .any(|(k, local)| *local && k.identical(&value, supplied));
+                    (seen, !seen && same.iter().any(|(_, local)| !local))
+                }
+            };
             if !revise && off_machine {
                 unchecked += 1;
             } else if seen && !revise {
@@ -2054,6 +2185,8 @@ impl Model {
             // During a restore the check cannot run against facts that are
             // not yet local (§8 Restore step 2, §2.4).
             if !revise
+                && checked
+                && !off_machine
                 && v.restore.as_ref().is_some_and(|rt| {
                     if rt.index_back {
                         rt.remote_single.contains(&key)
@@ -2082,6 +2215,7 @@ impl Model {
                 value,
                 quality,
                 supplied_quality: supplied,
+                changed_at: r.changed_at,
                 flags: Flags {
                     future,
                     late,
@@ -2092,6 +2226,13 @@ impl Model {
             let n = batch_newest.entry(r.series).or_insert(r.t);
             *n = (*n).max(r.t);
             batch_history.entry(key).or_default().push(Known::of(&fact));
+            if let Some(c) = fact.changed_at {
+                if top.is_some_and(|top| c < top) {
+                    outranked.insert(fact.position);
+                }
+                let v = batch_versions.entry(key).or_insert(c);
+                *v = (*v).max(c);
+            }
             batch.push(Entry {
                 position: fact.position,
                 received_at: wall,
@@ -2149,7 +2290,15 @@ impl Model {
         }
         // Live state.
         self.counters.duplicates_unchecked += unchecked;
-        self.publish_live(&batch)?;
+        self.counters.outranked_on_arrival += outranked.len() as u64;
+        self.publish_live(&batch, &outranked)?;
+        // An outranked fact is delivered, flagged, but never fed to a
+        // condition (§4 Outranked facts).
+        let fed: Vec<Entry> = batch
+            .iter()
+            .filter(|e| !outranked.contains(&e.position))
+            .cloned()
+            .collect();
         // Delivery.
         let stop_after = match fault {
             Some(Fault::Crash(CrashPoint::DuringDelivery(n))) => Some(n),
@@ -2161,8 +2310,8 @@ impl Model {
                 self.crash();
                 return Err(Error::Crashed);
             }
-            self.deliver_live(i, &batch);
-            self.evaluate_funnels(i, Some(&batch));
+            self.deliver_live(i, &batch, &outranked);
+            self.evaluate_funnels(i, Some(&fed));
         }
         if stop_after.is_some_and(|n| n >= n_consumers) {
             self.crash();
@@ -2246,7 +2395,11 @@ impl Model {
         }
     }
 
-    fn publish_live(&mut self, batch: &[Entry]) -> Result<(), Error> {
+    fn publish_live(
+        &mut self,
+        batch: &[Entry],
+        outranked: &BTreeSet<Position>,
+    ) -> Result<(), Error> {
         let cfg = self.config.clone();
         let restoring = self.vol.as_ref().is_some_and(|v| v.restore.is_some());
         let local =
@@ -2256,14 +2409,22 @@ impl Model {
         for e in batch {
             v.entries.insert(e.position, e.clone());
             let Some(f) = e.fact() else { continue };
-            v.current.insert((f.series, f.t), f.clone());
             v.history
                 .entry((f.series, f.t))
                 .or_default()
                 .push(Known::of(f));
+            if let Some(c) = f.changed_at {
+                let top = v.versions.entry((f.series, f.t)).or_insert(c);
+                *top = (*top).max(c);
+            }
             let n = v.newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
-            touched.insert((f.series, floor_to(f.t, MINUTE)));
+            // An outranked fact changes no current fact and no node (§2.3,
+            // §5.6).
+            if !outranked.contains(&e.position) {
+                v.current.insert((f.series, f.t), f.clone());
+                touched.insert((f.series, floor_to(f.t, MINUTE)));
+            }
             if f.flags.late {
                 self.counters.late += 1;
             }
@@ -2428,7 +2589,7 @@ impl Model {
             .and_then(|v| v.entries.keys().next_back().copied())
     }
 
-    fn deliver_live(&mut self, i: usize, batch: &[Entry]) {
+    fn deliver_live(&mut self, i: usize, batch: &[Entry], outranked: &BTreeSet<Position>) {
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
         for e in batch {
@@ -2442,6 +2603,7 @@ impl Model {
                         c.queue.push_back(Envelope {
                             position: e.position,
                             replayed: false,
+                            outranked: outranked.contains(&e.position),
                             kind: DeliveryKind::Fact(f.clone()),
                         });
                     } else {
@@ -2533,11 +2695,12 @@ impl Model {
                 // The last arrival is the last committed reading, whose
                 // stamp a backward correction may have put below earlier
                 // ones.
+                // An outranked fact refreshes nothing (§4 Outranked facts).
                 h.since_arrival = v
                     .entries
                     .values()
                     .filter_map(Entry::fact)
-                    .rfind(|x| x.series == s)
+                    .rfind(|x| x.series == s && !outranked_at_commit(&v.history, x))
                     .map(|x| (self.wall - x.received_at).max(0));
             }
             Condition::Threshold { .. } | Condition::OnChange { .. } => {}
@@ -2621,6 +2784,7 @@ impl Model {
         c.queue.push_back(Envelope {
             position: head,
             replayed: false,
+            outranked: false,
             kind: DeliveryKind::Trigger(Trigger {
                 funnel,
                 incarnation,
@@ -2757,6 +2921,7 @@ impl Model {
             c.queue.push_back(Envelope {
                 position: restored_end,
                 replayed: false,
+                outranked: false,
                 kind: DeliveryKind::GenerationChanged {
                     cursor,
                     restored_end,
@@ -2770,6 +2935,7 @@ impl Model {
         c.queue.push_back(Envelope {
             position,
             replayed: false,
+            outranked: false,
             kind: DeliveryKind::Resync(Resync {
                 funnels: states,
                 replaced,
@@ -2831,6 +2997,7 @@ impl Model {
                     c.queue.push_back(Envelope {
                         position: *p,
                         replayed: true,
+                        outranked: outranked_at_commit(&v.history, f),
                         kind: DeliveryKind::Fact(f.clone()),
                     });
                 }
@@ -2894,6 +3061,7 @@ impl Model {
                     position: d.position,
                     fact,
                     replayed: d.replayed,
+                    outranked: d.outranked,
                 }),
                 _ => None,
             })
@@ -3495,6 +3663,7 @@ impl Model {
             position,
             registry: v.registry.clone(),
             latest_t: v.newest_t.clone(),
+            versions: v.versions.clone(),
             trees: v.trees.iter().map(|(s, t)| (*s, t.nodes_only())).collect(),
         };
         self.disk.checkpoints.push(cp);

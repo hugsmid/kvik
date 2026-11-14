@@ -362,14 +362,28 @@ proptest! {
         }
     }
 
-    /// 4. The current view equals "highest position per (series, t)" over all
-    /// facts in all tiers.
+    /// 4. The current view equals "highest rank per `(series, t)`" (§2.2:
+    /// the position, or in a versioned series `(changed_at, position)`) over
+    /// all facts in all tiers. Checked against the view module and against a
+    /// naive maximum computed here.
     #[test]
     fn inv04_current_view_over_all_tiers(ops in proptest::collection::vec(arb_op(), 1..80)) {
-        let (mut m, _) = run(&ops)?;
+        let (mut m, ids) = run(&ops)?;
         settle(&mut m);
         let all = m.disk.all_facts();
         prop_assert_eq!(m.current().unwrap(), &view::current(all.iter()));
+        let mut naive: BTreeMap<_, kvik_model::types::Fact> = BTreeMap::new();
+        for f in &all {
+            let key = (f.series, f.t);
+            let better = naive.get(&key).is_none_or(|g| {
+                let c = |x: &kvik_model::types::Fact| if x.series == ids[VERSIONED] { x.changed_at.unwrap() } else { 0 };
+                c(f) > c(g) || (c(f) == c(g) && f.position > g.position)
+            });
+            if better {
+                naive.insert(key, f.clone());
+            }
+        }
+        prop_assert_eq!(m.current().unwrap(), &naive);
         // Order and repetition of the input do not matter.
         let mut shuffled: Vec<_> = all.iter().rev().cloned().collect();
         shuffled.extend(all.iter().cloned());
@@ -796,6 +810,7 @@ fn generator_coverage() {
     let (mut facts, mut discarded, mut overflows, mut compacted, mut uploaded, mut revisions) =
         (0usize, 0u64, 0u64, 0usize, 0usize, 0usize);
     let (mut tails, mut kept_after_reboot, mut recovery_failed) = (0usize, 0usize, 0usize);
+    let mut outranked = 0u64;
     for _ in 0..200 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let (mut m, ids) = machine();
@@ -829,11 +844,13 @@ fn generator_coverage() {
             .filter(|f| f.class != kvik_model::engine::FileClass::Segment)
             .count();
         uploaded += m.disk.bucket.objects.len();
+        outranked += m.counters.outranked_on_arrival;
     }
     eprintln!(
-        "facts {facts} revisions {revisions} discarded {discarded} overflows {overflows} compacted {compacted} uploaded {uploaded} tails {tails} kept-after-reboot {kept_after_reboot} recovery-failed {recovery_failed}"
+        "facts {facts} revisions {revisions} discarded {discarded} overflows {overflows} compacted {compacted} uploaded {uploaded} tails {tails} kept-after-reboot {kept_after_reboot} recovery-failed {recovery_failed} outranked {outranked}"
     );
     assert!(facts > 1000 && revisions > 50 && discarded > 10 && overflows > 10);
+    assert!(outranked > 20);
     assert!(compacted > 20 && uploaded > 20);
     assert!(tails > 50 && kept_after_reboot > 15 && recovery_failed > 5);
 }
@@ -933,16 +950,19 @@ fn delivery_generator_coverage() {
     assert!(overflows > 30 && routes > 400 && latches > 200);
 }
 
-// ----- the duplicate rule (invariant 15) -----
+// ----- the duplicate rule and versioned series (invariants 15 and 19) -----
 
 /// One step of the duplicate machine: a reading on a small pool of keys,
-/// values and qualities, committed alone, or a step that moves detail.
+/// values, qualities and `changed_at` (for the versioned series), committed
+/// alone, or a step that moves detail.
 #[derive(Clone, Debug)]
 enum DupOp {
     Emit {
+        versioned: bool,
         key: usize,
         value: usize,
         quality: usize,
+        changed_at: u64,
         revise: bool,
     },
     Seal,
@@ -960,11 +980,10 @@ const DUP_QUALITIES: [kvik_model::types::Quality; 3] = [
     kvik_model::types::Quality::Estimated,
     kvik_model::types::Quality::Bad,
 ];
+const DUP_KEYS: [Nanos; 3] = [T0, T0 + SECOND, T0 + SECOND + 1];
 
-fn arb_dup_op() -> impl Strategy<Value = DupOp> {
+fn arb_dup_step() -> impl Strategy<Value = DupOp> {
     prop_oneof![
-        12 => (0usize..3, 0usize..DUP_VALUES.len(), 0usize..DUP_QUALITIES.len(), proptest::bool::weighted(0.1))
-            .prop_map(|(key, value, quality, revise)| DupOp::Emit { key, value, quality, revise }),
         2 => Just(DupOp::Seal),
         2 => Just(DupOp::Compact),
         2 => Just(DupOp::Upload),
@@ -974,13 +993,24 @@ fn arb_dup_op() -> impl Strategy<Value = DupOp> {
     ]
 }
 
-/// A store whose fast disk is small enough for fill pressure to move current
-/// detail out (§8 Fill pressure).
-fn dup_machine() -> (kvik_model::engine::Model, kvik_model::types::SeriesId) {
+fn arb_dup_op() -> impl Strategy<Value = DupOp> {
+    prop_oneof![
+        12 => (any::<bool>(), 0usize..3, 0usize..DUP_VALUES.len(), 0usize..DUP_QUALITIES.len(), 0u64..4, proptest::bool::weighted(0.1))
+            .prop_map(|(versioned, key, value, quality, changed_at, revise)| DupOp::Emit {
+                versioned, key, value, quality, changed_at, revise: revise && !versioned,
+            }),
+        10 => arb_dup_step(),
+    ]
+}
+
+/// A store with a gauge and a versioned gauge whose fast disk is small
+/// enough for fill pressure to move current detail out (§8 Fill pressure).
+fn dup_machine() -> (kvik_model::engine::Model, [kvik_model::types::SeriesId; 2]) {
     use kvik_model::engine::{Config, Model};
+    use kvik_model::registry::{ChangedAtKind, SeriesOptions};
     use kvik_model::types::{HOUR, Kind, ValueType};
     let cfg = Config {
-        disk_bytes: 1_000,
+        disk_bytes: 1_200,
         entry_bytes: 64,
         low_mark: 0,
         critical_mark: 0,
@@ -991,7 +1021,17 @@ fn dup_machine() -> (kvik_model::engine::Model, kvik_model::types::SeriesId) {
     let s = m
         .define(NAMES[0], Kind::Gauge, ValueType::Number, "1", 5 * SECOND)
         .unwrap();
-    (m, s)
+    let v = m
+        .define_with(
+            NAMES[VERSIONED],
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            5 * SECOND,
+            SeriesOptions::versioned(ChangedAtKind::Version),
+        )
+        .unwrap();
+    (m, [s, v])
 }
 
 /// Applies a step that is not an emit.
@@ -1020,71 +1060,143 @@ fn apply_dup_step(m: &mut kvik_model::engine::Model, op: &DupOp) {
     }
 }
 
+/// The reading an emit step submits.
+fn dup_reading(ids: [kvik_model::types::SeriesId; 2], op: &DupOp) -> kvik_model::types::Reading {
+    let DupOp::Emit {
+        versioned,
+        key,
+        value,
+        quality,
+        changed_at,
+        ..
+    } = op
+    else {
+        unreachable!("an emit")
+    };
+    kvik_model::types::Reading {
+        quality: DUP_QUALITIES[*quality],
+        changed_at: versioned.then_some(*changed_at),
+        ..kvik_model::types::Reading::num(
+            ids[usize::from(*versioned)],
+            DUP_KEYS[*key],
+            DUP_VALUES[*value],
+        )
+    }
+}
+
 proptest! {
     #![proptest_config(cases(256))]
 
     /// 15. An arriving fact is dropped as a duplicate iff it is identical
-    /// (§2.4: value, compared bitwise, "no value" for a non-finite one, and
-    /// adapter-supplied quality) to a fact in the history of its
-    /// `(series, t)` and lacks `revise`, except `duplicates_unchecked`: when
-    /// the current fact of its key is on no local tier, it is recorded and
-    /// counted. The test keeps its own history from the disk.
+    /// (§2.4: value, compared bitwise, "no value" for a non-finite one,
+    /// adapter-supplied quality and, in a versioned series, `changed_at`) to
+    /// a fact in the history of its `(series, t)` and lacks `revise`, except
+    /// `duplicates_unchecked`: when the current fact of its key is on no
+    /// local tier, or in a versioned series when a fact with its
+    /// `changed_at` is on no local tier and none local is identical, it is
+    /// recorded and counted. A versioned fact whose `changed_at` is above
+    /// every one of its key's needs no check. The test keeps its own history
+    /// from the disk.
     #[test]
     fn inv15_dropped_iff_identical_without_revise(ops in proptest::collection::vec(arb_dup_op(), 1..80)) {
-        use kvik_model::types::Reading;
-        let (mut m, s) = dup_machine();
-        let keys = [T0, T0 + SECOND, T0 + SECOND + 1];
+        let (mut m, ids) = dup_machine();
         for op in &ops {
-            let DupOp::Emit { key, value, quality, revise } = op else {
+            let DupOp::Emit { revise, .. } = op else {
                 apply_dup_step(&mut m, op);
                 continue;
             };
-            let (t, v, q) = (keys[*key], DUP_VALUES[*value], DUP_QUALITIES[*quality]);
-            let identity = if v.is_finite() { Value::Num(v) } else { Value::Absent };
-            let history: Vec<_> = durable(&m).into_values().filter(|f| f.series == s && f.t == t).collect();
+            let r = dup_reading(ids, op);
+            let identity = r.value.as_f64().filter(|v| v.is_finite()).map_or(Value::Absent, Value::Num);
+            let history: Vec<_> = durable(&m).into_values().filter(|f| f.series == r.series && f.t == r.t).collect();
             let local = m.disk.local_positions();
-            let off = history.iter().max_by_key(|f| f.position).is_some_and(|c| !local.contains(&c.position));
-            let identical = history.iter().any(|f| f.value.identical(&identity) && f.supplied_quality == q);
-            let reading = Reading { quality: q, ..Reading::num(s, t, v) };
-            if *revise { m.emit_revise(reading).unwrap() } else { m.emit(reading).unwrap() }
+            let same = |f: &kvik_model::types::Fact| f.value.identical(&identity) && f.supplied_quality == r.quality;
+            let (seen, off) = match r.changed_at {
+                None => (
+                    history.iter().any(same),
+                    history.iter().max_by_key(|f| f.position).is_some_and(|c| !local.contains(&c.position)),
+                ),
+                Some(c) => {
+                    let equal: Vec<_> = history.iter().filter(|f| f.changed_at == Some(c)).collect();
+                    let seen = equal.iter().any(|f| local.contains(&f.position) && same(f));
+                    (seen, !seen && equal.iter().any(|f| !local.contains(&f.position)))
+                }
+            };
+            let dropped = !*revise && !off && seen;
             let unchecked = m.counters.duplicates_unchecked;
-            let r = m.commit(None).unwrap();
-            let dropped = !*revise && !off && identical;
-            prop_assert_eq!(r.duplicates, usize::from(dropped), "{:?}", op);
-            prop_assert_eq!(r.positions.len(), usize::from(!dropped));
+            if *revise { m.emit_revise(r).unwrap() } else { m.emit(r).unwrap() }
+            let c = m.commit(None).unwrap();
+            prop_assert_eq!(c.duplicates, usize::from(dropped), "{:?}", op);
+            prop_assert_eq!(c.positions.len(), usize::from(!dropped));
             prop_assert_eq!(m.counters.duplicates_unchecked - unchecked, u64::from(!*revise && off));
+        }
+    }
+
+    /// 19. "For a source whose `changed_at` rises with every revision,
+    /// re-submitting readings already recorded on a versioned series never
+    /// changes the value, adapter-supplied quality or `changed_at` of any
+    /// current fact while the version index is local, whether or not the
+    /// duplicate check could run." Revisions take the next `changed_at` of
+    /// their key; re-submissions repeat a recorded fact exactly, also while
+    /// its detail is off every local tier.
+    #[test]
+    fn inv19_resubmission_never_changes_a_current_fact(
+        steps in proptest::collection::vec(prop_oneof![
+            6 => (0usize..3, 0usize..DUP_VALUES.len(), 0usize..DUP_QUALITIES.len())
+                .prop_map(|(key, value, quality)| (Some((key, value, quality)), None, None)),
+            6 => any::<proptest::sample::Index>().prop_map(|i| (None, Some(i), None)),
+            6 => arb_dup_step().prop_map(|s| (None, None, Some(s))),
+        ], 1..80),
+    ) {
+        use kvik_model::types::Reading;
+        let (mut m, ids) = dup_machine();
+        let v = ids[1];
+        let identity = |m: &kvik_model::engine::Model| -> BTreeMap<Nanos, (String, kvik_model::types::Quality, Option<u64>)> {
+            m.current().unwrap().iter().filter(|((s, _), _)| *s == v)
+                .map(|((_, t), f)| (*t, (format!("{:?}", f.value), f.supplied_quality, f.changed_at))).collect()
+        };
+        for step in &steps {
+            match step {
+                (Some((key, value, quality)), _, _) => {
+                    let t = DUP_KEYS[*key];
+                    let next = durable(&m).values().filter(|f| f.series == v && f.t == t)
+                        .filter_map(|f| f.changed_at).max().map_or(0, |c| c + 1);
+                    m.ingest(vec![Reading { quality: DUP_QUALITIES[*quality], ..Reading::versioned(v, t, DUP_VALUES[*value], next) }]).unwrap();
+                }
+                (_, Some(i), _) => {
+                    let recorded: Vec<_> = durable(&m).into_values().filter(|f| f.series == v).collect();
+                    if recorded.is_empty() {
+                        continue;
+                    }
+                    let f = i.get(&recorded);
+                    let value = f.value.as_f64().unwrap_or(f64::NAN);
+                    let before = identity(&m);
+                    m.ingest(vec![Reading { quality: f.supplied_quality, ..Reading::versioned(v, f.t, value, f.changed_at.unwrap()) }]).unwrap();
+                    prop_assert_eq!(identity(&m), before, "re-submitting {:?}", f);
+                }
+                (_, _, Some(s)) => apply_dup_step(&mut m, s),
+                _ => unreachable!(),
+            }
         }
     }
 }
 
 /// Guards the duplicate machine: its histories must reach identical repeats,
-/// `revise`, and repeats whose current fact is off every local tier.
+/// `revise`, repeats whose current fact is off every local tier and
+/// outranked facts.
 #[test]
 fn dup_generator_coverage() {
     use proptest::strategy::ValueTree;
     use proptest::test_runner::TestRunner;
     let mut runner = TestRunner::deterministic();
     let strat = proptest::collection::vec(arb_dup_op(), 60..80);
-    let (mut dropped, mut unchecked, mut revised) = (0u64, 0u64, 0usize);
+    let (mut dropped, mut unchecked, mut revised, mut outranked) = (0u64, 0u64, 0usize, 0u64);
     for _ in 0..200 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
-        let (mut m, s) = dup_machine();
+        let (mut m, ids) = dup_machine();
         for op in &ops {
             match op {
-                DupOp::Emit {
-                    key,
-                    value,
-                    quality,
-                    revise,
-                } => {
-                    let r = kvik_model::types::Reading {
-                        quality: DUP_QUALITIES[*quality],
-                        ..kvik_model::types::Reading::num(
-                            s,
-                            T0 + *key as i64 * SECOND,
-                            DUP_VALUES[*value],
-                        )
-                    };
+                DupOp::Emit { revise, .. } => {
+                    let r = dup_reading(ids, op);
                     if *revise {
                         m.emit_revise(r).unwrap();
                         revised += 1;
@@ -1098,7 +1210,8 @@ fn dup_generator_coverage() {
         }
         dropped += m.counters.duplicates_dropped;
         unchecked += m.counters.duplicates_unchecked;
+        outranked += m.counters.outranked_on_arrival;
     }
-    eprintln!("dropped {dropped} unchecked {unchecked} revised {revised}");
-    assert!(dropped > 500 && unchecked > 100 && revised > 200);
+    eprintln!("dropped {dropped} unchecked {unchecked} revised {revised} outranked {outranked}");
+    assert!(dropped > 500 && unchecked > 100 && revised > 100 && outranked > 300);
 }

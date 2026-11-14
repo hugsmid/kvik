@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use crate::types::{Fact, Nanos, Position, SeriesId};
 
-/// Current view: for each `(series, t)`, the fact with the highest position.
+/// Current view: for each `(series, t)`, the fact of highest rank (§2.2): the
+/// highest position, or in a versioned series the highest
+/// `(changed_at, position)`.
 pub fn current<'a, I>(facts: I) -> BTreeMap<(SeriesId, Nanos), Fact>
 where
     I: IntoIterator<Item = &'a Fact>,
@@ -18,7 +20,7 @@ where
     for f in facts {
         let key = (f.series, f.t);
         match out.get(&key) {
-            Some(existing) if existing.position >= f.position => {}
+            Some(existing) if existing.rank() >= f.rank() => {}
             _ => {
                 out.insert(key, f.clone());
             }
