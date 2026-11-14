@@ -3813,6 +3813,33 @@ fn s5_7_day_spans_pinned() {
     use kvik_model::calendar::{Zoning, aligned};
     let db = kvik_model::calendar::Tzdb::bundled();
     let cases = [
+        // Midnight in a gap that straddles it: the day starts when the gap
+        // ends, at 00:30 local.
+        (
+            "America/Toronto",
+            (1919, 3, 31),
+            "1919-03-31T04:30:00Z",
+            "1919-04-01T04:00:00Z",
+        ),
+        (
+            "America/Toronto",
+            (1919, 3, 30),
+            "1919-03-30T05:00:00Z",
+            "1919-03-31T04:30:00Z",
+        ),
+        // Midnight at the start of a gap, and midnight twice (Q-77).
+        (
+            "America/Havana",
+            (2026, 3, 8),
+            "2026-03-08T05:00:00Z",
+            "2026-03-09T04:00:00Z",
+        ),
+        (
+            "America/Havana",
+            (2026, 11, 1),
+            "2026-11-01T04:00:00Z",
+            "2026-11-02T05:00:00Z",
+        ),
         (
             "Europe/London",
             (2026, 3, 29),
@@ -4054,4 +4081,45 @@ fn s6_since_midnight_ends_at_now_on_a_scheduled_series() {
     for a in [&since, &today] {
         assert_eq!(a.node, oracle::window(&p, &rs, a.from, a.to, now));
     }
+}
+
+/// §5.7 "The site zone is a log entry with an effective time" and §12 D3
+/// "past days keep the old zone": a new store records its zone, opening it
+/// with another configured zone is refused (and so is restoring it), and its
+/// past days keep their spans; a change is a site-zone entry.
+#[test]
+fn s5_7_store_keeps_its_site_zone_and_refuses_another_at_open() {
+    use kvik_model::calendar::Period;
+    let (mut m, s) = calendar_model("America/New_York", utc("2026-06-04T00:00:00Z"), HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-05-29T00:00:00Z"),
+            utc("2026-06-03T00:00:00Z"),
+            HOUR,
+        ),
+    );
+    let may30 = Period::Day(jiff::civil::Date::constant(2026, 5, 30));
+    let before = m.calendar(s, may30).unwrap();
+    assert_eq!(before.from, utc("2026-05-30T04:00:00Z"));
+    m.seal_active();
+    m.upload();
+    m.config.site_zone = "Europe/London".into();
+    m.restart();
+    assert!(!m.is_up());
+    assert!(matches!(
+        m.disk.open_refused,
+        Some(Error::SiteZoneMismatch { .. })
+    ));
+    assert!(m.health().reasons.contains(&Reason::OpenRefused));
+    let cfg = m.config.clone();
+    assert!(matches!(
+        Model::restore_from(cfg, vec![], &mut m.disk.bucket, m.wall, false),
+        Err(Error::SiteZoneMismatch { .. })
+    ));
+    m.config.site_zone = "America/New_York".into();
+    m.restart();
+    assert!(m.is_up() && m.disk.open_refused.is_none());
+    assert_eq!(m.calendar(s, may30).unwrap(), before);
 }

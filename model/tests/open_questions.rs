@@ -730,8 +730,6 @@ fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
 /// takes New York, leaving 13 hours in no local day and no month. The other
 /// way round, 1 June starts in force in neither; the model keeps the old
 /// zone, and 13 hours fall in both 1 and 2 June, so June stores no month node.
-/// (b): the zone before the first entry is configuration, so a restart with
-/// another one re-takes the past days.
 #[test]
 fn q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap() {
     use jiff::civil::Date;
@@ -818,20 +816,14 @@ fn q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap() {
         jun.node.count + both,
         "the overlap counts twice in the days"
     );
-    // (b) The days before the first entry follow the configured zone.
-    let (may30, _, _) = day(&m, s, 5, 30);
-    m.config.site_zone = "Europe/London".into();
-    m.restart();
-    assert_eq!(may30, utc("2026-05-30T04:00:00Z"));
-    assert_eq!(day(&m, s, 5, 30).0, utc("2026-05-29T23:00:00Z"));
 }
 
-/// Q-76: a tzdata change is logged by the engine, not recorded in the log.
-/// Between the change and the rebuild a build from the log uses the version
-/// the files were built with; a restart builds with the host's version and
-/// nothing is logged.
+/// Q-76 (a): the model reads "is logged" as a log entry. Installing a new
+/// tzdata release writes nothing; the logged rebuild writes a tzdata entry,
+/// and until then the log names the old version, so a restart keeps it, and a
+/// build from the log equals the live files.
 #[test]
-fn q76_tzdata_change_is_not_in_the_log() {
+fn q76_tzdata_change_is_a_log_entry_written_by_the_rebuild() {
     use kvik_model::calendar::Tzdb;
     let (mut m, s) = calendar_model("America/Santiago", utc("2026-04-12T00:00:00Z"), HOUR);
     feed(
@@ -849,11 +841,50 @@ fn q76_tzdata_change_is_not_in_the_log() {
         .unwrap();
     let entries = m.entries().unwrap().len();
     m.install_tzdb(db);
-    assert_eq!(m.entries().unwrap().len(), entries, "no log entry");
-    let rebuilt = m.rebuilt_calendars().unwrap();
-    assert_eq!(rebuilt[&s].tzdata, "bundled");
-    assert_eq!(&rebuilt, m.calendars().unwrap());
+    assert_eq!(m.entries().unwrap().len(), entries, "no entry yet");
     m.restart();
-    assert_eq!(m.calendar_file(s).unwrap().tzdata, "test-2");
+    assert_eq!(m.calendar_file(s).unwrap().tzdata, "bundled");
+    assert_eq!(&m.rebuilt_calendars().unwrap(), m.calendars().unwrap());
     assert!(m.calendar_log.is_empty());
+    let log = m.rebuild_calendars().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(m.entries().unwrap().len(), entries + 1, "the tzdata entry");
+    assert_eq!(&m.rebuilt_calendars().unwrap(), m.calendars().unwrap());
+    let live = m.calendars().unwrap().clone();
+    m.restart();
+    assert_eq!(m.calendars().unwrap(), &live);
+    assert_eq!(m.calendar_file(s).unwrap().tzdata, "test-2");
+    assert!(m.rebuild_calendars().unwrap().is_empty());
+}
+
+/// Q-77: a day whose local midnight occurs twice. Havana falls back from
+/// 01:00 (−04) to 00:00 (−05) on 1 November 2026, so 00:00 on 1 November is
+/// both 04:00 and 05:00 UTC. The model starts the day at the earlier, so 1
+/// November has 25 hours and 31 October ends at 04:00 UTC.
+#[test]
+fn q77_day_whose_midnight_occurs_twice_starts_at_the_earlier() {
+    use jiff::civil::Date;
+    use kvik_model::calendar::Period;
+    let (mut m, s) = calendar_model("America/Havana", utc("2026-11-03T00:00:00Z"), HOUR);
+    feed(
+        &mut m,
+        s,
+        &every(
+            utc("2026-10-31T00:00:00Z"),
+            utc("2026-11-02T12:00:00Z"),
+            10 * MINUTE,
+        ),
+    );
+    let oct31 = m
+        .calendar(s, Period::Day(Date::constant(2026, 10, 31)))
+        .unwrap();
+    let nov1 = m
+        .calendar(s, Period::Day(Date::constant(2026, 11, 1)))
+        .unwrap();
+    assert_eq!(oct31.to, utc("2026-11-01T04:00:00Z"));
+    assert_eq!(
+        (nov1.from, nov1.to),
+        (utc("2026-11-01T04:00:00Z"), utc("2026-11-02T05:00:00Z"))
+    );
+    assert_eq!(nov1.node.count, 150);
 }

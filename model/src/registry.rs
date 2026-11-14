@@ -165,6 +165,12 @@ pub enum RegistryEvent {
         /// Effective time.
         effective: Nanos,
     },
+    /// The tzdata version calendar files are built with from this entry on,
+    /// written by the logged rebuild after a tzdata change (§5.7; see Q-76).
+    Tzdata {
+        /// The version.
+        version: String,
+    },
 }
 
 /// A series definition.
@@ -263,6 +269,7 @@ pub enum RegistryError {
 pub struct Registry {
     series: BTreeMap<SeriesId, SeriesDef>,
     site_zones: BTreeMap<Nanos, String>,
+    tzdata: Option<String>,
 }
 
 impl Registry {
@@ -313,6 +320,9 @@ impl Registry {
             RegistryEvent::SiteZone { zone, effective } => {
                 self.site_zones.insert(*effective, zone.clone());
             }
+            RegistryEvent::Tzdata { version } => {
+                self.tzdata = Some(version.clone());
+            }
         }
     }
 
@@ -320,6 +330,11 @@ impl Registry {
     /// effective time the later in the log.
     pub fn site_zones(&self) -> &BTreeMap<Nanos, String> {
         &self.site_zones
+    }
+
+    /// The tzdata version of the latest tzdata entry, if any.
+    pub fn tzdata(&self) -> Option<&str> {
+        self.tzdata.as_deref()
     }
 
     /// The next unused identifier. Identifiers are never reused because

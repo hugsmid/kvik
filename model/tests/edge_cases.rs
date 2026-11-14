@@ -1501,13 +1501,20 @@ proptest! {
             "Australia/Lord_Howe", "Asia/Tokyo", "Africa/Cairo", "America/Sao_Paulo",
         ]),
         day in 0i32..(366 * 6),
+        near in proptest::option::weighted(0.7, (0usize..12, -1i32..=1)),
+        link in any::<bool>(),
         head in arb_readings(Kind::Gauge, 12),
         tail in arb_readings(Kind::Gauge, 12),
         late in 0i64..(2 * HOUR),
     ) {
         use kvik_model::calendar::{CalendarFile, Tzdb, Zoning};
         let tz = TimeZone::get(zone).unwrap();
-        let date = Date::constant(2024, 1, 1).checked_add(jiff::Span::new().days(day)).unwrap();
+        // Mostly a DST change in the zone, or a day either side of one.
+        let start: jiff::Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
+        let date = match near.and_then(|(k, off)| tz.following(start).nth(k).map(|t| (t, off))) {
+            Some((t, off)) => t.timestamp().to_zoned(tz.clone()).date().checked_add(jiff::Span::new().days(off)).unwrap(),
+            None => Date::constant(2024, 1, 1).checked_add(jiff::Span::new().days(day)).unwrap(),
+        };
         let q = quarters_in_day(&tz, date).unwrap();
         prop_assert!((92..=100).contains(&q) && q % 2 == 0, "{} {} has {} quarter-hours", zone, date, q);
         // Readings around both edges of this local day, some outside it.
@@ -1525,12 +1532,84 @@ proptest! {
         let db = Tzdb::bundled();
         let zoning = Zoning::Named(zone.into());
         let file = CalendarFile::build(&tree, &zoning, &db).unwrap();
-        let d = zoning.day(&db, date).unwrap();
+        // The query may name a link to the zone the file was built in.
+        let query = if link { link_of(zone) } else { zone };
+        let d = Zoning::Named(query.into()).day(&db, date).unwrap();
+        prop_assert_eq!((d.start, d.end), (ds, de));
         let now = de - HOUR + late;
         let inputs = kvik_model::calendar::inputs(Some(&file), &db, &[d], None, ds, now.min(de));
         let stored = file.days.get(&date).map(|n| n.node.clone());
         prop_assert_eq!(stored.clone(), Some(tree.day(&tz, date).unwrap()).filter(|n| n.count > 0));
         prop_assert_eq!(inputs.len(), usize::from(stored.is_some() && de <= now));
+        let got = kvik_model::calendar::evaluate(&tree, ds, de, now, &inputs);
+        prop_assert_eq!(got, oracle::window(&p, &rs, ds, de, now));
+    }
+}
+
+/// A link to `zone` in the bundled database, or `zone` where none is used.
+fn link_of(zone: &str) -> &str {
+    match zone {
+        "America/New_York" => "US/Eastern",
+        "Asia/Kolkata" => "Asia/Calcutta",
+        "Asia/Kathmandu" => "Asia/Katmandu",
+        "Australia/Sydney" => "Australia/NSW",
+        "Australia/Lord_Howe" => "Australia/LHI",
+        "Pacific/Chatham" => "NZ-CHAT",
+        "America/Havana" => "Cuba",
+        "Africa/Cairo" => "Egypt",
+        "Asia/Tokyo" => "Japan",
+        "Europe/London" => "GB",
+        "UTC" => "Etc/UTC",
+        _ => zone,
+    }
+}
+
+proptest! {
+    /// Row 20 and §5.7 for days whose midnight is in a gap (also one that
+    /// straddles midnight), a skipped date and a midnight that occurs twice
+    /// (Q-77): the result is a window over the span; a stored node, where the
+    /// edges allow one, is the merge of its quarter-hours and an input, also
+    /// to a query naming a link to the zone.
+    #[test]
+    fn row_20_days_with_midnight_in_a_gap_or_twice(
+        case in proptest::sample::select(vec![
+            ("Pacific/Apia", (2011, 12, 30)),
+            ("Pacific/Apia", (2011, 12, 31)),
+            ("America/Santiago", (2026, 9, 6)),
+            ("America/Toronto", (1919, 3, 31)),
+            ("America/Havana", (2026, 3, 8)),
+            ("America/Havana", (2026, 11, 1)),
+        ]),
+        link in any::<bool>(),
+        head in arb_readings(Kind::Gauge, 12),
+        tail in arb_readings(Kind::Gauge, 12),
+    ) {
+        use kvik_model::calendar::{CalendarFile, Tzdb, Zoning, aligned};
+        let (zone, (y, mo, d)) = case;
+        let date = Date::constant(y, mo, d);
+        let db = Tzdb::bundled();
+        let day = Zoning::Named(zone.into()).day(&db, date).unwrap();
+        let (ds, de) = (day.start, day.end);
+        let mut rs: BTreeMap<Nanos, Value> = BTreeMap::new();
+        rs.extend(head.into_iter().map(|(t, v)| (t - T0 + ds - 20 * MINUTE, v)));
+        rs.extend(tail.into_iter().map(|(t, v)| (t - T0 + de - 20 * MINUTE, v)));
+        let rs: Vec<(Nanos, Value)> = rs.into_iter().collect();
+        let p = Params {
+            expected_interval: Some(SECOND),
+            ..Params::new(Kind::Gauge, 7 * SECOND)
+        };
+        let tree = SeriesTree::build(p, &rs);
+        let file = CalendarFile::build(&tree, &Zoning::Named(zone.into()), &db).unwrap();
+        let query = if link { link_of(zone) } else { zone };
+        let q = Zoning::Named(query.into()).day(&db, date).unwrap();
+        let inputs = kvik_model::calendar::inputs(Some(&file), &db, &[q], None, ds, de);
+        let stored = file.days.get(&date);
+        prop_assert_eq!(stored.is_some(), aligned((ds, de)) && rs.iter().any(|(t, _)| ds <= *t && *t < de));
+        if let Some(n) = stored {
+            prop_assert_eq!(&n.node, &oracle::node(&p, &rs, ds, de));
+        }
+        prop_assert_eq!(inputs.len(), usize::from(stored.is_some()));
+        let now = de + HOUR;
         let got = kvik_model::calendar::evaluate(&tree, ds, de, now, &inputs);
         prop_assert_eq!(got, oracle::window(&p, &rs, ds, de, now));
     }
@@ -2298,13 +2377,21 @@ fn row_21_tzdata_change_rebuilds_the_affected_days() {
     );
     let log = m.rebuild_calendars().unwrap();
     assert_eq!(log.len(), 1);
+    // The new version is a log entry, at the position the rebuild names.
+    let position = m.entries().unwrap().last().unwrap().position;
     assert_eq!(
         log[0].cause,
         kvik_model::engine::CalendarCause::Tzdata {
             from: "bundled".into(),
-            to: "test-2".into()
+            to: "test-2".into(),
+            position,
         }
     );
+    assert!(matches!(
+        &m.entries().unwrap().last().unwrap().body,
+        kvik_model::engine::EntryBody::Registry(kvik_model::registry::RegistryEvent::Tzdata { version })
+            if version == "test-2"
+    ));
     // 1–3 April and June keep their spans; 4 April (whose end moves) and
     // 5–10 April are rebuilt.
     let days: Vec<Date> = (4..=10).map(|d| Date::constant(2026, 4, d)).collect();

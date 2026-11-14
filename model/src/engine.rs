@@ -70,8 +70,10 @@ pub struct Config {
     /// Fill ratio (percent) above which verified sealed log segments, then
     /// the oldest current detail, leave the fast disk (§8: 70 %).
     pub fill_threshold_pct: u64,
-    /// The site zone in force before the first site-zone entry (§5.7; see
-    /// Q-75 (b)).
+    /// The site zone (`api.md` `time_zone`). A new store records it in its
+    /// header as its zone before any site-zone entry; opening a store with
+    /// another zone is refused (§5.7, §12 D3: past days keep their zone), as
+    /// is restoring one; a change is [`Model::set_site_zone`].
     pub site_zone: String,
 }
 
@@ -497,6 +499,20 @@ pub struct Bucket {
     /// this set stands in for what they say, so that a restore does not
     /// restore a file and the file that replaced it.
     pub retired: BTreeSet<FileId>,
+    /// The store header, written when the store is created.
+    pub header: Option<StoreHeader>,
+}
+
+/// What a store records when it is created, before its first log entry: the
+/// site zone before any site-zone entry, and the tzdata version before any
+/// tzdata entry (§5.7). The model keeps it beside the log, not in it, so that
+/// positions start at `0:1`; it stands for the store's entries at creation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreHeader {
+    /// The site zone.
+    pub site_zone: String,
+    /// The tzdata version.
+    pub tzdata: String,
 }
 
 /// Outcome of a batch that was written but not synced when the machine stopped.
@@ -667,6 +683,15 @@ pub enum Error {
         /// The position.
         position: Position,
     },
+    /// The configured site zone is not the store's: opening (or restoring)
+    /// with another zone would re-take past days (§5.7, §12 D3).
+    #[error("site zone {configured} configured, but the store's is {store}")]
+    SiteZoneMismatch {
+        /// The store's zone.
+        store: String,
+        /// The configured zone.
+        configured: String,
+    },
 }
 
 /// What caused a calendar rebuild.
@@ -677,12 +702,14 @@ pub enum CalendarCause {
         /// Its position.
         position: Position,
     },
-    /// A tzdata change (§5.7).
+    /// A tzdata change (§5.7), recorded as a tzdata entry.
     Tzdata {
         /// The version the calendar files were built with.
         from: String,
         /// The version now.
         to: String,
+        /// The position of the tzdata entry.
+        position: Position,
     },
 }
 
@@ -738,6 +765,9 @@ pub enum Reason {
     Superseded,
     /// Starting or resuming a restore failed; the engine is down.
     RestoreFailed,
+    /// The engine refused to start (a site zone other than the store's);
+    /// it is down.
+    OpenRefused,
     /// A file is quarantined.
     Quarantined(FileId),
     /// Below the low mark.
@@ -1122,6 +1152,10 @@ pub struct Disk {
     /// Why the last attempt to start or resume a restore failed; the engine
     /// stays down meanwhile.
     pub restore_failed: Option<Error>,
+    /// What the store recorded at its creation.
+    pub header: StoreHeader,
+    /// Why the last start was refused; the engine stays down meanwhile.
+    pub open_refused: Option<Error>,
     /// Lease files of reader processes, by id (§7 Leases).
     pub leases: BTreeMap<u64, Lease>,
     /// Next lease id.
@@ -1497,6 +1531,7 @@ struct Derived {
     cp_versions: Option<(Position, Versions)>,
     trees: BTreeMap<SeriesId, SeriesTree>,
     calendars: BTreeMap<SeriesId, CalendarFile>,
+    calendar_tzdb: Tzdb,
     restore: Option<RestoreRt>,
 }
 
@@ -1619,6 +1654,11 @@ impl Model {
     pub fn new(config: Config, consumers: Vec<ConsumerDecl>, wall: Nanos) -> Self {
         let mut disk = Disk::default();
         disk.bucket.reachable = true;
+        disk.header = StoreHeader {
+            site_zone: config.site_zone.clone(),
+            tzdata: Tzdb::bundled().version().to_string(),
+        };
+        disk.bucket.header = Some(disk.header.clone());
         for c in &consumers {
             disk.cursors.insert(c.id, Position::ORIGIN);
         }
@@ -1704,6 +1744,14 @@ impl Model {
     /// sync fails, stay read-only").
     pub fn restart_with(&mut self, recovery_sync_fails: bool) {
         self.vol = None;
+        if self.config.site_zone != self.disk.header.site_zone {
+            self.disk.open_refused = Some(Error::SiteZoneMismatch {
+                store: self.disk.header.site_zone.clone(),
+                configured: self.config.site_zone.clone(),
+            });
+            return;
+        }
+        self.disk.open_refused = None;
         // A restore that stopped before its record starts again with the
         // next generation (§8 Restore).
         if self.disk.restore.is_none()
@@ -1785,7 +1833,7 @@ impl Model {
             cp_versions: d.cp_versions,
             trees: d.trees,
             calendars: d.calendars,
-            calendar_tzdb: self.tzdb.clone(),
+            calendar_tzdb: d.calendar_tzdb,
             queue: VecDeque::new(),
             next_position,
             routes: d.routes,
@@ -1897,7 +1945,8 @@ impl Model {
                 (trees, Some(rt))
             }
         };
-        let calendars = build_calendars(&self.zoning(&registry), &self.tzdb, &trees);
+        let calendar_tzdb = self.calendar_db(&registry);
+        let calendars = build_calendars(&self.zoning(&registry), &calendar_tzdb, &trees);
         Derived {
             registry,
             entries,
@@ -1909,6 +1958,7 @@ impl Model {
             cp_versions,
             trees,
             calendars,
+            calendar_tzdb,
             restore,
         }
     }
@@ -1928,7 +1978,7 @@ impl Model {
             v.cp_versions = d.cp_versions;
             v.trees = d.trees;
             v.calendars = d.calendars;
-            v.calendar_tzdb = self.tzdb.clone();
+            v.calendar_tzdb = d.calendar_tzdb;
             v.restore = d.restore;
         }
     }
@@ -2706,6 +2756,7 @@ impl Model {
         outranked: &BTreeSet<Position>,
     ) -> Result<(), Error> {
         let cfg = self.config.clone();
+        let initial_zone = self.disk.header.site_zone.clone();
         let restoring = self.vol.as_ref().is_some_and(|v| v.restore.is_some());
         let local =
             (!restoring && self.disk.any_detail_off_machine()).then(|| self.disk.local_positions());
@@ -2757,7 +2808,7 @@ impl Model {
             .map(|s| (*s, v.trees[s].readings()))
             .collect();
         let zoning = Zoning::Site {
-            initial: cfg.site_zone.clone(),
+            initial: initial_zone,
             entries: v.registry.site_zones().clone(),
         };
         for (s, minute) in &touched {
@@ -3741,7 +3792,7 @@ impl Model {
 
     /// Fetches missing detail for a minute and recomputes its path (§5.6).
     pub fn fetch_detail(&mut self, s: SeriesId, minute: Nanos) -> Result<(), Error> {
-        let initial = self.config.site_zone.clone();
+        let initial = self.disk.header.site_zone.clone();
         let v = self.vol_mut()?;
         let rs: Vec<(Nanos, Value)> = v
             .current
@@ -3767,9 +3818,17 @@ impl Model {
 
     fn zoning(&self, registry: &Registry) -> Zoning {
         Zoning::Site {
-            initial: self.config.site_zone.clone(),
+            initial: self.disk.header.site_zone.clone(),
             entries: registry.site_zones().clone(),
         }
+    }
+
+    /// The tzdata release calendar files are built with: the version of the
+    /// latest tzdata entry, else the store header's (§5.7, Q-76). A version
+    /// this process has not seen is replaced by the host's database.
+    fn calendar_db(&self, registry: &Registry) -> Tzdb {
+        let version = registry.tzdata().unwrap_or(&self.disk.header.tzdata);
+        Tzdb::release(version).unwrap_or_else(|| self.tzdb.clone())
     }
 
     /// How local days are taken in the site zone now.
@@ -3793,24 +3852,30 @@ impl Model {
     }
 
     /// The host's time-zone database changes (a tzdata update). Calendar
-    /// files keep the version they were built with, so their nodes are no
-    /// input to calendar results (§5.7), until [`Model::rebuild_calendars`].
+    /// files keep the version the log names, also across a restart, so their
+    /// nodes are no input to calendar results (§5.7), until
+    /// [`Model::rebuild_calendars`].
     pub fn install_tzdb(&mut self, db: Tzdb) {
         self.tzdb = db;
     }
 
-    /// After a tzdata change, rebuilds the calendar days it affects (§5.7,
-    /// row 21), records the new version in every calendar file and logs the
-    /// rebuild. Returns what it logged.
+    /// After a tzdata change, records the host's version as a tzdata log
+    /// entry, rebuilds the calendar days it affects (§5.7, row 21), records
+    /// the new version in every calendar file and logs the rebuild. Returns
+    /// what it logged.
     pub fn rebuild_calendars(&mut self) -> Result<Vec<CalendarRebuild>, Error> {
         let from = self.vol()?.calendar_tzdb.version().to_string();
         if from == self.tzdb.version() {
             return Ok(Vec::new());
         }
         let db = self.tzdb.clone();
+        let position = self.commit_registry(RegistryEvent::Tzdata {
+            version: db.version().to_string(),
+        })?;
         let cause = CalendarCause::Tzdata {
             from,
             to: db.version().to_string(),
+            position,
         };
         self.rebuild_calendars_with(&db, &cause)
     }
@@ -3871,16 +3936,17 @@ impl Model {
         Ok(&self.vol()?.calendars)
     }
 
-    /// Rebuilds every calendar file from the log alone, with the database
-    /// the live files were built with (invariant 8). Does not change the
-    /// running engine.
+    /// Rebuilds every calendar file from the log alone, with the tzdata
+    /// version the log names (invariant 8). Does not change the running
+    /// engine.
     pub fn rebuilt_calendars(&self) -> Result<BTreeMap<SeriesId, CalendarFile>, Error> {
         let v = self.vol()?;
         let trees = self.rebuild_trees()?;
         let zoning = self.zoning(&v.registry);
+        let db = self.calendar_db(&v.registry);
         Ok(trees
             .iter()
-            .map(|(s, t)| CalendarFile::build(t, &zoning, &v.calendar_tzdb).map(|f| (*s, f)))
+            .map(|(s, t)| CalendarFile::build(t, &zoning, &db).map(|f| (*s, f)))
             .collect::<Result<_, _>>()?)
     }
 
@@ -3967,6 +4033,9 @@ impl Model {
         }
         if self.disk.restore_failed.is_some() {
             raise(Level::Fatal, Reason::RestoreFailed, &mut reasons);
+        }
+        if self.disk.open_refused.is_some() {
+            raise(Level::Fatal, Reason::OpenRefused, &mut reasons);
         }
         for f in &self.disk.quarantined {
             raise(Level::Fatal, Reason::Quarantined(*f), &mut reasons);
@@ -4826,8 +4895,19 @@ impl Model {
             }
             g
         };
+        if let Some(h) = &bucket.header
+            && h.site_zone != config.site_zone
+        {
+            return Err(Error::SiteZoneMismatch {
+                store: h.site_zone.clone(),
+                configured: config.site_zone.clone(),
+            });
+        }
         let mut m = Model::new(config, consumers, wall);
         m.disk.bucket = bucket.clone();
+        if let Some(h) = &bucket.header {
+            m.disk.header = h.clone();
+        }
         // New files never take the identity of a bucket file not yet local.
         m.disk.next_file = bucket.objects.keys().next_back().map_or(0, |f| f.0 + 1);
         m.disk.generation = generation;

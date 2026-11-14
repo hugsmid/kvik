@@ -55,10 +55,31 @@ impl Default for Tzdb {
 impl Tzdb {
     /// The bundled database.
     pub fn bundled() -> Tzdb {
-        Tzdb {
+        let db = Tzdb {
             version: "bundled".into(),
             rules: BTreeMap::new(),
-        }
+        };
+        db.archive();
+        db
+    }
+
+    /// A release by its version, if this process has seen it. It stands in
+    /// for the rules a calendar file records for its version, so that a
+    /// store keeps the version its log names until a logged rebuild (§5.7).
+    pub fn release(version: &str) -> Option<Tzdb> {
+        releases()
+            .lock()
+            .expect("tzdata releases")
+            .get(version)
+            .cloned()
+    }
+
+    fn archive(&self) {
+        releases()
+            .lock()
+            .expect("tzdata releases")
+            .entry(self.version.clone())
+            .or_insert_with(|| self.clone());
     }
 
     /// A later release `version` of this database in which the zone `name`,
@@ -73,6 +94,7 @@ impl Tzdb {
         let mut db = self.clone();
         db.version = version.into();
         db.rules.insert(id, rules);
+        db.archive();
         Ok(db)
     }
 
@@ -94,6 +116,11 @@ impl Tzdb {
             None => bundled(name)?,
         })
     }
+}
+
+fn releases() -> &'static Mutex<BTreeMap<String, Tzdb>> {
+    static RELEASES: OnceLock<Mutex<BTreeMap<String, Tzdb>>> = OnceLock::new();
+    RELEASES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn bundled(name: &str) -> Result<TimeZone, TreeError> {
@@ -155,14 +182,34 @@ fn cal(e: jiff::Error) -> TreeError {
 
 /// UTC span `[start, end)` of local `date` in `zone`, wherever its edges fall.
 /// A day whose local midnight does not exist starts at its first instant
-/// (§5.7), and a skipped date has an empty span.
+/// (§5.7): the end of the gap, which may be after midnight (Toronto on
+/// 31 March 1919 went from 23:30 to 00:30). A skipped date has an empty span.
+/// A day whose midnight occurs twice starts at the earlier (Q-77).
 pub fn day_span(zone: &TimeZone, date: Date) -> Result<(Nanos, Nanos), TreeError> {
-    let at = |d: Date| -> Result<Nanos, TreeError> {
-        Ok(nanos(d.to_zoned(zone.clone()).map_err(cal)?.timestamp()))
-    };
+    let at = |d: Date| -> Result<Nanos, TreeError> { Ok(nanos(day_start(zone, d)?)) };
     let start = at(date)?;
     let end = at(date.tomorrow().map_err(cal)?)?;
     Ok((start, end.max(start)))
+}
+
+fn day_start(zone: &TimeZone, date: Date) -> Result<Timestamp, TreeError> {
+    use jiff::tz::AmbiguousOffset;
+    let midnight = date.to_datetime(jiff::civil::Time::midnight());
+    let at = |o: jiff::tz::Offset| o.to_timestamp(midnight).map_err(cal);
+    match zone.to_ambiguous_timestamp(midnight).offset() {
+        AmbiguousOffset::Unambiguous { offset } => at(offset),
+        // Midnight lies in a gap: the day's first instant is the transition
+        // that ends it, the first after midnight read at the later offset.
+        AmbiguousOffset::Gap { after, .. } => {
+            let probe = at(after)?;
+            zone.following(probe)
+                .next()
+                .map(|t| t.timestamp())
+                .ok_or_else(|| TreeError::Calendar(format!("no transition after {probe}")))
+        }
+        // Midnight occurs twice: the earlier, at the offset before the fold.
+        AmbiguousOffset::Fold { before, .. } => at(before),
+    }
 }
 
 /// Whether both edges of a span fall on 15-minute boundaries, so that a

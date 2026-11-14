@@ -1883,22 +1883,30 @@ proptest! {
     }
 
     /// 17. For a counter, the increases of the local days of a month add up to
-    /// the month's increase, in a zone with a 30-minute DST shift.
+    /// the month's increase, in months with a DST change (a 30-minute shift
+    /// among them) and in 30- and 45-minute offsets.
     #[test]
     fn inv17_counter_days_add_up_to_their_month(
         steps in proptest::collection::vec((1i64..30 * 60, 0u32..20), 1..60),
         named in any::<bool>(),
+        case in proptest::sample::select(vec![
+            ("Australia/Lord_Howe", 10i8),
+            ("Europe/London", 10),
+            ("America/Santiago", 9),
+            ("Asia/Kathmandu", 10),
+            ("Asia/Kolkata", 3),
+        ]),
     ) {
         use kvik_model::calendar::{Month, Period};
-        let zone = "Australia/Lord_Howe";
-        let cfg = kvik_model::engine::Config { site_zone: zone.into(), ..kvik_model::engine::Config::default() };
-        let mut m = kvik_model::engine::Model::new(cfg, vec![], utc("2026-11-03T00:00:00Z"));
+        let (zone, month_no) = case;
+        let cfg = kvik_model::engine::Config { site_zone: if named { "UTC" } else { zone }.into(), ..kvik_model::engine::Config::default() };
+        let mut m = kvik_model::engine::Model::new(cfg, vec![], utc("2026-12-03T00:00:00Z"));
         let s = m.define_with(
             "line-1/meter/energy", Kind::Counter, kvik_model::types::ValueType::Number, "Wh",
             6 * kvik_model::types::HOUR, kvik_model::registry::SeriesOptions::expected(SECOND),
         ).unwrap();
-        // Readings from late September into early November.
-        let mut t = utc("2026-09-29T00:00:00Z");
+        // Readings from two days before the month.
+        let mut t = utc(&format!("2026-{month_no:02}-01T00:00:00Z")) - 2 * kvik_model::types::DAY;
         let mut v = 0.0;
         let mut rs = Vec::new();
         for (dt, inc) in steps {
@@ -1907,7 +1915,7 @@ proptest! {
             rs.push((t, v));
         }
         feed(&mut m, s, &rs);
-        let october = Month { year: 2026, month: 10 };
+        let october = Month { year: 2026, month: month_no };
         let zone = named.then_some(zone);
         let month = m.calendar_window(s, kvik_model::calendar::CalendarWindow::Period(Period::Month(october)), zone).unwrap();
         let increase = |n: &Node| match &n.body { Body::Counter { increase, .. } => increase.clone(), _ => unreachable!() };
@@ -1923,26 +1931,33 @@ proptest! {
         prop_assert_eq!(sum, increase(&month.node));
     }
 
-    /// 22. For an interval series with d = 30 min in a +05:45 zone, the sums of
-    /// the local days of a month add up to the month's sum, though every day
-    /// edge apportions an interval.
+    /// 22. For an interval series with d = 30 min, the sums of the local days
+    /// of a month add up to the month's sum: in a +05:45 zone, where every day
+    /// edge apportions an interval, and in months with a DST change (a
+    /// 30-minute shift among them).
     #[test]
     fn inv22_interval_days_add_up_to_their_month(
         amounts in proptest::collection::btree_map(0i64..(33 * 48), 0i32..40, 0..80),
         named in any::<bool>(),
+        case in proptest::sample::select(vec![
+            ("Asia/Kathmandu", 5i8),
+            ("Europe/London", 3),
+            ("Australia/Lord_Howe", 4),
+            ("America/New_York", 3),
+        ]),
     ) {
         use kvik_model::calendar::{Month, Period};
-        let zone = "Asia/Kathmandu";
+        let (zone, month_no) = case;
         let cfg = kvik_model::engine::Config { site_zone: if named { "UTC" } else { zone }.into(), ..kvik_model::engine::Config::default() };
         let mut m = kvik_model::engine::Model::new(cfg, vec![], utc("2026-06-05T00:00:00Z"));
         let s = m.define_with(
             "line-1/meter/energy", Kind::Interval, kvik_model::types::ValueType::Number, "Wh",
             None, kvik_model::registry::SeriesOptions::interval(30 * MINUTE, 0),
         ).unwrap();
-        let first = utc("2026-04-30T00:00:00Z");
+        let first = utc(&format!("2026-{month_no:02}-01T00:00:00Z")) - kvik_model::types::DAY;
         let rs: Vec<(Nanos, f64)> = amounts.iter().map(|(k, v)| (first + k * 30 * MINUTE, f64::from(*v) * 1.5)).collect();
         feed(&mut m, s, &rs);
-        let may = Month { year: 2026, month: 5 };
+        let may = Month { year: 2026, month: month_no };
         let zone = named.then_some(zone);
         let sum = |n: &Node| match &n.body { Body::Interval { sum, .. } => sum.clone(), _ => unreachable!() };
         let month = m.calendar_window(s, kvik_model::calendar::CalendarWindow::Period(Period::Month(may)), zone).unwrap();
