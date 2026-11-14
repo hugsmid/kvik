@@ -240,7 +240,9 @@ impl<'a> Scanner<'a> {
     }
 
     /// A scan from `from`, typically the [`Scanner::resume_point`] of an earlier scan of the same file with a lower
-    /// limit. The header is read again; with `last_sequence: None` its `base_sequence` bounds the first batch.
+    /// limit. The header is read again; with `last_sequence: None` its `base_sequence` bounds the first batch. A
+    /// limit or resume point off an 8-byte boundary, or a resume point outside the header's end and the limit, is
+    /// refused ([`FormatError::ScanPoint`]).
     pub fn resume(
         bytes: &'a [u8],
         id: &SegmentIdentity,
@@ -248,6 +250,11 @@ impl<'a> Scanner<'a> {
         from: Resume,
     ) -> Result<Self, FormatError> {
         let header = read_header(bytes, id)?;
+        if let ScanLimit::Mark(m) = limit
+            && !m.is_multiple_of(8)
+        {
+            return Err(FormatError::ScanPoint { offset: m });
+        }
         let base = match header {
             HeaderState::Valid(h) => h.base_sequence,
             HeaderState::Invalid => 0,
@@ -262,6 +269,15 @@ impl<'a> Scanner<'a> {
         // Below the mark and before seal blocks, everything is durable: what is not a complete batch is
         // corruption.
         let bounded = matches!(limit, ScanLimit::Mark(_)) || seal.is_some();
+        let start = HEADER_LEN as u64;
+        if !from.offset.is_multiple_of(8)
+            || from.offset < start
+            || from.offset > area_end.max(start)
+        {
+            return Err(FormatError::ScanPoint {
+                offset: from.offset,
+            });
+        }
         Ok(Self {
             bytes,
             id: *id,
@@ -270,7 +286,7 @@ impl<'a> Scanner<'a> {
             area_end,
             bounded,
             base,
-            pos: from.offset.max(HEADER_LEN as u64),
+            pos: from.offset,
             last: from.last_sequence,
             pending: None,
             tail: None,
@@ -725,6 +741,23 @@ mod tests {
             matches!(s.next(), Some(Ok(Found::Batch(b))) if b.offset == at && b.commit.first_sequence == 2)
         );
         assert!(s.next().is_none());
+        // Resume points off a block boundary or above the limit are refused.
+        for bad in [at + 4, 8, bytes.len() as u64 + 8] {
+            let r = Scanner::resume(
+                &bytes,
+                &id,
+                ScanLimit::Mark(bytes.len() as u64),
+                Resume {
+                    offset: bad,
+                    last_sequence: None,
+                },
+            );
+            assert_eq!(r.err(), Some(FormatError::ScanPoint { offset: bad }));
+        }
+        assert_eq!(
+            Scanner::new(&bytes, &id, ScanLimit::Mark(at + 4)).err(),
+            Some(FormatError::ScanPoint { offset: at + 4 })
+        );
         // A resumed scan still requires the sequence to rise.
         let mut s = Scanner::resume(
             &bytes,

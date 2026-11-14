@@ -356,6 +356,10 @@ impl BatchBuilder {
             let h: BlockHeader = encode_block(*t, *flags, body, &mut out)?;
             crc.update(&h.encode());
         }
+        // A batch holds at most 8 MiB of data blocks (A, common rules: sizes).
+        if out.len() as u64 > MAX_BATCH_DATA {
+            return Err(EncodeError::TooLarge);
+        }
         let commit = Commit {
             generation: id.generation,
             block_count: self.blocks.len() as u32,

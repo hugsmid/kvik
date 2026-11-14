@@ -54,6 +54,13 @@ pub enum FormatError {
     /// A checksum-valid header whose `store_id` is not the store's (`format.md` A.1).
     #[error("the file belongs to another store")]
     StoreIdMismatch,
+    /// A scan limit or resume point that is not a multiple of 8, or a resume point below the header's end or
+    /// above the limit.
+    #[error("scan point {offset} is not a block boundary within the limit")]
+    ScanPoint {
+        /// The offset.
+        offset: u64,
+    },
     /// A checksum-valid header that disagrees with the file name (see `model/OPEN-QUESTIONS.md`, Q-105 (e)).
     #[error("header field {field} is {in_header}, the file name gives {expected}")]
     HeaderMismatch {
@@ -103,6 +110,9 @@ pub enum EncodeError {
         /// Bytes left.
         left: u64,
     },
+    /// An entry above 8 MiB, or a batch above 8 MiB of data blocks.
+    #[error("too large")]
+    TooLarge,
     /// A segment that is not in use yet (`base_sequence = 0`), already sealed, or empty where a batch is needed.
     #[error("operation not allowed in the segment's state: {0}")]
     State(&'static str),

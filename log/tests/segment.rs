@@ -672,6 +672,11 @@ fn a_batch_above_8_mib_of_data_blocks_or_without_a_sequence_is_not_complete() {
     put(s.bytes_mut(), 64, &batch);
     let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();
     assert!(r.batches.is_empty());
+    // The writer refuses to frame it.
+    let mut b = BatchBuilder::new();
+    b.push(block_type::FACTS, big(1)).unwrap();
+    b.push(block_type::FACTS, big(2)).unwrap();
+    assert_eq!(b.encode(&ID, 64, T0), Err(kvik_log::EncodeError::TooLarge));
     // One block of the same size fits.
     let one = raw_batch(&ID, 64, &blocks[..1], 1, 1, T0);
     let mut s = SegmentImage::create_ahead(ID, T0, one.len() as u64 + 128).unwrap();
