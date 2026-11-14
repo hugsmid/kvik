@@ -1,7 +1,11 @@
 //! Reading a log segment: complete batches, invalid regions, the tail and the seal (`format.md` A.2, A.4, A.9).
 
-use crate::batch::{Batch, BatchFault, BatchRead, Refusal, SegmentIdentity, read_batch};
-use crate::block::{BLOCK_HEADER_LEN, BlockHeader, block_type, read_block};
+use std::collections::HashMap;
+
+use crate::batch::{
+    Batch, BatchFault, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, read_batch,
+};
+use crate::block::{BLOCK_HEADER_LEN, block_type, peek_header, read_block};
 use crate::body::{
     COMMIT_LEN, Commit, END_MARKER_LEN, SegmentIndex, TRAILER_LEN, Trailer, decode_end_marker,
 };
@@ -152,7 +156,7 @@ impl ScanReport<'_> {
     }
 }
 
-/// Reads the log segment in `bytes`, checking its batches against `id`.
+/// Reads the log segment in `bytes`, checking its batches against `id`: [`Scanner`] run to its end.
 ///
 /// Returns a version refusal for a header of a newer major version, of another kind or of another store, a valid
 /// header that disagrees with `id`, or an unknown critical block in a checksum-valid batch. Damage is never an
@@ -162,90 +166,234 @@ pub fn scan<'a>(
     id: &SegmentIdentity,
     limit: ScanLimit,
 ) -> Result<ScanReport<'a>, FormatError> {
-    let header = read_header(bytes, id)?;
-    let base = match header {
-        HeaderState::Valid(h) => h.base_sequence,
-        HeaderState::Invalid => 0,
-    };
-    let len = bytes.len() as u64;
-    let (area_end, seal) = match limit {
-        ScanLimit::Mark(m) => (m, None),
-        ScanLimit::End => match find_seal(bytes) {
-            Some(s) => (s.start, Some(s)),
-            None => (len, None),
-        },
-    };
-    // Below the mark and before seal blocks, everything is durable: what is not a complete batch is corruption.
-    let bounded = matches!(limit, ScanLimit::Mark(_)) || seal.is_some();
-    let mut batches: Vec<Batch<'a>> = Vec::new();
+    let mut s = Scanner::new(bytes, id, limit)?;
+    let mut batches = Vec::new();
     let mut regions = Vec::new();
-    let mut pos = HEADER_LEN as u64;
-    let tail = loop {
-        if pos >= area_end {
-            break Tail::Clean { offset: area_end };
+    for found in &mut s {
+        match found? {
+            Found::Batch(b) => batches.push(b),
+            Found::Region(r) => regions.push(r),
         }
-        let last = batches.last().map(|b: &Batch<'_>| b.commit.last_sequence);
-        let min_first = last.map_or(base, |l| l.saturating_add(1));
-        let fault = match read_batch(bytes, id, pos, area_end, min_first, Refusal::AtOnce) {
-            BatchRead::Complete(b) => {
-                pos = b.end();
-                batches.push(b);
-                continue;
+    }
+    Ok(ScanReport {
+        header: s.header,
+        tail: s.tail().cloned(),
+        seal: s.seal,
+        batches,
+        regions,
+    })
+}
+
+/// Where a scan starts again: just past the last batch or region read, and the last kept sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Resume {
+    /// File offset to read from (at least the header's end).
+    pub offset: u64,
+    /// The last sequence of the last batch kept before `offset`; `None` at the start of the file.
+    pub last_sequence: Option<u64>,
+}
+
+/// One finding of a scan, in file order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found<'a> {
+    /// A complete batch.
+    Batch(Batch<'a>),
+    /// An invalid region that is corruption.
+    Region(InvalidRegion),
+}
+
+/// A scan of one log segment as an iterator of [`Found`] items, resumable from a [`Resume`] point: a reader
+/// that tails a segment as the mark moves, or a large segment, reads each part once.
+#[derive(Clone, Debug)]
+pub struct Scanner<'a> {
+    bytes: &'a [u8],
+    id: SegmentIdentity,
+    header: HeaderState,
+    seal: Option<Seal>,
+    area_end: u64,
+    bounded: bool,
+    base: u64,
+    pos: u64,
+    last: Option<u64>,
+    pending: Option<Batch<'a>>,
+    tail: Option<Tail>,
+    done: bool,
+}
+
+impl<'a> Scanner<'a> {
+    /// A scan from the start of the segment.
+    pub fn new(
+        bytes: &'a [u8],
+        id: &SegmentIdentity,
+        limit: ScanLimit,
+    ) -> Result<Self, FormatError> {
+        Self::resume(
+            bytes,
+            id,
+            limit,
+            Resume {
+                offset: HEADER_LEN as u64,
+                last_sequence: None,
+            },
+        )
+    }
+
+    /// A scan from `from`, typically the [`Scanner::resume_point`] of an earlier scan of the same file with a lower
+    /// limit. The header is read again; with `last_sequence: None` its `base_sequence` bounds the first batch.
+    pub fn resume(
+        bytes: &'a [u8],
+        id: &SegmentIdentity,
+        limit: ScanLimit,
+        from: Resume,
+    ) -> Result<Self, FormatError> {
+        let header = read_header(bytes, id)?;
+        let base = match header {
+            HeaderState::Valid(h) => h.base_sequence,
+            HeaderState::Invalid => 0,
+        };
+        let (area_end, seal) = match limit {
+            ScanLimit::Mark(m) => (m, None),
+            ScanLimit::End => match find_seal(bytes) {
+                Some(s) => (s.start, Some(s)),
+                None => (bytes.len() as u64, None),
+            },
+        };
+        // Below the mark and before seal blocks, everything is durable: what is not a complete batch is
+        // corruption.
+        let bounded = matches!(limit, ScanLimit::Mark(_)) || seal.is_some();
+        Ok(Self {
+            bytes,
+            id: *id,
+            header,
+            seal,
+            area_end,
+            bounded,
+            base,
+            pos: from.offset.max(HEADER_LEN as u64),
+            last: from.last_sequence,
+            pending: None,
+            tail: None,
+            done: false,
+        })
+    }
+
+    /// The header.
+    pub fn header(&self) -> HeaderState {
+        self.header
+    }
+
+    /// The seal blocks, when read to the end and found.
+    pub fn seal(&self) -> Option<&Seal> {
+        self.seal.as_ref()
+    }
+
+    /// Where a later scan continues: past everything returned so far.
+    pub fn resume_point(&self) -> Resume {
+        Resume {
+            offset: self.pos,
+            last_sequence: self.last,
+        }
+    }
+
+    /// What follows the last batch, once the iterator is exhausted; `None` before that, when read up to the mark
+    /// and when sealed.
+    pub fn tail(&self) -> Option<&Tail> {
+        if self.bounded {
+            None
+        } else {
+            self.tail.as_ref()
+        }
+    }
+
+    fn finish(&mut self, tail: Tail) {
+        self.done = true;
+        self.tail = Some(tail);
+    }
+
+    fn keep(&mut self, b: Batch<'a>) -> Found<'a> {
+        self.pos = b.end();
+        self.last = Some(b.commit.last_sequence);
+        Found::Batch(b)
+    }
+}
+
+impl<'a> Iterator for Scanner<'a> {
+    type Item = Result<Found<'a>, FormatError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(b) = self.pending.take() {
+            return Some(Ok(self.keep(b)));
+        }
+        if self.done {
+            return None;
+        }
+        let (bytes, pos, area_end) = (self.bytes, self.pos, self.area_end);
+        if pos >= area_end {
+            self.finish(Tail::Clean { offset: area_end });
+            return None;
+        }
+        let last = self.last;
+        let min_first = last.map_or(self.base, |l| l.saturating_add(1));
+        let fault = match read_batch(bytes, &self.id, pos, area_end, min_first, Refusal::AtOnce) {
+            BatchRead::Complete(b) => return Some(Ok(self.keep(b))),
+            BatchRead::Refused(e) => {
+                self.done = true;
+                return Some(Err(e));
             }
-            BatchRead::Refused(e) => return Err(e),
             BatchRead::Incomplete { fault } => fault,
         };
         // Sixteen zero bytes at a block boundary are the end of data only if nothing but zeros follows up to the
         // limit; below the mark or the seal blocks they are never the end (Q-105 (a)).
-        if !bounded && all_zero(bytes, pos, area_end) {
-            break Tail::Clean { offset: pos };
+        if !self.bounded && all_zero(bytes, pos, area_end) {
+            self.finish(Tail::Clean { offset: pos });
+            return None;
         }
         let cause = match fault {
             BatchFault::Content => LossCause::InvalidContent,
             _ => LossCause::Corruption,
         };
         // An invalid region starts at `pos` (zeros below the limit included, Q-105 (a)); resynchronise (A.2).
-        match resync(bytes, id, pos, area_end, min_first)? {
-            Some(b) => {
-                regions.push(InvalidRegion {
+        match resync(bytes, &self.id, pos, area_end, min_first) {
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+            Ok(Some(b)) => {
+                let region = InvalidRegion {
                     start: pos,
                     end: b.offset,
                     last_sequence_before: last,
                     first_sequence_after: Some(b.commit.first_sequence),
                     cause,
-                });
-                pos = b.end();
-                batches.push(b);
+                };
+                self.pos = b.offset;
+                self.pending = Some(b);
+                Some(Ok(Found::Region(region)))
             }
-            None if bounded => {
-                regions.push(InvalidRegion {
+            Ok(None) if self.bounded => {
+                self.pos = area_end;
+                self.finish(Tail::Clean { offset: area_end });
+                Some(Ok(Found::Region(InvalidRegion {
                     start: pos,
                     end: area_end,
                     last_sequence_before: last,
                     first_sequence_after: None,
                     cause,
-                });
-                break Tail::Clean { offset: area_end };
+                })))
             }
-            None => {
+            Ok(None) => {
                 let end = last_non_zero_end(bytes, pos, area_end);
-                break Tail::Torn {
+                let commits = readable_commits(bytes, pos, end, area_end);
+                self.finish(Tail::Torn {
                     start: pos,
                     end,
                     cause,
-                    commits: readable_commits(bytes, pos, end, area_end),
-                };
+                    commits,
+                });
+                None
             }
         }
-    };
-    let tail = (!bounded).then_some(tail);
-    Ok(ScanReport {
-        header,
-        batches,
-        regions,
-        tail,
-        seal,
-    })
+    }
 }
 
 fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, FormatError> {
@@ -285,6 +433,11 @@ fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, Format
 }
 
 /// Steps forward 8 bytes at a time from an invalid region at `start` and returns the first complete batch (A.2).
+///
+/// Each chain of consecutive checksum-valid blocks is walked once: the commit block (or fault) it ends in is
+/// remembered for every block start on it, and a candidate offset `o` is read in full only when that commit's
+/// `batch_bytes` is the distance from `o`. So the blocks read grow linearly with the region, also when it holds a
+/// long chain of block images without a commit (for example inside text values).
 fn resync<'a>(
     bytes: &'a [u8],
     id: &SegmentIdentity,
@@ -292,25 +445,59 @@ fn resync<'a>(
     limit: u64,
     min_first: u64,
 ) -> Result<Option<Batch<'a>>, FormatError> {
+    let mut chains: HashMap<u64, Option<(u64, Commit)>> = HashMap::new();
     let mut o = start + 8;
     while o + (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
-        let Some(head) = slice(bytes, o, BLOCK_HEADER_LEN as u64) else {
-            break;
-        };
         // A zero word cannot start a block header (type 0 is never valid), and a header that fails its checksum
         // cannot start a batch: both are passed without reading further.
-        let head: &[u8; BLOCK_HEADER_LEN] = head.try_into().unwrap_or(&[0; BLOCK_HEADER_LEN]);
-        if u64_at(head, 0) == 0 || BlockHeader::decode(head).is_none() {
+        if slice(bytes, o, 8).is_none_or(|w| u64_at(w, 0) == 0)
+            || peek_header(bytes, o, limit).is_none()
+        {
             o += 8;
             continue;
         }
-        match read_batch(bytes, id, o, limit, min_first, Refusal::IfBatchVerifies) {
-            BatchRead::Complete(b) => return Ok(Some(b)),
-            BatchRead::Refused(e) => return Err(e),
-            BatchRead::Incomplete { .. } => o += 8,
+        let ends_here = chain_end(bytes, o, limit, &mut chains)
+            .is_some_and(|(at, c)| at > o && c.batch_bytes == at - o && at - o <= MAX_BATCH_DATA);
+        if ends_here {
+            match read_batch(bytes, id, o, limit, min_first, Refusal::IfBatchVerifies) {
+                BatchRead::Complete(b) => return Ok(Some(b)),
+                BatchRead::Refused(e) => return Err(e),
+                BatchRead::Incomplete { .. } => {}
+            }
         }
+        o += 8;
     }
     Ok(None)
+}
+
+/// The commit block that the chain of checksum-valid blocks from `o` ends in, with its offset, or `None` if the
+/// chain ends in anything else. Every block start walked is remembered in `chains`.
+fn chain_end(
+    bytes: &[u8],
+    o: u64,
+    limit: u64,
+    chains: &mut HashMap<u64, Option<(u64, Commit)>>,
+) -> Option<(u64, Commit)> {
+    let mut walked = Vec::new();
+    let mut p = o;
+    let end = loop {
+        if let Some(known) = chains.get(&p) {
+            break *known;
+        }
+        let Ok(b) = read_block(bytes, p, limit) else {
+            break None;
+        };
+        walked.push(p);
+        match b.header.block_type {
+            block_type::COMMIT => break Commit::decode(b.body).ok().map(|c| (p, c)),
+            block_type::SEGMENT_INDEX | block_type::TRAILER => break None,
+            _ => p = b.next_offset(),
+        }
+    };
+    for w in walked {
+        chains.insert(w, end);
+    }
+    end
 }
 
 /// The seal blocks, if the last non-zero bytes of the file are a valid trailer block and end marker (A.4, A.9).
@@ -378,8 +565,10 @@ fn readable_commits(bytes: &[u8], from: u64, to: u64, limit: u64) -> Vec<Readabl
     let mut out = Vec::new();
     let mut o = from;
     while o < to && o + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
-        if let Ok(b) = read_block(bytes, o, limit)
-            && b.header.block_type == block_type::COMMIT
+        // Type and length are tested on the header before the body checksum is computed.
+        if peek_header(bytes, o, limit).is_some_and(|h| {
+            h.block_type == block_type::COMMIT && h.body_len as usize == COMMIT_LEN
+        }) && let Ok(b) = read_block(bytes, o, limit)
             && let Ok(commit) = Commit::decode(b.body)
         {
             out.push(ReadableCommit { offset: o, commit });
@@ -389,4 +578,100 @@ fn readable_commits(bytes: &[u8], from: u64, to: u64, limit: u64) -> Vec<Readabl
         o += 8;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{BLOCK_READS, FLAG_SKIPPABLE, encode_block};
+
+    /// A segment holding `n` checksum-valid header-only blocks and no commit block: a torn batch whose body
+    /// holds block images, as crafted text values could.
+    fn chain(n: usize) -> (Vec<u8>, SegmentIdentity) {
+        let id = SegmentIdentity {
+            store_id: [3; 16],
+            file_id: 1,
+            generation: 0,
+        };
+        let mut h = FileHeader::new(kind::LOG_SEGMENT, 0, 1, 0, id.store_id);
+        h.base_sequence = 1;
+        let mut b = h.encode().to_vec();
+        for _ in 0..n {
+            encode_block(0x50, FLAG_SKIPPABLE, &[], &mut b).unwrap();
+        }
+        b.resize(b.len() + 256, 0);
+        (b, id)
+    }
+
+    #[test]
+    fn resynchronising_over_a_chain_of_block_images_is_linear() {
+        for n in [1_000, 2_000, 4_000, 16_000] {
+            let (bytes, id) = chain(n);
+            BLOCK_READS.with(|c| c.set(0));
+            let r = scan(&bytes, &id, ScanLimit::End).unwrap();
+            let reads = BLOCK_READS.with(|c| c.get());
+            assert!(r.batches.is_empty());
+            assert!(matches!(r.tail, Some(Tail::Torn { start: 64, .. })));
+            assert!(
+                reads <= 3 * n as u64 + 64,
+                "{reads} block reads for {n} blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resumed_scan_continues_where_the_last_stopped() {
+        let (mut bytes, id) = chain(0);
+        bytes.truncate(64);
+        let mut builder = crate::batch::BatchBuilder::new();
+        let mut body = vec![0u8; 24];
+        crate::body::DataPrefix {
+            first_sequence: 1,
+            received_at: 0,
+            count: 1,
+        }
+        .write(&mut body);
+        builder.push(block_type::ENTRIES, body.clone()).unwrap();
+        let first = builder.encode(&id, 64, 0).unwrap();
+        bytes.extend_from_slice(&first);
+        let at = bytes.len() as u64;
+        let mut builder = crate::batch::BatchBuilder::new();
+        crate::body::DataPrefix {
+            first_sequence: 2,
+            received_at: 0,
+            count: 1,
+        }
+        .write(&mut body);
+        builder.push(block_type::ENTRIES, body).unwrap();
+        bytes.extend_from_slice(&builder.encode(&id, at, 0).unwrap());
+        let mut s = Scanner::new(&bytes, &id, ScanLimit::Mark(at)).unwrap();
+        assert!(matches!(s.next(), Some(Ok(Found::Batch(_)))));
+        assert!(s.next().is_none());
+        let point = s.resume_point();
+        assert_eq!(
+            point,
+            Resume {
+                offset: at,
+                last_sequence: Some(1)
+            }
+        );
+        let mut s =
+            Scanner::resume(&bytes, &id, ScanLimit::Mark(bytes.len() as u64), point).unwrap();
+        assert!(
+            matches!(s.next(), Some(Ok(Found::Batch(b))) if b.offset == at && b.commit.first_sequence == 2)
+        );
+        assert!(s.next().is_none());
+        // A resumed scan still requires the sequence to rise.
+        let mut s = Scanner::resume(
+            &bytes,
+            &id,
+            ScanLimit::Mark(bytes.len() as u64),
+            Resume {
+                offset: at,
+                last_sequence: Some(2),
+            },
+        )
+        .unwrap();
+        assert!(matches!(s.next(), Some(Ok(Found::Region(_)))));
+    }
 }

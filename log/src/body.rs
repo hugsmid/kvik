@@ -29,7 +29,7 @@ pub struct ContentFault;
 
 impl DataPrefix {
     /// Reads the prefix of a facts or entries body and applies the checks the container is responsible for: the
-    /// body holds the prefix, and a facts block has 1 to 65,536 rows. The checks of the columns and entries
+    /// body holds the prefix, a facts block has 1 to 65,536 rows and an entries block at least one entry. The checks of the columns and entries
     /// themselves (A.5, A.6) belong to the batch layer.
     pub fn decode(block_type: u8, body: &[u8]) -> Result<Self, ContentFault> {
         if body.len() < DATA_PREFIX_LEN {
@@ -42,7 +42,8 @@ impl DataPrefix {
         };
         match block_type {
             block_type::FACTS if (1..=MAX_ROWS).contains(&p.count) => Ok(p),
-            block_type::ENTRIES => Ok(p),
+            // An entries block holds at least one entry: every batch takes a sequence.
+            block_type::ENTRIES if p.count >= 1 => Ok(p),
             _ => Err(ContentFault),
         }
     }
@@ -290,7 +291,10 @@ mod tests {
             DataPrefix::decode(block_type::FACTS, &body),
             Err(ContentFault)
         );
-        assert!(DataPrefix::decode(block_type::ENTRIES, &body).is_ok());
+        assert_eq!(
+            DataPrefix::decode(block_type::ENTRIES, &body),
+            Err(ContentFault)
+        );
         DataPrefix {
             first_sequence: 1,
             received_at: 5,

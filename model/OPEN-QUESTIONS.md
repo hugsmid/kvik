@@ -500,14 +500,14 @@ not covered.
 the mark (and before the seal blocks of a sealed segment) they start an invalid region, and resynchronisation
 continues, as recovery's scan does. (b) Every block before the commit block is counted in `block_count`,
 `batch_bytes` and `batch_crc32c`; a skipped block takes no sequence (a block that took sequences could not be skipped
-without losing entries) and has no `received_at` to compare. A skippable block between batches, with no commit block
-of its own, is taken as the start of the next batch; that batch's `block_count` and `batch_crc32c` then fail, the
-block is reported as an invalid region (corruption) and resynchronisation finds the batch after it. (c) At a block
-boundary reached from a valid position the refusal is immediate, as written; at a candidate offset while
-resynchronising it applies only if the rest of the batch checks out (its commit block, `block_count`, `batch_bytes`,
-generation and `batch_crc32c`), and otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the
-last kept sequence + 1: the first batch may start at or above it, never below. (e) Refused
-(`FormatError::HeaderMismatch`); the file is not read.
+without losing entries) and has no `received_at` to compare; a batch takes at least one sequence, so one of skipped
+blocks alone is not complete. A skippable block between batches, with no commit block of its own, is taken as the
+start of the next batch; that batch's `block_count` and `batch_crc32c` then fail, the block is reported as an invalid
+region (corruption) and resynchronisation finds the batch after it. (c) At a block boundary reached from a valid
+position the refusal is immediate, as written; at a candidate offset while resynchronising it applies only if the
+rest of the batch checks out (its commit block, `block_count`, `batch_bytes`, generation and `batch_crc32c`), and
+otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the last kept sequence + 1: the first
+batch may start at or above it, never below. (e) Refused (`FormatError::HeaderMismatch`); the file is not read.
 **Needed.** Confirmation of, or a rule for, each part; for (a), whether A.2's end-of-data sentence applies to a
 reader below the mark at all. To be settled by roadmap 4.5 (recovery), (a) and (c) with 4.6 (second-process reader).
 

@@ -653,3 +653,55 @@ fn padding_between_blocks_is_not_checked() {
     assert_eq!(bodies, after);
     assert_eq!(offsets.len(), 3);
 }
+
+#[test]
+fn a_batch_above_8_mib_of_data_blocks_or_without_a_sequence_is_not_complete() {
+    // Two facts blocks of 4 MiB + 8 bytes each, with every checksum valid.
+    let big = |first: u64| {
+        let mut body = facts_body(first, T0, &[(1, T0, 1.0)]);
+        body.resize(4 * 1024 * 1024 + 8, 0);
+        body
+    };
+    let blocks = vec![
+        (block_type::FACTS, 0, big(1)),
+        (block_type::FACTS, 0, big(2)),
+    ];
+    let batch = raw_batch(&ID, 64, &blocks, 1, 2, T0);
+    let mut s = SegmentImage::create_ahead(ID, T0, batch.len() as u64 + 128).unwrap();
+    s.take_into_use(1).unwrap();
+    put(s.bytes_mut(), 64, &batch);
+    let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();
+    assert!(r.batches.is_empty());
+    // One block of the same size fits.
+    let one = raw_batch(&ID, 64, &blocks[..1], 1, 1, T0);
+    let mut s = SegmentImage::create_ahead(ID, T0, one.len() as u64 + 128).unwrap();
+    s.take_into_use(1).unwrap();
+    put(s.bytes_mut(), 64, &one);
+    assert_eq!(
+        scan(s.bytes(), &ID, ScanLimit::End).unwrap().batches.len(),
+        1
+    );
+    // An entries block without entries, and a batch of skippable blocks only: no sequence taken, not complete.
+    let empty = entries_body(1, T0, &[]);
+    for blocks in [
+        vec![(block_type::ENTRIES, 0, empty)],
+        vec![(0x50, FLAG_SKIPPABLE, vec![1])],
+    ] {
+        let mut s = SegmentImage::create_ahead(ID, T0, 1024).unwrap();
+        s.take_into_use(1).unwrap();
+        put(s.bytes_mut(), 64, &raw_batch(&ID, 64, &blocks, 1, 0, T0));
+        assert!(
+            scan(s.bytes(), &ID, ScanLimit::End)
+                .unwrap()
+                .batches
+                .is_empty()
+        );
+    }
+    let mut b = BatchBuilder::new();
+    assert!(
+        b.push(block_type::ENTRIES, entries_body(1, T0, &[]))
+            .is_err()
+    );
+    b.push_unknown(0x50, FLAG_SKIPPABLE, vec![]).unwrap();
+    assert!(b.encode(&ID, 64, T0).is_err());
+}

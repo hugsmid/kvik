@@ -10,6 +10,10 @@ use crate::body::{COMMIT_LEN, Commit, ContentFault, DataPrefix};
 use crate::crc::Crc32c;
 use crate::error::{Element, EncodeError, FormatError};
 
+/// The most bytes of data blocks in one batch (A, common rules: a batch is at most 8 MiB of data blocks plus its
+/// commit block).
+pub const MAX_BATCH_DATA: u64 = 8 << 20;
+
 /// What a segment's batches are checked against: the store's id (from the store descriptor) and the file id and
 /// generation (from the file name, `format.md` A.12). They are taken from outside the file because the header may be
 /// invalid while complete batches follow it (A.4).
@@ -142,6 +146,10 @@ pub(crate) fn read_batch<'a>(
         crc.update(&b.header_bytes);
         blocks.push(DataBlock { block: b, prefix });
         pos = b.next_offset();
+        // A batch holds at most 8 MiB of data blocks (A, common rules: sizes).
+        if pos - o > MAX_BATCH_DATA {
+            return incomplete(BatchFault::Disagreement);
+        }
     };
     let Ok(commit) = Commit::decode(commit_block.body) else {
         return incomplete(BatchFault::Content);
@@ -169,8 +177,10 @@ pub(crate) fn read_batch<'a>(
         }
         next = p.first_sequence.checked_add(u64::from(p.count));
     }
-    // `next` is one past the last counted sequence; `None` is an overflow.
-    if next.map(|n| n - 1) != Some(commit.last_sequence) {
+    // `next` is one past the last counted sequence; `None` is an overflow. A batch takes at least one sequence.
+    if next.map(|n| n - 1) != Some(commit.last_sequence)
+        || commit.last_sequence < commit.first_sequence
+    {
         return incomplete(BatchFault::Disagreement);
     }
     BatchRead::Complete(Batch {
