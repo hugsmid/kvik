@@ -114,7 +114,8 @@ moment it is recorded: it is **outranked** when a fact of higher rank for its ke
   included; not the lateness reference, §2.2) cannot be a duplicate; no lookup. Other facts are checked against the
   in-memory recent window (§5.1) before any index probe.
 - If the current fact for a key is on no local tier (its detail moved out under §8 fill pressure or retention class),
-  the fact is recorded and counted `duplicates_unchecked` (§12 D5). The check never reads off-machine data. In a
+  the fact is recorded and counted `duplicates_unchecked` (§12 D5), unless its `t` is a displaced interval start
+  (§5.4), where it is refused. The check never reads off-machine data. In a
   versioned series an arriving fact whose `changed_at` matches none in its key's history is not a duplicate and needs
   no check; one whose `changed_at` equals that of a fact off every local tier is recorded, counted
   `duplicates_unchecked` and takes the tie by position. An unchecked repeat therefore never reverts a correction with
@@ -261,13 +262,14 @@ window. Live staleness applies only to live state and stale-for conditions.
 an interval start is **displaced**. It is kept (current, as-of and history views show it), and is ignored by live
 state, staleness and every window, as a bad-quality fact is (§2.5). A window result whose span contains the `t` of a
 displaced current reading is flagged `displaced`; a per-series statistic, `interval_displaced`, counts the readings
-found displaced, monotone and best effort like the other statistics (§11). The flag stays while the rules displace the
+found displaced, monotone and persisted on a best-effort basis like the health counters (§11). The flag stays while the rules displace the
 reading, also after the source has repaired its interval; a window inside the affected interval that does not contain
 the old `t` shows the missing amount only as missing coverage. A reading whose `t` is still a start keeps its place
 and its end follows the version in force. Displacement is a function of `t`, the interval zone, the day start and the
 tzdata version in force, so a later release can undo it. The source repairs by sending the amount at the new start,
 which is a new key; nothing needs withdrawing. An identical replay at the displaced `t` is a duplicate and is dropped
-(§2.4); any other reading there, a revision included, is refused off its phase (row 40). A tzdata change invalidates
+(§2.4) when the check can run on a local current fact; any other reading there, a revision included, or a replay
+whose current fact is on no local tier, is refused off its phase (row 40), never recorded unchecked. A tzdata change invalidates
 cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there being no stored node.
 
 ### 5.5 Counters
@@ -516,7 +518,7 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 37b | Forecast source falls silent | No live staleness; reported by stale-for on the adapter's companion series, and later by shrinking lookahead coverage | integration |
 | 38 | Window over tomorrow on a scheduled or forecast series | Credited up to the window end; coverage shows where the values run out | property |
 | 39 | Window ending after `now` on an observed series | Nothing credited past `now` | property |
-| 40 | Interval reading off its phase; on a calendar-length series, not at an interval start in the interval zone (a day start, or the start of a month), including an irregular period or a day starting at another hour than its day start | Refused and counted; an identical replay of a reading already recorded at that `t` (now displaced, row 45) is dropped as a duplicate first (§2.4) | unit |
+| 40 | Interval reading off its phase; on a calendar-length series, not at an interval start in the interval zone (a day start, or the start of a month), including an irregular period or a day starting at another hour than its day start | Refused and counted; an identical replay of a reading already recorded at that `t` (now displaced, row 45) is dropped as a duplicate first (§2.4) when its current fact is local, and otherwise refused | unit |
 | 41 | Window edge inside an interval | That interval's amount credited pro rata by time; result flagged `apportioned` | property |
 | 42 | Interval missing | A gap in coverage; nothing held across it | property |
 | 43 | Daily amount on a clock-change day (`day`, 23 or 25 h), with a day start of 00:00 or another (05:00) | Accepted at the day start; its interval runs to the next day start, a day start in the gap or the repeated hour placed as §2.1 says (a day start of 01:30 in Europe/London on 29 March 2026 falls in the gap and is placed at its end, 01:00Z; a reading labelled 01:30Z is refused, row 40); with a day start of 00:00, day and month results in the interval zone are exact and unflagged; rate uses the true length | property |
