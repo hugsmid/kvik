@@ -80,6 +80,9 @@ Not supported by the model backend:
 - The seams other than the clock are not used: the backend writes no files, takes no lock file and computes calendars
   with the reference model's embedded tzdata rather than through `Env::tz`. `SystemTz` reports the embedded tzdata as
   the release `"embedded"`; `StdFs::free_space` returns `Unsupported`; `SystemBootId` is `None` outside Linux.
+- `MemFs` makes every write visible at once: it does not drop unsynced writes at a simulated power loss, model
+  Linux's failed writeback per page or report per page whether a sync wrote it, as `docs/api.md` asks of the test
+  file system (roadmap 4.5).
 - `DiskStats.free` and the disk marks (`limits.disk_low`, `limits.disk_critical`) are measured against the reference
   model's simulated disk of 1 TiB, not a real file system; `IngestStats.syncs` is 0, as nothing is synced.
 

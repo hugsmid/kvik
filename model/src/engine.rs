@@ -2572,11 +2572,9 @@ impl Model {
             // quality without a value, flagged and counted; the duplicate
             // rule compares them as "no value" with the supplied quality
             // (§2.4).
+            let supplied_absent = matches!(r.value, Value::Absent);
             let (value, mut quality) = match r.value {
-                Value::Absent => {
-                    absent += 1;
-                    (Value::Absent, Quality::Bad)
-                }
+                Value::Absent => (Value::Absent, Quality::Bad),
                 Value::Num(x) if !x.is_finite() => {
                     non_finite += 1;
                     (Value::Absent, Quality::Bad)
@@ -2654,6 +2652,8 @@ impl Model {
                 duplicates += 1;
                 continue;
             }
+            // A supplied `Absent` is counted when it is recorded (§2.5).
+            absent += u64::from(supplied_absent);
             // During a restore the check cannot run against facts that are
             // not yet local (§8 Restore step 2, §2.4).
             if !revise

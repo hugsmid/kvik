@@ -681,8 +681,8 @@ restore stays in progress. A listed file that the bucket no longer holds, or has
 treated as §8 Corrupt block with deep as the failed tier: what it held is compacted again from the other listed files,
 and the positions that no other listed file holds become a lost range, recorded and reported as `data_lost` (§3
 Recovery rule 2); the restore then completes without them. Facts of a log segment found lost in step 1 that other listed files hold
-(such as compacted chunks) are fetched in step 1, before ingest is accepted, so that the version index and each
-series' latest recorded `t` stay exact at the restored end (§2.4, step 2). A lost or corrupted tree checkpoint is
+(such as compacted chunks) are fetched in step 1, before ingest is accepted, so that the version index, each
+series' latest recorded `t` and each decimal series' largest magnitude stay exact at the restored end (§2.4, step 2). A lost or corrupted tree checkpoint is
 replaced by the latest earlier checkpoint the records list, or, with none, by the whole sealed log, as step 1 allows.
 How the engine tells that the bucket has lost or corrupted a file, rather than a transient fault, a damaged download
 or a wrong key, is open (Q-82). A definition entry lost this way is lost as §2.1 says (only the kept log applies; its facts are orphaned); how the registry file, trees and indexes are brought back after it is open (Q-33). A file

@@ -4294,7 +4294,7 @@ fn reading(s: SeriesId, t: Nanos, v: Value) -> Reading {
     }
 }
 
-/// §2.5: a reading submitted with no value is recorded with quality bad,
+/// §2.5, row 31: a reading submitted with no value is recorded with quality bad,
 /// no value, flagged and counted, whatever quality was supplied, on a series
 /// of any kind. It is never live state and enters no summary: the previous
 /// reading stays live (on a state or text series, which has no staleness
@@ -4335,7 +4335,7 @@ fn s2_5_absent_recorded_bad_whatever_quality_supplied() {
     }
 }
 
-/// §2.4, §2.5: a supplied `Absent` keeps its supplied quality for the
+/// §2.4, §2.5, row 31: a supplied `Absent` keeps its supplied quality for the
 /// duplicate rule, across a restart. `Absent` good then `Absent` bad at one
 /// `t` are two facts; NaN good then `Absent` good at one `t` are one.
 #[test]
@@ -4351,6 +4351,10 @@ fn s2_4_absent_compared_by_supplied_quality() {
     );
     let r = m.ingest(vec![absent(s, T0, Quality::Good)]).unwrap();
     assert_eq!(r.duplicates, 1, "the same supplied quality is a duplicate");
+    assert_eq!(
+        m.counters.absent_supplied, 2,
+        "counted when recorded, not when dropped"
+    );
     m.ingest(vec![Reading::num(s, T0 + SECOND, f64::NAN)])
         .unwrap();
     m.restart();
