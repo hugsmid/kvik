@@ -121,6 +121,7 @@ impl<C: Codec> Candidate for C {
         }
         let e = encoded.expect("at least one repetition");
 
+        self.check(&e);
         for (i, c) in refs.iter().enumerate() {
             assert!(
                 &self.decode(&e, i) == *c,

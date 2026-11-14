@@ -187,6 +187,12 @@ pub trait Codec {
         self.sizes(encoded).iter().map(ColumnSizes::total).sum()
     }
 
+    /// Checks the encoded layout (Parquet: encodings and page sizes); panics
+    /// if it is not the intended one. Not timed.
+    fn check(&self, encoded: &Self::Encoded) {
+        let _ = encoded;
+    }
+
     /// Does what a reader must do once per file before reading chunks, and
     /// throws the result away (Parquet: parse the footer and page index).
     fn open(&self, encoded: &Self::Encoded) {

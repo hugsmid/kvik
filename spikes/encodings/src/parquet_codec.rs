@@ -180,17 +180,19 @@ impl ParquetCodec {
         }
         for i in 0..md.num_row_groups() {
             let rows = md.row_group(i).num_rows() as usize;
-            let pages = md
-                .page_index_for_row_group(i)
-                .offset_index(0)
-                .expect("offset index")
-                .page_locations()
-                .len();
-            assert_eq!(
-                pages,
-                rows.div_ceil(BLOCK_ROWS),
-                "pages of t in row group {i}"
-            );
+            for col in 0..md.row_group(i).num_columns() {
+                let pages = md
+                    .page_index_for_row_group(i)
+                    .offset_index(col)
+                    .expect("offset index")
+                    .page_locations()
+                    .len();
+                assert_eq!(
+                    pages,
+                    rows.div_ceil(BLOCK_ROWS),
+                    "pages of column {col} in row group {i}"
+                );
+            }
         }
     }
 }
@@ -247,6 +249,10 @@ impl Codec for ParquetCodec {
             s.overhead = rest / n + u64::from((i as u64) < rest % n);
         }
         out
+    }
+
+    fn check(&self, f: &ParquetFile) {
+        self.check_layout(f);
     }
 
     fn open(&self, f: &ParquetFile) {
