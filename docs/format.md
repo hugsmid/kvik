@@ -158,8 +158,10 @@ decided only by the gap between its last sequence and the next segment's `base_s
 rule 2), never by the bytes after its last batch. At most one segment is unused; any number may be awaiting a seal.
 
 **Truncation is zero-filling.** Recovery never shortens an unsealed segment. It overwrites with zeros from the
-truncation offset to the last non-zero byte, working from the end backwards, then syncs, before any new batch is
-written. Rule 1 also zero-fills every later segment in use. Accepted limit: a power loss during the zero-fill can
+truncation offset to the last non-zero byte, working from the end backwards, then syncs. Under rule 1 this is done
+before any new batch is written, and rule 1 also zero-fills every later segment in use. Under rule 3 the recovery
+batch is written and synced first and the rest of the torn tail is zeroed after it (`spec.md` §3 Order of a start,
+step 5); ingest resumes only after both. Accepted limit: a power loss during the zero-fill can
 leave unacknowledged batches after a zeroed hole; the next recovery keeps them and records the hole as `data_lost`
 although nothing acknowledged was lost.
 

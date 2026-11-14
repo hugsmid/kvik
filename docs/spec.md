@@ -65,7 +65,7 @@ log (Q-33).
 and counted. The old id stays reachable by id.
 
 ### 2.2 Log entries, positions and facts
-- Every log entry (fact, definition, parameter, alias, retirement, site zone, tzdata, routing change, recovery
+- Every log entry (fact, definition, parameter, alias, retirement, scale raise, site zone, tzdata, routing change, recovery
   entry, §3) has a **position** `(generation: u32, sequence: u64)`, ordered lexicographically. Every generation starts
   at sequence 1; `(g, 0)` means "before the first entry of generation g" and `(0, 0)` means none. Sequence is strictly
   increasing and gap-free within a generation across restarts, except for lost ranges, each recorded in the manifest

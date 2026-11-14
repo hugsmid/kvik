@@ -97,8 +97,8 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
   then handled by its `ExcessPrecision` policy (spec §2.1): rounded half to even and flagged `rounded` (the default),
   refused with `Refusal::ExcessPrecision { scale_needed }`, or the scale raised up to a maximum. Writers should round
   to the precision they actually need; raw sensor floats belong in an `f64` series, which keeps the value bit-exact.
-  `Absent` is "no value" (spec §2.5); NaN and ±∞ are accepted and recorded so (a decimal series cannot hold them:
-  `Refusal::WrongType`).
+  `Absent` is "no value" (spec §2.5); NaN and ±∞ are recorded as quality bad with no value, flagged and counted
+  (spec §2.5), on a decimal series as on any other.
 - Configuration durations are `std::time::Duration`; `Span` is used only where a sign is needed.
 
 ## Errors (accepted at gate 3.3)
