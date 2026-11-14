@@ -413,6 +413,8 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         exchange(s, &mut w);
         let step = w.step(s.clock.monotonic(), s.clock.wall(), &mut SharedSource(s));
         complete(s, step.done);
+        // A roll or a seal in this step asks for maintenance work at once.
+        exchange(s, &mut w);
         publish(s, &w);
         s.room_cv.notify_all();
         let mut f = lock(&s.front);
