@@ -509,6 +509,9 @@ position the refusal is immediate, as written; at a candidate offset while resyn
 rest of the batch checks out (its commit block, `block_count`, `batch_bytes`, generation and `batch_crc32c`), and
 otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the last kept sequence + 1: the first
 batch may start at or above it, never below. (e) Refused (`FormatError::HeaderMismatch`); the file is not read.
+**Note.** A reader accepts a batch whose first sequence is above the last kept sequence by any amount (A.4 Gaps). That
+a batch may start higher only after an invalid region or with a recovery entry (A.7) is checked by the writer's
+recovery, roadmap 4.5, not by the reader.
 **Needed.** Confirmation of, or a rule for, each part; for (a), whether A.2's end-of-data sentence applies to a
 reader below the mark at all. To be settled by roadmap 4.5 (recovery), (a) and (c) with 4.6 (second-process reader).
 

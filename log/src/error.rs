@@ -73,6 +73,13 @@ pub enum FormatError {
     /// A checksum-valid header whose `store_id` is not the store's (`format.md` A.1).
     #[error("the file belongs to another store")]
     StoreIdMismatch,
+    /// A scan limit or resume point that is not a multiple of 8, or a resume point below the header's end or
+    /// above the limit.
+    #[error("scan point {offset} is not a block boundary within the limit")]
+    ScanPoint {
+        /// The offset.
+        offset: u64,
+    },
     /// A checksum-valid header that disagrees with the file name (see `model/OPEN-QUESTIONS.md`, Q-105 (e)).
     #[error("header field {field} is {in_header}, the file name gives {expected}")]
     HeaderMismatch {

@@ -34,9 +34,9 @@ pub fn decode_all(data: &[u8]) {
     };
     let len = data.len() as u64;
     let marks = [
-        len,
+        len & !7,
         (len / 2) & !7,
-        data.get(..8).map_or(0, |_| u64_at(data, 0) % (len + 64)),
+        data.get(..8).map_or(0, |_| u64_at(data, 0) % (len + 64)) & !7,
     ];
     if let Ok(r) = scan(data, &id, ScanLimit::End) {
         check(&r, len, true);
