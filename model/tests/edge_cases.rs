@@ -1243,6 +1243,45 @@ fn row_11a_corrupt_block_below_an_old_boots_mark() {
     assert_eq!(after, next.next());
 }
 
+/// Row 11a with a failed recovery sync (§3 Recovery rule 4): after a power
+/// loss, the recovery that finds a damaged batch cannot sync, so the engine
+/// stays read-only. Whether the lost range is recorded and `data_lost`
+/// reported then is Q-79; the model records nothing until a recovery that can
+/// write, even if the read-only engine sealed the segment meanwhile, and then
+/// records the range once and continues above it.
+#[test]
+fn row_11a_failed_recovery_sync_records_the_range_later() {
+    let (mut m, s, b) = open_segment_model();
+    m.crash();
+    let damaged = batch_holding(&m, b[3][0]);
+    m.corrupt_open_batch(damaged).unwrap();
+    m.power_loss();
+    m.restart_with(true);
+    assert!(m.is_read_only());
+    assert!(
+        m.disk.lost_ranges().is_empty(),
+        "nothing recorded while read-only"
+    );
+    assert!(
+        !m.health()
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::DataLost(..)))
+    );
+    m.seal_active();
+    assert!(
+        m.disk.active.is_none(),
+        "the read-only engine sealed the segment"
+    );
+    m.restart();
+    assert!(!m.is_read_only());
+    assert_eq!(m.disk.lost_ranges(), vec![(b[3][0], b[3][1])]);
+    m.restart();
+    assert_eq!(m.disk.lost_ranges().len(), 1, "recorded once");
+    let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
+    assert_eq!(next, b[3][1].next(), "positions not reused");
+}
+
 /// Row 11a in the model: damage to a batch holding a definition is refused,
 /// since what a lost registry, routing or zone entry means is open (Q-33);
 /// so is damage while the engine runs (the model finds corruption of the open

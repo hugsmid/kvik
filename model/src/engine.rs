@@ -2151,11 +2151,13 @@ impl Model {
                 return false;
             };
             if mark.boot == self.boot {
+                self.record_lost_ranges();
                 return false;
             }
             if sync_fails {
                 return true;
             }
+            self.record_lost_ranges();
             self.sync_mark();
             return false;
         };
@@ -2179,13 +2181,13 @@ impl Model {
         // What is left on disk is now whole.
         self.disk.tail_fate = None;
         if same_boot {
-            self.record_lost_ranges(active);
+            self.record_lost_ranges();
             return false;
         }
         if sync_fails {
             return true;
         }
-        self.record_lost_ranges(active);
+        self.record_lost_ranges();
         self.sync_mark();
         false
     }
@@ -2198,18 +2200,27 @@ impl Model {
     /// batch or, with none, to the mark's last position; the model keeps the
     /// positions each damaged batch held, which give the same range when its
     /// neighbours are valid, and do not repeat an earlier lost range next to it.
-    fn record_lost_ranges(&mut self, active: FileId) {
+    /// A recovery whose sync fails records nothing; damage it leaves is
+    /// recorded by the next recovery that can write, even if a read-only
+    /// engine sealed the segment meanwhile.
+    fn record_lost_ranges(&mut self) {
         let runs: Vec<(Position, Position)> = self
             .disk
             .damaged
-            .range((active, 0)..=(active, usize::MAX))
-            .fold(Vec::new(), |mut runs, (_, (from, to))| {
-                match runs.last_mut() {
-                    Some((_, end)) if end.next() == *from => *end = *to,
-                    _ => runs.push((*from, *to)),
-                }
-                runs
-            });
+            .iter()
+            .fold(
+                Vec::<(FileId, Position, Position)>::new(),
+                |mut runs, ((f, _), (from, to))| {
+                    match runs.last_mut() {
+                        Some((g, _, end)) if g == f && end.next() == *from => *end = *to,
+                        _ => runs.push((*f, *from, *to)),
+                    }
+                    runs
+                },
+            )
+            .into_iter()
+            .map(|(_, from, to)| (from, to))
+            .collect();
         let at = self.wall;
         for (from, to) in runs {
             let epoch = self.disk.epoch();
@@ -2219,7 +2230,7 @@ impl Model {
                 op: ManifestOp::LostRange { from, to },
             });
         }
-        self.disk.damaged.retain(|(f, _), _| *f != active);
+        self.disk.damaged.clear();
     }
 
     /// Moves the durable mark to the end of the active segment, stamped with

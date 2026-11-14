@@ -2221,39 +2221,39 @@ proptest! {
 
     /// 2 with lost ranges. Every delivered position is durable or, delivered
     /// before its batch was damaged, in a lost range; no lost position is
-    /// delivered once its range is recorded; every durable position routed
-    /// to a consumer is delivered to it, or superseded by a `resync`.
+    /// delivered after the damage; every durable position routed to a
+    /// consumer is delivered to it, or superseded by a `resync`.
     #[test]
     fn inv02_delivered_iff_durable_except_lost_ranges(ops in proptest::collection::vec(arb_lossy_op(), 1..80)) {
         let (mut m, ids) = machine();
         let mut basis = ResyncBasis::new();
-        // Per consumer, how many observations each lost range found.
-        let mut seen_at: BTreeMap<(u32, kvik_model::types::Position), usize> = BTreeMap::new();
-        let note = |m: &kvik_model::engine::Model, seen_at: &mut BTreeMap<_, _>| {
-            for (from, _) in m.disk.lost_ranges() {
-                for c in [0u32, 1] {
-                    let n = m.observed.get(&ConsumerId(c)).map_or(0, Vec::len);
-                    seen_at.entry((c, from)).or_insert(n);
+        // Per damaged batch, how many observations each consumer had when
+        // it was damaged: the `Corrupt` operation stops the engine first, so
+        // nothing is delivered between the damage and its recovery.
+        let mut damaged_at: Vec<((kvik_model::types::Position, kvik_model::types::Position), [usize; 2])> = Vec::new();
+        for op in &ops {
+            let before: BTreeSet<_> = m.disk.damaged.values().copied().collect();
+            track_resyncs(&mut m, &mut basis, |m| apply(m, &ids, op)).map_err(TestCaseError::fail)?;
+            let counts = [0u32, 1].map(|c| m.observed.get(&ConsumerId(c)).map_or(0, Vec::len));
+            for r in m.disk.damaged.values() {
+                if !before.contains(r) {
+                    damaged_at.push((*r, counts));
                 }
             }
-        };
-        for op in &ops {
-            track_resyncs(&mut m, &mut basis, |m| apply(m, &ids, op)).map_err(TestCaseError::fail)?;
-            note(&m, &mut seen_at);
         }
         track_resyncs(&mut m, &mut basis, settle);
-        note(&m, &mut seen_at);
         track_resyncs(&mut m, &mut basis, |m| m.drain()).unwrap();
         let dur = durable(&m);
-        let ranges = m.disk.lost_ranges();
+        let lost = lost_positions(&m);
         for (c, sel) in [(0u32, None), (1u32, Some(ids[0]))] {
             let obs = m.observed.get(&ConsumerId(c)).cloned().unwrap_or_default();
             for (i, o) in obs.iter().enumerate() {
-                let range = ranges.iter().find(|(a, b)| *a <= o.position && o.position <= *b);
-                match range {
-                    None => prop_assert!(dur.contains_key(&o.position), "consumer {} saw non-durable {}", c, o.position),
-                    Some((from, _)) => prop_assert!(i < seen_at[&(c, *from)], "consumer {} got lost {} after its range was recorded", c, o.position),
+                if !lost.contains(&o.position) {
+                    prop_assert!(dur.contains_key(&o.position), "consumer {} saw non-durable {}", c, o.position);
+                    continue;
                 }
+                let (_, counts) = damaged_at.iter().find(|((a, b), _)| *a <= o.position && o.position <= *b).unwrap();
+                prop_assert!(i < counts[c as usize], "consumer {} got lost {} after its batch was damaged", c, o.position);
             }
             let seen = observed_positions(&m, c);
             let replaced = resync_replaced_justified(&m, &basis, c);
@@ -2367,4 +2367,70 @@ fn lossy_generator_coverage() {
     // A cursor inside a range is rare here; `tests/edge_cases.rs`
     // `row_11a_corrupt_block_inside_the_open_segment` has one by hand.
     assert!(below > 50 && inside > 2);
+}
+
+/// Guards `inv19_resubmission_never_changes_a_current_fact`: re-submissions
+/// must be dropped by the duplicate check and, with the detail off every
+/// local tier, recorded unchecked.
+#[test]
+fn inv19_generator_coverage() {
+    use kvik_model::types::Reading;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = proptest::collection::vec(
+        prop_oneof![
+            6 => (0usize..3, 0usize..DUP_VALUES.len()).prop_map(|(k, v)| (Some((k, v)), None, None)),
+            6 => any::<proptest::sample::Index>().prop_map(|i| (None, Some(i), None)),
+            6 => arb_dup_step().prop_map(|s| (None, None, Some(s))),
+        ],
+        60..80,
+    );
+    let (mut dropped, mut unchecked) = (0u64, 0u64);
+    for _ in 0..200 {
+        let steps = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, ids) = dup_machine();
+        let v = ids[1];
+        for step in &steps {
+            match step {
+                (Some((key, value)), _, _) => {
+                    let t = DUP_KEYS[*key];
+                    let next = durable(&m)
+                        .values()
+                        .filter(|f| f.series == v && f.t == t)
+                        .filter_map(|f| f.changed_at)
+                        .max()
+                        .map_or(0, |c| c + 1);
+                    m.ingest(vec![Reading::versioned(v, t, DUP_VALUES[*value], next)])
+                        .unwrap();
+                }
+                (_, Some(i), _) => {
+                    let recorded: Vec<_> = durable(&m)
+                        .into_values()
+                        .filter(|f| f.series == v)
+                        .collect();
+                    if recorded.is_empty() {
+                        continue;
+                    }
+                    let f = i.get(&recorded);
+                    let (d, u) = (
+                        m.counters.duplicates_dropped,
+                        m.counters.duplicates_unchecked,
+                    );
+                    let value = f.value.as_f64().unwrap_or(f64::NAN);
+                    m.ingest(vec![Reading {
+                        quality: f.supplied_quality,
+                        ..Reading::versioned(v, f.t, value, f.changed_at.unwrap())
+                    }])
+                    .unwrap();
+                    dropped += m.counters.duplicates_dropped - d;
+                    unchecked += m.counters.duplicates_unchecked - u;
+                }
+                (_, _, Some(s)) => apply_dup_step(&mut m, s),
+                _ => unreachable!(),
+            }
+        }
+    }
+    eprintln!("re-submissions dropped {dropped} unchecked {unchecked}");
+    assert!(dropped > 500 && unchecked > 50);
 }
