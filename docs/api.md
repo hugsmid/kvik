@@ -93,7 +93,7 @@ while let Some(d) = consumer.next().await {
 enum ConditionState { True, False, Unknown }
 enum Live { Value(Fact), None, Unknown }
 ```
-- During a restore a condition evaluation with no local detail, and live state that no local fact gives, are
+- During a restore a condition evaluation with no local detail, and live state with no local fact or node, are
   `Unknown` (spec §2.3, §6 Conditions): the evaluation is skipped and counted (`evaluations_unknown`), the latch is
   unchanged, `Resync` carries `Unknown` for that funnel, and the first evaluation with detail is delivered as a
   `Trigger`.
