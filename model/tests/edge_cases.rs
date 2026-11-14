@@ -2142,7 +2142,8 @@ fn row_23_series_renamed_alias_fact() {
     );
 }
 
-/// Row 24: "Unit, kind or scale changes: new series; old one retired."
+/// Row 24: "Unit or kind changes, or a lower decimal scale: new series; old one retired." (The model has no
+/// decimal scale, so a raise is not modelled.)
 #[test]
 fn row_24_unit_or_kind_change_is_new_series() {
     let (mut m, s) = model();

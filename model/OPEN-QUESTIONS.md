@@ -26,6 +26,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
+| Q-100 | §2.1 `decimal scale`, `excess precision`, §5.2, §5.6 | Where the largest stored magnitude is kept, whether the policy may change, and stored nodes across a scale raise |
+| Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise of a reading that was rounded |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -383,6 +385,34 @@ middle is not examined. One `resync` delivery carries the state of every funnel 
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
 
+## Q-100 — Where the largest stored magnitude is kept, whether the policy may change, and nodes across a raise
+**Scenario.** The owner's decimal ruling (§2.1 `decimal scale`, `excess precision`): a raise is refused if the
+largest magnitude stored so far for the series would overflow `i64` at the new scale, and that magnitude is to be
+kept per series in the manifest. (a) Manifest records are appended when files are published, retired, moved or lost
+(§7 Manifest), and the last record is not acted on until a successor is synced; the largest magnitude changes with
+facts, at any commit. Recording it there needs a record per new maximum, or a value that lags the log, which the range
+check cannot use. It can also be derived from the facts (§1 principle 2), for example from the per-series index of
+sealed segments and the summaries of compacted chunks and nodes, with the open segment scanned at start. (b) The
+policy (`round`, `refuse`, `auto-raise` with its maximum) is a definition field; whether a parameter change may
+change it, and from which position or time, is not said. (c) Stored summary nodes of a decimal series hold exact
+`i128` sums (§5.6, bitwise reproducible): at which scale a node is held when the facts it covers were stored at
+different scales, and how rebuild-equals-live holds across a raise (for example, at the highest scale among its
+facts), is not said.
+**Model.** Not modelled; the model has no decimal series (see the table below).
+**Needed.** (a) Where the magnitude is kept, or the owner's confirmation of the manifest with the record it needs.
+(b) Whether the policy may change after definition. (c) The scale of a stored node. To be settled by roadmap 5.1, (c)
+by 7.1.
+
+## Q-101 — A replay across a scale raise of a reading that was rounded
+**Scenario.** A series at scale 4 with the policy `round` receives 0.12345, stored as 0.1234 (half to even) and
+flagged `rounded`. The scale is raised to 5. The adapter replays the same reading: it is now stored as 0.12345, which
+is not identical to the stored fact (§2.4 compares values), so it is recorded as a new fact for the same `t` and
+becomes the current value, a correction nobody made. The same follows from `auto-raise` between a reading and its
+replay.
+**Model.** Not modelled; the model has no decimal series.
+**Needed.** Whether duplicate identity compares a decimal value at the scale of the fact already stored (so the
+replay, rounded to that scale, is a duplicate), or the replay is recorded. To be settled by roadmap 5.1.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -414,6 +444,8 @@ gate 3.3.
 | Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
+| Q-100 | 5.1 | Series registry; (c) by 7.1; recorded after gate 3.3, from the owner's decimal ruling |
+| Q-101 | 5.1 | Series registry and duplicates; recorded after gate 3.3, from the owner's decimal ruling |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
@@ -708,6 +740,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |
 | Calendar files | §5.1: per-series files on hot, loaded at start | Built from the trees at every start with the tzdata version the log names, taken from the releases this process has seen (the host's database when it has not seen that version), and refreshed per changed minute at commit | `tests/invariants.rs` `inv08_calendar_rebuild_equals_live` |
 | Adopting a tzdata release | §5.7: the writer reads the host's release at open, about once a minute and at each local midnight, and whenever it is not the version in force writes a tzdata entry naming it and rebuilds the affected days, without a restart; readers and drills never refuse, and compute calendar results with their own release, using a stored node only where its recorded release is theirs (Q-93 (a)) | The model holds several releases: installing one (`Model::install_tzdb`) writes nothing, results then follow the new rules before any entry names them, a restart keeps the version the log names, and `Model::rebuild_calendars` writes the tzdata entry and rebuilds when called; nothing is refused | `tests/open_questions.rs` `q76_tzdata_change_is_a_log_entry_written_by_the_rebuild` (its restart step), `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` (results between the install and the rebuild) |
+| Decimal series | §2.1 `decimal scale` (default 4, raised by an entry, never lowered; range check), `excess precision` (`round` flagged `rounded`, `refuse`, `auto-raise`; `f64` input converted to its shortest decimal first), row 24 | Values are `f64` only (`ValueType::Number`): there is no scale, raise, policy or `rounded` flag | `tests/edge_cases.rs` `row_24_unit_or_kind_change_is_new_series` |
 | Local days around a site-zone change | §5.7: the day of date D starts at the first instant whose local date, in the zone in force at that instant, is D or later, so days and months tile; "today" is the latest date whose day has started | `calendar::Zoning::Site` takes a day in the latest entry's zone under which it starts at or after that entry's effective time, else in the store's zone, so a change to another offset leaves hours in no day or two days overlapping; a month node is stored only where its days are contiguous | `tests/open_questions.rs` `q75_site_zone_change_to_another_offset_leaves_a_gap_or_an_overlap` |
 | New-consumer start; `emits` and cycles; name patterns | §4 New consumer, Routing (a consumer declares `emits` and emits through its own handle; a change that closes a cycle is refused), row 33; the pattern grammar is open (Q-88) | Consumers are declared when the model is created and start before the first position; a consumer declares no `emits` and emits through the store like any adapter, and no cycle is rejected; a selection is a list of ids or every series | `tests/edge_cases.rs` `row_33_emit_from_a_delivery_does_not_block_and_a_cycle_is_not_rejected` |
 | Routes before a restore's checkpoint | §2.1, §4 Routing: routing changes are kept with their positions in the registry file, which every tree checkpoint carries, so a route is in force from step 1 of a restore, and after its log segment has left hot | Routes are taken from the entries that are local; a route added before the checkpoint is not in force until the file holding its entry is downloaded | `tests/open_questions.rs` `q64_route_before_checkpoint_not_in_force_until_its_entry_is_back` |

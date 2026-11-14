@@ -86,23 +86,26 @@ pub struct Span(pub i64);          // signed ns; window offsets relative to now,
 pub struct Position { pub generation: u32, pub sequence: u64 }     // Ord; (g, 0) = before generation g
 pub struct SeriesId(pub u32);
 pub enum Quality { Good, Estimated, Suspect, Bad }
-pub enum Value { F64(f64), Decimal(i64), State(u16), Bool(bool), Text(String), Absent }
+pub enum Value { F64(f64), Decimal { units: i64, scale: u8 }, State(u16), Bool(bool), Text(String), Absent }   // Decimal = units × 10^−scale
 pub struct TimeRange { pub from: Timestamp, pub to: Timestamp }    // half-open [from, to), event time
 pub struct LocalDate { pub year: i16, pub month: u8, pub day: u8 }
 pub struct LocalTime(/* ns since local midnight */);
 pub struct ZoneName(String);       // an IANA name; checked against the tzdata release where used
 ```
-- `Value::Decimal(i)` is the scaled integer of a series declared `ValueType::Decimal { scale }`; an `F64` sent to
-  such a series is refused (`Refusal::WrongType`), never rounded (owner decision pending).
-  `Value::decimal(x: f64, scale) -> Option<Value>` converts exactly representable values for adapters. `Absent` is
-  "no value" (spec §2.5); NaN and ±∞ are accepted and recorded so.
+- A decimal series takes `Value::Decimal` or `Value::F64`. An `F64` is first converted to its shortest decimal
+  representation (0.1 + 0.2 gives 0.3 at scale 4); a value with more decimal places than the series' current scale is
+  then handled by its `ExcessPrecision` policy (spec §2.1): rounded half to even and flagged `rounded` (the default),
+  refused with `Refusal::ExcessPrecision { scale_needed }`, or the scale raised up to a maximum. Writers should round
+  to the precision they actually need; raw sensor floats belong in an `f64` series, which keeps the value bit-exact.
+  `Absent` is "no value" (spec §2.5); NaN and ±∞ are accepted and recorded so (a decimal series cannot hold them:
+  `Refusal::WrongType`).
 - Configuration durations are `std::time::Duration`; `Span` is used only where a sign is needed.
 
 ## Errors (accepted at gate 3.3)
 ```rust
 pub enum Refusal {                 // per reading, in Ack; each counted per series
     UnknownSeries, Retired, WrongType, StateOutOfRange, TextTooLong, ChangedAtMissing, ChangedAtUnexpected,
-    ReviseOnVersioned, OffPhase, NotDeclared }
+    ReviseOnVersioned, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
 pub enum Wait { QueueFull, DiskFull, UnsyncedClock }                // back-pressure: not a refusal, not a fault
 pub enum EmitError {               // per call
     Busy(Wait),                    // try_emit only: nothing was queued
@@ -115,7 +118,7 @@ pub enum OpenError { Locked, NotAStore, StoreIdMismatch { file }, UnsupportedFor
 pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { epoch }, NoSpace { path } }
 pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault) }      // any call that appends an entry
 pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid { field, reason }, UnknownZone,
-    UnknownSeries, Retired, Write(WriteError) }
+    UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 }, Write(WriteError) }
 pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timestamp> }, AggregateRefused { reason },
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source } }
@@ -138,21 +141,26 @@ Funnel compilation errors (`RouteCycle` among them) and backup errors are added 
 ```rust
 let id: SeriesId = store.define_series(SeriesSpec {
     name: "plant/line-1/temperature".into(),
-    kind: Kind::Gauge { value: ValueType::Decimal { scale: 1 } },
+    kind: Kind::Gauge { value: ValueType::Decimal { scale: 1 } },   // ValueType::decimal() declares scale 4
     unit: "°C".into(),
     expected_interval: Some(Duration::from_secs(1)),
+    excess_precision: ExcessPrecision::Round,   // default; or Refuse, or AutoRaise { max_scale }
     ..Default::default()
 }).await?;
 store.set_parameters(id, effective_from, ParameterChange { .. }).await?;
+store.raise_scale(id, 3).await?;              // from this entry's position on; never lowered
 store.alias(id, "plant/line-1/temp").await?;
 store.retire(id, t_r).await?;
 let info = store.series(id)?;                 // also by name
 ```
 These calls, and route changes, resolve only after the durable mark has been synced past their entry (spec §3
 Commit). The writer forces that mark sync at once rather than waiting for the timed interval, so each call waits for
-one mark sync, not for up to the interval. Defining a series that already
-exists with the same specification returns its id. A different kind, value type,
-scale or unit under the same name is an error; the caller retires and defines anew.
+one mark sync, not for up to the interval. Defining a series that already exists with the same specification
+returns its id. A different kind, value type or unit, or a lower scale, under the same name is an error; the caller
+retires and defines anew. A higher scale is set with `raise_scale`, which appends a scale raise entry (spec §2.1
+`decimal scale`); it fails with `ScaleNotRaised` unless the new scale is higher, and with `ScaleOverflow` if the
+largest magnitude stored so far would overflow `i64` at it. Earlier facts keep their scale and are returned rescaled
+exactly to the current one.
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
 series; a day may start at a declared local time instead of midnight:
@@ -172,7 +180,7 @@ pub async fn emit(&self, readings: &[Reading]) -> Result<Ack, EmitError>;       
 pub fn try_emit(&self, readings: &[Reading]) -> Result<Pending, EmitError>;         // never waits; Err(Busy(w))
 pub struct Pending;  /* impl Future<Output = Result<Ack, EmitError>> */              // may be dropped
 pub struct Ack { pub outcomes: Vec<Outcome> }                                        // one per reading, by index
-pub enum Outcome { Recorded { position: Position, outranked: bool, unchecked: bool }, Duplicate, Refused(Refusal) }
+pub enum Outcome { Recorded { position: Position, outranked: bool, unchecked: bool, rounded: bool }, Duplicate, Refused(Refusal) }
 impl Ack { pub fn first(&self) -> Option<Position>; pub fn last(&self) -> Option<Position>;
            pub fn duplicates_dropped(&self) -> u32; pub fn refused(&self) -> impl Iterator<Item = (usize, Refusal)>; }
 pub struct Reading { pub series: SeriesId, pub t: Timestamp, pub value: Value, pub quality: Quality,
@@ -320,7 +328,8 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
 // LogStats { durable: Position, mark_synced: Position, open_file_id, sealed_segments, bytes }   ClockStats { jumps, last: Option<ClockJump> }
 pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, duplicates_dropped, duplicates_unchecked,
-                                                                   // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts
+                                                                   // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts,
+                                                                   // rounded, scale_raises
 let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), for re-ingest
 ```
 - A loss's identity is the first position of its range when it was first reported. Reports are read from the

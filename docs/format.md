@@ -99,7 +99,7 @@ commit block. A batch never spans files. Unsealed segments are created ahead of 
 | Type | Name | Skippable | Role |
 |---:|---|---|---|
 | `0x01` | facts | no | readings, in arrival order |
-| `0x02` | entries | no | definitions, parameters, aliases, retirements, site-zone and tzdata entries, routing changes, recovery entries |
+| `0x02` | entries | no | definitions, parameters, aliases, retirements, scale raises, site-zone and tzdata entries, routing changes, recovery entries |
 | `0x0F` | commit | no | ends a batch |
 | `0x10` | segment index | yes | written at seal: which series the segment holds |
 | `0x7F` | trailer | no | written at seal: marks the file as sealed |
@@ -113,7 +113,7 @@ uses it.
 
 **Sizes.** `segment_size` is a configuration key, 16 MiB to 1 GiB, a multiple of 4,096, default 64 MiB; it applies
 to segments created after it changes. A facts block is closed when the next row would take it past 65,536 rows or a
-plain-encoded size of 8 MiB (32 bytes per row plus text bytes); rows fill blocks in order, each block as full as
+plain-encoded size of 8 MiB (33 bytes per row plus text bytes); rows fill blocks in order, each block as full as
 these limits allow. A batch holds whole emit calls and whole entry calls; it is closed when the next call would take
 its data blocks past `max_batch_bytes` (default 1 MiB), and always holds at least one call. One call is at most
 `min(65,536, limits.ingest_queue)` readings and 8 MiB plain-encoded (`api.md` Writing), so every batch fits an empty
@@ -189,11 +189,12 @@ and ignorable rule.
 | 1 | `series_id` | u32 | mandatory | plain |
 | 2 | `t` | i64 | mandatory | plain |
 | 3 | `quality` | u8: 0 good, 1 estimated, 2 suspect, 3 bad | optional; absent means all good | plain, run-length |
-| 4 | `flags` | u16 bit set: 0 future, 1 late, 2 revise, 3 host_time, 4 unsynced_clock, 5 no_value, 6 has_changed_at | optional; absent means all zero | plain, run-length |
+| 4 | `flags` | u16 bit set: 0 future, 1 late, 2 revise, 3 host_time, 4 unsynced_clock, 5 no_value, 6 has_changed_at, 7 rounded | optional; absent means all zero | plain, run-length |
 | 5 | `value_type` | u8: 1 f64, 2 i64 (scaled), 3 state index, 4 bool, 5 text | mandatory | plain, run-length |
 | 6 | `value` | 8 bytes per row | mandatory | plain |
 | 7 | text heap | bytes | exactly when a row has `value_type = 5` | plain |
 | 8 | `changed_at` | u64 | exactly when a row has flag bit 6 | plain |
+| 9 | `scale` | u8, 0–18 | exactly when a row has `value_type = 2` | plain, run-length |
 
 - `value` holds the IEEE-754 bit pattern (f64), the two's-complement integer (i64), the index or 0/1 in the low
   bytes with zero upper bytes (state, bool), or for text a `u32` offset and a `u32` length relative to the start of
@@ -202,11 +203,14 @@ and ignorable rule.
   stored: bad for a `no_value` row, else the worse of the supplied quality and suspect when `future` is set.
 - A `no_value` row has `value = 0` and the series' declared `value_type`.
 - Flag bit 6 `has_changed_at`: the row belongs to a versioned series and column 8 holds its `changed_at`, an unsigned
-  integer to which the rule that times are `i64` does not apply; other rows hold 0 there. Bits 7–15 are undefined
-  and critical.
+  integer to which the rule that times are `i64` does not apply; other rows hold 0 there. Flag bit 7 `rounded`: the
+  value was rounded to the series' scale (`spec.md` §2.1 `excess precision`). Bits 8–15 are undefined and critical.
+- Column 9 holds the scale each decimal row was stored at (the series' scale at the row's position); other rows hold
+  0 there. A reader rescales exactly to the series' current scale, so a fact never depends on a raise entry being
+  kept.
 - **Checks** (a failure makes the block invalid, A.2): a mandatory column missing; a column id twice; a payload
   outside the body or overlapping another; a length that does not match `row_count`; an encoding not allowed for the
-  column; a value out of the range above; the presence rules of columns 7 and 8 broken. A `value_type` that
+  column; a value out of the range above; the presence rules of columns 7, 8 and 9 broken. A `value_type` that
   contradicts the series definition is not a block check: the fact is treated as an orphaned fact (`spec.md` §2.1) by
   whoever has the registry.
 - **Encoding 0, plain:** `row_count` fixed-width values.
@@ -214,8 +218,8 @@ and ignorable rule.
   written as minimal unsigned LEB128 of at most 3 bytes; adjacent runs differ in value; the run lengths sum to
   `row_count`. A reader rejects anything else. A writer uses run-length for a column exactly when it is smaller than
   plain.
-- `value_type` lets a block be decoded to typed raw values without the registry (bit pattern, unscaled integer,
-  state index, bool, text). Scale, state names, kind, versioning and interval length come from definition entries,
+- `value_type` and `scale` let a block be decoded to typed values without the registry (bit pattern, decimal,
+  state index, bool, text). State names, kind, versioning and interval length come from definition entries,
   which a reader takes from the registry file and the log.
 
 ### A.6 Entries block body
@@ -237,13 +241,14 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | Entry type | Fields |
 |---:|---|
 | 1 series definition | the table below |
-| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (13–19 and 22 are fixed for life). A change of 7 without 8 is written with 8 = 3 × the new interval, so the entry is self-contained |
+| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12. Fields 23 and 24 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20. No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life; whether 25 and 26 may change is open, Q-100). A change of 7 without 8 is written with 8 = 3 × the new interval, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
 | 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
 | 6 site zone | 30 zone name (UTF-8 IANA name, at most 63 bytes); 20 effective time |
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
 | 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reserved; 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32`; 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
+| 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
 
 Series definition fields, all critical:
 
@@ -253,7 +258,7 @@ Series definition fields, all critical:
 | 2 | name | UTF-8, 1–255 bytes | always |
 | 3 | kind | u8: 1 gauge, 2 counter, 3 state, 4 text, 5 interval | always |
 | 4 | value type | u8, the A.5 codes: 1 f64, 2 scaled i64, 3 named state, 4 bool, 5 text | always |
-| 5 | decimal scale | u8, 0–18 (value = integer × 10^−scale) | value type 2 |
+| 5 | decimal scale | u8, 0–18 (value = integer × 10^−scale); 4 when the caller declared none | value type 2 |
 | 6 | unit | UTF-8, 0–63 bytes | always |
 | 7 | expected interval | i64 ns > 0, or none | always |
 | 8 | staleness limit S | i64 ns > 0, or none | always |
@@ -270,6 +275,8 @@ Series definition fields, all critical:
 | 22 | day start | i64 ns, 0 ≤ x < 24 h | tag 1 |
 | 23 | retention class | u8: 0 long-term, 1 diagnostic | always |
 | 24 | retention period | i64 ns | class 1 |
+| 25 | excess precision | u8: 0 round, 1 refuse, 2 auto-raise | value type 2 |
+| 26 | maximum scale | u8, 0–18, at least field 5 | field 25 = 2 |
 
 **Checks** (a failure makes the block invalid, A.2): `length` or a field overrunning its container; a critical
 field out of order or repeated when not marked repeated; a value outside its range above.
@@ -493,7 +500,8 @@ to every stored file.
   style of A.9. Roadmap 2.1 decided the encodings: delta with frame-of-reference bit-packing per 128 values for `t`,
   positions and `i64`; scaled decimal with per-value exceptions and a zstd-compressed XOR fallback; run-length for
   quality, flags and states; 4,096-row blocks behind a directory of first and last `t`. The layout, the per-batch
-  `received_at` table and the self-description fields are written by roadmap 6.1. The index can be fetched without
+  `received_at` table and the self-description fields are written by roadmap 6.1. A chunk of a decimal series
+  records its own scale; the encoder may use any scale up to the series' current scale, and readers rescale exactly. The index can be fetched without
   the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
 - **Manifest (`kind = 3`).** Framing, the empty, lost-range and acknowledgement records are in A.14. Still to be laid
   out: the publish and retire record (one record publishes a set of files and retires another set atomically, with an
