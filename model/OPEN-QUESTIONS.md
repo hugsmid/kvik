@@ -29,9 +29,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-100 | §2.1 `decimal scale`, `excess precision`, §5.2, §5.6 | Where the largest stored magnitude is kept, whether the policy may change, stored nodes across a scale raise, and a lost raise |
 | Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise, rounded or not |
 | Q-102 | §2.1 `decimal scale`, §2.5 | A finite value too large for `i64` at the series' scale |
-| Q-103 | §7 Manifest, §8 Generations, Tiers | What an automatic manifest rebuild cannot recover from local files |
 | Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
 | Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
+| Q-107 | §7 Manifest (Deep unreachable), §3 Write or sync failure, §11 Health, `api.md` Health | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -420,31 +420,22 @@ make it worse).
 **Model.** Not modelled; the model has no decimal series.
 **Needed.** The outcome and its counter. To be settled by roadmap 5.1.
 
-## Q-103 — What an automatic manifest rebuild cannot recover from local files
-**Scenario.** §7 Manifest rebuilds the manifest from the self-describing local files when a corrupt record has no
-copy; its steps are ruled only where the local files settle the case. Cases they do not settle:
-(a) Files held only in deep (evicted) or only in the mirror path: their positions look missing, and a local input
-whose merged output is only in deep would be taken as live beside it.
-(b) Any rebuild above generation 0 (§8 Generations): the restore record (restored end, ends carried from earlier
-generations, files restored from), set-aside ranges, acknowledgements, lost-range causes and id floors are in no
-file; which valid records, before and after the corrupt one, are carried over into the rebuilt manifest is not said.
-(c) Loss causes and identities: a lost range found again is only missing positions, so its cause (any of 1–4) is
-not known, and a loss that had been extended downward has as identity its first position when first reported
-(§3 Order of a start, step 4), not the first missing position the rebuild would give it, so an acknowledgement given
-under the old identity no longer matches.
-(d) Deep cannot be reached, so whether a copy of the record exists is unknown; for now the store stays read-only
-(`manifest_corrupt`) until deep answers. What the writer does meanwhile (wait, retry, or rebuild after a time) is
-not said.
-(e) Quarantine and tier-move records (reserved, roadmap 8.1).
-(f) Uploading: whether and how the rebuilt manifest's records are uploaded (their epochs and generation), and how a
-restore reads a generation whose records in the bucket are those before the rebuild followed by a rebuild record.
-(g) The `file_id` floor (`format.md` A.12): ids named only by the lost record, or by records not carried over, are
-no longer seen, so an id could be issued again.
+## Q-107 — The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild
+Recorded when Q-103 (d) was settled. To be settled by roadmap item 6.3.
+**Scenario.** A start finds a corrupt manifest record; the mirror path holds no copy and deep does not answer. The
+store opens read-only (`manifest_corrupt`) and, after `manifest.rebuild_wait`, rebuilds provisionally and continues
+(§7 Manifest). (1) The rule does not say when the wait starts, nor whether a restart starts it again: on a process
+that restarts every ten minutes, a wait counted from each start never ends. (2) Every other read-only state is left
+only by a restart (§3 Write or sync failure; `api.md` Principles: "a fault makes the store read-only"); the
+provisional rebuild leaves `ReadOnly { cause: ManifestCorrupt }` while the store runs, and the same holds when deep
+answers during the wait. (3) Whether `acknowledge_manifest_rebuild` is accepted while the rebuild is provisional,
+and what an acknowledgement given then means when deep later answers with a copy that replaces the reconstruction.
 **Model.** Not modelled; manifest records are not corrupted.
-**Needed.** For (a), (b) and (f), whether the rebuild also lists the bucket (needs the object layout of roadmap
-8.2) and which records it carries over; for (c), whether a cause may be recorded as unknown and how identities are
-kept; for (d), the writer's behaviour while deep is unreachable; for (g), a floor that survives a rebuild (for
-example in the rebuild record). To be settled by roadmap 6.3; (a), (b) and (f) with 8.2 and 8.3.
+**Needed.** (1) The start of the wait (for example the writer's monotonic clock from the first start that found the
+record corrupt with deep unreachable, as the grace period counts from the writer's start, §7 Retired files, or a
+time recorded durably); (2) whether the read-only state of a corrupt manifest record is left without a restart, or
+the store opens writable after the wait only at a later start; (3) whether a provisional rebuild can be
+acknowledged, or the acknowledgement is refused until the rebuild is final.
 
 
 ## Q-105 — Reading a segment: points `format.md` Part A leaves open
@@ -526,7 +517,7 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87 and Q-104 were settled after gate 3.3 by the owner's rulings.
+Q-87 was reopened there. Q-87, Q-103 and Q-104 were settled after gate 3.3 by the owner's rulings; Q-107 was recorded then.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -552,9 +543,9 @@ Q-87 was reopened there. Q-87 and Q-104 were settled after gate 3.3 by the owner
 | Q-100 | 5.1 | Series registry; (c) by 7.1; recorded after gate 3.3, from the owner's decimal ruling |
 | Q-101 | 5.1 | Series registry and duplicates; recorded after gate 3.3, from the owner's decimal ruling |
 | Q-102 | 5.1 | Series registry; recorded at the gate 3.3 review |
-| Q-103 | 6.3 | Manifest rebuild; (a) and (b) with 8.2 and 8.3; recorded at the gate 3.3 review |
 | Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
 | Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
+| Q-107 | 6.3 | Manifest rebuild; recorded when Q-103 was settled |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
@@ -725,7 +716,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-49 (b) | Conditions and live state with no local detail during a restore | §6 Conditions (the state is unknown, not false: the evaluation is skipped and counted, `evaluations_unknown`, the condition keeps its latched state, and the first evaluation with detail is delivered as a transition if it differs from the latched state, or there is none), §2.3 Live state (unknown, not none, for a series whose latest recorded `t` no local fact or stored node holds), §4 Resync and §6 Restart and resume (`resync` reports "unknown" for that funnel, no transition), §8 Restore step 2, invariant 16, §11 Health, `api.md` Consuming, Reading and statistics (`ConditionState::Unknown`, `Live::Unknown`) (open part: Q-84, a state that stays unknown) |
 | Q-50 | Window edges over moved detail of a series with no stored 1-minute level | §6 Old spans (an edge whose detail is not local moves inward to a node boundary of the finest stored level, or with none to where its detail is local, flagged `approximate_edges`; with no span left, `detail_not_local`; no fetch on the evaluation path), invariants 7, 17 and 22, `api.md` Reading |
 | Q-52 | Manifest records as single copies, in part | §7 Manifest (a record appended only after the previous record's sync; the last valid record written again in place at every start; a torn tail, dropped, told from a corrupt record by a valid successor; the last record neither uploaded nor acted on irreversibly until a later record is synced; a corrupt record fetched from deep or the mirror path, else read-only with `manifest_corrupt` and no fact lost), §8 Corrupt block (a manifest record not yet uploaded is a single copy; `mirror_path` covers the manifest), invariant 10, `format.md` Part B (open part: Q-52, rebuilding a corrupt record never uploaded, and checking the in-place rewrite on each platform); the read-only stop for a record with no copy is superseded by Q-52 (a), the automatic rebuild) |
-| Q-52 (a), (c) | Rebuilding a corrupt manifest record never uploaded; a mark without a checksum | §7 Manifest (every file self-describing; with no copy in the mirror path or deep, the writer rebuilds the manifest from the local files by the procedure of `rebuild_manifest`, continues, and reports `manifest_rebuilt` until acknowledged; open part: Q-103), §11 Health, `format.md` A.10 (two checksummed slots), A.14 (rebuild record; open part: Q-52 (b)), `api.md` Health |
+| Q-52 (a), (c) | Rebuilding a corrupt manifest record never uploaded; a mark without a checksum | §7 Manifest (every file self-describing; with no copy in the mirror path or deep, the writer rebuilds the manifest from the local files by the procedure of `rebuild_manifest`, continues, and reports `manifest_rebuilt` until acknowledged; what a rebuild cannot recover from local files: Q-103, settled), §11 Health, `format.md` A.10 (two checksummed slots), A.14 (rebuild record; open part: Q-52 (b)), `api.md` Health |
 | Q-60 | Calendar nodes when the expected interval changes | §5.1 density rule (the levels a series stores are fixed by the expected interval its definition gives; a later change moves the staleness limit and keep-alive, never the levels), §5.1 table and §5.7 (calendar nodes for a series that stores the 15-minute level), §5.6 Canonical order (1-minute nodes computed for the merge where they are not stored), row 20a (open part: Q-83, node contents after a past-effective change of the staleness limit) |
 | Q-61 | Identity of a condition delivery, and where its sequence is kept | §4 Order (every condition delivery, on a fact or on the timer, is `(funnel, sequence)`; the sequence is in memory, from 1 at every engine start, and a consumer resuming at a start receives none before that start's `resync`), §4 At-least-once (never delivered twice; the identity holds until the consumer's next `resync`), `api.md` Consuming; no field in `format.md` |
 | Q-62 | Condition transitions while a consumer catches up after overflow | §4 Overflow (funnels evaluated but silent; the present state sent on re-attaching where it differs; transitions in between counted, `transitions_not_delivered`; catch-up reads hot and cold only and ends with `resync` where its next entry is on no local tier), §4 Resync, §8 Behind consumers, `api.md` Health and statistics |
@@ -749,6 +740,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
 | Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |
 | Q-99 | An exclusive `flock` on the store directory on Windows | §3 Single writer (an operating-system lock on the file `LOCK`, released when the process ends; network file systems not supported), `format.md` A.12, `api.md` Handles |
+| Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (open details: Q-107)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 `file_id` floor and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
 | Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
 
 ## Where the model differs from the specification

@@ -71,7 +71,7 @@ Not supported by the model backend:
 - **Backup, restore, export of set-aside facts and rebuild** (`BackupError::NotSupportedYet`), and
   `export_orphaned` (`QueryError::NotAvailable`).
 - Never produced: the `Unknown` live and condition states, `approximate_edges`, `displaced`, a trigger's value and
-  coverage, `forget_above`, the `ResetPoint` and `GenerationChanged` resync causes, `PossibleLoss`, `ManifestRebuilt`,
+  coverage, `forget_above`, the `ResetPoint` and `GenerationChanged` resync causes, `PossibleLoss`, `ManifestRebuilt` (provisional or not), `LossCause::Unknown`,
   `Outcome::Recorded.unchecked` and `duplicates_unchecked` (the model's detail is always local),
   `SealBlocked`, `Wait::QueueFull` (a call never exceeds the queue, which is empty between calls), commit latency and
   time waited, `orphaned_facts`, `scale_raises`, `interval_displaced`, and `evaluations_unknown` and

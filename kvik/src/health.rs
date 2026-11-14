@@ -60,6 +60,10 @@ pub enum Reason {
     ManifestRebuilt {
         /// Its epoch.
         epoch: u64,
+        /// Rebuilt while deep could not be reached, after
+        /// `manifest.rebuild_wait` (spec §7 Manifest): uploads, evictions and
+        /// removals are held until deep answers.
+        provisional: bool,
     },
     /// A series' source clock appears skewed (spec §9 row 5; an addition of
     /// the model backend).
@@ -74,8 +78,9 @@ impl fmt::Display for Reason {
             Reason::DiskLow { free } => write!(f, "free space low: {free} bytes"),
             Reason::DiskCritical { free } => write!(f, "free space critical: {free} bytes"),
             Reason::SealBlocked { file_id } => write!(f, "segment {file_id} cannot be sealed"),
-            Reason::ManifestRebuilt { epoch } => {
-                write!(f, "manifest record of epoch {epoch} rebuilt")
+            Reason::ManifestRebuilt { epoch, provisional } => {
+                let how = if *provisional { " provisionally" } else { "" };
+                write!(f, "manifest record of epoch {epoch} rebuilt{how}")
             }
             Reason::ClockSkew(s) => write!(f, "the source clock of {s} appears skewed"),
         }
@@ -104,6 +109,9 @@ pub enum LossCause {
     LostInBucket,
     /// Content that failed validation.
     InvalidContent,
+    /// Not known: a loss found again by a manifest rebuild whose cause no
+    /// valid record or recovery entry gives (spec §7 Manifest).
+    Unknown,
 }
 
 /// The state of the mark at recovery.

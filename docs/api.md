@@ -75,7 +75,10 @@ The keys roadmap section 4 needs; all may change between opens.
 | `limits.disk_critical` | `u64` bytes | 512 MiB | |
 | `limits.future_tolerance`, `limits.default_lateness_bound` | `Duration` | 60 s, 5 min | |
 
-Keys of later sections (consumer queue, tiers, tree, leases, backup, `mirror_path`) are listed by their items.
+Keys of later sections (consumer queue, tiers, tree, leases, backup, `mirror_path`) are listed by their items. One is
+fixed already: `manifest.rebuild_wait` (roadmap 6.3), `RebuildWait::After(Duration)` (default 15 minutes) or
+`RebuildWait::Never`, how long the store stays read-only while deep cannot say whether it holds a copy of a corrupt
+manifest record before it rebuilds provisionally (spec §7 Manifest).
 
 ## Core types (accepted at gate 3.3)
 ```rust
@@ -324,9 +327,10 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }
 pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64 }, DiskCritical { free: u64 },
-    SealBlocked { file_id: u64 }, ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */ } }
+    SealBlocked { file_id: u64 },
+    ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool } }
 pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost | PossibleLoss */,
-    pub cause: LossCause /* Corruption | TruncatedTail | LostInBucket | InvalidContent */,
+    pub cause: LossCause /* Corruption | TruncatedTail | LostInBucket | InvalidContent | Unknown */,
     pub first: Option<Position>, pub last: Option<Position>, pub file_id: Option<u64>, pub bytes: u64,
     pub readable_commit_blocks: u32, pub mark_state: MarkState /* Readable | Missing | Unreadable | Stale */,
     pub boot_id: Option<[u8; 16]>, pub commit_time_before: Option<Timestamp>, pub commit_time_after: Option<Timestamp>,
@@ -350,8 +354,12 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
   no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,
   which is refused while read-only and in a drill as `acknowledge_losses` is, and whose torn acknowledgement record is
-  given again as for `acknowledge_losses` (spec §7 Manifest);
-  while deep cannot be reached to tell whether a copy exists, it is the fault `ManifestCorrupt` (spec §7 Manifest).
+  given again as for `acknowledge_losses` (spec §7 Manifest).
+  While deep cannot be reached to tell whether a copy exists, it is the fault `ManifestCorrupt` for
+  `manifest.rebuild_wait`; then the manifest is rebuilt provisionally (`ManifestRebuilt { provisional: true }`), and
+  uploads, evictions and removals are held until deep answers (spec §7 Manifest; open details: Q-107 in
+  `model/OPEN-QUESTIONS.md`). A corrupt restore record with no copy stays `ManifestCorrupt`. `LossCause::Unknown` is
+  the cause of a loss that a manifest rebuild found again with no cause given by a valid record or recovery entry.
   `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.

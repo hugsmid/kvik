@@ -430,7 +430,8 @@ exists; a new file is created only when none exists.
   `store_id` must equal `STORE`'s.
 - **`file_id`** is unique per store and kind across all generations and never reused. The next id of a kind is 1 +
   the highest id among local file names of that kind, ids named by any manifest record (a restore record lists every
-  file it restores from, local or not) and, for log segments, the mark's `file_id`. `<generation>` in a name is the
+  file it restores from, local or not), any rebuild record's floor of that kind (A.14) and, for log segments, the
+  mark's `file_id`. `<generation>` in a name is the
   generation in which the file was created.
 - **Lock.** `std::fs::File::try_lock` on `LOCK` (`flock` on Unix, `LockFileEx` on Windows), held for the life of the
   writer and released when the process ends. A second writer, in this or another process, fails with `Locked`.
@@ -470,13 +471,19 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
   positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 the corrupt record's epoch as
-  presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`), the
-  first record of a rebuilt manifest. Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
-  `0x25` restore (8.3), `0x26` quarantine and `0x27` tier move (8.1).
+  presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`;
+  5 `file_id` floor, repeated, one per file kind: kind `u8`, id `u64`, 2^32 above the highest id of that kind in any
+  local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
+  missing position because no valid record names their identity, `u32`), the first record of a rebuilt manifest.
+  Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
+  §7 Manifest). Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
+  `0x25` restore (8.3), `0x26` quarantine and `0x27` tier move (8.1). A rebuild never reconstructs these two: a
+  quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
+  another tier" is verified again, so their layouts may hold no fact that only they hold.
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
-  content); 8 boot id (16 bytes); 9 id floor `u32`; 10 and 11 commit times before and after (11 absent at the tail);
-  12 present when the record extends the loss named by field 1. Fields that settling Q-33 and Q-48 needs are added by
+  content, 5 unknown: found again by a manifest rebuild with no cause given, `spec.md` §7 Manifest); 8 boot id
+  (16 bytes); 9 id floor `u32`; 10 and 11 commit times before and after (11 absent at the tail); 12 present when the record extends the loss named by field 1. Fields that settling Q-33 and Q-48 needs are added by
   roadmap 4.5 as new field ids.
 - A torn tail and a corrupt record are told apart as `spec.md` §7 Manifest says: a forward search at 8-byte steps
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
@@ -487,8 +494,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
   (`0x28`), synced, renamed over `MANIFEST`, and the directory synced; a `MANIFEST.new` left by a crash is removed at
   the next start. The rebuild record is acknowledged by an acknowledgement record carrying the rebuild record's own
-  epoch in field 2. What a rebuild cannot recover from local files is open
-  (Q-103).
+  epoch in field 2. The rebuilt manifest carries every valid record of the old one, and the rebuild reconstructs
+  only what the corrupt record alone held (`spec.md` §7 Manifest); a restore record is never rebuilt.
 
 ## A.15 Cursor file and lease file
 - **Cursor**, `cursors/<name>.cur`, kind 4: an A.1 header then blocks of type `0x30`, **appended**, one per cursor
@@ -519,10 +526,17 @@ to every stored file.
   records its own scale; how that scale relates to the scales of its facts is open (Q-100, Q-101). The index can be
   fetched without
   the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
+- **Chunk index (`kind = 14`).** Carries the compacted file's self-description (A.14: kind, class, `file_id`,
+  generation, position range, input `file_id`s, plaintext hash), so that a manifest rebuild can read the inputs of a
+  file that is not local (`spec.md` §7 Manifest).
+- **Local restore record (`kind = 12`).** A copy of the restore record, written by every restore beside the
+  manifest's, from which a corrupt restore record is read again (`spec.md` §7 Manifest, §8 Generations).
 - **Manifest (`kind = 3`).** Framing, the empty, lost-range and acknowledgement records are in A.14. Still to be laid
   out: the publish and retire record (one record publishes a set of files and retires another set atomically, with an
   epoch), the sealed-segment, quarantine and tier-move records, and the restore record, which also carries the lost
-  ranges, acknowledgements and recovery-entry loss reports of the generations it restores from.
+  ranges, acknowledgements and recovery-entry loss reports of the generations it restores from. Every record that
+  names a file repeats its kind, position range and plaintext hash, and every record that names a loss repeats its
+  identity, so that no such fact is held by one record alone once a second names it (`spec.md` §7 Manifest).
 - **Cursor (`kind = 4`).** A.15; latches and sequences are added by roadmap 5.2.
 - **Registry (`kind = 5`).** The compacted registry: series entries, site-zone and tzdata entries, routing
   changes and recovery entries, each with its position.
