@@ -59,8 +59,8 @@ pub const DENSITY: [Nanos; 2] = [5 * SECOND, 60 * SECOND];
 
 impl Params {
     /// Parameters with a staleness limit, default counter rules and the
-    /// expected interval for which that limit is the default (S = 3 ×
-    /// expected interval, §2.1), or none without a limit.
+    /// kind's default expected interval (§2.1: 60 s for gauges and counters,
+    /// none for state and text).
     pub fn new(kind: Kind, staleness: impl Into<Option<Nanos>>) -> Self {
         let staleness = staleness.into();
         assert!(
@@ -71,7 +71,7 @@ impl Params {
             kind,
             staleness,
             counter: CounterRules::default(),
-            expected_interval: staleness.map(|s| s / 3),
+            expected_interval: crate::registry::default_expected_interval(kind, None),
             timing: Timing::Observed,
             interval: None,
         }
@@ -83,6 +83,7 @@ impl Params {
     pub fn interval(length: Nanos, phase: Nanos) -> Self {
         Params {
             interval: Some(IntervalSpec { length, phase }),
+            expected_interval: Some(length),
             ..Params::new(Kind::Interval, 3 * length)
         }
     }

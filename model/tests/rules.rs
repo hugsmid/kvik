@@ -22,15 +22,18 @@ use kvik_model::types::{
 };
 use kvik_model::view;
 
+/// A gauge with staleness limit `staleness` and an expected interval of
+/// 1 s, so that both levels are stored (§5.1).
 fn model(staleness: Nanos) -> (Model, SeriesId) {
     let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             staleness,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     (m, s)
@@ -214,12 +217,13 @@ fn s2_4_current_fact_in_cold_tier_is_checked() {
     };
     let mut m = Model::new(cfg, vec![], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     for i in 0..6 {
@@ -407,6 +411,83 @@ fn s2_1_interval_and_record_on_change_definitions() {
     );
 }
 
+/// §2.1: the expected interval is configuration of its own, defaulting to
+/// 60 s for gauges and counters, d for an interval series and none for state
+/// and text; the staleness limit defaults to 3 × the expected interval, and
+/// setting S does not change the expected interval.
+#[test]
+fn s2_1_expected_interval_defaults() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let mut def = |name: &str, kind, vt, s: Option<Nanos>, options| {
+        let id = m.define_with(name, kind, vt, "1", s, options).unwrap();
+        let d = m.registry().unwrap().get(id).unwrap().clone();
+        (d.expected_interval(), d.staleness)
+    };
+    let none = SeriesOptions::default();
+    assert_eq!(
+        def("a/b/gauge", Kind::Gauge, ValueType::Number, None, none),
+        (Some(MINUTE), Some(3 * MINUTE))
+    );
+    assert_eq!(
+        def("a/b/counter", Kind::Counter, ValueType::Number, None, none),
+        (Some(MINUTE), Some(3 * MINUTE))
+    );
+    assert_eq!(
+        def("a/b/state", Kind::State, ValueType::Name, None, none),
+        (None, None)
+    );
+    assert_eq!(
+        def("a/b/text", Kind::Text, ValueType::Text, None, none),
+        (None, None)
+    );
+    assert_eq!(
+        def(
+            "a/b/interval",
+            Kind::Interval,
+            ValueType::Number,
+            None,
+            SeriesOptions::interval(15 * MINUTE, 0)
+        ),
+        (Some(15 * MINUTE), Some(45 * MINUTE))
+    );
+    // S set: the expected interval keeps its default.
+    assert_eq!(
+        def(
+            "a/b/fast",
+            Kind::Gauge,
+            ValueType::Number,
+            Some(10 * SECOND),
+            none
+        ),
+        (Some(MINUTE), Some(10 * SECOND))
+    );
+    assert_eq!(
+        def(
+            "a/b/dense",
+            Kind::Gauge,
+            ValueType::Number,
+            None,
+            SeriesOptions::expected(SECOND)
+        ),
+        (Some(SECOND), Some(3 * SECOND))
+    );
+    // A gauge given neither stores the 15-minute level and not the 1-minute
+    // level (§5.1).
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let g = m
+        .define("a/b/gauge", Kind::Gauge, ValueType::Number, "1", None)
+        .unwrap();
+    let f = m
+        .define("a/b/fast", Kind::Gauge, ValueType::Number, "1", 10 * SECOND)
+        .unwrap();
+    m.ingest(vec![Reading::num(g, T0, 1.0), Reading::num(f, T0, 1.0)])
+        .unwrap();
+    for s in [g, f] {
+        let tree = m.tree(s).unwrap();
+        assert!(tree.stored(0).next().is_none() && tree.stored(1).next().is_some());
+    }
+}
+
 /// §5.1 density rule: the 1-minute level is stored only for series whose
 /// expected interval is 5 s or shorter, the 15-minute level only for 60 s or
 /// shorter; a sparser series answers those levels from its facts, and stores
@@ -580,12 +661,13 @@ fn s4_overflow_catch_up_resumes_after_last_enqueued() {
     };
     let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     for i in 0..5 {
@@ -682,12 +764,13 @@ fn s3_full_ingest_queue_waits() {
         T0 + HOUR,
     );
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.emit(Reading::num(s, T0, 1.0)).unwrap();
@@ -736,12 +819,13 @@ fn consumer_model() -> (Model, SeriesId) {
     };
     let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "site/pump-2/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     (m, s)
@@ -868,12 +952,13 @@ fn backed_up_model() -> (Model, SeriesId) {
     };
     let mut m = Model::new(Config::default(), vec![c], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "plant/line-1/temperature",
             Kind::Gauge,
             ValueType::Number,
             "degC",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     for i in 0..4 {
@@ -1726,21 +1811,23 @@ fn routed_model(capacity: usize) -> (Model, SeriesId, SeriesId) {
     };
     let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
     let a = m
-        .define(
+        .define_with(
             "site/pump-2/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     let b = m
-        .define(
+        .define_with(
             "site/pump-3/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     (m, a, b)
@@ -2538,7 +2625,10 @@ fn versioned_model() -> (Model, SeriesId) {
             ValueType::Number,
             "kW",
             10 * SECOND,
-            SeriesOptions::versioned(ChangedAtKind::Version),
+            SeriesOptions {
+                expected_interval: Some(SECOND),
+                ..SeriesOptions::versioned(ChangedAtKind::Version)
+            },
         )
         .unwrap();
     (m, s)
@@ -2551,12 +2641,13 @@ fn versioned_model() -> (Model, SeriesId) {
 fn s2_2_changed_at_on_versioned_series_only() {
     let (mut m, v) = versioned_model();
     let g = m
-        .define(
+        .define_with(
             "site/pump-2/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     assert_eq!(
@@ -2825,12 +2916,13 @@ fn record_adding(m: &Model, f: FileId) -> &kvik_model::engine::ManifestRecord {
 fn s7_compaction_publishes_per_series_chunks_in_one_record() {
     let (mut m, a) = model(10 * SECOND);
     let b = m
-        .define(
+        .define_with(
             "vehicle/8/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.ingest(vec![Reading::num(a, T0, 1.0), Reading::num(b, T0, 2.0)])
@@ -3067,12 +3159,13 @@ fn s3_low_mark_pauses_compaction_not_tiering() {
     };
     let mut m = Model::new(cfg, vec![], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
@@ -3093,12 +3186,13 @@ fn s3_low_mark_pauses_compaction_not_tiering() {
 fn s8_eviction_at_90_days_with_revision_age_per_series() {
     let (mut m, a) = model(10 * SECOND);
     let b = m
-        .define(
+        .define_with(
             "vehicle/8/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.config.revision_age.insert(b, None);
@@ -3155,12 +3249,13 @@ fn s8_eviction_at_90_days_with_revision_age_per_series() {
 fn s8_retention_class_moves_diagnostic_detail_after_its_period() {
     let (mut m, s) = model(10 * SECOND);
     let g = m
-        .define(
+        .define_with(
             "vehicle/8/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     for x in [s, g] {
@@ -3223,12 +3318,13 @@ fn s8_fill_pressure_moves_log_segments_before_current_detail() {
     };
     let mut m = Model::new(cfg, vec![], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     let mut chunks = Vec::new();

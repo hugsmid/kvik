@@ -344,8 +344,15 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
         .iter()
         .enumerate()
         .map(|(i, k)| {
-            m.define(NAMES[i], *k, value_type(*k), "1", 5 * SECOND)
-                .unwrap()
+            m.define_with(
+                NAMES[i],
+                *k,
+                value_type(*k),
+                "1",
+                5 * SECOND,
+                SeriesOptions::expected(SECOND),
+            )
+            .unwrap()
         })
         .collect();
     ids.push(
@@ -355,7 +362,10 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
             ValueType::Number,
             "1",
             5 * SECOND,
-            SeriesOptions::versioned(ChangedAtKind::Version),
+            SeriesOptions {
+                expected_interval: Some(SECOND),
+                ..SeriesOptions::versioned(ChangedAtKind::Version)
+            },
         )
         .unwrap(),
     );
@@ -928,8 +938,15 @@ pub fn delivery_machine() -> (Model, Vec<SeriesId>) {
     let ids: Vec<SeriesId> = ["plant/line-1/temperature", "plant/line-2/temperature"]
         .iter()
         .map(|n| {
-            m.define(n, Kind::Gauge, ValueType::Number, "degC", D_STALENESS)
-                .unwrap()
+            m.define_with(
+                n,
+                Kind::Gauge,
+                ValueType::Number,
+                "degC",
+                D_STALENESS,
+                SeriesOptions::expected(SECOND),
+            )
+            .unwrap()
         })
         .collect();
     for (c, kind) in [

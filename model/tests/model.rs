@@ -11,6 +11,7 @@ use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, Event, Runner};
 use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Model, Selection};
 use kvik_model::oracle;
+use kvik_model::registry::SeriesOptions;
 use kvik_model::summary::{Aggregate, Params};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
 use kvik_model::types::{
@@ -27,12 +28,13 @@ fn model() -> (Model, SeriesId) {
     };
     let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "site/pump-2/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     (m, s)

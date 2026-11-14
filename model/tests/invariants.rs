@@ -1157,7 +1157,14 @@ fn dup_machine() -> (kvik_model::engine::Model, [kvik_model::types::SeriesId; 2]
     };
     let mut m = Model::new(cfg, vec![], T0 + HOUR);
     let s = m
-        .define(NAMES[0], Kind::Gauge, ValueType::Number, "1", 5 * SECOND)
+        .define_with(
+            NAMES[0],
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            5 * SECOND,
+            SeriesOptions::expected(SECOND),
+        )
         .unwrap();
     let v = m
         .define_with(
@@ -1166,7 +1173,10 @@ fn dup_machine() -> (kvik_model::engine::Model, [kvik_model::types::SeriesId; 2]
             ValueType::Number,
             "1",
             5 * SECOND,
-            SeriesOptions::versioned(ChangedAtKind::Version),
+            SeriesOptions {
+                expected_interval: Some(SECOND),
+                ..SeriesOptions::versioned(ChangedAtKind::Version)
+            },
         )
         .unwrap();
     (m, [s, v])
@@ -1342,10 +1352,9 @@ proptest! {
         use kvik_model::registry::{ChangedAtKind, SeriesOptions};
         use kvik_model::types::{HOUR, Kind, Reading, ValueType};
         let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
-        let s = m.define(NAMES[0], Kind::Gauge, ValueType::Number, "1", 5 * SECOND).unwrap();
+        let s = m.define_with(NAMES[0], Kind::Gauge, ValueType::Number, "1", 5 * SECOND, SeriesOptions::expected(SECOND)).unwrap();
         let v = m
-            .define_with(NAMES[VERSIONED], Kind::Gauge, ValueType::Number, "1", 5 * SECOND,
-                SeriesOptions::versioned(ChangedAtKind::Version))
+            .define_with(NAMES[VERSIONED], Kind::Gauge, ValueType::Number, "1", 5 * SECOND, SeriesOptions { expected_interval: Some(SECOND), ..SeriesOptions::versioned(ChangedAtKind::Version) })
             .unwrap();
         let next = |m: &Model, t: Nanos| durable(m).values().filter(|f| f.series == v && f.t == t)
             .filter_map(|f| f.changed_at).max().map_or(0, |c| c + 1);

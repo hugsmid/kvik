@@ -35,12 +35,13 @@ fn model_with(cfg: Config) -> (Model, SeriesId) {
     };
     let mut m = Model::new(cfg, vec![consumer], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "plant/line-1/temperature",
             Kind::Gauge,
             ValueType::Number,
             "degC",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     (m, s)
@@ -1138,12 +1139,13 @@ fn row_14_consumer_slower_than_stream_catches_up_from_log() {
     };
     let mut m = Model::new(Config::default(), vec![slow, fast], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     for i in 0..10 {
@@ -1289,21 +1291,23 @@ fn row_34_route_added_while_catching_up() {
     };
     let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
     let a = m
-        .define(
+        .define_with(
             "vehicle/7/speed",
             Kind::Gauge,
             ValueType::Number,
             "km/h",
             SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     let b = m
-        .define(
+        .define_with(
             "vehicle/7/rpm",
             Kind::Gauge,
             ValueType::Number,
             "1/min",
             SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.add_route(C, FunnelId(1), Funnel::facts(Selection::Series([a].into())))
@@ -1847,20 +1851,22 @@ fn row_30_series_ceiling() {
         ..Config::default()
     };
     let (mut m, _) = model_with(cfg);
-    m.define(
+    m.define_with(
         "site/pump-3/flow",
         Kind::Gauge,
         ValueType::Number,
         "l/min",
         SECOND,
+        SeriesOptions::expected(SECOND),
     )
     .unwrap();
-    let e = m.define(
+    let e = m.define_with(
         "vehicle/8/speed",
         Kind::Gauge,
         ValueType::Number,
         "km/h",
         SECOND,
+        SeriesOptions::expected(SECOND),
     );
     assert!(matches!(
         e,
@@ -1894,12 +1900,13 @@ fn row_31_nan_or_infinite_recorded_as_bad_without_value() {
     // A negative counter value is recorded the same way (§2.5, §5.5), and
     // compared as "no value" by the duplicate rule (§2.4).
     let c = m
-        .define(
+        .define_with(
             "plant/line-1/energy",
             Kind::Counter,
             ValueType::Number,
             "kWh",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.ingest(vec![

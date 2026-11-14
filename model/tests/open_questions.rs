@@ -13,6 +13,7 @@ use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, DeliveryId, EntryBody, Error, FileClass, FileId, Funnel,
     FunnelId, Level, Model, Reason, Selection, TriggerCause,
 };
+use kvik_model::registry::SeriesOptions;
 use kvik_model::types::{
     HOUR, Kind, MINUTE, Position, Reading, SECOND, SeriesId, Value, ValueType,
 };
@@ -236,12 +237,13 @@ fn condition_model(cond: Condition, capacity: usize) -> (Model, SeriesId) {
     };
     let mut m = Model::new(Config::default(), vec![consumer], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "site/pump-2/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     m.add_route(C, F, Funnel::condition(s, None, cond)).unwrap();
@@ -595,12 +597,13 @@ fn q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it() {
     };
     let mut m = Model::new(cfg, vec![], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "site/pump-2/flow",
             Kind::Gauge,
             ValueType::Number,
             "l/min",
             10 * SECOND,
+            SeriesOptions::expected(SECOND),
         )
         .unwrap();
     let v = m
@@ -610,7 +613,10 @@ fn q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it() {
             ValueType::Number,
             "kW",
             10 * SECOND,
-            SeriesOptions::versioned(ChangedAtKind::Version),
+            SeriesOptions {
+                expected_interval: Some(SECOND),
+                ..SeriesOptions::versioned(ChangedAtKind::Version)
+            },
         )
         .unwrap();
     m.ingest(vec![

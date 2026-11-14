@@ -63,9 +63,9 @@ pub struct SeriesOptions {
     pub timing: Timing,
     /// Expected interval (§2.1), configuration and never learned; for a
     /// record-on-change series the keep-alive interval (§2.6). `None` takes
-    /// the interval for which the given staleness limit is the default
-    /// (S = 3 × expected interval), and no interval when no limit is given.
-    /// It decides which tree levels are stored (§5.1 density rule).
+    /// the default ([`default_expected_interval`]). It sets the default
+    /// staleness limit (S = 3 × expected interval) and decides which tree
+    /// levels are stored (§5.1 density rule).
     pub expected_interval: Option<Nanos>,
     /// Record on change (§2.6): the series records a fact when its value
     /// changes and a keep-alive fact at least once per expected interval.
@@ -184,17 +184,23 @@ pub struct SeriesDef {
     pub retired_at: Option<Nanos>,
 }
 
+/// The default expected interval of a kind (§2.1): 60 s for gauges and
+/// counters, the interval length for an interval series, none for state and
+/// text (valid until the next reading).
+pub fn default_expected_interval(kind: Kind, interval: Option<IntervalSpec>) -> Option<Nanos> {
+    match kind {
+        Kind::Gauge | Kind::Counter => Some(60 * 1_000_000_000),
+        Kind::Interval => interval.map(|iv| iv.length),
+        Kind::State | Kind::Text => None,
+    }
+}
+
 impl SeriesDef {
-    /// The expected interval (§2.1): as defined, or for a series defined
-    /// with a staleness limit only, the interval for which that limit is the
-    /// default (S = 3 × expected interval); `None` without either.
+    /// The expected interval (§2.1): as defined, or the kind's default.
     pub fn expected_interval(&self) -> Option<Nanos> {
         self.options
             .expected_interval
-            .or(match self.options.interval {
-                Some(iv) => Some(iv.length),
-                None => self.staleness.map(|s| s / 3),
-            })
+            .or(default_expected_interval(self.kind, self.options.interval))
     }
 }
 
@@ -365,11 +371,10 @@ impl Registry {
         if kind == Kind::Interval && options.record_on_change {
             return Err(RegistryError::RecordOnChangeInterval);
         }
-        // S = 3 × expected interval unless set (§2.1); an interval series'
-        // expected interval defaults to its length.
+        // S = 3 × expected interval unless set (§2.1).
         let expected = options
             .expected_interval
-            .or(options.interval.map(|iv| iv.length));
+            .or(default_expected_interval(kind, options.interval));
         let staleness = staleness.or(expected.map(|e| 3 * e));
         if options.timing == Timing::Forecast && options.versioned != Some(ChangedAtKind::Time) {
             return Err(RegistryError::ForecastNotVersioned);

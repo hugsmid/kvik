@@ -2050,7 +2050,10 @@ impl Model {
         Ok(position)
     }
 
-    /// Defines a series, or returns the id of an identical live one.
+    /// Defines a series, or returns the id of an identical live one. The
+    /// staleness limit is S as given, or with `None` 3 × the kind's default
+    /// expected interval (§2.1); [`Model::define_with`] sets the expected
+    /// interval.
     pub fn define(
         &mut self,
         name: &str,
