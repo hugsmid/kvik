@@ -16,7 +16,7 @@ again; nothing after a gate starts before it is passed.
   the questions listed under "Open at v0.2" in `model/OPEN-QUESTIONS.md` deferred to the roadmap items named there)
 
 ## 2. Measurements before building
-- [ ] 2.1 Spike: candidate chunk encodings against the Parquet reader — size and scan speed on synthetic per-second data; results in `docs/measurements/`
+- [x] 2.1 Spike: candidate chunk encodings against the Parquet reader — size and scan speed on synthetic per-second data; results in `docs/measurements/`
 - [ ] 2.2 Spike: commit and sync latency, group commit, behaviour on sync failure and a full disk; results in `docs/measurements/`
 - [ ] 2.3 **Gate** — measurements looked at
 
