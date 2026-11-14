@@ -1164,9 +1164,10 @@ fn assert_resumed(m: &Model, c: ConsumerId, session: u32, cursor: Position, kept
 /// position before the third, reports `data_lost` without going read-only,
 /// and continues above the last batch. A consumer whose cursor is below the
 /// range and one whose cursor is inside it receive the kept facts after their
-/// cursor, never a lost position, then `resync`. The report stays after
-/// another restart, read from the manifest (pins the model's choice for
-/// Q-34 (c)).
+/// cursor, never a lost position, then `resync` (the specification now
+/// delivers a `resync` carrying `forget_above` at the range first; see
+/// `OPEN-QUESTIONS.md`). The report stays after another restart, read from
+/// the manifest, and holds health degraded (§11 Health, Q-34 (c)).
 #[test]
 fn row_11a_corrupt_block_inside_the_open_segment() {
     let (mut m, s, b) = open_segment_model();
@@ -1245,13 +1246,13 @@ fn row_11a_corrupt_block_below_an_old_boots_mark() {
     assert_eq!(after, next.next());
 }
 
-/// Row 11a with a failed recovery sync (§3 Recovery rule 4): after a power
-/// loss, the recovery that finds a damaged batch cannot sync, so the engine
-/// stays read-only. Rule 2 applies before rule 4, and §8 records a loss "when
-/// found", so `data_lost` is reported at once; whether the manifest record is
-/// written then is Q-79, and the model writes it at the next recovery that can
-/// write. A read-only engine does not seal (§3 Write or sync failure). The
-/// range is then recorded once, and new positions continue above it.
+/// Row 11a with a failed recovery sync (§3 Order of a start, step 3): after a
+/// power loss, the recovery that finds a damaged batch cannot sync, so the
+/// engine stays read-only and writes nothing. `data_lost` is reported at once,
+/// as found, and the next start that can write records the range once (Q-79).
+/// A read-only engine does not seal (§3 Write or sync failure). New positions
+/// continue above the range (the specification puts a recovery entry there
+/// first; see `OPEN-QUESTIONS.md`).
 #[test]
 fn row_11a_failed_recovery_sync_reports_the_range_as_found() {
     let (mut m, s, b) = open_segment_model();
@@ -1286,7 +1287,8 @@ fn row_11a_failed_recovery_sync_reports_the_range_as_found() {
 }
 
 /// Row 11a in the model: damage to a batch holding a definition is refused,
-/// since what a lost registry, routing or zone entry means is open (Q-33);
+/// since the model does not support orphaned facts and how derived files are
+/// brought back after a lost registry, routing or zone entry is open (Q-33);
 /// so is damage while the engine runs (the model finds corruption of the open
 /// segment at recovery only) or past the mark.
 #[test]
