@@ -6,7 +6,6 @@
 use crate::batch::{BatchBuilder, SegmentIdentity};
 use crate::block::{block_type, encode_block};
 use crate::body::{INDEX_HAS_ENTRIES, IndexRecord, SegmentIndex, Trailer, encode_end_marker};
-use crate::crc::crc32c;
 use crate::error::EncodeError;
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::scan::{HeaderState, ScanReport, SealState};
@@ -19,20 +18,64 @@ pub struct SegmentImage {
     bytes: Vec<u8>,
     /// Where the next batch goes: just past the last batch.
     write_offset: u64,
-    summary: Option<Summary>,
+    summary: Option<SealSummary>,
     has_entries: bool,
     sealed: bool,
 }
 
-/// What a trailer says about the batches written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Summary {
-    entry_count: u64,
-    first_sequence: u64,
-    last_sequence: u64,
-    first_commit_time: i64,
-    last_commit_time: i64,
-    batch_count: u64,
+/// What a trailer says about a segment's batches (A.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SealSummary {
+    /// Entries in the segment.
+    pub entry_count: u64,
+    /// The first batch's first sequence.
+    pub first_sequence: u64,
+    /// The last batch's last sequence.
+    pub last_sequence: u64,
+    /// The first batch's commit time.
+    pub first_commit_time: i64,
+    /// The last batch's commit time.
+    pub last_commit_time: i64,
+    /// Complete batches.
+    pub batch_count: u64,
+}
+
+/// The seal blocks (A.4 seal step 1): the segment index block, the trailer block and the end marker, to be written
+/// at `before.len()`, the offset just past the last complete batch. `before` is the file from offset 0 up to there;
+/// `file_crc32c` covers it and the index block.
+pub fn encode_seal(
+    before: &[u8],
+    summary: &SealSummary,
+    index: &SegmentIndex,
+) -> Result<Vec<u8>, EncodeError> {
+    let index_offset = before.len() as u64;
+    if index_offset < HEADER_LEN as u64 || !index_offset.is_multiple_of(8) {
+        return Err(EncodeError::Misaligned(index_offset));
+    }
+    let mut seal = Vec::new();
+    encode_block(
+        block_type::SEGMENT_INDEX,
+        crate::block::FLAG_SKIPPABLE,
+        &index.encode(),
+        &mut seal,
+    )?;
+    let trailer_offset = index_offset + seal.len() as u64;
+    let mut crc = crate::crc::Crc32c::new();
+    crc.update(before);
+    crc.update(&seal);
+    let trailer = Trailer {
+        entry_count: summary.entry_count,
+        first_sequence: summary.first_sequence,
+        last_sequence: summary.last_sequence,
+        first_commit_time: summary.first_commit_time,
+        last_commit_time: summary.last_commit_time,
+        batch_count: summary.batch_count,
+        index_offset,
+        file_crc32c: crc.finish(),
+    };
+    encode_block(block_type::TRAILER, 0, &trailer.encode(), &mut seal)?;
+    seal.extend_from_slice(&encode_end_marker(trailer_offset));
+    Ok(seal)
 }
 
 impl SegmentImage {
@@ -107,7 +150,7 @@ impl SegmentImage {
         self.write_offset += out.len() as u64;
         self.has_entries |= batch.block_types().any(|t| t == block_type::ENTRIES);
         self.summary = Some(match self.summary {
-            None => Summary {
+            None => SealSummary {
                 entry_count: last + 1 - first,
                 first_sequence: first,
                 last_sequence: last,
@@ -115,7 +158,7 @@ impl SegmentImage {
                 last_commit_time: commit_time,
                 batch_count: 1,
             },
-            Some(s) => Summary {
+            Some(s) => SealSummary {
                 entry_count: s.entry_count + (last + 1 - first),
                 last_sequence: last,
                 last_commit_time: commit_time,
@@ -141,39 +184,13 @@ impl SegmentImage {
             },
             records,
         };
-        let index_offset = self.write_offset;
-        let mut seal = Vec::new();
-        encode_block(
-            block_type::SEGMENT_INDEX,
-            crate::block::FLAG_SKIPPABLE,
-            &index.encode(),
-            &mut seal,
-        )?;
-        let trailer_offset = index_offset + seal.len() as u64;
-        let at = index_offset as usize;
-        let needed = at + seal.len();
-        if self.bytes.len() < needed {
-            self.bytes.resize(needed, 0);
-        }
-        self.bytes[at..needed].copy_from_slice(&seal);
-        let trailer = Trailer {
-            entry_count: s.entry_count,
-            first_sequence: s.first_sequence,
-            last_sequence: s.last_sequence,
-            first_commit_time: s.first_commit_time,
-            last_commit_time: s.last_commit_time,
-            batch_count: s.batch_count,
-            index_offset,
-            file_crc32c: crc32c(&self.bytes[..needed]),
-        };
-        let mut rest = Vec::new();
-        encode_block(block_type::TRAILER, 0, &trailer.encode(), &mut rest)?;
-        rest.extend_from_slice(&encode_end_marker(trailer_offset));
-        let end = needed + rest.len();
+        let at = self.write_offset as usize;
+        let seal = encode_seal(&self.bytes[..at], &s, &index)?;
+        let end = at + seal.len();
         if self.bytes.len() < end {
             self.bytes.resize(end, 0);
         }
-        self.bytes[needed..end].copy_from_slice(&rest);
+        self.bytes[at..end].copy_from_slice(&seal);
         self.sealed = true;
         Ok(end as u64)
     }

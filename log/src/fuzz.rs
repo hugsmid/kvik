@@ -49,6 +49,12 @@ pub fn decode_all(data: &[u8]) {
     }
     let _ = FileHeader::decode(data);
     let _ = read_mark(data, &id.store_id);
+    // As a mark file: the store id where slot 0 holds it.
+    if let Some(store) = data.get(16..32) {
+        let mut store_id = [0u8; 16];
+        store_id.copy_from_slice(store);
+        let _ = read_mark(data, &store_id);
+    }
     let body = data.get(BLOCK_HEADER_LEN.min(data.len())..).unwrap_or(&[]);
     let _ = DataPrefix::decode(block_type::FACTS, body);
     let _ = DataPrefix::decode(block_type::ENTRIES, body);

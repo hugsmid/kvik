@@ -52,6 +52,7 @@ pub mod body;
 mod bytes;
 pub mod crc;
 mod error;
+#[doc(hidden)]
 pub mod fuzz;
 pub mod header;
 pub mod mark;
