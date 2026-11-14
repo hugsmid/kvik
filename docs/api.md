@@ -12,7 +12,7 @@ illustrative and are not compiled.
 - **Errors are typed.** A refusal (invalid value, retired series, back-pressure) is distinct from a fault
   (failed write or sync), and a fault makes the store read-only.
 - **Everything the engine depends on from outside is a trait** with a production and a test implementation:
-  clock, file system, backup sink, boot identity.
+  clock, file system, backup sink, boot identity, tzdata release.
 
 ## Opening
 ```rust
@@ -22,13 +22,16 @@ let store = Store::open(StoreConfig {
     log: LogConfig::default(),     // segment size, seal interval, linger
     limits: Limits::default(),     // queue sizes, series ceiling, disk marks
     tiers: TierConfig::default(),  // cold path, age and fill thresholds
-    env: Env::system(),            // clock, file system, boot identity
+    env: Env::system(),            // clock, file system, boot identity, tzdata release
 }).await?;
 let reader = Reader::open(path).await?;      // read-only; no lock; may be another process
 store.shutdown().await?;                     // final sync, checkpoint, release the lock
 ```
 `Store::open` runs recovery and returns only when the log is consistent. It fails if another writer holds the
-directory, if the store id of a file does not match, or if a file has a newer major format version.
+directory, if the store id of a file does not match, or if a file has a newer major format version. A writer whose
+tzdata release is not the version in force writes a tzdata entry before it accepts ingest (spec §5.7); a reader, a
+restore drill or a writer that cannot write fails with `TzdataMismatch` instead, and an open reader stops with it when
+a later entry names another version.
 
 ## Series
 ```rust
@@ -74,7 +77,7 @@ store.emit_with(&readings, Intent::Revise).await?;
 
 ## Consuming (funnels)
 ```rust
-let mut consumer = store.consumer("load-shedding", Start::Now).await?;
+let mut consumer = store.consumer("load-shedding", Start::Now, Select::None).await?;   // emits: the series it may emit
 consumer.route(Funnel {
     series: Select::Names("plant/*/power".into()),
     operator: Some(Operator::rolling(Aggregate::Avg, Duration::from_secs(600))),
@@ -97,14 +100,20 @@ enum Live { Value(Fact), None, Unknown }
   `Unknown` (spec §2.3, §6 Conditions): the evaluation is skipped and counted (`evaluations_unknown`), the latch is
   unchanged, `Resync` carries `Unknown` for that funnel, and the first evaluation with detail is delivered as a
   `Trigger` if it differs from the latched state, or there is none.
-- A delivery carries `id` (position, or funnel and sequence for timer deliveries), `flags` (`replayed`,
+- A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
+  or on the timer, valid until the next `Resync`), `flags` (`replayed`,
   `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
 - `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.
 - On `Resync` the consumer must forget every position it has seen above its durable cursor as recovered, which can
   lag its last confirmation: after a power loss such a position can name a different fact (spec §3 Recovery rule 3,
   §4 At-least-once).
-- A consumer that emits readings uses `try_emit` or its own task, never the delivery callback.
-- Routes may be added and removed while running; each change is a log entry and takes effect at its position.
+- A consumer that emits readings uses its own handle, `consumer.try_emit(&readings)`, or its own task, never the
+  delivery callback. A reading on a series outside the consumer's `emits` is refused with `Refusal::NotDeclared` and
+  counted.
+- Routes may be added and removed while running; each change is a log entry and takes effect at its position. A
+  route, a change of `emits` or an alias (`store.alias`) that closes a cycle between consumers is refused with the
+  error `RouteCycle`, naming the cycle (spec §4 Routing). Whether two name patterns overlap must be decidable from
+  the two patterns alone; the pattern grammar is not yet defined (`model/OPEN-QUESTIONS.md`, Q-88).
 
 ## Reading
 ```rust
@@ -119,9 +128,10 @@ let (start, end) = reader.interval(id, t)?;                 // the interval of a
 ```
 - `Resolution::Auto` picks the coarsest stored level that yields at most `max_points`, and raw facts when the
   range is short enough. Every bucket carries count, min, max and coverage so a chart can show gaps and spikes.
-- Data is stored in UTC; a zone only defines calendar days and months. `calendar` uses the site zone in force at
-  each day's start; `calendar_in` and calendar windows that name a zone use that zone throughout, evaluated as a
-  window over the UTC data (spec §5.7).
+- Data is stored in UTC; a zone only defines calendar days and months. `calendar` takes site-zone days as spec §5.7
+  defines them, also across a zone change; `calendar_in` and calendar windows that name a zone use that zone
+  throughout, evaluated as a window over the UTC data (spec §5.7).
+- `interval` is an error for a displaced reading (spec §5.4).
 - Every result type carries the flag `restoring` while a restore is bringing detail back (spec §8 Restore);
   `WindowResult.flags` also carries `approximate_edges`, with `from` and `to` giving the span evaluated (spec §6
   Old spans). A window with no span over local detail is the error `DetailNotLocal`, never an empty result. On an
@@ -138,9 +148,12 @@ let s: Stats = store.stats();       // per series and per consumer counters, com
 ```
 Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
 calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,
-`evaluations_unknown`, the evaluations skipped during a restore for lack of local detail (spec §6 Conditions). Health
-reasons include `restore_failed` (naming the file) and the set-aside range of each restore record; statistics include
-restore progress (files and bytes remaining), which is not a health condition (spec §8 Restore).
+`evaluations_unknown`, the evaluations skipped during a restore for lack of local detail (spec §6 Conditions), and
+per condition funnel `transitions_not_delivered` while its consumer caught up (spec §4 Overflow). Health reasons
+include `restore_failed` (naming the file), the set-aside range of each restore record, a tzdata change with both
+versions and the days rebuilt, and a series whose interval zone the tzdata version in force does not know (spec §2.1,
+§5.7); statistics include restore progress (files and bytes remaining), which is not a health condition (spec §8
+Restore).
 
 ## Backup and restore
 ```rust
@@ -162,6 +175,7 @@ The sink has no delete. An S3-compatible implementation lives in a separate crat
 trait Clock { fn wall(&self) -> Timestamp; fn monotonic(&self) -> Instant; fn synchronised(&self) -> bool; }
 trait Fs { /* open, preallocate, write_at, sync, rename, sync_dir, mmap, free_space */ }
 trait BootId { fn current(&self) -> Option<[u8; 16]>; }
+trait Tzdata { fn version(&self) -> &str; /* rules by zone name */ }   // read once at open (spec §5.7)
 ```
 The test implementations inject crashes at every write and sync, failed syncs, a full disk, clock jumps and a
 changed boot identity. The engine is tested against the reference model through these seams.

@@ -63,7 +63,7 @@ file to its written length, syncs it, renames it to `.kvl`, and syncs the direct
 | Type | Name | Skippable | Role |
 |---:|---|---|---|
 | `0x01` | facts | no | readings, in arrival order |
-| `0x02` | entries | no | definitions, parameters, aliases, retirements, routing changes |
+| `0x02` | entries | no | definitions, parameters, aliases, retirements, site-zone and tzdata entries, routing changes |
 | `0x0F` | commit | no | ends a batch |
 | `0x10` | segment index | yes | written at seal: which series the segment holds |
 | `0x7F` | trailer | no | written at seal: marks the file as sealed |
@@ -124,7 +124,9 @@ are a list of `field_id: u16`, `field_len: u16`, bytes (padded to 4). Unknown fi
 | 2 parameter change | 1 id; 20 effective time; then any of fields 7–12 |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
-| 5 routing change | defined with the interface document |
+| 5 routing change | defined with the interface document; carries the consumer's `emits` selection |
+| 6 site zone | 30 zone name; 20 effective time |
+| 7 tzdata | 31 version (UTF-8 release name) |
 
 Durations are `i64` nanoseconds. Strings are UTF-8 without a terminator.
 
@@ -199,11 +201,13 @@ byte. A file is sealed only if these are present and the trailer is valid.
   facts or revisions, each with its position range and a summary, followed by an index and a trailer in the
   style of A.9. Candidate encodings: delta-of-delta timestamps, ALP for decimal values with an XOR fallback,
   run-length for quality, flags and rarely changing values. The layout and encodings are fixed after the
-  encoding measurements. Compacted data uses this own format; Parquet is the export format.
+  encoding measurements. Compacted data uses this own format; Parquet is the export format. The index can be fetched
+  without the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.
 - **Manifest (`kind = 3`).** An append-only sequence of checksummed records; one record publishes a set of
   files and retires another set atomically, with an epoch.
 - **Cursor (`kind = 4`).** Per consumer: last confirmed position and one latch per condition funnel.
-- **Registry (`kind = 5`).** The compacted series registry.
+- **Registry (`kind = 5`).** The compacted registry: series entries, site-zone and tzdata entries and routing
+  changes, each with its position.
 - **Tree (`kind = 6`).** Per-series stored summary levels with the position up to which they are complete.
 
 Each is specified in this document before the roadmap section that implements it.

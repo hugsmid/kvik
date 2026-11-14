@@ -27,5 +27,7 @@ of a new invariant go to the last invariants shard unless the table names them, 
 - **Data.** Fixtures must not contain real device identifiers, locations or personal data.
 
 ## Licence
-By contributing you agree that your contributions are dual licensed under MIT OR Apache-2.0, as described in the
-README.
+kvik is licensed under the PolyForm Noncommercial License 1.0.0, and the project owner also grants commercial
+licences. Contributions are accepted only if you agree that they may be distributed both under the project's licence
+and under commercial licences granted by the project owner. You may be asked to sign a contributor licence agreement
+before a contribution is merged.

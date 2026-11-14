@@ -857,10 +857,12 @@ fn q76_tzdata_change_is_a_log_entry_written_by_the_rebuild() {
     assert!(m.rebuild_calendars().unwrap().is_empty());
 }
 
-/// Q-77: a day whose local midnight occurs twice. Havana falls back from
-/// 01:00 (−04) to 00:00 (−05) on 1 November 2026, so 00:00 on 1 November is
-/// both 04:00 and 05:00 UTC. The model starts the day at the earlier, so 1
-/// November has 25 hours and 31 October ends at 04:00 UTC.
+/// Q-77: a day whose local midnight occurs twice. Under current tzdata
+/// Havana falls back from 01:00 (−04) to 00:00 (−05) on 2 November 2025 (the
+/// date spec §5.7 uses); the model's bundled rules still place a fall-back on
+/// 1 November 2026, which this test uses, so 00:00 on 1 November 2026 is both
+/// 04:00 and 05:00 UTC. The model starts the day at the earlier, so that day
+/// has 25 hours and the day before ends at 04:00 UTC.
 #[test]
 fn q77_day_whose_midnight_occurs_twice_starts_at_the_earlier() {
     use jiff::civil::Date;
