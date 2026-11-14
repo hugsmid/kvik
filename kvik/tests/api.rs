@@ -487,6 +487,8 @@ fn restart_replays_then_resyncs() {
     // Shutdown through a clone closes every clone.
     let other = s.clone();
     block_on(other.shutdown()).unwrap();
+    // After a shutdown, `next` ends and `try_next` tells a clean close.
+    assert!(block_on(c.next()).is_none());
     assert!(matches!(c.try_next(), Err(ConsumerError::Closed)));
     assert!(matches!(
         block_on(s.emit(&[num(g, 9, 1.0)])),
@@ -904,8 +906,9 @@ fn opening_rules() {
         )),
         Err(OpenError::NotAStore)
     ));
-    let mut small = config("small-queue", &clock);
-    small.limits.ingest_queue = 10;
+    let mut limits = kvik::Limits::default();
+    limits.ingest_queue = 10;
+    let small = config("small-queue", &clock).limits(limits);
     assert!(matches!(
         block_on(Store::open(small)),
         Err(OpenError::Config {
@@ -913,8 +916,11 @@ fn opening_rules() {
             ..
         })
     ));
-    let mut segment = config("odd-segment", &clock);
-    segment.log.segment_size = 1 << 20;
+    let mut log = kvik::LogConfig::default();
+    log.segment_size = 1 << 20;
+    let segment = config("odd-segment", &clock)
+        .log(log)
+        .tiers(kvik::TierConfig::default());
     assert!(matches!(
         block_on(Store::open(segment)),
         Err(OpenError::Config {
@@ -931,7 +937,9 @@ fn opening_rules() {
     let s = block_on(Store::open(config("zones", &clock))).unwrap();
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
-    let reader = Reader::open(ReaderConfig::new("kvik-test/zones")).unwrap();
+    let reader =
+        Reader::open(ReaderConfig::new("kvik-test/zones").lease_refresh(Duration::from_secs(600)))
+            .unwrap();
     assert_eq!(reader.series(g).unwrap().name, "a/b/c");
     let state = reader.refresh().unwrap();
     assert!(state.durable > Position::ORIGIN);

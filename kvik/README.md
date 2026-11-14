@@ -65,23 +65,28 @@ Not supported by the model backend:
   `NotDeclared`, and `RouteCycle` is never returned.
 - **A funnel with an operator but no condition**, and a held-for condition over an operator:
   `ConsumerError::NotSupportedYet`.
+- **A condition funnel over several series**: it must select exactly one, and a name pattern in it is resolved once,
+  when routed, so `docs/api.md`'s `plant/*/power` condition example is refused (`ConsumerError::Route`) unless
+  exactly one series matches.
 - **Backup, restore, export of set-aside facts and rebuild** (`BackupError::NotSupportedYet`), and
   `export_orphaned` (`QueryError::NotAvailable`).
 - Never produced: the `Unknown` live and condition states, `approximate_edges`, `displaced`, a trigger's value and
   coverage, `forget_above`, the `ResetPoint` and `GenerationChanged` resync causes, `PossibleLoss`, `ManifestRebuilt`,
+  `Outcome::Recorded.unchecked` and `duplicates_unchecked` (the model's detail is always local),
   `SealBlocked`, `Wait::QueueFull` (a call never exceeds the queue, which is empty between calls), commit latency and
   time waited, `orphaned_facts`, `scale_raises`, `interval_displaced`, and `evaluations_unknown` and
   `transitions_not_delivered`, which are not reported at all.
 - The seams other than the clock are not used: the backend writes no files, takes no lock file and computes calendars
   with the reference model's embedded tzdata rather than through `Env::tz`. `SystemTz` reports the embedded tzdata as
   the release `"embedded"`; `StdFs::free_space` returns `Unsupported`; `SystemBootId` is `None` outside Linux.
+- `DiskStats.free` and the disk marks (`limits.disk_low`, `limits.disk_critical`) are measured against the reference
+  model's simulated disk of 1 TiB, not a real file system; `IngestStats.syncs` is 0, as nothing is synced.
 
 Different from `docs/api.md`:
 
-- **Configuration and specification structs are `#[non_exhaustive]`**, as the stable-shapes principle requires, so
-  `docs/api.md`'s `StoreConfig { .., ..Default::default() }` and `SeriesSpec { .., ..Default::default() }` examples do
-  not compile outside the crate: build them with `new`, the setters, or `default()` and field assignment. `Funnel` and
-  `Reading` stay plain structs, as `docs/api.md` builds them literally.
+- **Every seam trait requires `fmt::Debug`** besides `Send + Sync`, so that `Env` can be printed.
+- `Funnel` and `Reading` are plain structs, as `docs/api.md` builds them literally; every other configuration or
+  result struct is `#[non_exhaustive]`, built with `new`, the setters, or `default()` and field assignment.
 - **Errors**: the backend adds `NotSupportedYet` to `DefineError`, `ConsumerError::NotSupportedYet`,
   `QueryError::Invalid` (a malformed query) and `QueryError::Closed`. `ConsumerError` and `BackupError` stand in for
   the funnel-compilation and backup errors that roadmap 5.2 and 8.2 settle.
@@ -97,12 +102,16 @@ Different from `docs/api.md`:
 - **`Reader::interval`** returns the interval that contains `t`, whether or not `t` is its start.
 - **`Consumer::next`** ends with `None` on any error, not only after a shutdown; `try_next` returns the error.
 - **`Value::Absent`** is recorded with quality bad: the reference model summarises a value-less reading only when it
-  is bad, so the supplied quality is not kept.
+  is bad (and panics otherwise; [Q-104](../model/OPEN-QUESTIONS.md#q-104--a-supplied-absent-value-with-a-quality-other-than-bad)),
+  so the supplied quality is not kept. This breaks spec §2.4, which compares no-value readings by their supplied
+  quality: an `Absent` of good quality and then one of bad quality at the same `t` is dropped as a duplicate.
 - `BackupSink` takes and returns `Vec<u8>` until roadmap 8.2 settles its signatures.
 - **Added**: `Store::tick` (temporary), `Store::now`, `Store::is_durable`, `Store::consumer_stats`,
-  `Consumer::try_next`, `Consumer::unroute`, `Consumer::routes`, `Reader::series`, `Ack::recorded`,
-  `SeriesStats.latest_t` and `counter_regressions`, `IngestStats.waits`, and `Limits.consumer_queue` and
-  `max_consumers` (keys of later sections that the backend needs).
+  `Consumer::try_next`, `Consumer::unroute`, `Consumer::routes`, `Reader::series`, `Ack::recorded`, `Start::Time`,
+  `Trigger.cause`, `DeliveryFlags.outranked`, `WindowResult.count` and `coverage_fraction`,
+  `ResultFlags.summary_stale` and `rate_flagged`, `Resolution::Step`, `SeriesStats.latest_t` and
+  `counter_regressions`, `IngestStats.waits`, and `Limits.consumer_queue` and `max_consumers` (keys of later
+  sections that the backend needs).
 
 Name patterns in a funnel's selection work, but their grammar is provisional (`*` within one `/`-separated segment),
 as the specification does not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).

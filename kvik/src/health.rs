@@ -216,7 +216,7 @@ pub enum MarkSyncMode {
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct LogStats {
-    /// The durable mark.
+    /// The durable mark (in memory with the model backend).
     pub durable: Position,
     /// The position the mark file was last synced at.
     pub mark_synced: Position,
@@ -236,7 +236,8 @@ pub struct LogStats {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DiskStats {
-    /// Free bytes (model accounting).
+    /// Free bytes (from the reference model's simulated disk with the model
+    /// backend).
     pub free: u64,
 }
 
@@ -302,7 +303,7 @@ pub struct SeriesStats {
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ConsumerStats {
-    /// The durable cursor.
+    /// The durable cursor (in memory with the model backend).
     pub cursor: Position,
     /// Whether it is catching up from the log.
     pub catching_up: bool,

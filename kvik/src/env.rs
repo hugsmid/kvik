@@ -194,6 +194,16 @@ pub struct DirEntry {
     pub len: u64,
 }
 
+impl DirEntry {
+    /// An entry, for implementations of [`Fs::read_dir`].
+    pub fn new(name: impl Into<String>, len: u64) -> Self {
+        DirEntry {
+            name: name.into(),
+            len,
+        }
+    }
+}
+
 /// The file-system operations the durable engine uses (spec §3, §7).
 ///
 /// Removal exists for retired files after their grace period (spec §7),
@@ -876,8 +886,7 @@ mod tests {
         fs.rename(&p, &q).unwrap();
         fs.sync_dir(dir).unwrap();
         let entries = fs.read_dir(dir).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!((entries[0].name.as_str(), entries[0].len), ("sealed", 64));
+        assert_eq!(entries, vec![DirEntry::new("sealed", 64)]);
         let g = fs.open(&q, OpenMode::Read).unwrap();
         assert_eq!(g.len().unwrap(), 64);
         drop(g);

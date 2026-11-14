@@ -18,6 +18,13 @@ pub struct Stored {
     pub sha256: [u8; 32],
 }
 
+impl Stored {
+    /// What the bucket reports, for implementations of [`BackupSink`].
+    pub fn new(size: u64, sha256: [u8; 32]) -> Self {
+        Stored { size, sha256 }
+    }
+}
+
 /// The deep tier: an object store with no delete (spec §8). An S3-compatible
 /// implementation lives in a separate crate.
 pub trait BackupSink: Send + Sync {
@@ -72,4 +79,15 @@ pub enum Rebuild {
     /// Every derived structure, from the facts.
     #[default]
     Derived,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_is_constructible() {
+        let s = Stored::new(3, [7; 32]);
+        assert_eq!((s.size, s.sha256), (3, [7; 32]));
+    }
 }

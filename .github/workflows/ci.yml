@@ -44,6 +44,7 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --all-targets --locked
+      - run: cargo clippy -p kvik --all-targets --locked --features jiff
 
   docs:
     runs-on: ubuntu-latest
@@ -73,6 +74,7 @@ jobs:
           PROPTEST_CASES: "1024"
       - run: cargo run --locked --example basic
       - run: cargo run --locked -p kvik --example quickstart
+      - run: cargo test --locked -p kvik --features jiff
 
   spike:
     # The encoding spike (roadmap 2.1) and the commit-path spike (roadmap

@@ -1793,7 +1793,9 @@ impl Slot {
                 waiting: self.waiting.values().next().copied(),
                 waits: self.waits.clone(),
                 batches: self.batches,
-                syncs: self.batches,
+                // Nothing is synced: the model backend holds every batch in
+                // memory.
+                syncs: 0,
                 ..IngestStats::default()
             },
             log: LogStats {

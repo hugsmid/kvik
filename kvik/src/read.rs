@@ -307,7 +307,7 @@ impl Iterator for Facts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReaderState {
-    /// The durable mark's position.
+    /// The durable mark's position (in memory with the model backend).
     pub durable: Position,
     /// The manifest epoch held.
     pub epoch: u64,

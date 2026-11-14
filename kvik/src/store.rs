@@ -42,7 +42,7 @@ impl Drop for Writer {
 /// `Store` is `Clone + Send + Sync`; clones share the one writer. Dropping
 /// the last clone (consumers hold one) without [`Store::shutdown`] is
 /// equivalent to a process crash; with the model backend nothing committed
-/// is lost either way.
+/// is lost either way, within the process.
 #[derive(Clone, Debug)]
 pub struct Store {
     writer: Arc<Writer>,
@@ -582,9 +582,9 @@ impl Consumer {
             .map_err(|e| e.consumer(self.store.dir_path()))
     }
 
-    /// The next delivery, waiting for one; `None` once the store is shut
-    /// down. Any other error also ends the stream with `None`;
-    /// [`Consumer::try_next`] returns it.
+    /// The next delivery, waiting for one; `None` when no more will come.
+    /// After `None`, call [`Consumer::try_next`]: `Err(ConsumerError::Closed)`
+    /// is a clean close, anything else a fault.
     ///
     /// With the model backend nothing runs in the background: a waiting call
     /// is woken by the next emit, routing change, confirmation or

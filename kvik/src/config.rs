@@ -53,6 +53,24 @@ impl StoreConfig {
         self
     }
 
+    /// Sets the log configuration.
+    pub fn log(mut self, log: LogConfig) -> Self {
+        self.log = log;
+        self
+    }
+
+    /// Sets the limits.
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Sets the tier configuration.
+    pub fn tiers(mut self, tiers: TierConfig) -> Self {
+        self.tiers = tiers;
+        self
+    }
+
     /// Checks every key against its limits (`docs/api.md` Configuration).
     pub(crate) fn validate(&self) -> Result<(), OpenError> {
         let bad = |key, reason: &str| {
@@ -235,6 +253,12 @@ impl ReaderConfig {
     /// Sets the environment.
     pub fn env(mut self, env: Env) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Sets the lease refresh interval.
+    pub fn lease_refresh(mut self, d: Duration) -> Self {
+        self.lease_refresh = d;
         self
     }
 }
