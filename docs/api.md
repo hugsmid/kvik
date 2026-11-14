@@ -19,7 +19,7 @@ illustrative and are not compiled.
 let store = Store::open(StoreConfig {
     dir: path,
     time_zone: tz,                 // required: calendar levels use it
-    log: LogConfig::default(),     // segment size, seal interval, linger
+    log: LogConfig::default(),     // segment size, seal interval, min sync interval
     limits: Limits::default(),     // queue sizes, series ceiling, disk marks
     tiers: TierConfig::default(),  // cold path, age and fill thresholds
     env: Env::system(),            // clock, file system, boot identity, tzdata release
