@@ -229,9 +229,10 @@ proptest! {
     /// revision (3) with A's value is recorded and current."
     #[test]
     fn row_02c_replay_never_reverts_a_versioned_correction(
-        a in -3i32..3, b in -3i32..3, off in any::<bool>(), compact in any::<bool>(),
+        a in -3i32..3, step in 1i32..6, off in any::<bool>(), compact in any::<bool>(),
     ) {
-        prop_assume!(a != b);
+        // b differs from a by construction, so no case is rejected.
+        let b = (a + 3 + step) % 6 - 3;
         let (mut m, v) = versioned_model(SeriesOptions::versioned(ChangedAtKind::Version));
         let (a, b) = (f64::from(a), f64::from(b));
         let pa = m.ingest(vec![Reading::versioned(v, T0, a, 1)]).unwrap().positions[0];
