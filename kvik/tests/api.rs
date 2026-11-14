@@ -481,6 +481,19 @@ fn interval_series_and_calendar_results() {
         .unwrap();
     assert_eq!(ny.from, "2026-01-05T05:00:00Z".parse().unwrap());
     assert_eq!(ny.number(), Some(11.0));
+    let month = r
+        .calendar(
+            g,
+            kvik::CalendarPeriod::Month {
+                year: 2026,
+                month: 1,
+            },
+            Aggregate::Count,
+        )
+        .unwrap();
+    assert_eq!(month.from, "2026-01-01T00:00:00Z".parse().unwrap());
+    assert_eq!(month.to, "2026-02-01T00:00:00Z".parse().unwrap());
+    assert_eq!(month.number(), Some(11.0));
 
     match r
         .buckets(g, at(-3_600)..at(0), Resolution::Auto { max_points: 100 })
