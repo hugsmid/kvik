@@ -160,7 +160,8 @@ proptest! {
 
     /// 2. Every delivered position is durable; every durable position is
     /// eventually delivered to each matching consumer, or superseded by a
-    /// `resync` delivered to it in place of the replay of that position.
+    /// `resync` delivered to it in place of the replay of that position
+    /// because its cursor was older than the oldest local log segment.
     #[test]
     fn inv02_delivered_iff_durable(ops in proptest::collection::vec(arb_op(), 1..80)) {
         let (mut m, ids) = run(&ops)?;
@@ -169,7 +170,7 @@ proptest! {
         let dur = durable(&m);
         for (c, sel) in [(0u32, None), (1u32, Some(ids[0]))] {
             let seen = observed_positions(&m, c);
-            let replaced = resync_replaced(&m, c);
+            let replaced = resync_replaced_justified(&m, c);
             for p in &seen {
                 prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", c, p);
             }
@@ -202,7 +203,8 @@ proptest! {
 
     /// 2, with run-time routes, conditions and timers: every durable position
     /// routed to a consumer by the routes in force at it is delivered to it,
-    /// or superseded by a `resync` delivered in place of its replay; every
+    /// or superseded by a `resync` delivered in place of its replay because
+    /// the cursor was older than the oldest local log segment; every
     /// delivered fact is durable (checked as it is taken).
     #[test]
     fn inv02_routed_positions_delivered_or_resynced(ops in proptest::collection::vec(arb_delivery_op(), 1..100)) {
@@ -215,7 +217,7 @@ proptest! {
         let dur = durable(&m);
         for d in delivery_consumers() {
             let seen = observed_positions(&m, d.id.0);
-            let replaced = resync_replaced(&m, d.id.0);
+            let replaced = resync_replaced_justified(&m, d.id.0);
             for p in &seen {
                 prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", d.id.0, p);
             }

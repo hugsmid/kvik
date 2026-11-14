@@ -1434,6 +1434,34 @@ fn s4_resync_follows_replay_on_restart() {
     );
 }
 
+/// §7: "Log segments are never retired by compaction"; §8: they leave the
+/// fast disk only after 90 days or under fill pressure, once verified
+/// elsewhere. A consumer behind a compacted position is replayed from them,
+/// not sent `resync` in place of the replay.
+#[test]
+fn s7_consumer_behind_compacted_position_is_replayed() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, F, Funnel::facts(Selection::All)).unwrap();
+    put(&mut m, a, 1.0);
+    m.drain().unwrap();
+    m.advance(SECOND);
+    put(&mut m, a, 2.0);
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.upload();
+    m.advance(2 * HOUR);
+    m.housekeeping().unwrap();
+    let r = m.open_reader();
+    assert!(
+        r.files
+            .iter()
+            .any(|f| m.disk.files[f].class == FileClass::Segment && m.disk.hot.contains(f))
+    );
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    assert_eq!(labels(&session_stream(&m, C, 2)), ["R5", "S"]);
+}
+
 /// §4 Resync: sent "when the cursor is older than the oldest local log
 /// segment"; §8 Behind consumers: such a consumer "receives `resync`, not a
 /// replay. The engine never downloads from deep for catch-up." Confirming the

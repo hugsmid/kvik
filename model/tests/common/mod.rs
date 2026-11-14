@@ -398,6 +398,42 @@ pub fn resync_replaced(m: &Model, c: u32) -> Vec<(Position, Position)> {
         .collect()
 }
 
+/// Positions held by log segments on a local tier (hot, or cold), now.
+pub fn local_segment_positions(m: &Model) -> BTreeSet<Position> {
+    use kvik_model::engine::{FileClass, Locality};
+    m.disk
+        .published()
+        .into_iter()
+        .filter(|f| {
+            m.disk.files[f].class == FileClass::Segment
+                && (m.disk.locality(*f) == Locality::Hot || m.disk.cold.contains(f))
+        })
+        .flat_map(|f| {
+            m.disk.files[&f]
+                .entries()
+                .map(|e| e.position)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The ranges `(after, up_to]` a `resync` replaced for consumer `c` where the
+/// specification sends one: the cursor was older than the oldest local log
+/// segment, so some entry in the range is not in a local log segment. Local
+/// segments only ever leave in these histories, so checking now suffices.
+pub fn resync_replaced_justified(m: &Model, c: u32) -> Vec<(Position, Position)> {
+    let local = local_segment_positions(m);
+    let entries: Vec<Position> = m.disk.all_entries().into_keys().collect();
+    resync_replaced(m, c)
+        .into_iter()
+        .filter(|(a, b)| {
+            entries
+                .iter()
+                .any(|p| a < p && p <= b && !local.contains(p))
+        })
+        .collect()
+}
+
 /// What consumer `c` received in `session`, in order.
 pub fn session_stream(m: &Model, c: ConsumerId, session: u32) -> Vec<Envelope> {
     m.received

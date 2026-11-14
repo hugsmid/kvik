@@ -310,6 +310,9 @@ pub enum ManifestOp {
         file: FileId,
         /// Inputs this file replaces.
         replaces: Vec<FileId>,
+        /// Log segments compacted into this file and its siblings; they are
+        /// not retired (§7: log segments are never retired by compaction).
+        from: Vec<FileId>,
         /// Hash of the file as stored.
         hash: u64,
     },
@@ -1001,6 +1004,10 @@ impl Disk {
     }
 
     fn add(&mut self, at: Nanos, file: FileId, replaces: Vec<FileId>) {
+        self.add_from(at, file, replaces, Vec::new());
+    }
+
+    fn add_from(&mut self, at: Nanos, file: FileId, replaces: Vec<FileId>, from: Vec<FileId>) {
         let hash = self.files[&file].hash();
         let epoch = self.epoch();
         self.manifest.push(ManifestRecord {
@@ -1009,9 +1016,21 @@ impl Disk {
             op: ManifestOp::Add {
                 file,
                 replaces,
+                from,
                 hash,
             },
         });
+    }
+
+    /// Log segments already compacted (§7).
+    pub fn compacted_segments(&self) -> BTreeSet<FileId> {
+        self.manifest
+            .iter()
+            .flat_map(|r| match &r.op {
+                ManifestOp::Add { from, .. } => from.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     fn retire(&mut self, at: Nanos, file: FileId) {
@@ -3044,13 +3063,17 @@ impl Model {
             return Err(Error::Paused);
         }
         let retired = self.disk.retired();
+        let compacted = self.disk.compacted_segments();
         let inputs: Vec<FileId> = self
             .disk
             .published()
             .into_iter()
             .filter(|f| {
                 let file = &self.disk.files[f];
-                file.class == FileClass::Segment && file.sealed && !retired.contains_key(f)
+                file.class == FileClass::Segment
+                    && file.sealed
+                    && !retired.contains_key(f)
+                    && !compacted.contains(f)
             })
             .collect();
         if inputs.is_empty() {
@@ -3110,21 +3133,19 @@ impl Model {
         ins.sort_by_key(|e| e.position);
         outs.sort_by_key(|e| e.position);
         assert_eq!(ins, outs, "compaction verification");
-        // Publish.
+        // Publish. The input log segments stay: compaction never retires a
+        // log segment (§7); they leave the fast disk only by eviction (§8).
         for (i, f) in outputs.iter().enumerate() {
-            let replaces = if i + 1 == outputs.len() {
+            let from = if i + 1 == outputs.len() {
                 inputs.clone()
             } else {
                 Vec::new()
             };
-            self.disk.add(self.wall, *f, replaces);
+            self.disk.add_from(self.wall, *f, Vec::new(), from);
         }
         if crash == Some(CompactionCrash::AfterPublish) {
             self.crash();
             return Err(Error::Crashed);
-        }
-        for f in inputs {
-            self.disk.retire(self.wall, f);
         }
         Ok(outputs)
     }
@@ -3233,8 +3254,30 @@ impl Model {
                 removed.push(f);
             }
         }
-        // Fill threshold: the oldest current detail moves out, verified first.
+        // Fill threshold: verified sealed log segments leave first, oldest
+        // first, then the oldest current detail, verified first (§8, §12 D4).
         let limit = self.config.disk_bytes / 100 * self.config.fill_threshold_pct;
+        let mut segments: Vec<FileId> = self
+            .disk
+            .hot
+            .iter()
+            .filter(|f| {
+                let file = &self.disk.files[f];
+                file.class == FileClass::Segment
+                    && file.sealed
+                    && self.disk.active != Some(**f)
+                    && self.disk.verified_elsewhere(**f)
+            })
+            .copied()
+            .collect();
+        segments.sort();
+        for f in segments {
+            if self.disk.used_bytes(self.config.entry_bytes) <= limit {
+                break;
+            }
+            self.disk.hot.remove(&f);
+            removed.push(f);
+        }
         let mut current: Vec<FileId> = self
             .disk
             .hot
@@ -3681,7 +3724,7 @@ impl Model {
 
     /// Step 1: the log segments holding a position after the checkpoint's
     /// (every segment with no checkpoint). Where no segment holds a position
-    /// up to the restored end (the model's compaction retires segments), the
+    /// up to the restored end (a segment missing from the bucket), the
     /// first file in download order that holds it.
     fn step_one_files(&self) -> Vec<FileId> {
         let r = self.disk.restore.as_ref().expect("restore state");
@@ -3754,6 +3797,7 @@ impl Model {
             op: ManifestOp::Add {
                 file: id,
                 replaces: Vec::new(),
+                from: Vec::new(),
                 hash,
             },
         });
