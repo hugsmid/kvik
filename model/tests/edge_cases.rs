@@ -294,7 +294,7 @@ proptest! {
         issues in proptest::collection::vec(proptest::collection::btree_map(0i64..6, -3i32..3, 1..6), 1..5),
         replays in proptest::collection::vec((any::<proptest::sample::Index>(), any::<proptest::sample::Index>()), 0..6),
     ) {
-        let options = SeriesOptions { versioned: Some(ChangedAtKind::Time), timing: Timing::Forecast };
+        let options = SeriesOptions { versioned: Some(ChangedAtKind::Time), timing: Timing::Forecast, ..SeriesOptions::default() };
         let (mut m, v) = versioned_model(options);
         let valid = |h: i64| m.wall + h * HOUR;
         let valid: Vec<Nanos> = (0..6).map(valid).collect();
@@ -1207,6 +1207,15 @@ fn row_25_series_retired_at_t_r() {
     assert_eq!(m.registry().unwrap().live().count(), 0, "hidden");
     assert!(m.registry().unwrap().get(s).is_some(), "reachable by id");
     assert_eq!(m.facts().unwrap().len(), 2, "facts stay");
+    // A reading that waited in the queue while the retirement committed is
+    // refused at commit and counted.
+    let (mut m, s) = model();
+    m.emit(num(s, t_r, 1.0)).unwrap();
+    m.emit(num(s, t_r - 1, 1.0)).unwrap();
+    m.retire(s, t_r).unwrap();
+    assert_eq!(m.commit(None).unwrap().positions.len(), 1);
+    assert_eq!(m.counters.refused[&Refusal::Retired], 1);
+    assert!(m.facts().unwrap().iter().all(|f| f.t < t_r));
 }
 
 /// Row 26: "Reader holds an old epoch: its files stay while its lease names
@@ -1367,8 +1376,89 @@ fn row_31_nan_or_infinite_recorded_as_bad_without_value() {
             .iter()
             .all(|f| f.quality == Quality::Bad && f.value == Value::Absent)
     );
+    assert!(facts.iter().all(|f| f.flags.no_value));
     // Bad quality is ignored by summaries.
     assert_eq!(m.window(s, T0, T0 + MINUTE).unwrap().count, 0);
+    // A negative counter value is recorded the same way (§2.5, §5.5), and
+    // compared as "no value" by the duplicate rule (§2.4).
+    let c = m
+        .define(
+            "plant/line-1/energy",
+            Kind::Counter,
+            ValueType::Number,
+            "kWh",
+            10 * SECOND,
+        )
+        .unwrap();
+    m.ingest(vec![
+        num(c, T0, 100.0),
+        num(c, T0 + SECOND, -5.0),
+        num(c, T0 + 2 * SECOND, 110.0),
+    ])
+    .unwrap();
+    assert_eq!(m.counters.negative_counter, 1);
+    let f = m.current().unwrap()[&(c, T0 + SECOND)].clone();
+    assert!(f.quality == Quality::Bad && f.value == Value::Absent && f.flags.no_value);
+    let r = m.ingest(vec![num(c, T0 + SECOND, -7.0)]).unwrap();
+    assert_eq!(
+        r.duplicates, 1,
+        "both are \"no value\" with the same supplied quality"
+    );
+    // The bad reading is ignored: the step is from 100 to 110, no reset.
+    let w = m.window(c, T0, T0 + MINUTE).unwrap();
+    assert_eq!(
+        w.aggregate(&Aggregate::Increase),
+        Some(AggValue::Exact(exact(10.0)))
+    );
+    let kvik_model::summary::Body::Counter {
+        resets,
+        regressions,
+        ..
+    } = w.body
+    else {
+        unreachable!()
+    };
+    assert_eq!((resets, regressions), (0, 0));
+}
+
+/// Row 22a: "Host clock not yet synchronised at boot: `unsynced_clock`;
+/// host-stamped facts wait."
+#[test]
+fn row_22a_host_clock_not_yet_synchronised() {
+    let (mut m, s) = model();
+    m.power_loss();
+    m.clock_synchronised = false;
+    m.restart();
+    let now = m.wall;
+    // A host-stamped reading waits: the emit returns back-pressure and the
+    // adapter emits it again later.
+    let host = num(s, now, 1.0).host();
+    assert_eq!(m.emit(host.clone()), Err(Wait::UnsyncedClock.into()));
+    assert_eq!(
+        m.queued(),
+        0,
+        "not stamped into the queue with a wrong time"
+    );
+    // A device-stamped reading is accepted and flagged.
+    let p = m.ingest(vec![num(s, now - HOUR, 2.0)]).unwrap().positions[0];
+    let f = m
+        .facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.position == p)
+        .unwrap();
+    assert!(f.flags.unsynced_clock);
+    assert!(!f.flags.late, "late is not set before synchronisation");
+    m.clock_synchronised = true;
+    m.emit(host).unwrap();
+    let p = m.commit(None).unwrap().positions[0];
+    let f = m
+        .facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.position == p)
+        .unwrap();
+    assert!(f.flags.host_time && !f.flags.unsynced_clock);
 }
 
 #[test]

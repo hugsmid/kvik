@@ -594,7 +594,11 @@ nothing back; fill pressure moves verified sealed log segments first, oldest fir
 oldest data, never the registry's chunk; every move needs a verified copy in cold or deep and is recorded in one
 manifest record; invariant 12; `tests/rules.rs` `s3_low_mark_…` and `s8_eviction_…`, `s8_retention_…`,
 `s8_fill_…`), the late and future
-flags (§2.2), invalid values (§2.5), retirement at `t_r` (§2.1), the durable mark and recovery by boot id (§3),
+flags by timing and per-series lateness bound (§2.2), `t_source` and the clock (§2.2, §2.5: `host_time`; before
+synchronisation, `unsynced_clock`, no `future` or `late`, and a host-stamped emit waits as back-pressure, counted;
+row 22a), invalid values (§2.5: NaN, ±∞ and a negative counter value recorded as bad quality without a value,
+flagged `no_value` and counted), retirement at `t_r` (§2.1, also for a reading that waited in the queue while the
+retirement committed), the durable mark and recovery by boot id (§3),
 delivery (§4, §6: routing changes as log entries taking effect at their position, in live delivery and in catch-up;
 condition funnels evaluated on routed facts and on the timer, never on replayed facts, their deliveries carrying the
 last committed position and a per-funnel sequence; one latch per condition funnel, moved when the consumer confirms;
@@ -630,8 +634,6 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
-| `t_source`, `host_time`, `unsynced_clock` | §2.2, §2.5, row 22a | Not modelled | — |
-| Negative counter values | §2.5, §5.5: bad quality, no value | Reset rule applied | `negative_counter_decrease_counts_as_reset` |
 | Record on change | §2.6, row 17a | Keep-alive facts are ordinary facts from the adapter | `tests/edge_cases.rs` `row_17a_…` |
 | Effective-dated parameters and site zone | §2.1, §5.7, row 21 | One staleness limit per series; days computed per zone on demand | `calendar_depends_on_zone_utc_levels_do_not` |
 | New-consumer start; cycles; name patterns | §4 New consumer, Routing, row 33 | Consumers are declared when the model is created and start before the first position; no consumer emits readings; a selection is a list of ids or every series | — |

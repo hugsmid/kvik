@@ -1397,3 +1397,93 @@ fn dup_generator_coverage() {
     eprintln!("dropped {dropped} unchecked {unchecked} revised {revised} outranked {outranked}");
     assert!(dropped > 500 && unchecked > 100 && revised > 100 && outranked > 300);
 }
+
+// ----- timing (§2.1 `timing`, §2.2 flags, §6 credit limit) -----
+
+/// Readings for invariants 20 and 21: `(series index, offset from the wall
+/// clock at emit, value, clock advance before the emit)`. Offsets stay
+/// within the lateness bound in the past and reach days ahead, in any order.
+fn arb_timed_readings() -> impl Strategy<Value = Vec<(usize, Nanos, i32, Nanos)>> {
+    proptest::collection::vec(
+        (
+            0usize..3,
+            prop_oneof![
+                -(4 * MINUTE)..(2 * MINUTE),
+                (2 * MINUTE)..(3 * kvik_model::types::DAY),
+            ],
+            -5i32..5,
+            prop_oneof![Just(0), 0..(10 * MINUTE)],
+        ),
+        1..40,
+    )
+}
+
+/// A store with a scheduled gauge, a forecast gauge (versioned, kind
+/// `time`) and an observed gauge, all with S = 10 minutes.
+fn timed_machine() -> (kvik_model::engine::Model, [kvik_model::types::SeriesId; 3]) {
+    use kvik_model::engine::{Config, Model};
+    use kvik_model::registry::{ChangedAtKind, SeriesOptions, Timing};
+    use kvik_model::types::ValueType;
+    let mut m = Model::new(Config::default(), vec![], T0);
+    let s = 10 * MINUTE;
+    let def = |m: &mut Model, name: &str, options| {
+        m.define_with(name, Kind::Gauge, ValueType::Number, "1", s, options)
+            .unwrap()
+    };
+    let sched = def(
+        &mut m,
+        "site/tariff-1/price",
+        SeriesOptions::timing(Timing::Scheduled),
+    );
+    let forecast = def(
+        &mut m,
+        "site/weather-1/irradiance",
+        SeriesOptions {
+            versioned: Some(ChangedAtKind::Time),
+            ..SeriesOptions::timing(Timing::Forecast)
+        },
+    );
+    let observed = def(&mut m, "site/meter-1/power", SeriesOptions::default());
+    (m, [sched, forecast, observed])
+}
+
+fn emit_timed(
+    m: &mut kvik_model::engine::Model,
+    ids: [kvik_model::types::SeriesId; 3],
+    readings: &[(usize, Nanos, i32, Nanos)],
+) {
+    use kvik_model::types::Reading;
+    for (i, off, v, adv) in readings {
+        m.advance(*adv);
+        let t = m.wall + off;
+        let r = if *i == 1 {
+            Reading::versioned(ids[1], t, f64::from(*v), u64::try_from(m.wall).unwrap())
+        } else {
+            Reading::num(ids[*i], t, f64::from(*v))
+        };
+        m.ingest(vec![r]).unwrap();
+    }
+}
+
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// 20. No fact of a scheduled or forecast series carries `future`, or
+    /// `late` by its first clause. The readings stay within the lateness
+    /// bound, so any `late` would come from the first clause; the observed
+    /// series shows that the same inputs do flag it there.
+    #[test]
+    fn inv20_scheduled_and_forecast_facts_never_future_or_out_of_order_late(
+        readings in arb_timed_readings(),
+    ) {
+        let (mut m, ids) = timed_machine();
+        emit_timed(&mut m, ids, &readings);
+        for f in m.facts().unwrap() {
+            if f.series != ids[2] {
+                prop_assert!(!f.flags.future && !f.flags.late, "{:?}", f);
+            } else {
+                prop_assert_eq!(f.flags.future, f.t > f.received_at + 60 * SECOND);
+            }
+        }
+    }
+}

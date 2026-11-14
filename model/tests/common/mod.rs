@@ -14,7 +14,7 @@ use kvik_model::summary::Aggregate;
 use kvik_model::summary::Params;
 use kvik_model::types::{
     DAY, Fact, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId,
-    Value, ValueType,
+    TSource, Value, ValueType,
 };
 use proptest::prelude::*;
 
@@ -431,6 +431,7 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
                 value: value.clone(),
                 quality: if *bad { Quality::Bad } else { Quality::Good },
                 changed_at: (*series == VERSIONED).then_some(*changed_at),
+                t_source: TSource::Device,
             };
             let _ = if *revise { m.emit_revise(r) } else { m.emit(r) };
         }

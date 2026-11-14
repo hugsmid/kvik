@@ -11,7 +11,7 @@ use jiff::tz::TimeZone;
 use kvik_model::condition::{Condition, Event, Runner};
 use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, Model, Selection};
 use kvik_model::oracle;
-use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
+use kvik_model::summary::{AggValue, Aggregate, Params};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
 use kvik_model::types::{
     DAY, Exact, HOUR, Kind, MINUTE, Nanos, Reading, SECOND, SeriesId, Value, ValueType, floor_to,
@@ -207,16 +207,4 @@ fn rate_divides_by_covered_seconds() {
         w.aggregate(&Aggregate::Rate),
         Some(AggValue::Exact(Exact::new(150.into(), 181.into())))
     );
-}
-
-/// §5.5: counter values are non-negative and a negative value is recorded as bad
-/// quality; the model applies the reset rule to negative values.
-#[test]
-fn negative_counter_decrease_counts_as_reset() {
-    let p = Params::new(Kind::Counter, HOUR);
-    let rs = vec![(T0, Value::Num(-10.0)), (T0 + SECOND, Value::Num(-20.0))];
-    let Body::Counter { resets, .. } = direct(&p, T0, T0 + MINUTE, &rs).body else {
-        unreachable!()
-    };
-    assert_eq!(resets, 1);
 }

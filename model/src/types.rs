@@ -234,6 +234,23 @@ pub struct Flags {
     pub late: bool,
     /// Submitted with `revise` intent, bypassing the duplicate check (§2.4).
     pub revise: bool,
+    /// The adapter stamped `t` from the host clock (`t_source = host`, §2.2).
+    pub host_time: bool,
+    /// Committed before the system reported clock synchronisation (§2.5).
+    pub unsynced_clock: bool,
+    /// Recorded without a value: a NaN or infinite value, or a negative
+    /// counter value (§2.5, §5.5).
+    pub no_value: bool,
+}
+
+/// Which clock stamped a reading's `t` (§2.2 `t_source`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TSource {
+    /// The device's own clock.
+    #[default]
+    Device,
+    /// The host's clock.
+    Host,
 }
 
 /// A reading as an adapter emits it.
@@ -250,6 +267,8 @@ pub struct Reading {
     /// The source's revision time or version (§2.2): carried by every
     /// reading of a versioned series and by no other.
     pub changed_at: Option<u64>,
+    /// Which clock stamped `t` (§2.2).
+    pub t_source: TSource,
 }
 
 impl Reading {
@@ -261,6 +280,15 @@ impl Reading {
             value: Value::Num(v),
             quality: Quality::Good,
             changed_at: None,
+            t_source: TSource::Device,
+        }
+    }
+
+    /// The same reading with `t` stamped by the host clock (§2.2).
+    pub fn host(self) -> Self {
+        Reading {
+            t_source: TSource::Host,
+            ..self
         }
     }
 

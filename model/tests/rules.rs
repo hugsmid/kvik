@@ -61,6 +61,99 @@ fn s2_2_late_flag() {
     m.ingest(vec![Reading::num(s, now - 6 * MINUTE, 1.0)])
         .unwrap();
     assert!(m.facts().unwrap()[0].flags.late);
+    assert_eq!(m.counters.late, 1);
+}
+
+/// §2.2: the first clause of `late` applies to observed series only; the
+/// second, `received_at − t` above the lateness bound, to any series, with
+/// the bound set per series (default 5 minutes).
+#[test]
+fn s2_2_late_first_clause_observed_only_bound_per_series() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let sched = m
+        .define_with(
+            "site/tariff-1/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "c/kWh",
+            10 * SECOND,
+            SeriesOptions {
+                lateness_bound: Some(30 * MINUTE),
+                ..SeriesOptions::timing(Timing::Scheduled)
+            },
+        )
+        .unwrap();
+    let now = m.wall;
+    m.ingest(vec![Reading::num(sched, now + DAY, 1.0)]).unwrap();
+    // A day below the latest recorded t, but within the series' bound.
+    m.ingest(vec![Reading::num(sched, now - 20 * MINUTE, 1.0)])
+        .unwrap();
+    m.ingest(vec![Reading::num(sched, now - 31 * MINUTE, 1.0)])
+        .unwrap();
+    let late: Vec<bool> = m.facts().unwrap().iter().map(|f| f.flags.late).collect();
+    assert_eq!(late, vec![false, false, true]);
+}
+
+/// §2.2: `future` applies to observed series only; a scheduled or forecast
+/// reading far ahead is recorded unflagged with its quality kept.
+#[test]
+fn s2_2_future_observed_series_only() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let sched = m
+        .define_with(
+            "site/tariff-1/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "c/kWh",
+            10 * SECOND,
+            SeriesOptions::timing(Timing::Scheduled),
+        )
+        .unwrap();
+    let now = m.wall;
+    m.ingest(vec![Reading::num(sched, now + DAY, 1.0)]).unwrap();
+    let f = &m.facts().unwrap()[0];
+    assert!(!f.flags.future && !f.flags.late);
+    assert_eq!(f.quality, Quality::Good);
+    assert_eq!(m.counters.future, 0);
+}
+
+/// §2.5: until the system reports clock synchronisation, batches carry
+/// `unsynced_clock`, `future` and `late` are not set, host-stamped readings
+/// wait (back-pressure, counted) and device-stamped readings are accepted.
+/// §2.2: a host-stamped fact is flagged `host_time`.
+#[test]
+fn s2_5_unsynchronised_clock() {
+    let (mut m, s) = model(10 * SECOND);
+    m.clock_synchronised = false;
+    let now = m.wall;
+    assert_eq!(
+        m.emit(Reading::num(s, now, 1.0).host()),
+        Err(Wait::UnsyncedClock.into())
+    );
+    assert_eq!(m.counters.waits[&Wait::UnsyncedClock], 1);
+    m.ingest(vec![
+        Reading::num(s, now - DAY, 2.0),
+        Reading::num(s, now + DAY, 3.0),
+    ])
+    .unwrap();
+    for f in m.facts().unwrap() {
+        assert!(f.flags.unsynced_clock && !f.flags.host_time);
+        assert!(!f.flags.late && !f.flags.future);
+        assert_eq!(f.quality, Quality::Good);
+    }
+    m.clock_synchronised = true;
+    let now = m.wall;
+    let p = m
+        .ingest(vec![Reading::num(s, now, 1.0).host()])
+        .unwrap()
+        .positions[0];
+    let f = m
+        .facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.position == p)
+        .unwrap();
+    assert!(f.flags.host_time && !f.flags.unsynced_clock);
 }
 
 #[test]
@@ -2133,6 +2226,7 @@ fn s2_1_forecast_series_versioned_with_time() {
     let forecast = |versioned| SeriesOptions {
         versioned,
         timing: Timing::Forecast,
+        ..SeriesOptions::default()
     };
     for versioned in [None, Some(ChangedAtKind::Version)] {
         assert_eq!(

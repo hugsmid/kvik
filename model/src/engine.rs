@@ -10,13 +10,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
 use crate::registry::{
-    Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions,
+    Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
 };
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{SeriesTree, TreeError};
 use crate::types::{
     Fact, Flags, HOUR, Kind, MAX_TEXT_BYTES, MINUTE, Nanos, Position, QUARTER, Quality, Reading,
-    SECOND, SeriesId, Value, ValueType, floor_to,
+    SECOND, SeriesId, TSource, Value, ValueType, floor_to,
 };
 use crate::view;
 
@@ -558,6 +558,11 @@ pub enum Wait {
     /// The ingest queue is full.
     #[error("ingest queue full")]
     QueueFull,
+    /// A host-stamped reading while the system has not reported clock
+    /// synchronisation (§2.5): it waits rather than being stamped with a
+    /// wrong time.
+    #[error("host clock not synchronised")]
+    UnsyncedClock,
 }
 
 /// Why an emit did not enter the ingest queue.
@@ -722,6 +727,9 @@ pub struct Counters {
     pub duplicates_unchecked: u64,
     /// NaN or infinite values recorded as bad quality without a value (§2.5).
     pub non_finite: u64,
+    /// Negative counter values recorded as bad quality without a value
+    /// (§2.5, §5.5).
+    pub negative_counter: u64,
     /// Uploads the bucket rejected for a hash mismatch.
     pub uploads_rejected: u64,
     /// Compaction or tiering runs skipped for low disk.
@@ -1526,6 +1534,10 @@ pub struct Model {
     pub now: Nanos,
     /// Boot id of the machine; a power loss starts a new boot.
     pub boot: u64,
+    /// Whether the system reports clock synchronisation (§2.5). Until it
+    /// does, batches carry `unsynced_clock`, `future` and `late` are not set
+    /// and host-stamped readings wait.
+    pub clock_synchronised: bool,
     vol: Option<Volatile>,
     sessions: BTreeMap<ConsumerId, u32>,
 }
@@ -1552,6 +1564,7 @@ impl Model {
             mono: 0,
             now: wall,
             boot: 0,
+            clock_synchronised: true,
             vol: None,
             sessions: BTreeMap::new(),
         };
@@ -2219,6 +2232,9 @@ impl Model {
         {
             return Err(Refusal::TextTooLong.into());
         }
+        if r.t_source == TSource::Host && !self.clock_synchronised {
+            return Err(Wait::UnsyncedClock.into());
+        }
         if v.queue.len() >= self.config.ingest_capacity {
             return Err(Wait::QueueFull.into());
         }
@@ -2266,18 +2282,40 @@ impl Model {
         let mut duplicates = 0;
         let mut unchecked = 0;
         let mut non_finite = 0;
+        let mut negative = 0;
+        let synced = self.clock_synchronised;
         let mut next = v.next_position;
         let readings: Vec<(Reading, bool)> = v.queue.drain(..).collect();
         for (r, revise) in readings {
+            let Some(def) = v.registry.get(r.series) else {
+                continue;
+            };
+            // A retirement committed while the reading waited in the queue
+            // (§2.1): refused and counted.
+            if def.retired_at.is_some_and(|at| r.t >= at) {
+                *self.counters.refused.entry(Refusal::Retired).or_insert(0) += 1;
+                continue;
+            }
             let supplied = r.quality;
+            // NaN and ±∞ (§12 D1), and a negative counter value (§5.5), are
+            // recorded as bad quality without a value, flagged and counted;
+            // the duplicate rule compares them as "no value" (§2.4).
             let (value, mut quality) = match r.value {
                 Value::Num(x) if !x.is_finite() => {
                     non_finite += 1;
                     (Value::Absent, Quality::Bad)
                 }
+                Value::Num(x) if def.kind == Kind::Counter && x < 0.0 => {
+                    negative += 1;
+                    (Value::Absent, Quality::Bad)
+                }
                 other => (other, r.quality),
             };
-            let future = r.t > wall.saturating_add(cfg.future_tolerance);
+            let no_value = matches!(value, Value::Absent);
+            let observed = def.options.timing == Timing::Observed;
+            // `future` (§2.2): observed series only, and not before the
+            // clock is synchronised (§2.5).
+            let future = synced && observed && r.t > wall.saturating_add(cfg.future_tolerance);
             if future {
                 quality = quality.worst(Quality::Suspect);
             }
@@ -2353,12 +2391,16 @@ impl Model {
                 .get(&r.series)
                 .or_else(|| v.newest_t.get(&r.series))
                 .copied();
-            let s = v.registry.get(r.series).and_then(|d| d.staleness);
-            let out_of_order = match (newest, s) {
-                (Some(n), Some(s)) => r.t < n.saturating_sub(2 * s),
+            // `late` (§2.2): on an observed series, earlier than the latest
+            // recorded `t` by more than 2 × S; on any series, older than the
+            // lateness bound. Neither before the clock is synchronised (§2.5).
+            let def = v.registry.get(r.series).expect("checked above");
+            let out_of_order = match (newest, def.staleness) {
+                (Some(n), Some(s)) => observed && r.t < n.saturating_sub(2 * s),
                 _ => false,
             };
-            let late = out_of_order || wall - r.t > cfg.lateness_bound;
+            let bound = def.options.lateness_bound.unwrap_or(cfg.lateness_bound);
+            let late = synced && (out_of_order || wall.saturating_sub(r.t) > bound);
             let fact = Fact {
                 series: r.series,
                 t: r.t,
@@ -2372,6 +2414,9 @@ impl Model {
                     future,
                     late,
                     revise,
+                    host_time: r.t_source == TSource::Host,
+                    unsynced_clock: !synced,
+                    no_value,
                 },
             };
             next = next.next();
@@ -2394,6 +2439,7 @@ impl Model {
         v.next_position = next;
         self.counters.duplicates_dropped += duplicates as u64;
         self.counters.non_finite += non_finite;
+        self.counters.negative_counter += negative;
         let mut report = CommitReport {
             positions: batch.iter().map(|e| e.position).collect(),
             duplicates,
@@ -4789,7 +4835,10 @@ fn download_rank(class: FileClass) -> u8 {
 }
 
 fn params_of(d: &SeriesDef) -> Params {
-    Params::new(d.kind, d.staleness)
+    Params {
+        counter: d.options.counter,
+        ..Params::new(d.kind, d.staleness)
+    }
 }
 
 /// The funnels of a consumer in force at `before` (routing changes at

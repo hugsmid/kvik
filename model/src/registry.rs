@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::summary::CounterRules;
 use crate::types::{Kind, Nanos, SeriesId, ValueType};
 
 /// What `changed_at` holds in a versioned series (§2.1).
@@ -51,15 +52,28 @@ impl RetentionClass {
     }
 }
 
-/// Definition fields fixed for the life of a series beyond kind, type and
-/// unit (§2.1).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Definition fields beyond kind, type, unit and staleness limit (§2.1).
+/// The model fixes them for the life of a series: it has no parameter
+/// entries with an effective time (see `OPEN-QUESTIONS.md`, Q-60).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SeriesOptions {
     /// `Some` for a versioned series, with what its `changed_at` holds.
     pub versioned: Option<ChangedAtKind>,
-    /// Timing. The model checks only that a forecast series is versioned
-    /// with `changed_at` kind `time`; every series is otherwise observed.
+    /// Timing (§2.1): observed, scheduled or forecast.
     pub timing: Timing,
+    /// Expected interval (§2.1), configuration and never learned; for a
+    /// record-on-change series the keep-alive interval (§2.6). `None` takes
+    /// the interval for which the given staleness limit is the default
+    /// (S = 3 × expected interval), and no interval when no limit is given.
+    /// It decides which tree levels are stored (§5.1 density rule).
+    pub expected_interval: Option<Nanos>,
+    /// Record on change (§2.6): the series records a fact when its value
+    /// changes and a keep-alive fact at least once per expected interval.
+    pub record_on_change: bool,
+    /// Counter rules (§5.5); counters only.
+    pub counter: CounterRules,
+    /// Lateness bound (§2.2); `None` takes the configured default (5 min).
+    pub lateness_bound: Option<Nanos>,
 }
 
 impl SeriesOptions {
@@ -67,6 +81,22 @@ impl SeriesOptions {
     pub fn versioned(kind: ChangedAtKind) -> Self {
         SeriesOptions {
             versioned: Some(kind),
+            ..SeriesOptions::default()
+        }
+    }
+
+    /// A series of the given timing.
+    pub fn timing(timing: Timing) -> Self {
+        SeriesOptions {
+            timing,
+            ..SeriesOptions::default()
+        }
+    }
+
+    /// A series with the given expected interval.
+    pub fn expected(interval: Nanos) -> Self {
+        SeriesOptions {
+            expected_interval: Some(interval),
             ..SeriesOptions::default()
         }
     }
@@ -141,6 +171,17 @@ pub struct SeriesDef {
     pub retired_at: Option<Nanos>,
 }
 
+impl SeriesDef {
+    /// The expected interval (§2.1): as defined, or for a series defined
+    /// with a staleness limit only, the interval for which that limit is the
+    /// default (S = 3 × expected interval); `None` without either.
+    pub fn expected_interval(&self) -> Option<Nanos> {
+        self.options
+            .expected_interval
+            .or(self.staleness.map(|s| s / 3))
+    }
+}
+
 /// Registry errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryError {
@@ -169,6 +210,13 @@ pub enum RegistryError {
     /// A retention period must be positive.
     #[error("retention period must be positive")]
     BadRetention,
+    /// An expected interval or lateness bound must be positive.
+    #[error("expected interval and lateness bound must be positive")]
+    BadInterval,
+    /// Counter rules on a series that is not a counter, or out of range
+    /// (§5.5: `wrap_at` positive, `reset_ceiling` between 0 and 1).
+    #[error("counter rules apply to counters only, with wrap_at > 0 and 0 <= reset_ceiling <= 1")]
+    BadCounterRules,
 }
 
 /// The registry.
@@ -272,6 +320,20 @@ impl Registry {
         if staleness.is_some_and(|s| s <= 0) {
             return Err(RegistryError::BadStaleness);
         }
+        if options.expected_interval.is_some_and(|e| e <= 0)
+            || options.lateness_bound.is_some_and(|l| l <= 0)
+        {
+            return Err(RegistryError::BadInterval);
+        }
+        let rules = options.counter;
+        if (kind != Kind::Counter && rules != CounterRules::default())
+            || rules.wrap_at.is_some_and(|w| !(w > 0.0 && w.is_finite()))
+            || !(0.0..=1.0).contains(&rules.reset_ceiling)
+        {
+            return Err(RegistryError::BadCounterRules);
+        }
+        // S = 3 × expected interval unless set (§2.1).
+        let staleness = staleness.or(options.expected_interval.map(|e| 3 * e));
         if options.timing == Timing::Forecast && options.versioned != Some(ChangedAtKind::Time) {
             return Err(RegistryError::ForecastNotVersioned);
         }
