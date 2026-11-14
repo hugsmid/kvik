@@ -1,8 +1,9 @@
-# kvik specification, v0.1 (design; not yet implemented)
+# kvik specification, v0.2 (design; not yet implemented)
 
 This repository contains this specification and a reference model of its semantics (`model/`). The engine
 described here does not exist yet. "Must" is normative: it states what an implementation is required to do. §12
-records the choices decided between alternatives. The byte-level format will be specified in a separate document. Open questions found by modelling are in `model/OPEN-QUESTIONS.md`.
+records the choices decided between alternatives. The byte-level format will be specified in a separate document. Open questions found by modelling are in `model/OPEN-QUESTIONS.md`; those still open at v0.2, and the roadmap item
+each is deferred to, are listed there under "Open at v0.2".
 
 ## 1. Principles
 1. **Facts are immutable.** A recorded reading is never edited or deleted by the engine.

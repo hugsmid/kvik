@@ -12,7 +12,8 @@ again; nothing after a gate starts before it is passed.
 - [x] 1.5 Model: data rules — lateness, non-finite values, retirement time, record-on-change keep-alive, density rule, counters, rate
 - [x] 1.6 Model: calendar results as window evaluations; time-zone edge cases in several zones
 - [x] 1.7 Every invariant has a property test and every edge-case row has a test; coverage table in `model/README.md`
-- [ ] 1.8 **Gate** — open questions settled and the specification tagged v0.2
+- [x] 1.8 **Gate** — open questions settled and the specification tagged v0.2 (passed by the owner's decision with
+  the questions listed under "Open at v0.2" in `model/OPEN-QUESTIONS.md` deferred to the roadmap items named there)
 
 ## 2. Measurements before building
 - [ ] 2.1 Spike: candidate chunk encodings against the Parquet reader — size and scan speed on synthetic per-second data; results in `docs/measurements/`

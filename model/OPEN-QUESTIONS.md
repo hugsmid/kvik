@@ -582,6 +582,42 @@ flagged.
 **Proposal.** Readings whose whole interval lies in the window; where an edge cuts an interval, the result is flagged
 `apportioned` as sum is. For fixed-length series this changes only windows whose edges cut an interval.
 
+## Open at v0.2
+
+The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
+by the roadmap item named here, before that item is done. Until then the model's choice, where it has one, is the
+one pinned in `tests/open_questions.rs`.
+
+| Question | Settle by roadmap item | Note |
+|---|---|---|
+| Q-16 | 5.4 | Live state and staleness are built there |
+| Q-33 | 4.5 | Recovery with lost ranges |
+| Q-34 (c) | 4.5 | Recovery and health reports |
+| Q-39 (e) | 8.3 | For the owner, before restore is built |
+| Q-39 (f) | 8.3 | Restore |
+| Q-44 (b)–(d) | 5.1 | Series registry and timing; (d) for the owner |
+| Q-46 | 4.6 | Second-process reader |
+| Q-47 | 4.5 | Recovery, with 5.3 (resync) |
+| Q-48 | 4.5 | Recovery |
+| Q-49 (b) | 8.3 | For the owner, before restore is built |
+| Q-52 | 4.5 | Recovery, with 6.3 (manifest) |
+| Q-60 | 7.1 | Stored levels |
+| Q-61 | 5.2 | Consumer queues and durable cursors |
+| Q-62 | 5.3 | Catch-up |
+| Q-63 | 5.4 | Windowed operators and conditions |
+| Q-64 | 8.3 | Restore |
+| Q-70 | 8.3 | Restore |
+| Q-71 | 6.3 | Manifest and publish-and-retire |
+| Q-72 | 6.2 | Revised-key index and compaction |
+| Q-73 | 5.1 | Series registry (proposal: the adapter leaves them out) |
+| Q-75 | 7.3 | Calendar levels |
+| Q-76 | 7.3 | Calendar levels |
+| Q-77 | 7.3 | Calendar levels |
+| Q-78 | 5.2 | Routing table |
+| Q-79 | 4.5 | Recovery |
+| Q-80 | 7.3 | Calendar levels, with 5.1 |
+| Q-81 | 5.4 | Windowed operators |
+
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
 `docs/api.md`:
