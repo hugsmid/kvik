@@ -368,6 +368,9 @@ and resume), whether its latches are kept, and whether its condition delivery se
 at every engine start").
 **Model.** The cursor and the latches are durable at once on confirmation (see "Cursor file synced at most every 1 s"
 in the table below); a consumer restart resumes from the cursor with a replay and `resync`.
+**Settled since.** For (a), what the consumer forgets: §4 Resync gives a consumer with no cursor file, before its
+first delivery, a `resync` with `forget_above` = the position before its start (the mark's last position for `start:
+now`, before the first fact at or after T for `start: time`, P for `start: position` P).
 **Needed.** The first state, the latches and the delivery identity in both cases.
 
 ## Q-96 — A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer

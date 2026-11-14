@@ -117,7 +117,7 @@ enum Live { Value(Fact), None, Unknown }
   Recovery rule 3, §4 At-least-once). It confirms that `Resync` only when the forgetting is durable wherever that
   memory is kept; nothing further is delivered until it does. Records it keeps outside the engine at those positions
   are copies of facts the store may no longer hold; the engine never asks for them to be deleted and does not protect
-  them. A `Resync` without `forget_above` requires no forgetting.
+  them. A `Resync` without `forget_above` requires no forgetting of positions.
 - A consumer that emits readings uses its own handle, `consumer.try_emit(&readings)`, or its own task, never the
   delivery callback. A reading on a series outside the consumer's `emits` is refused with `Refusal::NotDeclared` and
   counted.
