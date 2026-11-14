@@ -31,16 +31,14 @@ the rest is filled in by the roadmap items named.
 
 ## Opening
 ```rust
-let store = Store::open(StoreConfig {
-    dir: path,
-    time_zone: tz,                 // the site zone at creation; checked at every later open
-    create_if_missing: true,       // creates only in a missing or empty directory (format.md A.12)
-    log: LogConfig::default(),     // segment size, seal interval, min_sync_interval, batch size, mark sync
-    limits: Limits::default(),     // queue sizes, series ceiling, disk marks
-    tiers: TierConfig::default(),  // cold path, age and fill thresholds
-    env: Env::system(),            // clock, file system, boot identity, tzdata, entropy
-    ..Default::default()
-}).await?;
+let store = Store::open(
+    StoreConfig::new(path, tz)        // tz: the site zone at creation; checked at every later open
+        .create_if_missing(true)       // creates only in a missing or empty directory (format.md A.12)
+        .log(LogConfig::default())     // segment size, seal interval, min_sync_interval, batch size, mark sync
+        .limits(Limits::default())     // queue sizes, series ceiling, disk marks
+        .tiers(TierConfig::default())  // cold path, age and fill thresholds
+        .env(Env::system()),           // clock, file system, boot identity, tzdata, entropy
+).await?;
 let reader = Reader::open(ReaderConfig::new(path))?;   // read-only; no lock; may be another process; blocking
 store.shutdown().await?;                               // final sync, checkpoint, release the lock
 ```
@@ -140,15 +138,14 @@ Funnel compilation errors (`RouteCycle` among them) and backup errors are added 
 
 ## Series
 ```rust
-let id: SeriesId = store.define_series(SeriesSpec {
-    name: "plant/line-1/temperature".into(),
-    kind: Kind::Gauge { value: ValueType::Decimal { scale: 1 } },   // ValueType::decimal() declares scale 4
-    unit: "°C".into(),
-    expected_interval: Some(Duration::from_secs(1)),
-    excess_precision: ExcessPrecision::Round,   // default; or Refuse, or AutoRaise { max_scale }
-    ..Default::default()
-}).await?;
-store.set_parameters(id, effective_from, ParameterChange { .. }).await?;
+let id: SeriesId = store.define_series(
+    SeriesSpec::new("plant/line-1/temperature",
+                    Kind::Gauge { value: ValueType::Decimal { scale: 1 } },   // ValueType::decimal() declares scale 4
+                    "°C")
+        .expected_interval(Duration::from_secs(1))
+        .excess_precision(ExcessPrecision::Round),   // default; or Refuse, or AutoRaise { max_scale }
+).await?;
+store.set_parameters(id, effective_from, ParameterChange::default().staleness(s)).await?;
 store.raise_scale(id, 3).await?;              // from this entry's position on; never lowered
 store.alias(id, "plant/line-1/temp").await?;
 store.retire(id, t_r).await?;

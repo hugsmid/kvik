@@ -31,6 +31,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-101 | §2.4, §2.1 `excess precision` | A replay across a scale raise, rounded or not |
 | Q-102 | §2.1 `decimal scale`, §2.5 | A finite value too large for `i64` at the series' scale |
 | Q-103 | §7 Manifest, §8 Generations, Tiers | What an automatic manifest rebuild cannot recover from local files |
+| Q-104 | §2.5, §2.4 | A supplied `Absent` value with a quality other than bad |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -461,6 +462,20 @@ no longer seen, so an id could be issued again.
 kept; for (d), the writer's behaviour while deep is unreachable; for (g), a floor that survives a rebuild (for
 example in the rebuild record). To be settled by roadmap 6.3; (a), (b) and (f) with 8.2 and 8.3.
 
+## Q-104 — A supplied `Absent` value with a quality other than bad
+**Scenario.** `api.md` Core types gives `Value::Absent`, "no value" (§2.5), as a value an adapter may submit. §2.5
+names only NaN, ±∞ and a negative counter value as recorded without a value, each with quality bad; no rule covers an
+`Absent` submitted with quality good, estimated or suspect. Recorded as given, it would be a reading of good quality
+with nothing to summarise.
+**Model.** `Value::fits` accepts `Absent` for every value type (`model/src/types.rs`), and the reading is recorded
+with its supplied quality; the summary then expects a number for a reading that is not bad and panics
+(`model/src/summary.rs`, `Node::hold`). The `kvik` crate submits an `Absent` as bad quality, so its supplied quality
+is lost and §2.4's comparison of no-value readings by supplied quality cannot hold: an `Absent` of good quality and
+then one of bad quality at the same `t` is dropped as a duplicate.
+**Needed.** Whether a supplied `Absent` is accepted, and with what quality.
+**Proposal.** Treat it as NaN is treated: recorded as quality bad with no value, flagged and counted, with its supplied
+quality kept for the duplicate rule (one more arm beside NaN and ±∞ in `Model::commit`, `model/src/engine.rs`).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -497,6 +512,7 @@ Q-87 was reopened there.
 | Q-101 | 5.1 | Series registry and duplicates; recorded after gate 3.3, from the owner's decimal ruling |
 | Q-102 | 5.1 | Series registry; recorded at the gate 3.3 review |
 | Q-103 | 6.3 | Manifest rebuild; (a) and (b) with 8.2 and 8.3; recorded at the gate 3.3 review |
+| Q-104 | 4.3 | Arrival batches; recorded after gate 3.3, from the interface crate |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
