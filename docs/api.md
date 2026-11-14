@@ -72,7 +72,7 @@ while let Some(d) = consumer.next().await {
     match d.kind {
         DeliveryKind::Fact(f) => { /* f.position, f.series, f.t, f.value */ }
         DeliveryKind::Trigger(t) => { /* t.funnel, t.state, t.value, t.coverage */ }
-        DeliveryKind::Resync(s) => { /* current live state and condition state; forget unconfirmed positions */ }
+        DeliveryKind::Resync(s) => { /* live and condition state now; forget positions above the recovered cursor */ }
     }
     consumer.confirm(d.id).await?;            // advances the durable cursor
 }
@@ -80,8 +80,9 @@ while let Some(d) = consumer.next().await {
 - A delivery carries `id` (position, or funnel and sequence for timer deliveries), `flags` (`replayed`,
   `future`) and the times needed to judge its age.
 - `confirm` is cheap and batched; the cursor is written at most once a second and on shutdown.
-- On `Resync` the consumer must forget every position above its last confirmation that it has seen: after a power
-  loss such a position can name a different fact (spec §3 Recovery rule 3, §4 At-least-once).
+- On `Resync` the consumer must forget every position it has seen above its durable cursor as recovered, which can
+  lag its last confirmation: after a power loss such a position can name a different fact (spec §3 Recovery rule 3,
+  §4 At-least-once).
 - A consumer that emits readings uses `try_emit` or its own task, never the delivery callback.
 - Routes may be added and removed while running; each change is a log entry and takes effect at its position.
 
