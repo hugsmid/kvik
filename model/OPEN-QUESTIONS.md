@@ -128,7 +128,8 @@ every file the restore reads is local; the label goes earlier, once every span t
 (`q39_restoring_ends_when_every_file_is_local`). (d) The revised-key index counts as back once every current chunk is
 local, and is taken from the restored facts (`q39_revised_key_index_back_with_current_chunks`). While `restoring`, a
 window bound inside a minute is refused and no tree checkpoint is taken
-(`q39_no_sub_minute_query_or_checkpoint_while_restoring`).
+(`q39_no_sub_minute_query_or_checkpoint_while_restoring`); only window queries are guarded, and `current`, `facts`
+and `latest` return the local facts, unflagged.
 **Needed.** What each failure does, what a restart clears, and when the store stops being flagged `restoring`.
 
 ## Q-40 — Ranking facts of versioned series during a restore
@@ -384,8 +385,7 @@ next if the marker exists, and starts it at sequence 1; a bucket with nothing ba
 is the last position before the first gap, and later positions of older generations are set aside, outside views,
 trees, the registry and delivery; the restore writes its record (generation, checkpoint, restored end) and downloads
 the latest checkpoint at or below the restored end and the log segments after it (with no checkpoint, the whole log)
-before it accepts ingest; queries at 1-minute resolution are then flagged `restoring`, and a minute holding a fact
-after the checkpoint whose earlier detail is not local is `summary_stale`; until the current chunks (and with them the
+before it accepts ingest; window queries at 1-minute resolution are then flagged `restoring`; until the current chunks (and with them the
 revised-key index) are back, a fact at or before the latest known `t` of its series that matches no local fact is
 recorded and counted `duplicates_unchecked`; a consumer whose kept cursor is at or below the restored end catches up
 to it, flagged `replayed`, if log segments after it are local, and otherwise only receives `resync`; every consumer
@@ -432,7 +432,8 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Timed mark sync; `possible_loss`; no reuse of positions after a truncation; `resync` to every consumer after it | §3 Durable mark, §3 Recovery rule 3, §4 Resync, row 7a | The mark is always exact; a truncation after a reboot is not reported | — |
 | Segments beyond the restored end | §8 Restore step 1: quarantined, reported in health like a lost range, available for re-ingest (see Q-38) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery; not reported; their series ids are not reserved; reader epochs (§7) still read them | `tests/rules.rs` `s8_restored_end_before_first_gap` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1 (see Q-37) | The record is local; a restore reads every file in the bucket whatever its generation, so a second restore finds the first restore's gap again and sets aside the generation that restore started | `tests/open_questions.rs` `q37_…` |
-| Query flags | §11 Query: each result carries coverage and flags | Only window results carry flags (`restoring`, `summary_stale`) | — |
+| Query flags | §11 Query: each result carries coverage and flags | Only window results carry flags (`restoring`, `summary_stale`); while restoring, `current`, `facts` and `latest` return the local facts, unflagged (see Q-39) | — |
+| Replaying the log after a checkpoint | §8 Restore step 1: "replay them into the tree" | A minute for which the checkpoint holds a node and the replay (or new ingest) brings a fact, while the minute's earlier detail is not local, is recomputed from the local facts and flagged `summary_stale` until the detail is back (row 29); an engine that folds facts in `t` order into the checkpoint's node would hold it exact | `tests/rules.rs` `s8_replayed_minute_without_its_detail_is_stale` |
 | Lost ranges and the restored end | §8 Restore step 1: a recorded lost range is not a gap | Every missing position is a gap (the model records no lost ranges) | — |
 | Consumers after a restore | §8 Restore step 2: every consumer "then" receives `generation_changed` and `resync` | Signals and fact deliveries are kept in separate lists (`signals`, `observed`), so the model cannot show that `generation_changed` follows the catch-up | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
 | Invariants 12–16 | §10 | Not checked yet | — |

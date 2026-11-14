@@ -6,7 +6,7 @@ again; nothing after a gate starts before it is passed.
 
 ## 1. Specification settled
 - [x] 1.1 Apply the outstanding rulings to `docs/spec.md`
-- [ ] 1.2 Model: durable mark, boot identity, recovery, generations and restore
+- [x] 1.2 Model: durable mark, boot identity, recovery, generations and restore
 - [ ] 1.3 Model: delivery — latch, resync, catch-up after overflow, run-time routes, timer deliveries
 - [ ] 1.4 Model: files — atomic manifest records, reader leases, tiers and eviction, duplicate rule with revise
 - [ ] 1.5 Model: data rules — lateness, non-finite values, retirement time, record-on-change keep-alive, density rule, counters, rate
