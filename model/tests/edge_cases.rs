@@ -1506,7 +1506,10 @@ proptest! {
         // Readings placed on this local day; day node from the tree = direct.
         let (ds, _) = kvik_model::tree::day_span(&tz, date).unwrap();
         let rs: Vec<(Nanos, Value)> = rs.into_iter().map(|(t, v)| (t - T0 + ds, v)).collect();
-        let p = Params::new(Kind::Gauge, 7 * SECOND);
+        let p = Params {
+            expected_interval: Some(SECOND),
+            ..Params::new(Kind::Gauge, 7 * SECOND)
+        };
         let tree = SeriesTree::build(p, &rs);
         prop_assert_eq!(tree.day(&tz, date).unwrap(), oracle::day(&p, &rs, &tz, date).unwrap());
     }

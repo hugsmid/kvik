@@ -656,7 +656,10 @@ fn s6_rate_over_elapsed_time_between_bounding_readings() {
 
 #[test]
 fn s6_windows_exact_to_the_nanosecond() {
-    let p = Params::new(Kind::Gauge, SECOND);
+    let p = Params {
+        expected_interval: Some(SECOND),
+        ..Params::new(Kind::Gauge, SECOND)
+    };
     let rs = vec![(T0, n(1.0))];
     let tree = SeriesTree::build(p, &rs);
     let w = tree.window(T0 + 1, T0 + 7, T0 + HOUR);
@@ -1932,12 +1935,18 @@ fn s5_4_stale_for_on_a_scheduled_series() {
         Some(&ConditionState::Active(true)),
         "S + n after it took effect"
     );
-    // A commit does not refresh it, even of a value already in force.
+    // A commit does not refresh it: neither a value for an earlier `t`, nor
+    // a correction of the value in force at its own `t`.
     let now = m.wall;
     m.ingest(vec![Reading::num(s, now - 20 * MINUTE, 3.0)])
         .unwrap();
     m.tick().unwrap();
     assert_eq!(states(&mut m).len(), 3);
+    let in_force = m.latest(s).unwrap().unwrap().t;
+    m.ingest(vec![Reading::num(s, in_force, 4.0)]).unwrap();
+    m.tick().unwrap();
+    assert_eq!(states(&mut m).len(), 3);
+    assert_eq!(m.latest(s).unwrap().unwrap().value, Value::Num(4.0));
     assert_eq!(m.scheduled_stale(s).unwrap(), Some(true));
     m.reconnect(C).unwrap();
     m.drain().unwrap();

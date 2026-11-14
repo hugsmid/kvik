@@ -1671,3 +1671,34 @@ proptest! {
         }
     }
 }
+
+/// Guards `arb_params` with `arb_readings`, the inputs of invariants 6, 7,
+/// 17, 18 and 21: every kind gets trees that store both levels, the
+/// 15-minute level only, and no level (§5.1).
+#[test]
+fn params_generator_covers_every_density_level() {
+    use kvik_model::types::Kind;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = arb_params().prop_flat_map(|p| (Just(p), arb_readings(p.kind, 16)));
+    // Per kind: trees with a stored 1-minute node, with a stored 15-minute
+    // node and no 1-minute level, and with no stored level.
+    let mut seen: BTreeMap<Kind, [u32; 3]> = BTreeMap::new();
+    for _ in 0..2000 {
+        let (p, rs) = strat.new_tree(&mut runner).unwrap().current();
+        let tree = SeriesTree::build(p, &rs);
+        let c = seen.entry(p.kind).or_default();
+        if tree.stored(0).next().is_some() {
+            c[0] += 1;
+        } else if tree.stored(1).next().is_some() {
+            c[1] += 1;
+        } else if !rs.is_empty() {
+            c[2] += 1;
+        }
+    }
+    for kind in [Kind::Gauge, Kind::Counter, Kind::State, Kind::Text] {
+        let c = seen[&kind];
+        assert!(c.iter().all(|n| *n > 20), "{kind:?}: {c:?}");
+    }
+}

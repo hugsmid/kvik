@@ -118,14 +118,36 @@ pub fn arb_params() -> impl Strategy<Value = Params> {
             1 => Just(Timing::Scheduled),
             1 => Just(Timing::Forecast),
         ],
+        arb_expected_interval(),
     )
-        .prop_map(|(k, s, wrap, ceiling, timing)| {
+        .prop_map(|(k, s, wrap, ceiling, timing, expected)| {
             let mut p = Params::new(k, s);
             p.counter.wrap_at = wrap;
             p.counter.reset_ceiling = ceiling;
             p.timing = timing;
+            // `None` keeps the kind's default: 60 s for gauges and counters,
+            // none for state and text (§2.1).
+            if expected.is_some() {
+                p.expected_interval = expected;
+            }
             p
         })
+}
+
+/// Expected intervals on both sides of each density threshold (§5.1): both
+/// levels stored (≤ 5 s), the 15-minute level only (5–60 s), none (> 60 s),
+/// or `None` for the kind's default.
+pub fn arb_expected_interval() -> impl Strategy<Value = Option<Nanos>> {
+    prop_oneof![
+        3 => Just(Some(SECOND)),
+        1 => Just(Some(5 * SECOND)),
+        1 => Just(Some(5 * SECOND + 1)),
+        2 => Just(Some(20 * SECOND)),
+        1 => Just(Some(MINUTE)),
+        1 => Just(Some(MINUTE + 1)),
+        1 => Just(Some(5 * MINUTE)),
+        2 => Just(None),
+    ]
 }
 
 /// Distinct, sorted readings for one series.
