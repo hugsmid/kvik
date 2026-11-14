@@ -683,6 +683,12 @@ pub fn seqs(positions: impl IntoIterator<Item = Position>) -> Vec<u64> {
 /// 200 s after the checkpoint (`0:7`, `0:8`). Everything is sealed and backed
 /// up, and the checkpoint is uploaded.
 pub fn checkpointed_model() -> (Model, SeriesId, Position) {
+    checkpointed_model_with(SECOND)
+}
+
+/// [`checkpointed_model`] with the given expected interval, which decides
+/// the levels stored (§5.1).
+pub fn checkpointed_model_with(expected: Nanos) -> (Model, SeriesId, Position) {
     let c = ConsumerDecl {
         id: ConsumerId(1),
         selection: Selection::All,
@@ -690,12 +696,13 @@ pub fn checkpointed_model() -> (Model, SeriesId, Position) {
     };
     let mut m = Model::new(Config::default(), vec![c], T0 + HOUR);
     let s = m
-        .define(
+        .define_with(
             "plant/line-1/temperature",
             Kind::Gauge,
             ValueType::Number,
             "degC",
             2 * MINUTE,
+            SeriesOptions::expected(expected),
         )
         .unwrap();
     for (t, v) in [(0, 0.0), (20, 1.0), (40, 2.0), (130, 3.0), (20, 100.0)] {

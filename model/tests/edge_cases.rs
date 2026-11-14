@@ -17,7 +17,7 @@ use kvik_model::engine::{
 use kvik_model::oracle;
 use kvik_model::registry::{ChangedAtKind, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Params};
-use kvik_model::tree::{SeriesTree, quarters_in_day};
+use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
 use kvik_model::types::{
     DAY, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND, SeriesId, Value,
     ValueType, exact, floor_to,
@@ -1028,6 +1028,36 @@ proptest! {
         let p = Params::new(Kind::Gauge, 7 * SECOND);
         let tree = SeriesTree::build(p, &rs);
         prop_assert_eq!(tree.day(&tz, date).unwrap(), oracle::day(&p, &rs, &tz, date).unwrap());
+    }
+}
+
+/// Row 20a: "Calendar day or month of a series with no stored 15-minute level
+/// (expected interval above 60 s): no calendar node; the result is a window
+/// over its facts and any stored nodes inside the span." The interval-series
+/// case is `row_20a_interval_series_…`; a span in which the expected interval
+/// crosses the threshold needs parameter changes, which the model does not
+/// have (Q-60).
+#[test]
+fn row_20a_no_calendar_node_without_a_stored_15_minute_level() {
+    let tz = TimeZone::get("Europe/Paris").unwrap();
+    for date in [Date::constant(2026, 3, 29), Date::constant(2026, 6, 1)] {
+        let (ds, de) = kvik_model::tree::day_span(&tz, date).unwrap();
+        let p = Params {
+            expected_interval: Some(2 * MINUTE),
+            ..Params::new(Kind::Gauge, 6 * MINUTE)
+        };
+        let rs: Vec<(Nanos, Value)> = (0..30)
+            .map(|k| {
+                (
+                    ds - 5 * MINUTE + k * 50 * MINUTE,
+                    Value::Num(f64::from(k as i32)),
+                )
+            })
+            .collect();
+        let tree = SeriesTree::build(p, &rs);
+        assert_eq!(tree.day(&tz, date), Err(TreeError::NoCalendarNode));
+        assert!(tree.stored(1).next().is_none());
+        assert_eq!(tree.window(ds, de, de), oracle::window(&p, &rs, ds, de, de));
     }
 }
 

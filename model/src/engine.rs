@@ -13,7 +13,7 @@ use crate::registry::{
     Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
 };
 use crate::summary::{Aggregate, Node, Params};
-use crate::tree::{SeriesTree, TreeError};
+use crate::tree::{LEVELS, SeriesTree, TreeError};
 use crate::types::{
     Fact, Flags, HOUR, Kind, MAX_TEXT_BYTES, MINUTE, Nanos, Position, QUARTER, Quality, Reading,
     SECOND, SeriesId, TSource, Value, ValueType, floor_to,
@@ -1895,7 +1895,16 @@ impl Model {
                 .as_ref()
                 .and_then(|c| c.trees.get(&d.id))
                 .map_or_else(|| SeriesTree::new(params), SeriesTree::nodes_only);
-            let held: BTreeSet<Nanos> = tree.stored(0).map(|n| n.start).collect();
+            // Minutes covered by a checkpoint node of the finest level the
+            // series stores (§5.1 density rule).
+            let held: BTreeSet<Nanos> = match (0..LEVELS.len()).find(|l| tree.stores(*l)) {
+                Some(0) => tree.stored(0).map(|n| n.start).collect(),
+                Some(l) => tree
+                    .stored(l)
+                    .flat_map(|n| (n.start..n.end).step_by(MINUTE as usize))
+                    .collect(),
+                None => BTreeSet::new(),
+            };
             checkpoint_minutes.extend(held.iter().map(|m| (d.id, *m)));
             let mut after: BTreeMap<Nanos, bool> = held.iter().map(|m| (*m, false)).collect();
             for ((_, t), f) in current.range((d.id, Nanos::MIN)..=(d.id, Nanos::MAX)) {
@@ -4799,9 +4808,11 @@ impl Model {
                     .get(&s)
                     .cloned()
                     .unwrap_or_else(|| SeriesTree::new(params));
-                held.node(1, q) == check.node(1, q)
-                    && (0..QUARTER / MINUTE)
-                        .all(|i| held.node(0, q + i * MINUTE) == check.node(0, q + i * MINUTE))
+                // The stored levels only (§5.1 density rule).
+                (!params.stores(1) || held.node(1, q) == check.node(1, q))
+                    && (!params.stores(0)
+                        || (0..QUARTER / MINUTE)
+                            .all(|i| held.node(0, q + i * MINUTE) == check.node(0, q + i * MINUTE)))
             });
             if !same {
                 differences.push((s, q));
@@ -4852,6 +4863,7 @@ fn download_rank(class: FileClass) -> u8 {
 fn params_of(d: &SeriesDef) -> Params {
     Params {
         counter: d.options.counter,
+        expected_interval: d.expected_interval(),
         ..Params::new(d.kind, d.staleness)
     }
 }

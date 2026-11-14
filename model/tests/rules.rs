@@ -17,8 +17,8 @@ use kvik_model::registry::{ChangedAtKind, RegistryError, RetentionClass, SeriesO
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
 use kvik_model::types::{
-    DAY, Exact, Fact, HOUR, Kind, MINUTE, Nanos, Position, Quality, Reading, SECOND, SeriesId,
-    Value, ValueType, exact,
+    DAY, Exact, Fact, HOUR, Kind, MINUTE, Nanos, Position, QUARTER, Quality, Reading, SECOND,
+    SeriesId, Value, ValueType, exact,
 };
 use kvik_model::view;
 
@@ -328,6 +328,90 @@ fn s6_edge_stretches() {
         w.aggregate(&Aggregate::Increase),
         Some(AggValue::Exact(exact(10.0)))
     );
+}
+
+/// §5.1 density rule: the 1-minute level is stored only for series whose
+/// expected interval is 5 s or shorter, the 15-minute level only for 60 s or
+/// shorter; a sparser series answers those levels from its facts, and stores
+/// no calendar nodes (§5.7). State and text series have no expected interval
+/// by default and store no level.
+#[test]
+fn s5_1_density_rule() {
+    let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+    let cases = [
+        (Some(5 * SECOND), [true, true]),
+        (Some(5 * SECOND + 1), [false, true]),
+        (Some(MINUTE), [false, true]),
+        (Some(MINUTE + 1), [false, false]),
+    ];
+    let mut ids = Vec::new();
+    for (i, (e, _)) in cases.iter().enumerate() {
+        let options = SeriesOptions {
+            expected_interval: *e,
+            ..SeriesOptions::default()
+        };
+        let s = m
+            .define_with(
+                &format!("site/meter-{i}/power"),
+                Kind::Gauge,
+                ValueType::Number,
+                "W",
+                None,
+                options,
+            )
+            .unwrap();
+        // S = 3 × expected interval unless set (§2.1).
+        assert_eq!(
+            m.registry().unwrap().get(s).unwrap().staleness,
+            e.map(|e| 3 * e)
+        );
+        ids.push(s);
+    }
+    let state = m
+        .define("site/door-1/state", Kind::State, ValueType::Name, "", None)
+        .unwrap();
+    let rs: Vec<Reading> = (0..40)
+        .flat_map(|k| {
+            ids.iter()
+                .map(move |s| Reading::num(*s, T0 + k * 7 * SECOND, f64::from(k as i32)))
+        })
+        .collect();
+    m.ingest(rs).unwrap();
+    m.ingest(vec![Reading {
+        value: Value::Str("open".into()),
+        ..Reading::num(state, T0, 0.0)
+    }])
+    .unwrap();
+    let tz = jiff::tz::TimeZone::UTC;
+    let date = jiff::civil::Date::constant(2026, 3, 29);
+    for (s, (_, stores)) in ids.iter().zip(cases) {
+        let tree = m.tree(*s).unwrap();
+        for (level, stored) in stores.iter().enumerate() {
+            assert_eq!(
+                tree.stored(level).next().is_some(),
+                *stored,
+                "{s} level {level}"
+            );
+        }
+        assert_eq!(tree.day(&tz, date).is_ok(), stores[1]);
+        let rs = oracle::readings(m.current().unwrap(), *s);
+        let p = tree.params;
+        for (a, b) in [(T0, T0 + QUARTER), (T0 + SECOND, T0 + 4 * MINUTE + 3)] {
+            assert_eq!(
+                m.window(*s, a, b).unwrap(),
+                oracle::window(&p, &rs, a, b, m.now)
+            );
+        }
+    }
+    let tree = m.tree(state).unwrap();
+    assert!(tree.stored(0).next().is_none() && tree.stored(1).next().is_none());
+    assert_eq!(
+        tree.day(&tz, date),
+        Err(kvik_model::tree::TreeError::NoCalendarNode)
+    );
+    for (s, live) in m.trees().unwrap() {
+        assert!(live.same_summaries(&m.rebuild_trees().unwrap()[s]));
+    }
 }
 
 /// §6 Aggregates: rate is the increase over the elapsed seconds between the
@@ -1244,6 +1328,28 @@ fn s8_replayed_minute_without_its_detail_is_stale() {
         r.tree(s).unwrap().node(0, T0 + 2 * MINUTE),
         m.tree(s).unwrap().node(0, T0 + 2 * MINUTE)
     );
+}
+
+/// As above for a series that stores only the 15-minute level (§5.1): a
+/// minute the replay touches inside a quarter-hour the checkpoint holds is
+/// flagged `summary_stale` until the detail is back, since its other minutes
+/// are not local; then the quarter-hour equals the live store's.
+#[test]
+fn s8_replayed_minute_of_a_series_without_a_1_minute_level_is_stale() {
+    let (mut m, s, _) = checkpointed_model_with(30 * SECOND);
+    assert!(m.tree(s).unwrap().stored(0).next().is_none());
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    assert!(r.tree(s).unwrap().stored(0).next().is_none());
+    assert!(r.tree(s).unwrap().is_stale(0, T0 + 2 * MINUTE));
+    assert!(r.tree(s).unwrap().is_stale(0, T0 + 3 * MINUTE));
+    assert!(r.query_window(s, T0, T0 + QUARTER).unwrap().summary_stale);
+    r.restore_rest().unwrap();
+    assert!(!r.tree(s).unwrap().is_stale(1, T0));
+    assert_eq!(
+        r.tree(s).unwrap().node(1, T0),
+        m.tree(s).unwrap().node(1, T0)
+    );
+    assert_eq!(r.counters.checkpoint_differences, 0);
 }
 
 /// §8 Restore step 2: "The store serves queries at ≥ 1-minute resolution,

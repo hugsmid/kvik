@@ -164,7 +164,11 @@ fn day_node_omits_edge_stretches() {
     let tz = TimeZone::get("Asia/Tokyo").unwrap();
     let date = Date::constant(2026, 6, 1);
     let (ds, de) = kvik_model::tree::day_span(&tz, date).unwrap();
-    let p = Params::new(Kind::Gauge, None);
+    // A dense series (expected interval 1 s), so a day node is stored.
+    let p = Params {
+        expected_interval: Some(SECOND),
+        ..Params::new(Kind::Gauge, None)
+    };
     let rs = vec![
         (ds - HOUR, Value::Num(900.0)),
         (ds + HOUR, Value::Num(100.0)),

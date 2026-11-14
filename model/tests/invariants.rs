@@ -400,6 +400,8 @@ proptest! {
         for (s, tree) in m.trees().unwrap() {
             let rs = oracle::readings(&cur, *s);
             for (level, width) in LEVELS.iter().enumerate() {
+                // Only the levels the density rule keeps are stored (§5.1).
+                prop_assert!(tree.stores(level) || tree.stored(level).next().is_none());
                 let mut starts: BTreeSet<Nanos> = tree.stored(level).map(|n| n.start).collect();
                 // Also some empty nodes next to stored ones.
                 let extra: Vec<Nanos> = starts.iter().map(|s| s + width).collect();
@@ -408,6 +410,31 @@ proptest! {
                     let want = oracle::node(&tree.params, &rs, st, st + width);
                     prop_assert_eq!(tree.node(level, st), want, "series {} level {} start {}", s, level, st);
                 }
+            }
+        }
+    }
+
+    /// 5 with the density rule (§5.1): over expected intervals on both sides
+    /// of each threshold, a level is stored exactly where the series' expected
+    /// interval qualifies it and there is data; every node, stored or
+    /// answered from facts, equals the direct computation.
+    #[test]
+    fn inv05_stored_levels_follow_the_density_rule(
+        (p, rs) in (arb_params(), proptest::option::of(prop_oneof![
+            Just(SECOND), Just(5 * SECOND), Just(5 * SECOND + 1), Just(MINUTE), Just(MINUTE + 1),
+        ])).prop_flat_map(|(mut p, e)| {
+            p.expected_interval = e;
+            (Just(p), arb_readings(p.kind, 30))
+        }),
+    ) {
+        let tree = SeriesTree::build(p, &rs);
+        for (level, width) in LEVELS.iter().enumerate() {
+            let qualifies = p.expected_interval.is_some_and(|e| e <= [5 * SECOND, MINUTE][level]);
+            let with_data: BTreeSet<Nanos> = rs.iter().map(|(t, _)| floor_to(*t, *width)).collect();
+            let stored: BTreeSet<Nanos> = tree.stored(level).map(|n| n.start).collect();
+            prop_assert_eq!(&stored, &if qualifies { with_data.clone() } else { BTreeSet::new() });
+            for st in with_data {
+                prop_assert_eq!(tree.node(level, st), oracle::node(&p, &rs, st, st + width));
             }
         }
     }

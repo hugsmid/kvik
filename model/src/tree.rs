@@ -34,6 +34,10 @@ pub enum TreeError {
     /// A date could not be placed in the zone.
     #[error("calendar error: {0}")]
     Calendar(String),
+    /// The series stores no 15-minute level, so no calendar node (§5.1, §5.7):
+    /// its calendar results are window evaluations over its facts.
+    #[error("no calendar node: the series stores no 15-minute level")]
+    NoCalendarNode,
 }
 
 /// Summary tree for one series.
@@ -99,7 +103,7 @@ impl SeriesTree {
     }
 
     fn set(&mut self, level: usize, start: Nanos, node: Node) {
-        if node.is_empty() {
+        if node.is_empty() || !self.params.stores(level) {
             self.levels[level].remove(&start);
         } else {
             self.levels[level].insert(start, node);
@@ -136,17 +140,45 @@ impl SeriesTree {
         self.readings.iter().map(|(t, v)| (*t, v.clone())).collect()
     }
 
-    /// The node at `level` (index into [`LEVELS`]) starting at `start`.
+    /// The node at `level` (index into [`LEVELS`]) starting at `start`: the
+    /// stored node, or for a level the series does not store (§5.1 density
+    /// rule), the node computed from its readings (a 15-minute node as the
+    /// merge of its minutes).
     pub fn node(&self, level: usize, start: Nanos) -> Node {
         assert_eq!(
             start,
             floor_to(start, LEVELS[level]),
             "unaligned node start"
         );
+        let width = LEVELS[level];
+        if !self.params.stores(level) {
+            return match level {
+                0 => direct(
+                    &self.params,
+                    start,
+                    start + width,
+                    &self.raw(start, start + width),
+                ),
+                _ => {
+                    let minutes: Vec<Node> = (0..width / MINUTE)
+                        .map(|i| self.node(0, start + i * MINUTE))
+                        .collect();
+                    let mut n = merge_all(&self.params, start, minutes.iter());
+                    n.start = start;
+                    n.end = start + width;
+                    n
+                }
+            };
+        }
         self.levels[level]
             .get(&start)
             .cloned()
-            .unwrap_or_else(|| Node::empty(self.params.kind, start, start + LEVELS[level]))
+            .unwrap_or_else(|| Node::empty(self.params.kind, start, start + width))
+    }
+
+    /// Whether the series stores the level (§5.1 density rule).
+    pub fn stores(&self, level: usize) -> bool {
+        self.params.stores(level)
     }
 
     /// All stored (non-empty) nodes at a level.
@@ -183,17 +215,22 @@ impl SeriesTree {
 
     /// The last summarised reading strictly before `t`. A tree loaded from a
     /// checkpoint holds nodes without their readings (§8 Restore), so the last
-    /// reading of every whole minute before `t` is also taken from its node.
+    /// reading of every whole node of the finest stored level before `t` is
+    /// also taken from its node.
     pub fn last_before(&self, t: Nanos) -> Option<(Nanos, Value)> {
         let reading = self
             .readings
             .range(..t)
             .next_back()
             .map(|(t, v)| (*t, v.clone()));
-        let node = self.levels[0]
-            .range(..floor_to(t, MINUTE))
-            .next_back()
-            .and_then(|(_, n)| n.last.clone());
+        let node = (0..LEVELS.len())
+            .find(|l| self.params.stores(*l))
+            .and_then(|l| {
+                self.levels[l]
+                    .range(..floor_to(t, LEVELS[l]))
+                    .next_back()
+                    .and_then(|(_, n)| n.last.clone())
+            });
         match (reading, node) {
             (Some(r), Some(n)) => Some(if n.0 > r.0 { n } else { r }),
             (r, n) => r.or(n),
@@ -258,6 +295,9 @@ impl SeriesTree {
     /// 15-minute nodes (§5.7). It holds no edge stretches; the specification
     /// makes the calendar result a window evaluation (see `OPEN-QUESTIONS.md`).
     pub fn day(&self, zone: &TimeZone, date: Date) -> Result<Node, TreeError> {
+        if !self.params.stores(1) {
+            return Err(TreeError::NoCalendarNode);
+        }
         let (start, end) = day_span(zone, date)?;
         let quarters: Vec<Node> = (0..(end - start) / QUARTER)
             .map(|i| self.node(1, start + i * QUARTER))

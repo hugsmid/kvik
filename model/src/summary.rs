@@ -40,10 +40,20 @@ pub struct Params {
     pub staleness: Option<Nanos>,
     /// Counter rules.
     pub counter: CounterRules,
+    /// Expected interval (§2.1); it decides which levels are stored
+    /// ([`Params::stores`]).
+    pub expected_interval: Option<Nanos>,
 }
 
+/// The longest expected interval for which each stored level is kept
+/// (§5.1 density rule): 5 s for the 1-minute level, 60 s for the 15-minute
+/// level.
+pub const DENSITY: [Nanos; 2] = [5 * SECOND, 60 * SECOND];
+
 impl Params {
-    /// Parameters with a staleness limit and default counter rules.
+    /// Parameters with a staleness limit, default counter rules and the
+    /// expected interval for which that limit is the default (S = 3 ×
+    /// expected interval, §2.1), or none without a limit.
     pub fn new(kind: Kind, staleness: impl Into<Option<Nanos>>) -> Self {
         let staleness = staleness.into();
         assert!(
@@ -54,7 +64,17 @@ impl Params {
             kind,
             staleness,
             counter: CounterRules::default(),
+            expected_interval: staleness.map(|s| s / 3),
         }
+    }
+
+    /// Whether the stored level `level` (0: 1 minute, 1: 15 minutes) is kept
+    /// for the series (§5.1 density rule): only where its nodes summarise many
+    /// facts, so for an expected interval of at most [`DENSITY`]`[level]`. A
+    /// series with no expected interval stores no level. A level that is not
+    /// stored is answered from the facts.
+    pub fn stores(&self, level: usize) -> bool {
+        self.expected_interval.is_some_and(|e| e <= DENSITY[level])
     }
 
     /// End of the validity of a reading at `t`, clipped to `limit`.
