@@ -396,11 +396,12 @@ seconds and as a fraction of the window. Live staleness applies only to live sta
    current chunks, then revision chunks and log segments. Other files stay in deep and are fetched on demand as
    before. A position present in two files is one fact and must have identical content.
 4. When detail for a span is back, recompute its nodes from facts as of the checkpoint's position and compare them
-   with the checkpoint's; any difference is reported and the recomputed value wins. The checkpoint label is removed
+   with the checkpoint's; any difference is reported, and the nodes are then recomputed from the current facts of
+   their span (§5.6), which also include facts committed after the checkpoint. The checkpoint label is removed
    when the detail the restore brings back has been verified (Failures and end below).
 
 A restart after the restore record is written resumes the restore in its generation, uploading its restore record if
-that had not finished, reading the claims again before ingest is accepted if step 1 had not completed (Generations
+that had not finished (a drill uploads nothing and reads no claims), reading the claims again before ingest is accepted if step 1 had not completed (Generations
 above), and fetching the files its restore record lists that steps 1 and 3 bring back and are not yet local.
 A crash before the record starts the restore again with the next generation.
 
