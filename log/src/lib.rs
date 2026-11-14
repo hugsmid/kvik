@@ -16,6 +16,9 @@
 //! - [`manifest`]: the manifest's records as far as the log's start needs them (A.14).
 //! - [`name`]: segment file names (A.12).
 //! - [`store`]: the store directory, its descriptor and lock (A.12).
+//! - [`reader`]: a reader process: the log up to the durable mark, tailed as the mark moves, without the lock
+//!   (`spec.md` §7 Readers).
+//! - [`lease`]: reader leases and the writer's view of them (A.15).
 //! - [`writer`]: the commit path: group commit, sync, the durable mark, positions, segment creation and sealing
 //!   (`spec.md` §3).
 //! - [`fs`]: the file-system seam every file operation goes through (A.13).
@@ -65,9 +68,11 @@ pub mod fs;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod header;
+pub mod lease;
 pub mod manifest;
 pub mod mark;
 pub mod name;
+pub mod reader;
 mod rle;
 pub mod scan;
 pub mod segment;

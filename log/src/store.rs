@@ -24,7 +24,9 @@ pub const LOG_DIR: &str = "log";
 pub const MARK: &str = "MARK";
 const STORE_TMP: &str = "STORE.tmp";
 const MANIFEST_NEW: &str = "MANIFEST.new";
-const DIRS: [&str; 3] = [LOG_DIR, "cursors", "leases"];
+/// The lease directory's name (A.15).
+pub const LEASES_DIR: &str = "leases";
+const DIRS: [&str; 3] = [LOG_DIR, "cursors", LEASES_DIR];
 
 /// Why a store directory cannot be opened or created.
 #[derive(Debug, thiserror::Error)]
@@ -182,7 +184,7 @@ fn names(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<String>> {
     }
 }
 
-fn read_all(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_all(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
     let f = fs.open(path, OpenMode::Read)?;
     let len = usize::try_from(f.len()?).map_err(io::Error::other)?;
     let mut buf = vec![0u8; len];
@@ -209,6 +211,16 @@ fn take_lock(fs: &dyn Fs, dir: &Path) -> Result<Box<dyn FsFile>, StoreError> {
         return Err(StoreError::Locked);
     }
     Ok(f)
+}
+
+/// Reads the store descriptor of the store in `dir` without taking the lock, as a reader process does (A.12:
+/// readers never take it). No descriptor is [`StoreError::NotAStore`].
+pub fn read_descriptor(fs: &dyn Fs, dir: &Path) -> Result<StoreDescriptor, StoreError> {
+    match read_all(fs, &dir.join(STORE)) {
+        Ok(b) => StoreDescriptor::decode(&b),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(StoreError::NotAStore),
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl StoreDir {

@@ -26,7 +26,7 @@ use crate::mark::{MARK_LEN, MarkSlot, SLOT_OFFSETS, encode_mark_file, read_mark,
 use crate::name::SegmentName;
 use crate::scan::{HeaderState, ScanLimit, Tail, scan};
 use crate::segment::SealSummary;
-use crate::store::{MANIFEST, MARK, StoreDir, StoreError};
+use crate::store::{LEASES_DIR, MANIFEST, MARK, StoreDir, StoreError};
 
 use super::maint::{AheadSegment, CreateError, SealJob, SegmentRequest, create_segment};
 use super::{Fault, FaultOp, Halt, OpenSegment, WriterConfig, reach};
@@ -910,7 +910,11 @@ pub(super) fn start(
     for l in &mut losses {
         l.id_floor = id_floor;
     }
-    let mut epoch = manifest.last_epoch();
+    // New epochs continue above every epoch named by the last valid record and by any lease file (§7 Manifest).
+    let leases = store.dir().join(LEASES_DIR);
+    let mut epoch = manifest
+        .last_epoch()
+        .max(crate::lease::highest_epoch(&*fs, &leases, &store_id)?);
     let manifest_path = store.dir().join(MANIFEST);
     let mfile = match fs.open(&manifest_path, OpenMode::ReadWrite) {
         Ok(f) => f,

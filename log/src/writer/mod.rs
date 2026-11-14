@@ -64,9 +64,10 @@ use crate::entries::{Entry, IntervalLength};
 use crate::error::EncodeError;
 use crate::fs::{Fs, FsFile};
 use crate::header::{FileHeader, HEADER_LEN, kind};
+use crate::lease::LeaseTable;
 use crate::mark::{MarkSlot, SLOT_OFFSETS};
 use crate::segment::SealSummary;
-use crate::store::{MARK, StoreDir, StoreError};
+use crate::store::{LEASES_DIR, MARK, StoreDir, StoreError};
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -536,6 +537,7 @@ pub struct LogWriter {
     waiting: Option<Wait>,
     stats: LogStats,
     report: StartReport,
+    leases: LeaseTable,
 }
 
 fn reach(t: i64, interval: Option<&IntervalLength>) -> i64 {
@@ -562,6 +564,7 @@ impl LogWriter {
     ) -> Result<Self, OpenError> {
         cfg.validate()?;
         let halt = Arc::new(Halt::default());
+        let leases_dir = store.dir().join(LEASES_DIR);
         let r = recovery::start(&store, &cfg, boot_id, now, wall, &halt)?;
         let fs = store.fs().clone();
         let log_dir = store.log_dir();
@@ -585,7 +588,13 @@ impl LogWriter {
         } else {
             r.mark_slot.last_sequence
         };
+        // At the start every lease of this boot counts as first observed now; void ones are deleted (§7 Leases).
+        let mut leases = LeaseTable::new(boot_id.unwrap_or_default());
+        if r.fault.is_none() {
+            let _ = leases.scan(&*store.fs().clone(), &leases_dir, &store_id, now);
+        }
         Ok(Self {
+            leases,
             stats: LogStats {
                 durable: at(r.last_sequence),
                 mark_synced: at(synced),
@@ -845,6 +854,7 @@ impl LogWriter {
         }
         if self.fault.is_none() {
             self.timed_seal(now);
+            self.scan_leases(now);
         }
         if self.fault.is_none() {
             let disk_wait = self.ingest_blocked_by_disk();
@@ -912,6 +922,20 @@ impl LogWriter {
             at(t);
         }
         next
+    }
+
+    /// Looks at the lease files when a look is due; an idle writer looks at its next turn. Failures are left for
+    /// the next look: a late look only makes an expiry later.
+    fn scan_leases(&mut self, now: Duration) {
+        if self.leases.scan_due(now) {
+            let dir = self.store.dir().join(LEASES_DIR);
+            let _ = self.leases.scan(&*self.fs, &dir, &self.store_id, now);
+        }
+    }
+
+    /// The reader leases as last seen (`spec.md` §7 Leases).
+    pub fn leases(&self) -> &LeaseTable {
+        &self.leases
     }
 
     fn timed_mark_sync(&mut self, now: Duration) {

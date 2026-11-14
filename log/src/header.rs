@@ -16,6 +16,8 @@ pub mod kind {
     pub const MANIFEST: u8 = 3;
     /// The store descriptor (A.12).
     pub const STORE: u8 = 7;
+    /// A reader's lease file (A.15).
+    pub const LEASE: u8 = 8;
 }
 
 /// A file header. Reserved bytes are written as zero and not read.
