@@ -305,9 +305,10 @@ proptest! {
 
     /// 16. After resume, every condition true now is delivered once in
     /// `resync`: each condition funnel in force appears exactly once, with
-    /// its state now (the value computed directly from the current view;
-    /// conditions with memory as in Q-63) and a transition exactly when that
-    /// differs from the latch on disk.
+    /// its state now computed directly from the current view (a held-for or
+    /// stale-for condition true now is reported true; a threshold between its
+    /// levels keeps the latch, Q-63), and a transition exactly when that
+    /// differs from the latch on disk of the same funnel incarnation.
     #[test]
     fn inv16_resume_delivers_each_condition_once_in_resync(
         ops in proptest::collection::vec(arb_delivery_op(), 1..100),
@@ -344,8 +345,11 @@ proptest! {
                     prop_assert!(fs.condition.is_none());
                     continue;
                 };
-                let latch = latches.get(&(d.id, fs.funnel)).map(|l| &l.state);
-                let want = resumed_state(cond, oracle_funnel_value(&m, f), latch);
+                let latch = latches
+                    .get(&(d.id, fs.funnel))
+                    .filter(|l| l.incarnation == fs.incarnation)
+                    .map(|l| &l.state);
+                let want = condition_now(&m, f, latch);
                 let got = fs.condition.clone().unwrap();
                 prop_assert_eq!(&got.state, &want, "consumer {} funnel {:?}", d.id.0, fs.funnel);
                 prop_assert_eq!(got.transition, cond.is_transition(&want, latch));

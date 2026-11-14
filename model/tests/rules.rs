@@ -1588,6 +1588,7 @@ fn s4_timer_deliveries_carry_last_position_and_funnel_sequence() {
         [
             (
                 DeliveryId::Timer {
+                    generation: 0,
                     funnel: F,
                     sequence: 1
                 },
@@ -1595,6 +1596,7 @@ fn s4_timer_deliveries_carry_last_position_and_funnel_sequence() {
             ),
             (
                 DeliveryId::Timer {
+                    generation: 0,
                     funnel: F,
                     sequence: 2
                 },
@@ -1677,6 +1679,131 @@ fn s6_latch_moves_on_confirmation_only() {
         last_resync_condition(&m),
         (ConditionState::Active(false), true)
     );
+}
+
+/// §6 Restart and resume: the operator "is rebuilt from the tree and recent
+/// window as of now … A condition that became true while the consumer was
+/// down is therefore delivered, never suppressed"; invariant 16, row 16. A
+/// value held above its level for longer than the hold while the consumer was
+/// down is reported true in the `resync`, a transition from a latched false.
+#[test]
+fn s6_held_for_true_while_down_delivered_in_resync() {
+    let (mut m, a, _) = routed_model(100);
+    let held = Condition::HeldFor {
+        above: 5.0,
+        n: 10 * SECOND,
+    };
+    m.add_route(C, F, Funnel::condition(a, None, held)).unwrap();
+    put(&mut m, a, 9.0);
+    m.advance(10 * SECOND);
+    m.tick().unwrap();
+    put(&mut m, a, 1.0);
+    m.drain().unwrap();
+    assert_eq!(m.disk.latches[&(C, F)].state, ConditionState::Active(false));
+    // Held above for 30 s while the consumer is down; it restarts before
+    // taking the transition, and then the engine restarts too.
+    m.advance(SECOND);
+    put(&mut m, a, 9.0);
+    m.advance(30 * SECOND);
+    m.tick().unwrap();
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(true), true)
+    );
+    m.crash();
+    m.restart();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(true), false)
+    );
+    // Above for less than the hold: false, and it fires once the hold is
+    // complete.
+    put(&mut m, a, 1.0);
+    m.advance(SECOND);
+    put(&mut m, a, 9.0);
+    m.advance(4 * SECOND);
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    assert_eq!(last_resync_condition(&m).0, ConditionState::Active(false));
+    m.advance(6 * SECOND);
+    m.tick().unwrap();
+    let got = m.receive(C, 10).unwrap();
+    assert_eq!(
+        got[0].trigger().unwrap().state,
+        ConditionState::Active(true)
+    );
+}
+
+/// §6 Latch: each condition funnel persists its own latch. A transition of
+/// a funnel that is removed and added again with another condition before
+/// the consumer confirms it does not become the new funnel's latch.
+#[test]
+fn s6_latch_belongs_to_one_funnel_incarnation() {
+    let (mut m, a, _) = routed_model(100);
+    m.add_route(C, F, Funnel::condition(a, None, threshold()))
+        .unwrap();
+    put(&mut m, a, 90.0);
+    let got = m.receive(C, 10).unwrap();
+    assert_eq!(
+        got[0].trigger().unwrap().state,
+        ConditionState::Active(true)
+    );
+    m.remove_route(C, F).unwrap();
+    let held = Condition::HeldFor {
+        above: 100.0,
+        n: 10 * SECOND,
+    };
+    m.add_route(C, F, Funnel::condition(a, None, held)).unwrap();
+    m.confirm_delivery(C, got[0].id()).unwrap();
+    assert!(!m.disk.latches.contains_key(&(C, F)));
+    m.crash();
+    m.restart();
+    m.drain().unwrap();
+    assert_eq!(
+        last_resync_condition(&m),
+        (ConditionState::Active(false), true)
+    );
+}
+
+/// §8 Restore step 2: "Every consumer then receives `generation_changed` and
+/// `resync`." It stays owed until the consumer confirms it: a crash before
+/// the consumer takes it does not lose it.
+#[test]
+fn s8_generation_changed_owed_until_confirmed() {
+    let (mut m, _) = backed_up_model();
+    let mut r = Model::restore_with_cursors(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        &BTreeMap::new(),
+        m.wall,
+        false,
+        false,
+    )
+    .unwrap();
+    r.crash();
+    r.restart();
+    r.drain().unwrap();
+    let kinds = |r: &Model, session: u32| -> Vec<&'static str> {
+        r.received[&C]
+            .iter()
+            .filter(|x| x.session == session)
+            .map(|x| match x.delivery.kind {
+                DeliveryKind::GenerationChanged { .. } => "generation_changed",
+                DeliveryKind::Resync(_) => "resync",
+                _ => "other",
+            })
+            .collect()
+    };
+    let last = r.received[&C].last().unwrap().session;
+    assert_eq!(kinds(&r, last), ["generation_changed", "resync"]);
+    r.crash();
+    r.restart();
+    r.drain().unwrap();
+    assert_eq!(kinds(&r, last + 1), ["resync"]);
 }
 
 /// §4 Replay: replayed facts "are never fed to a condition operator a second

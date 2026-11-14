@@ -94,6 +94,19 @@ impl Condition {
     }
 }
 
+/// What a resume rebuilds of a condition's past from the tree and recent
+/// window as of now (§6 Restart and resume).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResumeHistory {
+    /// How long the operator's value has been continuously above a held-for
+    /// level, evaluated at the timer cadence back from now (0 if not above
+    /// now), up to the hold duration.
+    pub above_for: Nanos,
+    /// Time since the last reading of the series arrived (its `received_at`),
+    /// or `None` if none has.
+    pub since_arrival: Option<Nanos>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum State {
     Threshold { active: bool },
@@ -166,19 +179,21 @@ impl Runner {
         Runner { cond, state }
     }
 
-    /// Rebuilds a runner on resume (§6 Restart and resume) from the
-    /// operator's value now and the latch, if any. A condition with memory is
-    /// not fully determined by the value now (see `OPEN-QUESTIONS.md`); the
-    /// model resolves it as follows. Threshold: true above `on`, false below
-    /// `clear`, and between them the latched state (false with no latch).
-    /// On change: the value now. Held for: true only if the value is above
-    /// now and the latch is true; otherwise the hold starts now. Stale for:
-    /// not fired, with the last arrival taken as now (see Q-16).
+    /// Rebuilds a runner on resume (§6 Restart and resume): from the
+    /// operator's value now, `history` rebuilt from the tree and recent
+    /// window as of now, and the latch, if any. Threshold: true above `on`,
+    /// false below `clear`, and between them the latched state (false with no
+    /// latch; see Q-63). On change: the value now. Held for: true once the
+    /// value has been above for `n` ([`ResumeHistory::above_for`]); otherwise
+    /// the hold continues from when the value went above. Stale for: true once
+    /// no reading has arrived for `staleness + n`
+    /// ([`ResumeHistory::since_arrival`]; with no reading, measured from now).
     pub fn resume(
         cond: Condition,
         mono: Nanos,
         now_value: Option<f64>,
         latch: Option<&ConditionState>,
+        history: ResumeHistory,
     ) -> Self {
         let latched = matches!(latch, Some(ConditionState::Active(true)));
         let state = match &cond {
@@ -192,17 +207,20 @@ impl Runner {
             Condition::OnChange { .. } => State::OnChange {
                 reference: now_value,
             },
-            Condition::HeldFor { above, .. } => {
+            Condition::HeldFor { above, n } => {
                 let above_now = now_value.is_some_and(|v| v > *above);
                 State::HeldFor {
-                    since: above_now.then_some(mono),
-                    fired: above_now && latched,
+                    since: above_now.then(|| mono - history.above_for),
+                    fired: above_now && history.above_for >= *n,
                 }
             }
-            Condition::StaleFor { .. } => State::StaleFor {
-                last_arrival: mono,
-                fired: false,
-            },
+            Condition::StaleFor { staleness, n } => {
+                let silent = history.since_arrival.unwrap_or(0);
+                State::StaleFor {
+                    last_arrival: mono - silent,
+                    fired: silent >= staleness + n,
+                }
+            }
         };
         Runner { cond, state }
     }

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::condition::{Condition, ConditionState, Runner};
+use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
 use crate::registry::{Registry, RegistryError, RegistryEvent, SeriesDef};
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{SeriesTree, TreeError};
@@ -242,6 +242,9 @@ pub enum FileClass {
     /// Compacted chunk of revisions.
     Revision,
 }
+
+/// Default timer cadence of a windowed funnel (§6 Cadence).
+pub const TIMER_CADENCE: Nanos = SECOND;
 
 /// Format version this model writes and reads (§9 row 32).
 pub const FORMAT_VERSION: u32 = 1;
@@ -678,6 +681,9 @@ pub enum DeliveryId {
     Fact(Position),
     /// A condition delivery.
     Timer {
+        /// Generation in which it was issued: a restore starts the sequences
+        /// again (see `OPEN-QUESTIONS.md` Q-61).
+        generation: u32,
         /// Funnel.
         funnel: FunnelId,
         /// Per-funnel sequence.
@@ -706,6 +712,11 @@ pub enum TriggerCause {
 pub struct Trigger {
     /// Funnel.
     pub funnel: FunnelId,
+    /// The funnel's incarnation: the position of the routing entry that
+    /// added it ([`Position::ORIGIN`] for the configured funnel).
+    pub incarnation: Position,
+    /// Generation in which it was issued.
+    pub generation: u32,
     /// Per-funnel sequence, never repeated for the funnel (§4 Order).
     pub sequence: u64,
     /// The state the transition leads to.
@@ -729,6 +740,8 @@ pub struct ConditionNow {
 pub struct FunnelState {
     /// Funnel.
     pub funnel: FunnelId,
+    /// The funnel's incarnation (see [`Trigger::incarnation`]).
+    pub incarnation: Position,
     /// Live state (§2.3) of each selected series.
     pub live: Vec<(SeriesId, Option<Fact>)>,
     /// Condition state, for a condition funnel.
@@ -785,6 +798,7 @@ impl Envelope {
         match &self.kind {
             DeliveryKind::Fact(_) => DeliveryId::Fact(self.position),
             DeliveryKind::Trigger(t) => DeliveryId::Timer {
+                generation: t.generation,
                 funnel: t.funnel,
                 sequence: t.sequence,
             },
@@ -831,6 +845,10 @@ pub struct Received {
 /// confirmed, and the position at which it was emitted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Latch {
+    /// The incarnation of the funnel it belongs to (see
+    /// [`Trigger::incarnation`]); a latch of an earlier incarnation of the
+    /// same funnel id is never used.
+    pub incarnation: Position,
     /// State.
     pub state: ConditionState,
     /// Position of the delivery that carried it.
@@ -2437,6 +2455,71 @@ impl Model {
         }
     }
 
+    /// The value a condition funnel's condition saw at an earlier instant
+    /// `x`, rebuilt from the tree and the facts known now (§6 Restart and
+    /// resume): the operator over its window ending at `x`, or the live-state
+    /// value at `x`.
+    fn funnel_value_at(&self, f: &Funnel, x: Nanos) -> Option<f64> {
+        let s = f.series()?;
+        match &f.operator {
+            Some(op) => self
+                .tree(s)
+                .ok()?
+                .window(x - op.width, x, x)
+                .aggregate(&op.aggregate)?
+                .to_f64(),
+            None => self
+                .vol
+                .as_ref()?
+                .current
+                .range((s, Nanos::MIN)..=(s, x))
+                .rev()
+                .map(|(_, f)| f)
+                .find(|f| f.summarised())
+                .and_then(|f| match f.value {
+                    Value::Num(v) => Some(v),
+                    _ => None,
+                }),
+        }
+    }
+
+    /// What a resume rebuilds of a condition's past (§6 Restart and resume,
+    /// "rebuilt from the tree and recent window as of now"): for held-for,
+    /// how long the value has been above its level, evaluated at the timer
+    /// cadence back from now, up to the hold; for stale-for, the time since
+    /// the series' last reading arrived (its `received_at`).
+    fn resume_history(&self, f: &Funnel, cond: &Condition) -> ResumeHistory {
+        let mut h = ResumeHistory::default();
+        match cond {
+            Condition::HeldFor { above, n } => {
+                let mut held = 0;
+                while held < *n
+                    && self
+                        .funnel_value_at(f, self.now - held - TIMER_CADENCE)
+                        .is_some_and(|v| v > *above)
+                {
+                    held += TIMER_CADENCE;
+                }
+                let above_now = self.funnel_value(f).is_some_and(|v| v > *above);
+                h.above_for = if above_now { held } else { 0 };
+            }
+            Condition::StaleFor { .. } => {
+                let s = f.series();
+                h.since_arrival = self.vol.as_ref().and_then(|v| {
+                    v.entries
+                        .values()
+                        .filter_map(Entry::fact)
+                        .filter(|x| Some(x.series) == s)
+                        .map(|x| x.received_at)
+                        .max()
+                        .map(|r| (self.now - r).max(0))
+                });
+            }
+            Condition::Threshold { .. } | Condition::OnChange { .. } => {}
+        }
+        h
+    }
+
     /// Evaluates a consumer's condition funnels: on a committed batch (those
     /// whose series has a fact in it) or on the timer (all of them). Replayed
     /// facts never reach a condition (§4 Replay). A consumer waiting for its
@@ -2496,11 +2579,13 @@ impl Model {
         cause: TriggerCause,
     ) {
         let head = self.head().unwrap_or(Position::ORIGIN);
+        let generation = self.disk.generation;
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
         if !matches!(c.mode, Mode::Live) {
             return;
         }
+        let incarnation = incarnation(&c.decl, &v.routes, funnel).unwrap_or(Position::ORIGIN);
         if c.queue.len() >= c.decl.capacity {
             c.mode = Mode::CatchUp { next: head.next() };
             self.counters.overflows += 1;
@@ -2513,6 +2598,8 @@ impl Model {
             replayed: false,
             kind: DeliveryKind::Trigger(Trigger {
                 funnel,
+                incarnation,
+                generation,
                 sequence: *seq,
                 state: state.clone(),
                 cause,
@@ -2603,9 +2690,22 @@ impl Model {
                 .into_iter()
                 .map(|s| (s, self.latest(s).ok().flatten()))
                 .collect();
+            let inc = incarnation(&decl, &v.routes, *id).unwrap_or(Position::ORIGIN);
             let condition = f.condition.as_ref().map(|cond| {
-                let latch = self.disk.latches.get(&(decl.id, *id)).map(|l| &l.state);
-                let runner = Runner::resume(cond.clone(), self.mono, self.funnel_value(f), latch);
+                let latch = self
+                    .disk
+                    .latches
+                    .get(&(decl.id, *id))
+                    .filter(|l| l.incarnation == inc)
+                    .map(|l| &l.state);
+                let history = self.resume_history(f, cond);
+                let runner = Runner::resume(
+                    cond.clone(),
+                    self.mono,
+                    self.funnel_value(f),
+                    latch,
+                    history,
+                );
                 let state = runner.state();
                 let transition = cond.is_transition(&state, latch);
                 runners.insert(*id, runner);
@@ -2614,11 +2714,13 @@ impl Model {
             });
             states.push(FunnelState {
                 funnel: *id,
+                incarnation: inc,
                 live,
                 condition,
             });
         }
-        let gc = self.disk.generation_changed.remove(&decl.id);
+        // Owed until the consumer confirms it.
+        let gc = self.disk.generation_changed.get(&decl.id).copied();
         let signals = self.signals.entry(decl.id).or_default();
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
@@ -2809,29 +2911,40 @@ impl Model {
         let id = c.decl.id;
         let done: Vec<Envelope> = c.unconfirmed.drain(..n).collect();
         let funnels = routes_in_force(&c.decl, &v.routes, None);
-        let mut latch = |f: FunnelId, state: &ConditionState, position: Position| {
-            if funnels.get(&f).is_some_and(|x| x.condition.is_some()) {
+        let decl = c.decl.clone();
+        // A latch is written only for the incarnation of the funnel that
+        // emitted the state, if it is still in force.
+        let mut latch = |f: FunnelId, inc: Position, state: &ConditionState, position: Position| {
+            if funnels.get(&f).is_some_and(|x| x.condition.is_some())
+                && incarnation(&decl, &v.routes, f) == Some(inc)
+            {
                 self.disk.latches.insert(
                     (id, f),
                     Latch {
+                        incarnation: inc,
                         state: state.clone(),
                         position,
                     },
                 );
             }
         };
+        let mut gc_confirmed = false;
         for d in &done {
             match &d.kind {
-                DeliveryKind::Trigger(t) => latch(t.funnel, &t.state, d.position),
+                DeliveryKind::Trigger(t) => latch(t.funnel, t.incarnation, &t.state, d.position),
                 DeliveryKind::Resync(r) => {
                     for f in &r.funnels {
                         if let Some(cn) = &f.condition {
-                            latch(f.funnel, &cn.state, d.position);
+                            latch(f.funnel, f.incarnation, &cn.state, d.position);
                         }
                     }
                 }
-                DeliveryKind::Fact(_) | DeliveryKind::GenerationChanged { .. } => {}
+                DeliveryKind::GenerationChanged { .. } => gc_confirmed = true,
+                DeliveryKind::Fact(_) => {}
             }
+        }
+        if gc_confirmed {
+            self.disk.generation_changed.remove(&id);
         }
         let cur = self.disk.cursors.entry(id).or_insert(Position::ORIGIN);
         *cur = (*cur).max(p);
@@ -4014,6 +4127,32 @@ fn routes_in_force(
         }
     }
     out
+}
+
+/// The incarnation of a consumer's funnel in force now: the position of the
+/// routing entry that added it, or [`Position::ORIGIN`] for the configured
+/// funnel; `None` if it is not in force.
+fn incarnation(
+    decl: &ConsumerDecl,
+    routes: &BTreeMap<Position, RouteChange>,
+    funnel: FunnelId,
+) -> Option<Position> {
+    let mut inc = (funnel == FunnelId::CONFIGURED).then_some(Position::ORIGIN);
+    for (p, change) in routes {
+        match change {
+            RouteChange::Add {
+                consumer,
+                funnel: f,
+                ..
+            } if *consumer == decl.id && *f == funnel => inc = Some(*p),
+            RouteChange::Remove {
+                consumer,
+                funnel: f,
+            } if *consumer == decl.id && *f == funnel => inc = None,
+            _ => {}
+        }
+    }
+    inc
 }
 
 /// Whether a fact is routed to a consumer by a funnel without a condition in

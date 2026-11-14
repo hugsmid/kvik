@@ -840,9 +840,10 @@ pub fn routed_at(m: &Model, decl: &ConsumerDecl, p: Position, series: SeriesId) 
     })
 }
 
-/// The value a condition funnel sees now, computed directly from the current
-/// view: the live-state value, or the operator's window by the window oracle.
-pub fn oracle_funnel_value(m: &Model, f: &Funnel) -> Option<f64> {
+/// The value a condition funnel saw at instant `x`, computed directly from
+/// the current view: the live-state value at `x`, or the operator's window
+/// ending at `x` by the window oracle.
+pub fn oracle_funnel_value_at(m: &Model, f: &Funnel, x: Nanos) -> Option<f64> {
     let Selection::Series(set) = &f.selection else {
         return None;
     };
@@ -852,29 +853,35 @@ pub fn oracle_funnel_value(m: &Model, f: &Funnel) -> Option<f64> {
         Some(op) => {
             let p = kvik_model::summary::Params::new(Kind::Gauge, D_STALENESS);
             let rs = oracle::readings(current, s);
-            oracle::window(&p, &rs, m.now - op.width, m.now, m.now)
+            oracle::window(&p, &rs, x - op.width, x, x)
                 .aggregate(&op.aggregate)?
                 .to_f64()
         }
         None => current
-            .range((s, Nanos::MIN)..=(s, m.now))
+            .range((s, Nanos::MIN)..=(s, x))
             .rev()
             .map(|(_, f)| f)
             .find(|f| f.summarised())
             .and_then(|f| match f.value {
-                Value::Num(x) => Some(x),
+                Value::Num(v) => Some(v),
                 _ => None,
             }),
     }
 }
 
-/// The condition state on resume that `OPEN-QUESTIONS.md` Q-63 (and Q-16
-/// for stale-for) describes, from the value now and the latch.
-pub fn resumed_state(
-    cond: &Condition,
-    value: Option<f64>,
-    latch: Option<&ConditionState>,
-) -> ConditionState {
+/// The value a condition funnel sees now.
+pub fn oracle_funnel_value(m: &Model, f: &Funnel) -> Option<f64> {
+    oracle_funnel_value_at(m, f, m.now)
+}
+
+/// The condition state now, as invariant 16 needs it, computed directly: a
+/// threshold by its levels, between them by the latch (Q-63); on change, the
+/// value now; held for, true when the value is above at every timer-cadence
+/// instant from now back over the hold; stale for, true when no reading of
+/// the series has arrived for S + N (Q-16: measured by `received_at`).
+pub fn condition_now(m: &Model, f: &Funnel, latch: Option<&ConditionState>) -> ConditionState {
+    let cond = f.condition.as_ref().expect("a condition funnel");
+    let value = oracle_funnel_value(m, f);
     let latched = matches!(latch, Some(ConditionState::Active(true)));
     match cond {
         Condition::Threshold { on, clear } => ConditionState::Active(match value {
@@ -883,9 +890,25 @@ pub fn resumed_state(
             _ => latched,
         }),
         Condition::OnChange { .. } => ConditionState::Value(value),
-        Condition::HeldFor { above, .. } => {
-            ConditionState::Active(latched && value.is_some_and(|v| v > *above))
+        Condition::HeldFor { above, n } => {
+            let steps = n / SECOND;
+            ConditionState::Active((0..=steps).all(|k| {
+                oracle_funnel_value_at(m, f, m.now - k * SECOND).is_some_and(|v| v > *above)
+            }))
         }
-        Condition::StaleFor { .. } => ConditionState::Active(false),
+        Condition::StaleFor { staleness, n } => {
+            let Selection::Series(set) = &f.selection else {
+                unreachable!()
+            };
+            let s = *set.iter().next().unwrap();
+            let last = m
+                .disk
+                .all_facts()
+                .into_iter()
+                .filter(|x| x.series == s)
+                .map(|x| x.received_at)
+                .max();
+            ConditionState::Active(last.is_some_and(|r| m.now - r >= staleness + n))
+        }
     }
 }

@@ -285,12 +285,13 @@ fn resync_condition(m: &Model) -> (ConditionState, bool) {
     (c.state, c.transition)
 }
 
-/// Q-16: a stale-for condition measures monotonic time since the last
-/// arrival, which a restart does not keep. The `resync` after a restart
-/// reports it false, a transition from a latched true, and it fires again
-/// only after S + N more of silence.
+/// Q-16: a stale-for condition measures time since the last arrival of any
+/// reading, monotonic while the engine runs; a resume rebuilds it from the
+/// last reading's `received_at`. A stale-for condition that is true now is
+/// reported true in the `resync` after a restart, no transition from a
+/// latched true; a series that reports again after the restart clears it.
 #[test]
-fn q16_stale_for_resyncs_false_after_restart() {
+fn q16_stale_for_true_now_reported_true_on_resync() {
     let stale = Condition::StaleFor {
         staleness: 10 * SECOND,
         n: 5 * SECOND,
@@ -302,10 +303,22 @@ fn q16_stale_for_resyncs_false_after_restart() {
     m.drain().unwrap();
     assert_eq!(m.disk.latches[&(C, F)].state, ConditionState::Active(true));
     m.crash();
+    m.advance(SECOND);
     m.restart();
     m.drain().unwrap();
-    assert_eq!(resync_condition(&m), (ConditionState::Active(false), true));
-    m.advance(15 * SECOND);
+    assert_eq!(resync_condition(&m), (ConditionState::Active(true), false));
+    put(&mut m, s, 2.0);
+    let got = m.receive(C, 10).unwrap();
+    assert_eq!(
+        got[0].trigger().unwrap().state,
+        ConditionState::Active(false)
+    );
+    // Silent again, but not yet for S + N: a resume reports it false.
+    m.advance(10 * SECOND);
+    m.reconnect(C).unwrap();
+    m.drain().unwrap();
+    assert_eq!(resync_condition(&m).0, ConditionState::Active(false));
+    m.advance(5 * SECOND);
     m.tick().unwrap();
     let got = m.receive(C, 10).unwrap();
     assert_eq!(
@@ -333,6 +346,7 @@ fn q61_condition_delivery_sequence_survives_a_crash() {
     assert_eq!(
         first[0].id(),
         DeliveryId::Timer {
+            generation: 0,
             funnel: F,
             sequence: 1
         }
@@ -346,10 +360,59 @@ fn q61_condition_delivery_sequence_survives_a_crash() {
     assert_eq!(
         next[0].id(),
         DeliveryId::Timer {
+            generation: 0,
             funnel: F,
             sequence: 2
         }
     );
+}
+
+/// Q-61: a restore starts a new store whose sequences begin again, so the
+/// model puts the generation into a condition delivery's identity: the first
+/// transition after a restore is `(1, F, 1)`, not the `(0, F, 1)` a consumer
+/// may still remember.
+#[test]
+fn q61_condition_delivery_identity_includes_the_generation() {
+    let (mut m, s) = condition_model(
+        Condition::Threshold {
+            on: 50.0,
+            clear: 40.0,
+        },
+        100,
+    );
+    put(&mut m, s, 90.0);
+    let before = m.receive(C, 10).unwrap()[0].id();
+    assert_eq!(
+        before,
+        DeliveryId::Timer {
+            generation: 0,
+            funnel: F,
+            sequence: 1
+        }
+    );
+    m.seal_active();
+    m.upload();
+    let mut r = Model::restore_from(
+        m.config.clone(),
+        m.consumers.clone(),
+        &mut m.disk.bucket,
+        m.wall,
+        false,
+    )
+    .unwrap();
+    r.drain().unwrap();
+    r.advance(SECOND);
+    put(&mut r, s, 10.0);
+    let after = r.receive(C, 10).unwrap()[0].id();
+    assert_eq!(
+        after,
+        DeliveryId::Timer {
+            generation: 1,
+            funnel: F,
+            sequence: 1
+        }
+    );
+    assert_ne!(after, before);
 }
 
 /// Q-62: a transition while the consumer is catching up after overflow is
@@ -382,13 +445,10 @@ fn q62_transition_during_overflow_sent_on_reattach() {
     assert_eq!(stream[3].position, p);
 }
 
-/// Q-63: a condition with memory is resumed from the latch. A threshold
-/// whose value now lies between its clear and activation levels keeps the
-/// latched state (false with no latch); a held-for condition is true only if
-/// it is above now and was latched true, otherwise its hold starts at the
-/// resume, although it may have been held above for longer while down.
+/// Q-63: a threshold whose value now lies between its clear and activation
+/// levels is resumed with the latched state (false with no latch).
 #[test]
-fn q63_conditions_with_memory_resume_from_the_latch() {
+fn q63_threshold_between_levels_resumes_from_the_latch() {
     let band = Condition::Threshold {
         on: 50.0,
         clear: 40.0,
@@ -404,33 +464,6 @@ fn q63_conditions_with_memory_resume_from_the_latch() {
     m.reconnect(C).unwrap();
     m.drain().unwrap();
     assert_eq!(resync_condition(&m), (ConditionState::Active(false), true));
-
-    let held = Condition::HeldFor {
-        above: 5.0,
-        n: 10 * SECOND,
-    };
-    let (mut m, s) = condition_model(held, 100);
-    put(&mut m, s, 9.0);
-    m.advance(10 * SECOND);
-    m.tick().unwrap();
-    put(&mut m, s, 1.0);
-    m.drain().unwrap();
-    assert_eq!(m.disk.latches[&(C, F)].state, ConditionState::Active(false));
-    // While the consumer is down the value is held above for 30 s and the
-    // condition fires; the consumer restarts before taking it.
-    put(&mut m, s, 9.0);
-    m.advance(30 * SECOND);
-    m.tick().unwrap();
-    m.reconnect(C).unwrap();
-    m.drain().unwrap();
-    assert_eq!(resync_condition(&m), (ConditionState::Active(false), false));
-    m.advance(10 * SECOND);
-    m.tick().unwrap();
-    let got = m.receive(C, 10).unwrap();
-    assert_eq!(
-        got[0].trigger().unwrap().state,
-        ConditionState::Active(true)
-    );
 }
 
 /// Restarts `m` and commits one fact for `s` before the consumer catches up,

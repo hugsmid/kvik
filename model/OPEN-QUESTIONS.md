@@ -35,9 +35,9 @@ said whether staleness counts from its commit or from when it fell due, nor whet
 forward clock jump moves) or the monotonic clock (§4 Timers). (d) The monotonic clock restarts at boot, so after a
 restart there is no last-commit instant to measure from. (e) "Bad quality" may mean the supplied or the engine
 quality.
-**Model.** Stale-for conditions measure monotonic time since the last arrival of any reading. A resume starts them
-unfired, so a latched-true stale-for condition is reported cleared, as a transition, in every `resync`
-(`q16_stale_for_resyncs_false_after_restart`).
+**Model.** Stale-for conditions measure monotonic time since the last arrival of any reading. A resume, which has no
+monotonic instant from before it, rebuilds that time from the last reading's `received_at` against `now`, so a
+stale-for condition true now is reported true in `resync` (`q16_stale_for_true_now_reported_true_on_resync`).
 **Tried and rejected.** Counting from a staleness reference that restarts only when the live state's `t` rises past
 a high-water mark, for facts not flagged `late`, with "due" on the monotonic clock. Review found that this breaks
 principle 2 (when a fact fell due depends on a clock the log does not hold, so replay cannot rebuild it), that one
@@ -355,12 +355,17 @@ delivery would share its identity with the fact delivery at 0:7, and two funnels
 (b) A timer delivery `(F, 5)` is taken but not confirmed, and the engine crashes. The latch (§6) holds the state
 and position, not the sequence, and is never ahead of confirmation (invariant 13), so a sequence restored from it
 starts again at 5: the next, different transition is `(F, 5)`, which a consumer de-duplicating by `(funnel,
-sequence)` (§4 At-least-once) drops. Nothing else on disk is said to hold the sequence.
-**Model.** Every condition delivery, on a routed fact or on the timer, is identified by `(funnel, sequence)` and
-carries the last committed position at evaluation. The sequence is kept on disk when the delivery is issued, so it
-is never issued twice for a funnel (`q61_condition_delivery_sequence_survives_a_crash`).
-**Needed.** The identity of a delivery from an evaluation on a fact, and where the per-funnel sequence is persisted
-(with the mark, in the cursor file at issue, or a sequence that a consumer forgets on `resync`).
+sequence)` (§4 At-least-once) drops. Nothing else on disk is said to hold the sequence. (c) A store is restored
+(§8): cursor files are not backed up, so nothing tells the new store which sequences were issued, and its first
+transition is `(F, 1)` again, which a consumer that kept its de-duplication memory across the restore drops.
+**Model.** Every condition delivery, on a routed fact or on the timer, is identified by `(generation, funnel,
+sequence)`, the generation being the store's at issue, and carries the last committed position at evaluation. The
+sequence is kept on disk when the delivery is issued, so it is never issued twice for a funnel within a generation
+(`q61_condition_delivery_sequence_survives_a_crash`), and a restore, which starts a generation, starts the sequences
+again without repeating an identity (`q61_condition_delivery_identity_includes_the_generation`).
+**Needed.** The identity of a delivery from an evaluation on a fact, where the per-funnel sequence is persisted (with
+the mark, in the cursor file at issue, or a sequence that a consumer forgets on `resync`), and how it continues after
+a restore.
 
 ## Q-62 — Condition transitions while a consumer catches up after overflow
 **Scenario.** A consumer has a fact funnel and a threshold funnel; its queue is full, so it is catching up from the
@@ -380,20 +385,19 @@ position is no longer local.
 ## Q-63 — Condition state now, for conditions with memory
 **Scenario.** §6 Restart and resume rebuilds the operator "as of now" and compares "the condition state now" with the
 latch. (a) A threshold with activation 50 and clear 40 whose value now is 45: its state depends on the last crossing,
-which the value now does not show; after a restore there is no latch either. (b) A held-for-10-s condition whose
-value has been above its level for 30 s, partly while the consumer was down: the monotonic hold started before the
-resume, and the spec does not say whether it is rebuilt from the tree or restarts. Row 16 and invariant 16 ("every
-condition true now is delivered once in `resync`") depend on the answer. (c) For an on-change condition, "differs
-from the latch" is not said to use the dead-band. (d) A condition funnel added at run time has no latch; it is not
-said whether it announces its present state.
+which the value now does not show, and finding that crossing in the tree means replaying past evaluations, which
+depend on the cadence and on data that arrived late; after a restore there is no latch either. (b) For an on-change
+condition, "differs from the latch" is not said to use the dead-band. (c) A condition funnel added at run time has no
+latch; it is not said whether it announces its present state.
 **Model.** `Runner::resume`: a threshold is true above its activation level, false below its clear level and, between
-them, keeps the latched state (false with no latch); a held-for condition is true only if its value is above now and
-the latch is true, and otherwise its hold starts at the resume, so a condition held while the consumer was down is
-delivered only N later (`q63_conditions_with_memory_resume_from_the_latch`); an on-change condition reports the value
-now, a transition if it moved beyond the dead-band from the latched value; stale-for follows Q-16. A funnel added at
-run time starts with a fresh condition and announces nothing until it is first evaluated; a removed funnel's latch is
-dropped.
-**Needed.** How each condition's state now is determined on resume, whether from the tree, the latch or both.
+them, keeps the latched state (false with no latch) (`q63_threshold_between_levels_resumes_from_the_latch`); an
+on-change condition reports the value now, a transition if it moved beyond the dead-band from the latched value. A
+funnel added at run time starts with a fresh condition and announces nothing until it is first evaluated; a removed
+funnel's latch is dropped, and a latch belongs to one incarnation of a funnel id. Held-for is rebuilt from the tree as
+of now (§6): true when the value is above at every timer-cadence instant over the hold (`tests/rules.rs`
+`s6_held_for_true_while_down_delivered_in_resync`); stale-for follows Q-16.
+**Needed.** How a threshold's state between its levels is determined on resume, the dead-band rule for on-change, and
+whether a new funnel announces its state.
 
 ## Q-64 — Routing changes before a restore's checkpoint
 **Scenario.** A route is added at 0:2; a tree checkpoint is taken at 0:5 and the log before it is compacted. A restore
@@ -578,9 +582,10 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it, and a resume restarts it unfired | `tests/open_questions.rs` `q16_stale_for_resyncs_false_after_restart` |
+| Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
-| Condition state on resume | §6 Restart and resume, invariant 16 (see Q-63) | The engine resumes conditions with `Runner::resume`, from the value now and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
+| Condition state on resume | §6 Restart and resume, invariant 16 (see Q-63) | The engine resumes conditions with `Runner::resume`, from the value now, the history rebuilt from the tree (held-for, stale-for) and the latch; a standalone `Runner::rebuild` scans a history of values and counts a true condition as fired | `restart_rebuilds_threshold_without_firing_again`, `tests/open_questions.rs` `q63_…` |
+| Cursor of a consumer after a restore | §4 Consumer state, invariant 13: a cursor is never ahead of the consumer's confirmation | A consumer without a kept cursor, or whose catch-up segments are not local, gets the restored end written as its cursor, which it never confirmed, standing in for "treated as beyond the restored end" (§8 Restore step 2) | `tests/rules.rs` `s8_cursor_catches_up_only_if_its_segments_are_local` |
 | Tree files and their checkpoint, density rule | §5.1, row 20a | Tree rebuilt from facts at restart (tree checkpoints are taken only for backup, by an explicit call); both levels, and calendar nodes, stored for every series | — |
 | Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
 | Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
