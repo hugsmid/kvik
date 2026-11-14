@@ -26,13 +26,16 @@ sources must be acted on quickly, kept for years and restored to a known, record
 >   newer rules are not yet modelled ([coverage table](model/README.md#coverage)).
 > - Two measurements are recorded: [chunk encodings against Parquet](docs/measurements/2.1-chunk-encodings.md) and
 >   [commit and sync latency](docs/measurements/2.2-commit-latency.md); gate 2.3 has looked at both.
+> - The public interface ([`kvik/`](kvik/)) is implemented on the reference model as an in-memory backend: **not
+>   durable, for development and tests**; nothing is written to disk yet.
 >
 > | [Roadmap](docs/roadmap.md) section | Progress |
 > |---|---|
 > | 1. Specification settled | 8 of 8 done |
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
-> | 4–10. Log, delivery, compaction, summary tree, tiers and backup, query, scale | not started |
+> | 4. Log | not started (the interface crate was started early, on the reference model) |
+> | 5–10. Delivery, compaction, summary tree, tiers and backup, query, scale | not started |
 >
 > 14 of 47 roadmap items are done, including 3 of 9 gates.
 
@@ -200,7 +203,9 @@ demand for fact reads, never for windows or consumer catch-up. The engine never 
 | Tier | Hot local disk, optional cold path, deep bucket; files move between them only after a verified copy |
 
 ### Planned interface
-*Subject to change: an outline from [`docs/api.md`](docs/api.md), not yet implemented.*
+*Subject to change: an outline from [`docs/api.md`](docs/api.md). The [`kvik`](kvik/) crate implements it on the
+in-memory reference model, which is not durable; decimal value types, calendar-length intervals, backup and restore
+are among what it does not support yet ([coverage](kvik/README.md#coverage)).*
 
 ```rust
 let store = Store::open(config).await?;   // StoreConfig: directory, time zone, limits, tiers, ...

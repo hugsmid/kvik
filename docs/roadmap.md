@@ -30,7 +30,8 @@ again; nothing after a gate starts before it is passed.
   `docs/api-check.md`)
 
 ## 4. Log
-- [ ] 4.1 Crate skeleton: errors, configuration, injectable clock and file-system seams
+- [x] 4.1 Crate skeleton: errors, configuration, injectable clock and file-system seams (public API first implemented
+  on the reference model; durable engine from 4.2)
 - [ ] 4.2 Segment container: header, blocks, checksums; reader up to the durable mark; golden files; fuzz target
 - [ ] 4.3 Arrival batches: encode, decode, round-trip property tests
 - [ ] 4.4 Commit path: group commit, sync, durable mark, positions
