@@ -276,7 +276,7 @@ pub type SyncHook = Arc<dyn Fn(&Path) + Send + Sync>;
 /// last successful sync, and the list of writes and length changes made since. Crashes:
 /// - [`MemFs::power_loss`] puts every file back to its durable image; [`MemFs::power_loss_partial`] also applies a
 ///   seeded subset of the unsynced changes, one of them cut short at an 8-byte boundary, and may undo creations and
-///   renames not yet made durable by a directory sync;
+///   renames and removals not yet made durable by a directory sync;
 /// - [`MemFs::crash_after`] makes every operation fail after a number of further operations, as if the process
 ///   stopped there.
 ///
@@ -299,7 +299,14 @@ impl fmt::Debug for MemFs {
 #[derive(Debug)]
 enum NameChange {
     Created(PathBuf),
-    Renamed { from: PathBuf, to: PathBuf },
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Removed {
+        path: PathBuf,
+        data: Arc<Mutex<MemData>>,
+    },
 }
 
 #[derive(Debug)]
@@ -311,7 +318,7 @@ struct MemState {
     ops: Vec<MemOp>,
     /// Operations left before every operation fails.
     crash_in: Option<usize>,
-    /// Creations and renames not yet made durable by a directory sync, oldest first.
+    /// Creations, renames and removals not yet made durable by a directory sync, oldest first.
     names: Vec<NameChange>,
 }
 
@@ -507,7 +514,7 @@ impl MemFs {
 
     /// A simulated power loss that lets part of the unsynced work reach the disk, chosen by `seed`: each unsynced
     /// change of each file is applied or not, in order, and one applied write may be cut short at an 8-byte
-    /// boundary; each creation or rename not yet made durable by a directory sync may be undone.
+    /// boundary; each creation, rename or removal not yet made durable by a directory sync may be undone.
     pub fn power_loss_partial(&self, seed: u64) {
         self.crash(Some(Rng(seed)));
     }
@@ -566,6 +573,20 @@ impl MemFs {
                         {
                             lock(&d).path = from.clone();
                             s.files.insert(from, d);
+                        }
+                    }
+                    NameChange::Removed { path, data } => {
+                        if !s.files.contains_key(&path) {
+                            let len = {
+                                let mut d = lock(&data);
+                                d.bytes = d.durable.clone();
+                                d.pending.clear();
+                                d.lost.clear();
+                                d.locked = false;
+                                d.bytes.len() as u64
+                            };
+                            s.free = s.free.saturating_sub(len);
+                            s.files.insert(path, data);
                         }
                     }
                 }
@@ -708,8 +729,19 @@ impl Fs for MemFs {
         let mut s = lock(&self.state);
         let d = s.files.remove(path).ok_or_else(not_found)?;
         s.free += lock(&d).bytes.len() as u64;
+        let created_unsynced = s
+            .names
+            .iter()
+            .any(|n| matches!(n, NameChange::Created(p) if p == path));
         s.names
             .retain(|n| !matches!(n, NameChange::Created(p) if p == path));
+        // A removal not yet made durable by a directory sync may be undone by a power loss.
+        if !created_unsynced {
+            s.names.push(NameChange::Removed {
+                path: path.to_path_buf(),
+                data: d,
+            });
+        }
         Ok(())
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
@@ -718,6 +750,7 @@ impl Fs for MemFs {
             let p = match n {
                 NameChange::Created(p) => p,
                 NameChange::Renamed { to, .. } => to,
+                NameChange::Removed { path, .. } => path,
             };
             p.parent() != Some(path)
         });

@@ -813,6 +813,10 @@ struct Cycle {
     fault: Fault,
     crash: Crash,
     crash_start: Option<usize>,
+    /// A fault inside the start that follows the crash, and how the process then stops: a kill on the same boot,
+    /// or a power loss.
+    start_fault: Fault,
+    after_fault: Option<u64>,
     clean: bool,
 }
 
@@ -835,15 +839,27 @@ fn cycle() -> impl Strategy<Value = Cycle> {
         fault,
         crash,
         prop::option::weighted(0.3, 0..40usize),
+        prop_oneof![
+            3 => Just(Fault::None),
+            2 => (0..4usize).prop_map(|k| Fault::Sync(".open", k)),
+            1 => (0..2usize).prop_map(|k| Fault::Sync("MARK", k)),
+            1 => (0..3usize).prop_map(|k| Fault::Sync("MANIFEST", k)),
+            1 => (0..20_000u64).prop_map(Fault::Full),
+        ],
+        prop::option::of(any::<u64>()),
         prop::bool::weighted(0.2),
     )
-        .prop_map(|(calls, fault, crash, crash_start, clean)| Cycle {
-            calls,
-            fault,
-            crash,
-            crash_start,
-            clean,
-        })
+        .prop_map(
+            |(calls, fault, crash, crash_start, start_fault, after_fault, clean)| Cycle {
+                calls,
+                fault,
+                crash,
+                crash_start,
+                start_fault,
+                after_fault,
+                clean,
+            },
+        )
 }
 
 /// Runs a kill loop: every cycle writes, fails or crashes somewhere, and starts again.
@@ -918,6 +934,39 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
             // The start that stopped may have written a mark; the next one reads it.
             if mark_before.is_some() || r.mark().is_some_and(|m| m.boot_id == r.boot_id()) {
                 mark_before = r.mark();
+            }
+        }
+        // A failed sync or a full disk inside the start; the process then stops, on the same boot or by a power
+        // loss, and the next start must finish.
+        let armed = match c.start_fault {
+            Fault::None | Fault::Stop(_) => false,
+            Fault::Sync(p, k) => {
+                r.fs.fail_nth(FaultOp::Sync, p, k, io::ErrorKind::Other);
+                true
+            }
+            Fault::Full(b) => {
+                r.fs.set_free_space(b);
+                true
+            }
+        };
+        if armed {
+            let started = r.open();
+            r.fs.set_free_space(1 << 40);
+            if started.is_some() {
+                r.check_started();
+                continue;
+            }
+            match c.after_fault {
+                Some(seed) => {
+                    r.power_loss(Some(seed));
+                    mark_before = None;
+                }
+                None => {
+                    r.kill();
+                    if mark_before.is_some() || r.mark().is_some_and(|m| m.boot_id == r.boot_id()) {
+                        mark_before = r.mark();
+                    }
+                }
             }
         }
         let before = r.batches();
@@ -1126,5 +1175,296 @@ fn a_loss_at_the_tail_below_the_mark_is_not_overwritten() {
     assert_eq!(
         r.positions().keys().copied().collect::<Vec<_>>(),
         vec![1, 3]
+    );
+}
+
+/// Commits one batch per call into segment 1 and returns after `n` batches, the mark synced at every commit.
+fn rig_with_batches(n: i64, cfg: WriterConfig) -> Rig {
+    let mut r = Rig::new(cfg);
+    for i in 0..n {
+        r.submit(vec![fact(1, i)]);
+        r.drain();
+    }
+    r
+}
+
+#[test]
+fn an_adopted_entry_whose_own_sync_failed_is_written_again() {
+    // Q-117: the entry's sync fails (the store turns read-only); the next start on the same boot adopts it. Its
+    // bytes are in the page cache but not on disk, and a later sync would not write them unless they are written
+    // again.
+    let mut r = rig_with_batches(2, cfg());
+    r.shutdown().unwrap();
+    r.power_loss(None);
+    // Step 3 syncs segment 1; the entry's own sync is the next one of a segment.
+    r.fs.fail_nth(FaultOp::Sync, ".open", 1, io::ErrorKind::Other);
+    assert!(r.open().is_none());
+    r.kill();
+    let rep = r.open().unwrap();
+    assert!(rep.entry.as_ref().unwrap().adopted);
+    assert!(rep.rewrote_last_batch);
+    r.submit(vec![fact(2, 0)]);
+    r.drain();
+    r.shutdown().unwrap();
+    // A power loss keeps the entry: nothing is lost.
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    assert!(
+        rep.losses.iter().all(|l| l.kind == LossKind::PossibleLoss),
+        "{:?}",
+        rep.losses
+    );
+    r.check_started();
+}
+
+#[test]
+fn exactly_two_batches_beyond_the_mark_on_the_same_boot_make_it_stale() {
+    let mut r = Rig::new(WriterConfig {
+        min_sync_interval: Duration::ZERO,
+        ..cfg()
+    });
+    for i in 0..2 {
+        r.submit(vec![fact(1, i)]);
+        r.step();
+    }
+    assert_eq!(r.acked.len(), 2);
+    r.w = None;
+    r.fs.power_loss();
+    r.fs.restart();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::Reboot(MarkState::Stale));
+    r.check_started();
+}
+
+#[test]
+fn after_a_reboot_a_loss_at_the_tail_below_the_mark_ends_at_the_marks_position() {
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::EveryCommit,
+        ..cfg()
+    });
+    for i in 0..3 {
+        r.submit(vec![fact(1, i)]);
+        r.drain();
+    }
+    let m = r.mark().unwrap();
+    r.w = None;
+    // Damage the last batch, below the mark.
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let last = scan(&bytes, &id, ScanLimit::End).unwrap().batches[2].offset;
+    r.fs.poke(&seg, last as usize + 40, &[0xff; 8]);
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    let e = rep.entry.unwrap();
+    assert_eq!(
+        (e.entry.after, e.sequence),
+        (m.last_sequence, m.last_sequence + 1)
+    );
+}
+
+#[test]
+fn a_write_after_an_entry_inside_its_reported_tail_is_not_adopted() {
+    // An entry reporting a 400-byte tail; a batch written after it (inside that extent) is torn, its commit block
+    // still readable with a later commit time. Some start resumed after the entry, so it is not adopted.
+    let mut r = rig_with_batches(1, cfg());
+    r.w = None;
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let end = (bytes.iter().rposition(|&b| b != 0).unwrap() + 1).div_ceil(8) * 8;
+    r.fs.poke(&seg, end, &[0x5a; 400]);
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    assert_eq!(rep.entry.as_ref().unwrap().entry.tail_bytes, 400);
+    r.advance(Duration::from_secs(1));
+    r.submit(vec![fact(2, 0)]);
+    r.drain();
+    r.w = None;
+    // Tear the batch after the entry (its first block), keep its commit block, and lose the mark.
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let b = scan(&bytes, &id, ScanLimit::End).unwrap().batches[2].offset;
+    r.fs.poke(&seg, b as usize + 40, &[0xff; 8]);
+    r.fs.remove_file(&log_path("MARK")).unwrap();
+    r.kill();
+    let rep = r.open().unwrap();
+    assert!(!rep.entry.as_ref().unwrap().adopted);
+}
+
+#[test]
+fn the_header_is_written_again_with_a_segments_first_batch() {
+    // The batch that takes segment 2 into use fails its sync: header and batch are in the page cache only. With the
+    // mark lost, the start writes both again before its sync.
+    let mut r = Rig::new(WriterConfig {
+        segment_size: 4096,
+        min_sync_interval: Duration::ZERO,
+        ..cfg()
+    });
+    let seg2 = log_path("00000000-0000000000000002.open");
+    let mut planned = false;
+    for i in 0..200 {
+        // Once segment 2 is created ahead, the batch that takes it into use fails its sync.
+        if !planned && r.fs.read_durable(&seg2).is_some_and(|b| b.len() == 4096) {
+            r.fs.fail_nth(FaultOp::Sync, "0000000000000002", 0, io::ErrorKind::Other);
+            planned = true;
+        }
+        r.submit(vec![fact(1, i)]);
+        r.step();
+        r.maint();
+        if r.w().fault().is_some() {
+            break;
+        }
+    }
+    assert!(r.w().fault().is_some());
+    r.kill();
+    r.fs.remove_file(&log_path("MARK")).unwrap();
+    let rep = r.open().unwrap();
+    assert!(rep.rewrote_last_batch);
+    r.w = None;
+    assert!(FileHeaderOf::base(&r.fs.read_durable(&seg2).unwrap()) >= 1);
+}
+
+struct FileHeaderOf;
+impl FileHeaderOf {
+    fn base(b: &[u8]) -> u64 {
+        kvik_log::header::FileHeader::decode(b).map_or(0, |h| h.base_sequence)
+    }
+}
+
+#[test]
+fn the_manifests_last_record_is_written_again_at_a_start() {
+    // A start records a loss but the record's sync fails; the next start finds the record (in the page cache) and
+    // writes it again before its sync, so a power loss keeps it.
+    let mut r = rig_with_batches(
+        3,
+        WriterConfig {
+            mark_sync: MarkSync::EveryCommit,
+            ..cfg()
+        },
+    );
+    r.shutdown().unwrap();
+    r.w = None;
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let second = scan(&bytes, &id, ScanLimit::End).unwrap().batches[1].offset;
+    r.fs.poke(&seg, second as usize + 40, &[0xff; 8]);
+    r.kill();
+    // The repair's sync is the manifest's first; the record's is the second.
+    r.fs.fail_nth(FaultOp::Sync, "MANIFEST", 1, io::ErrorKind::Other);
+    assert!(r.open().is_none());
+    r.kill();
+    r.open().unwrap();
+    r.w = None;
+    r.fs.power_loss();
+    let m = read_manifest(&r.fs.read(&dir().join("MANIFEST")).unwrap(), &STORE_ID).unwrap();
+    assert_eq!(m.lost_ranges().count(), 1);
+}
+
+#[test]
+fn a_mark_read_from_the_page_cache_at_a_same_boot_start_is_synced_on_the_timer() {
+    let mut r = rig_with_batches(2, cfg());
+    let last = r.acked.len() as u64;
+    r.kill();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    r.advance(Duration::from_secs(2));
+    r.step();
+    let durable = read_mark(&r.fs.read_durable(&log_path("MARK")).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(durable.last_sequence, last);
+}
+
+#[test]
+fn a_start_begins_with_a_directory_sync_and_stops_if_it_fails() {
+    let mut r = rig_with_batches(1, cfg());
+    r.power_loss(None);
+    r.fs.clear_ops();
+    r.open().unwrap();
+    let ops = r.fs.ops();
+    assert_eq!((ops[0].op, ops[0].ok), (FaultOp::SyncDir, true));
+    assert!(ops[0].path.ends_with("log"));
+    // Step 3 syncs the kept segments and then the directory, before the manifest is touched.
+    let manifest = ops
+        .iter()
+        .position(|o| o.path.ends_with("MANIFEST"))
+        .unwrap();
+    let last_segment_sync = ops[..manifest]
+        .iter()
+        .rposition(|o| o.op == FaultOp::Sync && o.path.to_string_lossy().ends_with(".open"))
+        .unwrap();
+    assert!(
+        ops[last_segment_sync..manifest]
+            .iter()
+            .any(|o| o.op == FaultOp::SyncDir && o.path.ends_with("log")),
+        "{ops:?}"
+    );
+    r.power_loss(None);
+    r.fs.fail_nth(FaultOp::SyncDir, "log", 0, io::ErrorKind::Other);
+    r.fs.clear_ops();
+    assert!(r.open().is_none());
+    let ops = r.fs.ops();
+    assert_eq!(
+        ops.len(),
+        1,
+        "nothing written or deleted after the failed directory sync: {ops:?}"
+    );
+}
+
+#[test]
+fn unused_segments_are_kept_only_with_a_valid_header_the_configured_size_and_zeros() {
+    use kvik_log::header::{FileHeader, kind};
+    let mut r = rig_with_batches(1, cfg());
+    r.shutdown().unwrap();
+    r.w = None;
+    let mk = |r: &Rig, id: u64, len: usize, junk: bool| {
+        let p = log_path(
+            &SegmentName {
+                generation: 0,
+                file_id: id,
+                sealed: false,
+            }
+            .to_string(),
+        );
+        let mut b = vec![0u8; len];
+        b[..64].copy_from_slice(&FileHeader::new(kind::LOG_SEGMENT, 0, id, T0, STORE_ID).encode());
+        if junk {
+            b[200] = 1;
+        }
+        let f = r.fs.open(&p, kvik_log::fs::OpenMode::CreateNew).unwrap();
+        f.write_at(&b, 0).unwrap();
+        f.sync_all().unwrap();
+        p
+    };
+    // Segment 2 is the one created ahead; add a junk one and a short one above it.
+    let size = cfg().segment_size as usize;
+    let s3 = mk(&r, 3, size, true);
+    let s4 = mk(&r, 4, size / 2, false);
+    let s5 = mk(&r, 5, size, false);
+    r.kill();
+    let rep = r.open().unwrap();
+    let mut deleted = rep.deleted.clone();
+    deleted.sort_unstable();
+    assert_eq!(deleted, vec![2, 3, 4]);
+    for p in [&s3, &s4] {
+        assert!(r.fs.read(p).is_none());
+    }
+    assert!(
+        r.fs.read(&s5).is_some(),
+        "the highest valid one is kept as created ahead"
     );
 }

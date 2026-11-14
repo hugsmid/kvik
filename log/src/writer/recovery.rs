@@ -353,7 +353,9 @@ fn plan(
             if rule == StartRule::SameBoot {
                 // Truncate everything after the mark: in the mark's segment from its offset, in every later segment
                 // in use from the header's end.
-                for &i in &in_use {
+                // A segment that is not the last in use holds no batch beyond a current mark, and may hold seal
+                // blocks, which are never truncated (A.4).
+                for &i in in_use.iter().filter(|&&i| Some(i) == last_in_use) {
                     let s = &segs[i];
                     if s.id.file_id < slot.file_id {
                         continue;
@@ -516,7 +518,10 @@ fn plan(
                 let b = &s.batches[j];
                 let covered = mark_slot.is_some_and(|m| m.last_sequence >= b.first);
                 if let (Some(rec), false) = (b.recovery(), covered) {
-                    let within = end <= b.offset + rec.tail_bytes.max(b.end - b.offset);
+                    // The tail it reported began where it was written; as the first batch of its segment it may have
+                    // gone to a new segment, so then only its own length counts.
+                    let reported = if j == 0 { 0 } else { rec.tail_bytes };
+                    let within = end <= b.offset + reported.max(b.end - b.offset);
                     let later = s
                         .tail_commits
                         .iter()
@@ -531,8 +536,9 @@ fn plan(
         if p.adopt.is_none() {
             p.last_sequence = 1 + k.max(manifest_highest);
         }
-        // Q-87: with no readable mark of another boot, the last complete batch is written again before the sync.
-        if state != MarkState::Readable {
+        // Q-87: with no readable mark of another boot, the last complete batch is written again before the sync; so
+        // is an adopted entry, whose own sync may have failed (Q-117).
+        if state != MarkState::Readable || p.adopt.is_some() {
             p.rewrite_last = last_kept;
         }
     } else {
@@ -575,8 +581,8 @@ pub(super) fn start(
     {
         return Ok(read_only(fault(FaultOp::Sync, &log_dir, &e), report, halt));
     }
-    let manifest = read_manifest(&store.read_file(&store.dir().join(MANIFEST))?, &store_id)
-        .map_err(manifest_error)?;
+    let manifest_bytes = store.read_file(&store.dir().join(MANIFEST))?;
+    let manifest = read_manifest(&manifest_bytes, &store_id).map_err(manifest_error)?;
     let mark_path = log_dir.join(MARK);
     let mark_bytes = match store.read_file(&mark_path) {
         Ok(b) => Some(b),
@@ -620,13 +626,20 @@ pub(super) fn start(
                 generation: name.generation,
             };
             let r = scan(&bytes, &id, ScanLimit::End).map_err(StoreError::Unsupported)?;
-            r.seal.map(|s| {
-                (
-                    name.file_id,
-                    s.trailer.last_sequence,
-                    s.trailer.last_commit_time,
-                )
-            })
+            // Without a valid trailer, its last complete batch.
+            r.seal
+                .map(|s| {
+                    (
+                        name.file_id,
+                        s.trailer.last_sequence,
+                        s.trailer.last_commit_time,
+                    )
+                })
+                .or_else(|| {
+                    r.batches
+                        .last()
+                        .map(|b| (name.file_id, b.commit.last_sequence, b.commit.commit_time))
+                })
         }
         None => None,
     };
@@ -643,16 +656,19 @@ pub(super) fn start(
         .map(|s| s.id.file_id)
         .max();
     let keep = keep.filter(|&i| last_in_use_id.is_none_or(|l| segs[i].id.file_id > l));
-    for &i in &unused {
-        if Some(i) != keep {
-            fs.remove_file(&segs[i].path)?;
-            report.deleted.push(segs[i].id.file_id);
-        }
-    }
+    // Unused segments not kept are deleted once the kept segments are synced (after step 3).
+    let to_delete: Vec<usize> = unused
+        .iter()
+        .copied()
+        .filter(|&i| Some(i) != keep)
+        .collect();
     let ahead = match keep {
         Some(i) => {
             let s = &segs[i];
-            let f = fs.open(&s.path, OpenMode::ReadWrite)?;
+            let f = match fs.open(&s.path, OpenMode::ReadWrite) {
+                Ok(f) => f,
+                Err(e) => return Ok(read_only(fault(FaultOp::Write, &s.path, &e), report, halt)),
+            };
             let h = s.header.expect("kept for its valid header");
             Some(AheadSegment {
                 file: f,
@@ -667,7 +683,18 @@ pub(super) fn start(
     let in_use_idx: Vec<usize> = (0..segs.len()).filter(|&i| segs[i].in_use()).collect();
 
     // The first start of a new store, or a first start that stopped before its mark was readable.
-    if empty_log && !matches!(mark, MarkRead::Readable { .. }) {
+    if empty_log && !matches!(mark, MarkRead::Readable { .. }) && manifest.highest_sequence(0) == 0
+    {
+        for &i in &to_delete {
+            if let Err(e) = fs.remove_file(&segs[i].path) {
+                return Ok(read_only(
+                    fault(FaultOp::Write, &segs[i].path, &e),
+                    report,
+                    halt,
+                ));
+            }
+            report.deleted.push(segs[i].id.file_id);
+        }
         let slot = MarkSlot {
             generation: 0,
             store_id,
@@ -750,8 +777,10 @@ pub(super) fn start(
             store_id,
         );
         h.base_sequence = first;
-        let f = fs.open(&s.path, OpenMode::ReadWrite)?;
-        if let Err(e) = f.write_at(&h.encode(), 0) {
+        if let Err(e) = fs
+            .open(&s.path, OpenMode::ReadWrite)
+            .and_then(|f| f.write_at(&h.encode(), 0))
+        {
             return ro(fault(FaultOp::Write, &s.path, &e), report);
         }
         header_rewritten.push(i);
@@ -761,7 +790,12 @@ pub(super) fn start(
     // Open every segment in use.
     let mut files: BTreeMap<usize, Box<dyn FsFile>> = BTreeMap::new();
     for &i in &in_use_idx {
-        files.insert(i, fs.open(&segs[i].path, OpenMode::ReadWrite)?);
+        match fs.open(&segs[i].path, OpenMode::ReadWrite) {
+            Ok(f) => {
+                files.insert(i, f);
+            }
+            Err(e) => return ro(fault(FaultOp::Write, &segs[i].path, &e), report),
+        }
     }
     let zero_fill = |f: &dyn FsFile, from: u64, to: u64| -> io::Result<()> {
         // Truncation is zero-filling, from the end backwards (A.4).
@@ -831,6 +865,12 @@ pub(super) fn start(
     if let Err(e) = fs.sync_dir(&log_dir) {
         return ro(fault(FaultOp::Sync, &log_dir, &e), report);
     }
+    for &i in &to_delete {
+        if let Err(e) = fs.remove_file(&segs[i].path) {
+            return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
+        }
+        report.deleted.push(segs[i].id.file_id);
+    }
 
     // The id floor: the mark's highest series id, and every id defined or used in the kept log.
     let mut id_floor = match &mark {
@@ -868,10 +908,12 @@ pub(super) fn start(
     }
     let mut epoch = manifest.last_epoch();
     let manifest_path = store.dir().join(MANIFEST);
-    let mfile = fs.open(&manifest_path, OpenMode::ReadWrite)?;
-    match repair_manifest(&*mfile, &store.read_file(&manifest_path)?, &manifest) {
-        Ok(()) => {}
-        Err(e) => return ro(fault(FaultOp::Sync, &manifest_path, &e), report),
+    let mfile = match fs.open(&manifest_path, OpenMode::ReadWrite) {
+        Ok(f) => f,
+        Err(e) => return ro(fault(FaultOp::Write, &manifest_path, &e), report),
+    };
+    if let Err(e) = repair_manifest(&*mfile, &manifest_bytes, &manifest) {
+        return ro(fault(FaultOp::Sync, &manifest_path, &e), report);
     }
     for (k, l) in losses.iter().enumerate() {
         match record_loss(&*mfile, &manifest, l, &mut epoch, wall, &manifest_path) {
@@ -1120,7 +1162,10 @@ pub(super) fn start(
         };
         mark_slot = *slot;
         mark_next_slot = 1 - index;
-        mark_file = Some(fs.open(&mark_path, OpenMode::ReadWrite)?);
+        mark_file = match fs.open(&mark_path, OpenMode::ReadWrite) {
+            Ok(f) => Some(f),
+            Err(e) => return ro(fault(FaultOp::MarkWrite, &mark_path, &e), report),
+        };
         // The mark read on this boot may not be on stable storage yet: the timer syncs it.
         mark_dirty = true;
         id_floor = id_floor.max(slot.max_series_id);
@@ -1193,7 +1238,9 @@ pub(super) fn start(
         let path = a.path.clone();
         let id = a.id.file_id;
         ahead = None;
-        fs.remove_file(&path)?;
+        if let Err(e) = fs.remove_file(&path) {
+            return ro(fault(FaultOp::Write, &path, &e), report);
+        }
         report.deleted.push(id);
     }
     Ok(Resume {
