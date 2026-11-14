@@ -139,28 +139,6 @@ fn q39_restoring_ends_when_every_file_is_local() {
     assert!(!r.restoring());
 }
 
-/// Q-39 (d): the revised-key index counts as back once every current chunk
-/// is local; the model takes it from the restored facts. A replay of a
-/// revised key's earlier value is then dropped although the revision chunk
-/// holding it is still remote.
-#[test]
-fn q39_revised_key_index_back_with_current_chunks() {
-    let (mut m, s, _) = checkpointed_model();
-    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
-    let replay = Reading::num(s, T0 + 20 * SECOND, 1.0);
-    let mut before = r.clone();
-    let p = before.ingest(vec![replay.clone()]).unwrap();
-    assert_eq!(p.positions.len(), 1, "recorded unchecked");
-    assert_eq!(before.counters.duplicates_unchecked, 1);
-    for _ in 0..2 {
-        let f = r.restore_step().unwrap().unwrap();
-        assert_eq!(r.disk.files[&f].class, FileClass::Current);
-    }
-    let p = r.ingest(vec![replay]).unwrap();
-    assert_eq!((p.positions.len(), p.duplicates), (0, 1));
-    assert_eq!(r.counters.duplicates_unchecked, 0);
-}
-
 /// Q-39: while restoring, a window bound inside a minute is refused, and no
 /// tree checkpoint is taken.
 #[test]

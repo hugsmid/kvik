@@ -278,7 +278,8 @@ pub struct StoredFile {
     pub sealed: bool,
     /// Wall time the file was opened.
     pub opened_at: Nanos,
-    /// Wall time the file was sealed.
+    /// When the file was sealed, on the engine clock `now`; for a compacted
+    /// file, when its oldest input was sealed.
     pub sealed_at: Option<Nanos>,
 }
 
@@ -400,8 +401,26 @@ pub struct Checkpoint {
     /// The version index as of the position (§2.4, §8 Continuous backup):
     /// the highest recorded `changed_at` of every key of a versioned series.
     pub versions: BTreeMap<(SeriesId, Nanos), u64>,
+    /// The revised-key index as of the position (§2.4, §8 Continuous
+    /// backup): for every key with more than one recorded fact, each fact's
+    /// value, adapter-supplied quality and `changed_at`. The model keeps each
+    /// fact's position with them.
+    pub revised: BTreeMap<(SeriesId, Nanos), Vec<IndexEntry>>,
     /// Stored nodes per series, without readings.
     pub trees: BTreeMap<SeriesId, SeriesTree>,
+}
+
+/// One fact of a key in the revised-key index (§2.4).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexEntry {
+    /// Position of the fact.
+    pub position: Position,
+    /// Value.
+    pub value: Value,
+    /// Adapter-supplied quality.
+    pub quality: Quality,
+    /// `changed_at`, in a versioned series.
+    pub changed_at: Option<u64>,
 }
 
 /// A restore in progress or finished, kept on the local disk with its
@@ -1364,6 +1383,10 @@ struct Volatile {
     /// The version index (§2.4), exact also while a restore brings detail
     /// back (from the checkpoint and the replay, §8 Restore step 2).
     versions: Versions,
+    /// While a restore brings detail back, the checkpoint's position and
+    /// version index: facts after the checkpoint are judged outranked
+    /// against it as well as against the facts before them.
+    cp_versions: Option<(Position, Versions)>,
     trees: BTreeMap<SeriesId, SeriesTree>,
     /// Queued readings with their `revise` intent.
     queue: VecDeque<(Reading, bool)>,
@@ -1398,6 +1421,7 @@ struct Derived {
     newest_t: BTreeMap<SeriesId, Nanos>,
     history: History,
     versions: Versions,
+    cp_versions: Option<(Position, Versions)>,
     trees: BTreeMap<SeriesId, SeriesTree>,
     restore: Option<RestoreRt>,
 }
@@ -1431,14 +1455,24 @@ impl Known {
 /// Whether a fact was outranked when it was committed (§2.3): a fact of its
 /// key with a lower position has a higher `changed_at`. A function of the
 /// log, so live delivery and catch-up agree on it.
-fn outranked_at_commit(history: &History, f: &Fact) -> bool {
+fn outranked_at_commit(
+    history: &History,
+    checkpoint: Option<&(Position, Versions)>,
+    f: &Fact,
+) -> bool {
     let Some(c) = f.changed_at else {
         return false;
     };
-    history.get(&(f.series, f.t)).is_some_and(|ks| {
-        ks.iter()
-            .any(|k| k.position < f.position && k.changed_at.is_some_and(|kc| kc > c))
-    })
+    // While restoring, facts at or before the checkpoint's position may not
+    // be local; for a fact after it, its version index stands for them.
+    let before_checkpoint = checkpoint.is_some_and(|(p, versions)| {
+        f.position > *p && versions.get(&(f.series, f.t)).is_some_and(|top| *top > c)
+    });
+    before_checkpoint
+        || history.get(&(f.series, f.t)).is_some_and(|ks| {
+            ks.iter()
+                .any(|k| k.position < f.position && k.changed_at.is_some_and(|kc| kc > c))
+        })
 }
 
 /// The version index (§2.4): the highest recorded `changed_at` of every key
@@ -1662,6 +1696,7 @@ impl Model {
             newest_t: d.newest_t,
             history: d.history,
             versions: d.versions,
+            cp_versions: d.cp_versions,
             trees: d.trees,
             queue: VecDeque::new(),
             next_position,
@@ -1735,6 +1770,25 @@ impl Model {
             let n = newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
         }
+        // While restoring, the checkpoint's revised-key index, so a replay of
+        // an earlier value of a revised key is dropped before the current
+        // chunks are back (§8 Restore step 2).
+        if let Some(cp) = cp {
+            for (key, entries) in &cp.revised {
+                let known = history.entry(*key).or_default();
+                for e in entries {
+                    if !known.iter().any(|k| k.position == e.position) {
+                        known.push(Known {
+                            position: e.position,
+                            value: e.value.clone(),
+                            quality: e.quality,
+                            changed_at: e.changed_at,
+                        });
+                    }
+                }
+            }
+        }
+        let cp_versions = cp.map(|c| (c.position, c.versions.clone()));
         let (trees, restore) = match restoring {
             None => (build_trees(&registry, &current), None),
             Some(r) => {
@@ -1745,10 +1799,10 @@ impl Model {
                     let revised = self.revised_keys(r);
                     for f in self.listed_facts(r) {
                         if revised.contains(&(f.series, f.t)) {
-                            history
-                                .entry((f.series, f.t))
-                                .or_default()
-                                .push(Known::of(&f));
+                            let known = history.entry((f.series, f.t)).or_default();
+                            if !known.iter().any(|k| k.position == f.position) {
+                                known.push(Known::of(&f));
+                            }
                         }
                     }
                 }
@@ -1763,6 +1817,7 @@ impl Model {
             newest_t,
             history,
             versions,
+            cp_versions,
             trees,
             restore,
         }
@@ -1780,6 +1835,7 @@ impl Model {
             v.newest_t = d.newest_t;
             v.history = d.history;
             v.versions = d.versions;
+            v.cp_versions = d.cp_versions;
             v.trees = d.trees;
             v.restore = d.restore;
         }
@@ -2479,9 +2535,11 @@ impl Model {
         }
         if let Some(id) = self.disk.active.take() {
             let wall = self.wall;
+            let now = self.now;
             let f = self.disk.files.get_mut(&id).expect("segment");
             f.sealed = true;
-            f.sealed_at = Some(wall);
+            // On the engine clock `now`, as the retention class (§8).
+            f.sealed_at = Some(now);
             let hash = self.disk.files[&id].hash();
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
@@ -2797,7 +2855,9 @@ impl Model {
                     .entries
                     .values()
                     .filter_map(Entry::fact)
-                    .rfind(|x| x.series == s && !outranked_at_commit(&v.history, x))
+                    .rfind(|x| {
+                        x.series == s && !outranked_at_commit(&v.history, v.cp_versions.as_ref(), x)
+                    })
                     .map(|x| (self.wall - x.received_at).max(0));
             }
             Condition::Threshold { .. } | Condition::OnChange { .. } => {}
@@ -3094,7 +3154,7 @@ impl Model {
                     c.queue.push_back(Envelope {
                         position: *p,
                         replayed: true,
-                        outranked: outranked_at_commit(&v.history, f),
+                        outranked: outranked_at_commit(&v.history, v.cp_versions.as_ref(), f),
                         kind: DeliveryKind::Fact(f.clone()),
                     });
                 }
@@ -3496,9 +3556,11 @@ impl Model {
     /// the same entries go to revision chunks, every other fact to current
     /// chunks, one of each per series; facts set aside beyond a restored
     /// end take no part in the ranking and go to current chunks; other
-    /// entries (registry and routing) go to one chunk of their own. Returns
-    /// the new files, unpublished.
-    fn write_chunks(&mut self, entries: Vec<Entry>) -> Vec<FileId> {
+    /// entries (registry and routing) go to one chunk of their own. Each
+    /// output keeps `sealed_at`, the seal time of its oldest input, so its age
+    /// (§8 Eviction at 90 days) is not reset by being rewritten. Returns the
+    /// new files, unpublished.
+    fn write_chunks(&mut self, entries: Vec<Entry>, sealed_at: Option<Nanos>) -> Vec<FileId> {
         let mut best: BTreeMap<(SeriesId, Nanos), (u64, Position)> = BTreeMap::new();
         for f in entries.iter().filter_map(Entry::fact) {
             if !self.set_aside(f.position) {
@@ -3535,13 +3597,21 @@ impl Model {
                     batches: vec![entries],
                     sealed: true,
                     opened_at: self.wall,
-                    sealed_at: Some(self.wall),
+                    sealed_at: sealed_at.or(Some(self.now)),
                 },
             );
             self.disk.hot.insert(id);
             outputs.push(id);
         }
         outputs
+    }
+
+    /// The earliest seal time among `files`.
+    fn oldest_seal(&self, files: &[FileId]) -> Option<Nanos> {
+        files
+            .iter()
+            .filter_map(|f| self.disk.files[f].sealed_at)
+            .min()
     }
 
     /// Verifies compaction outputs against their inputs: the same entries,
@@ -3594,7 +3664,8 @@ impl Model {
             .filter(|e| !covered.contains(&e.position))
             .cloned()
             .collect();
-        let outputs = self.write_chunks(entries.clone());
+        let oldest = self.oldest_seal(&inputs);
+        let outputs = self.write_chunks(entries.clone(), oldest);
         if crash == Some(CompactionCrash::AfterWrite) {
             self.crash();
             return Err(Error::Crashed);
@@ -3667,7 +3738,8 @@ impl Model {
                 .flat_map(|f| self.disk.files[f].entries())
                 .cloned()
                 .collect();
-            let outputs = self.write_chunks(entries.clone());
+            let oldest = self.oldest_seal(&inputs);
+            let outputs = self.write_chunks(entries.clone(), oldest);
             if crash == Some(CompactionCrash::AfterWrite) {
                 self.crash();
                 return Err(Error::Crashed);
@@ -3932,7 +4004,7 @@ impl Model {
                 continue;
             }
             let file = &self.disk.files[&f];
-            let age = |limit: Nanos| file.sealed_at.is_some_and(|s| self.wall - s >= limit);
+            let age = |limit: Nanos| file.sealed_at.is_some_and(|s| self.now - s >= limit);
             // Retention class (§8): a diagnostic series' raw detail whose span
             // ends more than its retention period before `now`.
             let span = self.chunk_span(f);
@@ -4071,6 +4143,23 @@ impl Model {
             registry: v.registry.clone(),
             latest_t: v.newest_t.clone(),
             versions: v.versions.clone(),
+            revised: v
+                .history
+                .iter()
+                .filter(|(_, ks)| ks.len() > 1)
+                .map(|(key, ks)| {
+                    let entries = ks
+                        .iter()
+                        .map(|k| IndexEntry {
+                            position: k.position,
+                            value: k.value.clone(),
+                            quality: k.quality,
+                            changed_at: k.changed_at,
+                        })
+                        .collect();
+                    (*key, entries)
+                })
+                .collect(),
             trees: v.trees.iter().map(|(s, t)| (*s, t.nodes_only())).collect(),
         };
         self.disk.checkpoints.push(cp);

@@ -1281,6 +1281,87 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// 15 and 19, and row 2a, across a restore (§8 Restore step 2): history
+    /// on a gauge and a versioned gauge before a tree checkpoint, versioned
+    /// revisions after it (each with the next `changed_at` of its key), then
+    /// a restore that has brought back only some files. Re-submitting
+    /// recorded readings is either dropped or recorded and counted
+    /// `duplicates_unchecked`, never silently recorded; a replay of an
+    /// earlier value of a key revised before the checkpoint is dropped (the
+    /// checkpoint carries the revised-key index); and once the restore ends,
+    /// no current fact's value, adapter-supplied quality or `changed_at` has
+    /// changed.
+    #[test]
+    fn inv19_resubmission_across_a_restore(
+        before in proptest::collection::vec((any::<bool>(), 0usize..3, 0usize..DUP_VALUES.len(), 0usize..DUP_QUALITIES.len()), 1..20),
+        after in proptest::collection::vec((0usize..3, 0usize..DUP_VALUES.len()), 0..6),
+        replays in proptest::collection::vec(any::<proptest::sample::Index>(), 1..10),
+        steps in 0usize..4,
+    ) {
+        use kvik_model::engine::{Config, Model};
+        use kvik_model::registry::{ChangedAtKind, SeriesOptions};
+        use kvik_model::types::{HOUR, Kind, Reading, ValueType};
+        let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
+        let s = m.define(NAMES[0], Kind::Gauge, ValueType::Number, "1", 5 * SECOND).unwrap();
+        let v = m
+            .define_with(NAMES[VERSIONED], Kind::Gauge, ValueType::Number, "1", 5 * SECOND,
+                SeriesOptions::versioned(ChangedAtKind::Version))
+            .unwrap();
+        let next = |m: &Model, t: Nanos| durable(m).values().filter(|f| f.series == v && f.t == t)
+            .filter_map(|f| f.changed_at).max().map_or(0, |c| c + 1);
+        for (versioned, key, value, quality) in &before {
+            let t = DUP_KEYS[*key];
+            let r = if *versioned {
+                Reading::versioned(v, t, DUP_VALUES[*value], next(&m, t))
+            } else {
+                Reading::num(s, t, DUP_VALUES[*value])
+            };
+            m.ingest(vec![Reading { quality: DUP_QUALITIES[*quality], ..r }]).unwrap();
+        }
+        m.seal_active();
+        m.compact(None).unwrap();
+        m.checkpoint().unwrap();
+        for (key, value) in &after {
+            let t = DUP_KEYS[*key];
+            m.ingest(vec![Reading::versioned(v, t, DUP_VALUES[*value], next(&m, t))]).unwrap();
+        }
+        m.seal_active();
+        prop_assert_eq!(m.upload_checkpoints(), 1);
+        let identity = |m: &Model| -> BTreeMap<_, _> {
+            m.current().unwrap().iter()
+                .map(|(k, f)| (*k, (format!("{:?}", f.value), f.supplied_quality, f.changed_at)))
+                .collect()
+        };
+        let want = identity(&m);
+        let recorded: Vec<_> = durable(&m).into_values().collect();
+        let revised: BTreeSet<_> = {
+            let mut seen = BTreeSet::new();
+            recorded.iter().filter(|f| f.series == s).filter(|f| !seen.insert((f.series, f.t)))
+                .map(|f| (f.series, f.t)).collect()
+        };
+        let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+        for _ in 0..steps {
+            r.restore_step().unwrap();
+        }
+        for i in &replays {
+            let f = i.get(&recorded);
+            let unchecked = r.counters.duplicates_unchecked;
+            let value = f.value.as_f64().unwrap_or(f64::NAN);
+            let c = r.ingest(vec![Reading { quality: f.supplied_quality, changed_at: f.changed_at, ..Reading::num(f.series, f.t, value) }]).unwrap();
+            let counted = r.counters.duplicates_unchecked - unchecked;
+            prop_assert!(c.duplicates == 1 || (c.positions.len() == 1 && counted == 1), "replay of {:?}", f);
+            if revised.contains(&(f.series, f.t)) {
+                prop_assert_eq!(c.duplicates, 1, "row 2a: replay of a revised key {:?}", f);
+            }
+        }
+        r.restore_rest().unwrap();
+        prop_assert_eq!(identity(&r), want);
+    }
+}
+
 /// Guards the duplicate machine: its histories must reach identical repeats,
 /// `revise`, repeats whose current fact is off every local tier and
 /// outranked facts.

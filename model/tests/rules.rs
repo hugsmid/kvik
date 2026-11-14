@@ -2818,3 +2818,106 @@ fn s8_fill_pressure_moves_log_segments_before_current_detail() {
             .any(|f| m.disk.files[f].entries().all(|e| e.fact().is_none()))
     );
 }
+
+// ----- indexes, flags and ages across a restore and a merge -----
+
+/// §8 Continuous backup: "Each tree checkpoint carries the registry file,
+/// each series' latest recorded `t`, the revised-key index and the version
+/// index, as of its position." §8 Restore step 2: facts "which match no local
+/// fact and no entry of the revised-key index are recorded and counted
+/// `duplicates_unchecked`". A replay of an earlier value of a key revised
+/// before the checkpoint is dropped before any chunk is back (row 2a).
+#[test]
+fn s8_checkpoint_carries_the_revised_key_index() {
+    let (mut m, s, cp) = checkpointed_model();
+    let key = (s, T0 + 20 * SECOND);
+    assert_eq!(m.disk.bucket.checkpoints[&cp].revised[&key].len(), 2);
+    assert!(
+        !m.disk.bucket.checkpoints[&cp]
+            .revised
+            .contains_key(&(s, T0))
+    );
+    let mut r = restore_in_progress(&mut m, &BTreeMap::new());
+    let p = r.ingest(vec![Reading::num(s, key.1, 1.0)]).unwrap();
+    assert_eq!((p.positions.len(), p.duplicates), (0, 1));
+    assert_eq!(r.counters.duplicates_unchecked, 0);
+    // A key with one fact at the checkpoint, not yet local: unchecked.
+    let p = r.ingest(vec![Reading::num(s, T0, 0.0)]).unwrap();
+    assert_eq!((p.positions.len(), r.counters.duplicates_unchecked), (1, 1));
+    r.crash();
+    r.restart();
+    let p = r.ingest(vec![Reading::num(s, key.1, 1.0)]).unwrap();
+    assert_eq!(p.duplicates, 1, "also after a restart");
+    r.restore_rest().unwrap();
+    assert_eq!(r.current().unwrap()[&key].value, n(100.0));
+}
+
+/// §4 Outranked facts: a fact outranked at commit is delivered flagged
+/// `outranked`; the flag is a function of the log, so its replay in catch-up
+/// during a restore carries it although the fact that outranks it is still in
+/// the bucket (§2.4 Version index, §8 Restore step 2).
+#[test]
+fn s4_outranked_flag_in_catch_up_during_a_restore() {
+    let (mut m, s) = versioned_model();
+    let a = m
+        .ingest(vec![Reading::versioned(s, T0, 1.0, 5)])
+        .unwrap()
+        .positions[0];
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.checkpoint().unwrap();
+    let b = m
+        .ingest(vec![Reading::versioned(s, T0, 2.0, 4)])
+        .unwrap()
+        .positions[0];
+    m.seal_active();
+    assert_eq!(m.upload_checkpoints(), 1);
+    m.drain().unwrap();
+    assert!(
+        m.received[&C]
+            .iter()
+            .any(|r| r.delivery.position == b && r.delivery.outranked)
+    );
+    let cursors: BTreeMap<ConsumerId, Position> = [(C, a)].into_iter().collect();
+    let mut r = restore_in_progress(&mut m, &cursors);
+    assert!(r.restoring());
+    r.drain().unwrap();
+    let replayed: Vec<&Envelope> = r.received[&C]
+        .iter()
+        .map(|x| &x.delivery)
+        .filter(|d| d.position == b && d.fact().is_some())
+        .collect();
+    assert_eq!(replayed.len(), 1);
+    assert!(replayed[0].replayed && replayed[0].outranked);
+}
+
+/// §8 Eviction at 90 days: a revision chunk's age is not reset when a merge
+/// of compacted files (§7) rewrites it; it keeps the seal time of its oldest
+/// input.
+#[test]
+fn s8_merge_keeps_the_age_of_its_oldest_input() {
+    let (mut m, s) = model(10 * SECOND);
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.seal_active();
+    m.compact(None).unwrap();
+    m.advance(60 * DAY);
+    for i in 0..4 {
+        m.ingest(vec![Reading::num(s, T0 + i * SECOND, 10.0 + i as f64)])
+            .unwrap();
+        m.seal_active();
+        m.compact(None).unwrap();
+    }
+    let out = m.merge_chunks(None).unwrap();
+    let revision = *out
+        .iter()
+        .find(|f| m.disk.files[*f].class == FileClass::Revision)
+        .unwrap();
+    m.upload();
+    m.advance(29 * DAY);
+    assert!(!m.housekeeping().unwrap().contains(&revision));
+    m.advance(DAY);
+    assert!(
+        m.housekeeping().unwrap().contains(&revision),
+        "90 days after its oldest input"
+    );
+}

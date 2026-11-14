@@ -1233,17 +1233,27 @@ fn row_26_reader_holds_an_old_epoch() {
     m.advance(HOUR);
     m.housekeeping().unwrap();
     assert!(inputs.iter().all(|f| !m.disk.hot.contains(f)));
-    // A lease of another boot is void at once.
-    let (mut m, inputs) = crowded_model();
-    let reader = m.lease_reader();
-    m.merge_chunks(None).unwrap();
-    m.upload();
-    m.power_loss();
-    m.restart();
-    m.advance(HOUR);
-    let _ = reader;
-    m.housekeeping().unwrap();
-    assert!(inputs.iter().all(|f| !m.disk.hot.contains(f)));
+    // A lease of another boot is void at once: with leases expiring only
+    // after three hours, the inputs stay an hour after the merge on the same
+    // boot, and leave after a reboot.
+    for reboot in [false, true] {
+        let (mut m, inputs) = crowded_model();
+        m.config.lease_expiry = 3 * HOUR;
+        let reader = m.lease_reader();
+        m.merge_chunks(None).unwrap();
+        m.upload();
+        if reboot {
+            m.power_loss();
+        } else {
+            m.crash();
+        }
+        m.restart();
+        m.advance(HOUR);
+        m.housekeeping().unwrap();
+        assert_eq!(inputs.iter().all(|f| !m.disk.hot.contains(f)), reboot);
+        assert_eq!(m.live_lease_epochs().is_empty(), reboot);
+        m.close_reader(&reader);
+    }
     // A reader that takes the latest epoch no longer holds the inputs.
     let (mut m, inputs) = crowded_model();
     let reader = m.lease_reader();

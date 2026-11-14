@@ -434,13 +434,13 @@ pressure moves the detail holding both off every local tier. An adapter replays 
 for a key is on no local tier the fact is recorded and counted `duplicates_unchecked`, and that such a repeat "can
 revert a correction that differs in value"; so A is recorded and becomes current. But the revised-key index, which
 is hot and never moves, holds A's value and quality, so the check could run and drop A; and §8 Restore step 2 drops a
-fact that matches an entry of the index, so the same replay is dropped during a restore once the index is back.
+fact that matches an entry of the index, so the same replay is dropped during a restore, from the checkpoint's index.
 (b) The versioned twin: A (`changed_at` 1), B (2), both off every local tier; a replay of A matches "a fact off every
 local tier" by `changed_at`, so §2.4 records it unchecked, although the index holds it. Row 2c allows both outcomes.
 **Model.** Outside a restore it follows §2.4 as written: (a) records A unchecked and A becomes current; (b) records A
-unchecked, outranked, and B stays current. During a restore with the index back, the replay is dropped
+unchecked, outranked, and B stays current. During a restore the replay is dropped
 (`q72_replay_off_the_machine_recorded_unchecked_although_the_index_holds_it`,
-`q39_revised_key_index_back_with_current_chunks`).
+`tests/rules.rs` `s8_checkpoint_carries_the_revised_key_index`).
 **Needed.** Whether the check compares with the revised-key index whenever it holds the key, so that "on no local
 tier" applies only to a key with a single fact, or whether the unchecked rule applies whatever the index holds.
 
@@ -572,8 +572,9 @@ The model implements the summary semantics (§5, §6), the duplicate rule with `
 adapter-supplied quality; a fact whose key's current fact is on no local tier, hot or cold, is recorded and counted
 `duplicates_unchecked`; invariant 15, rows 2, 2a and 2b), versioned series (§2.1–§2.4: `changed_at` required on
 every reading of a versioned series and refused on any other, `revise` refused there, rank `(changed_at, position)`
-in every view, identity including `changed_at`, the version index, carried by each tree checkpoint and exact while a
-restore brings detail back; §4: an outranked fact delivered flagged `outranked`, live and in catch-up (where catch-up judges it from the local
+in every view, identity including `changed_at`, the version index and the revised-key index, carried by each tree
+checkpoint, so that during a restore ranks are exact and a replay of an earlier value of a key revised by the
+checkpoint is dropped before the current chunks are back; §4: an outranked fact delivered flagged `outranked`, live and in catch-up (where catch-up judges it from the local
 history, so while a restore's detail is not yet local a replayed fact can miss the flag), counted, and
 never fed to a condition or refreshing stale-for; §5.6: it changes no node; invariants 4, 15 and 19, rows 2c, 2d and
 37), compaction and files (§7: per-series current and revision chunks, ranked within the compaction's inputs, and a
@@ -646,9 +647,9 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Calendar results as windows | §5.7: a result is a window evaluation, also in a named zone; no stored node for a span off 15-minute boundaries or without a stored 15-minute level; rows 20a and 21a | Day node is the merge of quarter-hours; unaligned days refused | `day_node_omits_edge_stretches`, `unaligned_days_are_refused` |
 | Rate | §6: increase ÷ elapsed time; flagged when a step spans more than S; empty with no step | Increase ÷ covered seconds | `rate_divides_by_covered_seconds` |
 | Compaction of compacted files | §7 Policy: merge when a series' chunks overlapping any 15-minute span exceed 4 | Counts and merges the live current chunks of a series on the fast disk only; revision chunks are never merged | `tests/rules.rs` `s7_merge_publishes_outputs_and_retires_inputs_in_one_record` |
+| Clock of the eviction age | §8 Eviction at 90 days: no clock named | The engine clock `now`, as for the retention class, from the seal of a log segment, or of a compacted file's oldest input, so a merge does not reset it | `tests/rules.rs` `s8_merge_keeps_the_age_of_its_oldest_input` |
 | Verification of compaction outputs | §7 Procedure: fact count, per-series checksum of facts, each chunk's summary equals the summary recomputed from its input facts | The outputs hold exactly the input entries; chunks carry no summary | — |
 | A restore without the log segments after its checkpoint | §8 Restore step 1 | Where no backed-up log segment holds a position after the checkpoint, step 1 takes the first file in download order that holds it | — |
-| Revised-key index, recent window | §2.4, §5.1, §8 (each tree checkpoint carries the revised-key and version indexes) | A full in-memory history, which tree checkpoints do not carry (they carry the version index); outside a restore the index is not consulted when the current fact is off the machine (Q-72); during a restore, the history of local facts, plus every value of each key with more than one restored fact once the current chunks are back (§8 Restore step 2) | `tests/open_questions.rs` `q39_revised_key_index_back_with_current_chunks` |
 | Series timing: scheduled and forecast series, credit limit | §2.1, §2.2, §2.3, §4, §5.4, §6, invariants 18, 20 and 21 | Timing is recorded with the definition, and a forecast series must be versioned with `changed_at` kind `time`; otherwise every series is treated as observed (`future` and `late` flags, live state, staleness, delivery, cadence and the credit limit `now`) | — |
 | Interval series | §2.1, §2.2, §5.2, §6, invariant 22 | Not modelled; readings are instants | — |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
