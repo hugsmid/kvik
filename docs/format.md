@@ -28,8 +28,9 @@ writes it.
   critical, `≥ 0x80` ignorable; a field id `< 0x8000` critical, `≥ 0x8000` ignorable; a fact flag bit not defined in
   A.5 is critical; manifest record types follow block types. An addition that changes the meaning of existing data
   takes a critical id; `changed_at`, versioning, timing and every v1 id are critical.
-- **An unknown critical element in a checksum-valid block** is a version refusal (`UnsupportedFormat`, naming the
-  file, the offset and the element). It is never an invalid region, a torn tail or a lost range, and recovery never
+- **An unknown critical element in a checksum-valid block reached from a valid position, or in a batch that is
+  otherwise complete at a resynchronisation candidate (A.2),** is a version refusal (`UnsupportedFormat`, naming the
+  file, the offset and the element); a block image at any other candidate is not a block. It is never an invalid region, a torn tail or a lost range, and recovery never
   truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
@@ -62,8 +63,9 @@ writes it.
 
 The body follows immediately and is padded with zeros to the next multiple of 8. The next block starts there.
 
-**Reading blocks.** At a block boundary, sixteen zero bytes are *end of data* for a reader; recovery scans an
-unsealed segment to its end regardless (`spec.md` §3). A block is **valid** when its header checksum matches,
+**Reading blocks.** Sixteen zero bytes at a block boundary are *end of data* only if every byte from there to the
+reader's limit (the mark's offset, the seal blocks, or the end of the file) is zero; otherwise they start an invalid
+region. Recovery scans an unsealed segment to its end regardless (`spec.md` §3). A block is **valid** when its header checksum matches,
 `body_len` fits in the file, the body checksum matches, its type is known and its body passes the checks of its type
 (A.5, A.6). A checksum-valid block of unknown type is skipped if `skippable`, else refused (common rules). Anything
 else starts an **invalid region**. Outside a log segment, an invalid region ends the readable part of the file
@@ -290,12 +292,12 @@ field out of order or repeated when not marked repeated; a value outside its ran
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 4 | `generation` | equals the file header's |
-| 4 | 4 | `block_count` | data blocks in this batch |
+| 4 | 4 | `block_count` | blocks in this batch before the commit block, of known type or not |
 | 8 | 8 | `first_sequence` | the first data block's |
 | 16 | 8 | `last_sequence` | inclusive; the last counted |
 | 24 | 8 | `commit_time` | non-decreasing within a generation by construction; a reader does not test it |
 | 32 | 8 | `batch_bytes` | from the first byte of the batch's first block header up to, not including, this block's header, padding included; so this header is at `o + batch_bytes`, where `o` is the batch's offset |
-| 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then the 16-byte headers of the batch's data blocks, in order |
+| 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then the 16-byte headers of every block before the commit block, in order |
 | 44 | 4 | reserved | |
 
 A batch is **complete** when every data block is valid, the commit block is valid, `block_count` and `batch_bytes`
@@ -305,8 +307,13 @@ file header's, every data block has the same `received_at`, and its first sequen
 batch's last, or the end of a lost range between them after an invalid region (`spec.md` §3 Recovery rule 2),
 except that a batch holding a recovery entry may start higher; its `after` is the previous batch's last sequence or
 the end of a lost range at the tail, and it may follow an invalid region at the tail. A disagreement with valid
-checksums is an invalid region. The first batch of a file starts at `base_sequence`. Readers use only complete
-batches.
+checksums is an invalid region. Readers use only complete batches.
+
+`block_count`, `batch_bytes` and `batch_crc32c` cover every block before the commit block, of known type or not; a
+skipped block (A.2) takes no sequence and carries no `received_at`, and a batch of skipped blocks alone takes no
+sequence and is not complete. Before the seal blocks, every block of a log segment belongs to a batch. The first
+batch of a file starts at or above `base_sequence`; that it starts higher only after an invalid region or with a
+recovery entry is checked by the writer's recovery (`spec.md` §3), not by a reader.
 
 ### A.8 Segment index body (written at seal)
 `series_count: u32`, `record_size: u16` (24 in v1), `flags: u16` (bit 0 `has_entries`: the segment holds at least
@@ -433,8 +440,8 @@ exists; a new file is created only when none exists.
 - **`file_id`** is unique per store and kind across all generations and never reused. The next id of a kind is 1 +
   the highest id among local file names of that kind, ids named by any manifest record (a restore record lists every
   file it restores from, local or not), any rebuild record's floor of that kind (A.14) and, for log segments, the
-  mark's `file_id`. `<generation>` in a name is the
-  generation in which the file was created.
+  mark's `file_id`. `<generation>` in a name is the generation in which the file was created. A valid header whose
+  `file_id` or generation differs from the file name is refused, never scanned or deleted.
 - **Lock.** `std::fs::File::try_lock` on `LOCK` (`flock` on Unix, `LockFileEx` on Windows), held for the life of the
   writer and released when the process ends. A second writer, in this or another process, fails with `Locked`.
   `LOCK` stays empty. Readers never take it. Network file systems are not supported. That a second open in the same

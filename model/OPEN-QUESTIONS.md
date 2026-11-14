@@ -26,7 +26,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
-| Q-105 | `format.md` A.2, A.4, A.7, A.12 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name |
 | Q-108 | §8 Generations, §7 Manifest, §8 Restore step 1 | A restore from a rebuilt manifest only partly uploaded |
 | Q-106 | `format.md` A.4, A.5, A.6 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, parameter change ranges |
 
@@ -399,43 +398,6 @@ its closing record is in the bucket (records are uploaded in order, so it is the
 reads the records before its rebuild record, as if the rebuild had not happened, and the uploaded part of the
 rebuilt manifest is not read. To be settled with roadmap 8.3 (restore).
 
-## Q-105 — Reading a segment: points `format.md` Part A leaves open
-Found while building the segment reader (roadmap 4.2, crate `kvik-log`). Each part names the reading implemented for
-now; tests in `log/tests/segment.rs` pin it.
-**Scenario.** (a) *Zeros below the mark.* A.2 says sixteen zero bytes at a block boundary are the end of data for a
-reader. A.4's accepted limit leaves a zeroed hole with kept batches after it (a power loss during a zero-fill); the
-next recovery keeps those batches, records the hole as a lost range and moves the mark past them. A reader process
-that stops at the hole never reads the kept batches below the mark. (b) *An unknown skippable block inside a batch.*
-A.7 counts "data blocks" in `block_count` and hashes "the headers of the batch's data blocks"; whether a skipped
-block of unknown type (A.2) between a batch's data blocks is one of them is not said, nor whether it takes sequences;
-nor whether a skippable block may stand between batches, outside any batch. (c) *A refusal while resynchronising.*
-The common rules make an unknown critical element in any checksum-valid block a version refusal. While stepping
-through an invalid region (A.2), a checksum-valid block image can appear inside a text value or other bytes that are
-not a block; read literally, a crafted value in a damaged region makes the whole segment unreadable, although such an
-image is never accepted as a batch. (d) *The first batch against `base_sequence`.* A.7: "the first batch of a file
-starts at `base_sequence`"; but A.4 lets a recovery batch be the first batch of a segment and rewrites the header
-with F only afterwards, so a crash between the two leaves a first batch above `base_sequence`; A.4 Gaps lets a reader
-accept any gap. (e) *A header that disagrees with its name.* Batches are checked against the file id and generation
-from the file name (needed when the header is invalid, A.4); a valid header naming another file id or generation is
-not covered.
-**Implemented.** (a) Zeros at a block boundary are the end of data only if every byte up to the limit is zero; below
-the mark (and before the seal blocks of a sealed segment) they start an invalid region, and resynchronisation
-continues, as recovery's scan does. (b) Every block before the commit block is counted in `block_count`,
-`batch_bytes` and `batch_crc32c`; a skipped block takes no sequence (a block that took sequences could not be skipped
-without losing entries) and has no `received_at` to compare; a batch takes at least one sequence, so one of skipped
-blocks alone is not complete. A skippable block between batches, with no commit block of its own, is taken as the
-start of the next batch; that batch's `block_count` and `batch_crc32c` then fail, the block is reported as an invalid
-region (corruption) and resynchronisation finds the batch after it. (c) At a block boundary reached from a valid
-position the refusal is immediate, as written; at a candidate offset while resynchronising it applies only if the
-rest of the batch checks out (its commit block, `block_count`, `batch_bytes`, generation and `batch_crc32c`), and
-otherwise the offset is not a batch. (d) A segment's `base_sequence` acts as the last kept sequence + 1: the first
-batch may start at or above it, never below. (e) Refused (`FormatError::HeaderMismatch`); the file is not read.
-**Note.** A reader accepts a batch whose first sequence is above the last kept sequence by any amount (A.4 Gaps). That
-a batch may start higher only after an invalid region or with a recovery entry (A.7) is checked by the writer's
-recovery, roadmap 4.5, not by the reader.
-**Needed.** Confirmation of, or a rule for, each part; for (a), whether A.2's end-of-data sentence applies to a
-reader below the mark at all. To be settled by roadmap 4.5 (recovery), (a) and (c) with 4.6 (second-process reader).
-
 ## Q-106 — Decoding batch bodies: points `format.md` A.5 and A.6 leave open
 Found while building the batch codecs (roadmap 4.3, crate `kvik-log`: `facts`, `entries`, `content`). Each part names
 the reading implemented for now; tests in `log/tests/batches.rs` pin it.
@@ -501,7 +463,6 @@ Q-87 was reopened there. Q-87, Q-100 to Q-104 and Q-107 were settled after gate 
 | Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
-| Q-105 | 4.5 | Segment reader; (a) and (c) with 4.6; recorded at roadmap 4.2 |
 | Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
 | Q-106 | 4.9 | Batch codecs; (g) with 5.1 (Q-100), (f) with 5.2; recorded at roadmap 4.3 |
 
@@ -703,6 +664,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-102 | A finite value too large for `i64` at the series' scale | §2.5 (out of range, `i64::MIN` units included: recorded as quality bad with no value whatever the policy, counted `out_of_range`, and reported in the reading's outcome while the call succeeds; `auto-raise` never raises for it), §2.1 `excess precision`, §2.4 (compares as "no value"), row 31, §11 Ingest, `api.md` Core types, Writing (`Outcome::Recorded.out_of_range`) and `series_stats` (`out_of_range`). Model property test (values across the `i64` boundary at every scale 0 to 18: none panics, each recorded exactly or out of range) and a unit test (`auto-raise` does not move the scale for 1e300) wait for decimal values in the model (before roadmap 5.1) |
 | Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (the wait and acknowledgement: Q-107, settled)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 ((g) the `file_id` floor) and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
 | Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
+| Q-105 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name | `format.md` A.2 ((a) sixteen zero bytes at a block boundary are end of data only if every byte to the reader's limit is zero, else they start an invalid region), A.7 ((b) `block_count`, `batch_bytes` and `batch_crc32c` cover every block before the commit block; a skipped block takes no sequence and carries no `received_at`; a batch of skipped blocks alone is not complete; every block before the seal blocks belongs to a batch; (d) the first batch starts at or above `base_sequence`, higher only after an invalid region or with a recovery entry, checked by recovery at roadmap 4.5), common rules ((c) a version refusal only from a valid position or in an otherwise complete batch at a resynchronisation candidate; any other block image is not a block), A.12 ((e) a header disagreeing with its name is refused, never scanned or deleted). As implemented in `kvik-log`; `log/tests/segment.rs` pins each part |
 | Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
 
 ## Where the model differs from the specification

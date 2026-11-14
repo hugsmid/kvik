@@ -80,7 +80,7 @@ pub enum FormatError {
         /// The offset.
         offset: u64,
     },
-    /// A checksum-valid header that disagrees with the file name (see `model/OPEN-QUESTIONS.md`, Q-105 (e)).
+    /// A checksum-valid header that disagrees with the file name: refused (`docs/format.md` A.12).
     #[error("header field {field} is {in_header}, the file name gives {expected}")]
     HeaderMismatch {
         /// The field.
