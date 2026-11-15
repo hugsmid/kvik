@@ -32,7 +32,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
-| Q-150 | `format.md` common rules (canonical writing), A.3 (golden files); `format-chunk.md` C.8–C.10 | Canonical bytes of the zstd-compressed XOR fallback |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 
 ## Q-16 — Which commits refresh live staleness
@@ -617,7 +616,7 @@ choice between XOR and compressed XOR (C.9) compares lengths, so another zstd ca
 then reports writer output of the older build as not canonical. (c) A golden file holding a compressed payload breaks
 on a zstd upgrade although the format did not change. (d) Compared by the stream it decompresses to, a payload may
 carry further skippable or concatenated zstd frames, extra bytes that a canonical check then does not see.
-**Implemented for now.** An encoding 5 payload is canonical when its frames decompress to exactly its declared length
+**Implemented first.** An encoding 5 payload was canonical when its frames decompress to exactly its declared length
 and that stream is the canonical XOR stream; `Block::decode_canonical` compares it by the stream, not by its bytes,
 when both bodies use encoding 5; (b) is not covered. The golden file `xor-zstd.blk` is checked by what it decodes to
 (`chunk/tests/golden.rs`). zstd 1.5.7 at level 3, through the `zstd` crate 0.14, is pinned by `Cargo.lock`.
@@ -625,7 +624,15 @@ when both bodies use encoding 5; (b) is not covered. The golden file `xor-zstd.b
 (b) for files written before it; (2) proposed: make encodings 4 and 5 one canonical class, so that a canonical check
 accepts either for the canonical XOR stream and only a writer compares lengths; (3) replace zstd by a compressor
 specified in `format-chunk.md`; or (4) drop the compressed fallback (the °F→°C shape of roadmap 2.1 grows from 0.87
-to 1.84 bytes per row). To be settled by gate 6.5.
+to 1.84 bytes per row).
+**Settled at the review of roadmap 6.1** by option (2). The format constrains only decoding, which RFC 8878 fixes, so
+no compression level or library version is pinned: encodings 4 and 5 form one canonical class, canonical when the
+stream they hold is the canonical XOR stream and the payload is shorter than every other candidate; only a writer
+compares the two lengths ((a)–(c)). An encoding 5 payload is exactly one zstd frame with no dictionary and no content
+checksum, ending where the payload ends ((d)), a reader check (`format-chunk.md` C.8, C.10, C.11). Gate 6.5 measures
+a pure-Rust codec on the XOR stream (`ruzstd` or `lz4_flex`): within about 10 % of zstd level 3 on the °F→°C shape,
+it replaces the C library; otherwise zstd stays and CI fails when `ZSTD_SYS_USE_PKG_CONFIG` is set, so that the
+bundled library is always the one built.
 
 ## Q-170 — Durability levels chosen per source
 
@@ -659,7 +666,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 6.1 recorded Q-150.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 6.1 recorded Q-150, settled at its review.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -693,7 +700,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
-| Q-150 | 6.5 | Gate; recorded by roadmap 6.1 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
@@ -910,6 +916,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
 | Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
 | Q-122 | A torn mark update could leave a mark older than the last one synced | `format.md` A.10 Update and Read, `spec.md` §3 Order of a start step 2 (settled by roadmap 4.7: every update between two mark syncs goes to the slot that does not hold the last synced mark, and a start writes the mark file again in place, as read, and syncs it before its own mark write, or, keeping the mark it read, writes that slot again and syncs it before the first update). Scenario: updates alternated between the slots whether or not the last was synced; with a timed mark sync, A held counter c, synced, and B c − 1; c + 1 went to B and c + 2 to A, neither synced, and a power loss that tore the write of c + 2 left A invalid and B at c − 1, older than the mark synced last. Rule 3 kept every complete batch, but the start took its id floor from that mark and the unsealed segments only, so an id defined after c − 1 in a batch then in a sealed segment was above the floor; the low floor was durable, in the recovery entry and in the new mark's highest series id, so ids would have been assigned again once roadmap 5.1 assigns above floors (`log/tests/recovery.rs`, `a_torn_mark_update_never_falls_back_past_the_last_synced_mark`) |
+| Q-150 | Canonical bytes of the zstd-compressed XOR fallback | `format-chunk.md` C.8 and C.10 (settled at the review of roadmap 6.1 by option (2): encodings 4 and 5 are one canonical class, compared by the XOR stream they hold; the payload is exactly one frame, no dictionary, no checksum, no skippable frame; no level or library is pinned; `chunk/src/block/tests.rs` `xor_class_is_one_canonical_class`); roadmap 6.5 measures a pure-Rust codec |
 | Q-121 | Series id 0 against an id floor of 0 | §2.1 `id`, `format.md` A.6 field 46 and A.10 `max_series_id` (settled by roadmap 5.1, which assigns ids: ids start at 1 and 0 names no series, so a highest id assigned or an id floor of 0 means none; the model's registry assigns from 1). Scenario: the model assigned ids from 0, so the mark's `max_series_id` and a recovery entry's id floor were 0 both in a store that had assigned no id and in one whose only series was id 0; read literally, "above every id floor" then forbade id 0 after a power loss in an empty store, and no reader of the floor could tell id 0 from none. Decoders do not refuse id 0, so files written before stay readable (`kvik/tests/durable.rs`, `ids_start_at_one_and_never_reuse_a_floor`) |
 
 ## Where the model differs from the specification

@@ -10,7 +10,8 @@ A chunk holds the facts of one series for one time range, current facts or revis
 most 4,096 rows. This document lays out one block's body. The chunk around it (its header, the A.2 framing of its
 blocks, the directory of first and last `t`, the summary), the index, the per-batch `received_at` table, the trailer
 and the self-description fields are laid out by roadmap 6.2, which may reuse the encodings below for its own
-columns.
+columns. A block is checked on its own; that each stored scale is at most the series' scale in force, and other rules
+that need the series, are checked by roadmap 6.2.
 
 ## C.2 Block body
 | Offset | Size | Field |
@@ -30,7 +31,7 @@ listed below is critical, `≥ 0x80` ignorable (`format.md` common rules). Ids 2
 | 3 | `quality` | `u8` 0–3, one per row | optional; absent means all good | 0, 1 |
 | 4 | `flags` | `u16`, one per row; bits as A.5, 8–15 undefined and critical | optional; absent means all zero | 0, 1 |
 | 5 | `value_type` | `u8` 1–5, one per row | mandatory | 0, 1 |
-| 6 | `value` | a 64-bit value word per row **without** flag bit 5 (`no_value`), in row order | mandatory (empty when no row has a value) | 0–5 |
+| 6 | `value` | a 64-bit value word per row **without** flag bit 5 (`no_value`), in row order | mandatory (empty when no row has a value) | 0–2; 3–5 only when at least one row has a value word and every such row has `value_type = 1` |
 | 7 | text heap | bytes | exactly when a row has `value_type = 5` | 0 |
 | 8 | `changed_at` | `u64` per row **with** flag bit 6, in row order | exactly when such a row exists | 0, 2 |
 | 9 | `scale` | `u8` 0–18 per row **with** `value_type = 2`, in row order | exactly when such a row exists | 0, 1 |
@@ -58,7 +59,8 @@ For values `x[0..n]`, as `i64` (a `u64` column is read through two's complement)
 - nothing if `n = 0`;
 - `x[0]` (8 bytes, little-endian);
 - the differences `d[i] = x[i] − x[i−1]` for `i ≥ 1`, in frames of 128 (the last may be shorter). Per frame: the
-  smallest difference `m` as zigzag-encoded minimal unsigned LEB128 (at most 10 bytes); a bit width `w` (one byte,
+  smallest difference `m`, zigzag-encoded (`(m << 1) XOR (m >> 63)` with an arithmetic shift, so 0, −1, 1, −2 …
+  become 0, 1, 2, 3 …) as minimal unsigned LEB128 (at most 10 bytes); a bit width `w` (one byte,
   0–64); then each `d[i] − m` as a `w`-bit unsigned integer, packed least significant bit first, the first value in
   the lowest bits of the first byte, in `ceil(count × w / 8)` bytes whose padding bits are zero.
 
@@ -94,10 +96,13 @@ each later value the XOR `x` with the one before it:
 The first `10` of a stream follows an `11`, and `l` plus the meaningful length is at most 64.
 
 ## C.8 Encoding 5, XOR compressed
-The length of an encoding 4 stream (`u32`), then that stream compressed as zstd frames (written at level 3, one
-frame). The length is at most `ceil((64 + 77 × (n − 1)) / 8)` for `n ≥ 1` values (0 for none), the longest stream
-encoding 4 can produce, and the frames decompress to exactly that many bytes. Compressed bytes depend on the zstd
-build, so this payload is compared by the stream it decompresses to (Q-150).
+The length of an encoding 4 stream (`u32`, little-endian), then that stream as **exactly one** Zstandard frame
+(RFC 8878 §3.1.1): it starts with the frame magic number, declares no dictionary (dictionary id flag 0) and no
+content checksum (checksum flag 0; the block's own checksum covers it), and ends where the payload ends, so no
+skippable frame and no second frame. The length is at most `ceil((64 + 77 × (n − 1)) / 8)` for `n ≥ 1` values (0 for
+none), the longest stream encoding 4 can produce, and the frame decompresses to exactly that many bytes. The format
+constrains only what a frame decodes to, which RFC 8878 fixes; the compression level and library are a writer's
+choice (this writer: level 3), so compressed bytes are never compared (C.10).
 
 ## C.9 Choice of encodings
 - `t`, `changed_at`, `sequence`: delta when its payload is shorter than plain's, else plain.
@@ -108,32 +113,39 @@ build, so this payload is compared by the stream it decompresses to (Q-150).
   `value_type = 1`:
   - decimal at its best exponent: among the distinct smallest exponents at which the block's values fit (C.6), the
     one giving the shortest decimal payload, the lowest on a tie; no decimal candidate if no value fits any exponent;
-  - XOR and compressed XOR, when there is no decimal candidate or it has more than one exception per eight values.
+  - the **XOR class** (encodings 4 and 5), when there is no decimal candidate or it has more than one exception per
+    eight values: the shorter of XOR and the writer's compressed XOR (XOR on a tie), which wins only when strictly
+    shorter than every other candidate.
 
 ## C.10 Canonical body
 For given rows a v1 writer produces one body (`format.md` common rules, canonical writing): every mandatory column, an
 optional column exactly when its presence rule or a non-default value requires it (`quality` when a row is not good,
 `flags` when a row has a flag), each in the encoding C.9 chooses, in canonical form, in ascending id order, with no
-unknown column. A body read and encoded again gives the same bytes, a compressed XOR payload excepted (C.8).
+unknown column. The XOR class is one canonical class: a value column in encoding 4 or 5 is canonical when the class
+is a candidate (C.9), the stream it holds is the canonical encoding 4 stream of the values, and its payload is
+shorter than every other candidate; which of the two, and which valid frame, is not compared. Any other body read
+and encoded again gives the same bytes.
 
 ## C.11 Checks
 A body that fails one of these is invalid (for a block reached in a valid file, invalid content, `format.md` A.2):
 - `row_count` outside 1 ..= 4,096; a directory that does not fit or has a malformed length; ids not strictly
   ascending; payloads that do not end exactly at the end of the body;
-- a mandatory column missing; an encoding not allowed for its column (an unknown encoding included); a presence
-  rule broken;
+- a mandatory column missing; an encoding not allowed for its column (an unknown encoding included, and encodings
+  3–5 for a value column whose rows are not all `f64` or that holds no value word); a presence rule broken;
 - a payload that does not hold exactly its value count in its encoding: a plain payload of the wrong length; run-length
   form broken (C.4); in delta, a width above 64, a malformed LEB128, a frame cut short, non-zero padding bits or bytes
   left over; in decimal, an exponent above 18, more exceptions than values, exception indexes not strictly ascending
   or not below the count, a scaled integer of magnitude 2^53 or more, or a malformed integer payload; in XOR, a `10`
   before any window, a window wider than 64 bits, a stream cut short, 8 or more bits left over or non-zero padding
-  bits; in compressed XOR, a declared length above the bound of C.8 or frames that do not decompress to exactly it;
+  bits; in compressed XOR, a declared length above the bound of C.8, a payload that is not exactly one frame with
+  no dictionary and no content checksum (a skippable or second frame included), or a frame that does not decompress
+  to exactly the declared length;
 - a value out of range: quality above 3, a value type outside 1–5, a scale above 18, `i64::MIN` in a decimal row, a
   state index above `u16::MAX`, a bool other than 0 or 1, a text longer than 255 bytes or not UTF-8, texts that do not
   fill the heap exactly.
 
 Undefined flag bits (8–15) and an unknown critical column are a version refusal (`UnsupportedFormat`), not invalid
-content; an unknown ignorable column is skipped. A reader applies only these checks; a canonical check (writer
+content; undefined flag bits are refused before any per-row check. An unknown ignorable column is skipped. A reader applies only these checks; a canonical check (writer
 output, golden files, a scrub) also requires the canonical body (C.10). The value count of each column comes from
 `row_count` and the flags and value types, never from a payload, and nothing is allocated from a length in the body
 before it is checked against the body and the row limit.

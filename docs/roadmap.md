@@ -65,11 +65,13 @@ again; nothing after a gate starts before it is passed.
 
 ## 6. Compacted segments
 - [x] 6.1 Value and timestamp encodings with property and fuzz tests (block bodies and column encodings in
-  `docs/format-chunk.md`; sizes in `docs/measurements/6.1-encodings.md`; the compressed fallback's canonical bytes in Q-150)
+  `docs/format-chunk.md`; sizes in `docs/measurements/6.1-encodings.md`; the compressed fallback's canonical class settled in Q-150)
 - [ ] 6.2 Per-series chunks, index, lossless compaction with verification
 - [ ] 6.3 Manifest and atomic publish-and-retire
 - [ ] 6.4 Parquet export and a differential check against it
-- [ ] 6.5 **Gate** — compaction looked at as a whole
+- [ ] 6.5 **Gate** — compaction looked at as a whole (includes: measure a pure-Rust codec, `ruzstd` or `lz4_flex`, on the XOR
+  stream; within about 10 % of zstd level 3 on the °F→°C shape it replaces the C library, otherwise zstd stays and CI
+  fails when `ZSTD_SYS_USE_PKG_CONFIG` is set; Q-150)
 
 ## 7. Summary tree
 - [ ] 7.1 Stored levels, checkpoints, rebuild-equals-live
