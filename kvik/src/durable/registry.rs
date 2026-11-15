@@ -111,6 +111,11 @@ impl Registry {
         self.highest = self.highest.max(id);
     }
 
+    /// Every series, retired or not, in id order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Series> {
+        self.series.values()
+    }
+
     /// A series by id, retired or not.
     pub(crate) fn get(&self, id: u32) -> Option<&Series> {
         self.series.get(&id)

@@ -8,15 +8,20 @@
 //! what is durable. Live state, windows, chart buckets and calendar results are evaluated from the reader's facts
 //! (roadmap 5.4, [`windows`]).
 //!
-//! Not supported yet, with the roadmap item that brings each: consumers and routing (5.2), catch-up and saved
-//! points (5.3), stored summaries (7.x), decimal series, calendar-length interval series and parameter changes
-//! other than the retention class, compaction (6.x), backup and restore (8.x).
+//! Consumers, routing, condition funnels and durable cursors are in [`deliver`] and [`routing`] (roadmap 5.2).
+//!
+//! Not supported yet, with the roadmap item that brings each: starting a consumer at a position or a time and
+//! saved points (5.3), windowed operators in funnels, stored summaries (7.x), decimal series, calendar-length
+//! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore (8.x).
 
 mod clock;
+mod consumers;
+mod deliver;
 mod index;
 mod ingest;
 pub(crate) mod reader;
 mod registry;
+mod routing;
 mod windows;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -180,6 +185,8 @@ pub(crate) struct Writer {
     closed: AtomicBool,
     /// The window clock and the refresh instants of live staleness, shared with the reader of this process.
     clocks: Arc<clock::Clocks>,
+    /// Consumers and routing; `None` when the start left the store read-only before the log could be read.
+    hub: Option<Arc<deliver::Hub>>,
 }
 
 /// How a queued call's acknowledgement becomes its [`Ack`].
@@ -430,10 +437,34 @@ impl Writer {
                 start_fault = Some(registry_fault(&dir, &e));
             }
         }
+        // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
+        let now = Arc::new(std::sync::atomic::AtomicI64::new(wall));
+        let hub = match deliver::Deliverer::open(
+            &dir,
+            &env,
+            descriptor.store_id,
+            config.limits.consumer_queue,
+            config.limits.max_consumers,
+        ) {
+            Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, now.clone())),
+            Err(_) if start_fault.is_some() => None,
+            Err(source) => {
+                return Err(OpenError::Io {
+                    path: dir.clone(),
+                    source,
+                });
+            }
+        };
         let log = Log::start(writer, clock).map_err(|source| OpenError::Io {
             path: dir.clone(),
             source,
         })?;
+        if let Some(h) = &hub {
+            h.start(log.watch()).map_err(|source| OpenError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+        }
         let w = Arc::new(Writer {
             dir,
             limits: config.limits.clone(),
@@ -448,6 +479,7 @@ impl Writer {
             next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             clocks: Arc::new(clock::Clocks::new(env.clock.clone())),
+            hub,
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
@@ -475,6 +507,7 @@ impl Writer {
     fn fault(&self) -> Option<LogFault> {
         lock(&self.own_fault)
             .clone()
+            .or_else(|| self.hub.as_ref().and_then(|h| lock(&h.fault).clone()))
             .or_else(|| self.log().as_ref().and_then(Log::fault))
     }
 
@@ -527,7 +560,25 @@ impl Writer {
             return Ok(());
         };
         let floor = log.stats().max_series_id;
-        if let Err(f) = log.shutdown() {
+        let shut = log.shutdown();
+        // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
+        if let Some(h) = &self.hub {
+            h.closed.store(true, Ordering::SeqCst);
+            if shut.is_ok()
+                && let Err(e) = h.run(|d, c| {
+                    let r = d.flush_all(c);
+                    d.close();
+                    r
+                })
+            {
+                h.failed(&e);
+            }
+            h.run(|_, _| ());
+        }
+        if let Err(f) = shut {
+            return Err(WriteError::ReadOnly(fault_out(&f)));
+        }
+        if let Some(f) = self.hub.as_ref().and_then(|h| lock(&h.fault).clone()) {
             return Err(WriteError::ReadOnly(fault_out(&f)));
         }
         if let Some(f) = lock(&self.own_fault).clone() {
@@ -567,6 +618,7 @@ impl Writer {
             CommitError::OutcomeUnknown => Error::SyncFailed,
         })?;
         d.registry.apply(&entry);
+        self.deliver();
         Ok(ack)
     }
 
@@ -635,6 +687,15 @@ impl Writer {
         // A name the series already carries is given again: it becomes the display name, as in the model.
         if d.registry.resolve(name).is_some_and(|s| s.def.id != id.0) {
             return Err(Error::NameInUse(name.into()));
+        }
+        // An alias that would close a routing cycle is refused (`spec.md` §4 Routing).
+        if let Some(h) = &self.hub
+            && let Some(c) = h.run(|dl, c| {
+                dl.pump(c);
+                dl.view().cycle_with(None, Some((id.0, name)))
+            })
+        {
+            return Err(Error::RouteCycle(c.join(" -> ")));
         }
         self.commit_entry(
             &mut d,
@@ -750,6 +811,8 @@ impl Writer {
         wait: bool,
     ) -> Result<Emitted, EmitError> {
         self.writable().map_err(|e| e.emit(&self.dir))?;
+        // Timers due run before a call is decided, as the model backend runs them.
+        self.tick();
         let bytes: usize = readings
             .iter()
             .map(|r| {
@@ -855,6 +918,9 @@ impl Writer {
             finish: Box::new(move |r| {
                 if own {
                     me.note_latency(started.elapsed());
+                }
+                if r.is_ok() {
+                    me.deliver();
                 }
                 match r {
                     Ok(ack) if own => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),

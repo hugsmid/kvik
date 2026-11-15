@@ -46,6 +46,8 @@ pub(crate) enum Error {
     },
     #[error("route refused: {0}")]
     Route(String),
+    #[error("routing cycle: {0}")]
+    RouteCycle(String),
     #[error("consumer {0:?} in use")]
     ConsumerInUse(String),
     #[error("all {0} consumer slots are taken")]
@@ -132,6 +134,7 @@ impl Error {
             Error::UnknownSeries(_) => DefineError::UnknownSeries,
             Error::Retired(_) => DefineError::Retired,
             Error::NotSupportedYet(what) => DefineError::NotSupportedYet { what },
+            Error::RouteCycle(c) => DefineError::RouteCycle(c),
             e @ (Error::Closed | Error::ReadOnly(_) | Error::SyncFailed) => {
                 DefineError::Write(e.write(dir))
             }
@@ -168,6 +171,7 @@ impl Error {
             Error::TooManyConsumers(n) => ConsumerError::TooManyConsumers(n),
             Error::UnknownSeries(_) => ConsumerError::UnknownSeries,
             Error::Route(r) => ConsumerError::Route(r),
+            Error::RouteCycle(c) => ConsumerError::RouteCycle(c),
             Error::BadConfirm => ConsumerError::BadConfirm,
             Error::NotSupportedYet(what) => ConsumerError::NotSupportedYet { what },
             e @ (Error::ReadOnly(_) | Error::SyncFailed) => ConsumerError::Write(e.write(dir)),

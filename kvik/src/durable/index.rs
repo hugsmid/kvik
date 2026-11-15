@@ -272,6 +272,18 @@ impl Index {
         })
     }
 
+    /// The facts of a series with `t ≤ to`, latest `(t, position)` first.
+    pub(crate) fn series_facts_back(&self, id: u32, to: i64) -> impl Iterator<Item = &Stored> {
+        let top = LogPos {
+            generation: u32::MAX,
+            sequence: u64::MAX,
+        };
+        self.facts
+            .get(&id)
+            .into_iter()
+            .flat_map(move |m| m.range(..=(to, top)).rev().map(|(_, s)| s))
+    }
+
     /// Every series id that has a kept fact.
     pub(crate) fn fact_series(&self) -> impl Iterator<Item = u32> + '_ {
         self.facts.keys().copied()

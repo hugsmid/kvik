@@ -210,7 +210,7 @@ fn model_config(config: &StoreConfig) -> Result<km::engine::Config> {
 
 /// Whether `name` matches `pattern`: the same number of `/`-separated
 /// segments, `*` matching any run of characters within a segment.
-fn matches_pattern(pattern: &str, name: &str) -> bool {
+pub(crate) fn matches_pattern(pattern: &str, name: &str) -> bool {
     fn segment(p: &[u8], s: &[u8]) -> bool {
         match p.split_first() {
             None => s.is_empty(),

@@ -316,8 +316,11 @@ impl Store {
     pub fn tick(&self) -> Result<(), WriteError> {
         let dir = self.dir_path();
         by_backend!(self,
-            m => m.shared.with(|s| s.tick(m.epoch)).map_err(|e| e.write(dir)),
-            _d => Ok(()))
+        m => m.shared.with(|s| s.tick(m.epoch)).map_err(|e| e.write(dir)),
+        d => {
+            d.tick();
+            Ok(())
+        })
     }
 
     /// A consumer by name. A new consumer starts at `start`; an existing one
@@ -327,8 +330,12 @@ impl Store {
     /// `emits` is the series the consumer may emit, so that routing can
     /// refuse a cycle (spec §4 Routing). The model backend accepts only
     /// [`Select::None`]; anything else is
-    /// [`ConsumerError::NotSupportedYet`]. The durable backend has no
-    /// consumers yet (roadmap 5.2).
+    /// [`ConsumerError::NotSupportedYet`]. On the durable backend a change of
+    /// `emits` is a routing change, refused with
+    /// [`ConsumerError::RouteCycle`] if it closes a cycle; a consumer with no
+    /// cursor (a new one) is first sent a resync of cause
+    /// [`ResyncCause::NoCursor`](crate::ResyncCause::NoCursor), and only
+    /// [`Start::Now`] is supported so far.
     pub async fn consumer(
         &self,
         name: &str,
@@ -342,13 +349,18 @@ impl Store {
                     .with(|s| s.consumer(m.epoch, name, start, &emits))
                     .map_err(|e| e.consumer(dir))?;
                 Ok(Consumer {
-                    writer: m.clone(),
+                    inner: ConsumerInner::Model(m.clone()),
                     name: name.to_string(),
                 })
             }
-            StoreInner::Durable(_) => Err(ConsumerError::NotSupportedYet {
-                what: "consumers and routing on the durable backend (roadmap 5.2)",
-            }),
+            StoreInner::Durable(d) => {
+                d.take_consumer(name, start, &emits)
+                    .map_err(|e| e.consumer(dir))?;
+                Ok(Consumer {
+                    inner: ConsumerInner::Durable(d.clone()),
+                    name: name.to_string(),
+                })
+            }
         }
     }
 
@@ -379,9 +391,9 @@ impl Store {
         by_backend!(self, m => m.shared.with(|s| s.series_stats(id)), d => d.series_stats(id))
     }
 
-    /// Per-consumer statistics (an addition of the model backend).
+    /// Per-consumer statistics (an addition of the interface).
     pub fn consumer_stats(&self, name: &str) -> Option<ConsumerStats> {
-        by_backend!(self, m => m.shared.with(|s| s.consumer_stats(name)), _d => None)
+        by_backend!(self, m => m.shared.with(|s| s.consumer_stats(name)), d => d.consumer_stats(name))
     }
 
     /// Every loss report, for ever.
@@ -731,25 +743,29 @@ impl Reader {
 }
 
 /// A consumer: its funnels, deliveries and confirmations (spec §4). `Send`,
-/// not `Clone`; it holds a share of the store. Only the model backend has
-/// consumers yet.
+/// not `Clone`; it holds a share of the store.
 ///
 /// Deliveries are at least once: de-duplicate fact deliveries by position and
 /// condition deliveries by funnel and sequence. A consumer that emits
 /// readings uses [`Consumer::try_emit`], never the store's handle.
 #[derive(Debug)]
 pub struct Consumer {
-    writer: Arc<Writer>,
+    inner: ConsumerInner,
     name: String,
 }
 
-impl Consumer {
-    fn shared(&self) -> &Shared {
-        &self.writer.shared
-    }
+#[derive(Debug)]
+enum ConsumerInner {
+    Model(Arc<Writer>),
+    Durable(Arc<durable::Writer>),
+}
 
-    fn epoch(&self) -> u64 {
-        self.writer.epoch
+impl Consumer {
+    fn dir(&self) -> &Path {
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.dir(),
+            ConsumerInner::Durable(d) => d.dir(),
+        }
     }
 
     /// The consumer's name.
@@ -759,23 +775,29 @@ impl Consumer {
 
     /// Adds a funnel; a log entry that takes effect at its position.
     pub async fn route(&self, funnel: Funnel) -> Result<FunnelId, ConsumerError> {
-        self.shared()
-            .with(|s| s.route(self.epoch(), &self.name, funnel))
-            .map_err(|e| e.consumer(self.writer.shared.dir()))
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.route(w.epoch, &self.name, funnel)),
+            ConsumerInner::Durable(d) => d.route(&self.name, &funnel),
+        }
+        .map_err(|e| e.consumer(self.dir()))
     }
 
     /// Removes a funnel; a log entry that takes effect at its position.
     pub async fn unroute(&self, funnel: FunnelId) -> Result<(), ConsumerError> {
-        self.shared()
-            .with(|s| s.unroute(self.epoch(), &self.name, funnel))
-            .map_err(|e| e.consumer(self.writer.shared.dir()))
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.unroute(w.epoch, &self.name, funnel)),
+            ConsumerInner::Durable(d) => d.unroute(&self.name, funnel),
+        }
+        .map_err(|e| e.consumer(self.dir()))
     }
 
     /// The funnels in force.
     pub fn routes(&self) -> Result<Vec<(FunnelId, Funnel)>, ConsumerError> {
-        self.shared()
-            .with(|s| s.routes(self.epoch(), &self.name))
-            .map_err(|e| e.consumer(self.writer.shared.dir()))
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.routes(w.epoch, &self.name)),
+            ConsumerInner::Durable(d) => d.routes(&self.name),
+        }
+        .map_err(|e| e.consumer(self.dir()))
     }
 
     /// The next delivery, waiting for one; `None` when no more will come.
@@ -784,35 +806,47 @@ impl Consumer {
     ///
     /// With the model backend nothing runs in the background: a waiting call
     /// is woken by the next emit, routing change, confirmation or
-    /// [`Store::tick`].
+    /// [`Store::tick`]. With the durable backend it is woken when a batch is
+    /// acknowledged and by the timers.
     pub async fn next(&mut self) -> Option<Delivery> {
-        poll_fn(|cx| {
-            self.shared()
-                .with(|s| match s.poll_delivery(self.epoch(), &self.name) {
-                    Ok(Some(d)) => Poll::Ready(Some(d)),
-                    Ok(None) => {
-                        s.register(cx.waker());
-                        Poll::Pending
-                    }
-                    Err(_) => Poll::Ready(None),
-                })
+        poll_fn(|cx| match &self.inner {
+            ConsumerInner::Model(w) => {
+                w.shared
+                    .with(|s| match s.poll_delivery(w.epoch, &self.name) {
+                        Ok(Some(d)) => Poll::Ready(Some(d)),
+                        Ok(None) => {
+                            s.register(cx.waker());
+                            Poll::Pending
+                        }
+                        Err(_) => Poll::Ready(None),
+                    })
+            }
+            ConsumerInner::Durable(d) => match d.poll_delivery(&self.name, Some(cx.waker())) {
+                Ok(Some(x)) => Poll::Ready(Some(x)),
+                Ok(None) => Poll::Pending,
+                Err(_) => Poll::Ready(None),
+            },
         })
         .await
     }
 
     /// The next delivery if one is ready, without waiting.
     pub fn try_next(&mut self) -> Result<Option<Delivery>, ConsumerError> {
-        self.shared()
-            .with(|s| s.poll_delivery(self.epoch(), &self.name))
-            .map_err(|e| e.consumer(self.writer.shared.dir()))
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.poll_delivery(w.epoch, &self.name)),
+            ConsumerInner::Durable(d) => d.poll_delivery(&self.name, None),
+        }
+        .map_err(|e| e.consumer(self.dir()))
     }
 
     /// Confirms a delivery and every delivery received before it. A resync is
     /// confirmed by its last part; nothing further is delivered until then.
     pub async fn confirm(&self, id: DeliveryId) -> Result<(), ConsumerError> {
-        self.shared()
-            .with(|s| s.confirm(self.epoch(), &self.name, id))
-            .map_err(|e| e.consumer(self.writer.shared.dir()))
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.confirm(w.epoch, &self.name, id)),
+            ConsumerInner::Durable(d) => d.confirm(&self.name, id),
+        }
+        .map_err(|e| e.consumer(self.dir()))
     }
 
     /// Emits readings on behalf of this consumer, without waiting (spec §4
@@ -820,16 +854,25 @@ impl Consumer {
     /// [`Refusal::NotDeclared`](crate::Refusal::NotDeclared). With the model
     /// backend a consumer emits nothing, so every reading is refused.
     pub fn try_emit(&self, readings: &[Reading]) -> Result<Pending, EmitError> {
-        self.shared()
-            .with(|s| s.consumer_emit(self.epoch(), &self.name, readings))
-            .map(|ack| Pending::ready(Ok(ack)))
-            .map_err(|e| e.emit(self.writer.shared.dir()))
+        match &self.inner {
+            ConsumerInner::Model(w) => w
+                .shared
+                .with(|s| s.consumer_emit(w.epoch, &self.name, readings))
+                .map(|ack| Pending::ready(Ok(ack)))
+                .map_err(|e| e.emit(self.dir())),
+            ConsumerInner::Durable(d) => match d.consumer_emit(&self.name, readings)? {
+                Emitted::Ready(ack) => Ok(Pending::ready(Ok(ack))),
+                Emitted::Queued(q) => Ok(Pending::queued(q)),
+            },
+        }
     }
 }
 
 impl Drop for Consumer {
     fn drop(&mut self) {
-        let epoch = self.epoch();
-        self.shared().with(|s| s.release(epoch, &self.name));
+        match &self.inner {
+            ConsumerInner::Model(w) => w.shared.with(|s| s.release(w.epoch, &self.name)),
+            ConsumerInner::Durable(d) => d.release(&self.name),
+        }
     }
 }

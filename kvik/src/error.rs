@@ -272,6 +272,9 @@ pub enum DefineError {
     /// Writing the entry failed.
     #[error(transparent)]
     Write(#[from] WriteError),
+    /// An alias would close a routing cycle between consumers (spec §4 Routing), named consumer by consumer.
+    #[error("routing cycle: {0}")]
+    RouteCycle(String),
     /// Named by the interface but not supported by the current backend.
     #[error("not supported yet: {what}")]
     NotSupportedYet {
@@ -370,9 +373,10 @@ pub enum ConsumerError {
     /// A routing change is refused (spec §4, §6 Cadence).
     #[error("route refused: {0}")]
     Route(String),
-    /// A route, a change of `emits` or an alias would close a cycle between
-    /// consumers (spec §4 Routing). Not produced by the model backend, which
-    /// accepts only consumers that emit nothing.
+    /// A route or a change of `emits` would close a cycle between consumers
+    /// (spec §4 Routing; an alias that would is [`DefineError::RouteCycle`]).
+    /// Not produced by the model backend, which accepts only consumers that
+    /// emit nothing.
     #[error("routing cycle: {0}")]
     RouteCycle(String),
     /// A confirmation names a delivery that was not received.

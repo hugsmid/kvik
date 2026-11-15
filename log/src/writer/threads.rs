@@ -205,6 +205,61 @@ impl CallSource for SharedSource<'_> {
     }
 }
 
+/// Watches the writer's progress ([`Log::watch`]).
+#[derive(Clone, Debug)]
+pub struct Watch {
+    shared: Arc<Shared>,
+}
+
+impl Watch {
+    /// As [`Log::wait_progress`].
+    pub fn wait_progress(&self, seen: u64, timeout: Duration) -> u64 {
+        let i = lock(&self.shared.info);
+        let (i, _) = self
+            .shared
+            .progress_cv
+            .wait_timeout_while(i, timeout, |i| i.progress == seen && !i.stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        i.progress
+    }
+
+    /// Whether the writer thread has ended.
+    pub fn stopped(&self) -> bool {
+        lock(&self.shared.info).stopped
+    }
+
+    /// As [`Log::stats`].
+    pub fn stats(&self) -> LogStats {
+        lock(&self.shared.info).stats.clone()
+    }
+
+    /// Asks the writer to sync the mark now rather than at its timer, and waits until the mark on stable storage
+    /// names at least the durable position at the call (`spec.md` §3 Durable mark: a file that would name a
+    /// position above the last synced mark waits for the next mark sync or forces one). Returns the last synced
+    /// position, or the fault if the store is or becomes read-only; after a shutdown, the last synced position.
+    pub fn sync_mark(&self) -> Result<super::Position, Fault> {
+        let target = lock(&self.shared.info).stats.durable;
+        {
+            let mut f = lock(&self.shared.front);
+            f.mark_sync = true;
+            f.wake = true;
+        }
+        self.shared.writer_cv.notify_one();
+        let i = lock(&self.shared.info);
+        let i = self
+            .shared
+            .progress_cv
+            .wait_while(i, |i| {
+                i.fault.is_none() && !i.stopped && i.stats.mark_synced < target
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        match &i.fault {
+            Some(f) => Err(f.clone()),
+            None => Ok(i.stats.mark_synced),
+        }
+    }
+}
+
 /// The log writer on its threads. See the module documentation of [`crate::writer`].
 #[derive(Debug)]
 pub struct Log {
@@ -335,13 +390,15 @@ impl Log {
     /// `timeout`, and returns the latest value. A caller that watches for acknowledged batches, and must not run on
     /// the writer thread, waits here and then looks at [`Log::stats`]. Returns at once once the writer has stopped.
     pub fn wait_progress(&self, seen: u64, timeout: Duration) -> u64 {
-        let i = lock(&self.shared.info);
-        let (i, _) = self
-            .shared
-            .progress_cv
-            .wait_timeout_while(i, timeout, |i| i.progress == seen && !i.stopped)
-            .unwrap_or_else(PoisonError::into_inner);
-        i.progress
+        self.watch().wait_progress(seen, timeout)
+    }
+
+    /// A handle that waits for the writer's progress without holding the log, for a thread that outlives a borrow
+    /// of it.
+    pub fn watch(&self) -> Watch {
+        Watch {
+            shared: self.shared.clone(),
+        }
     }
 
     /// Asks the writer to sync the mark now rather than at its timer, and waits until the mark on stable storage
@@ -349,25 +406,7 @@ impl Log {
     /// position above the last synced mark waits for the next mark sync or forces one). Returns the last synced
     /// position, or the fault if the store is or becomes read-only; after a shutdown, the last synced position.
     pub fn sync_mark(&self) -> Result<super::Position, Fault> {
-        let target = self.stats().durable;
-        {
-            let mut f = lock(&self.shared.front);
-            f.mark_sync = true;
-            f.wake = true;
-        }
-        self.shared.writer_cv.notify_one();
-        let i = lock(&self.shared.info);
-        let i = self
-            .shared
-            .progress_cv
-            .wait_while(i, |i| {
-                i.fault.is_none() && !i.stopped && i.stats.mark_synced < target
-            })
-            .unwrap_or_else(PoisonError::into_inner);
-        match &i.fault {
-            Some(f) => Err(f.clone()),
-            None => Ok(i.stats.mark_synced),
-        }
+        self.watch().sync_mark()
     }
 
     /// Entries queued.
