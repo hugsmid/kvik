@@ -17,9 +17,8 @@
 //! - **Unacknowledged batches.** A batch whose commit was cut short may be kept or not (`spec.md` §3 Write or sync
 //!   failure, §9 rows 7 and 7a). For faults the model names, the log is made to stop at the same point; for stops at
 //!   arbitrary operations the log decides, and the model is given the fault that has the same outcome.
-//! - **Open questions.** A torn batch alone in a segment whose header never reached the disk is deleted unreported
-//!   (Q-116 (f), (l) and (p)); a power loss that leaves a mark older than the last one synced may lower the id floor
-//!   (Q-122). Each is accepted only where it applies.
+//! - **Open questions.** A torn batch alone in a segment whose header on disk reads unused is deleted unreported
+//!   (Q-116 (f), (l) and (p)); accepted only when the header on disk does read unused.
 //!
 //! Left out, with the reason:
 //! - Routing changes: the log has no entry for them yet (`format.md` A.6, type 5 is reserved for roadmap 5.2).
@@ -29,12 +28,19 @@
 //! - Wall-clock steps backwards: the batch's `received_at` is then open (Q-115 (i)); the wall clock only moves on.
 //! - Defaults of a definition: resolving them is the registry's (roadmap 5.1); every definition here sets them.
 //! - Corruption below the mark and tzdata entries: covered by `recovery.rs` and `model_differential.rs`.
+//! - Failed mark syncs, write errors, a full disk and clean shutdowns: covered by `recovery.rs` (the kill loop) and
+//!   `writer.rs`; the model has no counterpart for a failed mark sync or a full disk at the log's level.
+//! - A batch whose sync failed surviving a remount: a remount runs only with the mark synced at every commit, and a
+//!   failed sync's bytes never reach the disk in the in-memory file system unless written again.
+//! - A reader voiding what it read: it reads only up to the mark, which a start on the same boot never moves back
+//!   here (a remount that loses mark updates is left out above), so its voids remove nothing.
 
 mod convert;
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +49,7 @@ use kvik_log::batch::SegmentIdentity;
 use kvik_log::content::{BatchContent, Item};
 use kvik_log::entries::{Entry as LogEntry, MarkState};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
+use kvik_log::header::FileHeader;
 use kvik_log::manifest::LossCause;
 use kvik_log::mark::{MarkSlot, read_mark};
 use kvik_log::name::SegmentName;
@@ -62,6 +69,7 @@ use kvik_model::types::{
     IntervalSpec, Kind, Position, Quality, Reading, SECOND, SeriesId, TSource, Value, ValueType,
 };
 use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 
 const STORE_ID: [u8; 16] = [9; 16];
 /// 2026-01-01T00:00:00Z: the model's wall clock at the start of every history.
@@ -132,6 +140,11 @@ enum Op {
     PowerLoss,
     Remount,
     Refresh,
+    /// A crash (or a power loss), then a start that stops after `n` file operations, then a start on the same boot.
+    CutStart {
+        n: usize,
+        power: bool,
+    },
 }
 
 fn series_spec() -> impl Strategy<Value = SeriesSpec> {
@@ -231,6 +244,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Crash),
         1 => Just(Op::PowerLoss),
         1 => Just(Op::Remount),
+        1 => (0..40usize, any::<bool>()).prop_map(|(n, power)| Op::CutStart { n, power }),
         2 => Just(Op::Refresh),
     ]
 }
@@ -246,6 +260,44 @@ fn history(ops: usize) -> impl Strategy<Value = (Vec<Op>, bool)> {
             first.extend(rest);
             (first, every)
         })
+}
+
+// ----- coverage -----
+
+/// What the histories reached, counted over every history of a run; the long variant requires each.
+#[derive(Clone, Copy, Debug)]
+enum Count {
+    Rule1Resets,
+    Reboots,
+    StopsKept,
+    StopsLost,
+    TornReported,
+    TornDeleted,
+    CutStarts,
+    Adoptions,
+    Voids,
+    SealedSegments,
+}
+
+const COUNTS: usize = 10;
+static REACHED: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
+
+fn count(c: Count) {
+    REACHED[c as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+fn reached(c: Count) -> u64 {
+    REACHED[c as usize].load(Ordering::Relaxed)
+}
+
+/// The configuration of a property test with `cases / divisor` cases: each case is a whole history. Passed to a
+/// runner of our own, since `proptest!` would set the cases from `PROPTEST_CASES` again.
+fn config(divisor: u32) -> ProptestConfig {
+    let d = ProptestConfig::default();
+    ProptestConfig {
+        cases: (d.cases / divisor).max(1),
+        ..d
+    }
 }
 
 // ----- the log side -----
@@ -284,6 +336,8 @@ enum Expect {
     SameBoot(Option<bool>),
     /// Rule 3: a recovery entry written, and the tail it reports.
     Reboot(Tail),
+    /// After a start cut short: either rule, and an entry the cut start wrote may be adopted.
+    Any,
 }
 
 /// The tail a start under rule 3 finds.
@@ -330,8 +384,8 @@ struct Log {
     acked: BTreeMap<u64, Item>,
     /// A batch whose sync failed: its outcome at the next power loss and its writes.
     pending: Option<(WriteOutcome, Vec<Write>)>,
-    /// The last power loss left a mark older than the last one synced (Q-122).
-    mark_rolled_back: bool,
+    /// After a power loss, the segment of the torn batch reads unused on disk: its header never reached it.
+    torn_header_unused: bool,
     /// The mark as the last start found it, if readable.
     before: Option<MarkSlot>,
     armed: Arc<Mutex<Option<Arm>>>,
@@ -408,10 +462,24 @@ impl Log {
             view: BTreeMap::new(),
             acked: BTreeMap::new(),
             pending: None,
-            mark_rolled_back: false,
+            torn_header_unused: false,
             before: None,
             armed,
         }
+    }
+
+    /// Starts the writer with the file system stopping after `n` more operations; the start may finish or not.
+    fn open_cut(&mut self, n: usize, now: Duration, wall: i64) {
+        self.w = None;
+        self.fs.crash_after(n);
+        if let Ok(store) = StoreDir::open(
+            Arc::new(self.fs.clone()),
+            Path::new("store"),
+            Some(&new_store()),
+        ) {
+            let _ = LogWriter::open(store, self.cfg.clone(), Some([self.boot; 16]), now, wall);
+        }
+        self.kill();
     }
 
     /// Starts the writer; every start in these histories finishes.
@@ -553,6 +621,13 @@ impl Log {
                 };
                 self.fs.poke(path, *at as usize, &bytes[..cut]);
             }
+            self.torn_header_unused = outcome == WriteOutcome::Torn
+                && writes.last().is_some_and(|(path, _, _)| {
+                    self.fs
+                        .read_durable(path)
+                        .and_then(|b| FileHeader::decode(&b))
+                        .is_none_or(|h| h.base_sequence == 0)
+                });
         }
         self.fs.restart();
         self.boot += 1;
@@ -570,7 +645,11 @@ impl Log {
         };
         let synced = counter(self.fs.read_durable(&mark_path()));
         self.fs.power_loss_partial(seed);
-        self.mark_rolled_back = counter(self.fs.read(&mark_path())) < synced;
+        // Updates since the last mark sync never overwrite its slot (`format.md` A.10 Update, Q-122).
+        assert!(
+            counter(self.fs.read(&mark_path())) >= synced,
+            "a power loss left a mark older than the last one synced"
+        );
         self.fs.restart();
         self.boot += 1;
         self.pending = None;
@@ -660,7 +739,10 @@ impl Log {
                         self.view.insert(seq, item);
                     }
                 }
-                ReadEvent::Void { above, .. } => self.view.retain(|&s, _| s <= above.sequence),
+                ReadEvent::Void { above, .. } => {
+                    count(Count::Voids);
+                    self.view.retain(|&s, _| s <= above.sequence);
+                }
                 ReadEvent::Corruption { .. } => panic!("no corruption is injected"),
             }
         }
@@ -1046,6 +1128,11 @@ impl World {
             b.items == items && b.last_sequence() <= self.log.mark().last_sequence
         });
         assert!(kept || !acked, "an acknowledged batch was lost");
+        count(if kept {
+            Count::StopsKept
+        } else {
+            Count::StopsLost
+        });
         if acked {
             for (k, item) in items.into_iter().enumerate() {
                 self.log.acked.insert(first + k as u64, item);
@@ -1096,9 +1183,11 @@ impl World {
                         assert_eq!(self.log.mark().stamp, before.stamp, "no reset");
                     }
                     Some(entry) => {
+                        count(Count::Rule1Resets);
                         // K is the mark's last position; the truncated batch may have been acknowledged.
                         assert_eq!(entry.entry.after, before.last_sequence);
                         assert_eq!(entry.entry.mark_state, MarkState::Readable);
+                        assert!(!entry.adopted, "nothing to adopt: every start finished");
                         self.check_entry(report);
                         assert_eq!(report.losses.len(), 1, "{report:?}");
                         assert!(report.losses[0].bytes > 0);
@@ -1107,25 +1196,43 @@ impl World {
             }
             Expect::Reboot(tail) => {
                 assert!(matches!(report.rule, StartRule::Reboot(_)), "{report:?}");
+                count(Count::Reboots);
+                let entry = report.entry.as_ref().expect("a recovery entry");
+                assert!(!entry.adopted, "nothing to adopt: every start finished");
                 self.check_entry(report);
                 let reported = !report.losses.is_empty();
                 match tail {
                     Tail::Either => {}
                     Tail::Clean => assert!(!reported, "nothing torn: {report:?}"),
-                    Tail::Torn { file_id } => assert!(
-                        reported || report.deleted.contains(&file_id),
-                        "a torn tail is reported: {report:?}"
-                    ),
+                    Tail::Torn { file_id } if reported => {
+                        count(Count::TornReported);
+                        assert!(!report.deleted.contains(&file_id));
+                    }
+                    Tail::Torn { file_id } => {
+                        count(Count::TornDeleted);
+                        assert!(
+                            self.log.torn_header_unused && report.deleted.contains(&file_id),
+                            "a torn tail is reported, unless its segment reads unused: {report:?}"
+                        );
+                    }
+                }
+            }
+            Expect::Any => {
+                if report.entry.as_ref().is_some_and(|e| e.adopted) {
+                    count(Count::Adoptions);
+                }
+                if report.entry.is_some() {
+                    self.check_entry(report);
                 }
             }
         }
+        self.log.torn_header_unused = false;
     }
 
     /// The recovery entry a start wrote: at F = K + 1, the last batch, with the id floor and a new reset stamp that
     /// the mark carries; at most one possible loss, identified by F.
     fn check_entry(&mut self, report: &StartReport) {
         let entry = report.entry.as_ref().expect("a recovery entry");
-        assert!(!entry.adopted, "nothing to adopt: every start finished");
         assert_eq!(entry.sequence, entry.entry.after + 1, "F = K + 1");
         let mark = self.log.mark();
         assert_eq!(
@@ -1154,15 +1261,10 @@ impl World {
             })
             .max()
             .unwrap_or(0);
-        // A torn mark update may leave a mark older than the last one synced, and the start reads
-        // definitions only from unsealed segments: the floor may then be lower (Q-122).
-        if entry.entry.id_floor != floor {
-            assert!(
-                entry.entry.id_floor < floor && self.log.mark_rolled_back,
-                "the id floor: {report:?}"
-            );
+        assert_eq!(entry.entry.id_floor, floor, "the id floor: {report:?}");
+        if let Some(before) = self.log.before {
+            assert!(entry.entry.id_floor >= before.max_series_id, "{report:?}");
         }
-        self.log.mark_rolled_back = false;
         assert!(report.losses.len() <= 1);
         for l in &report.losses {
             assert_eq!(l.kind, LossKind::PossibleLoss);
@@ -1190,6 +1292,23 @@ impl World {
         let fate = self.log.pending.take();
         self.log.power_loss(fate);
         self.restart(Expect::Reboot(tail));
+    }
+
+    fn cut_start(&mut self, n: usize, power: bool) {
+        if power {
+            self.m.power_loss();
+            let fate = self.log.pending.take();
+            self.log.power_loss(fate);
+        } else {
+            self.m.crash();
+            self.log.kill();
+        }
+        self.m.restart();
+        let (now, wall) = self.clocks();
+        self.log.open_cut(n, now, wall);
+        count(Count::CutStarts);
+        let report = self.log.open(now, wall);
+        self.started(&report, Expect::Any);
     }
 
     fn remount(&mut self) {
@@ -1331,6 +1450,7 @@ impl World {
             Op::Crash => self.crash(),
             Op::PowerLoss => self.power_loss(),
             Op::Remount => self.remount(),
+            Op::CutStart { n, power } => self.cut_start(*n, *power),
             Op::Refresh => self.refresh(),
         }
         let (now, wall) = self.clocks();
@@ -1354,31 +1474,62 @@ fn run(ops: &[Op], every: bool) {
         w.apply(op);
     }
     w.refresh();
+    let sealed = w
+        .log
+        .fs
+        .paths()
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "kvl"))
+        .count();
+    REACHED[Count::SealedSegments as usize].fetch_add(sealed as u64, Ordering::Relaxed);
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: ProptestConfig::default().cases / 8, ..ProptestConfig::default() })]
-
-    /// On every generated history, the log keeps exactly what the model says is committed, at the model's positions
-    /// shifted by the recovery entries before them, and the reader returns exactly the log up to the mark.
-    #[test]
-    fn the_log_keeps_what_the_model_commits((ops, every) in history(40)) {
-        run(&ops, every);
-    }
-}
-
-/// Longer histories, for a local soak run: `cargo test --release -p kvik-log --test model_histories -- --ignored`.
+/// On every generated history, the log keeps exactly what the model says is committed, at the model's positions
+/// shifted by the recovery entries before them, and the reader returns exactly the log up to the mark.
 #[test]
-#[ignore]
-fn the_log_keeps_what_the_model_commits_long() {
-    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
-        cases: 500,
-        ..ProptestConfig::default()
-    });
-    runner
-        .run(&history(200), |(ops, every)| {
+fn the_log_keeps_what_the_model_commits() {
+    TestRunner::new(config(8))
+        .run(&history(40), |(ops, every)| {
             run(&ops, every);
             Ok(())
         })
         .unwrap();
+}
+
+/// Longer histories, for a local soak run: `cargo test --release -p kvik-log --test model_histories -- --ignored`.
+/// Every kind of start and stop the harness can make must be reached.
+#[test]
+#[ignore]
+fn the_log_keeps_what_the_model_commits_long() {
+    TestRunner::new(ProptestConfig {
+        cases: 500,
+        ..ProptestConfig::default()
+    })
+    .run(&history(200), |(ops, every)| {
+        run(&ops, every);
+        Ok(())
+    })
+    .unwrap();
+    let floors = [
+        (Count::Rule1Resets, 100),
+        (Count::Reboots, 100),
+        (Count::StopsKept, 50),
+        (Count::StopsLost, 20),
+        (Count::TornReported, 20),
+        (Count::CutStarts, 100),
+        (Count::Adoptions, 1),
+        (Count::SealedSegments, 100),
+    ];
+    for (c, floor) in floors {
+        println!("{c:?}: {}", reached(c));
+        assert!(
+            reached(c) >= floor,
+            "{c:?} reached {} times, below {floor}",
+            reached(c)
+        );
+    }
+    // Reached rarely or never, and so not required: the readings of Q-116 (p), and voids (see "Left out").
+    for c in [Count::TornDeleted, Count::Voids] {
+        println!("{c:?}: {}", reached(c));
+    }
 }
