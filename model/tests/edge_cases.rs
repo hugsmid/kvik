@@ -1618,6 +1618,10 @@ fn row_12a_mark_lost_on_the_same_boot_after_a_failed_sync() {
         let (at, entry) = m.recovery_entries().into_iter().next_back().unwrap();
         assert_eq!(entry.mark_state, state);
         assert_eq!(entry.after.next(), at);
+        assert_eq!(
+            entry.id_floor, s.0,
+            "the id floor from the log, the mark lost"
+        );
         let loss = m
             .losses()
             .into_iter()

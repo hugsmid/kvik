@@ -603,7 +603,9 @@ pub enum CrashPoint {
 pub enum Fault {
     /// The process stops; the machine keeps running (same boot). Recovery
     /// truncates to the durable mark (§3), so an unsynced batch is discarded
-    /// whatever reached the page cache (§9 row 7).
+    /// whatever its write outcome; the page cache holds it whole, so its
+    /// truncation is a reset point with a recovery entry (§3 Recovery rule 1,
+    /// §9 row 7).
     Crash(CrashPoint),
     /// The machine loses power after the write and before the sync: the
     /// process stops and the boot id changes ([`Model::power_loss`]).
@@ -1705,6 +1707,9 @@ struct ConsumerRt {
     /// the consumer's confirmation: nothing further is delivered until then
     /// (§4 Resync).
     awaiting: Option<Position>,
+    /// Reset points catch-up has passed with nothing routed since, merged
+    /// (the lowest `forget_above`, the highest id), not yet delivered.
+    pending: Option<ResetPoint>,
 }
 
 /// State a crash discards.
@@ -2172,6 +2177,7 @@ impl Model {
                 runners: BTreeMap::new(),
                 emitted: BTreeMap::new(),
                 awaiting: None,
+                pending: None,
             });
         }
         self.vol = Some(Volatile {
@@ -2458,8 +2464,9 @@ impl Model {
         // Damaged batches at the end of the open segment beyond the mark (a
         // remount or a lost mark moved it below them) are not below a valid
         // mark and no complete batch follows them: a torn tail, not
-        // corruption (§3 Recovery rules 2 and 3).
-        if let Some(active) = self.disk.active {
+        // corruption (§3 Recovery rules 2 and 3). A start whose sync fails
+        // truncates nothing.
+        if let Some(active) = self.disk.active.filter(|_| !sync_fails) {
             loop {
                 let n = self.disk.files[&active].batches.len();
                 let Some(&(from, _)) = n
@@ -2635,11 +2642,15 @@ impl Model {
     /// (definitions and the series of kept facts), earlier recovery entries
     /// and the restore's checkpoint.
     fn id_floor(&self, mark: Option<u32>) -> u32 {
+        // Every complete batch of the log, the open segment's included,
+        // whatever the mark covers.
         let log = self
             .disk
-            .live_entries()
-            .into_values()
-            .filter_map(|e| match e.body {
+            .files
+            .values()
+            .filter(|f| f.class == FileClass::Segment)
+            .flat_map(StoredFile::entries)
+            .filter_map(|e| match &e.body {
                 EntryBody::Registry(RegistryEvent::Define { id, .. }) => Some(id.0),
                 EntryBody::Fact(f) => Some(f.series.0),
                 EntryBody::Recovery(r) => Some(r.id_floor),
@@ -4082,6 +4093,7 @@ impl Model {
         let behind: Vec<Position> = v.entries.range(cursor.next()..).map(|(p, _)| *p).collect();
         let c = &mut v.consumers[i];
         c.awaiting = None;
+        c.pending = None;
         if behind.is_empty() && !reset {
             c.mode = Mode::Live;
             self.issue_resync(i, stop, None, None);
@@ -4239,24 +4251,20 @@ impl Model {
             if c.awaiting.is_some() {
                 return Ok(());
             }
-            // Reset points passed since the last routed fact: merged, and
-            // the position of the first, where a pause starts again.
-            let mut pending: Option<(ResetPoint, Position)> = None;
-            let merge =
-                |pending: &mut Option<(ResetPoint, Position)>, from: Position, to: Position| {
-                    for rp in points.iter().filter(|r| r.id >= from && r.id <= to) {
-                        *pending = Some(match *pending {
-                            None => (*rp, rp.id),
-                            Some((p, first)) => (
-                                ResetPoint {
-                                    id: p.id.max(rp.id),
-                                    forget_above: p.forget_above.min(rp.forget_above),
-                                },
-                                first,
-                            ),
-                        });
-                    }
-                };
+            // Reset points passed since the last routed fact, merged; kept
+            // across a pause, so a bounded call never reads them again.
+            let mut pending: Option<ResetPoint> = c.pending.take();
+            let merge = |pending: &mut Option<ResetPoint>, from: Position, to: Position| {
+                for rp in points.iter().filter(|r| r.id >= from && r.id <= to) {
+                    *pending = Some(match *pending {
+                        None => *rp,
+                        Some(p) => ResetPoint {
+                            id: p.id.max(rp.id),
+                            forget_above: p.forget_above.min(rp.forget_above),
+                        },
+                    });
+                }
+            };
             let mut paused = false;
             let mut flush = None;
             for (p, e) in v.entries.range(next..) {
@@ -4266,7 +4274,7 @@ impl Model {
                 merge(&mut pending, next, *p);
                 let fact = e.fact().filter(|f| routed(&c.decl, &v.routes, f));
                 if fact.is_some()
-                    && let Some((rp, _)) = pending
+                    && let Some(rp) = pending
                 {
                     flush = Some(rp);
                     break;
@@ -4287,18 +4295,15 @@ impl Model {
                 next = p.next();
             }
             if paused {
-                // Read again from the first reset point passed, so it is
-                // not skipped.
-                c.mode = Mode::CatchUp {
-                    next: pending.map_or(next, |(_, first)| first),
-                };
+                c.mode = Mode::CatchUp { next };
+                c.pending = pending;
                 return Ok(());
             }
             if flush.is_none() {
                 // Reset points after the last entry read: a lost range at
                 // the tail.
                 merge(&mut pending, next, Position::new(u32::MAX, u64::MAX));
-                flush = pending.map(|(rp, _)| rp);
+                flush = pending;
             }
             if let Some(stop) = c.resume
                 && v.entries
@@ -4519,6 +4524,7 @@ impl Model {
         c.emitted.clear();
         c.resume = None;
         c.awaiting = None;
+        c.pending = None;
         c.session = session;
         c.last_received = cursor;
         self.begin_resume(i, cursor);

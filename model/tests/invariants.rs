@@ -2608,6 +2608,8 @@ enum ROp {
     Acknowledge,
     Seal,
     Compact,
+    Merge,
+    Housekeeping,
     Checkpoint,
 }
 
@@ -2646,6 +2648,8 @@ fn arb_rop() -> impl Strategy<Value = ROp> {
         1 => Just(ROp::Acknowledge),
         1 => Just(ROp::Seal),
         1 => Just(ROp::Compact),
+        1 => Just(ROp::Merge),
+        1 => Just(ROp::Housekeeping),
         1 => Just(ROp::Checkpoint),
     ]
 }
@@ -2881,6 +2885,12 @@ impl RWorld {
             ROp::Compact if up => {
                 let _ = self.m.compact(None);
             }
+            ROp::Merge if up => {
+                let _ = self.m.merge_chunks(None);
+            }
+            ROp::Housekeeping if up => {
+                let _ = self.m.housekeeping();
+            }
             ROp::Checkpoint if up => {
                 let _ = self.m.checkpoint();
             }
@@ -2936,8 +2946,26 @@ impl RWorld {
         // 1. Gap-free except lost ranges, each recorded in the manifest or
         // described by a recovery entry (the positions between K and F),
         // checked at every step of every recovery history.
-        let mut held: BTreeSet<u64> = seqs(m.disk.all_entries().into_keys()).into_iter().collect();
-        for (from, to) in m.disk.lost_ranges() {
+        // Every complete batch on disk, beyond the mark too (after a start
+        // that could not write, with the mark lost).
+        let mut held: BTreeSet<u64> = seqs(
+            m.disk
+                .files
+                .values()
+                .filter(|f| f.class == kvik_model::engine::FileClass::Segment)
+                .flat_map(|f| f.entries().map(|e| e.position)),
+        )
+        .into_iter()
+        .collect();
+        // A range a start that could not write found is reported as found
+        // and recorded by the next start that can.
+        let found = m
+            .disk
+            .found_lost
+            .iter()
+            .copied()
+            .chain(m.disk.damaged_runs());
+        for (from, to) in m.disk.lost_ranges().into_iter().chain(found) {
             held.extend(from.sequence..=to.sequence);
         }
         let top = held.iter().next_back().copied().unwrap_or(0);

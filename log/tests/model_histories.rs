@@ -12,7 +12,9 @@
 //! Recovery entries are compared with the model's: both write one, with a new reset stamp, after every start under
 //! `spec.md` §3 Recovery rule 3 and after a start under rule 1 that truncates a complete batch, at F = K + 1 (no
 //! position is named above K here: no cursor file, derived file or lost range exists), with the same K, mark state,
-//! id floor and stamp sequence, and a possible loss exactly when the model's entry names a tail.
+//! id floor and stamp sequence. Where the history fixes the tail (a clean power loss, a torn batch, a truncated
+//! complete batch), the log reports a possible loss exactly when the model's entry names a tail; after a stop at an
+//! arbitrary operation the file system chooses, and the tails are not compared.
 //!
 //! The differences the specification allows, made explicit here:
 //! - **Starts cut short.** The model has no start cut short: it starts once where the log starts twice, and a cut
@@ -1616,8 +1618,8 @@ fn run(ops: &[Op], every: bool) {
     REACHED[Count::SealedSegments as usize].fetch_add(sealed as u64, Ordering::Relaxed);
 }
 
-/// On every generated history, the log keeps exactly what the model says is committed, at the model's positions
-/// shifted by the recovery entries before them, and the reader returns exactly the log up to the mark.
+/// On every generated history, the log keeps exactly what the model says is committed, recovery entries included, at
+/// the model's positions (renumbered after a start cut short), and the reader returns exactly the log up to the mark.
 #[test]
 fn the_log_keeps_what_the_model_commits() {
     TestRunner::new(config(8))

@@ -1179,6 +1179,10 @@ fn s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry() {
     let k = m.facts().unwrap().last().unwrap().position;
     let (at, entry) = m.recovery_entries().into_iter().next_back().unwrap();
     assert_eq!((entry.after, at), (k, cursor.next()), "F above the cursor");
+    assert_eq!(
+        entry.id_floor, s.0,
+        "the id floor from the log, the mark lost"
+    );
     assert_eq!(entry.gap(at), Some((k.next(), cursor)));
     assert_eq!(m.disk.lost_ranges(), vec![(k.next(), cursor)]);
     let losses = m.losses();
@@ -1222,6 +1226,67 @@ fn s3_missing_cursor_file_is_named_by_the_recovery_entry() {
         m.observed[&C].iter().filter(|o| o.session == 2).count() == 1,
         "replayed from no cursor"
     );
+}
+
+/// §4 Overflow and Resync: catch-up applies reset points, and a bounded
+/// catch-up that passes a reset point and then entries routed elsewhere keeps
+/// it across calls, so the `resync` carrying `forget_above` arrives however
+/// little each call reads.
+#[test]
+fn s4_bounded_catch_up_delivers_a_reset_point_across_calls() {
+    let mut m = Model::new(
+        Config::default(),
+        vec![ConsumerDecl {
+            id: C,
+            selection: Selection::Series(BTreeSet::from([kvik_model::types::SeriesId(1)])),
+            capacity: 100,
+        }],
+        T0 + HOUR,
+    );
+    let a = m
+        .define(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+        )
+        .unwrap();
+    let b = m
+        .define(
+            "site/pump-2/speed",
+            Kind::Gauge,
+            ValueType::Number,
+            "rpm",
+            10 * SECOND,
+        )
+        .unwrap();
+    assert_eq!(a, kvik_model::types::SeriesId(1));
+    m.ingest(vec![Reading::num(a, T0, 1.0)]).unwrap();
+    m.drain().unwrap();
+    m.power_loss();
+    m.restart();
+    let entry = m.disk.mark.unwrap().last;
+    for i in 0..3 {
+        m.ingest(vec![Reading::num(b, T0 + i, 1.0)]).unwrap();
+    }
+    m.crash();
+    m.restart();
+    let mut got = Vec::new();
+    for _ in 0..10 {
+        m.catch_up(C, 1).unwrap();
+        got.extend(m.receive(C, usize::MAX).unwrap());
+        if !got.is_empty() {
+            break;
+        }
+    }
+    let r = got
+        .first()
+        .and_then(Envelope::resync)
+        .expect("the reset point");
+    let k = m.recovery_entries()[&entry].after;
+    assert_eq!(k.next(), entry);
+    assert_eq!(r.forget_above, Some(k));
 }
 
 /// §8 Acknowledging a loss: a `data_lost` holds health degraded until it is
