@@ -124,10 +124,10 @@ pub(crate) fn model_node(n: kt::Node, names: &[String]) -> km::summary::Node {
             max,
             integral,
         } => B::Gauge {
-            sum,
+            sum: sum.to_ratio(),
             min,
             max,
-            integral,
+            integral: integral.to_ratio(),
         },
         kt::Body::Counter {
             increase,
@@ -137,7 +137,7 @@ pub(crate) fn model_node(n: kt::Node, names: &[String]) -> km::summary::Node {
             long_steps,
             elapsed,
         } => B::Counter {
-            increase,
+            increase: increase.to_ratio(),
             resets,
             regressions,
             steps,
@@ -165,7 +165,7 @@ pub(crate) fn model_node(n: kt::Node, names: &[String]) -> km::summary::Node {
             max,
             apportioned,
         } => B::Interval {
-            sum,
+            sum: sum.to_ratio(),
             min,
             max,
             apportioned,

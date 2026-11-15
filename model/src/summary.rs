@@ -293,10 +293,10 @@ impl Node {
                 long_steps,
                 elapsed,
             } => {
-                let span = cur.0 - prev.0;
+                let span = i128::from(cur.0) - i128::from(prev.0);
                 *steps += 1;
-                *elapsed += i128::from(span);
-                if p.staleness.is_some_and(|s| span > s) {
+                *elapsed += span;
+                if p.staleness.is_some_and(|s| span > i128::from(s)) {
                     *long_steps += 1;
                 }
                 let a = prev.1.as_f64().expect("counter value");
@@ -560,8 +560,7 @@ fn opt(a: Option<f64>, b: Option<f64>, f: fn(f64, f64) -> f64) -> Option<f64> {
 /// Credits the readings of an interval series to the window `[start, end)`
 /// (§6 Aggregates, interval series): each reading's amount pro rata to the
 /// part of its interval `[t, t + d)` inside the window, computed exactly
-/// (the specification computes it in f64 and compares within the §5.6
-/// tolerance); coverage is the length of those parts; a part shorter than d
+/// (§5.6); coverage is the length of those parts; a part shorter than d
 /// flags the result `apportioned`. Count, first, last, min and max are over
 /// readings whose `t` lies in the window. Readings must be ready: the caller
 /// leaves out those of an observed series with `t + d > now`.
@@ -571,7 +570,7 @@ where
 {
     let d = p.interval.expect("interval series").length;
     for (t, v) in readings {
-        let overlap = (t.saturating_add(d)).min(end) - (*t).max(start);
+        let overlap = i128::from(t.saturating_add(d).min(end)) - i128::from((*t).max(start));
         if overlap <= 0 && !(start <= *t && *t < end) {
             continue;
         }
@@ -590,12 +589,12 @@ where
             *sum = sum_before;
             if overlap > 0 {
                 let x = v.as_f64().expect("interval value");
-                *sum += exact(x) * exact_ns(i128::from(overlap)) / exact_ns(i128::from(d));
-                *apportioned |= overlap < d;
+                *sum += exact(x) * exact_ns(overlap) / exact_ns(i128::from(d));
+                *apportioned |= overlap < i128::from(d);
             }
         }
         if overlap > 0 {
-            node.coverage += i128::from(overlap);
+            node.coverage += overlap;
         }
     }
 }

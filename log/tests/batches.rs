@@ -129,7 +129,8 @@ fn definition() -> impl Strategy<Value = Definition> {
             any::<i64>(),
         ),
         (
-            prop::collection::vec("[A-Za-z_]{1,63}", 1..5),
+            prop::collection::btree_set("[A-Za-z_]{1,63}", 1..5)
+                .prop_map(|names| names.into_iter().collect::<Vec<_>>()),
             0u8..=2,
             0u8..=2,
             interval,
@@ -955,8 +956,15 @@ fn definition_field_ranges() {
         f
     };
     assert!(
-        matches!(&decode_one(1, two).unwrap().entries[0], Entry::Definition(d) if d.state_names == ["off", "on"])
+        matches!(&decode_one(1, two.clone()).unwrap().entries[0], Entry::Definition(d) if d.state_names == ["off", "on"])
     );
+    let twice = {
+        let mut f = two;
+        let i = f.iter().rposition(|e| e.0 == 13).unwrap();
+        f[i].1 = b"off".to_vec();
+        f
+    };
+    assert_eq!(decode_one(1, twice), field_err(13));
     assert_eq!(
         decode_one(1, replace(state.clone(), 13, vec![])),
         field_err(13)

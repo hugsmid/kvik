@@ -4,8 +4,9 @@ Summary-tree nodes of the kvik storage engine (`docs/spec.md` §5, roadmap 7.1a)
 associative merge, the window edge credit, and the canonical byte layout of a stored node, laid out in
 [`docs/format-tree.md`](../docs/format-tree.md). Part of the kvik storage engine; not published on its own.
 
-- Sums, integrals and increases are exact rationals (Q-180); a stored node holds them as dyadic numbers, so a node
-  and every aggregate taken from it equal the reference model's whatever the bracketing.
+- Sums, integrals and increases are exact (Q-180): a dyadic mantissa and binary exponent, which folding and merging
+  never leave, so no gcd runs; a rational only after a window's pro rata division. A node and every aggregate taken
+  from it equal the reference model's whatever the bracketing.
 - `encode` writes the one byte sequence of a node and refuses window evaluations; `decode` applies the checks of
   T.6, never panics and never allocates from an unchecked length.
 
@@ -24,6 +25,7 @@ assert_eq!(encode(&parts).unwrap(), encode(&whole).unwrap());
 assert_eq!(decode(&encode(&whole).unwrap()).unwrap(), whole);
 ```
 
-Tests: merge laws and agreement with the model (`tests/properties.rs`), layout checks (`tests/layout.rs`), golden
+Tests: merge laws and agreement with the model (`tests/properties.rs`), layout checks (`tests/layout.rs`, one vector
+per T.6 check in `tests/checks.rs`), node rules (`tests/nodes.rs`), golden
 nodes (`tests/golden/`), the fuzz entry over random and mutated inputs (`tests/fuzz_inputs.rs`), and a cargo-fuzz
-target in [`fuzz/`](fuzz/README.md).
+target in [`fuzz/`](fuzz/README.md). Fold time and node sizes: `cargo run --release -p kvik-tree --example fold_cost`.

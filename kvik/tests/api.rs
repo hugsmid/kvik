@@ -1629,3 +1629,24 @@ fn a_reset_ceiling_off_the_parts_per_million_grid_is_refused() {
         block_on(s.define_series(with("a/b/on", 0.333_333))).unwrap();
     }
 }
+
+#[test]
+fn a_state_name_declared_twice_is_refused() {
+    for b in BACKENDS {
+        let (s, _clock) = store_on(b, "twice");
+        let spec = SeriesSpec::new(
+            "a/b/switch",
+            Kind::State {
+                values: StateValues::Named(vec!["on".into(), "on".into()]),
+            },
+            "",
+        );
+        assert!(
+            matches!(
+                block_on(s.define_series(spec)),
+                Err(DefineError::Invalid { .. })
+            ),
+            "{b:?}"
+        );
+    }
+}

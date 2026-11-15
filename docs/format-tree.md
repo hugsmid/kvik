@@ -17,8 +17,10 @@ fold (a stretched window whose stretches keep within its first and last readings
 Decimal series (`spec.md` §5.6: `i128` sums at the node's `u8` scale) take form ids of their own, laid out with
 decimal series in the durable backend; they are additions under the critical rule, not a new major version.
 
-Notation: `i64` and `u16` are little-endian; `uv` is a minimal unsigned LEB128 (`format-chunk.md` C.2) of at most
-64 bits (`uv64`) or 127 bits (`uv127`); `f64` is the 8-byte bit pattern, little-endian, finite.
+Notation: `i64` and `u16` are little-endian; `f64` is the 8-byte bit pattern, little-endian, finite. `uv` is an
+unsigned LEB128: seven bits per byte, the lowest group first, the high bit set on every byte but the last; it is in its
+shortest form (a last byte of zero only when it is the only byte) and holds at most 64 bits (`uv64`) or 127 bits
+(`uv127`).
 
 ## T.2 Node
 | Field | Encoding | Notes |
@@ -50,8 +52,10 @@ nanoseconds. So each is stored as ± mantissa × 2^`exp` with an odd mantissa:
 
 The magnitude is below 2^1100: a node holds fewer than 2^64 readings and covers less than 2^64 ns, so a sum is below
 2^1088, an integral below 2^1088 and an increase below 2^1090. Mantissa and exponent therefore take at most 272
-bytes; values of similar magnitude, the usual case, take a few. A 15-minute node of a gauge read every 5 s takes about
-80 bytes in all (`gauge-quarter.node`); a node holding both 5e−324 and 1e300 takes about 600.
+bytes; values of similar magnitude, the usual case, take a few. Measured (`cargo run --release -p kvik-tree --example
+fold_cost`): a 1-minute node of a gauge read every 5 s at 0.01 resolution takes 86 bytes in all, its 15-minute node
+88 bytes, and the 1-minute node with one subnormal reading among the 12 takes 346 bytes; `gauge.node`, holding both
+5e−324 and 1e300, takes 592.
 
 ## T.4 Values and state keys
 By form: gauge, counter and interval values are `f64`. A state value and a state key are a tag, `u8` 0 false, 1 true,
@@ -77,7 +81,8 @@ encoding it again gives the same bytes. Golden files rely on it.
 A reader refuses, naming the offset: bytes ending inside a field, or bytes after the node; a `uv` not in its shortest
 form or out of range; a reserved form (`UnsupportedForm`, a version refusal); an `end` beyond `i64`; coverage with no
 readings; coverage beyond last `t` − first `t` on any form but interval (holds lie between consecutive readings); a
-first `t` outside the span; a last `t` not after the first or not before `end`; a value or bound that is not finite;
+first `t` outside the span; a last `t` not after the first or not before `end`; more readings than
+nanoseconds from the first `t` to the last, plus one (readings have distinct times); a value or bound that is not finite;
 text that is not UTF-8; an unknown state tag; an exact number with an unknown sign, an even mantissa, a mantissa with
 a zero last byte, a length outside 1 to 272 or a magnitude outside T.3; a gauge or interval sum with no readings; a
 gauge integral with no coverage; first or last outside min and max, or min and max that differ with one reading; a

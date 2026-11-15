@@ -294,7 +294,7 @@ Series definition fields, all critical:
 | 10 | `wrap_at` | 8 bytes in the series' value type, or none | counters |
 | 11 | `reset_ceiling` | u32 parts per million (10 % = 100,000) | counters |
 | 12 | lateness bound | i64 ns | always |
-| 13 | state name (repeated, in index order) | UTF-8, 1–63 bytes; at most 65,536 | value type 3 |
+| 13 | state name (repeated, in index order) | UTF-8, 1–63 bytes, distinct (Q-182); at most 65,536 | value type 3 |
 | 14 | versioning | u8: 0 not versioned, 1 `changed_at` is a time, 2 a version | always |
 | 15 | timing | u8: 0 observed, 1 scheduled, 2 forecast | always |
 | 16 | interval length tag | u8: 0 fixed, 1 `day`, 2 `month` | kind 5 |

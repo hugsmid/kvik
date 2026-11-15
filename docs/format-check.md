@@ -506,7 +506,7 @@ entries, the node version, the `summary_stale` flag and the checkpoint position.
 **Scenario.** Two builds serialise a node's `i128` sum differently and produce different tree files from the same
 facts; rebuild-equals-live compares them byte for byte.
 **Needed:** the layout before 7.1.
-**Deferred at gate 3.3** to roadmap 7.1 and 7.3 (needs the tree).
+**Deferred at gate 3.3** to roadmap 7.1 and 7.3 (needs the tree). **Laid out by roadmap 7.1a** for the node: `format-tree.md` (the §5.2 fields per kind, exact dyadic sums for a series without a decimal scale, Q-180, and the state time map); the node version, `summary_stale` and the checkpoint position are left to the tree file of 7.1b, and decimal node forms and calendar nodes to the items that bring them.
 
 ### FC-35 — The compacted segment depends on 2.1, and Parquet has no A.1 header
 **Where:** B (compacted segment) · **Severity:** can wait (6.2) · **Relates to:** roadmap 2.1, 10.3, §7, §8 Hashes

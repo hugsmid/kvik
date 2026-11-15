@@ -879,10 +879,17 @@ fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
         .all(13)
         .map(|v| p.text(13, v, 1, 63))
         .collect::<Result<_, _>>()?;
+    // Distinct, so a state's index and its name count the same transitions (Q-182).
+    let distinct = {
+        let mut sorted: Vec<&String> = state_names.iter().collect();
+        sorted.sort_unstable();
+        sorted.windows(2).all(|w| w[0] != w[1])
+    };
     if (value_type == ValueType::State) == state_names.is_empty()
         || state_names.len() > MAX_STATE_NAMES
+        || !distinct
     {
-        return Err(if state_names.len() > MAX_STATE_NAMES {
+        return Err(if state_names.len() > MAX_STATE_NAMES || !distinct {
             p.bad(13)
         } else {
             p.presence(13)

@@ -5,9 +5,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use num_bigint::BigUint;
-use num_traits::Zero;
 
-use crate::exact::{Dyadic, Exact, dyadic, from_dyadic};
+use crate::exact::{Dyadic, Exact};
 use crate::node::{Body, Kind, Node, StateKey, Value};
 
 /// Form ids of a stored node (`format-tree.md` T.2); every other id is reserved, decimal forms among them.
@@ -208,6 +207,10 @@ pub fn decode(bytes: &[u8]) -> Result<Node, DecodeError> {
             let dt = r.uv64()?;
             if dt == 0 || i128::from(ft) + i128::from(dt) >= i128::from(end) {
                 return Err(r.invalid(at, "last reading not after the first inside the span"));
+            }
+            // Readings have distinct nanosecond times.
+            if count - 1 > dt {
+                return Err(r.invalid(at, "more readings than nanoseconds between first and last"));
             }
             ((i128::from(ft) + i128::from(dt)) as i64, r.value(kind)?)
         };
@@ -416,7 +419,10 @@ fn put_extremes(
 }
 
 fn put_exact(w: &mut Vec<u8>, x: &Exact) -> Result<(), NotStorable> {
-    let Some(d) = dyadic(x).map_err(|()| NotStorable("an exact field that is not dyadic"))? else {
+    let Some(d) = x
+        .dyadic()
+        .map_err(|()| NotStorable("an exact field that is not dyadic"))?
+    else {
         w.push(0);
         return Ok(());
     };
@@ -586,7 +592,7 @@ impl Reader<'_> {
         if exp < MIN_EXP || exp.saturating_add(bits) > MAX_BITS {
             return Err(self.invalid(at, "exact number out of range"));
         }
-        Ok(from_dyadic(Dyadic {
+        Ok(Exact::from_dyadic(Dyadic {
             negative,
             mantissa,
             exp,

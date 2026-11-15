@@ -291,11 +291,6 @@ impl Node {
         matches!(self.body, Body::Interval { apportioned, .. } if apportioned)
     }
 
-    /// Whether a rate over this node is flagged (spec §6).
-    pub fn rate_flagged(&self) -> bool {
-        matches!(self.body, Body::Counter { long_steps, .. } if long_steps > 0)
-    }
-
     /// Credits `ns` nanoseconds of value `v`: coverage, integral, state time.
     pub(crate) fn hold(&mut self, v: &Value, ns: i128) {
         if ns <= 0 {
@@ -324,10 +319,10 @@ impl Node {
                 long_steps,
                 elapsed,
             } => {
-                let span = cur.0 - prev.0;
+                let span = i128::from(cur.0) - i128::from(prev.0);
                 *steps += 1;
-                *elapsed += i128::from(span);
-                if p.staleness.is_some_and(|s| span > s) {
+                *elapsed += span;
+                if p.staleness.is_some_and(|s| span > i128::from(s)) {
                     *long_steps += 1;
                 }
                 let a = prev.1.as_f64().expect("counter value");

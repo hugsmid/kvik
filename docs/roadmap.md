@@ -80,7 +80,9 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   fails when `ZSTD_SYS_USE_PKG_CONFIG` is set; Q-150)
 
 ## 7. Summary tree
-- [ ] 7.1 Stored levels, checkpoints, rebuild-equals-live
+- [x] 7.1a Summary nodes: the per-node fold, the associative merge and the canonical byte layout (`kvik-tree`,
+  `docs/format-tree.md`; exact node fields, signed zeros and distinct state names settled in Q-180 to Q-182)
+- [ ] 7.1b Stored levels, tree files, checkpoints, rebuild-equals-live (moved from 7.1)
 - [ ] 7.2 Late and corrected data; revisions
 - [ ] 7.3 Calendar levels; windowed operators over the tree
 - [ ] 7.4 **Gate** — tree looked at as a whole

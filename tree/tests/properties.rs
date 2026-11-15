@@ -5,13 +5,36 @@ mod support;
 
 use kvik_model as km;
 use kvik_tree::{
-    Node, Value, credit_intervals, decode, encode, fold, merge, merge_all, with_stretches,
+    Body, Node, Value, credit_intervals, decode, encode, fold, merge, merge_all, with_stretches,
 };
 use proptest::prelude::*;
 use support::*;
 
 fn bytes(n: &Node) -> Vec<u8> {
     encode(n).expect("a fold or merge of readings is storable")
+}
+
+/// Min and max by bit pattern, so −0.0 and +0.0 differ.
+fn extremes(n: &Node) -> Option<(u64, u64)> {
+    match n.body {
+        Body::Gauge { min, max, .. } | Body::Interval { min, max, .. } => {
+            Some((min?.to_bits(), max?.to_bits()))
+        }
+        _ => None,
+    }
+}
+
+/// Min and max of readings in IEEE total order (Q-181), by bit pattern.
+fn total_order_extremes(r: &[(i64, Value)]) -> Option<(u64, u64)> {
+    let mut x = r.iter().filter_map(|(_, v)| v.as_f64());
+    let first = x.next()?;
+    let (lo, hi) = x.fold((first, first), |(lo, hi), v| {
+        (
+            if v.total_cmp(&lo).is_lt() { v } else { lo },
+            if v.total_cmp(&hi).is_gt() { v } else { hi },
+        )
+    });
+    Some((lo.to_bits(), hi.to_bits()))
 }
 
 fn parts(c: &Case, edges: &[i64]) -> Vec<Node> {
@@ -30,6 +53,7 @@ proptest! {
         let all = fold(&c.p, c.start, c.end, &c.readings);
         let merged = merge_all(&c.p, c.start, &parts(&c, &c.edges(&cuts)));
         prop_assert_eq!(&merged, &all);
+        prop_assert_eq!(extremes(&merged), extremes(&all));
         prop_assert_eq!(bytes(&merged), bytes(&all));
     }
 
@@ -40,6 +64,7 @@ proptest! {
         let left = merge(&c.p, &merge(&c.p, a, b), d);
         let right = merge(&c.p, a, &merge(&c.p, b, d));
         prop_assert_eq!(&left, &right);
+        prop_assert_eq!(extremes(&left), extremes(&right));
         prop_assert_eq!(bytes(&left), bytes(&right));
     }
 
@@ -70,7 +95,12 @@ proptest! {
         );
         prop_assert_eq!(model_node(&a), ma.clone());
         prop_assert_eq!(model_node(&b), mb.clone());
-        prop_assert_eq!(model_node(&merge(&c.p, &a, &b)), km::summary::merge(&mp, &ma, &mb));
+        let ab = merge(&c.p, &a, &b);
+        prop_assert_eq!(model_node(&ab), km::summary::merge(&mp, &ma, &mb));
+        if matches!(ab.body, Body::Gauge { .. } | Body::Interval { .. }) {
+            prop_assert_eq!(extremes(&a), total_order_extremes(c.within(e[0], e[1])));
+            prop_assert_eq!(extremes(&ab), total_order_extremes(c.within(e[0], e[2])));
+        }
     }
 
     #[test]
@@ -112,6 +142,7 @@ proptest! {
             let b = bytes(&n);
             let back = decode(&b).unwrap();
             prop_assert_eq!(&back, &n);
+            prop_assert_eq!(extremes(&back), extremes(&n));
             prop_assert_eq!(bytes(&back), b);
         }
     }
@@ -128,12 +159,8 @@ fn signed_zeros_give_the_same_bytes_in_any_order_of_folding() {
         &fold(&p, 0, SECOND, &r(0.0, -0.0)[..1]),
         &fold(&p, SECOND, 2 * SECOND, &r(0.0, -0.0)[1..]),
     );
-    let extremes = |n: &Node| match n.body {
-        kvik_tree::Body::Gauge { min, max, .. } => (min.unwrap().to_bits(), max.unwrap().to_bits()),
-        _ => unreachable!(),
-    };
     for n in [&one, &other, &split] {
-        assert_eq!(extremes(n), ((-0.0f64).to_bits(), 0.0f64.to_bits()));
+        assert_eq!(extremes(n), Some(((-0.0f64).to_bits(), 0.0f64.to_bits())));
     }
     assert_eq!(bytes(&one), bytes(&split));
 }

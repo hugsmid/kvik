@@ -46,7 +46,7 @@ where
 {
     let d = p.interval.expect("interval series");
     for (t, v) in readings {
-        let overlap = t.saturating_add(d).min(end) - (*t).max(start);
+        let overlap = i128::from(t.saturating_add(d).min(end)) - i128::from((*t).max(start));
         let inside = start <= *t && *t < end;
         if inside {
             node.note(*t, v);
@@ -61,8 +61,8 @@ where
             panic!("interval node");
         };
         let x = v.as_f64().expect("interval value");
-        *sum += exact(x) * exact_ns(i128::from(overlap)) / exact_ns(i128::from(d));
-        *apportioned |= overlap < d;
-        node.coverage += i128::from(overlap);
+        *sum += exact(x) * exact_ns(overlap) / exact_ns(i128::from(d));
+        *apportioned |= overlap < i128::from(d);
+        node.coverage += overlap;
     }
 }

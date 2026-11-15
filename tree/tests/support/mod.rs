@@ -188,10 +188,10 @@ pub fn model_node(n: &Node) -> km::summary::Node {
             max,
             integral,
         } => B::Gauge {
-            sum: sum.clone(),
+            sum: sum.to_ratio(),
             min: *min,
             max: *max,
-            integral: integral.clone(),
+            integral: integral.to_ratio(),
         },
         Body::Counter {
             increase,
@@ -201,7 +201,7 @@ pub fn model_node(n: &Node) -> km::summary::Node {
             long_steps,
             elapsed,
         } => B::Counter {
-            increase: increase.clone(),
+            increase: increase.to_ratio(),
             resets: *resets,
             regressions: *regressions,
             steps: *steps,
@@ -228,7 +228,7 @@ pub fn model_node(n: &Node) -> km::summary::Node {
             max,
             apportioned,
         } => B::Interval {
-            sum: sum.clone(),
+            sum: sum.to_ratio(),
             min: *min,
             max: *max,
             apportioned: *apportioned,
