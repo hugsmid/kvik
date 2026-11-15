@@ -543,11 +543,18 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
   record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire and `0x22` sealed log segment are laid out below. Reserved for their roadmap items:
-  `0x25` restore (8.3; it carries the restore's reset stamp, `spec.md` §8 Generations), `0x26` quarantine and `0x27` tier move (8.1). A rebuild never reconstructs these two: a
+  `0x25` restore (8.3; it carries the restore's reset stamp, `spec.md` §8 Generations), `0x26` quarantine (8.1) and `0x27` copy verified (laid out below). A rebuild never reconstructs `0x26` or `0x27`: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
   another tier" is verified again, so their layouts may hold no fact that only they hold. Until their items lay them
   out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
-  with field 100 added; the catalogue of files does not apply one.
+  with field 100 added; the catalogue of files does not apply one. A reserved type stays written and carried as a
+  field list once laid out; only its decoding becomes strict.
+- Copy verified (`0x27`, Q-281): 1 the file, 12 bytes (kind `u8`, 3 reserved zero bytes, `file_id` `u64`); 2 the tier
+  holding the copy, `u8` (1 hot, 2 cold, 3 deep); 3 the object's size `u64`; 4 its SHA-256 as the bucket reported it
+  (32 bytes; for deep, of the ciphertext, `spec.md` §8 Hashes). Each field exactly once; another field below `0x8000`
+  is unsupported. Written only after the bucket reported that size and hash for the uploaded object. One carried
+  into a rebuilt manifest (it holds field 100) gives the copy but does not count the file as verified, which takes a
+  fresh record (`spec.md` §7 Manifest; Q-280).
 - **Canonical writing.** A record's own fields in ascending id order, a repeated field's values in the order stated
   for it; then field 100; then any ignorable fields it was read with, in their order. A record of a reserved or
   unknown skippable type keeps its fields in their order, field 100 placed before the first field with a higher id.
