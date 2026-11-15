@@ -672,6 +672,133 @@ mod tests {
         out
     }
 
+    /// A body of `vt.len()` rows with plain columns and the given extra columns.
+    fn plain_body(vt: &[u8], values: &[u64], extra: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let n = vt.len();
+        let t = encode_plain(&(0..n as i64).collect::<Vec<_>>());
+        let gens = encode_plain(&vec![1u32; n]);
+        let seq = encode_plain(&(1..=n as u64).collect::<Vec<_>>());
+        let vals = encode_plain(values);
+        let mut cols: Vec<(u8, u8, &[u8])> = vec![
+            (column::T, encoding::PLAIN, &t),
+            (column::VALUE_TYPE, encoding::PLAIN, vt),
+            (column::VALUE, encoding::PLAIN, &vals),
+            (column::GENERATION, encoding::PLAIN, &gens),
+            (column::SEQUENCE, encoding::PLAIN, &seq),
+        ];
+        for (id, p) in extra {
+            cols.push((*id, encoding::PLAIN, p));
+        }
+        cols.sort_by_key(|c| c.0);
+        rebuild(n as u16, &cols)
+    }
+
+    #[test]
+    fn value_ranges_are_checked() {
+        let v = |column, row| Err(DecodeError::Value { column, row });
+        assert!(Block::decode(&plain_body(&[1, 1], &[5, 6], &[])).is_ok());
+        assert_eq!(
+            Block::decode(&plain_body(
+                &[1, 1],
+                &[5, 6],
+                &[(column::QUALITY, vec![0, 4])]
+            )),
+            v(column::QUALITY, 1)
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[1, 6], &[5, 6], &[])),
+            v(column::VALUE_TYPE, 1)
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[0, 1], &[5, 6], &[])),
+            v(column::VALUE_TYPE, 0)
+        );
+        let scale = |s: u8| (column::SCALE, vec![s]);
+        assert!(Block::decode(&plain_body(&[2], &[5], &[scale(18)])).is_ok());
+        assert_eq!(
+            Block::decode(&plain_body(&[2], &[5], &[scale(19)])),
+            v(column::SCALE, 0)
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[2], &[i64::MIN as u64], &[scale(2)])),
+            v(column::VALUE, 0)
+        );
+        assert!(Block::decode(&plain_body(&[3], &[65_535], &[])).is_ok());
+        assert_eq!(
+            Block::decode(&plain_body(&[3], &[65_536], &[])),
+            v(column::VALUE, 0)
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[4], &[2], &[])),
+            v(column::VALUE, 0)
+        );
+        let heap = |h: &[u8]| (column::TEXT_HEAP, h.to_vec());
+        assert!(Block::decode(&plain_body(&[5, 5], &[2, 0], &[heap(b"ok")])).is_ok());
+        assert_eq!(
+            Block::decode(&plain_body(&[5], &[256], &[heap(&[b'a'; 256])])),
+            v(column::VALUE, 0)
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[5], &[2], &[heap(&[0xC3, 0x28])])),
+            Err(DecodeError::Text { row: 0 })
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[5], &[2], &[heap(b"abc")])),
+            Err(DecodeError::Text { row: 1 })
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[5], &[3], &[heap(b"ab")])),
+            Err(DecodeError::Text { row: 0 })
+        );
+        // Presence: text rows without a heap, a heap without text rows, a changed_at column without flag bit 6.
+        assert_eq!(
+            Block::decode(&plain_body(&[5], &[0], &[])),
+            Err(DecodeError::Presence {
+                column: column::TEXT_HEAP
+            })
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[1], &[0], &[heap(b"")])),
+            Err(DecodeError::Presence {
+                column: column::TEXT_HEAP
+            })
+        );
+        assert_eq!(
+            Block::decode(&plain_body(&[1], &[0], &[(column::CHANGED_AT, vec![0; 8])])),
+            Err(DecodeError::Presence {
+                column: column::CHANGED_AT
+            })
+        );
+        // A plain body is valid but not canonical where run-length or delta is shorter.
+        let body = plain_body(&[1; 40], &[7; 40], &[]);
+        assert!(Block::decode(&body).is_ok());
+        assert_eq!(
+            Block::decode_canonical(&body),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn non_minimal_delta_is_valid_but_not_canonical() {
+        let b = sample(3);
+        let body = b.encode().unwrap();
+        let mut d = directory(&body).unwrap();
+        assert_eq!(d[0], (column::T, encoding::DELTA, d[0].2));
+        // t on a 1 s grid: first value, then one frame with min 10^9 and width 0; widen it to 1 bit (2 zero bits).
+        let mut t = d[0].2.to_vec();
+        let w = t.len() - 1;
+        assert_eq!(t[w], 0);
+        t[w] = 1;
+        t.push(0);
+        d[0].2 = &t;
+        let wide = rebuild(3, &d);
+        assert_eq!(Block::decode(&wide), Ok(b));
+        assert_eq!(
+            Block::decode_canonical(&wide),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
     #[test]
     fn directory_checks() {
         let body = sample(5).encode().unwrap();
