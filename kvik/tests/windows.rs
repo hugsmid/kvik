@@ -319,8 +319,9 @@ fn next() -> u64 {
 
 #[test]
 fn durable_results_equal_the_model_s() {
-    // Each case opens a durable store and runs some thousands of queries on each backend.
-    let cases = (ProptestConfig::default().cases / 8).max(16);
+    // Each case opens a durable store and runs some thousands of queries on each backend: a 32nd of the configured
+    // cases keeps the deep runs in bounds (`.github/workflows/ci.yml`, the `deep` job).
+    let cases = (ProptestConfig::default().cases / 32).max(16);
     let mut runner = TestRunner::new(ProptestConfig {
         cases,
         failure_persistence: None,

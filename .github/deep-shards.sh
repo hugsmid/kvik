@@ -38,6 +38,7 @@ log-histories   log   model_histories
 log-writer      log   writer
 log-recovery    log   recovery
 log-reader      log   reader
+kvik-windows    kvik  windows
 '
 
 cd "$(dirname "$0")/.."
