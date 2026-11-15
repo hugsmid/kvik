@@ -712,6 +712,171 @@ fn a_forged_seal_in_the_last_segment_is_a_torn_tail() {
     r.check_started();
 }
 
+/// Bytes as a torn tail may hold them after the last complete batch at `end` of segment `id`: an entries block
+/// defining series 77, a commit block that is checksum-valid but closes no complete batch, and then, as the last
+/// bytes of a value, the 96 bytes of a seal whose trailer counts one batch ending at position 1, as the scan finds.
+/// Returns them and the length of the forged seal.
+fn forged_tail(bytes: &[u8], id: &SegmentIdentity, end: usize) -> (Vec<u8>, usize) {
+    use kvik_log::block::{block_type, encode_block};
+    use kvik_log::entries::{Definition, EntriesBlock, Kind, Retention, Timing, Versioning};
+    let def = Definition {
+        id: 77,
+        name: "s77".into(),
+        kind: Kind::Gauge,
+        value_type: kvik_log::facts::ValueType::F64,
+        scale: None,
+        unit: "u".into(),
+        expected_interval: None,
+        staleness: None,
+        record_on_change: false,
+        counter: None,
+        lateness_bound: 1_000_000_000,
+        state_names: vec![],
+        versioning: Versioning::None,
+        timing: Timing::Observed,
+        interval: None,
+        retention: Retention::LongTerm,
+        excess_precision: None,
+        staleness_set: false,
+    };
+    let body = EntriesBlock {
+        first_sequence: 2,
+        received_at: T0,
+        entries: vec![Entry::Definition(Box::new(def))],
+    }
+    .encode()
+    .unwrap();
+    let mut tail = Vec::new();
+    encode_block(block_type::ENTRIES, 0, &body, &mut tail).unwrap();
+    let commit = kvik_log::body::Commit {
+        generation: 0,
+        block_count: 1,
+        first_sequence: 2,
+        last_sequence: 2,
+        commit_time: T0,
+        batch_bytes: tail.len() as u64,
+        batch_crc32c: 0,
+    };
+    encode_block(block_type::COMMIT, 0, &commit.encode(), &mut tail).unwrap();
+    let mut before = bytes[..end].to_vec();
+    before.extend_from_slice(&tail);
+    let summary = kvik_log::segment::SealSummary {
+        entry_count: 1,
+        first_sequence: 1,
+        last_sequence: 1,
+        first_commit_time: 0,
+        last_commit_time: 0,
+        batch_count: 1,
+    };
+    let seal = kvik_log::segment::encode_seal(
+        &before,
+        &summary,
+        &kvik_log::body::SegmentIndex {
+            flags: 0,
+            records: vec![],
+        },
+    )
+    .unwrap();
+    // The forgery is what the old classing took for a seal.
+    let mut forged = before.clone();
+    forged.extend_from_slice(&seal);
+    assert!(scan(&forged, id, ScanLimit::End).unwrap().seal.is_some());
+    tail.extend_from_slice(&seal);
+    (tail, seal.len())
+}
+
+/// Q-109: a forged seal as the last bytes of a torn batch in the last segment in use fails the structural rule (its
+/// blocks do not start at the end of the last complete batch), so the torn tail is seen whole: the recovery entry
+/// counts its readable commit block and the id floor covers the definition in it.
+#[test]
+fn a_forged_seal_after_a_torn_batch_in_the_last_segment_hides_nothing() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.w = None;
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let end = scan(&bytes, &id, ScanLimit::End).unwrap().batches[0].end() as usize;
+    let (tail, _) = forged_tail(&bytes, &id, end);
+    r.fs.poke(&seg, end, &tail);
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    let e = rep.entry.as_ref().expect("a recovery entry").entry.clone();
+    assert_eq!(e.readable_commits, 1, "the tail's commit block is counted");
+    assert_eq!(
+        e.id_floor, 77,
+        "the definition in the tail raises the id floor"
+    );
+    assert_eq!(
+        e.tail_bytes,
+        tail.len() as u64 - 1,
+        "up to the last non-zero byte"
+    );
+    assert_eq!(r.w().stats().max_series_id, 77);
+    assert!(rep.to_seal.is_empty());
+    r.check_started();
+}
+
+/// Q-109: a segment that is not the last in use, left unsealed with bytes after its last complete batch that end in
+/// a forged seal: the forgery fails the structural rule, the bytes are seal blocks or damage (A.4), and the segment
+/// is sealed again at the end of its last complete batch, the forged bytes dropped. (This passed before the rule
+/// too: sealing again from step 1 already wrote the seal at the real end.)
+#[test]
+fn a_forged_seal_in_a_segment_that_is_not_the_last_in_use_is_ignored() {
+    let mut r = Rig::new(WriterConfig {
+        segment_size: 16 << 10,
+        ..cfg()
+    });
+    // Write until the writer rolls to segment 2; segment 1 is killed before its seal runs.
+    let mut t = 0;
+    while r.w().stats().open_file_id != Some(2) {
+        r.submit(vec![fact(1, t)]);
+        r.step();
+        if r.w().stats().open_file_id != Some(2) {
+            r.maint();
+        }
+        r.advance(10 * MS);
+        t += 1;
+        assert!(t < 10_000, "no roll");
+    }
+    assert!(r.w().fault().is_none());
+    r.kill();
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).expect("left unsealed");
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let found = scan(&bytes, &id, ScanLimit::End).unwrap();
+    assert!(found.seal.is_none());
+    let n = found.batches.len();
+    let end = found.batches[n - 1].end() as usize;
+    let (tail, _) = forged_tail(&bytes, &id, end);
+    r.fs.poke(&seg, end, &tail);
+    let rep = r.open().unwrap();
+    assert_eq!(rep.to_seal, vec![1]);
+    assert!(rep.losses.is_empty(), "{rep:?}");
+    r.maint();
+    let kvl =
+        r.fs.read(&log_path("00000000-0000000000000001.kvl"))
+            .expect("sealed");
+    let sealed = scan(&kvl, &id, ScanLimit::End).unwrap();
+    let real = sealed.seal.expect("a seal");
+    assert_eq!(real.start, end as u64, "sealed at the real end");
+    assert_eq!(real.end, kvl.len() as u64);
+    assert_eq!(real.trailer.batch_count, n as u64);
+    assert_eq!(sealed.batches.len(), n);
+    assert!(sealed.regions.is_empty());
+    assert!(real.file_crc_matches(&kvl));
+    r.check_started();
+}
+
 #[test]
 fn a_definition_still_readable_in_the_torn_tail_raises_the_id_floor() {
     use kvik_log::entries::{Definition, EntriesBlock, Kind, Retention, Timing, Versioning};

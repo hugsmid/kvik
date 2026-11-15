@@ -167,7 +167,31 @@ pub fn scan<'a>(
     id: &SegmentIdentity,
     limit: ScanLimit,
 ) -> Result<ScanReport<'a>, FormatError> {
-    let mut s = Scanner::new(bytes, id, limit)?;
+    collect(Scanner::new(bytes, id, limit)?)
+}
+
+/// [`scan`] to the end with any seal blocks ignored: their bytes are read as whatever precedes them (a torn batch or
+/// a value). Recovery uses it for an `.open` file whose seal fails the structural rule of A.4 (the seal blocks start
+/// exactly at the end of the last complete batch, and the trailer's `batch_count` and `last_sequence` equal the
+/// scan's), or that is the last in use (Q-109).
+pub(crate) fn scan_ignoring_seal<'a>(
+    bytes: &'a [u8],
+    id: &SegmentIdentity,
+) -> Result<ScanReport<'a>, FormatError> {
+    let from = Resume {
+        offset: HEADER_LEN as u64,
+        last_sequence: None,
+    };
+    collect(Scanner::resume_inner(
+        bytes,
+        id,
+        ScanLimit::End,
+        from,
+        false,
+    )?)
+}
+
+fn collect(mut s: Scanner<'_>) -> Result<ScanReport<'_>, FormatError> {
     let mut batches = Vec::new();
     let mut regions = Vec::new();
     for found in &mut s {
@@ -249,6 +273,16 @@ impl<'a> Scanner<'a> {
         limit: ScanLimit,
         from: Resume,
     ) -> Result<Self, FormatError> {
+        Self::resume_inner(bytes, id, limit, from, true)
+    }
+
+    fn resume_inner(
+        bytes: &'a [u8],
+        id: &SegmentIdentity,
+        limit: ScanLimit,
+        from: Resume,
+        find_seals: bool,
+    ) -> Result<Self, FormatError> {
         let header = read_header(bytes, id)?;
         if let ScanLimit::Mark(m) = limit
             && !m.is_multiple_of(8)
@@ -261,7 +295,7 @@ impl<'a> Scanner<'a> {
         };
         let (area_end, seal) = match limit {
             ScanLimit::Mark(m) => (m, None),
-            ScanLimit::End => match find_seal(bytes) {
+            ScanLimit::End => match find_seal(bytes).filter(|_| find_seals) {
                 Some(s) => (s.start, Some(s)),
                 None => (bytes.len() as u64, None),
             },

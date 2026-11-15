@@ -26,7 +26,7 @@ use crate::mark::{
     MARK_LEN, MarkSlot, ResetStamp, SLOT_OFFSETS, encode_mark_file, read_mark, read_slots,
 };
 use crate::name::SegmentName;
-use crate::scan::{HeaderState, ScanLimit, Tail, scan};
+use crate::scan::{HeaderState, ScanLimit, ScanReport, Tail, scan, scan_ignoring_seal};
 use crate::segment::SealSummary;
 use crate::store::{LEASES_DIR, MANIFEST, MARK, StoreDir, StoreError};
 
@@ -158,6 +158,8 @@ struct Seg {
     /// Series ids defined by entries blocks still readable in a torn tail (`spec.md` §2.1, id floor).
     tail_ids: Vec<u32>,
     last_nonzero: u64,
+    /// Seal blocks that hold to the structural rule were found and bound the scan.
+    sealed: bool,
 }
 
 impl Seg {
@@ -195,14 +197,40 @@ fn manifest_error(e: ManifestError) -> StoreError {
     }
 }
 
-fn scan_segment(store: &StoreDir, name: SegmentName, path: PathBuf) -> Result<Seg, StoreError> {
+/// Whether the seal blocks a scan found hold to the structural rule of A.4: they start exactly at the end of the last
+/// complete batch, and the trailer's `batch_count` and `last_sequence` equal the scan's. Seal blocks written by the
+/// sealer always do; a forgery inside a data block cannot, as its block header and prefix come first (Q-109).
+fn seal_holds(r: &ScanReport<'_>) -> bool {
+    let Some(seal) = &r.seal else {
+        return false;
+    };
+    let end = r.batches.last().map_or(HEADER_LEN as u64, |b| b.end());
+    seal.start == end
+        && seal.trailer.batch_count == r.batches.len() as u64
+        && Some(seal.trailer.last_sequence) == r.last_sequence()
+}
+
+/// Scans an unsealed segment. Seal blocks that fail [`seal_holds`], and any seal blocks when `ignore_seal` is set
+/// (the last segment in use, where a seal is never expected), are read as the bytes of whatever precedes them, so
+/// that a torn tail, its commit blocks and its definitions are seen (Q-109).
+fn scan_segment(
+    store: &StoreDir,
+    name: SegmentName,
+    path: PathBuf,
+    ignore_seal: bool,
+) -> Result<Seg, StoreError> {
     let bytes = store.read_file(&path)?;
     let id = SegmentIdentity {
         store_id: store.descriptor().store_id,
         file_id: name.file_id,
         generation: name.generation,
     };
-    let r = scan(&bytes, &id, ScanLimit::End).map_err(StoreError::Unsupported)?;
+    let mut r = scan(&bytes, &id, ScanLimit::End).map_err(StoreError::Unsupported)?;
+    let mut sealed = r.seal.is_some();
+    if sealed && (ignore_seal || !seal_holds(&r)) {
+        r = scan_ignoring_seal(&bytes, &id).map_err(StoreError::Unsupported)?;
+        sealed = false;
+    }
     let mut batches = Vec::new();
     for b in &r.batches {
         let content = BatchContent::decode(b).map_err(|_| StoreError::Corrupt("batch content"))?;
@@ -258,6 +286,7 @@ fn scan_segment(store: &StoreDir, name: SegmentName, path: PathBuf) -> Result<Se
         tail_commits,
         tail_ids,
         last_nonzero,
+        sealed,
     })
 }
 
@@ -710,10 +739,21 @@ pub(super) fn start(
         if name.sealed {
             sealed.push((name, path));
         } else {
-            segs.push(scan_segment(store, name, path)?);
+            segs.push(scan_segment(store, name, path, false)?);
         }
     }
     segs.sort_by_key(|s| s.id.file_id);
+    // In the last segment in use a seal is never expected (A.4 Sealing): one found there is read as tail bytes.
+    if let Some(last) = segs.iter_mut().rfind(|s| s.in_use())
+        && last.sealed
+    {
+        let name = SegmentName {
+            generation: last.id.generation,
+            file_id: last.id.file_id,
+            sealed: false,
+        };
+        *last = scan_segment(store, name, last.path.clone(), true)?;
+    }
     sealed.sort();
     if let MarkRead::Readable { slot, .. } = &mark {
         max_id = max_id.max(slot.file_id);
