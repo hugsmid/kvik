@@ -308,11 +308,11 @@ A.10) is treated as a different boot. The rules apply in this order:
    a kind), so a loss reported before any record holds it can be acknowledged at once, and the record,
    when written, carries that identity. Sync the
    manifest.
-5. Rule 3, or rule 1 with a complete batch beyond the mark: write or adopt the recovery entry (in the open segment,
+5. Rule 3, or rule 1 with a complete batch or any non-zero byte beyond the mark: write or adopt the recovery entry (in the open segment,
    or first in a new segment when it does not fit, its header written after it) and sync; zero the rest of the torn
    tail, or the bytes after the mark in whichever segment holds them, and batches a stopped reset's entry dropped
    (step 2), and sync.
-6. Rule 3, or rule 1 with a complete batch beyond the mark: write the mark (current boot id, last position F, highest
+6. Rule 3, or rule 1 with a complete batch or any non-zero byte beyond the mark: write the mark (current boot id, last position F, highest
    series id assigned, the entry's reset stamp) and sync the
    mark file and the directory. An existing mark file is first written again in place, as read, and synced, then updated in place,
    whatever its content (except a slot of unknown version, `format.md` A.10 Update); a new file is created only when none exists. Then record the entry's gap, if any, as in step 4.
@@ -796,8 +796,8 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 4a | Observed series: one reading a day ahead, then on-time readings | The on-time readings are not `late`; the reference follows them; duplicate checks still see the future reading | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
-| 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered; a complete batch or any non-zero byte truncated this way is followed by a recovery entry and reported as `possible_loss` (§3 Recovery rule 1). With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and described by a recovery entry, which reports the lost mark and the tail as `possible_loss` | kill loop |
-| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; a recovery entry at the first new position; every consumer below it receives `resync` with `forget_above` before any later position, on this start and on every later one until its synced cursor has passed the entry | power-loss rig |
+| 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered; a complete batch or any non-zero byte truncated this way is followed by a recovery entry and reported as `possible_loss` (§3 Recovery rule 1). With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and described by a recovery entry, which reports the lost mark and the tail as `possible_loss` and positions named between the last kept position and the entry as `data_lost` | kill loop |
+| 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`, and positions named between the last kept position and the recovery entry as a `data_lost` lost range (cause truncated tail); complete batches synced on recovery before use; a recovery entry at the first new position; every consumer below it receives `resync` with `forget_above` before any later position, on this start and on every later one until its synced cursor has passed the entry | power-loss rig |
 | 7b | Export continued by position across a power loss | The export keeps a saved point (§7 Readers); judged against the mark after the restart, nothing above the position it is void above is kept as valid, and an unknown answer starts the export again | power-loss rig |
 | 7c | Crash on the same boot after a rule 3 recovery, before a consumer received its `resync` | Rule 1 start; the replay meets the recovery entry before any reused position | kill loop |
 | 8 | Crash after sync, before delivery | Delivered on restart from each consumer's cursor | kill loop |
@@ -806,7 +806,7 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 11 | Torn or corrupt block in a sealed file | Quarantine; fetch from cold/deep, else compact again from kept inputs; verify, swap by manifest; errors meanwhile. Log segment with no other copy: valid batches copied to a new segment, the damaged region recorded as lost, `data_lost` | fault injection |
 | 11a | Corrupt block inside the open segment, or below an old boot's mark after a power loss | Later complete batches kept; range recorded as lost, `data_lost`; positions not reused; a reset point (§4 Resync) for cursors below its end | fault injection |
 | 12 | Sync returns an error | Read-only, fatal; a restart on the same boot truncates to the durable mark; after a reboot the batch may be kept (never acknowledged) | fault injection |
-| 12a | Mark deleted or damaged on the same boot after a failed sync | Rule 3; the last complete batch is written again and synced before use; kept only if that sync succeeds, else read-only; reported as `possible_loss` with the mark's state | fault injection |
+| 12a | Mark deleted or damaged on the same boot after a failed sync | Rule 3; the last complete batch is written again and synced before use; kept only if that sync succeeds, else read-only; reported as `possible_loss` with the mark's state, and positions named between the last kept position and the recovery entry as a `data_lost` lost range (cause truncated tail) | fault injection |
 | 13 | Disk fills | Degrade, then ingest waits; compaction ENOSPC abandons the job; nothing deleted | fault injection |
 | 14 | Consumer slower than the stream | Catch-up from the log after the last position enqueued, hand-over to live without gap or repeat | load test |
 | 15 | Consumer down for a day | Resumes from cursor; deliveries `replayed`; then `resync`. Cursor older than the oldest local log segment: `resync` only | model |
@@ -872,10 +872,11 @@ A disaster loses facts in files not backed up, which may already have been acted
     or sealed, with no other copy (§3 Recovery, §8 Corrupt block) or a listed file that the bucket has lost or
     corrupted when a restore reads it (§8 Restore, Failures and end), each recorded as a lost range and
     reported as `data_lost`, and a tail truncated by §3 Recovery rule 3 after a reboot or with the mark lost, reported as
-    `possible_loss`; after a reboot with a readable mark it can hold about one mark-sync interval of acknowledged
+    `possible_loss`, with the positions between its last kept position and its recovery entry recorded as a lost range
+    (cause truncated tail) and reported as `data_lost`; after a reboot with a readable mark it can hold about one mark-sync interval of acknowledged
     batches of facts (§3 Commit), and with the mark lost it is unbounded. On a store whose file system is unmounted
-    within one boot, one batch committed since the last mark sync can be truncated by §3 Recovery rule 1, reported
-    as `possible_loss` and delivered as a reset point (accepted limit). Corruption of a manifest record with no other copy loses no fact; the manifest is rebuilt
+    within one boot, one batch committed since the last mark sync, whole or damaged, can be truncated by §3 Recovery
+    rule 1, reported as `possible_loss` and delivered as a reset point (accepted limit). Corruption of a manifest record with no other copy loses no fact; the manifest is rebuilt
     from the local files (§7 Manifest).
 11. No reader or consumer observes a position beyond the durable mark as the writer holds it in memory.
 12. No file leaves a tier unless a hash-verified copy exists in another tier.
