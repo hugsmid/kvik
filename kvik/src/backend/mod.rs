@@ -9,7 +9,7 @@
 //! [`Limits::max_consumers`](crate::Limits::max_consumers) slots, each with a
 //! configured funnel that selects nothing, and binds consumer names to slots.
 
-mod convert;
+pub(crate) mod convert;
 mod error;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

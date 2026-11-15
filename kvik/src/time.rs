@@ -189,6 +189,11 @@ impl LocalTime {
     pub const fn as_nanos(self) -> u64 {
         self.0
     }
+
+    /// The time `n` nanoseconds after local midnight, wrapped into a day.
+    pub(crate) const fn from_nanos(n: u64) -> Self {
+        LocalTime(n % (86_400 * 1_000_000_000))
+    }
 }
 
 /// An IANA time-zone name; checked against the tzdata release where used.

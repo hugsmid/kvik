@@ -1,4 +1,5 @@
-//! The public interface end to end, on the model backend.
+//! The public interface end to end, on both backends where the durable backend supports the feature; where it
+//! does not yet, the test checks that it says so (`NotSupportedYet`, `QueryError::NotAvailable`).
 
 mod common;
 
@@ -6,16 +7,19 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use common::{Flag, at, block_on, config, poll_once, start, store};
+use common::{
+    BACKENDS, Flag, at, block_on, config, config_on, poll_once, reader_on, start, store, store_on,
+};
 use kvik::env::ManualClock;
 use kvik::{
-    Ack, Aggregate, BackupError, CalendarPeriod, CalendarUnit, ChangedAtKind, ChartData, Condition,
-    ConditionState, Consumer, ConsumerError, DefineError, Delivery, DeliveryFlags, DeliveryId,
-    DeliveryKind, EmitError, ExcessPrecision, Fact, Funnel, Health, Intent, IntervalLength, Kind,
-    Live, LocalDate, LocalTime, OpenError, Operator, Outcome, ParameterChange, Position, Quality,
-    QueryError, Reader, ReaderConfig, Reading, Reason, Refusal, Resolution, ResyncCause,
-    ResyncPart, RetentionClass, SavedPoint, Select, SeriesId, SeriesSpec, Span, Start, StateValues,
-    Store, TimeRange, Timing, TriggerCause, Value, ValueType, View, Wait, Window, ZoneName,
+    Ack, Aggregate, Backend, BackupError, CalendarPeriod, CalendarUnit, ChangedAtKind, ChartData,
+    Condition, ConditionState, Consumer, ConsumerError, DefineError, Delivery, DeliveryFlags,
+    DeliveryId, DeliveryKind, EmitError, ExcessPrecision, Fact, Funnel, Health, Intent,
+    IntervalLength, Kind, Live, LocalDate, LocalTime, OpenError, Operator, Outcome,
+    ParameterChange, Position, Quality, QueryError, Reader, Reading, Reason, Refusal, Resolution,
+    ResyncCause, ResyncPart, RetentionClass, SavedPoint, Select, SeriesId, SeriesSpec, Span, Start,
+    StateValues, Store, TimeRange, Timing, TriggerCause, Value, ValueType, View, Wait, Window,
+    ZoneName,
 };
 
 fn gauge(name: &str, expected: u64) -> SeriesSpec {
@@ -42,6 +46,11 @@ fn counter(name: &str) -> SeriesSpec {
 
 fn num(id: SeriesId, secs: i64, v: f64) -> Reading {
     Reading::new(id, at(secs), Value::F64(v))
+}
+
+/// Whether a read is one the durable backend does not answer yet.
+fn not_available<T: std::fmt::Debug>(r: Result<T, QueryError>) -> bool {
+    matches!(r, Err(QueryError::NotAvailable { .. }))
 }
 
 fn refused(ack: &Ack) -> Vec<(usize, Refusal)> {
@@ -99,8 +108,14 @@ fn resyncs(ds: &[Delivery]) -> Vec<ResyncPart> {
 
 #[test]
 fn define_emit_and_read() {
-    let (s, clock) = store("define-emit-read");
-    assert!(!s.is_durable());
+    for b in BACKENDS {
+        define_emit_and_read_on(b);
+    }
+}
+
+fn define_emit_and_read_on(b: Backend) {
+    let (s, clock) = store_on(b, "define-emit-read");
+    assert_eq!(s.is_durable(), b == Backend::Durable);
     let g = block_on(s.define_series(gauge("plant/line-1/power", 1))).unwrap();
     let c = block_on(s.define_series(counter("plant/line-1/energy"))).unwrap();
     // Defining again the same way returns the same id; differently, an error
@@ -153,6 +168,41 @@ fn define_emit_and_read() {
 
     clock.advance(Duration::from_secs(10));
     let r = s.reader();
+    if b == Backend::Durable {
+        assert!(not_available(r.window(
+            g,
+            Window::rolling(Duration::from_secs(10)),
+            Aggregate::Avg
+        )));
+        assert!(not_available(r.live(g)));
+        assert_eq!(facts(&r, g, at(0)..at(10), View::Current).len(), 2);
+    } else {
+        windows_and_live(&r, g, c);
+    }
+
+    let info = s.series("plant/line-1/power").unwrap();
+    assert_eq!(info.id, g);
+    assert_eq!(info.latest_t, Some(at(5)));
+    assert_eq!(info.staleness, Some(Duration::from_secs(3)));
+
+    let st = s.series_stats(g).unwrap();
+    assert_eq!(st.recorded, 2);
+    assert_eq!(st.duplicates_dropped, 1);
+    assert_eq!(st.refused[&Refusal::WrongType], 2);
+    assert!(s.series_stats(SeriesId(99)).is_none());
+    assert!(matches!(s.health(), Health::Ok));
+    let stats = s.stats();
+    if b == Backend::Model {
+        assert_eq!(stats.ingest.batches, 1);
+    } else {
+        // Each definition is a batch of its own, synced with the mark.
+        assert_eq!(stats.ingest.batches, 3);
+    }
+    assert!(stats.log.durable > Position::ORIGIN);
+    block_on(s.shutdown()).unwrap();
+}
+
+fn windows_and_live(r: &Reader, g: SeriesId, c: SeriesId) {
     let w = r
         .window(g, Window::rolling(Duration::from_secs(10)), Aggregate::Avg)
         .unwrap();
@@ -187,27 +237,17 @@ fn define_emit_and_read() {
         }
         other => panic!("{other:?}"),
     }
-
-    let info = s.series("plant/line-1/power").unwrap();
-    assert_eq!(info.id, g);
-    assert_eq!(info.latest_t, Some(at(5)));
-    assert_eq!(info.staleness, Some(Duration::from_secs(3)));
-
-    let st = s.series_stats(g).unwrap();
-    assert_eq!(st.recorded, 2);
-    assert_eq!(st.duplicates_dropped, 1);
-    assert_eq!(st.refused[&Refusal::WrongType], 2);
-    assert!(s.series_stats(SeriesId(99)).is_none());
-    assert!(matches!(s.health(), Health::Ok));
-    let stats = s.stats();
-    assert_eq!(stats.ingest.batches, 1);
-    assert!(stats.log.durable > Position::ORIGIN);
-    block_on(s.shutdown()).unwrap();
 }
 
 #[test]
 fn absent_and_non_finite_values_are_recorded_without_a_value() {
-    let (s, _clock) = store("absent");
+    for b in BACKENDS {
+        absent_and_non_finite_values_are_recorded_without_a_value_on(b);
+    }
+}
+
+fn absent_and_non_finite_values_are_recorded_without_a_value_on(b: Backend) {
+    let (s, _clock) = store_on(b, "absent");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     let ack =
         block_on(s.emit(&[Reading::new(g, at(0), Value::Absent), num(g, 1, f64::NAN)])).unwrap();
@@ -222,7 +262,13 @@ fn absent_and_non_finite_values_are_recorded_without_a_value() {
 
 #[test]
 fn absent_keeps_its_supplied_quality_for_the_duplicate_rule() {
-    let (s, _clock) = store("absent-quality");
+    for b in BACKENDS {
+        absent_keeps_its_supplied_quality_for_the_duplicate_rule_on(b);
+    }
+}
+
+fn absent_keeps_its_supplied_quality_for_the_duplicate_rule_on(b: Backend) {
+    let (s, _clock) = store_on(b, "absent-quality");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     let absent = |q| Reading {
         quality: q,
@@ -242,7 +288,13 @@ fn absent_keeps_its_supplied_quality_for_the_duplicate_rule() {
 
 #[test]
 fn try_emit_returns_a_pending_ack() {
-    let (s, _clock) = store("try-emit");
+    for b in BACKENDS {
+        try_emit_returns_a_pending_ack_on(b);
+    }
+}
+
+fn try_emit_returns_a_pending_ack_on(b: Backend) {
+    let (s, _clock) = store_on(b, "try-emit");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     let pending = s.try_emit(&[num(g, 0, 1.0), num(g, 0, 1.0)]).unwrap();
     let ack = block_on(pending).unwrap();
@@ -255,7 +307,13 @@ fn try_emit_returns_a_pending_ack() {
 
 #[test]
 fn views_revise_and_retire() {
-    let (s, clock) = store("views");
+    for b in BACKENDS {
+        views_revise_and_retire_on(b);
+    }
+}
+
+fn views_revise_and_retire_on(b: Backend) {
+    let (s, clock) = store_on(b, "views");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     let first = block_on(s.emit(&[num(g, 0, 1.0)])).unwrap().last().unwrap();
     block_on(s.emit(&[num(g, 0, 2.0)])).unwrap();
@@ -294,7 +352,13 @@ fn views_revise_and_retire() {
 
 #[test]
 fn the_fact_at_a_time() {
-    let (s, clock) = store("at");
+    for b in BACKENDS {
+        the_fact_at_a_time_on(b);
+    }
+}
+
+fn the_fact_at_a_time_on(b: Backend) {
+    let (s, clock) = store_on(b, "at");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     let first = block_on(s.emit(&[num(g, 0, 1.0), num(g, 10, 2.0)]))
         .unwrap()
@@ -619,8 +683,14 @@ fn next_waits_until_an_emit() {
 
 #[test]
 fn back_pressure_and_call_limits() {
+    for b in BACKENDS {
+        back_pressure_and_call_limits_on(b);
+    }
+}
+
+fn back_pressure_and_call_limits_on(b: Backend) {
     let clock = ManualClock::new(start());
-    let mut cfg = config("back-pressure", &clock);
+    let mut cfg = config_on(b, "back-pressure", &clock);
     cfg.limits.ingest_queue = 1_024;
     let s = block_on(Store::open(cfg)).unwrap();
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
@@ -648,6 +718,13 @@ fn back_pressure_and_call_limits() {
     let woken = Arc::new(Flag::default());
     let mut emit = std::pin::pin!(s.emit(&host));
     assert!(poll_once(emit.as_mut(), &woken).is_pending());
+    if b == Backend::Durable {
+        // The call waits until the clock is synchronised, then commits.
+        clock.set_synchronised(true);
+        assert_eq!(block_on(emit.as_mut()).unwrap().recorded(), 1);
+        assert_eq!(s.stats().ingest.waits[&Wait::UnsyncedClock], 2);
+        return;
+    }
     // The wait is named in statistics and health while it lasts.
     assert_eq!(s.stats().ingest.waiting, Some(Wait::UnsyncedClock));
     assert!(matches!(
@@ -804,7 +881,13 @@ fn interval_series_and_calendar_results() {
 
 #[test]
 fn state_and_text_series() {
-    let (s, clock) = store("states");
+    for b in BACKENDS {
+        state_and_text_series_on(b);
+    }
+}
+
+fn state_and_text_series_on(b: Backend) {
+    let (s, clock) = store_on(b, "states");
     let mode = block_on(s.define_series(SeriesSpec::new(
         "hvac/unit/mode",
         Kind::State {
@@ -828,17 +911,24 @@ fn state_and_text_series() {
     assert_eq!(refused(&ack), vec![(2, Refusal::StateOutOfRange)]);
     clock.advance(Duration::from_secs(30));
     let r = s.reader();
-    let heat = r
-        .window(
-            mode,
-            Window::absolute(at(0)..at(30)),
-            Aggregate::TimeInState(Value::State(1)),
-        )
-        .unwrap();
-    assert_eq!(heat.number(), Some(10.0));
-    match r.live(mode).unwrap() {
-        Live::Value(v) => assert_eq!(v.fact.value, Value::State(0)),
-        other => panic!("{other:?}"),
+    if b == Backend::Model {
+        let heat = r
+            .window(
+                mode,
+                Window::absolute(at(0)..at(30)),
+                Aggregate::TimeInState(Value::State(1)),
+            )
+            .unwrap();
+        assert_eq!(heat.number(), Some(10.0));
+        match r.live(mode).unwrap() {
+            Live::Value(v) => assert_eq!(v.fact.value, Value::State(0)),
+            other => panic!("{other:?}"),
+        }
+    } else {
+        assert!(not_available(r.live(mode)));
+        let modes = facts(&r, mode, at(0)..at(30), View::Current);
+        let values: Vec<_> = modes.iter().map(|f| f.value.clone()).collect();
+        assert_eq!(values, vec![Value::State(1), Value::State(0)]);
     }
     let notes = facts(&r, note, at(0)..at(1), View::Current);
     assert_eq!(notes[0].value, Value::Text("filter changed".into()));
@@ -847,7 +937,13 @@ fn state_and_text_series() {
 
 #[test]
 fn unsupported_items_say_so() {
-    let (s, _clock) = store("unsupported");
+    for b in BACKENDS {
+        unsupported_items_say_so_on(b);
+    }
+}
+
+fn unsupported_items_say_so_on(b: Backend) {
+    let (s, _clock) = store_on(b, "unsupported");
     let decimal = SeriesSpec::new(
         "a/b/decimal",
         Kind::Gauge {
@@ -894,10 +990,50 @@ fn unsupported_items_say_so() {
         period: Duration::from_secs(86_400),
     });
     block_on(s.set_parameters(g, at(0), retention)).unwrap();
+    assert_eq!(
+        s.series(g).unwrap().spec.retention,
+        RetentionClass::Diagnostic {
+            period: Duration::from_secs(86_400)
+        }
+    );
     assert!(matches!(
         block_on(s.consumer("late", Start::Position(SavedPoint::default()), Select::None)),
         Err(ConsumerError::NotSupportedYet { .. })
     ));
+    assert!(matches!(
+        block_on(s.rebuild(kvik::Rebuild::Derived)),
+        Err(BackupError::NotSupportedYet { .. })
+    ));
+    if b == Backend::Durable {
+        // Consumers, live state, windows and chart buckets come with later roadmap items.
+        assert!(matches!(
+            block_on(s.consumer("ops", Start::Now, Select::None)),
+            Err(ConsumerError::NotSupportedYet { .. })
+        ));
+        let r = s.reader();
+        assert!(not_available(r.live(g)));
+        assert!(not_available(r.window(
+            g,
+            Window::rolling(Duration::from_secs(60)),
+            Aggregate::Avg
+        )));
+        assert!(not_available(r.buckets(
+            g,
+            at(0)..at(60),
+            Resolution::Auto { max_points: 10 }
+        )));
+        assert!(not_available(r.calendar(
+            g,
+            LocalDate::new(2026, 1, 5),
+            Aggregate::Avg
+        )));
+        assert_eq!(
+            s.export_orphaned(Position::ORIGIN..=Position::ORIGIN)
+                .unwrap(),
+            vec![]
+        );
+        return;
+    }
     let c = block_on(s.consumer("ops", Start::Now, Select::None)).unwrap();
     let operator_only = Funnel {
         series: Select::Ids(vec![g]),
@@ -909,10 +1045,6 @@ fn unsupported_items_say_so() {
         Err(ConsumerError::NotSupportedYet { .. })
     ));
     assert!(matches!(
-        block_on(s.rebuild(kvik::Rebuild::Derived)),
-        Err(BackupError::NotSupportedYet { .. })
-    ));
-    assert!(matches!(
         s.export_orphaned(Position::ORIGIN..=Position::ORIGIN),
         Err(QueryError::NotAvailable { .. })
     ));
@@ -920,20 +1052,26 @@ fn unsupported_items_say_so() {
 
 #[test]
 fn opening_rules() {
+    for b in BACKENDS {
+        opening_rules_on(b);
+    }
+}
+
+fn opening_rules_on(b: Backend) {
     let clock = ManualClock::new(start());
     assert!(matches!(
-        Reader::open(ReaderConfig::new("kvik-test/never-opened")),
+        Reader::open(reader_on(b, "never-opened", &clock)),
         Err(OpenError::NotAStore)
     ));
     assert!(matches!(
         block_on(Store::open(
-            config("not-created", &clock).create_if_missing(false)
+            config_on(b, "not-created", &clock).create_if_missing(false)
         )),
         Err(OpenError::NotAStore)
     ));
     let mut limits = kvik::Limits::default();
     limits.ingest_queue = 10;
-    let small = config("small-queue", &clock).limits(limits);
+    let small = config_on(b, "small-queue", &clock).limits(limits);
     assert!(matches!(
         block_on(Store::open(small)),
         Err(OpenError::Config {
@@ -943,7 +1081,7 @@ fn opening_rules() {
     ));
     let mut log = kvik::LogConfig::default();
     log.segment_size = 1 << 20;
-    let segment = config("odd-segment", &clock)
+    let segment = config_on(b, "odd-segment", &clock)
         .log(log)
         .tiers(kvik::TierConfig::default());
     assert!(matches!(
@@ -953,17 +1091,17 @@ fn opening_rules() {
             ..
         })
     ));
-    let mut bad = config("zones", &clock);
+    let mut bad = config_on(b, "zones", &clock);
     bad.time_zone = "Not/AZone".into();
     assert!(matches!(
         block_on(Store::open(bad)),
         Err(OpenError::UnknownZone)
     ));
-    let s = block_on(Store::open(config("zones", &clock))).unwrap();
+    let s = block_on(Store::open(config_on(b, "zones", &clock))).unwrap();
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
     block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
     let reader =
-        Reader::open(ReaderConfig::new("kvik-test/zones").lease_refresh(Duration::from_secs(600)))
+        Reader::open(reader_on(b, "zones", &clock).lease_refresh(Duration::from_secs(600)))
             .unwrap();
     assert_eq!(reader.series(g).unwrap().name, "a/b/c");
     let state = reader.refresh().unwrap();
@@ -971,20 +1109,32 @@ fn opening_rules() {
     block_on(s.shutdown()).unwrap();
     // Readers are independent of the writer (`docs/api.md` Handles and life
     // cycle): they keep reading what was committed after it shuts down.
-    assert!(matches!(reader.live(g), Ok(Live::Value(_))));
-    let mut other = config("zones", &clock);
+    let readable = |r: &Reader| match b {
+        Backend::Model => matches!(r.live(g), Ok(Live::Value(_))),
+        _ => facts(r, g, at(0)..at(1), View::Current).len() == 1,
+    };
+    assert!(readable(&reader));
+    let mut other = config_on(b, "zones", &clock);
     other.time_zone = "Europe/Oslo".into();
     assert!(matches!(
         block_on(Store::open(other)),
         Err(OpenError::SiteZoneMismatch { .. })
     ));
-    let s = block_on(Store::open(config("zones", &clock))).unwrap();
-    assert!(matches!(reader.live(g), Ok(Live::Value(_))));
+    let s = block_on(Store::open(config_on(b, "zones", &clock))).unwrap();
+    assert!(readable(&reader));
     assert!(matches!(s.health(), Health::Ok));
     assert!(matches!(reader.health(), Health::Ok));
     assert!(s.losses().is_empty());
     block_on(s.acknowledge_losses(&[])).unwrap();
     block_on(s.acknowledge_manifest_rebuild(1)).unwrap();
+    // One writer per directory.
+    assert!(matches!(
+        block_on(Store::open(config_on(b, "zones", &clock))),
+        Err(OpenError::Locked)
+    ));
+    if b == Backend::Durable {
+        return;
+    }
     // One handle per consumer name at a time.
     let c = block_on(s.consumer("one", Start::Now, Select::None)).unwrap();
     assert!(matches!(
@@ -997,7 +1147,13 @@ fn opening_rules() {
 
 #[test]
 fn site_zone_change_and_clock_jumps() {
-    let (s, clock) = store("site-zone");
+    for b in BACKENDS {
+        site_zone_change_and_clock_jumps_on(b);
+    }
+}
+
+fn site_zone_change_and_clock_jumps_on(b: Backend) {
+    let (s, clock) = store_on(b, "site-zone");
     assert!(matches!(
         block_on(s.set_site_zone(&ZoneName::new("Not/AZone"), at(0))),
         Err(DefineError::UnknownZone)
@@ -1005,17 +1161,20 @@ fn site_zone_change_and_clock_jumps() {
     block_on(s.set_site_zone(&ZoneName::new("Europe/Oslo"), at(86_400))).unwrap();
     drop(s);
     // Reopened, the zone in force is the new one.
+    // Reopened, the zone in force is the new one.
     assert!(matches!(
-        block_on(Store::open(config("site-zone", &clock))),
+        block_on(Store::open(config_on(b, "site-zone", &clock))),
         Err(OpenError::SiteZoneMismatch { .. })
     ));
-    let mut oslo = config("site-zone", &clock);
+    let mut oslo = config_on(b, "site-zone", &clock);
     oslo.time_zone = "Europe/Oslo".into();
     let s = block_on(Store::open(oslo)).unwrap();
     clock.jump_wall(Span::from_secs(-30));
     let stats = s.stats();
-    assert_eq!(stats.clock.jumps, 1);
-    assert_eq!(stats.clock.last.unwrap().by, Span::from_secs(-30));
+    if b == Backend::Model {
+        assert_eq!(stats.clock.jumps, 1);
+        assert_eq!(stats.clock.last.unwrap().by, Span::from_secs(-30));
+    }
     // The window clock never runs backwards.
     assert_eq!(s.now(), start());
 }
@@ -1179,12 +1338,21 @@ fn wakers_run_outside_the_store_lock() {
 
 #[test]
 fn versioned_series_and_outranked_facts() {
-    let (s, clock) = store("versioned");
+    for b in BACKENDS {
+        versioned_series_and_outranked_facts_on(b);
+    }
+}
+
+fn versioned_series_and_outranked_facts_on(b: Backend) {
+    let (s, clock) = store_on(b, "versioned");
     let v =
         block_on(s.define_series(gauge("grid/area/price", 1).versioned(ChangedAtKind::Version)))
             .unwrap();
-    let mut c = block_on(s.consumer("prices", Start::Now, Select::None)).unwrap();
-    block_on(c.route(Funnel::facts(Select::Ids(vec![v])))).unwrap();
+    let mut c = (b == Backend::Model).then(|| {
+        let c = block_on(s.consumer("prices", Start::Now, Select::None)).unwrap();
+        block_on(c.route(Funnel::facts(Select::Ids(vec![v])))).unwrap();
+        c
+    });
     let ack = block_on(s.emit(&[
         num(v, 0, 1.0),
         num(v, 0, 10.0).changed_at(2),
@@ -1203,13 +1371,15 @@ fn versioned_series_and_outranked_facts() {
     let revise = block_on(s.emit_with(&[num(v, 0, 1.0).changed_at(3)], Intent::Revise)).unwrap();
     assert_eq!(refused(&revise), vec![(0, Refusal::ReviseOnVersioned)]);
     clock.advance(Duration::from_secs(1));
-    let fs = facts_of(&drain(&mut c));
-    assert_eq!(fs.len(), 2);
-    assert!(!fs[0].1.outranked);
-    assert!(
-        fs[1].1.outranked,
-        "a lower changed_at than the current fact"
-    );
+    if let Some(c) = c.as_mut() {
+        let fs = facts_of(&drain(c));
+        assert_eq!(fs.len(), 2);
+        assert!(!fs[0].1.outranked);
+        assert!(
+            fs[1].1.outranked,
+            "a lower changed_at than the current fact"
+        );
+    }
     let cur = facts(&s.reader(), v, at(0)..at(1), View::Current);
     assert_eq!(cur[0].number(), Some(10.0));
     assert_eq!(cur[0].changed_at, Some(2));
@@ -1218,8 +1388,23 @@ fn versioned_series_and_outranked_facts() {
 
 #[test]
 fn future_facts_are_flagged() {
-    let (s, _clock) = store("future");
+    for b in BACKENDS {
+        future_facts_are_flagged_on(b);
+    }
+}
+
+fn future_facts_are_flagged_on(b: Backend) {
+    let (s, _clock) = store_on(b, "future");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    if b == Backend::Durable {
+        block_on(s.emit(&[num(g, 120, 1.0)])).unwrap();
+        let fs = facts(&s.reader(), g, at(0)..at(200), View::Current);
+        assert!(fs[0].flags.future);
+        assert_eq!(fs[0].quality, Quality::Suspect);
+        assert_eq!(fs[0].supplied_quality, Quality::Good);
+        assert_eq!(s.series_stats(g).unwrap().future, 1);
+        return;
+    }
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     block_on(c.route(Funnel::facts(Select::All))).unwrap();
     block_on(s.emit(&[num(g, 120, 1.0)])).unwrap();

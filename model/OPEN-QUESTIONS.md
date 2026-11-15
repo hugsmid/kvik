@@ -31,6 +31,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-115 (e), (f), (j), (k), (n) | §3 Commit, Segments, Disk space, Back-pressure; `format.md` A.8, A.13 | The commit path: the points still open |
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
+| Q-123 | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -471,8 +472,11 @@ later start's scan.
 mark, so ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other
 series takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (j) Not done: a cloud runner can
 time `FlushFileBuffers` but cannot show whether a device cache is flushed or a name survives a power loss
-(`docs/measurements/4.8-commit-latency.md`). Nothing in the writer depends on it. (k) Left to the item that puts the
-engine behind the `kvik` interface. (n) Neither is bounded.
+(`docs/measurements/4.8-commit-latency.md`). Nothing in the writer depends on it. (k) Done by roadmap 5.1: the
+interface reports the log's `QueueFull` and `NoSegment` as `Wait::QueueFull` (a roll waiting for its segment holds the
+queue as a full queue does) and `DiskCritical` as `Wait::DiskFull`, measures `IngestStats.waited` as the time a call
+spends waiting for room in the queue and commit latency from queueing to acknowledgement (percentiles over the last
+1,024 calls), and takes batches and syncs from the log (`kvik/src/durable/mod.rs`). (n) Neither is bounded.
 **Gate 4.9.** (e) Recommended: the seam returns size and free space (`fn space(&self, path: &Path) ->
 io::Result<Space>` with `Space { free, total }` replacing `free_space`; low mark = `max(total × 5 %,
 disk_low_bytes)`; Windows stays unsupported, and neither mark applies where the platform gives no free space), in
@@ -500,8 +504,11 @@ nothing can be written until it exists. (m) *Consumers.* The entry's field 47 na
 missing or unreadable; cursor files are roadmap 5.2. (n) *Restart time.* A start reads every unsealed segment whole,
 and the last sealed one for its trailer, against the restart budget of `design.md`.
 **Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
-manifest count. (c) A start reports what it found and what the manifest holds; earlier recovery entries are read by
-the item that puts the engine behind the interface. (k) The start stays read-only; the next start retries. (m)
+manifest count. (c) A start reports what it found and what the manifest holds. Since roadmap 5.1 the interface reads
+every recovery entry of the kept log at every start and every reader refresh, as it reads the whole kept log to
+rebuild the registry anyway: `losses()` lists the manifest's lost-range records and, for each recovery entry that
+reports a torn tail, a `PossibleLoss` (`kvik/src/durable/index.rs`). The cost is that of reading the log, which
+roadmap 6.x bounds. (k) The start stays read-only; the next start retries. (m)
 Always empty. (n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments (446–639 MiB) again,
 after a clean shutdown with a warm page cache, against the 1 s budget, and 129–138 ms for two segments holding almost
 nothing, so the time is mostly reading the unsealed 64 MiB segments whole. The cloud runners of `bench.yml` (warm
@@ -535,6 +542,36 @@ Not a question: the reset nonce comes from std's OS-seeded hash keys for now; it
 (`api.md` Environment seams) when the interface wires the log in.
 **Needed.** (c) with roadmap 8.3; (f) and (k) with 6.3 (deferred there at gate 4.9).
 
+## Q-123 — The interface on the durable log: points `spec.md` §2.2, §3 and `api.md` leave open
+Found while putting the `kvik` interface on the log (roadmap 5.1, `kvik/src/durable/`). Each part names the reading
+implemented for now; `kvik/tests/durable.rs` and `kvik/tests/api.rs` pin it.
+**Scenario.** (a) *Stamping before the commit time.* `future` and the second clause of `late` compare `t` with
+`received_at`, "host clock at commit" (§2.2), but a call's outcomes, flags included, are decided before it is queued,
+and the log takes the batch's receive time when it writes the batch (Q-115 (i)), a few milliseconds later or, under
+back-pressure, much later: a reading at the 60 s edge can be flagged against one clock reading and stored with
+another. (b) *A call with nothing to record.* A call whose readings are all refused or duplicates writes no batch;
+its duplicates may be duplicates of facts queued by an earlier call that is not yet acknowledged, and if that call's
+sync then fails, the store turns read-only having answered `Duplicate` for a reading that is not stored. (c) *The
+log's timers and the clock seam.* `api.md` makes every clock a seam; with a manual clock that stands still, the
+log's `min_sync_interval` never passes and a second batch is never synced. (d) *Acknowledging a loss.*
+`acknowledge_losses` appends an acknowledgement record to the manifest (A.14), which the log's writer does not write
+at run time yet. (e) *Counts that are not in the log.* Per-series duplicates, refusals and `outranked_on_arrival`
+are not recorded anywhere, and a value recorded without one does not say whether it was a supplied `Absent` or a NaN
+(`absent_supplied` against D1). (f) *Definitions and ordering.* A definition resolves after its mark sync (§3 Commit);
+a second definition of the same name, or a reading of the new series, that is decided before the first is
+acknowledged would rest on an entry that may still be lost.
+**Implemented.** (a) The wall clock read when the call is decided stamps the flags; the stored `received_at` is the
+log's. (b) Such a call resolves at once with its outcomes. (c) The log's timers run on the process's monotonic
+clock; `received_at` comes from `Env::clock`. (d) Acknowledgements are held in memory until the store closes. (e)
+Recorded, late and future facts are counted from the log at every open; the others count since the store was opened.
+(f) Calls that append an entry other than facts hold the decision lock until their mark sync returns, blocking the
+calling thread; readings are decided against acknowledged definitions only.
+**Needed.** A rule for each part: (a) whether a batch's receive time may be taken before it is queued, or flags
+decided at write time on the writer thread; (b) whether such a call waits for the calls queued before it; (c)
+whether the seam gains a monotonic clock for the engine's timers or tests take `min_sync_interval` 0; (d) the run-time
+manifest append (with roadmap 6.3 at the latest); (e) whether these counts must survive a restart, which would need
+them recorded; (f) whether a definition may wait without blocking the caller's thread. To be settled at gate 5.6.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -547,7 +584,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -580,6 +617,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
+| Q-123 | 5.6 | Gate; recorded by roadmap 5.1 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

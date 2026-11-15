@@ -1,0 +1,368 @@
+//! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch and
+//! the recovery entries, built from the batches a log reader returns and cut back when it voids what it took
+//! (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use kvik_log::content::Item;
+use kvik_log::entries::{Entry, MarkState as LogMarkState, Recovery};
+use kvik_log::facts::{FactRow, Quality as LogQuality, Value as LogValue};
+use kvik_log::manifest::{LossCause as LogCause, LostRange};
+use kvik_log::reader::{ReadBatch, ReadEvent};
+use kvik_log::writer::Position as LogPos;
+
+use super::registry::{Registry, Series};
+use crate::backend::Error;
+use crate::health::{LossCause, LossKind, LossReport, MarkState};
+use crate::read::View;
+use crate::series::{SeriesInfo, SeriesKey, Timing};
+use crate::time::{TimeRange, Timestamp};
+use crate::types::{Fact, FactFlags, Position, Quality, SeriesId, Value};
+
+/// A kept fact with its position and its batch's receive time.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stored {
+    pub(crate) position: LogPos,
+    pub(crate) received_at: i64,
+    pub(crate) row: FactRow,
+}
+
+impl Stored {
+    pub(crate) fn no_value(&self) -> bool {
+        matches!(self.row.value, LogValue::Absent { .. })
+    }
+}
+
+/// See the module documentation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Index {
+    entries: BTreeMap<LogPos, Entry>,
+    registry: Registry,
+    facts: BTreeMap<u32, BTreeMap<(i64, LogPos), Stored>>,
+    /// Each batch's last position and commit time, in log order.
+    commits: Vec<(LogPos, i64)>,
+    recoveries: BTreeMap<LogPos, Recovery>,
+}
+
+pub(crate) fn pos(p: LogPos) -> Position {
+    Position::new(p.generation, p.sequence)
+}
+
+pub(crate) fn log_pos(p: Position) -> LogPos {
+    LogPos {
+        generation: p.generation,
+        sequence: p.sequence,
+    }
+}
+
+pub(crate) fn quality_out(q: LogQuality) -> Quality {
+    match q {
+        LogQuality::Good => Quality::Good,
+        LogQuality::Estimated => Quality::Estimated,
+        LogQuality::Suspect => Quality::Suspect,
+        LogQuality::Bad => Quality::Bad,
+    }
+}
+
+pub(crate) fn quality_in(q: Quality) -> LogQuality {
+    match q {
+        Quality::Good => LogQuality::Good,
+        Quality::Estimated => LogQuality::Estimated,
+        Quality::Suspect => LogQuality::Suspect,
+        Quality::Bad => LogQuality::Bad,
+    }
+}
+
+/// A fact as the interface shows it. The log keeps the adapter-supplied quality; the quality after stamping
+/// follows from the flags: bad without a value, at best suspect when `future` (spec §2.2, §2.5).
+pub(crate) fn fact_out(s: &Stored) -> Fact {
+    let r = &s.row;
+    let value = match &r.value {
+        LogValue::F64(bits) => Value::F64(f64::from_bits(*bits)),
+        LogValue::Decimal { units, scale } => Value::Decimal {
+            units: *units,
+            scale: *scale,
+        },
+        LogValue::State(i) => Value::State(*i),
+        LogValue::Bool(b) => Value::Bool(*b),
+        LogValue::Text(t) => Value::Text(t.clone()),
+        LogValue::Absent { .. } => Value::Absent,
+    };
+    let no_value = s.no_value();
+    let supplied = quality_out(r.quality);
+    let quality = if no_value {
+        Quality::Bad
+    } else if r.flags.future {
+        supplied.max(Quality::Suspect)
+    } else {
+        supplied
+    };
+    Fact {
+        series: SeriesId(r.series_id),
+        t: Timestamp(r.t),
+        position: pos(s.position),
+        received_at: Timestamp(s.received_at),
+        value,
+        quality,
+        supplied_quality: supplied,
+        flags: FactFlags {
+            future: r.flags.future,
+            late: r.flags.late,
+            revise: r.flags.revise,
+            host_time: r.flags.host_time,
+            unsynced_clock: r.flags.unsynced_clock,
+            no_value,
+            rounded: r.flags.rounded,
+        },
+        changed_at: r.changed_at,
+    }
+}
+
+impl Index {
+    /// Applies what a refresh found, in order.
+    pub(crate) fn apply(&mut self, events: &[ReadEvent]) {
+        for e in events {
+            match e {
+                ReadEvent::Batch(b) => self.batch(b),
+                ReadEvent::Void { above, .. } => self.void(*above),
+                // A region below the mark is a loss for the writer's next start to record in the manifest.
+                ReadEvent::Corruption { .. } => {}
+            }
+        }
+    }
+
+    fn batch(&mut self, b: &ReadBatch) {
+        let mut sequence = b.first.sequence;
+        for item in &b.content.items {
+            let p = LogPos {
+                generation: b.first.generation,
+                sequence,
+            };
+            match item {
+                Item::Fact(row) => {
+                    self.registry.note_fact(row.series_id);
+                    self.facts.entry(row.series_id).or_default().insert(
+                        (row.t, p),
+                        Stored {
+                            position: p,
+                            received_at: b.content.received_at,
+                            row: row.clone(),
+                        },
+                    );
+                }
+                Item::Entry(Entry::Ignored { .. }) => {}
+                Item::Entry(e) => {
+                    self.registry.apply(e);
+                    if let Entry::Recovery(r) = e {
+                        self.recoveries.insert(p, r.clone());
+                    }
+                    self.entries.insert(p, e.clone());
+                }
+            }
+            sequence += item.sequences();
+        }
+        self.commits.push((b.last, b.commit_time));
+    }
+
+    /// Forgets everything above `above` and rebuilds the registry from what is left.
+    fn void(&mut self, above: LogPos) {
+        let keep = |p: &LogPos| *p <= above;
+        self.entries.retain(|p, _| keep(p));
+        self.recoveries.retain(|p, _| keep(p));
+        self.commits.retain(|(p, _)| keep(p));
+        for f in self.facts.values_mut() {
+            f.retain(|(_, p), _| keep(p));
+        }
+        self.facts.retain(|_, f| !f.is_empty());
+        self.registry = Registry::default();
+        for e in self.entries.values() {
+            self.registry.apply(e);
+        }
+        for id in self.facts.keys() {
+            self.registry.note_fact(*id);
+        }
+    }
+
+    /// The registry of the kept log.
+    pub(crate) fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// The facts of a series in `(t, position)` order.
+    pub(crate) fn series_facts(&self, id: u32) -> impl Iterator<Item = &Stored> {
+        self.facts.get(&id).into_iter().flat_map(|m| m.values())
+    }
+
+    /// Every series id that has a kept fact.
+    pub(crate) fn fact_series(&self) -> impl Iterator<Item = u32> + '_ {
+        self.facts.keys().copied()
+    }
+
+    fn lookup(&self, key: &SeriesKey) -> Result<&Series, Error> {
+        match key {
+            SeriesKey::Id(id) => self.registry.get(id.0),
+            SeriesKey::Name(n) => self.registry.resolve(n),
+        }
+        .ok_or_else(|| {
+            Error::UnknownSeries(match key {
+                SeriesKey::Id(id) => id.to_string(),
+                SeriesKey::Name(n) => n.clone(),
+            })
+        })
+    }
+
+    /// The latest recorded `t` of a series (spec §2.2).
+    pub(crate) fn latest_t(&self, id: u32) -> Option<i64> {
+        self.facts
+            .get(&id)
+            .and_then(|m| m.keys().map(|(t, _)| *t).max())
+    }
+
+    /// The lateness reference of an observed series (spec §2.2): the greatest `t` of its facts flagged neither
+    /// `future` nor `unsynced_clock`.
+    pub(crate) fn lateness_reference(&self, id: u32) -> Option<i64> {
+        self.series_facts(id)
+            .filter(|s| !s.row.flags.future && !s.row.flags.unsynced_clock)
+            .map(|s| s.row.t)
+            .max()
+    }
+
+    /// What the registry knows about a series, by id or name.
+    pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, Error> {
+        let s = self.lookup(key)?;
+        let id = s.def.id;
+        Ok(SeriesInfo {
+            id: SeriesId(id),
+            name: s.names.last().cloned().unwrap_or_default(),
+            names: s.names.clone(),
+            spec: s.spec.clone(),
+            staleness: s
+                .def
+                .staleness
+                .map(|n| Duration::from_nanos(u64::try_from(n).unwrap_or(0))),
+            retired_at: s.retired_at.map(Timestamp),
+            latest_t: self.latest_t(id).map(Timestamp),
+            lateness_reference: (s.spec.timing == Timing::Observed)
+                .then(|| self.lateness_reference(id).map(Timestamp))
+                .flatten(),
+        })
+    }
+
+    /// The last position whose batch's commit time is at or before `at` (spec §2.3 As-of time).
+    fn position_at(&self, at: i64) -> LogPos {
+        self.commits
+            .iter()
+            .rev()
+            .find(|(_, t)| *t <= at)
+            .map_or(LogPos::default(), |(p, _)| *p)
+    }
+
+    /// The facts of a series with `t` in `range`, in a view (spec §2.3), in `t` order (and position order in the
+    /// history view).
+    pub(crate) fn facts(
+        &self,
+        id: SeriesId,
+        range: TimeRange,
+        view: View,
+    ) -> Result<Vec<Fact>, Error> {
+        let s = self.lookup(&SeriesKey::Id(id))?;
+        let versioned = s.spec.versioned.is_some();
+        let (a, b) = (range.from.0, range.to.0);
+        let in_range = self
+            .series_facts(id.0)
+            .filter(move |f| (a..b).contains(&f.row.t));
+        let limit = match view {
+            View::History => return Ok(in_range.map(fact_out).collect()),
+            View::Current => None,
+            View::AsOf(p) => Some(log_pos(p)),
+            View::AsOfTime(t) => Some(self.position_at(t.0)),
+        };
+        // The fact of highest rank per `t`: position, or `(changed_at, position)` in a versioned series.
+        let mut current: BTreeMap<i64, &Stored> = BTreeMap::new();
+        for f in in_range.filter(|f| limit.is_none_or(|l| f.position <= l)) {
+            let rank = |s: &Stored| (if versioned { s.row.changed_at } else { None }, s.position);
+            let e = current.entry(f.row.t).or_insert(f);
+            if rank(f) > rank(e) {
+                *e = f;
+            }
+        }
+        Ok(current.into_values().map(fact_out).collect())
+    }
+
+    /// Facts whose series has no definition in the kept log (spec §2.1 orphaned facts), counted per id.
+    pub(crate) fn orphaned(&self) -> BTreeMap<u32, u64> {
+        self.facts
+            .iter()
+            .filter(|(id, _)| self.registry.get(**id).is_none())
+            .map(|(id, f)| (*id, f.len() as u64))
+            .collect()
+    }
+
+    /// Losses: the manifest's lost-range records and the recovery entries of the kept log (Q-116 (c)).
+    pub(crate) fn losses(&self, recorded: &[LostRange]) -> Vec<LossReport> {
+        let mut out: BTreeMap<(Position, bool), LossReport> = BTreeMap::new();
+        for l in recorded {
+            let identity = Position::new(l.identity.0, l.identity.1);
+            let first = Position::new(l.first.0, l.first.1);
+            let last = Position::new(l.last.0, l.last.1);
+            let e = out.entry((identity, false)).or_insert_with(|| LossReport {
+                identity,
+                kind: LossKind::DataLost,
+                cause: match l.cause {
+                    LogCause::Corruption => LossCause::Corruption,
+                    LogCause::TruncatedTail => LossCause::TruncatedTail,
+                    LogCause::LostInBucket => LossCause::LostInBucket,
+                    LogCause::InvalidContent => LossCause::InvalidContent,
+                },
+                first: Some(first),
+                last: Some(last),
+                file_id: Some(l.file_id),
+                bytes: l.length,
+                readable_commit_blocks: 0,
+                mark_state: MarkState::Readable,
+                boot_id: (l.boot_id != [0; 16]).then_some(l.boot_id),
+                commit_time_before: l.time_before.map(Timestamp),
+                commit_time_after: l.time_after.map(Timestamp),
+                cursors_missing: Vec::new(),
+                recorded: true,
+                acknowledged: false,
+            });
+            // A record that extends a loss widens its range; the loss is counted once.
+            e.first = e.first.min(Some(first));
+            e.last = e.last.max(Some(last));
+        }
+        for (p, r) in &self.recoveries {
+            if r.tail_bytes == 0 && r.readable_commits == 0 {
+                continue;
+            }
+            let identity = Position::new(p.generation, r.after + 1);
+            out.insert(
+                (identity, true),
+                LossReport {
+                    identity,
+                    kind: LossKind::PossibleLoss,
+                    cause: LossCause::TruncatedTail,
+                    first: Some(identity),
+                    last: None,
+                    file_id: None,
+                    bytes: r.tail_bytes,
+                    readable_commit_blocks: r.readable_commits,
+                    mark_state: match r.mark_state {
+                        LogMarkState::Readable => MarkState::Readable,
+                        LogMarkState::Missing => MarkState::Missing,
+                        LogMarkState::Unreadable => MarkState::Unreadable,
+                        LogMarkState::Stale => MarkState::Stale,
+                    },
+                    boot_id: (r.boot_id != [0; 16]).then_some(r.boot_id),
+                    commit_time_before: None,
+                    commit_time_after: None,
+                    cursors_missing: r.consumers.clone(),
+                    recorded: true,
+                    acknowledged: false,
+                },
+            );
+        }
+        out.into_values().collect()
+    }
+}

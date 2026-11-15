@@ -1,26 +1,31 @@
 # kvik
 
 The public Rust interface of the kvik store, as settled at gate 3.3 in [`docs/api.md`](../docs/api.md) and governed by
-the [specification](../docs/spec.md). Applications can write adapters and consumers against it today; the durable log
-engine will replace the backend behind the same interface (roadmap section 4 onwards).
+the [specification](../docs/spec.md). Two backends stand behind it, chosen with `StoreConfig::backend` and
+`ReaderConfig::backend`.
 
-## Backend: in-memory, not durable, for development and tests
+## Backends
 
-> [!WARNING]
-> **Nothing is written to disk yet.** The only backend, behind the default feature `model-backend`, is the
-> executable [reference model](../model/): exact, slow and entirely in memory. Every store lives in the memory of the
-> current process and is lost when the process ends.
+**Durable (`Backend::Durable`, the default).** The log engine of [`kvik-log`](../log/): `Store::open` runs the log's
+start (recovery, `spec.md` §3), rebuilds the series registry from the kept log and starts the `kvik-writer` and
+`kvik-maint` threads; every write is committed to the log and acknowledged only once it is durable; a `Reader`, in
+the same process or another, reads up to the durable mark. It supports series definitions (defining again, aliases,
+retirement, a change of retention class, site-zone and tzdata entries), writing (`emit`, `emit_with`, `try_emit`
+with every outcome the model backend gives) and reading facts in every view, the fact at a time, the interval of a
+fixed-length interval series and series lookup, with `refresh`, health, statistics and losses. It decides outcomes
+as the model backend does, checked by a differential property test. **Not supported yet**, each until its roadmap
+item: consumers and routing (5.2; `ConsumerError::NotSupportedYet`), live state, windows, chart buckets and calendar
+results (5.4, 7.x; `QueryError::NotAvailable`), and what the model backend lacks too (below).
 
-`Store::open` takes a directory but only uses it as a name. Within one process, opening the same directory again after
-`Store::shutdown` (or after dropping the last `Store` clone, which acts as a crash) restarts the store as it was left,
-so restarts, catch-up, replay and resyncs can be exercised in tests. `Reader::open` finds a store opened in the same
-process.
-
-The engine owns its threads; the model backend has none. Its calls complete at once, except `Consumer::next`, which
-waits for a delivery, and `Store::emit`, which waits under back-pressure. Timers (window expiry, held-for and
-stale-for conditions, scheduled values taking effect) advance only when the store is called: before every emit and
-delivery poll, and on `Store::tick`, which is temporary and goes when the engine runs its own timers. A waiting call
-is woken by the next emit, routing change, confirmation or tick.
+**Model (`Backend::Model`).** The executable [reference model](../model/): exact, slow and entirely in memory. Nothing
+is written to disk: `Store::open` only uses the directory as a name, and every store lives in the memory of the
+current process. Within one process, opening the same directory again after `Store::shutdown` (or after dropping the
+last `Store` clone, which acts as a crash) restarts the store as it was left, so restarts, catch-up, replay and
+resyncs can be exercised in tests. `Reader::open` finds a store opened in the same process. It has no threads: its
+calls complete at once, except `Consumer::next`, which waits for a delivery, and `Store::emit`, which waits under
+back-pressure. Timers (window expiry, held-for and stale-for conditions, scheduled values taking effect) advance only
+when the store is called: before every emit and delivery poll, and on `Store::tick`, which is temporary and goes when
+the engine runs its own timers. A waiting call is woken by the next emit, routing change, confirmation or tick.
 
 Only std types appear in signatures. The optional feature `jiff` adds conversions between the interface's time types
 and jiff 0.2's; the default feature `bundled-tzdb` embeds the time-zone database (the model backend embeds it in any
@@ -33,11 +38,16 @@ cargo run -p kvik --example quickstart
 ```
 
 [`examples/quickstart.rs`](examples/quickstart.rs) opens a store, defines a gauge and a counter, emits readings,
-receives and confirms a threshold condition's transition, and queries a rolling window and a calendar day.
+receives and confirms a threshold condition's transition, and queries a rolling window and a calendar day; as the
+durable backend has no consumers or windows yet, it runs on the model backend.
 
 ## Coverage
 
-What the model backend supports, each with a test in [`tests/`](tests/) or the crate's unit tests:
+What the model backend supports, each with a test in [`tests/`](tests/) or the crate's unit tests. The tests in
+[`tests/api.rs`](tests/api.rs) run on both backends wherever the durable backend supports the feature, and check
+that it says so where it does not; [`tests/durable.rs`](tests/durable.rs) covers durability (acknowledged readings
+after a power loss), a reader in another handle, the registry after crashes, ids never assigned twice, writers on
+several threads, and the differential test of the durable backend against the model.
 
 | Area | Supported |
 |---|---|
@@ -51,7 +61,8 @@ What the model backend supports, each with a test in [`tests/`](tests/) or the c
 
 ## Differences from `docs/api.md`
 
-Not supported by the model backend:
+Not supported by either backend (the durable backend refuses the same definitions and calls as the model, with the
+same errors):
 
 - **Decimal series** (`ValueType::Decimal`, `ValueType::decimal()`), so also `raise_scale`, the excess-precision
   policy, `set_excess_precision` and `Refusal::ExcessPrecision`: defining one, raising a scale or changing a policy
@@ -77,14 +88,30 @@ Not supported by the model backend:
   `SealBlocked`, `Wait::QueueFull` (a call never exceeds the queue, which is empty between calls), commit latency and
   time waited, `orphaned_facts`, `scale_raises`, `interval_displaced`, and `evaluations_unknown` and
   `transitions_not_delivered`, which are not reported at all.
-- The seams other than the clock are not used: the backend writes no files, takes no lock file and computes calendars
-  with the reference model's embedded tzdata rather than through `Env::tz`. `SystemTz` reports the embedded tzdata as
+- The seams other than the clock are not used by the model backend: it writes no files, takes no lock file and
+  computes calendars with the reference model's embedded tzdata rather than through `Env::tz`. `SystemTz` reports the embedded tzdata as
   the release `"embedded"`; `StdFs::free_space` returns `Unsupported`; `SystemBootId` is `None` outside Linux.
-- `MemFs` makes every write visible at once: it does not drop unsynced writes at a simulated power loss, model
-  Linux's failed writeback per page or report per page whether a sync wrote it, as `docs/api.md` asks of the test
-  file system (roadmap 4.5).
 - `DiskStats.free` and the disk marks (`limits.disk_low`, `limits.disk_critical`) are measured against the reference
   model's simulated disk of 1 TiB, not a real file system; `IngestStats.syncs` is 0, as nothing is synced.
+
+Durable backend, besides consumers, live state, windows, chart buckets and calendar results:
+
+- `Reader::facts` collects a query's facts before it returns, as the model backend does, rather than streaming
+  block by block; every process holds the facts of the kept log in memory (the indexes and tree of roadmap 6 and 7
+  replace this).
+- The log's timers (group commit, mark sync, sealing) run on the process's monotonic clock, not on `Env::clock`,
+  whose wall clock stamps `received_at`: a manual clock that stands still would otherwise hold a sync back.
+- A call that defines, aliases, retires or changes a series waits for its mark sync on the calling thread, holding
+  the decision lock, so no later outcome depends on an entry that is not yet durable.
+- `acknowledge_losses` holds acknowledgements in memory until the store closes: the manifest's acknowledgement
+  record is not written yet. `losses()` reads the manifest's lost-range records and every recovery entry of the kept
+  log.
+- Per-series counts of recorded, late and future facts are rebuilt from the log at every open; duplicates,
+  refusals, `outranked_on_arrival` and `absent_supplied` count since the store was opened. Clock jumps are not
+  counted.
+- Not produced: `Wait::UnsyncedClock` in `stats().ingest.waiting` and health (the call waits, and `waits` counts
+  it), `ManifestRebuilt`, `loss_identities_rebuilt`, `WriteError::NotFinal`, `Outcome::Recorded.unchecked` (all
+  detail is local).
 
 Different from `docs/api.md`:
 
@@ -95,6 +122,7 @@ Different from `docs/api.md`:
   `QueryError::Invalid` (a malformed query) and `QueryError::Closed`. `ConsumerError` and `BackupError` stand in for
   the funnel-compilation and backup errors that roadmap 5.2 and 8.2 settle.
 - **`Health::Closed`** after the writer shuts down, and **`Reason::ClockSkew`** (spec §9 row 5).
+- **`Backend`**, `StoreConfig::backend` and `ReaderConfig::backend` choose the backend.
 - **`Live::Value` carries a `LiveValue`** (the fact and whether it is stale), where `docs/api.md` shows the fact alone
   "with staleness".
 - **`ConditionState::Value`** holds an on-change condition's last value; **`FunnelState.transition`** says whether a

@@ -13,9 +13,11 @@
 //! The in-memory model backend uses the clock only: it ignores the file
 //! system, the boot identity and the entropy, and computes calendars with the
 //! reference model's own copy of the tzdata it embeds rather than through
-//! [`Env::tz`]. The durable engine (roadmap 4.2 onwards) uses every seam.
-//! There is no memory mapping: every byte the engine persists passes a seam
-//! call.
+//! [`Env::tz`]. The durable backend uses the file system, the boot identity,
+//! the entropy (store and reader ids), the tzdata release's name and the wall
+//! clock; the log's timers run on the process's own monotonic clock, so that a
+//! manual clock that stands still does not hold a sync back. There is no
+//! memory mapping: every byte the engine persists passes a seam call.
 
 use std::collections::hash_map::RandomState;
 use std::fmt;

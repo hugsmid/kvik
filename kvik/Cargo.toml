@@ -1,7 +1,7 @@
 [package]
 name = "kvik"
 version = "0.1.0"
-description = "Embedded time-series store for device and sensor data (public interface; in-memory backend for now)"
+description = "Embedded time-series store for device and sensor data"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -12,10 +12,7 @@ keywords = ["time-series", "storage", "embedded"]
 categories = ["database-implementations"]
 
 [features]
-default = ["model-backend", "bundled-tzdb"]
-# In-memory backend on the reference model: not durable, for development and
-# tests. The durable log engine replaces it from roadmap item 4.2.
-model-backend = ["dep:kvik-model"]
+default = ["bundled-tzdb"]
 # Embeds the IANA time-zone database in the binary instead of reading the
 # system's. The model backend embeds it in any case.
 bundled-tzdb = ["jiff/tzdb-bundle-always"]
@@ -25,8 +22,13 @@ jiff = []
 [dependencies]
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 kvik-log = { path = "../log" }
-kvik-model = { path = "../model", optional = true }
+# The reference model: the in-memory backend (`Backend::Model`), and the
+# definition rules both backends share.
+kvik-model = { path = "../model" }
 thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true

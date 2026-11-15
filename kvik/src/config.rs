@@ -8,6 +8,22 @@ use std::time::Duration;
 use crate::env::Env;
 use crate::error::OpenError;
 
+/// Which implementation stands behind a [`Store`](crate::Store) or a
+/// [`Reader`](crate::Reader).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Backend {
+    /// The durable log engine (the default): every write goes through the
+    /// log in the store directory, on the file system of
+    /// [`Env::fs`](crate::env::Env). It does not support everything yet;
+    /// the crate `README.md` lists what returns `NotSupportedYet`.
+    #[default]
+    Durable,
+    /// The executable reference model: in memory, not durable, complete. The
+    /// directory only names the store within the process.
+    Model,
+}
+
 /// Configuration of [`Store::open`](crate::Store::open).
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
@@ -15,6 +31,8 @@ pub struct StoreConfig {
     /// The store directory. The model backend writes nothing to it: it only
     /// names the in-memory store within the process.
     pub dir: PathBuf,
+    /// The backend (default [`Backend::Durable`]).
+    pub backend: Backend,
     /// The site zone at creation, an IANA name; at every later open it must
     /// equal the zone in force (changed with
     /// [`Store::set_site_zone`](crate::Store::set_site_zone)).
@@ -50,6 +68,12 @@ impl StoreConfig {
     /// Sets the environment.
     pub fn env(mut self, env: Env) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Sets the backend.
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -117,7 +141,7 @@ pub enum MarkSync {
 }
 
 /// Log configuration (spec §3). The model backend uses
-/// [`LogConfig::seal_interval`] only.
+/// [`LogConfig::seal_interval`] only; the durable backend uses every key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LogConfig {
@@ -234,6 +258,9 @@ impl Default for TierConfig {
 pub struct ReaderConfig {
     /// The store directory.
     pub dir: PathBuf,
+    /// The backend (default [`Backend::Durable`]); it must be the one the
+    /// store's writer uses.
+    pub backend: Backend,
     /// The environment.
     pub env: Env,
     /// How often the lease is renewed at the latest (default 30 minutes).
@@ -245,6 +272,7 @@ impl ReaderConfig {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         ReaderConfig {
             dir: dir.into(),
+            backend: Backend::Durable,
             env: Env::system(),
             lease_refresh: Duration::from_secs(30 * 60),
         }
@@ -253,6 +281,12 @@ impl ReaderConfig {
     /// Sets the environment.
     pub fn env(mut self, env: Env) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Sets the backend.
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
         self
     }
 

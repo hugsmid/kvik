@@ -1,0 +1,1008 @@
+//! The durable backend: the interface on the log of `kvik-log` (roadmap 5.1).
+//!
+//! `Store::open` opens the log writer, whose start recovers the log (`spec.md` §3 Order of a start), then reads the
+//! kept log once with a log reader to build the series registry and the state the duplicate rule needs, and
+//! starts the writer's threads. Every call that appends an entry is decided against that state and queued in the
+//! log; it resolves when the log acknowledges it (after the sync and the mark update, and for an entry that is
+//! not a fact after the mark sync). Reads go through a log reader, in this process or another, and so see only
+//! what is durable.
+//!
+//! Not supported yet, with the roadmap item that brings each: consumers and routing (5.2), catch-up and saved
+//! points (5.3), live state and windows (5.4, 7.x), calendar results (7.3), decimal series, calendar-length
+//! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore
+//! (8.x).
+
+mod index;
+mod ingest;
+pub(crate) mod reader;
+mod registry;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
+
+use kvik_log::content::Item;
+use kvik_log::entries::{Entry, ParameterChange as LogChange};
+use kvik_log::store::{NewStore, StoreDir, StoreError};
+use kvik_log::writer::{
+    Ack as LogAck, CommitError, Fault as LogFault, FaultOp, Log, LogWriter,
+    MarkSync as LogMarkSync, MarkSyncMode as LogMarkSyncMode, OpenError as LogOpenError,
+    Pending as LogPending, Reason as LogReason, SubmitError, Wait as LogWait, WriterConfig,
+};
+
+use crate::backend::Error;
+use crate::backend::convert;
+use crate::config::{Limits, MarkSync, StoreConfig};
+use crate::env::{Clock, Env};
+use crate::error::{EmitError, Fault, OpenError, QueryError, Wait, WriteError};
+use crate::health::{
+    ClockStats, DiskStats, Health, IngestStats, Latency, LogStats, LossKind, LossReport,
+    MarkSyncMode, Reason, SeriesStats, Stats,
+};
+use crate::read::{Facts, ReaderState, View};
+use crate::series::{IntervalLength, Kind, ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
+use crate::time::{TimeRange, Timestamp, ZoneName};
+use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
+use index::{Index, fact_out, pos};
+use ingest::{Decider, Decision};
+pub(crate) use reader::DurableReader;
+
+/// The most readings in one call, whatever the ingest queue (`docs/api.md` Writing).
+const CALL_READINGS: usize = 65_536;
+/// The most plain-encoded bytes in one call.
+const CALL_BYTES: usize = 8 << 20;
+/// Commit latencies kept for the percentiles.
+const LATENCIES: usize = 1_024;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The log's clocks: the wall clock from the environment, and a monotonic time of this process for the log's
+/// timers (group commit, mark sync, sealing), so that a manual clock that stands still does not hold back a sync.
+#[derive(Debug)]
+pub(crate) struct LogClock {
+    env: Arc<dyn Clock>,
+    origin: Instant,
+}
+
+impl LogClock {
+    pub(crate) fn new(env: Arc<dyn Clock>) -> Self {
+        LogClock {
+            env,
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl kvik_log::writer::Clock for LogClock {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+    fn wall(&self) -> i64 {
+        self.env.wall().0
+    }
+}
+
+/// The interface's fault for a fault of the log.
+fn fault_out(f: &LogFault) -> Fault {
+    match (f.op, f.kind) {
+        (_, io::ErrorKind::StorageFull) => Fault::NoSpace {
+            path: f.path.clone(),
+        },
+        (FaultOp::Sync | FaultOp::MarkSync, _) => Fault::SyncFailed {
+            path: f.path.clone(),
+        },
+        (op, kind) => Fault::Io {
+            op: match op {
+                FaultOp::Create => "create",
+                FaultOp::Write => "write",
+                FaultOp::MarkWrite => "mark write",
+                FaultOp::Seal => "seal",
+                FaultOp::Panic => "writer thread",
+                FaultOp::Sync | FaultOp::MarkSync => "sync",
+            },
+            path: f.path.clone(),
+            kind,
+        },
+    }
+}
+
+/// The interface's wait for one of the log's (Q-115 (k)): a segment not yet created ahead holds the queue as a
+/// full queue does.
+fn wait_out(w: LogWait) -> Wait {
+    match w {
+        LogWait::QueueFull | LogWait::NoSegment => Wait::QueueFull,
+        LogWait::DiskCritical { .. } => Wait::DiskFull,
+    }
+}
+
+pub(crate) fn store_error(dir: &Path, e: StoreError) -> OpenError {
+    match e {
+        StoreError::NotAStore => OpenError::NotAStore,
+        StoreError::Locked => OpenError::Locked,
+        StoreError::Corrupt(what) => OpenError::Corrupt {
+            file: dir.join(what),
+        },
+        StoreError::ManifestCorrupt => OpenError::Corrupt {
+            file: dir.join(kvik_log::store::MANIFEST),
+        },
+        StoreError::Unsupported(_) => OpenError::UnsupportedFormat {
+            file: dir.to_path_buf(),
+            found: 0,
+            supported: u32::from(kvik_log::FORMAT_MAJOR),
+        },
+        StoreError::Io(source) => OpenError::Io {
+            path: dir.to_path_buf(),
+            source,
+        },
+        other => OpenError::Io {
+            path: dir.to_path_buf(),
+            source: io::Error::other(other.to_string()),
+        },
+    }
+}
+
+/// Counters kept by this process since the store was opened, and those rebuilt from the log.
+#[derive(Debug, Default)]
+struct Counters {
+    series: BTreeMap<u32, SeriesStats>,
+    waits: BTreeMap<Wait, u64>,
+    waited: Duration,
+    latencies: VecDeque<Duration>,
+    max_latency: Duration,
+}
+
+/// The writer of a durable store, shared by the clones of its `Store`.
+#[derive(Debug)]
+pub(crate) struct Writer {
+    dir: PathBuf,
+    env: Env,
+    limits: Limits,
+    log: RwLock<Option<Log>>,
+    start_fault: Option<LogFault>,
+    decider: Mutex<Decider>,
+    counters: Mutex<Counters>,
+    reader: Mutex<Option<Arc<DurableReader>>>,
+    acknowledged: Mutex<BTreeSet<Position>>,
+    closed: AtomicBool,
+    now: AtomicI64,
+}
+
+/// How a queued call's acknowledgement becomes its [`Ack`].
+type Finish = Box<dyn FnOnce(Result<LogAck, CommitError>) -> Result<Ack, EmitError> + Send + Sync>;
+
+/// A call queued in the log, and how its acknowledgement becomes the call's [`Ack`].
+pub(crate) struct Queued {
+    pending: LogPending,
+    finish: Finish,
+}
+
+impl std::fmt::Debug for Queued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Queued")
+            .field("pending", &self.pending)
+            .finish()
+    }
+}
+
+impl Queued {
+    pub(crate) fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<LogAck, CommitError>> {
+        std::pin::Pin::new(&mut self.pending).poll(cx)
+    }
+
+    pub(crate) fn finish(self, r: Result<LogAck, CommitError>) -> Result<Ack, EmitError> {
+        (self.finish)(r)
+    }
+}
+
+/// What an emit gives back: the outcomes at once, or a call queued in the log.
+pub(crate) enum Emitted {
+    Ready(Ack),
+    Queued(Queued),
+}
+
+impl Writer {
+    /// Opens the store (`docs/api.md` Opening).
+    pub(crate) fn open(config: &StoreConfig) -> Result<Arc<Writer>, OpenError> {
+        config.validate()?;
+        let dir = config.dir.clone();
+        let env = config.env.clone();
+        jiff::tz::TimeZone::get(&config.time_zone).map_err(|_| OpenError::UnknownZone)?;
+        let wall = env.clock.wall().0;
+        let new = config.create_if_missing.then(|| {
+            let mut store_id = [0u8; 16];
+            env.entropy.fill(&mut store_id);
+            NewStore {
+                store_id,
+                created_at: wall,
+                site_zone: config.time_zone.clone(),
+                tzdata: tzdata_name(env.tz.current().version()),
+                software: format!("kvik {}", env!("CARGO_PKG_VERSION")),
+            }
+        });
+        let store =
+            StoreDir::open(env.fs.clone(), &dir, new.as_ref()).map_err(|e| store_error(&dir, e))?;
+        let descriptor = store.descriptor().clone();
+        let clock = Arc::new(LogClock::new(env.clock.clone()));
+        let wcfg = writer_config(config);
+        let writer = LogWriter::open(
+            store,
+            wcfg,
+            env.boot.current(),
+            kvik_log::writer::Clock::monotonic(&*clock),
+            wall,
+        )
+        .map_err(|e| match e {
+            LogOpenError::Store(e) => store_error(&dir, e),
+            LogOpenError::Config(c) => OpenError::Config {
+                key: "log",
+                reason: c.0.into(),
+            },
+            other => OpenError::Io {
+                path: dir.clone(),
+                source: io::Error::other(other.to_string()),
+            },
+        })?;
+        let start_fault = writer.fault().cloned();
+        // The kept log, read once: the registry and the history of every key.
+        let index = match DurableReader::open(&dir, &env, Duration::from_secs(30 * 60)) {
+            Ok(r) => {
+                let mut index = None;
+                r.with(|i, _| {
+                    index = Some(i.clone());
+                    Ok(())
+                })
+                .map_err(|e| OpenError::Io {
+                    path: dir.clone(),
+                    source: io::Error::other(e.to_string()),
+                })?;
+                index.unwrap_or_default()
+            }
+            // A start that could not write may leave no readable mark: the store opens read-only.
+            Err(_) if start_fault.is_some() => Index::default(),
+            Err(e) => return Err(e),
+        };
+        // The site zone in force must be the configured one (`docs/api.md` Opening).
+        let tz = env.tz.current();
+        let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
+        let in_force = index
+            .registry()
+            .site_zone(&descriptor.site_zone)
+            .to_string();
+        if canonical(&in_force) != canonical(&config.time_zone) {
+            return Err(OpenError::SiteZoneMismatch {
+                configured: config.time_zone.clone(),
+                in_force,
+            });
+        }
+        let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
+        let mut counters = Counters::default();
+        for id in index.fact_series() {
+            let st = counters.series.entry(id).or_default();
+            for f in index.series_facts(id) {
+                st.recorded += 1;
+                st.late += u64::from(f.row.flags.late);
+                st.future += u64::from(f.row.flags.future);
+            }
+        }
+        let log = Log::start(writer, clock).map_err(|source| OpenError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let w = Arc::new(Writer {
+            dir,
+            limits: config.limits.clone(),
+            log: RwLock::new(Some(log)),
+            start_fault,
+            decider: Mutex::new(Decider::from_index(&index)),
+            counters: Mutex::new(counters),
+            reader: Mutex::new(None),
+            acknowledged: Mutex::new(BTreeSet::new()),
+            closed: AtomicBool::new(false),
+            now: AtomicI64::new(wall),
+            env,
+        });
+        // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
+        // Opening). A release whose name is not a valid entry is left out.
+        let release = tzdata_name(tz.version());
+        if w.fault().is_none() && release != tzdata_in_force && !release.is_empty() {
+            let mut d = lock(&w.decider);
+            w.commit_entry(&mut d, Entry::Tzdata { version: release })
+                .map_err(|e| OpenError::Io {
+                    path: w.dir.clone(),
+                    source: io::Error::other(e.to_string()),
+                })?;
+        }
+        Ok(w)
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn log(&self) -> RwLockReadGuard<'_, Option<Log>> {
+        self.log.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn fault(&self) -> Option<LogFault> {
+        self.start_fault
+            .clone()
+            .or_else(|| self.log().as_ref().and_then(Log::fault))
+    }
+
+    /// Fails if the store is closed or read-only.
+    fn writable(&self) -> Result<(), Error> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
+        if let Some(f) = self.fault() {
+            return Err(Error::ReadOnly(f.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The store's `now`, which never runs backwards.
+    pub(crate) fn now(&self) -> Timestamp {
+        let w = self.env.clock.wall().0;
+        Timestamp(self.now.fetch_max(w, Ordering::SeqCst).max(w))
+    }
+
+    /// The reader this process uses for its own reads, opened on first use.
+    pub(crate) fn reader(&self) -> Result<Arc<DurableReader>, QueryError> {
+        let mut r = lock(&self.reader);
+        if let Some(r) = r.as_ref() {
+            return Ok(r.clone());
+        }
+        let opened = Arc::new(
+            DurableReader::open(&self.dir, &self.env, Duration::from_secs(30 * 60)).map_err(
+                |e| QueryError::NotAvailable {
+                    reason: e.to_string(),
+                },
+            )?,
+        );
+        *r = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// Clean shutdown: final commit and mark sync, threads joined, lock released.
+    pub(crate) fn shutdown(&self) -> Result<(), WriteError> {
+        self.closed.store(true, Ordering::SeqCst);
+        let log = self
+            .log
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match log.map(Log::shutdown) {
+            Some(Err(f)) => Err(WriteError::ReadOnly(fault_out(&f))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Queues one entry and waits for its acknowledgement, holding the decision lock throughout, so no later
+    /// decision sees an entry that is not yet durable. Applies it to the registry once acknowledged.
+    fn commit_entry(&self, d: &mut Decider, entry: Entry) -> Result<LogAck, Error> {
+        self.writable()?;
+        let pending = {
+            let log = self.log();
+            let log = log.as_ref().ok_or(Error::Closed)?;
+            log.submit(vec![Item::Entry(entry.clone())])
+                .map_err(|e| self.submit_error(e))?
+        };
+        let ack = pending.wait().map_err(|e| match e {
+            CommitError::ShutDown => Error::Closed,
+            CommitError::ReadOnly => Error::ReadOnly("the store is read-only".into()),
+            CommitError::OutcomeUnknown => Error::SyncFailed,
+        })?;
+        d.registry.apply(&entry);
+        Ok(ack)
+    }
+
+    fn submit_error(&self, e: SubmitError) -> Error {
+        match e {
+            SubmitError::ReadOnly => Error::ReadOnly("the store is read-only".into()),
+            SubmitError::ShutDown => Error::Closed,
+            SubmitError::Busy(w) => Error::Internal(format!("busy: {}", wait_out(w))),
+            SubmitError::Call(c) => Error::Invalid {
+                field: "entry",
+                reason: c.to_string(),
+            },
+        }
+    }
+
+    // ----- series -----
+
+    pub(crate) fn define(&self, spec: &SeriesSpec) -> Result<SeriesId, Error> {
+        self.writable()?;
+        let lateness = self.limits.default_lateness_bound;
+        let mut d = lock(&self.decider);
+        if let Some(s) = d.registry.resolve(&spec.name) {
+            let new = registry::definition_of(spec, s.def.id, lateness)?;
+            return match registry::difference(&new, &s.def) {
+                None => Ok(SeriesId(s.def.id)),
+                Some(field) => Err(Error::Conflict(field)),
+            };
+        }
+        // Validate before an id is taken.
+        registry::definition_of(spec, 1, lateness)?;
+        let ceiling = self.limits.series_ceiling as usize;
+        if d.registry.len() >= ceiling {
+            return Err(Error::Ceiling(ceiling));
+        }
+        let floor = self.log().as_ref().map_or(0, |l| l.stats().max_series_id);
+        let id = d
+            .registry
+            .next_id(floor)
+            .ok_or(Error::Ceiling(u32::MAX as usize))?;
+        let def = registry::definition_of(spec, id, lateness)?;
+        self.commit_entry(&mut d, Entry::Definition(Box::new(def)))?;
+        Ok(SeriesId(id))
+    }
+
+    fn live(&self, d: &Decider, id: SeriesId) -> Result<(), Error> {
+        let s = d
+            .registry
+            .get(id.0)
+            .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
+        if s.retired() {
+            return Err(Error::Retired(id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn alias(&self, id: SeriesId, name: &str) -> Result<(), Error> {
+        self.writable()?;
+        let mut d = lock(&self.decider);
+        self.live(&d, id)?;
+        if name.is_empty() || name.len() > 255 {
+            return Err(Error::Invalid {
+                field: "name",
+                reason: "1 to 255 bytes".into(),
+            });
+        }
+        match d.registry.resolve(name) {
+            Some(s) if s.def.id != id.0 => return Err(Error::NameInUse(name.into())),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        self.commit_entry(
+            &mut d,
+            Entry::Alias {
+                id: id.0,
+                name: name.into(),
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn retire(&self, id: SeriesId, t_r: Timestamp) -> Result<(), Error> {
+        self.writable()?;
+        let mut d = lock(&self.decider);
+        let s = d
+            .registry
+            .get(id.0)
+            .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
+        // Retiring a retired series changes nothing, as in the model.
+        if s.retired() {
+            return Ok(());
+        }
+        self.commit_entry(
+            &mut d,
+            Entry::Retirement {
+                id: id.0,
+                t_r: t_r.0,
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn set_parameters(
+        &self,
+        id: SeriesId,
+        change: &ParameterChange,
+    ) -> Result<(), Error> {
+        self.writable()?;
+        let mut d = lock(&self.decider);
+        d.registry
+            .get(id.0)
+            .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
+        if change.expected_interval.is_some()
+            || change.staleness.is_some()
+            || change.lateness_bound.is_some()
+            || change.counter.is_some()
+        {
+            return Err(Error::NotSupportedYet(
+                "parameter changes other than the retention class",
+            ));
+        }
+        let Some(r) = change.retention else {
+            return Ok(());
+        };
+        let (class, period) = match convert::retention(r)? {
+            kvik_model::registry::RetentionClass::LongTerm => (0, None),
+            kvik_model::registry::RetentionClass::Diagnostic { period } => (1, Some(period)),
+        };
+        self.commit_entry(
+            &mut d,
+            Entry::ParameterChange(LogChange {
+                id: id.0,
+                retention_class: Some(class),
+                retention_period: period,
+                ..LogChange::default()
+            }),
+        )
+        .map(|_| ())
+    }
+
+    /// Decimal series are not supported yet: a raise or a policy change names an existing series or fails.
+    pub(crate) fn decimal_only(&self, id: SeriesId) -> Result<(), Error> {
+        self.writable()?;
+        let d = lock(&self.decider);
+        d.registry
+            .get(id.0)
+            .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
+        Err(Error::NotSupportedYet(
+            "decimal series, their scale raises and excess-precision policy",
+        ))
+    }
+
+    pub(crate) fn set_site_zone(&self, zone: &ZoneName, effective: Timestamp) -> Result<(), Error> {
+        self.writable()?;
+        let z = zone.as_str();
+        jiff::tz::TimeZone::get(z).map_err(|_| Error::UnknownZone(z.into()))?;
+        if z.is_empty() || z.len() > 63 {
+            return Err(Error::UnknownZone(z.into()));
+        }
+        let mut d = lock(&self.decider);
+        self.commit_entry(
+            &mut d,
+            Entry::SiteZone {
+                zone: z.into(),
+                effective: effective.0,
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, QueryError> {
+        self.reader()?.with(|i, _| i.series(key))
+    }
+
+    // ----- writing -----
+
+    /// Decides a call and queues it in the log. With `wait`, waits while the ingest queue is full; without, a
+    /// wait is [`EmitError::Busy`] with nothing queued.
+    pub(crate) fn emit(
+        self: &Arc<Self>,
+        readings: &[Reading],
+        intent: Intent,
+        wait: bool,
+    ) -> Result<Emitted, EmitError> {
+        self.writable().map_err(|e| e.emit(&self.dir))?;
+        let bytes: usize = readings
+            .iter()
+            .map(|r| {
+                32 + match &r.value {
+                    Value::Text(t) => t.len(),
+                    _ => 8,
+                }
+            })
+            .sum();
+        let limit = CALL_READINGS.min(self.limits.ingest_queue);
+        if readings.len() > limit || bytes > CALL_BYTES {
+            return Err(EmitError::TooLarge {
+                readings: readings.len(),
+                bytes,
+            });
+        }
+        let clock = ingest::Clock {
+            wall: self.env.clock.wall().0,
+            synced: self.env.clock.synchronised(),
+            future_tolerance: convert::dur_nanos(self.limits.future_tolerance).unwrap_or(i64::MAX),
+        };
+        // Host-stamped readings wait until the clock is synchronised (spec §2.5).
+        if !clock.synced && readings.iter().any(|r| r.source == TimeSource::Host) {
+            return self.busy(Wait::UnsyncedClock);
+        }
+        let mut d = lock(&self.decider);
+        let plan = d.plan(readings, intent, clock);
+        let started = Instant::now();
+        let queued = if plan.items.is_empty() {
+            None
+        } else {
+            let log = self.log();
+            let log = log.as_ref().ok_or(EmitError::Closed)?;
+            let r = if wait {
+                let r = log.submit(plan.items.clone());
+                self.note_waited(started.elapsed());
+                r
+            } else {
+                log.try_submit(plan.items.clone())
+            };
+            match r {
+                Ok(p) => Some(p),
+                Err(SubmitError::Busy(w)) => {
+                    drop(d);
+                    return self.busy(wait_out(w));
+                }
+                Err(SubmitError::ReadOnly) => {
+                    return Err(EmitError::ReadOnly(self.fault_now()));
+                }
+                Err(SubmitError::ShutDown) => return Err(EmitError::Closed),
+                Err(SubmitError::Call(_)) => {
+                    return Err(EmitError::TooLarge {
+                        readings: readings.len(),
+                        bytes,
+                    });
+                }
+            }
+        };
+        d.apply(&plan);
+        drop(d);
+        self.count(readings, &plan);
+        let decisions = plan.decisions;
+        let Some(pending) = queued else {
+            return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None))));
+        };
+        let me = self.clone();
+        Ok(Emitted::Queued(Queued {
+            pending,
+            finish: Box::new(move |r| {
+                me.note_latency(started.elapsed());
+                match r {
+                    Ok(ack) => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),
+                    Err(CommitError::ShutDown) => Err(EmitError::Closed),
+                    Err(CommitError::ReadOnly) => Err(EmitError::ReadOnly(me.fault_now())),
+                    Err(CommitError::OutcomeUnknown) => {
+                        Err(EmitError::OutcomeUnknown(me.fault_now()))
+                    }
+                }
+            }),
+        }))
+    }
+
+    /// The wait a call meets.
+    fn busy(&self, w: Wait) -> Result<Emitted, EmitError> {
+        Err(EmitError::Busy(w))
+    }
+
+    /// Counts a call that waits (`IngestStats::waits`), once per call.
+    pub(crate) fn count_wait(&self, w: Wait) {
+        *lock(&self.counters).waits.entry(w).or_insert(0) += 1;
+    }
+
+    /// Adds the time a queued call spent waiting for room in the ingest queue.
+    fn note_waited(&self, d: Duration) {
+        // A submit that found room at once did not wait.
+        if d > Duration::from_millis(1) {
+            lock(&self.counters).waited += d;
+        }
+    }
+
+    fn note_latency(&self, d: Duration) {
+        let mut c = lock(&self.counters);
+        if c.latencies.len() == LATENCIES {
+            c.latencies.pop_front();
+        }
+        c.latencies.push_back(d);
+        c.max_latency = c.max_latency.max(d);
+    }
+
+    fn fault_now(&self) -> Fault {
+        self.fault().map_or(
+            Fault::SyncFailed {
+                path: self.dir.clone(),
+            },
+            |f| fault_out(&f),
+        )
+    }
+
+    fn count(&self, readings: &[Reading], plan: &ingest::Plan) {
+        let mut c = lock(&self.counters);
+        for (r, d) in readings.iter().zip(&plan.decisions) {
+            let st = c.series.entry(r.series.0).or_default();
+            match d {
+                Decision::Refused(x) => *st.refused.entry(*x).or_insert(0) += 1,
+                Decision::Duplicate => st.duplicates_dropped += 1,
+                Decision::Record {
+                    item,
+                    outranked,
+                    absent,
+                } => {
+                    st.recorded += 1;
+                    st.outranked_on_arrival += u64::from(*outranked);
+                    st.absent_supplied += u64::from(*absent);
+                    if let Some(Item::Fact(row)) = plan.items.get(*item) {
+                        st.late += u64::from(row.flags.late);
+                        st.future += u64::from(row.flags.future);
+                    }
+                }
+            }
+        }
+    }
+
+    // ----- health and statistics -----
+
+    pub(crate) fn losses(&self) -> Vec<LossReport> {
+        let acked = lock(&self.acknowledged).clone();
+        self.reader()
+            .and_then(|r| r.losses())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut l| {
+                l.acknowledged = acked.contains(&l.identity);
+                l
+            })
+            .collect()
+    }
+
+    /// Acknowledges losses. Held in memory for this process: the manifest's acknowledgement record is not
+    /// written yet.
+    pub(crate) fn acknowledge_losses(&self, ids: &[Position]) -> Result<(), WriteError> {
+        self.writable().map_err(|e| e.write(&self.dir))?;
+        lock(&self.acknowledged).extend(ids.iter().copied());
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge_manifest_rebuild(&self) -> Result<(), WriteError> {
+        self.writable().map_err(|e| e.write(&self.dir))
+    }
+
+    pub(crate) fn health(&self) -> Health {
+        if self.closed.load(Ordering::SeqCst) {
+            return Health::Closed;
+        }
+        let mut reasons: Vec<Reason> = Vec::new();
+        if let Some(log) = self.log().as_ref() {
+            for r in log.reasons() {
+                reasons.push(match r {
+                    LogReason::IngestWaiting(w) => Reason::IngestWaiting(wait_out(w)),
+                    LogReason::DiskLow { free } => Reason::DiskLow { free },
+                    LogReason::DiskCritical { free } => Reason::DiskCritical { free },
+                    LogReason::SealBlocked { file_id } => Reason::SealBlocked { file_id },
+                });
+            }
+        }
+        reasons.extend(
+            self.losses()
+                .into_iter()
+                .filter(|l| l.kind == LossKind::DataLost && !l.acknowledged)
+                .map(Reason::DataLost),
+        );
+        match (self.fault(), reasons.is_empty()) {
+            (Some(f), _) => Health::ReadOnly {
+                cause: fault_out(&f),
+                reasons,
+            },
+            (None, true) => Health::Ok,
+            (None, false) => Health::Degraded { reasons },
+        }
+    }
+
+    pub(crate) fn stats(&self) -> Stats {
+        let log = self.log();
+        let ls = log.as_ref().map(Log::stats);
+        let waiting = log.as_ref().and_then(|l| {
+            l.reasons().into_iter().find_map(|r| match r {
+                LogReason::IngestWaiting(w) => Some(wait_out(w)),
+                _ => None,
+            })
+        });
+        let queue_depth = log.as_ref().map_or(0, Log::queue_depth);
+        drop(log);
+        let c = lock(&self.counters);
+        let mut sorted: Vec<Duration> = c.latencies.iter().copied().collect();
+        sorted.sort();
+        let pct = |p: usize| {
+            sorted
+                .get((sorted.len() * p / 100).min(sorted.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or_default()
+        };
+        let free = self.env.fs.free_space(&self.dir).unwrap_or(0);
+        Stats {
+            ingest: IngestStats {
+                queue_depth,
+                waiting,
+                waited: c.waited,
+                waits: c.waits.clone(),
+                batches: ls.as_ref().map_or(0, |s| s.batches),
+                syncs: ls.as_ref().map_or(0, |s| s.syncs),
+                commit_latency: Latency {
+                    p50: pct(50),
+                    p99: pct(99),
+                    max: c.max_latency,
+                },
+            },
+            log: LogStats {
+                durable: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.durable)),
+                mark_synced: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.mark_synced)),
+                mark_sync: match ls.as_ref().map(|s| s.mark_sync) {
+                    Some(LogMarkSyncMode::EveryCommit { reason }) => MarkSyncMode::EveryCommit {
+                        reason: format!("{reason:?}"),
+                    },
+                    _ => MarkSyncMode::Interval,
+                },
+                open_file_id: ls.as_ref().and_then(|s| s.open_file_id),
+                sealed_segments: ls.as_ref().map_or(0, |s| s.sealed_segments),
+                bytes: ls.as_ref().map_or(0, |s| s.bytes),
+                manifest_rebuilds: 0,
+                loss_identities_rebuilt: 0,
+            },
+            disk: DiskStats { free },
+            clock: ClockStats::default(),
+        }
+    }
+
+    pub(crate) fn series_stats(&self, id: SeriesId) -> Option<SeriesStats> {
+        lock(&self.decider).registry.get(id.0)?;
+        let mut st = lock(&self.counters)
+            .series
+            .get(&id.0)
+            .cloned()
+            .unwrap_or_default();
+        if let Ok(r) = self.reader() {
+            let _ = r.with(|i, _| {
+                st.latest_t = i.latest_t(id.0).map(Timestamp);
+                Ok(())
+            });
+        }
+        Some(st)
+    }
+
+    /// Orphaned facts with positions in a range (spec §2.1).
+    pub(crate) fn export_orphaned(
+        &self,
+        range: std::ops::RangeInclusive<Position>,
+    ) -> Result<Vec<Fact>, QueryError> {
+        self.reader()?.with(|i, _| Ok(orphaned(i, &range)))
+    }
+}
+
+/// The ASCII release name of at most 15 bytes a tzdata entry and the store descriptor carry; anything else is
+/// left out.
+fn tzdata_name(v: &str) -> String {
+    if v.is_empty() || v.len() > 15 || !v.is_ascii() {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+fn writer_config(config: &StoreConfig) -> WriterConfig {
+    let l = &config.log;
+    let lim = &config.limits;
+    WriterConfig {
+        segment_size: l.segment_size,
+        seal_interval: l.seal_interval,
+        min_sync_interval: l.min_sync_interval,
+        max_batch_bytes: l.max_batch_bytes,
+        mark_sync: match l.mark_sync {
+            MarkSync::Interval(d) => LogMarkSync::Interval(d),
+            MarkSync::EveryCommit => LogMarkSync::EveryCommit,
+        },
+        ingest_queue: lim.ingest_queue,
+        disk_low_percent: (lim.disk_low.fraction * 100.0).round() as u8,
+        disk_low_bytes: lim.disk_low.bytes,
+        disk_critical: lim.disk_critical,
+        ..WriterConfig::default()
+    }
+}
+
+/// One outcome per reading; positions follow the call's first, each recorded fact taking one.
+fn outcomes(decisions: &[Decision], first: Option<kvik_log::writer::Position>) -> Vec<Outcome> {
+    decisions
+        .iter()
+        .map(|d| match d {
+            Decision::Refused(x) => Outcome::Refused(*x),
+            Decision::Duplicate => Outcome::Duplicate,
+            Decision::Record {
+                item, outranked, ..
+            } => {
+                let f = first.unwrap_or_default();
+                Outcome::Recorded {
+                    position: Position::new(f.generation, f.sequence + *item as u64),
+                    outranked: *outranked,
+                    unchecked: false,
+                    rounded: false,
+                    out_of_range: false,
+                }
+            }
+        })
+        .collect()
+}
+
+fn orphaned(i: &Index, range: &std::ops::RangeInclusive<Position>) -> Vec<Fact> {
+    let mut out: Vec<Fact> = i
+        .orphaned()
+        .keys()
+        .flat_map(|id| i.series_facts(*id))
+        .filter(|s| range.contains(&pos(s.position)))
+        .map(fact_out)
+        .collect();
+    out.sort_by_key(|f| f.position);
+    out
+}
+
+/// Reads of a durable store: the queries a log reader can answer.
+pub(crate) fn facts(
+    r: &DurableReader,
+    id: SeriesId,
+    range: TimeRange,
+    view: View,
+) -> Result<Facts, QueryError> {
+    r.with(|i, _| i.facts(id, range, view)).map(Facts::new)
+}
+
+/// The latest fact at or before `t` that a window can credit (not bad quality), in a view, ignoring the
+/// staleness limit.
+pub(crate) fn at(
+    r: &DurableReader,
+    id: SeriesId,
+    t: Timestamp,
+    view: View,
+) -> Result<Option<Fact>, QueryError> {
+    let Some(end) = t.0.checked_add(1) else {
+        return Ok(None);
+    };
+    r.with(|i, _| {
+        let fs = i.facts(
+            id,
+            TimeRange::new(Timestamp(i64::MIN), Timestamp(end)),
+            view,
+        )?;
+        Ok(fs
+            .into_iter()
+            .filter(|f| f.quality != crate::types::Quality::Bad)
+            .max_by_key(|f| (f.t, f.position)))
+    })
+}
+
+/// The interval of a fixed-length interval series that contains `t`.
+pub(crate) fn interval(
+    r: &DurableReader,
+    id: SeriesId,
+    t: Timestamp,
+) -> Result<(Timestamp, Timestamp), QueryError> {
+    r.with(|i, _| {
+        let info = i.series(&SeriesKey::Id(id))?;
+        match info.spec.kind {
+            Kind::Interval {
+                length: IntervalLength::Fixed { d, phase },
+                ..
+            } => {
+                let (d, phase) = (convert::dur_nanos(d)?, convert::dur_nanos(phase)?);
+                let start = (t.0 - phase).div_euclid(d) * d + phase;
+                let end = start
+                    .checked_add(d)
+                    .ok_or_else(|| Error::InvalidQuery("interval outside the time range".into()))?;
+                Ok((Timestamp(start), Timestamp(end)))
+            }
+            Kind::Interval { .. } => Err(Error::NotSupportedYet(
+                "calendar-length interval series (a local day or month)",
+            )),
+            _ => Err(Error::InvalidQuery("not an interval series".into())),
+        }
+    })
+}
+
+/// What a durable reader does not answer yet.
+pub(crate) fn not_available(what: &str) -> QueryError {
+    QueryError::NotAvailable {
+        reason: format!(
+            "not supported yet by the durable backend: {what} (needs live state, windows or calendar results, \
+             roadmap 5.4 and 7.x)"
+        ),
+    }
+}
+
+/// The reader state of a durable reader.
+pub(crate) fn refresh(r: &DurableReader) -> Result<ReaderState, QueryError> {
+    r.refresh()
+}

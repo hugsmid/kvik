@@ -540,6 +540,7 @@ dependencies = [
  "jiff",
  "kvik-log",
  "kvik-model",
+ "proptest",
  "thiserror",
 ]
 

@@ -10,8 +10,18 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use kvik::env::{Env, ManualClock};
-use kvik::{Span, Store, StoreConfig, Timestamp};
+use kvik::{Backend, LogConfig, ReaderConfig, Span, Store, StoreConfig, Timestamp};
+
+/// Both backends, for the tests that run on each.
+pub const BACKENDS: [Backend; 2] = [Backend::Model, Backend::Durable];
+
+/// The environment of each durable test store, by name, so that a store can be opened again and read by a
+/// reader on the same in-memory file system.
+static ENVS: Mutex<Option<HashMap<String, Env>>> = Mutex::new(None);
 
 struct ThreadWaker(Thread);
 
@@ -70,17 +80,68 @@ pub fn start() -> Timestamp {
 }
 
 /// A configuration for a store unique to the test, on a manual clock,
-/// created if missing.
+/// created if missing, on the model backend.
 pub fn config(name: &str, clock: &ManualClock) -> StoreConfig {
-    StoreConfig::new(format!("kvik-test/{name}"), "Europe/London")
-        .create_if_missing(true)
-        .env(Env::test(clock.clone()))
+    config_on(Backend::Model, name, clock)
 }
 
-/// A new store unique to the test, on a manual clock at [`start`].
+/// The test environment of a durable store: one in-memory file system per
+/// name, with the given clock.
+pub fn env_for(name: &str, clock: &ManualClock) -> Env {
+    let mut envs = ENVS.lock().unwrap();
+    let map = envs.get_or_insert_with(HashMap::new);
+    let mut env = map
+        .entry(name.to_string())
+        .or_insert_with(|| Env::test(clock.clone()))
+        .clone();
+    env.clock = Arc::new(clock.clone());
+    env
+}
+
+/// The directory of a test store on a backend.
+pub fn dir_on(backend: Backend, name: &str) -> String {
+    match backend {
+        Backend::Model => format!("kvik-test/{name}"),
+        _ => format!("kvik-test/durable/{name}"),
+    }
+}
+
+/// [`config`] on a backend. A durable store has small segments (16 MiB,
+/// the least allowed), on an in-memory file system shared by every open of
+/// the same name.
+pub fn config_on(backend: Backend, name: &str, clock: &ManualClock) -> StoreConfig {
+    let c = StoreConfig::new(dir_on(backend, name), "Europe/London")
+        .create_if_missing(true)
+        .backend(backend);
+    match backend {
+        Backend::Model => c.env(Env::test(clock.clone())),
+        _ => {
+            let mut log = LogConfig::default();
+            log.segment_size = 16 << 20;
+            c.env(env_for(name, clock)).log(log)
+        }
+    }
+}
+
+/// A reader configuration for a test store on a backend.
+pub fn reader_on(backend: Backend, name: &str, clock: &ManualClock) -> ReaderConfig {
+    let c = ReaderConfig::new(dir_on(backend, name)).backend(backend);
+    match backend {
+        Backend::Model => c,
+        _ => c.env(env_for(name, clock)),
+    }
+}
+
+/// A new store unique to the test, on a manual clock at [`start`], on the
+/// model backend.
 pub fn store(name: &str) -> (Store, ManualClock) {
+    store_on(Backend::Model, name)
+}
+
+/// [`store`] on a backend.
+pub fn store_on(backend: Backend, name: &str) -> (Store, ManualClock) {
     let clock = ManualClock::new(start());
-    let s = block_on(Store::open(config(name, &clock))).unwrap();
+    let s = block_on(Store::open(config_on(backend, name, &clock))).unwrap();
     (s, clock)
 }
 

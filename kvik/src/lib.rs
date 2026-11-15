@@ -4,22 +4,28 @@
 //! rules of `docs/spec.md`. Applications can write adapters (which emit
 //! readings) and consumers (which react to them) against it today.
 //!
-//! # Backend: in-memory, not durable, for development and tests
+//! # Backends
 //!
-//! **Nothing is written to disk yet.** With the default feature
-//! `model-backend`, every [`Store`] is backed by the executable reference model
-//! (`kvik-model`): an in-memory, exact and slow implementation of the
-//! specification's semantics. All data lives in the memory of the current
-//! process and is lost when the process ends. [`Store::open`] takes a
-//! directory, but only uses it as a name: within one process, opening the same
-//! directory again after [`Store::shutdown`] (or after dropping the store,
-//! which acts as a crash) finds the store as it was left, so restarts,
-//! catch-up and `resync` can be exercised in tests.
+//! [`StoreConfig::backend`] chooses what stands behind a [`Store`]:
 //!
-//! The durable log engine (roadmap section 4 onwards) will replace the backend
-//! behind the same interface. Items the reference model does not support yet
-//! return a `NotSupportedYet` error (or, for reads, `QueryError::NotAvailable`);
-//! the crate `README.md` lists them and every difference from `docs/api.md`.
+//! - [`Backend::Durable`] (the default): the log engine. Every write is
+//!   committed to the log in the store directory, on the file system of
+//!   [`env::Env`], and acknowledged only once it is durable; a [`Reader`], in
+//!   this process or another, reads up to the durable mark. It supports
+//!   series definitions, writing, facts in every view and series lookup so
+//!   far; consumers, live state, windows and calendar results return
+//!   `NotSupportedYet` (or, for reads, `QueryError::NotAvailable`) until
+//!   their roadmap items.
+//! - [`Backend::Model`]: the executable reference model (`kvik-model`), an
+//!   in-memory, exact and slow implementation of the whole interface. Nothing
+//!   is written to disk: [`Store::open`] only uses the directory as a name,
+//!   and within one process opening the same directory again after
+//!   [`Store::shutdown`] (or after dropping the store, which acts as a crash)
+//!   finds the store as it was left, so restarts, catch-up and `resync` can
+//!   be exercised in tests.
+//!
+//! The crate `README.md` lists what each backend does not support yet and
+//! every difference from `docs/api.md`.
 //!
 //! # Shape
 //!
@@ -39,19 +45,21 @@
 //! nanoseconds, configuration durations are `std::time::Duration`. The
 //! optional feature `jiff` adds conversions to and from `jiff` 0.2.
 //!
-//! `Store` calls that wait are `async` and runtime-neutral; the model backend
+//! `Store` calls that wait are `async` and runtime-neutral. The durable
+//! backend runs the log's `kvik-writer` and `kvik-maint` threads, started by
+//! [`Store::open`] and joined by [`Store::shutdown`]. The model backend
 //! starts no threads, and every call completes at once except
 //! [`Consumer::next`], which waits for a delivery, and [`Store::emit`], which
-//! waits under back-pressure. Timers (window expiry, held-for and stale-for
-//! conditions, scheduled values) advance only when the store is called;
-//! [`Store::tick`] is a temporary way to run them.
+//! waits under back-pressure; its timers (window expiry, held-for and
+//! stale-for conditions, scheduled values) advance only when the store is
+//! called, and [`Store::tick`] is a temporary way to run them.
 //!
 //! # Example
 //!
 //! ```
 //! use std::time::Duration;
 //! use kvik::env::{Env, ManualClock};
-//! use kvik::{Aggregate, Kind, Reading, SeriesSpec, Store, StoreConfig, Value, ValueType, Window};
+//! use kvik::{Aggregate, Backend, Kind, Reading, SeriesSpec, Store, StoreConfig, Value, ValueType, Window};
 //!
 //! # fn block_on<F: std::future::Future>(f: F) -> F::Output {
 //! #     let mut f = std::pin::pin!(f);
@@ -60,8 +68,10 @@
 //! # }
 //! # block_on(async {
 //! let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+//! // Windows are not on the durable backend yet: this example runs on the model.
 //! let config = StoreConfig::new("doc-example-store", "Europe/London")
 //!     .create_if_missing(true)
+//!     .backend(Backend::Model)
 //!     .env(Env::test(clock.clone()));
 //! let store = Store::open(config).await.unwrap();
 //!
@@ -81,22 +91,15 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(not(feature = "model-backend"))]
-compile_error!(
-    "kvik needs a backend: enable the `model-backend` feature (in-memory, not durable); \
-     the durable log engine arrives from roadmap item 4.2"
-);
-
-#[cfg(feature = "model-backend")]
 mod backend;
 mod backup;
 mod config;
 mod consume;
+mod durable;
 mod error;
 mod health;
 mod read;
 mod series;
-#[cfg(feature = "model-backend")]
 mod store;
 mod time;
 mod types;
@@ -104,7 +107,9 @@ mod types;
 pub mod env;
 
 pub use backup::{BackupSink, Encryption, Rebuild, RestoreMode, Stored};
-pub use config::{DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig};
+pub use config::{
+    Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,
+};
 pub use consume::{
     Condition, ConditionState, Delivery, DeliveryFlags, DeliveryId, DeliveryKind, Funnel, FunnelId,
     FunnelState, Operator, RESYNC_PART_FUNNELS, ResyncCause, ResyncPart, Select, Start, Trigger,
@@ -127,7 +132,6 @@ pub use series::{
     ParameterChange, RetentionClass, SeriesInfo, SeriesKey, SeriesSpec, StateValues, Timing,
     ValueType,
 };
-#[cfg(feature = "model-backend")]
 pub use store::{Consumer, Reader, Store};
 pub use time::{LocalDate, LocalTime, ParseError, Span, TimeRange, Timestamp, ZoneName};
 pub use types::{

@@ -276,17 +276,30 @@ impl Ack {
 
 /// A batch accepted by [`Store::try_emit`](crate::Store::try_emit): a future
 /// of its [`Ack`], runtime-neutral, that may be dropped (dropping cancels
-/// nothing). With the model backend it is ready at once.
+/// nothing). With the model backend it is ready at once; with the durable
+/// backend it resolves when the log acknowledges the batch.
 #[derive(Debug)]
 #[must_use = "awaiting a Pending gives the outcomes; dropping it cancels nothing"]
 pub struct Pending {
-    result: Option<Result<Ack, EmitError>>,
+    inner: PendingInner,
+}
+
+#[derive(Debug)]
+enum PendingInner {
+    Ready(Option<Result<Ack, EmitError>>),
+    Queued(Option<crate::durable::Queued>),
 }
 
 impl Pending {
     pub(crate) fn ready(result: Result<Ack, EmitError>) -> Self {
         Pending {
-            result: Some(result),
+            inner: PendingInner::Ready(Some(result)),
+        }
+    }
+
+    pub(crate) fn queued(q: crate::durable::Queued) -> Self {
+        Pending {
+            inner: PendingInner::Queued(Some(q)),
         }
     }
 }
@@ -295,8 +308,23 @@ impl Future for Pending {
     type Output = Result<Ack, EmitError>;
     /// # Panics
     /// Panics if polled after it completed.
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(self.result.take().expect("Pending polled after completion"))
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.inner {
+            PendingInner::Ready(r) => {
+                Poll::Ready(r.take().expect("Pending polled after completion"))
+            }
+            PendingInner::Queued(q) => {
+                let r = match q
+                    .as_mut()
+                    .expect("Pending polled after completion")
+                    .poll(cx)
+                {
+                    Poll::Ready(r) => r,
+                    Poll::Pending => return Poll::Pending,
+                };
+                Poll::Ready(q.take().expect("present above").finish(r))
+            }
+        }
     }
 }
 

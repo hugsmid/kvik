@@ -1,8 +1,10 @@
 //! Open a store, define a gauge and a counter, emit readings, react to a
 //! threshold condition, and query a window and a calendar day.
 //!
-//! Run with `cargo run -p kvik --example quickstart`. The model backend keeps
-//! everything in memory: nothing is written to disk.
+//! Run with `cargo run -p kvik --example quickstart`. Consumers, conditions,
+//! windows and calendar results are not on the durable backend yet, so the
+//! example runs on the model backend, which keeps everything in memory:
+//! nothing is written to disk.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -12,8 +14,8 @@ use std::time::Duration;
 
 use kvik::env::{Env, ManualClock};
 use kvik::{
-    Aggregate, Condition, DeliveryKind, Funnel, Kind, LocalDate, Reading, Select, SeriesSpec, Span,
-    Start, Store, StoreConfig, Timestamp, Value, ValueType, Window,
+    Aggregate, Backend, Condition, DeliveryKind, Funnel, Kind, LocalDate, Reading, Select,
+    SeriesSpec, Span, Start, Store, StoreConfig, Timestamp, Value, ValueType, Window,
 };
 
 /// A minimal executor: any async runtime works, as the store starts no
@@ -47,6 +49,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clock = ManualClock::new(start);
     let config = StoreConfig::new("quickstart-store", "Europe/London")
         .create_if_missing(true)
+        .backend(Backend::Model)
         .env(Env::test(clock.clone()));
     let store = Store::open(config).await?;
     println!("store opened; durable: {}", store.is_durable());
