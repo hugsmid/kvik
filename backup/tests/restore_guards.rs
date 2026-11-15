@@ -1,18 +1,20 @@
-//! Guards of the restore executor: a drill never writes, claim retries, lagging listings and the bucket probe
-//! (`spec.md` §8 Generations, Restore, Restore drill).
+//! Guards of the restore executor: a drill never writes, claim retries, lagging listings, the bucket probe and the
+//! records read past a rebuilt manifest not yet whole (`spec.md` §8 Generations, Restore, Restore drill).
 
 mod support;
 
 use std::sync::Arc;
 
-use kvik_backup::fake::block_on;
+use kvik_backup::envelope::Envelope;
+use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::{ClaimMarker, Keys};
 use kvik_backup::plan::PlanMode;
 use kvik_backup::restore::{Prepared, RestoreDriver, RestoreError};
 use kvik_backup::upload::Refused;
+use kvik_files::record::{Body, Rebuild, Record};
 use kvik_log::fs::MemFs;
 use kvik_sink::fake::FakeBucket;
-use kvik_sink_api::SinkError;
+use kvik_sink_api::{BackupSink, SinkError};
 use support::*;
 
 #[test]
@@ -210,4 +212,38 @@ fn a_sink_fault_during_the_probe_is_a_sink_error_not_a_refusal() {
         let r = block_on(restorer(sink.clone(), &MemFs::new(), PlanMode::Full, KEY).prepare(1));
         assert!(matches!(r, Err(RestoreError::Sink(_))), "{fault:?}: {r:?}");
     }
+}
+
+#[test]
+fn q108_a_rebuilt_manifest_not_yet_whole_in_the_bucket_is_not_read() {
+    let mut src = source(ID, 3, false);
+    let sink = MemSink::new();
+    upload(&sink, &mut src);
+    use_copies(&src);
+    let (keys, env) = (Keys::new(ID), TestEnvelope::new(KEY));
+    let mut carried = Record::new(7, 0, 12, Body::Sealed(vec![src.segments[0].0.clone()]));
+    carried.old_epoch = Some(2);
+    for r in [
+        Record::new(5, 0, 12, Body::Rebuild(Rebuild::default())),
+        Record {
+            old_epoch: Some(1),
+            ..Record::new(6, 0, 12, Body::Empty)
+        },
+        carried,
+    ] {
+        let k = keys.record(0, r.epoch);
+        let sealed = env.seal(&k, &r.encode().unwrap()).unwrap();
+        block_on(sink.put(&k, sealed.clone().into(), sha256(&sealed))).unwrap();
+    }
+    let fs = MemFs::new();
+    let (p, o) = restore(&mut restorer(sink, &fs, PlanMode::Drill, KEY)).unwrap();
+    let listed: Vec<_> = p
+        .record
+        .files
+        .iter()
+        .map(|f| f.description.clone())
+        .collect();
+    let all: Vec<_> = src.segments.iter().map(|(d, _)| d.clone()).collect();
+    assert_eq!(listed, all);
+    assert_eq!(o.installed.len(), 3);
 }

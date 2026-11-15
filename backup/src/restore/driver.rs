@@ -21,7 +21,7 @@ use super::{
 };
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
-use crate::plan::{PlanError, PlanFn, PlanInput, PlanMode, RestorePlan};
+use crate::plan::{PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, records_to_read};
 use crate::{DriverFuture, LocalStore};
 
 fn sha256(b: &[u8]) -> [u8; 32] {
@@ -196,7 +196,8 @@ async fn claim<S: BackupSink>(
     }
 }
 
-/// The records of the highest generation below `generation` that has any, from its last rebuild record on (Q-108).
+/// The records a restore reads (`plan::records_to_read`, Q-108) of the highest generation below `generation` that has
+/// any.
 /// A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304).
 async fn source_records<S: BackupSink, E: Envelope>(
     sink: &S,
@@ -238,10 +239,7 @@ async fn source_records<S: BackupSink, E: Envelope>(
             }
             out.push(r);
         }
-        if let Some(i) = out.iter().rposition(|r| matches!(r.body, Body::Rebuild(_))) {
-            out.drain(..i);
-        }
-        return Ok((g, out));
+        return Ok((g, records_to_read(&out).to_vec()));
     }
     Err(PlanError::NoRecords.into())
 }
