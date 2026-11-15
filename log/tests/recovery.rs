@@ -12,6 +12,7 @@ use kvik_log::content::{BatchContent, Item};
 use kvik_log::entries::{Entry, MarkState};
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
+use kvik_log::header::HEADER_LEN;
 use kvik_log::manifest::{LossCause, RECORD_LOST_RANGE, encode_record, read_manifest};
 use kvik_log::mark::{MarkSlot, SLOT_LEN, SLOT_OFFSETS, read_mark};
 use kvik_log::name::SegmentName;
@@ -249,6 +250,29 @@ impl Rig {
             }
         }
         out
+    }
+
+    /// Whether an unsealed segment holds a non-zero byte beyond the mark: past its offset in the mark's segment,
+    /// past the header in a later one.
+    fn nonzero_beyond(&self, m: &MarkSlot) -> bool {
+        self.fs.paths().into_iter().any(|p| {
+            let Some(n) = p.file_name().and_then(|f| SegmentName::parse(f.to_str()?)) else {
+                return false;
+            };
+            if n.sealed || n.file_id < m.file_id {
+                return false;
+            }
+            let from = if n.file_id == m.file_id {
+                (m.offset as usize).max(HEADER_LEN)
+            } else {
+                HEADER_LEN
+            };
+            let bytes = self.fs.read(&p).unwrap();
+            bytes
+                .iter()
+                .rposition(|&b| b != 0)
+                .is_some_and(|i| i >= from)
+        })
     }
 
     /// Entries by position.
@@ -1373,6 +1397,9 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
             }
         }
         let before = r.batches();
+        let dirty = mark_before
+            .or_else(|| r.mark())
+            .is_some_and(|m| r.nonzero_beyond(&m));
         let rep = r.open().expect("a start finishes");
         r.check_started();
         paid(&r, &owed);
@@ -1400,10 +1427,11 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                     .iter()
                     .filter(|b| b.last_sequence() <= m.last_sequence)
                     .collect();
-                // A recovery entry, written or adopted, exactly when a complete batch lay beyond the mark (Q-118 (e)).
+                // A recovery entry, written or adopted, exactly when a complete batch or any non-zero byte lay beyond
+                // the mark (Q-118 (e), Q-125).
                 let beyond = before.iter().any(|b| b.last_sequence() > m.last_sequence);
-                assert_eq!(rep.entry.is_some(), beyond, "{:?}", rep.entry);
-                let extra = usize::from(beyond);
+                assert_eq!(rep.entry.is_some(), beyond || dirty, "{:?}", rep.entry);
+                let extra = usize::from(rep.entry.is_some());
                 assert_eq!(after.len(), expect.len() + extra);
                 assert_eq!(after[..expect.len()].iter().collect::<Vec<_>>(), expect);
                 if let Some(e) = &rep.entry {
