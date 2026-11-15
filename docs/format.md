@@ -535,7 +535,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`;
   5 `file_id` floor, repeated, one per file kind: kind `u8`, id `u64`, 2^32 above the highest id of that kind in any
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
-  missing position because no valid record names their identity, `u32`), the first record of a rebuilt manifest.
+  missing position because no valid record names their identity, `u32`; 7 repeated, each corrupt span the rebuild
+  stood in for, as the epochs of the valid records around it in the manifest it rebuilt: after `u64` (0 for none),
+  before `u64`, in ascending order and not overlapping), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
   record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire and `0x22` sealed log segment are laid out below. Reserved for their roadmap items:
@@ -582,7 +584,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   only what the corrupt record alone held (`spec.md` §7 Manifest); a restore record is never rebuilt. A rebuild record that no
   acknowledgement record names is provisional at a start: the store holds uploads, evictions, removals and
   retirements, and refuses to append an acknowledgement of it, until the mirror path and deep have answered in that
-  run for the record its fields 1 and 2 name (`spec.md` §7 Deep unreachable). Field 6 counts restated losses no
+  run for every corrupt span its field 7 names (`spec.md` §7 Deep unreachable); a copy is a valid record whose epoch
+  lies strictly between the span's two epochs. Field 6 counts restated losses no
   valid record names where the old manifest held two corrupt spans, or one whose next valid epoch is more than 2
   above the last valid one before it.
 

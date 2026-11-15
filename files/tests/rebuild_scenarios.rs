@@ -480,3 +480,60 @@ fn q103_a_an_unlisted_output_of_log_segments_is_verified_before_it_is_published(
     let p = plan(&input(&img, &h), &v).unwrap();
     assert!(live(&p.catalogue).contains(&comp_ref(9)));
 }
+
+#[test]
+fn q175_an_output_whose_unnamed_input_is_gone_stays_live_and_is_never_discarded() {
+    // Merges A (compacted 1 and 2 into 3) and B (3 and 4 into 5) both corrupt, no later merge; 3 removed locally.
+    let h = closed(play(&[
+        Step::Seal {
+            len: 4,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Seal {
+            len: 4,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Merge,
+        Step::Seal {
+            len: 4,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Merge,
+    ]));
+    let merges: Vec<usize> = h
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(&r.body, Body::Publish(p) if !p.retired.is_empty()))
+        .map(|(k, _)| k)
+        .collect();
+    for removed in [
+        vec![comp_ref(3)],
+        vec![comp_ref(1), comp_ref(2), comp_ref(3)],
+    ] {
+        let mut h = h.clone();
+        h.files
+            .retain(|f| !removed.contains(&f.description.file_ref()));
+        let (_, img) = image_with_corrupt(&h, &merges);
+        // A verifier that would fail it, were it asked: it is not, as an input is not at hand.
+        let v = FakeVerifier {
+            bad: [comp_ref(5)].into(),
+        };
+        let p = plan(&input(&img, &h), &v).unwrap();
+        assert!(p.discard.is_empty(), "{removed:?}");
+        assert_eq!(p.undescribed, vec![comp_ref(3)]);
+        let l = live(&p.catalogue);
+        assert!(
+            l.contains(&comp_ref(5)) && !l.contains(&comp_ref(4)),
+            "{removed:?}"
+        );
+        // 1 and 2 cannot be followed through 3: they stay as the valid records leave them.
+        assert!(l.contains(&comp_ref(1)) && l.contains(&comp_ref(2)));
+    }
+}

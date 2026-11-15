@@ -300,14 +300,23 @@ pub fn body() -> impl Strategy<Value = Body> {
         (
             any::<(u64, u64, u64, u32, u32)>(),
             proptest::collection::btree_map(1u8..15, any::<u64>(), 0..4),
+            proptest::collection::btree_set(any::<u64>(), 0..6),
         )
-            .prop_map(|((a, b, c, d, e), floors)| Body::Rebuild(Rebuild {
+            .prop_map(|((a, b, c, d, e), floors, ends)| Body::Rebuild(Rebuild {
                 presumed_epoch: a,
                 last_valid_before: b,
                 files_found: c,
                 losses_restated: d,
                 floors: floors.into_iter().collect(),
                 identities_rebuilt: e,
+                gaps: ends
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|w| (w[0], w[1]))
+                    .collect(),
             })),
         (
             prop_oneof![Just(0x25u8), Just(0x26), Just(0x27), 0x29u8..0x7F],

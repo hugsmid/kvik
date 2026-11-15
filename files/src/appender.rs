@@ -14,7 +14,7 @@
 //!   which only [`Appender::irreversible`] gives: the record is settled and no provisional rebuild holds it.
 //! - **Provisional rebuilds** (`spec.md` §7 Deep unreachable): at open, a rebuild record that no acknowledgement
 //!   names is provisional, so its holds survive a restart, until the mirror path and deep have answered in this run
-//!   for the corrupt record it stands for ([`crate::rebuild::resolve`]), or are not configured. A provisional
+//!   for every corrupt record it stands for (its field 7; [`crate::rebuild::resolve`]), or are not configured. A provisional
 //!   rebuild cannot be acknowledged.
 
 use std::io;
@@ -59,8 +59,7 @@ impl Irreversible {
 pub struct Gap {
     /// The epoch of the last valid record before it, 0 for none.
     pub after: u64,
-    /// Above the corrupt record's epoch: the next valid record's epoch, or, after a restart, the presumed epoch + 1
-    /// (the rebuild record's field 1).
+    /// The next valid record's epoch (the rebuild record's field 7 keeps it across a restart).
     pub before: u64,
 }
 
@@ -204,6 +203,29 @@ pub(crate) fn remove_leftover(fs: &dyn Fs, dir: &Path) -> io::Result<bool> {
     Ok(present)
 }
 
+/// The corrupt spans a rebuild record stands for: its field 7, or, for a record without it, the first span (fields 1
+/// and 2), bounded above by the first record it carried whose old epoch is above the last valid one before the span.
+fn gaps_of(image: &Image, epoch: u64, r: &crate::record::Rebuild) -> Vec<Gap> {
+    if !r.gaps.is_empty() {
+        return r
+            .gaps
+            .iter()
+            .map(|&(after, before)| Gap { after, before })
+            .collect();
+    }
+    let before = image
+        .records()
+        .skip_while(|x| x.epoch != epoch)
+        .skip(1)
+        .map_while(|x| x.old_epoch)
+        .find(|o| *o > r.last_valid_before)
+        .unwrap_or(r.presumed_epoch.saturating_add(1));
+    vec![Gap {
+        after: r.last_valid_before,
+        before,
+    }]
+}
+
 impl Appender {
     /// The start's repair of the manifest in `dir` (see the module documentation). `lease_epoch` is the highest
     /// epoch any lease file names.
@@ -238,10 +260,7 @@ impl Appender {
                 RebuildState::Provisional {
                     epoch: r.identity_epoch,
                 },
-                vec![Gap {
-                    after: r.record.last_valid_before,
-                    before: r.record.presumed_epoch.saturating_add(1),
-                }],
+                gaps_of(&image, r.epoch, &r.record),
             ),
         };
         let file = fs.open(&path, OpenMode::ReadWrite)?;

@@ -287,11 +287,16 @@ pub fn plan(
         // one is not, liveness follows from the named inputs alone: an input leaves the local tiers only once its
         // replacement is verified in another tier (`spec.md` §7 inputs kept), so the output was published and
         // verified.
+        // An input that no valid record names and no local path holds was an output of a corrupt record retired
+        // since, described nowhere (Q-175): it is not at hand either, and an output is never discarded because an
+        // input is missing.
         let at_hand = f
             .description
             .inputs
             .iter()
-            .filter(|i| i.kind == kind::LOG_SEGMENT || live_inputs.contains(i))
+            .filter(|i| {
+                i.kind == kind::LOG_SEGMENT || live_inputs.contains(i) || old.file(**i).is_none()
+            })
             .all(|i| local.contains_key(i));
         let inputs: Vec<&LocalFile> = f
             .description
@@ -311,8 +316,7 @@ pub fn plan(
                     retired.insert(i, d);
                 }
             }
-            // An input that no valid record names and no local path holds was an output of a corrupt record retired
-            // since: nothing describes it, so its own inputs cannot be followed (Q-175).
+            // Such an input's own inputs cannot be followed (Q-175).
             for i in f.description.inputs.iter().filter(|i| {
                 i.kind == kind::COMPACTED && old.file(**i).is_none() && !local.contains_key(*i)
             }) {
@@ -453,6 +457,11 @@ pub fn plan(
                 .map(|(k, id)| (k, id.saturating_add(FLOOR_MARGIN)))
                 .collect(),
             identities_rebuilt,
+            gaps: image
+                .corrupt
+                .iter()
+                .map(|s| (s.after_epoch, s.before_epoch))
+                .collect(),
         }),
     )];
     let next = |epoch: &mut u64| -> Result<u64, RebuildError> {

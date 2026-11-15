@@ -142,8 +142,7 @@ pub fn rebuild_manifest(
     let Opened::Ready(mut app) = Appender::open(fs, dir, store_id, state.lease_epoch)? else {
         return Err(RebuildManifestError::NotReadBack);
     };
-    // In this run every corrupt span is known, with the epochs around it; after a restart only the first is, from the
-    // rebuild record's fields 1 and 2.
+    // The same spans the rebuild record's field 7 keeps for a later start.
     let gaps: Vec<Gap> = image
         .corrupt
         .iter()

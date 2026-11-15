@@ -614,8 +614,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   final. A provisional rebuild cannot be acknowledged: `acknowledge_manifest_rebuild` is refused (`api.md` `WriteError::NotFinal`) until the rebuild is
   final, and one acknowledgement is given then. A rebuild record that no acknowledgement record names is taken as
   provisional at every start, so that the holds survive a restart: they apply until the mirror path and deep have
-  each answered, in that run, for the corrupt record it stands for (the rebuild record's fields 1 and 2 name it), or
-  are not configured; a copy then found replaces the reconstruction as above. Two corrupt records read as one span
+  each answered, in that run, for every corrupt record it stands for (the rebuild record lists each corrupt span,
+  `format.md` A.14 field 7), or are not configured; a copy then found replaces the reconstruction as above. Two corrupt records read as one span
   when nothing valid lies between them; a span whose epochs leave room for more than one record (the next valid
   epoch more than 2 above the last valid one before it) counts as two for step 3.
 - Compaction of compacted files (merging overlapping chunks created by late data) publishes outputs and retires

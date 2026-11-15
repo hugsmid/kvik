@@ -599,3 +599,118 @@ fn a_kill_while_appending_deeps_copy_keeps_the_holds_until_it_is_taken() {
         }
     }
 }
+
+/// Epochs 1, 2, 6, 7, 8: the record of epoch 6 came after a jump above a lease.
+fn jumped() -> History {
+    closed(play(&[
+        Step::Seal {
+            len: 6,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Jump(3),
+        Step::Seal {
+            len: 6,
+            lost: Some(1),
+            cause_given: false,
+        },
+    ]))
+}
+
+#[test]
+fn q171_after_a_restart_a_corrupt_record_whose_epoch_jumped_is_still_taken_from_deep() {
+    let h = jumped();
+    assert_eq!(
+        h.records.iter().map(|r| r.epoch).collect::<Vec<_>>(),
+        vec![1, 2, 6, 7, 8]
+    );
+    let (fs, img, app, e) = provisional(&h, &[2]);
+    let g = gap(&img.corrupt[0]);
+    assert_eq!(
+        g,
+        Gap {
+            after: 2,
+            before: 7
+        }
+    );
+    drop(app);
+    let mut app = reopen(&fs);
+    assert_eq!(app.pending(), &[g]);
+    let copy = h.records[2].encode().unwrap();
+    assert_eq!(
+        resolve(
+            &mut app,
+            g,
+            &Answer::HoldsNone,
+            &Answer::Holds(copy.clone())
+        )
+        .unwrap(),
+        RebuildState::Final { epoch: e }
+    );
+    assert!(app.acknowledge_rebuild(e, NOW).unwrap());
+    // A rebuild record without field 7: the span is bounded by the first record it carried after it.
+    let mut records = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID)
+        .unwrap()
+        .records()
+        .cloned()
+        .collect::<Vec<_>>();
+    records.truncate(records.len() - 2);
+    let rebuild_at = records
+        .iter()
+        .rposition(|r| matches!(r.body, Body::Rebuild(_)))
+        .unwrap();
+    if let Body::Rebuild(rb) = &mut records[rebuild_at].body {
+        rb.gaps.clear();
+    }
+    let fs = fs_with(&manifest_bytes(&records));
+    let mut app = reopen(&fs);
+    assert_eq!(app.pending(), &[g]);
+    resolve(&mut app, g, &Answer::HoldsNone, &Answer::Holds(copy)).unwrap();
+    assert!(!app.holds());
+}
+
+#[test]
+fn q171_every_corrupt_record_is_asked_for_again_after_a_restart() {
+    let h = closed(play(&[
+        Step::Seal {
+            len: 6,
+            lost: Some(2),
+            cause_given: false,
+        },
+        Step::Seal {
+            len: 6,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Seal {
+            len: 6,
+            lost: Some(1),
+            cause_given: false,
+        },
+    ]));
+    let (fs, img, app, e) = provisional(&h, &[2, 5]);
+    let gaps = [gap(&img.corrupt[0]), gap(&img.corrupt[1])];
+    drop(app);
+    let mut app = reopen(&fs);
+    assert_eq!(app.pending(), &gaps);
+    resolve(&mut app, gaps[0], &Answer::HoldsNone, &Answer::HoldsNone).unwrap();
+    assert!(app.holds(), "the second corrupt record has no answer yet");
+    drop(app);
+    // A restart asks for both again.
+    let mut app = reopen(&fs);
+    assert_eq!(app.pending(), &gaps);
+    resolve(&mut app, gaps[0], &Answer::HoldsNone, &Answer::HoldsNone).unwrap();
+    let copy = h.records[5].encode().unwrap();
+    assert_eq!(
+        resolve(&mut app, gaps[1], &Answer::HoldsNone, &Answer::Holds(copy)).unwrap(),
+        RebuildState::Final { epoch: e }
+    );
+    let identity = match &h.records[5].body {
+        Body::LostRange(l) => l.identity,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        app.catalogue().loss(identity).unwrap().record.cause,
+        LossCause::Corruption
+    );
+}

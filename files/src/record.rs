@@ -89,6 +89,10 @@ pub struct Rebuild {
     pub floors: Vec<(u8, u64)>,
     /// Field 6: losses listed under their first missing position because no valid record names their identity.
     pub identities_rebuilt: u32,
+    /// Field 7, repeated: every corrupt span the rebuild stood in for, as the epochs of the valid records around it in
+    /// the manifest it rebuilt (`after`, `before`; 0 for no record before), in ascending order. A start asks the copy
+    /// sources about each of them again while the rebuild is unacknowledged.
+    pub gaps: Vec<(u64, u64)>,
 }
 
 /// What a record says.
@@ -260,6 +264,11 @@ impl Record {
                     list.push((5, v));
                 }
                 list.push((6, r.identities_rebuilt.to_le_bytes().to_vec()));
+                for (a, b) in &r.gaps {
+                    let mut v = a.to_le_bytes().to_vec();
+                    v.extend_from_slice(&b.to_le_bytes());
+                    list.push((7, v));
+                }
             }
             Body::Other { fields, .. } => {
                 if fields.iter().any(|(id, _)| *id == FIELD_OLD_EPOCH) {
@@ -417,7 +426,7 @@ impl Record {
                 Body::Acknowledgement(a)
             }
             record_type::REBUILD => {
-                only(&[1, 2, 3, 4, 5, 6])?;
+                only(&[1, 2, 3, 4, 5, 6, 7])?;
                 let r = decode_rebuild(&own)?;
                 check_rebuild(&r).map_err(RecordError::Invalid)?;
                 Body::Rebuild(r)
@@ -546,6 +555,16 @@ fn decode_rebuild(own: &[(u16, &[u8])]) -> Result<Rebuild, RecordError> {
         losses_restated: u32f(4)?,
         floors,
         identities_rebuilt: u32f(6)?,
+        gaps: own
+            .iter()
+            .filter(|(id, _)| *id == 7)
+            .map(|(_, v)| {
+                if v.len() != 16 {
+                    return Err(bad("a corrupt span not 16 bytes"));
+                }
+                Ok((fields::u64_at(v, 0), fields::u64_at(v, 8)))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -615,6 +634,9 @@ fn check_ack(a: &Acknowledgement) -> Result<(), &'static str> {
 fn check_rebuild(r: &Rebuild) -> Result<(), &'static str> {
     if !r.floors.windows(2).all(|w| w[0].0 < w[1].0) {
         return Err("file id floors not in strictly ascending order of kind");
+    }
+    if r.gaps.iter().any(|(a, b)| a >= b) || !r.gaps.windows(2).all(|w| w[0].1 <= w[1].0) {
+        return Err("corrupt spans out of order");
     }
     Ok(())
 }

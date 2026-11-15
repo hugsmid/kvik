@@ -315,6 +315,7 @@ fn every_record() -> Vec<Record> {
                     (kind::COMPACTED, 5 + (1 << 32)),
                 ],
                 identities_rebuilt: 0,
+                gaps: vec![(2, 4)],
             }),
         ),
         carried,
