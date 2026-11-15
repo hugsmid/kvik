@@ -40,16 +40,17 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   to later items in Q-116)
 - [x] 4.6 Second-process reader and leases (in `kvik-log`; the interface `Reader`'s `facts` and series lookup moved to 5.1)
 - [x] 4.7 Differential tests: engine log against the model on generated histories
-- [x] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/` (recorded on macOS; pending:
-  the run on the Linux NVMe target that checks the delivery budget, `scripts/bench-nvme.sh`; the cloud-runner
+- [x] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/` (recorded on macOS and on the
+  Linux NVMe target, `scripts/bench-nvme.sh`, which checks the delivery budget (Q-310); the cloud-runner
   figures of the `bench.yml` workflow are recorded, not durability-representative; Q-52 (b), Q-86 (b) and Q-115 (j)
   moved to gate 4.9)
 - [ ] 4.9 **Gate** — log looked at as a whole. Reviewed; its fixes and the questions due here are applied
-  (`model/OPEN-QUESTIONS.md`). Remaining: (1) the owner's run on the Linux NVMe target, `scripts/bench-nvme.sh`
-  (delivery budget, the 100 × 1 Hz tail, restart time, Q-116 (n)); (2) the owner's decisions on Q-110 (trust
-  boundary), Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and (n) (a byte bound
-  on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k) (full disk after a power loss), the Q-52 (b)
-  macOS and Windows wording and the Q-86 (b) `chattr +C` sentence
+  (`model/OPEN-QUESTIONS.md`). The owner's run on the Linux NVMe target is recorded
+  (`docs/measurements/4.8-commit-latency.md`). Remaining: (1) the owner's decision on Q-310 (p50 above 5 ms at
+  exactly 100 × 1 Hz) and a cold start on the target for Q-116 (n) (warm: 0.39–0.74 s); (2) the owner's decisions
+  on Q-110 (trust boundary), Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and
+  (n) (a byte bound on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k) (full disk after a power
+  loss), the Q-52 (b) macOS and Windows wording and the Q-86 (b) `chattr +C` sentence
 
 ## 5. Delivery
 - [ ] 5.1 Series registry; the `kvik` crate on the durable log: writing, and `facts`, series lookup and `refresh` for

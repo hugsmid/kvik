@@ -26,8 +26,8 @@ sources must be acted on quickly, kept for years and restored to a known, record
 >   newer rules are not yet modelled ([coverage table](model/README.md#coverage)).
 > - Three measurements are recorded: [chunk encodings against Parquet](docs/measurements/2.1-chunk-encodings.md),
 >   [commit and sync latency](docs/measurements/2.2-commit-latency.md) (gate 2.3 has looked at both) and the log
->   writer's [commit latency and throughput](docs/measurements/4.8-commit-latency.md), on macOS only so far: the run
->   on the Linux NVMe target that checks the delivery budget is pending.
+>   writer's [commit latency and throughput](docs/measurements/4.8-commit-latency.md), on macOS and on the Linux NVMe
+>   target that checks the delivery budget (one point raised, Q-310).
 > - The public interface ([`kvik/`](kvik/)) has two backends: the durable log (the default), which defines series,
 >   writes and reads facts and series in this or another process, and holds live state, windows, buckets and calendar
 >   results (roadmap 5.4 stays open pending a question), and the reference model in memory (**not
@@ -38,7 +38,7 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 1. Specification settled | 8 of 8 done |
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
-> | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, with the Linux NVMe target run pending) |
+> | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, on macOS and the Linux NVMe target) |
 > | 5. Delivery | 2 of 8 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c)) |
 > | 6. Compacted segments | 2 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
 > | 7. Summary tree | 1 of 5 done (7.1a, summary nodes: the fold, merge and byte layout) |
@@ -249,8 +249,7 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
    per-value decimal exceptions and a compressed XOR fallback; gate 10.3 confirms it against Parquet at scale, and
    Parquet is for export only. Roadmap item 2.2 measured commit and sync latency, group commit, a failed sync and a
    full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)); roadmap item 4.8 measured
-   the log writer itself there ([results](docs/measurements/4.8-commit-latency.md)), and its run on the Linux NVMe
-   target is pending.
+   the log writer itself there and on the Linux NVMe target ([results](docs/measurements/4.8-commit-latency.md)).
 4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) will be
    built behind injectable clock and file-system seams and tested differentially against the model, with crash points,
    failed syncs and full disks injected.

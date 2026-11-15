@@ -49,6 +49,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
+| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -536,12 +537,15 @@ roadmap 6.x bounds. (k) The start stays read-only; the next start retries. (n) M
 130–241 ms to open a store of 7–10 segments (446–639 MiB) again, after a clean shutdown with a warm page cache, against the 1 s
 budget, and 129–138 ms for two segments holding almost nothing, so the time is mostly reading the unsealed 64 MiB
 segments whole. The cloud runners of `bench.yml` (warm cache, not durability-representative) took 0.24–0.68 s for 3–5
-segments. A cold cache, a crash and the Linux target are still to measure (`docs/measurements/4.8-commit-latency.md`).
+segments. On the Linux NVMe target (three runs, warm cache, clean shutdown) a store of 7–10 segments (446–639 MiB)
+opened again in 392–742 ms on the same boot and 393–739 ms on another. A cold cache and a crash are still to measure
+(`docs/measurements/4.8-commit-latency.md`).
 **Gate 4.9.** (a) Deferred to 6.3: the refusal stays until deep fetch or a rebuild exists. (c) Deferred to 5.1: the
 interface reads it. (k) Recommended as implemented: `spec.md` §3 step 5 to say that if the
 segment cannot be created for lack of space the start stays read-only and reports it, and the next start retries, so
 a full disk after a power loss needs space freed and a restart. Owner decision pending: that availability wording.
-(n) Open until the owner's run on the Linux NVMe target: if a cold start there is over 1 s, a start scans segments
+(n) Open: the owner's run on the Linux NVMe target measured a warm cache only (0.39–0.74 s, inside the budget with
+0.26 s to spare at worst); a cold start is still to measure. If a cold start there is over 1 s, a start scans segments
 awaiting a seal only up to their last complete batch; independently, a start should fold each batch's content into
 the segment's summary while scanning rather than hold it all at once.
 **Roadmap 6.3a.** (a) The crate `kvik-files` reads a manifest past its corrupt records (`image::read`), writes a
@@ -555,8 +559,8 @@ copy is written over the span's start, the rest left corrupt); `appender::Irreve
 appender or run, so it must be bound to both before anything consumes it; and while a rebuild stays
 unacknowledged, each start that is given deep's copy appends it again (the catalogue takes it as a no-op, but the
 manifest grows by one record per such start). Open points found: Q-171 to Q-175; Q-171 and Q-174 settled at the review of 6.3a, Q-172 withdrawn (spec §7 step 2 settles it).
-**Needed.** (a) with roadmap 6.3 (6.3b), (c) with 5.1; (k) the owner's decision and (n) the Linux target run, at gate
-4.9.
+**Needed.** (a) with roadmap 6.3 (6.3b), (c) with 5.1; (k) the owner's decision and (n) a cold start on the Linux
+target, at gate 4.9.
 
 ## Q-118 (c), (f), (k) — The reader process and leases: points `spec.md` §7 and §8 leave open
 Found while building the reader process (roadmap 4.6, crate `kvik-log`: `reader`, `lease`). Parts (a), (b), (d),
@@ -907,6 +911,32 @@ Calendar-length interval series are refused by the export, as neither backend st
 **Needed (owner decision pending).** Recommendation: keep `interval_end`; for calendar lengths (7.3) take each end from
 the interval zone under the tzdata version in force at export, recorded in the metadata.
 
+## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
+Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
+**Scenario.** 100 series at 1 Hz, staggered evenly, so a call of one reading every 10 ms; `WriterConfig::default()`
+(`min_sync_interval` 10 ms, mark timed). `design.md` Budgets sets p50 ≤ 5 ms "while syncs are not back to back,
+roughly up to 100 synced batches a second". Three runs: p50 6.95, 6.75 and 7.02 ms; p90 11.54, 11.40 and 11.50; p99
+12.33, 12.33 and 12.24 (inside 20 ms); 99 syncs a second, 1.0 call per batch. The same load with the bound at 0:
+p50 2.36, 0.68 and 2.24 ms. Quiet and 10 × 1 Hz loads pass at the default (p50 2.30–2.52 ms).
+**Cause.** The bound counts from the previous sync's start (spec §3 Group commit, `LogWriter::sync_ready_at`).
+With calls exactly one interval apart, each late timed wake of the writer (about 0.1 ms here) delays every later
+sync, so the wait climbs to the whole interval before two calls share a batch, and latency spreads evenly from the
+sync (2.2 ms here) to the sync plus 10 ms: p50 is the sync plus about 5 ms. Only a wake with no lateness avoids it.
+`design.md`'s statement that the default adds its wait "only when syncs are back to back" does not hold at the rate
+equal to one call per interval. The cause rests on the code and the fit of that spread (predicted p50 / p90 / p99
+7.2 / 11.2 / 12.2 ms), not on a trace. The miss is not the bound's average wait on random arrivals: the harness
+spaces calls evenly, and random arrivals would give about 73 syncs a second with 1.4 calls per batch (measured 99
+and 1.0), p99 about 11 ms at 10 × 1 Hz (measured 2.71–2.79) and p50 about 7 ms on macOS (measured 4.14). So it is
+not inherent in the interval and this drive's sync time; option (b) below would remove it. macOS shows a tail of
+the same size (p90 12.0 ms) without a budget.
+**Now.** Nothing changed; the budget and the bound stand.
+**Options.** (a) Word the p50 budget as applying below 100 synced batches a second at the default, putting this
+load with the higher rates. (b) Stop the lateness compounding: after a wait on the bound, count the next interval
+from when the sync was due, not when it started; two syncs could then start up to the lateness less than the
+interval apart, so spec §3 Group commit's "at least `min_sync_interval` apart" would need rewording, with tests. (c)
+A lower default interval moves the edge to a higher rate, at the cost of the host-write cap roadmap 2.2 measured.
+**Needed.** An engineering fix or the owner's decision on the wording, at gate 4.9.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -919,7 +949,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. The Linux NVMe run of roadmap 4.8 recorded Q-310.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -946,7 +976,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9; both implemented by roadmap 5.1 (see the question) |
 | Q-116 (a) | 6.3b | Deep fetch or manifest rebuild for a corrupt record; deferred by gate 4.9; roadmap 6.3a builds both in `kvik-files` (see the question), the start's call into them is 6.3b |
 | Q-116 (c) | 5.1 | The interface reads loss history; deferred by gate 4.9; implemented by roadmap 5.1 (see the question) |
-| Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
+| Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the Linux NVMe run measured a warm cache (0.39–0.74 s); a cold start is still to measure |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3b | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9; with 6.3b, which retires files (6.3a gives `Catalogue::at_epoch` and the settled and provisional holds) |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
@@ -969,12 +999,13 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
+| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; owner decision pending on the budget's wording or the bound |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
 runners. The cloud-runner figures are recorded there and are not durability-representative.
-The figures on the Linux NVMe target are the owner's run, pending before gate 4.9
-(`docs/measurements/4.8-commit-latency.md`).
+The figures on the Linux NVMe target are the owner's run, recorded there too
+(`docs/measurements/4.8-commit-latency.md`); the budget point they raise is Q-310.
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
