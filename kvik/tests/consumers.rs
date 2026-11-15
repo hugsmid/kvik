@@ -6,11 +6,13 @@
 
 mod common;
 
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::world::{World, drain, gauge, num, ready, resync};
 use common::{at, block_on};
+use kvik::env::{Fs, OpenMode};
 use kvik::{
     Condition, ConditionState, Consumer, ConsumerError, DefineError, Delivery, DeliveryKind,
     Funnel, MarkSync, Outcome, Position, Refusal, ResetStamp, ResyncCause, SavedPoint, Select,
@@ -385,7 +387,9 @@ fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind() {
     block_on(s.shutdown()).unwrap();
     drop((cs, s));
     for n in names {
-        let path = w.path_with(&format!("cursors/{n}.cur")).unwrap();
+        let path = w
+            .path_with(Path::new("cursors").join(format!("{n}.cur")))
+            .unwrap();
         w.fs.poke(&path, 0, &[0; 16]);
     }
     // A clean start writes no recovery entry (`spec.md` §3 Recovery rule 3), but the consumers are known from their
@@ -492,7 +496,7 @@ fn a_cursor_file_never_names_a_position_above_the_synced_mark() {
     let ahead = Arc::new(Mutex::new(Vec::new()));
     let checked = Arc::new(Mutex::new(0usize));
     let (fs, dir, seen, count) = (w.fs.clone(), w.dir.clone(), ahead.clone(), checked.clone());
-    w.fs.set_sync_hook(Some(Arc::new(move |p: &std::path::Path| {
+    w.fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
         if !p.to_string_lossy().ends_with(".cur") {
             return;
         }
@@ -503,7 +507,7 @@ fn a_cursor_file_never_names_a_position_above_the_synced_mark() {
             .store_id;
         let state = kvik_log::cursor::decode(&bytes, &id).unwrap().state;
         let mark = fs
-            .read_durable(&std::path::Path::new(&dir).join("log/MARK"))
+            .read_durable(&Path::new(&dir).join("log").join("MARK"))
             .unwrap();
         let (_, m) = kvik_log::mark::read_mark(&mark, &id).unwrap().unwrap();
         let high = state.highest();
@@ -611,11 +615,11 @@ fn the_registry_file_holds_each_routing_change_when_the_call_returns() {
     let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
     let c = new_consumer(&s, "watch", Select::None);
     let f = block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
-    let cur = w.path_with("cursors/watch.cur").unwrap();
+    let cur = w.path_with(Path::new("cursors").join("watch.cur")).unwrap();
     let id = kvik_log::header::FileHeader::decode(&w.fs.read(&cur).unwrap())
         .unwrap()
         .store_id;
-    let (_, file) = kvik_log::registry::read_latest(&*w.fs, std::path::Path::new(&w.dir), &id)
+    let (_, file) = kvik_log::registry::read_latest(&*w.fs, Path::new(&w.dir), &id)
         .unwrap()
         .unwrap();
     let at = file.entries.iter().find_map(|(p, _, e)| match e {
@@ -640,4 +644,17 @@ fn the_registry_file_holds_each_routing_change_when_the_call_returns() {
     assert_eq!(resync(&d).unwrap().cause, ResyncCause::NoCursor);
     assert_eq!(c.routes().unwrap().len(), 1);
     block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn path_with_matches_whole_trailing_components_with_the_platform_separator() {
+    let w = World::new("paths");
+    let decoy = Path::new(&w.dir).join("a-cursors").join("x.cur");
+    let sep = MAIN_SEPARATOR;
+    let real = PathBuf::from(format!("{}{sep}cursors{sep}x.cur", w.dir));
+    for p in [&decoy, &real] {
+        drop(w.fs.open(p, OpenMode::CreateNew).unwrap());
+    }
+    assert_eq!(w.path_with(Path::new("cursors").join("x.cur")), Some(real));
+    assert_eq!(w.path_with(Path::new("cursors").join("y.cur")), None);
 }

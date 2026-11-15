@@ -1,5 +1,6 @@
 //! A durable store on an in-memory file system, with crashes and power losses, for the consumer tests.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,12 +89,14 @@ impl World {
         }
     }
 
-    /// The path of a file of the store whose path contains `part`.
-    pub fn path_with(&self, part: &str) -> Option<std::path::PathBuf> {
+    /// The path of a file of the store whose path ends with the components of `rel`; matched by component so that
+    /// it holds whatever the platform's separator.
+    pub fn path_with(&self, rel: impl AsRef<Path>) -> Option<PathBuf> {
+        let rel = rel.as_ref();
         self.fs
             .paths()
             .into_iter()
-            .find(|p| p.starts_with(&self.dir) && p.to_string_lossy().contains(part))
+            .find(|p| p.starts_with(&self.dir) && p.ends_with(rel))
     }
 }
 
