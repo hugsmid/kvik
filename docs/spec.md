@@ -268,7 +268,8 @@ A.10) is treated as a different boot. The rules apply in this order:
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
 2. Rule 1: truncate after the mark; sync every segment holding a lost range found (rule 2) and the directory, with
-   step 3's rule for a failed sync; go to step 4.
+   step 3's rule for a failed sync; go to step 4 (and, when a complete batch was truncated, on to steps 5 and 6 as
+   for rule 3).
 3. With the mark missing, unreadable or stale, or a recovery entry adopted, first write the last complete batch again
    in place, with its segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
    the manifest as they are and writes nothing more; what it found is reported in health as found and recorded by the
@@ -281,8 +282,10 @@ A.10) is treated as a different boot. The rules apply in this order:
    was first reported, so a loss reported before any record holds it can be acknowledged at once, and the record,
    when written, carries that identity. Sync the
    manifest.
-5. Rule 3: write or adopt the recovery entry and sync; zero the rest of the torn tail and sync.
-6. Rule 3: write the mark (current boot id, last position F, highest series id assigned) and sync the
+5. Rule 3, or rule 1 after truncating a complete batch: write or adopt the recovery entry and sync; zero the rest
+   of the torn tail and sync.
+6. Rule 3, or rule 1 after truncating a complete batch: write the mark (current boot id, last position F, highest
+   series id assigned, the entry's reset stamp) and sync the
    mark file and the directory. An existing mark file is updated in place, whatever its content (except a slot of unknown version,
    `format.md` A.10); a new file is created only when none exists. Then record the entry's gap, if any, as in step 4.
 7. Resume. Each consumer's deliveries are computed from its cursor file and the log (§4 Resync, §6).
