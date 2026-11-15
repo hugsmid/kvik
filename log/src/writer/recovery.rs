@@ -367,7 +367,6 @@ fn plan(
     let mut zero = Vec::new();
     let mut reset = false;
     // Complete batches beyond a readable mark of the current boot.
-    let mut beyond_batches = 0u32;
     // Rule 1: a recovery entry beyond the mark written by an earlier start that stopped before its mark (Q-117).
     let mut adopt_beyond: Option<(usize, usize)> = None;
     // Rule selection.
@@ -398,9 +397,10 @@ fn plan(
                 // in use from the header's end.
                 // A segment that is not the last in use holds no batch beyond a current mark, and may hold seal
                 // blocks, which are never truncated (A.4). One exception: the mark's segment holds a complete batch
-                // beyond the mark and every later segment in use holds only its header, as a start leaves that took
-                // the next segment into use for its recovery entry and stopped before writing it. A batch beyond the
-                // mark rules out seal blocks there (the mark passes every batch of a segment before its seal).
+                // or, with no valid seal blocks, any non-zero byte beyond the mark, and every later segment in use
+                // holds only its header, as a start leaves that took the next segment into use for its recovery
+                // entry and stopped before writing it, or a remount within the boot. A batch beyond the mark rules
+                // out seal blocks there (the mark passes every batch of a segment before its seal).
                 let only_headers_after = |i: usize| {
                     in_use
                         .iter()
@@ -413,7 +413,10 @@ fn plan(
                     .filter(|&i| {
                         Some(i) == last_in_use
                             || (segs[i].id.file_id == slot.file_id
-                                && segs[i].batches.iter().any(|b| beyond(i, b))
+                                && (segs[i].batches.iter().any(|b| beyond(i, b))
+                                    || !segs[i].sealed
+                                        && segs[i].last_nonzero
+                                            > slot.offset.max(HEADER_LEN as u64))
                                 && only_headers_after(i))
                     })
                     .collect();
@@ -427,7 +430,6 @@ fn plan(
                 // A complete batch beyond the mark, or any non-zero byte there (a batch whose bytes were damaged
                 // after it was acknowledged), may have been acknowledged (a mark sync lost with the page cache within
                 // the boot): its truncation is a reset point (`spec.md` §3 Recovery rule 1, Q-125).
-                beyond_batches = u32::try_from(n).unwrap_or(u32::MAX);
                 reset = n == 1
                     || targets.iter().any(|&i| {
                         segs[i].id.file_id >= slot.file_id && segs[i].last_nonzero > from_of(i)
@@ -680,7 +682,21 @@ fn plan(
             p.last_sequence = b.first;
             p.tail = seg.map(|r| (r, 0, total, 0));
         } else {
-            p.tail = seg.map(|r| (r, 0, total, beyond_batches));
+            // The readable commit blocks in the truncated bytes, as rule 3 counts them: one per complete batch,
+            // and those still readable in a torn tail.
+            let commits: usize = p
+                .zero
+                .iter()
+                .map(|&(i, from, _)| {
+                    segs[i].batches.iter().filter(|b| b.offset >= from).count()
+                        + segs[i]
+                            .tail_commits
+                            .iter()
+                            .filter(|(o, _)| *o >= from)
+                            .count()
+                })
+                .sum();
+            p.tail = seg.map(|r| (r, 0, total, u32::try_from(commits).unwrap_or(u32::MAX)));
             p.last_sequence = 1 + k.max(manifest_highest);
         }
     } else {
@@ -1018,8 +1034,9 @@ pub(super) fn start(
     match p.rule {
         StartRule::SameBoot => {
             // Step 2: truncate after the mark; sync the truncated segments, those holding a lost range, and the
-            // directory. A complete batch beyond the mark is truncated only by the recovery entry written over it
-            // (steps 5 and 6), never before; an adopted entry is written again in place (Q-117).
+            // directory. At a reset point (a complete batch or any non-zero byte beyond the mark) nothing is zeroed
+            // before the recovery entry is written (steps 5 and 6); an adopted entry is written again in place
+            // (Q-117).
             if !p.reset {
                 for &(i, from, to) in &p.zero {
                     if let Err(e) = zero_fill(&*files[&i], from, to) {

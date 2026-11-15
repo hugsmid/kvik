@@ -147,6 +147,11 @@ impl Model {
             // been acknowledged, so the truncation is a reset point (Q-125).
             let damaged_beyond = self.disk.damaged.values().any(|(from, _)| *from > m.last);
             if beyond.is_empty() && !damaged_beyond && tail.is_empty() {
+                // Step 2 syncs the segments holding a lost range found and
+                // the directory, with step 3's rule for a failed sync.
+                if sync_fails {
+                    return true;
+                }
                 self.disk.tail_fate = None;
                 self.record_lost_ranges();
                 // The mark's slot is written again in place and synced.

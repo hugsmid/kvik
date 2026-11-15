@@ -165,7 +165,9 @@ jobs:
     #     (log-histories) run an eighth of the cases, each case a whole
     #     history: at 5,000, 625 histories took 4 s locally in release mode,
     #     and the whole recovery file under 1 s; so about 8 s at 10,000 and
-    #     35 s at 40,000, plus the build.
+    #     35 s at 40,000, plus the build. The long kill loop (log-kill-long,
+    #     ignored in the default run) has a fixed 2,000 histories: 7 s
+    #     locally in release mode.
     #   - The windows differential of kvik (kvik-windows) runs an eighth of
     #     the cases, at most 1,000, each case a whole history queried on
     #     both backends: 625 histories took 343 s locally in release mode at

@@ -501,6 +501,10 @@ fn damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point() {
     let e = rep.entry.as_ref().expect("a recovery entry");
     assert_eq!(e.entry.after, before.last_sequence);
     assert_ne!(e.entry.stamp, Some(before.stamp), "a new reset stamp");
+    assert_eq!(
+        e.entry.readable_commits, 1,
+        "the damaged batch's intact commit block is counted, as under rule 3"
+    );
     assert!(
         rep.losses
             .iter()
@@ -1150,6 +1154,9 @@ enum Crash {
     /// A power loss while the segment created ahead was being taken into use: its header reached the disk, its
     /// first batch only as a torn tail.
     TornRoll(u64),
+    /// The process is killed and bytes just beyond the mark in its segment are overwritten with garbage (a write cut
+    /// short, or a batch damaged after its sync): a reset point under rule 1 (Q-125).
+    Garble(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -1190,6 +1197,7 @@ fn cycle() -> impl Strategy<Value = Cycle> {
         1 => any::<u64>().prop_map(Crash::Remount),
         1 => any::<bool>().prop_map(|delete| Crash::LoseMark { delete }),
         1 => any::<u64>().prop_map(Crash::TornRoll),
+        1 => any::<u64>().prop_map(Crash::Garble),
     ];
     (
         prop::collection::vec((1..12usize, prop::bool::weighted(0.15)), 0..12),
@@ -1294,6 +1302,24 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                 r.fs.restart();
                 r.boot = r.boot.wrapping_add(1).max(1);
                 None
+            }
+            Crash::Garble(seed) => {
+                r.kill();
+                let m = r.mark();
+                if let Some(m) = m {
+                    let at = m.offset.max(HEADER_LEN as u64) + seed % 64;
+                    let seg = r.fs.paths().into_iter().find(|p| {
+                        p.file_name()
+                            .and_then(|f| SegmentName::parse(f.to_str()?))
+                            .is_some_and(|n| n.file_id == m.file_id && !n.sealed)
+                    });
+                    if let Some(p) = seg
+                        && at + 8 <= r.cfg.segment_size
+                    {
+                        r.fs.poke(&p, at as usize, &[0xa5; 8]);
+                    }
+                }
+                m
             }
             Crash::LoseMark { delete } => {
                 r.kill();
@@ -1474,7 +1500,8 @@ fn kill_loop_keeps_every_acknowledged_entry() {
     .unwrap();
 }
 
-/// A long kill loop, for a local soak run: `cargo test --release -p kvik-log --test recovery -- --ignored`.
+/// A long kill loop, ignored in the default run; the deep shard `log-kill-long` runs it
+/// (`cargo test --release -p kvik-log --test recovery -- --ignored kill_loop_long`).
 #[test]
 #[ignore]
 fn kill_loop_long() {
@@ -2285,6 +2312,74 @@ fn a_batch_beyond_the_mark_before_a_header_only_segment_is_a_reset() {
         "the entry opens the next segment"
     );
     assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+    r.check_started();
+}
+
+/// Q-125: damaged bytes beyond the mark in the mark's segment, with the next segment taken into use by its header
+/// alone, are a reset point as a complete batch there is: a recovery entry, a `possible_loss`, and the bytes zeroed.
+#[test]
+fn damaged_bytes_beyond_the_mark_before_a_header_only_segment_are_a_reset() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+    r.submit(vec![fact(1, 1)]);
+    r.step();
+    let mark = r.mark().unwrap();
+    r.kill();
+    let names: Vec<(SegmentName, PathBuf)> =
+        r.fs.paths()
+            .into_iter()
+            .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
+            .collect();
+    let ahead = &names
+        .iter()
+        .find(|(n, _)| n.file_id > mark.file_id && !n.sealed)
+        .expect("a segment created ahead")
+        .1;
+    let mut h = kvik_log::header::FileHeader::decode(&r.fs.read(ahead).unwrap()).unwrap();
+    h.base_sequence = mark.last_sequence + 1;
+    r.fs.poke(ahead, 0, &h.encode());
+    let seg = &names
+        .iter()
+        .find(|(n, _)| n.file_id == mark.file_id)
+        .unwrap()
+        .1;
+    r.fs.poke(seg, mark.offset as usize + 40, &[0xff; 8]);
+    assert!(
+        r.batches()
+            .iter()
+            .all(|b| b.last_sequence() <= mark.last_sequence),
+        "no complete batch beyond the mark"
+    );
+    let rep = r.open().expect("the start finishes");
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    let e = rep.entry.as_ref().expect("a reset point");
+    assert_eq!(e.entry.after, mark.last_sequence);
+    assert_ne!(e.entry.stamp, Some(mark.stamp), "a new reset stamp");
+    assert!(
+        rep.losses
+            .iter()
+            .any(|l| l.kind == LossKind::PossibleLoss && l.identity == e.sequence)
+    );
+    let (_, sealed) =
+        r.fs.paths()
+            .into_iter()
+            .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
+            .find(|(n, _)| n.file_id == mark.file_id)
+            .unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: mark.file_id,
+        generation: 0,
+    };
+    let bytes = r.fs.read(&sealed).unwrap();
+    let scanned = scan(&bytes, &id, ScanLimit::End).unwrap();
+    assert!(
+        !matches!(scanned.tail, Some(Tail::Torn { .. })),
+        "the damaged bytes are gone: {:?}",
+        scanned.tail
+    );
     r.check_started();
 }
 

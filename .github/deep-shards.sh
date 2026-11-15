@@ -37,7 +37,8 @@ log-batches     log   batches
 log-model       log   model_differential
 log-histories   log   model_histories
 log-writer      log   writer
-log-recovery    log   recovery
+log-recovery    log   recovery    --rest
+log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
 kvik-windows    kvik  windows
 chunk-properties chunk properties

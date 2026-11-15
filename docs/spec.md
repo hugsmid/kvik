@@ -279,18 +279,19 @@ A.10) is treated as a different boot. The rules apply in this order:
 
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
-2. Rule 1: truncate after the mark, unless a complete batch lies beyond it; sync every segment holding a lost range
+2. Rule 1: truncate after the mark, unless a complete batch or any non-zero byte lies beyond it (a reset point); sync every segment holding a lost range
    found (rule 2) and the directory, with step 3's rule for a failed sync; unless step 6 writes the mark, write the
    mark's slot again in place, as read, and sync the mark file (its update may not be on stable storage, and one whose
-   sync failed may no longer be dirty, `format.md` A.10 Update); go to step 4. A complete batch beyond the
-   mark is left in place here: step 5 writes the recovery entry over it, or adopts the entry an earlier start wrote
+   sync failed may no longer be dirty, `format.md` A.10 Update); go to step 4. At a reset point the bytes beyond the
+   mark are left in place here: step 5 writes the recovery entry over them, or adopts the entry an earlier start wrote
    there (written again in place first, as in step 3), and only then zeroes the rest, so a start that stops before
-   the entry is on disk leaves the batch for the next start to find. When the entry does not fit after the mark, it
-   goes to a new segment, and the batch, in the mark's segment, is zeroed after it. A start that stopped between the
+   the entry is on disk leaves those bytes for the next start to find. When the entry does not fit after the mark, it
+   goes to a new segment, and the bytes, in the mark's segment, are zeroed after it. A start that stopped between the
    two leaves a recovery entry, first in a later segment, whose `after` is below the batches kept before it: those
    batches are dropped, zeroed once the entry is adopted, and the entry stands (the stale mark this shows makes it
    rule 3, with Adoption). The mark's segment is truncated, though not the last in use, when it holds a complete
-   batch beyond the mark and every later segment in use holds only its header (a batch beyond the mark rules out
+   batch or, with no valid seal blocks, any non-zero byte beyond the mark and every later segment in use holds only
+   its header (a batch beyond the mark rules out
    seal blocks there); and a segment's header is rewritten with F only after the entry is written in it, so no stop
    leaves a later segment in use by its header alone. A start writes the header of the segment it resumes in
    again, in place, before its first sync (a header taken into use by a sync that failed may be in the page cache
@@ -658,7 +659,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
     carries S (every one of P's generation and after when S is zero, or when no kept entry or record carries S), and
     the lost ranges recorded since: each lost-range record carries the reset stamp in force when it was recorded (the
     mark's or, with the mark lost, that of the last kept recovery entry), and one that carries none counts as
-    recorded after every reset the start found. P is **void above** the lowest of P, each later recovery entry's `after`, each
+    recorded after every reset the start found. The record of a kept recovery entry's gap (its positions K + 1 to
+    F − 1, §3 Recovery rule 3, recorded with that entry's stamp) is part of that entry's reset, not a later lost
+    range: the entry's `after` already covers it, and it voids nothing saved under that entry's stamp. P is **void above** the lowest of P, each later recovery entry's `after`, each
     later restore record's restored end in P's generation, and the position before each later lost range of P's
     generation; the holder forgets every position above that and continues from it.
   - If no kept recovery entry or restore record carries S' (the reset the mark names is in a lost range, or was

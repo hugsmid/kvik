@@ -1516,6 +1516,28 @@ fn row_11a_failed_recovery_sync_reports_the_range_as_found() {
     assert_eq!(next, b[3][1].next().next(), "positions not reused");
 }
 
+/// Row 11a on the same boot: a damaged batch below the mark is found by rule
+/// 2, and when the start's sync fails (step 2 applies step 3's rule) the
+/// engine stays read-only, reports the range as found, records nothing and
+/// takes no ingest.
+#[test]
+fn row_11a_failed_same_boot_recovery_sync_reports_the_range_as_found() {
+    let (mut m, s, b) = open_segment_model();
+    m.crash();
+    let damaged = batch_holding(&m, b[3][0]);
+    m.corrupt_open_batch(damaged).unwrap();
+    let records = m.disk.manifest.len();
+    m.restart_with(true);
+    assert!(m.is_read_only());
+    let lost = Reason::DataLost(b[3][0], b[3][1]);
+    assert!(m.health().reasons.contains(&lost), "reported as found");
+    assert_eq!(m.disk.manifest.len(), records, "nothing recorded");
+    assert!(m.losses().iter().all(|l| !l.recorded));
+    assert!(m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).is_err());
+    m.restart();
+    assert_eq!(m.disk.lost_ranges(), vec![(b[3][0], b[3][1])]);
+}
+
 /// Row 11a in the model: damage to a batch holding a definition is refused,
 /// since the model does not support orphaned facts and how derived files are
 /// brought back after a lost registry, routing or zone entry is open (Q-33);
