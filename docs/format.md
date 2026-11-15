@@ -122,9 +122,10 @@ uses it.
 **Sizes.** `segment_size` is a configuration key, 16 MiB to 1 GiB, a multiple of 4,096, default 64 MiB; it applies
 to segments created after it changes. A facts block is closed when the next row would take it past 65,536 rows or a
 plain-encoded size of 8 MiB (33 bytes per row plus text bytes); rows fill blocks in order, each block as full as
-these limits allow. A batch holds whole emit calls and whole entry calls; it is closed when the next call would take
-its data blocks past `max_batch_bytes` (default 1 MiB), and always holds at least one call. One call is at most
-`min(65,536, limits.ingest_queue)` readings and 8 MiB plain-encoded (`api.md` Writing), so every batch fits an empty
+these limits allow. A batch holds whole emit calls and whole entry calls: it takes whole calls in order while the sum
+of their data blocks, each encoded alone, stays within `max_batch_bytes` (default 1 MiB), and at least one; calls
+that do not encode together are committed one by one. One call is at most `min(65,536, limits.ingest_queue)` readings
+and 8 MiB plain-encoded (`api.md` Writing), so every batch fits an empty
 segment. A batch that does not fit the space left in the open segment goes to the next segment, and the open one is
 sealed.
 
@@ -132,16 +133,19 @@ sealed.
 `segment_size` by ordinary writes (physical zeros, no `fallocate`), its header written with `base_sequence = 0`,
 then `sync_all` and a directory sync (A.13). When it is taken into use the 64-byte header is rewritten in place
 with the real `base_sequence`; the first batch's sync makes that durable. If creation fails for lack of space, the
-partial file is deleted, health is critical, ingest waits, and creation is retried when a free-space check passes;
-nothing is fatal. Lack of space at a batch write or sync stays a write failure (`spec.md` §3). On copy-on-write file
-systems zero-filling reserves nothing; that is accepted and documented, not refused.
+partial file is deleted, health is critical, ingest waits, and creation is retried when a free-space check passes
+(`spec.md` §3 Segments: at least `disk_critical` + `segment_size` free, checked every second; every 30 seconds where
+free space is unknown); nothing is fatal. Any other failure of a creation, a failed sync included, is a write
+failure on the log. Lack of space at a batch write or sync stays a write failure (`spec.md` §3). On copy-on-write
+file systems zero-filling reserves nothing; that is accepted and documented, not refused.
 
 **In use.** A segment is *in use* when its header is valid with `base_sequence ≥ 1`, or the scan (A.2) finds a
 complete batch in it; the *last in use* is the one with the highest `file_id`. A segment is taken into use by the
 header rewrite, made durable by the first batch's sync (a roll) or by its own `sync_data` (a timed seal with no
 batch waiting). A recovery batch that opens a segment is written before that header rewrite, and both are made
 durable by the entry's sync, so no stop leaves a segment in use by its header alone (`spec.md` §3 Order of a start,
-step 5).
+step 5). A header taken into use by a sync that failed may be in the page cache only, so a start writes the header
+of the segment it resumes in again, in place, before its first sync (`spec.md` §3 Order of a start, step 2).
 
 **Sealing** (off the writer thread) of segment S starts only after the next segment is in use and synced, so a
 segment being sealed is never the last in use: (1) at the offset just past S's last complete batch, write the
@@ -157,20 +161,27 @@ one row:
 
 | State of an `.open` file | Action |
 |---|---|
-| its last non-zero bytes are a valid trailer and end marker (wherever the mark points; the file may still be longer than the end marker, after a crash between seal steps 1 and 2) | seal again from step 1: after a failed `sync_all` on the same boot the trailer and end marker may be in the page cache only, and a repeated sync would not write them (`spec.md` §3 Recovery rule 3); never truncated |
-| in use, not the last in use, no valid trailer | whatever follows its last complete batch is seal blocks or damage, never a torn batch: seal again from step 1 |
+| its last non-zero bytes are a valid trailer and end marker (wherever the mark points; the file may still be longer than the end marker, after a crash between seal steps 1 and 2), the seal blocks start exactly at the end of its last complete batch, the trailer's `batch_count` and `last_sequence` equal the scan's, and it is not the last segment in use | seal again from step 1: after a failed `sync_all` on the same boot the trailer and end marker may be in the page cache only, and a repeated sync would not write them (`spec.md` §3 Recovery rule 3); never truncated |
+| in use with a complete batch, not the last in use, not in the first row | whatever follows its last complete batch is seal blocks or damage, never a torn batch: seal again from step 1 |
+| in use by its header alone, not the last in use | left as it is, never sealed (an empty segment is never sealed) |
 | in use, the last in use | `spec.md` §3 Recovery rules 1–3 (a torn first batch included); then appended to while a batch fits; if its first batch is then a recovery batch, the header is rewritten with F after that batch is written |
-| header invalid or `base_sequence = 0`, but a complete batch is found | rewrite the header from the file name, the store descriptor and the first batch; then one of the two rows above |
-| not in use (no complete batch; header invalid or `base_sequence = 0`) | unused: kept as the segment created ahead if its header is valid and its length is `segment_size`, else deleted |
+| header invalid or `base_sequence = 0`, but a complete batch is found | rewrite the header from the file name, the store descriptor and the first batch; then the row for a segment in use with a complete batch, or the last in use |
+| not in use (no complete batch; header invalid or `base_sequence = 0`) | unused: kept as the segment created ahead if its header is valid, its length is `segment_size` and every byte after its header is zero, else deleted |
+
+A trailer and end marker that fail the first row's conditions are bytes of whatever precedes them (a torn batch or a
+value); the file falls under the other rows. In the last segment in use a seal is never expected (Sealing).
 
 A `.kvl` file is sealed and is not scanned by recovery. Whether a segment that is not the last in use lost data is
 decided only by the gap between its last sequence and the next segment's `base_sequence` (`spec.md` §3 Recovery
-rule 2), never by the bytes after its last batch. At most one segment is unused; any number may be awaiting a seal.
+rule 2), never by the bytes after its last batch. A start checks the gap rule for unsealed segments and against the
+last sealed one; gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
+may be awaiting a seal.
 
 **Truncation is zero-filling.** Recovery never shortens an unsealed segment. It overwrites with zeros from the
 truncation offset to the last non-zero byte, working from the end backwards, then syncs. Under rule 1 this is done
-before any new batch is written, and rule 1 also zero-fills every later segment in use. Under rule 3 the recovery
-batch is written and synced first and the rest of the torn tail is zeroed after it (`spec.md` §3 Order of a start,
+before any new batch is written, and rule 1 also zero-fills every later segment in use after its header: their
+headers stay, and the writer resumes in the last segment in use. Under rule 3 the recovery batch is written and synced
+first and the rest of the torn tail is zeroed after it (`spec.md` §3 Order of a start,
 step 5); ingest resumes only after both. Accepted limit: a power loss during the zero-fill can
 leave unacknowledged batches after a zeroed hole; the next recovery keeps them and records the hole as `data_lost`
 although nothing acknowledged was lost.
@@ -312,7 +323,7 @@ entries block until the next would take its body past 16 MiB.
 | 4 | 4 | `block_count` | blocks in this batch before the commit block, of known type or not |
 | 8 | 8 | `first_sequence` | the first data block's |
 | 16 | 8 | `last_sequence` | inclusive; the last counted |
-| 24 | 8 | `commit_time` | non-decreasing within a generation by construction; a reader does not test it |
+| 24 | 8 | `commit_time` | non-decreasing within a generation by construction: `received_at` and the commit time are the wall clock when the batch is formed, raised to the previous batch's commit time; a reader does not test it |
 | 32 | 8 | `batch_bytes` | from the first byte of the batch's first block header up to, not including, this block's header, padding included; so this header is at `o + batch_bytes`, where `o` is the batch's offset |
 | 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then bytes 0..12 of the header of every block before the commit block, in order: each header without its `header_crc32c`, so that the bodies are reached through their `body_crc32c` (a header followed by its own CRC32C would cancel out of the sum, Q-119) |
 | 44 | 4 | reserved | |
@@ -395,6 +406,8 @@ exists; a new file is created only when none exists.
   the file again in place, as read, and syncs it; a start that keeps the mark it read (`spec.md` §3 Recovery rule 1)
   writes that slot again in place, as read, and syncs it before the first update. The writer writes the next batch
   only after that update (`spec.md` §3 Recovery rule 1).
+- **First mark.** The first start of a new store writes slot 0, counter 1, all position fields 0, the current boot
+  id.
 - **Reset stamp.** Bytes 84..100 were reserved in version 3 and are read as zero in a slot that predates them, so
   the version is unchanged. A zero `reset_nonce` is no stamp, whatever `reset_sequence` holds. A start that writes or
   adopts a recovery entry writes the entry's stamp into the mark; a restore
@@ -402,8 +415,9 @@ exists; a new file is created only when none exists.
 - **Read.** Read both slots; the mark is the valid slot (magic, known version, checksum, store id) with the higher
   `counter`; a checksum-valid slot of unknown version is refused as above, never treated as invalid. One slot always holds the last synced mark, so a torn or concurrent write falls back no further than it: a reader
   that meets an update in progress sees a mark at most one `mark_sync_interval` old (`spec.md` §3 Durable mark). If
-  neither slot is valid, a reader retries (8 times, then `MarkUnreadable`); for recovery the mark is unreadable. After
-  a power loss the older slot is still a valid mark of any boot for `spec.md` §3 Recovery rule 2.
+  neither slot is valid, a reader retries 8 times, back to back, then returns `MarkUnreadable`, as it does for a
+  missing mark file; for recovery the mark is unreadable. After a power loss the older slot is still a valid mark of any
+  boot for `spec.md` §3 Recovery rule 2.
 - **Boot identity.** Linux: `/proc/sys/kernel/random/boot_id` (a file read). macOS: `kern.bootsessionuuid`, through
   a dependency that wraps `sysctlbyname` (to be verified at roadmap 4.1; fallback: none). Windows: none until a
   source is verified (roadmap 4.5). Containers sharing the host's identity, and virtual machines resumed with their
@@ -499,16 +513,21 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   hardware run before gate 4.9 (moved from 4.4 and then 4.8, Q-115 (j)), but neither decides whether Windows is
   accepted.
 - **Readers** use positional reads only and never map a file. All handles are opened sharing read, write and delete
-  (std's default on Windows), so the writer's rename and length change succeed while readers hold a file. If a
-  rename or length change still fails with a sharing error (another program), the seal is retried later, the segment
-  stays a complete `.open` file, health is degraded (`SealBlocked`) and nothing is fatal. A reader that does not find
+  (std's default on Windows), so the writer's rename and length change succeed while readers hold a file. A
+  rename or length change that fails with a sharing error (another program) is retried every 10 seconds with health
+  degraded (`SealBlocked`); the segment stays a complete `.open` file. Sharing errors are, on Windows, the system
+  errors 5 (access denied), 32 (sharing violation), 33 (lock violation) and 1224 (user-mapped section); on any
+  platform, 'resource busy'. Lack of space at the rename is retried the same way. Any other failure of the rename or
+  length change is a write failure on the log. If the rename fails but the `.open` name is gone and the `.kvl` name
+  exists, the rename happened and its flush failed: a failed sync, never retried. A reader that does not find
   a name lists the directory and tries the other extension once.
 
 ## A.14 Manifest framing
 - `MANIFEST` is an A.1 header (kind 3) followed by **records, which are A.2 blocks**. A record body is
   `epoch: u64`, `generation: u32`, reserved `u32`, `written_at: i64`, then a field list (A.6 framing). **Every**
-  record, empty and lost-range records included, takes an epoch strictly above the previous record's: the previous
-  + 1, or after a start the next above every epoch named by the last valid record and by any lease file (`spec.md`
+  record, empty and lost-range records included, takes an epoch strictly above the previous record's (the first
+  record, written when the store is created, takes epoch 1): the previous + 1, or after a start the next above every
+  epoch named by the last valid record and by any lease file (`spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
   positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 the corrupt record's epoch as
@@ -547,8 +566,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   block is "unreadable" and is named in the recovery entry (field 47). Only the writer opens cursor files; when a
   file passes 16 MiB the writer writes `<name>.cur.new` with the current state, syncs it, renames it over the old one
   and syncs the directory.
-- **Lease**, `leases/<reader_id>.lease`, kind 8, 128 bytes: an A.1 header then one slot rewritten in place with one
-  positional write: 64 `epoch: u64`; 72 `refresh_counter: u64`; 80 `boot_id` (16 bytes); 96 `created_at: i64`;
+- **Lease**, `leases/<reader_id>.lease`, kind 8, 128 bytes: an A.1 header (`file_id` 0, the generation at
+  creation) then one slot rewritten in place with one positional write: 64 `epoch: u64`; 72 `refresh_counter: u64`; 80
+  `boot_id` (16 bytes); 96 `created_at: i64`;
   104 reserved (20 bytes); 124 `crc32c` over bytes 64..124. `reader_id` is 16 random bytes per reader handle. A lease
   is never synced (it is void on another boot). An invalid lease counts as holding epoch 0 until it expires; a zero
   `boot_id` is honoured until expiry. The reader deletes its lease on close; the writer deletes void and expired

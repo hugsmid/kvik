@@ -69,6 +69,9 @@ with ALP for decimal `f64` data, about 1 % for the same series declared as scale
 dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.3
 confirms the format against Parquet.
 
+**Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
+compute its checksum (`format.md` A.9).
+
 ## Build order
 0. Reference model of the semantics (`model/`): the oracle for everything after it.
 1. Log: segment container, arrival batches, sync, recovery, positions, second-process reader.

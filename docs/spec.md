@@ -198,8 +198,8 @@ The adapter leaves out unchanged readings between keep-alive facts; the engine r
 | Durable mark | After each successful sync the writer updates the mark file in place by positional writes (`format.md` A.10): segment id, byte offset, last position, boot id, highest series id assigned, and the current reset stamp (§7 Readers). The file holds two checksummed slots; every update between two mark syncs goes to the slot that does not hold the last synced mark, so a torn update falls back to that mark, never an older one, and a reader that meets an update in progress sees a mark at most about one interval old. The writer writes a batch only after the previous batch's sync has returned and the mark has moved. The mark file itself is synced on a timer (`mark_sync_interval`, default 1 s), at once after a batch holding an entry that is not a fact (Commit), at clean shutdown and by recovery, so after a power loss the mark on disk lags acknowledged batches by about one interval. It is updated in place and never replaced while it exists. Readers read log segments only up to the mark. No cursor file or derived file is written naming a position above the last synced mark, nor any manifest record except a lost-range record written by a start (§3 Order of a start, step 4), which names only positions in segments that start has synced; a write that would name one waits for the next mark sync or forces one. |
 | Sync primitive | "Sync" means the bytes are on stable storage with the device cache flushed. A failed sync is never retried, on any handle: the file's contents since its last successful sync are unknown. Linux: `fdatasync` or `fsync` on the file, `fsync` on the directory after a create or rename. macOS: `F_FULLFSYNC` for every sync named in this document (`fsync` alone does not flush the device), also for directories. Windows: `FlushFileBuffers` on the file; there is no directory sync, so a create or rename is made durable by flushing the created or renamed file (`format.md` A.13); a file that is open cannot always be replaced by rename, which is why the mark is updated in place and a manifest record is repaired in place (§7 Manifest), a rename being the fallback. The mark is synced like any other file; no file is memory-mapped. A platform or file system that cannot give these guarantees is refused at open, except Windows, which is a development platform like macOS (`design.md` Budgets): it builds, runs and is tested, runs with the mark synced at every commit, and is not held to these durability guarantees or to the budgets. (A platform without a boot identifier syncs the mark after every update, `format.md` A.10; that is a separate case.) These are requirements; the roadmap 2.2 spike and roadmap 4.8 measured their costs on macOS, 4.8's harness runs on Linux and Windows cloud runners, and the Linux figures on the target hardware are pending (`measurements/4.8-commit-latency.md`). |
 | Group commit | While a sync is in flight, arriving readings queue and form the next batch. A batch is synced at once if no log sync is in flight and at least `min_sync_interval` (default 10 ms; 0 disables the bound) has passed since the previous log sync started; otherwise it waits until both hold, taking in whatever arrives meanwhile. So the first reading after a quiet period has no added delay, and log syncs run at most 1/`min_sync_interval` per second (100 at the default). Mark syncs (Durable mark), timed or forced, are separate and not bounded by it. |
-| Segments | Created ahead of use and zero-filled (64 MiB, `format.md` A.4). If creating one fails for lack of space, the partial file is deleted, health is critical, ingest waits, and the creation is retried when a free-space check passes; lack of space at a batch write or sync is a write failure (below). The directory is synced after creating, sealing or renaming a file. |
-| Sealing | At 64 MiB or 5 minutes (both configurable), whichever first; an empty segment is not sealed. Sealed segments are immutable and eligible for backup. Compaction never removes a log segment (§8). |
+| Segments | Created ahead of use and zero-filled (64 MiB, `format.md` A.4). If creating one fails for lack of space, the partial file is deleted, health is critical, ingest waits, and the creation is retried when free space is at least `disk_critical` + `segment_size`, checked every second; where free space is unknown it is retried every 30 seconds, as each try zero-fills until it fails. Any failure of a creation other than lack of space at the create or a write, a failed sync included, is a write failure on the log (below); so is lack of space at a batch write or sync. The directory is synced after creating, sealing or renaming a file. |
+| Sealing | At 64 MiB or 5 minutes (both configurable), whichever first; an empty segment is not sealed. The 5 minutes run from when the segment is taken into use; the sync that takes the next segment into use at a timed seal carries no batch, is not bound by `min_sync_interval`, and counts as the previous log sync for the next batch. Sealed segments are immutable and eligible for backup. Compaction never removes a log segment (§8). |
 | Recovery | Below this table. |
 | Write or sync failure | On the log, manifest, mark, cursor or registry files: stop accepting writes, mark read-only, fatal health; a failed sync is never retried, on any handle; recovery by restart. (The read-only state of a corrupt manifest record while deep cannot be reached comes from no failed write and ends by itself, §7 Manifest.) After a failed sync the batch's fate is unknown: a restart on the same boot truncates it; after a reboot recovery may keep it (row 7a). It was never acknowledged, so adapters may replay it, which the duplicate rule absorbs. A failed compaction, tiering or tree write abandons that job, deletes its partial output and degrades health. |
 | Disk space | Low mark: free space below 5 % of the filesystem or 2 GiB, whichever is larger → compaction pauses, health degraded. Tiering and eviction, which free space, continue at every mark. Critical: below 512 MiB free → ingest waits (back-pressure). Reads continue. Space is never freed by deleting facts. |
@@ -212,8 +212,9 @@ A.10) is treated as a different boot. The rules apply in this order:
    not cover it, so it was never acknowledged or delivered; adapters replay. A batch is written only after the
    previous batch's sync and mark update, so beyond a current mark lies at most one complete batch. If two or more
    complete batches lie beyond the mark on the same boot, the mark is **stale** (the store's file system was
-   unmounted or detached within the boot and the page cache lost): rule 3 applies, as for a different boot. When the
-   truncated bytes hold exactly one complete batch, it may have been acknowledged (a remount within the boot loses
+   unmounted or detached within the boot and the page cache lost): rule 3 applies, as for a different boot. A sealed
+   segment holding positions above the mark makes the mark stale too (the mark passes every batch of a segment
+   before its seal starts). When the truncated bytes hold exactly one complete batch, it may have been acknowledged (a remount within the boot loses
    the mark's update since its last sync with the page cache) or not (its sync or mark update failed); recovery
    cannot tell, so the truncation is a **reset point**: after it, a recovery entry is written as under rule 3, with
    K = the mark's last position, mark state readable, the truncated bytes as its tail and a new reset stamp, and the
@@ -237,7 +238,9 @@ A.10) is treated as a different boot. The rules apply in this order:
    derived file. Recovery writes a **recovery entry** at F, alone in its batch, at the next write position (after
    the kept bytes or after the lost region at the tail; in a new segment when the open one is full): `after` = K, a
    new **reset stamp** (the sequence F and a random nonce, never zero; the mark carries it from then on), the
-   boot id, the tail's length in bytes up to the last non-zero byte, the readable commit blocks in it, the mark's state, an id floor (§2.1) and the consumers whose cursor file was missing or unreadable.
+   boot id, the tail's length in bytes up to the last non-zero byte, the readable commit blocks in it (the tail reported
+   is that of the last segment in use), the mark's state, an id floor (§2.1) and the consumers whose cursor file was
+   missing or unreadable.
    Positions between K and F, if any, are a lost range whose cause is a truncated tail. Positions above K may have
    been acknowledged and delivered and are assigned again (F to the entry, then from F + 1), so a recovery entry is
    a reset point for every consumer (§4 Resync). A consumer whose cursor file was missing or unreadable is treated
@@ -266,7 +269,10 @@ A.10) is treated as a different boot. The rules apply in this order:
    (keeping a batch never acknowledged is allowed, row 12); if it fails the engine stays read-only (step 3) and
    nothing is delivered. This rests on the platform fact that the manifest's rewrite of its last record rests on
    (§7 Manifest): that writing identical bytes makes the next sync write them, checked on each platform by gate
-   4.9 (Q-52 (b), moved from roadmap 4.8). The first start of a new store (no mark file and an empty log) writes no entry and creates the mark.
+   4.9 (Q-52 (b), moved from roadmap 4.8). The first start of a new store (no mark file and an empty log) writes no
+   entry and creates the mark. A mark with no valid slot beside a log with no segment in use and a manifest naming
+   no position is a first start too (a first start cut short while it wrote the mark): the mark is written again in
+   place.
 
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
@@ -283,7 +289,9 @@ A.10) is treated as a different boot. The rules apply in this order:
    rule 3, with Adoption). The mark's segment is truncated, though not the last in use, when it holds a complete
    batch beyond the mark and every later segment in use holds only its header (a batch beyond the mark rules out
    seal blocks there); and a segment's header is rewritten with F only after the entry is written in it, so no stop
-   leaves a later segment in use by its header alone.
+   leaves a later segment in use by its header alone. A start writes the header of the segment it resumes in
+   again, in place, before its first sync (a header taken into use by a sync that failed may be in the page cache
+   only).
 3. With the mark missing, unreadable or stale, or a recovery entry adopted, first write the last complete batch again
    in place, with its segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
    the manifest as they are and writes nothing more; what it found is reported in health as found and recorded by the
@@ -613,12 +621,21 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 - **Leases:** a lease file holds the epoch, the boot id (from the same source as the mark's) and a refresh counter
   that the reader increments at every refresh. The writer expires a lease when its counter has not changed for
   1 hour of the writer's monotonic clock since the writer first observed that value; at writer start, every lease of
-  the current boot counts as first observed then. A lease with a different boot id is void.
+  the current boot counts as first observed then. A lease is void only when both boot ids are non-zero and differ.
+  The writer looks at leases at its own turns, at most once a minute, with no timer of its own: a late look only
+  makes an expiry later.
 - **Readers** take an epoch, write a lease file naming it, and refresh both at least every 30 minutes. A reader
   needs nothing from the writer's memory: it reads via the manifest, the documented layout, tree files and log
   segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
   `after`; it compares the mark's reset stamp before and after reading, and discards what it read if the stamp
-  changed meanwhile.
+  changed meanwhile. A reader reads nothing without a renewed lease: if the lease write fails, the open or refresh
+  returns the error. Positions are read in order, so a reader that cannot read a file returns the error for that
+  file and reads nothing at or past it until it can. A manifest record a reader cannot take an epoch from is an
+  error of the manifest for the reader. Accepted residuals: a reader may read a mark that is not yet synced (from
+  the page cache, before a start's sync of it or after that sync failed); the new reset stamp of the start that then
+  truncates voids what it took. Corruption events reported by a pass that a start overtook (it truncated and wrote
+  past the old mark before the reader read the mark again) may be wrong; the next refresh's check of the last batch
+  still finds the rewrite.
 - **Reset stamp and saved points.** The mark carries the current reset stamp: zero until the first reset, then
   the stamp of the last recovery entry a start wrote (§3 Recovery rules 1 and 3) or of the last restore record (§8
   Generations; its sequence is the restored generation's first position, its nonce fresh). A position kept for later

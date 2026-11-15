@@ -26,12 +26,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-95 | §4 Consumer state, New consumer, §6 Latch, Restart and resume | A consumer with no cursor file at a same-boot restart, and one that registers again during a run |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
 | Q-108 | §8 Generations, §7 Manifest, §8 Restore step 1 | A restore from a rebuilt manifest only partly uploaded |
-| Q-109 | `format.md` A.4 (states recovery may find), A.9 | A forged seal in an `.open` file |
 | Q-110 | `format.md` A.2 Resynchronisation | The residual cost of resynchronising over nested batch images |
 | Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
-| Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
-| Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
-| Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
+| Q-115 (e), (f), (j), (k), (n) | §3 Commit, Segments, Disk space, Back-pressure; `format.md` A.8, A.13 | The commit path: the points still open |
+| Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
+| Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-121 | §2.1 `id`, id floors; `format.md` A.6, A.10 | Series id 0 against an id floor of 0 |
 
 ## Q-16 — Which commits refresh live staleness
@@ -166,6 +165,17 @@ To be settled on each platform. Roadmap 4.8 did not settle it: the check needs a
 (on Linux, for example a device-mapper target that fails or drops writes) or power cuts, which its timing runs do not
 give (`docs/measurements/4.8-commit-latency.md`). A hosted Linux runner with root could build such a device-mapper
 target; gate 4.9 will try that, with the owner's run on the target hardware.
+**Gate 4.9** keeps (b) open until a trial passes. The `fault-trials` workflow (`.github/workflows/fault-trials.yml`,
+run by hand and weekly) with `scripts/trial-rewrite.sh` and the example `log/examples/fault_trial.rs` checks it on
+ext4 and XFS on a loop device: a device-mapper `error` target is swapped in over exactly the file's extents, so a
+sync fails while the file system stays writable; a control arm syncs again without writing, a treatment arm writes
+the same bytes again and syncs, and the device is read directly in both. The engine is then checked the same way
+for the last batch, the mark slot and the manifest record: the writer stops at the fault, the start writes the bytes
+again, and every acknowledged position reads back after a remount (mark synced at every commit, a new boot id per
+remount). It has not run yet. If the treatment arm passes on both file systems, (b) is settled for Linux as written;
+if it fails on either, the fallbacks above are adopted. The result goes in `docs/measurements/4.9-fault-trials.md`.
+Owner decision pending: the deferral wording for macOS and Windows, where no device fails writes on demand without
+kernel code.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -251,6 +261,14 @@ ran none: filling a copy-on-write file system needs a small volume of its own, w
 create, and filling the development machine's own disk is not an option. A hosted Linux runner with root could fill
 Btrfs on a loop device; gate 4.9 will try that, with the owner's hardware run
 (`docs/measurements/4.8-commit-latency.md`).
+**Gate 4.9** keeps (b) open until a trial passes. The Btrfs job of the `fault-trials` workflow
+(`scripts/trial-no-space.sh`) fills a Btrfs loop device while the writer commits; it records which call failed
+(write or sync) and the error kind, which must be storage-full, checks that nothing after the fault is
+acknowledged, and that every acknowledged position reads back after a remount with the disk still full and again
+after space is freed, when a new batch must commit. A second arm repeats it on a log directory with copy-on-write off
+(`chattr +C`). It has not run yet; if it passes, (b) stays a write failure as settled at gate 3.3. Owner decision
+pending: whether `format.md` A.4 advises copy-on-write off for the log directory, if the second arm shows that it
+removes the failure.
 
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
@@ -386,24 +404,6 @@ its closing record is in the bucket (records are uploaded in order, so it is the
 reads the records before its rebuild record, as if the rebuild had not happened, and the uploaded part of the
 rebuilt manifest is not read. To be settled with roadmap 8.3 (restore).
 
-## Q-109 — A forged seal in an `.open` file
-Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9 (moved from 4.5, which left it open).
-**Scenario.** `format.md` A.4 classes an `.open` file whose last non-zero bytes are a valid trailer and end marker as
-seal-written, and seals it again (since Q-87) without truncating anything. A text value of 96 bytes holds exactly a
-segment index block, a trailer block and an end marker; when it is the last thing written to the open segment before
-a crash, the file's last non-zero bytes are that forged seal. Recovery then classes the last segment in use as
-sealed: its torn tail is never truncated or reported, and the next batch goes to a new segment.
-**Implemented.** The reader classes the file by its last bytes, as written.
-**Needed.** A rule that tells a real seal from bytes inside a batch. Suggested: an `.open` file counts as
-seal-written only if `file_crc32c` verifies and the trailer's batch count and last sequence equal those of the scan;
-otherwise its trailer is part of whatever precedes it (a torn batch or a text value) and rules 1–3 apply.
-**Roadmap 4.5** keeps the question open: A.9 does not verify `file_crc32c` at open, so the suggested rule conflicts
-with the text. It relies instead on A.4's order (a segment is sealed only after the next one is in use and synced, so
-a segment being sealed is never the last in use): a seal found in the last segment in use is treated as tail bytes
-under rules 1 to 3, and only a segment that is not the last in use is sealed again from step 1
-(`log/tests/recovery.rs`, `a_forged_seal_in_the_last_segment_is_a_torn_tail`). A forged seal in a segment that is not
-the last in use is not detected.
-
 ## Q-110 — The residual cost of resynchronising over nested batch images
 Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9.
 **Scenario.** Resynchronisation (`format.md` A.2) judges candidates on block headers and reads in full only a
@@ -415,6 +415,11 @@ Building them needs the store id, the file id and the offsets, so only a process
 **Implemented.** Each passing candidate is checksummed once; the cost is pinned by the test above.
 **Needed.** Whether the cost is accepted (write access is needed to cause it), or bounded, for example by a
 prefix-CRC table over the window so that each candidate's body checksum costs O(1) after one linear pass.
+**Gate 4.9** recommends accepting the cost now and stating the trust boundary (`design.md` Budgets: the restart
+budget holds for files the engine wrote, damaged or not, and a file crafted by a process with write access to the
+store is outside it; `SECURITY.md`: write access to the store directory is full trust), with the prefix-CRC table
+recorded as hardening before the format is declared stable (roadmap 10.3). Owner decision pending: the trust-boundary
+wording, which narrows a budget's scope.
 
 ## Q-111 — A full facts block against the batch limit
 Found at the review of roadmap 4.3 (crate `kvik-log`). To be settled at gate 4.9.
@@ -423,165 +428,101 @@ plain-encoded, "so every batch fits an empty segment"; the common rules limit a 
 commit block. A call that fills one facts block to 8 MiB of plain-encoded rows becomes a block whose body adds the
 24-byte prefix and the column directory, and whose header adds 16 bytes: its data blocks exceed 8 MiB, so the batch
 is over the limit although the call is within its own.
+**Implemented.** A call is measured by its data blocks encoded alone, not by its plain size: an incompressible 8 MiB
+call is refused, a compressible larger one accepted.
 **Needed.** One of: measure the batch limit in plain-encoded size, as the call and block limits are; or allow a batch
 8 MiB plus the per-block overhead (prefix, directory, header and padding of each data block). Related: A.6 lets
 consecutive entries share one entries block up to a body of 16 MiB (Q-106 (e)), a split that the 8 MiB batch limit
 means is never reached; whichever option is chosen, the entries rule should name the limit that actually applies.
+**Gate 4.9** recommends keeping the one hard limit and stating the call limit in the same unit, as implemented: one
+call is at most `min(65,536, limits.ingest_queue)` readings and 8 MiB of data blocks when encoded alone, so every
+batch fits an empty segment (`EmitError::TooLarge` otherwise, its `bytes` the encoded size); A.6 then says that in a
+log segment the 8 MiB batch limit applies before the 16 MiB body limit of A.2. Owner decision pending: the wording in
+`api.md` Writing, whose unit changes while the figure does not.
 
-## Q-115 — The commit path: points `spec.md` §3 and `format.md` A.4, A.10, A.12 and A.13 leave open
-Found while building the log writer (roadmap 4.4, crate `kvik-log`: `store`, `writer`, `fs`). Each part names the
-reading implemented for now; tests in `log/tests/writer.rs` pin it.
-**Scenario.** (a) *Closing a batch.* A.4 closes a batch "when the next call would take its data blocks past
-`max_batch_bytes`", but consecutive calls share blocks, so a batch's data blocks are only known once it is encoded.
-(b) *The seal clock.* "At 64 MiB or 5 minutes" does not say from when the 5 minutes run, nor whether the
-`sync_data` that takes the next segment into use at a timed seal, a log sync, is bound by `min_sync_interval`. (c) *The first mark.* The
-first start of a new store creates the mark before any segment is in use; its `file_id`, `offset` and
-`last_sequence` are not given. (d) *Retrying a creation.* After a creation fails for lack of space it is "retried when
-a free-space check passes", but no threshold is named. (e) *The low mark.* "5 % of the filesystem" needs the file
-system's size, which the `Fs` seam (`api.md`, accepted at gate 3.3) does not give; and on a platform with no
-free-space source (Windows, A.13) neither mark can be judged. (f) *The segment index's reach.* A.8's `max_t` for an
-interval series needs the series' interval length, which the writer knows only for definitions it committed itself;
-the registry (roadmap 5.1) holds the rest. (g) *The first manifest record.* A.12 creates `MANIFEST` with one empty
-record; A.14 does not say which epoch the first record takes. (h) *Failures while creating ahead.* Only lack of space
-is named; a failed sync or another write error during creation is not, nor lack of space reported by the creation's
-`sync_all` or directory sync. (i) *The receive time.* A batch's blocks
-carry one `received_at`; whether it may differ from the commit time, and what either is when the wall clock steps
-back, is not said. (j) *Windows name durability.* A.13 assigned to roadmap 4.4 the check that a name made durable by
-flushing the file survives a power loss on Windows; it needs a Windows machine and power-loss trials. (k) *The
-interface.* `api.md` names the waits `QueueFull`, `DiskFull` and `UnsyncedClock` and lists `IngestStats.waited` and
-commit latency; the log writer reports `QueueFull`, `DiskCritical` and `NoSegment` (a roll waiting for the segment
-created ahead) and measures neither. (l) *Memory at seal.* `file_crc32c` covers the whole segment up to its trailer;
-the sealer reads it into memory at once, up to `segment_size` (1 GiB at most); `design.md` sets no memory budget. (m)
-*A blocked seal.* A.13 retries a seal whose rename or length change fails with a sharing error; which errors count
-as sharing errors is not said.
-**Implemented.** (a) A call's own data-block bytes are measured when it is made; a batch takes whole calls while
-their sum stays within `max_batch_bytes`, at least one call. (b) From the moment the segment is taken into use; the sync that takes the next one into use is not bound
-by `min_sync_interval` (it carries no batch, and at most one runs per `seal_interval`). (c)
-Slot 0, counter 1, `file_id` 0, `offset` 0, `last_sequence` 0, `max_series_id` 0 and the current boot id; nothing is
-read below it. (d) Free space at least `disk_critical` + `segment_size`, checked every second; an unknown free space
-passes. (e) The low mark uses the byte floor alone (`disk_low_bytes`); an unknown free space applies neither mark, so
-ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other series
-takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (g) Epoch 1. (h) A write or sync failure
-on the log: read-only; lack of space at the creation's syncs too, as a failed sync is never retried. (i) Both are the wall clock at commit, raised to the previous batch's commit time if it went
-back. (j) Not done; deferred to roadmap 4.8 with the device-cache check (A.13). 4.8's harness times `FlushFileBuffers`
-on a cloud runner, which cannot show whether a device cache is flushed or a name survives a power loss; both need a
-Windows machine and power cuts, and move to gate 4.9 with the rest of this question
-(`docs/measurements/4.8-commit-latency.md`). Nothing in the writer depends on it. (k) Mapping the log's waits and statistics onto the interface's is left to the item that puts the engine behind
-the `kvik` interface. (l) Read whole; streaming the checksum is the change if a memory budget needs it. (m) Every
-failed rename or length change is retried every 10 seconds, for ever, with health degraded (`SealBlocked`); a failed
-write or sync of the seal is a fault.
-**Needed.** A rule for each part; for (e), whether the seam gains the file system's size (an `api.md` change, in
-its own pull request); for (m), the error kinds that count as sharing errors on each platform. To be settled at
-gate 4.9; (k) by the item that wires the engine into the interface.
+## Q-115 (e), (f), (j), (k), (n) — The commit path: points `spec.md` §3 and `format.md` A.8 and A.13 leave open
+Found while building the log writer (roadmap 4.4, crate `kvik-log`: `store`, `writer`, `fs`); (n) recorded at gate
+4.9. Parts (a)–(d), (g)–(i), (l) and (m) are settled at gate 4.9 (see Settled). Tests in `log/tests/writer.rs` pin
+what is implemented.
+**Scenario.** (e) *The low mark.* "5 % of the filesystem" needs the file system's size, which the `Fs` seam (`api.md`,
+accepted at gate 3.3) does not give; and on a platform with no free-space source (Windows, A.13) neither mark can be
+judged. (f) *The segment index's reach.* A.8's `max_t` for an interval series needs the series' interval length,
+which the writer knows only for definitions it committed itself; the registry (roadmap 5.1) holds the rest. (j)
+*Windows name durability.* A.13 assigned to roadmap 4.4 the check that a name made durable by flushing the file
+survives a power loss on Windows; it needs a Windows machine and power-loss trials. (k) *The interface.* `api.md`
+names the waits `QueueFull`, `DiskFull` and `UnsyncedClock` and lists `IngestStats.waited` and commit latency; the
+log writer reports `QueueFull`, `DiskCritical` and `NoSegment` (a roll waiting for the segment created ahead) and
+measures neither. (n) *Bounds on ingest and on blocked seals.* The ingest queue bounds entries, not bytes: 65,536
+one-entry calls of up to 8 MiB each are accepted (facts are small, so this needs entry calls of large definitions).
+Blocked seals have no bound: each holds a file handle, is read again every 10 seconds, and adds a segment to every
+later start's scan.
+**Implemented.** (e) The low mark uses the byte floor alone (`disk_low_bytes`); an unknown free space applies neither
+mark, so ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other
+series takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (j) Not done: a cloud runner can
+time `FlushFileBuffers` but cannot show whether a device cache is flushed or a name survives a power loss
+(`docs/measurements/4.8-commit-latency.md`). Nothing in the writer depends on it. (k) Left to the item that puts the
+engine behind the `kvik` interface. (n) Neither is bounded.
+**Gate 4.9.** (e) Recommended: the seam returns size and free space (`fn space(&self, path: &Path) ->
+io::Result<Space>` with `Space { free, total }` replacing `free_space`; low mark = `max(total × 5 %,
+disk_low_bytes)`; Windows stays unsupported, and neither mark applies where the platform gives no free space), in
+its own pull request before 5.1 wires the interface; the low mark only pauses compaction, which does not exist
+before roadmap 6. Owner decision pending: the seam change. (f) Deferred to 5.1: the registry gives the writer every
+series' interval at open; until then `max_t` may be low for series defined before the start, so the index must not
+be used for pruning before 5.1. (j) Proposed: A.13 says Windows name durability and the device cache are not
+verified, the flushed handle is the rule the engine follows, no durability guarantee is given there, and a trial on
+Windows hardware with power cuts is left to roadmap 10.1 and gates no item. Owner decision pending: that wording.
+(k) Deferred to 5.1, as the question says. (n) Recommended: a byte bound on the queue (64 MiB of data blocks, a limit
+in `api.md`) and an ingest wait at 8 blocked seals (`Wait::SealBlocked`), or at least a health figure for blocked
+seals. Owner decision pending: both, as each adds a limit or a wait.
+**Needed.** The owner's decisions on (e), (j) and (n), at gate 4.9; (f) and (k) with roadmap 5.1.
 
-## Q-116 — Recovery at a start: points `spec.md` §3 and `format.md` A.4, A.10 and A.14 leave open
-Found while building recovery (roadmap 4.5, crate `kvik-log`: `writer::recovery`, `manifest`). Each part names the
-reading implemented for now; tests in `log/tests/recovery.rs` pin it.
+## Q-116 (a)–(c), (k), (m), (n) — Recovery at a start: points `spec.md` §3 and `format.md` A.14 leave open
+Found while building recovery (roadmap 4.5, crate `kvik-log`: `writer::recovery`, `manifest`). Parts (d)–(j), (l),
+(o) and (p) are settled at gate 4.9 (see Settled). Tests in `log/tests/recovery.rs` pin what is implemented.
 **Scenario.** (a) *A corrupt manifest record.* §7 fetches it from deep or the mirror path, or rebuilds the manifest
 (roadmap 6.3); neither exists yet. (b) *F's sources.* F is above every position named by a local cursor file,
 manifest record or derived file; cursor files (5.2) and derived files (6.x, 7.x) do not exist yet. (c) *Loss
 history.* `api.md` reads loss reports "from the manifest and the recovery entries at every start"; reading every
-earlier recovery entry means reading every segment that holds one. (d) *A first start cut short.* A mark file with
-no valid slot beside an empty log is not named: a crash while the first start wrote the mark. (e) *Rule 1 and later
-segments.* "Rule 1 also zero-fills every later segment in use" does not say whether their headers, which put them in
-use, are zeroed too. (f) *The torn tail's extent.* The tail reported by a recovery entry is not said to include
-bytes in segments after the last in use, which are unused and deleted. (g) *Epochs above leases.* New manifest epochs
-continue above every epoch named by a lease file; leases were roadmap 4.6. (h) *Gaps between sealed segments.* The
-gap rule between a segment's last sequence and the next one's `base_sequence` (A.4) is not said to be checked at
-every start for segments already sealed. (i) *An empty segment in use that is not the last.* A segment taken into
-use with no batch, followed by another in use, is never sealed (an empty segment is not sealed) and is not named in
-A.4's table. (j) *A batch beyond the mark in a sealed file.* Rule 1 counts the complete batches beyond the mark; one
-that lies in a sealed segment cannot be truncated, and the spec does not say what rule 1 does then. (k) *No space for
-the recovery entry's segment.* A creation that fails for lack of space waits (§3 Segments); at a start that needs a
-new segment for its entry, nothing can be written until it exists. (l) *Unused segments with bytes beyond the
-header.* A.4 keeps an unused segment as the one created ahead by its header and length alone. (m) *Consumers.* The
-entry's field 47 names consumers whose cursor file was missing or unreadable; cursor files are roadmap 5.2. (n)
-*Restart time.* A start reads every unsealed segment whole, and the last sealed one for its trailer, against the
-restart budget of `design.md`. (o) *A mark from the page cache under `EveryCommit`.* Before roadmap 4.7 the order of a
-start synced the mark only when it wrote a recovery entry. Otherwise, under rule 1, a mark read on the same boot may
-not be on stable storage, yet a batch it covers is read and delivered at once; with the mark synced at every commit, a
-remount within the boot then truncated that batch at a reset point, which syncing at every commit is said to avoid
-(Recovery rule 1). A reader process can still read the mark from the page cache before the start's sync, or after
-that sync failed, and return such a batch. Found by roadmap 4.7. (p) *A header put in
-use by a failed sync.* When the sync that takes a segment into use fails (a timed seal's, which carries no batch; a
-batch's own is written over by rule 1's recovery entry, header included), the new header is in the page cache only; a start on the same boot keeps the segment in use from that header without writing it again, so after a
-later power loss the segment reads as unused unless a batch in it was synced since. Found by roadmap 4.7.
+earlier recovery entry means reading every segment that holds one. (k) *No space for the recovery entry's segment.*
+A creation that fails for lack of space waits (§3 Segments); at a start that needs a new segment for its entry,
+nothing can be written until it exists. (m) *Consumers.* The entry's field 47 names consumers whose cursor file was
+missing or unreadable; cursor files are roadmap 5.2. (n) *Restart time.* A start reads every unsealed segment whole,
+and the last sealed one for its trailer, against the restart budget of `design.md`.
 **Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
 manifest count. (c) A start reports what it found and what the manifest holds; earlier recovery entries are read by
-the item that puts the engine behind the interface. (d) Treated as a first start, if the manifest names no position either: the mark is written again in place.
-"An empty log" stops being a safe test once segments can leave `log/` (tiering, roadmap 8.1).
-(e) Their headers stay; the writer resumes in the last segment in use, after its header, whose `base_sequence` is the
-mark's last position + 1. (f) Only the last segment in use. (g) Done at roadmap 4.6: a start's first new epoch is above every epoch a valid
-lease file names, a void lease's included; an unreadable lease file counts as invalid; with no epoch left above them
-the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
-Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
-stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
-(n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments (446–639 MiB) again, after a clean
-shutdown with a warm page cache, against the 1 s budget, and 129–138 ms for two segments holding almost nothing, so
-the time is mostly reading the unsealed 64 MiB segments whole; a cold cache, a crash and the Linux target are still to
-measure (`docs/measurements/4.8-commit-latency.md`).
-(o) A start on the same boot writes the slot of the mark it read again in place and syncs it
-before it resumes, in every mode, as `format.md` A.10 Update requires since Q-122; a reader is not held back
-meanwhile. (p) Left as it is: that later
-start writes the header again from the segment's first complete batch; a torn batch alone in the segment is deleted
-with it under (l) and not reported (`log/tests/recovery.rs`,
-`a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_start`).
-**Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (n) with
-the Linux target run of 4.8.
-To be settled at gate 4.9.
+the item that puts the engine behind the interface. (k) The start stays read-only; the next start retries. (m)
+Always empty. (n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments (446–639 MiB) again,
+after a clean shutdown with a warm page cache, against the 1 s budget, and 129–138 ms for two segments holding almost
+nothing, so the time is mostly reading the unsealed 64 MiB segments whole. The cloud runners of `bench.yml` (warm
+cache, not durability-representative) took 0.24–0.68 s for 3–5 segments. A cold cache, a crash and the Linux target
+are still to measure (`docs/measurements/4.8-commit-latency.md`).
+**Gate 4.9.** (a) Deferred to 6.3: the refusal stays until deep fetch or a rebuild exists. (b) Deferred to 5.2
+(cursors), 6.2 and 7.1 (derived files): each item adds its source to F, with a test. (c) Deferred to 5.1: the
+interface reads it. (m) Deferred to 5.2. (k) Recommended as implemented: `spec.md` §3 step 5 to say that if the
+segment cannot be created for lack of space the start stays read-only and reports it, and the next start retries, so
+a full disk after a power loss needs space freed and a restart. Owner decision pending: that availability wording.
+(n) Open until the owner's run on the Linux NVMe target: if a cold start there is over 1 s, a start scans segments
+awaiting a seal only up to their last complete batch; independently, a start should fold each batch's content into
+the segment's summary while scanning rather than hold it all at once.
+**Needed.** (a) with roadmap 6.3, (b) and (m) with 5.2 (derived files with 6.2 and 7.1), (c) with 5.1; (k) the
+owner's decision and (n) the Linux target run, at gate 4.9.
 
-## Q-118 — The reader process and leases: points `spec.md` §7 and `format.md` A.2, A.10, A.13 and A.15 leave open
-Found while building the reader process (roadmap 4.6, crate `kvik-log`: `reader`, `lease`). Each part names the
-reading implemented for now; tests in `log/tests/reader.rs` pin every part.
-**Scenario.** (a) *No mark.* A.10 names retries when neither slot is valid, not a missing mark file: a store whose
-first start has not written it yet, or a mark an operator removed. (b) *Retry pace.* "Retries 8 times" gives no
-pause. (c) *A new generation.* A restore (roadmap 8.3) sets positions aside "also in reader processes"; a reader that
-sees the mark's generation change has no restore record to read yet. (d) *A refused file.* "A reader process returns
-the error for that file only": positions are read in order, so reading past a refused segment would skip positions.
-(e) *Truncation without a reset point.* §7 voids what a reader took above a recovery entry's `after`. A start after a
-page-cache loss on the same boot truncates the batch beyond the mark on disk (§3 Recovery rule 1, accepted limit)
-and writes no entry, though a reader read that batch under the newer mark the page cache held; positions are then
-assigned again. A start under rule 3 over a tail damaged after a reader read it writes its entry below where the
-reader had reached. (f) *Which epoch a refresh takes.* "Readers take an epoch ... and refresh both": whether a
-refresh moves to the manifest's current epoch, and whether a read that only renews keeps the old one. (g) *A failed
-lease write.* Whether a reader may read without a renewed lease. (h) *When the writer looks at leases.* Expiry runs
-from when the writer first observes a counter value, but no cadence is given; nor what "a different boot id" means
-when the writer has no boot identity. (i) *A corrupt manifest record.* A reader cannot take an epoch from it. (j) *The
-lease header.* A.15 says "an A.1 header" without its `file_id` and generation. (k) *What removal must honour.*
-Retired files (§7 Manifest) and tier moves (§8) do not exist yet. (l) *A start during a refresh.* The mark is read
-before the segments; a start that truncates below it while they are read leaves the reader with bytes of both.
-**Implemented.** (a) Unreadable: `MarkUnreadable` at open and at refresh, which changes nothing the reader holds. (b)
-Back to back. (c) Everything taken is void (`VoidCause::Generation`) and the log is read again from its start. (d) The
-error names the file; nothing at or past it is read until it can be. (e) The reader keeps a CRC32C over all the bytes of
-each of its last 64 batches (before the Q-119 ruling the commit block alone did not identify a batch) and reads the last one again
-before each refresh; if it differs, it voids what it took above the last
-that still reads the same (`VoidCause::Rewritten`) and reads on from there; with none left, above the position before
-the oldest, reading again from that segment's start, where every recovery entry is applied again: the new one voids
-the rest, and an earlier one may void intact batches, which are then returned again. A batch the reader
-holds that is damaged later in the middle of the log is a loss for the writer's next start to record, not voided. (f)
-A refresh takes the current epoch; `keep_alive` keeps the epoch unless the lease may have expired. With no files to
-retire this is safe; once tree and compacted files exist, whether a refresh may move the epoch under an open iteration
-is for roadmap 6.3. (g) Open and refresh return the error and read nothing. (h) At the writer's turns, at most once a
-minute, with no timer of its own: a late look only makes an expiry later. A lease is void only when both boot ids are
-non-zero and differ. (i) `ReaderError::Manifest`. (j) `file_id` 0 and the generation at creation; the store id is
-checked, as for every file. (k) `LeaseTable::oldest_live_epoch` is the input for roadmap 6.3 and 8.1; today the writer
-deletes only segments that hold no batch. (l) The mark is read again after the scan; if it moved backwards (another
-generation, a lower last position or an earlier place) the pass is discarded and returns nothing, and the next
-refresh checks what the reader holds. Left: a start that truncates and then writes enough that the mark is past its
-old place before the second read; the next refresh's check of the last batch still finds the rewrite, but corruption
-events from that pass may be wrong.
-**Settled by the owner's ruling, for (e) and (l).** (e) Rule 1 writes a recovery entry with a new reset stamp whenever
-it truncates a complete batch (`spec.md` §3 Recovery rule 1): the accepted limit becomes a loss reported as
-`possible_loss` and delivered as a reset point. A recovery entry was chosen over a stamp change in the mark alone
-because it is already the reset point consumers and readers act on (§4 Resync, §7 Readers) and the place a saved
-point's check finds a reset; nothing new is delivered. The reader keeps its whole-batch checksums as a second check
-(`log/tests/recovery.rs`, `a_kill_on_the_same_boot_truncates_the_batch_beyond_the_mark`). (l) Every start that
-removes a complete batch now writes a new stamp, so the reader compares the stamps of its two reads of the mark and
-discards the pass when they differ (`log/tests/reader.rs`,
-`a_mark_with_a_new_reset_stamp_during_a_refresh_discards_the_pass`).
+## Q-118 (c), (f), (k) — The reader process and leases: points `spec.md` §7 and §8 leave open
+Found while building the reader process (roadmap 4.6, crate `kvik-log`: `reader`, `lease`). Parts (a), (b), (d),
+(e), (g)–(j) and (l) are settled (see Settled). Tests in `log/tests/reader.rs` pin every part.
+**Scenario.** (c) *A new generation.* A restore (roadmap 8.3) sets positions aside "also in reader processes"; a
+reader that sees the mark's generation change has no restore record to read yet. (f) *Which epoch a refresh takes.*
+"Readers take an epoch ... and refresh both": whether a refresh moves to the manifest's current epoch, and whether a
+read that only renews keeps the old one. (k) *What removal must honour.* Retired files (§7 Manifest) and tier moves
+(§8) do not exist yet.
+**Implemented.** (c) Everything taken is void (`VoidCause::Generation`) and the log is read again from its start.
+(f) A refresh takes the current epoch; `keep_alive` keeps the epoch unless the lease may have expired. With no files
+to retire this is safe; once tree and compacted files exist, whether a refresh may move the epoch under an open
+iteration is for roadmap 6.3. (k) `LeaseTable::oldest_live_epoch` is the input for roadmap 6.3 and 8.1; today the
+writer deletes only segments that hold no batch.
 Not a question: the reset nonce comes from std's OS-seeded hash keys for now; it must come from `Env::entropy`
 (`api.md` Environment seams) when the interface wires the log in.
-**Needed.** A rule for each other part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
+**Needed.** (c) with roadmap 8.3; (f) and (k) with 6.3 (deferred there at gate 4.9).
 
 ## Q-121 — Series id 0 against an id floor of 0
 Found while building the differential test of the log against the model (roadmap 4.7).
@@ -604,7 +545,10 @@ after gate 3.3; such a change is made by the item that settles the question, in 
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
 Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119, Q-46 and parts (e) and (l) of Q-118 were settled after it by
-the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122.
+the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
+of Q-115, Q-116
+and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table; Q-52 (b) and
+Q-86 (b) wait for a passing run of the `fault-trials` workflow, which has not run yet.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -612,12 +556,12 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 | Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-52 (b) | 4.9 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform; moved from 4.8, as it needs a device that fails writes or power cuts |
+| Q-52 (b) | 4.9 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform; moved from 4.8, as it needs a device that fails writes or power cuts. Linux: the `fault-trials` workflow (ext4, XFS), not yet run; owner decision pending on the macOS and Windows wording |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
-| Q-86 (b) | 4.9 | Platform trials on a copy-on-write file system (moved from 4.5 and then from 4.8, see the question) |
+| Q-86 (b) | 4.9 | Platform trials on a copy-on-write file system (moved from 4.5 and then from 4.8, see the question): the Btrfs job of the `fault-trials` workflow, not yet run; owner decision pending on the `chattr +C` sentence |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
@@ -627,14 +571,22 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
-| Q-109 | 4.9 | Gate; left open by 4.5 (see the question); recorded at the review of roadmap 4.2 |
-| Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2 |
-| Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
+| Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2; owner decision pending on the trust-boundary wording |
+| Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3; owner decision pending on the call-limit wording in `api.md` |
+| Q-115 (e), (j), (n) | 4.9 | Gate; owner decisions pending: the `space()` seam, the Windows wording, and bounds on the ingest queue's bytes and on blocked seals |
+| Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9 |
+| Q-116 (a) | 6.3 | Deep fetch or manifest rebuild for a corrupt record; deferred by gate 4.9 |
+| Q-116 (b), (m) | 5.2 | Durable cursors as a source of F and in the recovery entry (derived files as sources of F at 6.2 and 7.1); deferred by gate 4.9 |
+| Q-116 (c) | 5.1 | The interface reads loss history; deferred by gate 4.9 |
+| Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
+| Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
+| Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-121 | 5.1 | Series registry: ids are assigned there; recorded by roadmap 4.7 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
-runners. The figures on the Linux NVMe target are the owner's run, pending before gate 4.9
+runners. The cloud-runner figures are recorded there and are not durability-representative.
+The figures on the Linux NVMe target are the owner's run, pending before gate 4.9
 (`docs/measurements/4.8-commit-latency.md`).
 
 ## For the format and interface documents
@@ -835,7 +787,11 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-105 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name | `format.md` A.2 ((a) sixteen zero bytes at a block boundary are end of data only when the limit is the end of the file, an `.open` segment scanned without a mark, and every byte to it is zero; below the mark's offset or before the seal blocks zeros start an invalid region, also when they run to that limit), A.7 ((b) `block_count`, `batch_bytes` and `batch_crc32c` cover every block before the commit block; a skipped block takes no sequence and carries no `received_at`; a batch of skipped blocks alone is not complete; every block before the seal blocks belongs to a batch; (d) the first batch starts at or above `base_sequence`, higher only after an invalid region or with a recovery entry, checked by recovery at roadmap 4.5), common rules ((c) a version refusal only from a valid position or in an otherwise complete batch at a resynchronisation candidate; any other block image is not a block), A.12 ((e) a header disagreeing with its name is refused, never scanned or deleted). As implemented in `kvik-log`; `log/tests/segment.rs` pins each part |
 | Q-106 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, the parameter change, the recovery entry alone | `format.md` common rules ((a) a reader applies only the listed checks; a canonical check also requires the canonical bytes), A.5 ((b) canonical heap in row order, none shared, a reader accepting any offsets inside the heap, shared bytes included; (c) unpadded payload lengths, plain wins a tie), A.6 ((d) presence checked as invalid content, a named-state series needs a name, kind and value type not compared; (e) entries share a block up to 16 MiB; (f) entry type 5 refused until roadmap 5.2, field 41 skipped (superseded by Q-46: field 41 is the reset stamp); (g) fields 25 and 26 allowed in a parameter change since Q-100, fields without a range take any value, a change with only field 1 valid; (h) a recovery entry not alone in its batch is invalid content), A.11 (nothing allocated from a declared count or length before it is checked; output bounded by the row and entry limits). As implemented in `kvik-log`, with (g) changed for Q-100; `log/tests/batches.rs` pins each part |
 | Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
+| Q-109 | A forged seal in an `.open` file | `format.md` A.4, the states recovery may find (settled at gate 4.9 by a structural rule, with no checksum pass at open and no change to A.9: an `.open` file counts as seal-written only if its seal blocks start exactly at the end of its last complete batch, the trailer's `batch_count` and `last_sequence` equal the scan's, and it is not the last segment in use; otherwise the trailer and end marker are bytes of what precedes them, and recovery reads the file again with them ignored, so a torn tail's commit blocks and definitions count; `log/tests/recovery.rs` `a_forged_seal_after_a_torn_batch_in_the_last_segment_hides_nothing`, `a_forged_seal_in_a_segment_that_is_not_the_last_in_use_is_ignored`, `a_forged_seal_in_the_last_segment_is_a_torn_tail`) |
 | Q-117 | A recovery entry adopted after its own sync failed | §3 Recovery rule 3, Last batch written again, and Order of a start step 3 (an adopted entry is written again in place before the sync of step 3, whatever the mark; extends the Q-87 ruling). Scenario: a readable mark of the old boot; the start's sync of its recovery entry fails, so the entry is in the page cache only; the next start on the same boot adopts it, and its sync writes nothing; the mark then names F, a batch is acknowledged at F + 1, and a power loss removes the entry, which the following start reports as `data_lost` with nothing damaged (`log/tests/recovery.rs`, `an_adopted_entry_whose_own_sync_failed_is_written_again`) |
+| Q-115 (a)–(d), (g)–(i), (l), (m) | The commit path, in part: closing a batch, the seal clock, the first mark, retrying a creation, the first manifest record, failures creating ahead, the receive time, memory at seal, a blocked seal | Settled at gate 4.9: `format.md` A.4 Sizes ((a) a batch takes whole calls in order while the sum of their data blocks, each encoded alone, stays within `max_batch_bytes`, and at least one; calls that do not encode together are committed one by one); `spec.md` §3 Sealing ((b) the 5 minutes run from when the segment is taken into use; the sync that takes the next segment into use at a timed seal carries no batch, is not bound by `min_sync_interval`, and counts as the previous log sync for the next batch); `format.md` A.10 First mark ((c) slot 0, counter 1, all position fields 0, the current boot id); `spec.md` §3 Segments ((d) retried when free space is at least `disk_critical` + `segment_size`, checked every second, and every 30 seconds where free space is unknown, `log/tests/writer.rs` `with_free_space_unknown_a_failed_creation_is_retried_after_30_seconds`; (h) any failure of a creation other than lack of space at the create or a write, a failed sync included, is a write failure on the log); `format.md` A.14 ((g) the first record takes epoch 1); A.7 ((i) `received_at` and the commit time are the wall clock when the batch is formed, raised to the previous batch's commit time); `design.md` Memory ((l) sealing uses memory independent of `segment_size`, the checksum streamed in 1 MiB reads, `log/src/writer/maint.rs` `sealing_reads_at_most_1_mib_at_a_time`); `format.md` A.13 ((m) a sharing error — on Windows the system errors 5, 32, 33 and 1224, on any platform 'resource busy' — at the rename or length change, and lack of space at the rename, are retried every 10 seconds with health degraded; any other failure of either is a write failure on the log; a rename that fails with the `.open` name gone and the `.kvl` name present is a failed sync, never retried; `log/tests/writer.rs` `a_seal_blocked_by_a_sharing_error_is_retried`, `no_space_at_a_seal_rename_is_retried`, `a_failed_rename_or_length_change_of_a_seal_is_a_write_failure`, `a_rename_whose_flush_fails_is_a_failed_sync_not_retried`, and on Windows `a_seal_blocked_by_another_handle_finishes_after_its_release`) (open part: Q-115 (e), (f), (j), (k), (n)) |
+| Q-116 (d)–(j), (l), (o), (p) | Recovery at a start, in part: a first start cut short, rule 1 and later segments, the tail's extent, epochs above leases, gaps between sealed segments, an empty segment in use, a batch beyond the mark in a sealed file, unused segments with bytes, a mark from the page cache, a header put in use by a failed sync | Settled at gate 4.9: `spec.md` §3 Recovery ((d) a mark with no valid slot beside a log with no segment in use and a manifest naming no position is a first start, and an empty `log/` stops being a safe test at roadmap 8.1; (f) the tail reported is that of the last segment in use; (j) a sealed segment holding positions above the mark makes the mark stale); `format.md` A.4 ((e) under rule 1 the headers of later segments stay and the writer resumes in the last segment in use; (h) a start checks the gap rule for unsealed segments and against the last sealed one, and the scrub checks gaps between sealed segments; (i) a segment in use by its header alone, not the last in use, is left as it is and never sealed, at the cost of being read whole at every start; how the state arises is a follow-up for 5.1; (l) an unused segment is kept as created ahead only if every byte after its header is zero); (g) by roadmap 4.6 (`format.md` A.14: a start's new epochs are above every epoch a lease file names); (o) by Q-122, its residual (a reader may read a mark not yet synced; the reset stamp voids what it took) accepted in `spec.md` §7 Readers; (p) `spec.md` §3 Order of a start step 2 and `format.md` A.4 In use (a start writes the header of the segment it resumes in again, in place, before its first sync; `log/tests/recovery.rs` `a_header_put_in_use_by_a_failed_sync_is_written_again_by_a_same_boot_start`) (open part: Q-116 (a)–(c), (k), (m), (n)) |
+| Q-118 (a), (b), (d), (e), (g)–(j), (l) | The reader process and leases, in part: no mark, retry pace, a refused file, truncation without a reset point, a failed lease write, when the writer looks at leases, a corrupt manifest record, the lease header, a start during a refresh | `format.md` A.10 Read ((a) a missing mark file is `MarkUnreadable`; (b) the 8 retries are back to back); `spec.md` §7 Readers ((d) nothing at or past a refused file is read; (g) no read without a renewed lease; (i) a manifest record a reader cannot take an epoch from is an error, `ReaderError::Manifest`); `spec.md` §7 Leases ((h) the writer looks at leases at its own turns, at most once a minute, and a lease is void only when both boot ids are non-zero and differ); `format.md` A.15 ((j) the lease header has `file_id` 0 and the generation at creation): settled at gate 4.9 as implemented. (e) and (l) by the owner's rulings after roadmap 4.6: rule 1 writes a recovery entry with a new reset stamp whenever it truncates a complete batch (`spec.md` §3 Recovery rule 1; `log/tests/recovery.rs` `a_kill_on_the_same_boot_truncates_the_batch_beyond_the_mark`), and a reader compares the stamps of its two reads of the mark and discards the pass when they differ (`log/tests/reader.rs` `a_mark_with_a_new_reset_stamp_during_a_refresh_discards_the_pass`); the residual of (l), corruption events of a pass that a start overtook may be wrong, is accepted and stated in `spec.md` §7 Readers (open part: Q-118 (c), (f), (k)) |
 | Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
 | Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
 | Q-122 | A torn mark update could leave a mark older than the last one synced | `format.md` A.10 Update and Read, `spec.md` §3 Order of a start step 2 (settled by roadmap 4.7: every update between two mark syncs goes to the slot that does not hold the last synced mark, and a start writes the mark file again in place, as read, and syncs it before its own mark write, or, keeping the mark it read, writes that slot again and syncs it before the first update). Scenario: updates alternated between the slots whether or not the last was synced; with a timed mark sync, A held counter c, synced, and B c − 1; c + 1 went to B and c + 2 to A, neither synced, and a power loss that tore the write of c + 2 left A invalid and B at c − 1, older than the mark synced last. Rule 3 kept every complete batch, but the start took its id floor from that mark and the unsealed segments only, so an id defined after c − 1 in a batch then in a sealed segment was above the floor; the low floor was durable, in the recovery entry and in the new mark's highest series id, so ids would have been assigned again once roadmap 5.1 assigns above floors (`log/tests/recovery.rs`, `a_torn_mark_update_never_falls_back_past_the_last_synced_mark`) |

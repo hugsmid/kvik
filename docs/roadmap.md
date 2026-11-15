@@ -41,10 +41,16 @@ again; nothing after a gate starts before it is passed.
 - [x] 4.6 Second-process reader and leases (in `kvik-log`; the interface `Reader`'s `facts` and series lookup moved to 5.1)
 - [x] 4.7 Differential tests: engine log against the model on generated histories
 - [x] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/` (recorded on macOS; pending:
-  the run on the Linux NVMe target that checks the delivery budget, `scripts/bench-nvme.sh`, and the cloud-runner
-  figures of the `bench.yml` workflow; Q-52 (b), Q-86 (b) and Q-115 (j) moved to gate 4.9)
-- [ ] 4.9 **Gate** — log looked at as a whole (inputs include the 4.8 run on the Linux NVMe target,
-  `scripts/bench-nvme.sh`)
+  the run on the Linux NVMe target that checks the delivery budget, `scripts/bench-nvme.sh`; the cloud-runner
+  figures of the `bench.yml` workflow are recorded, not durability-representative; Q-52 (b), Q-86 (b) and Q-115 (j)
+  moved to gate 4.9)
+- [ ] 4.9 **Gate** — log looked at as a whole. Reviewed; its fixes and the questions due here are applied
+  (`model/OPEN-QUESTIONS.md`). Remaining: (1) the owner's run on the Linux NVMe target, `scripts/bench-nvme.sh`
+  (delivery budget, the 100 × 1 Hz tail, restart time, Q-116 (n)); (2) one passing run of the `fault-trials`
+  workflow, recorded in `docs/measurements/4.9-fault-trials.md` (Q-52 (b) on ext4 and XFS, Q-86 (b) on Btrfs);
+  (3) the owner's decisions on Q-110 (trust boundary), Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam),
+  (j) (Windows wording) and (n) (a byte bound on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k)
+  (full disk after a power loss), the Q-52 (b) macOS and Windows wording and the Q-86 (b) `chattr +C` sentence
 
 ## 5. Delivery
 - [ ] 5.1 Series registry; the `kvik` crate on the durable log: writing, and `facts`, series lookup and `refresh` for
