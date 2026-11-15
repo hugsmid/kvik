@@ -399,4 +399,7 @@ pub enum BackupError {
         /// What.
         what: &'static str,
     },
+    /// The backup sink failed.
+    #[error("backup sink: {0}")]
+    Sink(#[from] crate::SinkError),
 }
