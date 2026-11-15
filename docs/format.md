@@ -462,7 +462,7 @@ exists; a new file is created only when none exists.
 <dir>/cursors/<consumer name>.cur            kind 4 (A.15)
 <dir>/leases/<reader_id:32 hex>.lease        kind 8 (A.15)
 <dir>/registry/<generation:8 hex>-<file_id:16 hex>.reg   kind 5 (A.16)
-<dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.1, 7.1 and 8.1
+<dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.2, 7.1 and 8.1
 ```
 - Hex is lower-case and zero-padded to the stated width; extensions are lower-case. Readers match names exactly and
   ignore any other name. A consumer name is `[a-z0-9][a-z0-9._-]{0,63}`, so it is its own file name.
@@ -622,8 +622,9 @@ to every stored file.
   facts or revisions, each with its position range and a summary, followed by an index and a trailer in the
   style of A.9. Roadmap 2.1 decided the encodings: delta with frame-of-reference bit-packing per 128 values for `t`,
   positions and `i64`; scaled decimal with per-value exceptions and a zstd-compressed XOR fallback; run-length for
-  quality, flags and states; 4,096-row blocks behind a directory of first and last `t`. The layout, the per-batch
-  `received_at` table and the self-description fields are written by roadmap 6.1. A chunk of a decimal series
+  quality, flags and states; 4,096-row blocks behind a directory of first and last `t`. Roadmap 6.1 laid out a
+  block's body and its column encodings in [`format-chunk.md`](format-chunk.md); the chunk layout, the per-batch
+  `received_at` table and the self-description fields are written by roadmap 6.2. A chunk of a decimal series
   keeps the per-fact scale column of A.5, and its summary, like a tree node of a decimal series, carries a `u8`
   scale: the highest stored scale among the current facts it covers that are not bad (`spec.md` §5.6). The index can
   be fetched without the chunk data: by a ranged read at an offset and length the trailer gives, or as its own object.

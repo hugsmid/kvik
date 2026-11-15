@@ -361,6 +361,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bytes",
+ "kvik-chunk",
  "parquet",
  "proptest",
  "zstd",
@@ -633,6 +634,15 @@ dependencies = [
  "kvik-model",
  "proptest",
  "thiserror",
+]
+
+[[package]]
+name = "kvik-chunk"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+ "zstd",
 ]
 
 [[package]]

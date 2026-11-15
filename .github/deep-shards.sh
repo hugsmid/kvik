@@ -38,6 +38,8 @@ log-histories   log   model_histories
 log-writer      log   writer
 log-recovery    log   recovery
 log-reader      log   reader
+chunk-properties chunk properties
+chunk-fuzz-inputs chunk fuzz_inputs
 '
 
 cd "$(dirname "$0")/.."

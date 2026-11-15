@@ -1,0 +1,23 @@
+[package]
+name = "kvik-chunk"
+version = "0.1.0"
+description = "Column encodings of kvik's compacted chunks: delta bit-packing, scaled decimals with exceptions, XOR, run-length"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository = "https://github.com/hugsmid/kvik"
+readme = "README.md"
+keywords = ["time-series", "storage", "embedded", "compression"]
+categories = ["database-implementations", "compression"]
+
+[dependencies]
+thiserror = "2"
+# The compressed XOR fallback (`docs/format-chunk.md`); the level and library measured in roadmap 2.1.
+zstd = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
