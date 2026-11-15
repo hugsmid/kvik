@@ -605,7 +605,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-16 | 5.4 | Live state and staleness are built there |
 | Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below). Roadmap 5.1 did the registry file's check and requirement 5; the rest is proposed for 6.2, owner decision pending (see the question) |
 | Q-39 (f) | 8.3 | Restore |
-| Q-44 (b) and (c) | 5.1 | Series registry and timing |
+| Q-44 (b) and (c) | 5.1 | Series registry and timing; not settled by roadmap 5.1, which needs the owner's ruling on the proposal and its objections (see the question) |
 | Q-52 (b) | 4.9 | Settled on Linux (ext4 and XFS) by the rewrite job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decision on the macOS and Windows wording |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
