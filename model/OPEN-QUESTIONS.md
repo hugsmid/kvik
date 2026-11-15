@@ -33,9 +33,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
 | Q-141 | §2.2 `received_at`, `format.md` A.7 `commit_time` | A fact's `received_at` after the wall clock steps back |
 | Q-142 | §5.5, §2.1 counter rules; `format.md` A.6 field 11 | A reset ceiling off the parts-per-million grid |
-| Q-160 | §8 Deep, Encryption, Hashes, Generations; `format.md` A.12, A.14 | Objects in the deep tier: keys, claim marker and envelope |
 | Q-161 | §8 Generations; `api.md` Backup and restore | Telling a restore's own claim marker from another restore's |
-| Q-162 | §8 Hashes, Bucket, Generations; §13 | Buckets without conditional writes or checksum checks |
 | Q-163 | §8 Generations, Restore step 1 | Reading the claims again on a bucket whose listings lag |
 | Q-164 | §8 Retention class, Restore; `api.md` Reading, Backup and restore | Interface points deferred to 8.2 that need tiers or restore |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
@@ -50,6 +48,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
 | Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
+| Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
+| Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
+| Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -664,24 +665,9 @@ decimal places is kept exactly (`kvik/tests/api.rs`, `a_reset_ceiling_off_the_pa
 **Needed.** Whether the refusal stands in `spec.md` §5.5 and `api.md` Series, or the field holds the ratio exactly
 (the `f64` bits or a rational, a `format.md` change).
 
-## Q-160 — Objects in the deep tier: keys, claim marker and envelope
-Recorded at roadmap 8.2, which built the sink with opaque keys. To be settled before roadmap 8.1 uploads anything.
-**Scenario.** Roadmap 8.1 uploads a sealed segment, then its manifest record; a newer build later restores the store
-from the bucket. Nothing says under which key either object lies, what an uploaded manifest record holds (the A.14
-block alone, or with a header carrying the store id and generation), what the generation claim marker is
-(`format-check.md` FC-33 left it to 8.2), or how a file is encrypted: algorithm, nonce, key identification, and a
-layout that allows the ranged reads `BackupSink::get` offers (a chunk index fetched by range, `format.md` Part B).
-§8 also refuses backup on a bucket holding files of another store id, which needs the store id findable from keys
-or object headers. The restore that reads them (8.3) cannot be written against an unwritten layout.
-**Model.** Not modelled; the sink (`kvik-sink`) takes any key of 1 to 1,024 bytes and stores bytes as given.
-**Needed.** An object layout section in `format.md`. Suggested: keys under a configured prefix and the store id,
-mirroring local names (`<prefix>/<store_id:32 hex>/STORE`, `.../log/<generation:8 hex>-<file_id:16 hex>.kvl`,
-`.../manifest/<generation:8 hex>/<epoch:16 hex>`, `.../claims/<generation:8 hex>`), so that listing a generation's
-records returns them in epoch order; each uploaded file an envelope of fixed-size authenticated chunks with a header
-naming the algorithm, key id and nonce base, so that a range decrypts on its own.
-
 ## Q-161 — Telling a restore's own claim marker from another restore's
-Recorded at roadmap 8.2. To be settled with Q-160, before roadmap 8.3.
+Recorded at roadmap 8.2. To be settled before roadmap 8.3 (8.3a). Roadmap 8.1a laid out the marker (`format.md` A.17)
+with the claiming restore's reset nonce, as suggested below; the procedure is still open.
 **Scenario.** Restores R1 and R2 of the same bucket both read generation 2 as the highest claimed and try to claim
 3 at once. R1's create-if-absent upload of the marker is stored but its reply is lost; R2's is refused. R2 moves on
 to 4. Had R2's upload landed first instead, R1's retry would meet a marker for 3 already there. The sink accepts a
@@ -692,19 +678,6 @@ marker has the same content (empty, say), R1 takes R2's marker for its own and b
 nonce (fresh random, §8 Generations), so a `put` that succeeds proves the marker is this restore's. Other
 content is `Exists` only when no attempt can have reached the bucket, and `HashMismatch` after an attempt that may have landed (`api.md` Backup and restore);
 either way the restore treats the claim as possibly lost and takes the next generation.
-
-## Q-162 — Buckets without conditional writes or checksum checks
-Recorded at roadmap 8.2. To be settled before roadmap 8.1 uploads anything.
-**Scenario.** (a) A bucket that ignores `If-None-Match` overwrites one restore's claim marker with another's;
-versioning keeps the first, but both restores believe they claimed the generation, and a sealed file uploaded twice
-silently replaces the first copy's current version. (b) A bucket that stores an upload without checking its SHA-256
-reports the hash it was sent: `put` and the scheduled reported-hash check pass on damaged bytes, and only a sampled
-download finds them (tested in `kvik-sink`, `a_bucket_that_does_not_check_is_caught_by_the_sampled_download`).
-§13 lists (b) as a risk with the fallback "hash in object metadata plus sampled downloads", whose metadata is not
-named; (a) is not listed. A bucket that reports no SHA-256 at all is refused by the sink (`SinkError::Failed`).
-**Model.** Not modelled.
-**Needed.** Whether the engine checks the bucket when backup is attached (a probe object, which stays, since the
-engine never deletes), or the operator does; (a) added to §13; and the metadata of the fallback, if it is kept.
 
 ## Q-163 — Reading the claims again on a bucket whose listings lag
 Recorded at roadmap 8.2. To be settled with roadmap 8.3.
@@ -934,6 +907,41 @@ place a key is built or parsed; kinds other than log segments under `files/<kind
 Both are fixed by `format.md` A.17 (roadmap 8.1b), which may change them before anything is uploaded.
 **Model.** Not modelled.
 
+## Q-210 — Telling a bucket that reports no checksum from another sink failure
+Recorded at roadmap 8.1a. To be settled by roadmap 8.1c.
+**Scenario.** The owner ruled that a bucket reporting no checksums is refused (`BackupRefusal::NoChecksums`). The
+probe's `stat` meets such a bucket, and `kvik-sink` fails it with `SinkError::Failed { reason }`, the same variant as
+refused credentials or a missing bucket. The driver cannot tell the refusal from a fault it should report as
+`BackupError::Sink`.
+**Model.** Not modelled.
+**Needed.** A distinct report. Suggested: an additive variant `SinkError::ChecksumMissing { key }` in
+`kvik-sink-api` (the enum is non-exhaustive), returned by `kvik-sink` where it now returns `Failed` for a missing
+SHA-256, and mapped to `NoChecksums` by the probe. Until then the probe reports `Failed` as `BackupError::Sink`.
+
+## Q-211 — An uploaded epoch written again after the last two synced records are damaged
+Recorded at roadmap 8.1a. To be settled by roadmap 6.3d.
+**Scenario.** Records 1 to 20 are synced; record 19 is uploaded, since 20 was synced after it (§7 Manifest). The
+device then damages records 19 and 20 together. No valid record follows them, so a start reads them as a torn tail
+(§7 Manifest), truncates after 18 and gives the next record epoch 19 again, with other content. Its upload under
+`manifest/<generation>/<epoch>` (`format.md` A.17) meets the uploaded record 19: the key is taken, and the bucket
+holds two different records 19 for one generation, one of them in no local manifest.
+**Model.** Not modelled.
+**Needed.** A rule that a start does not reuse an uploaded epoch. Suggested: a start that drops a tail, with deep
+configured, asks deep (`stat`) for the record keys above the last valid epoch in its generation; one that is present
+was uploaded, so its successor had been synced and the tail is corrupt, not torn: it is fetched and written back as
+§7 repairs a corrupt record, and new epochs continue above the highest present.
+
+## Q-212 — A key already taken by an object that is not the file
+Recorded at roadmap 8.1a. To be settled by roadmap 8.1c.
+**Scenario.** The envelope is deterministic (`format.md` A.17), so a repeated upload of the same file sends the same
+bytes and the sink accepts it. A `put` that fails with `Exists` or `HashMismatch` therefore means the key holds
+something else: another writer under `<sid>/`, damage in the bucket before the copy was verified, or Q-211. The key
+can never be used for the file (no overwrite, no delete), and the restore derives keys from the file's name.
+**Model.** Not modelled.
+**Needed.** What the driver does. Suggested: no alternate key in format v1; the file stays local, is never evicted,
+and health asks for attention (`BackupStalled` naming the key); the queue continues with other files, but no
+manifest record that names the file is uploaded while it is not backed up.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -946,7 +954,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162 and recorded Q-210 to Q-212.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -980,11 +988,12 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-140 | 5.6 | Gate, with the ruling on Q-16; recorded by roadmap 5.4 |
 | Q-141 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-142 | 5.6 | Gate; recorded by roadmap 5.4 |
-| Q-160 | 8.1 | Deep-tier object layout; recorded by roadmap 8.2; settled before 8.1 uploads anything |
-| Q-161 | 8.3 | Restore's own claim marker; recorded by roadmap 8.2; settled with Q-160 |
-| Q-162 | 8.1 | Buckets without conditional writes or checksum checks; recorded by roadmap 8.2; settled before 8.1 uploads anything |
+| Q-161 | 8.3 | Restore's own claim marker; recorded by roadmap 8.2; the marker's layout, with the nonce, is in `format.md` A.17 (roadmap 8.1a) |
 | Q-163 | 8.3 | Reading the claims on a lagging bucket; recorded by roadmap 8.2 |
 | Q-164 | 8.1, 8.3 | Interface points deferred to 8.2: (a) and (b) with 8.1, (c) with 8.3; recorded by roadmap 8.2 |
+| Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
+| Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
+| Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 | Q-173 | 6.3b | The operator call `rebuild_manifest`; recorded by roadmap 6.3a; its signature and finality come with the call in `api.md`, which 6.3b adds |
 | Q-175 | 6.3b | An intermediate output no record and no local file describes; recorded at the review of roadmap 6.3a; needs two corrupt merges, so it arises only once 6.3b publishes compaction outputs |
@@ -1224,6 +1233,8 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-130 | A consumer's missing cursor file that a start cannot tell | §3 Recovery rule 3, §4 Consumer state, §2.1, `format.md` A.6 field 47, A.16 (owner's ruling at the audit of roadmap 5.2: the registry file is written after each routing change, before that change's position can be sealed). Implemented: the routing call commits the change, and once its batch is acknowledged (with the mark synced, so the file names no position above it, invariant 26) writes the registry file before it returns, under the lock that orders routing changes; a write that fails turns the store read-only. A seal may still complete between the acknowledgement and the file, so a start also reads the routing changes of the segments sealed above the registry file's `through`, newest first, stopping at the first segment that begins at or below it. The registry file is written at a start, a clean shutdown and each routing change, so after a crash the start reads every segment sealed since the last of those, which can be the whole previous run, and with no registry file every sealed segment; that restart cost is tracked by Q-116 (n). Scenario: a consumer's only routing change lies in a segment sealed since the last registry file was written, the process stops, and the consumer's cursor file is lost; the start names the consumer in the recovery entry (`log/tests/recovery.rs` `a_routing_change_sealed_above_the_registry_file_names_its_consumer`); in the interface, the file holds a routing change as soon as `route` returns, and after a power loss with the cursor file unreadable the consumer is reported and sent the `NoCursor` resync (`kvik/tests/consumers.rs` `the_registry_file_holds_each_routing_change_when_the_call_returns`) |
 | Q-131 | The resync of a consumer with no cursor file | §4 Resync, New consumer, `api.md` Consuming (owner's ruling at the audit of roadmap 5.2): the position before a start is the position before the first fact at or after T for `start: time`, P for `start: position` P (a saved point: kept, P; void above X, X; unknown, the registration is refused with `ConsumerError::UnknownPoint`), and the mark's last position otherwise. A new consumer receives no resync: its cursor file is written at once naming that position and it starts after it, reset points above it applying as to a cursor there. A consumer whose cursor file is lost (Q-95 (a)) receives, before its first delivery, a resync of cause `NoCursor` with `forget_above` = that position, carrying each funnel's current live and condition state, every condition a transition since its latches are lost; §4's "any other `resync` carries no funnel state" names this exception, and `api.md` lists `NoCursor` among the causes. Scenario: facts at 0, 1, 2 and 3 s; a consumer started at 2 s starts after the fact at 1 s, one started now after the last position, one at a kept point at it; a point above what a power loss kept is void above the recovery entry's `after`, and that entry is then a reset point for it; with their cursor files damaged, three consumers latched true each receive the `NoCursor` resync with `forget_above` by their start kind and the condition true as a transition (`kvik/tests/consumers.rs` `a_new_consumer_starts_after_the_position_before_its_start_with_no_resync`, `a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind`; `kvik/tests/api.rs`: a new consumer receives nothing on either backend) |
 | Q-132 | A confirmed latch lost with the last second of a cursor file | §4 Consumer state, At-least-once, §6 Latch, invariant 26 (owner's ruling at the review of roadmap 5.2 and its audit: a confirmation that changes a latch writes the cursor file at once and returns once it is synced, so a confirmed condition delivery is never reported again as a transition; a state acted on but not confirmed before a stop is reported again by the resync that ends the next resume if it differs from the latch, so actions on conditions are at least once, as `spec.md` §4 At-least-once now says; the immediate write never names a position above the last synced mark: it asks for a mark sync first and is skipped, the store read-only, if the mark cannot be synced past it). Scenario: a consumer confirms a trigger to true and the process stops a moment later, the mark synced only on request; the cursor file already holds the latch, so the resume reports the condition true as no transition; every cursor file synced names no position above the mark synced at that moment (`kvik/tests/consumers.rs` `a_cursor_file_never_names_a_position_above_the_synced_mark`, `routes_cursors_and_latches_survive_a_restart`; `kvik/tests/consumer_properties.rs` `deliveries_after_crashes_follow_the_rules`: after crashes part-way through a confirmation, a condition reported as no transition is always in a state handed out before a confirmation) |
+| Q-160 | Objects in the deep tier: keys, claim marker and envelope | `format.md` A.17, `spec.md` §8 Deep and Encryption, `api.md` Backup and restore (settled by roadmap 8.1a; owner: backups always encrypted, no unencrypted mode; XChaCha20-Poly1305 from an audited crate; 64 KiB authenticated chunks under a header with format version, algorithm id, key check value and nonce base). Keys start at the store id with no engine prefix, mirror the local names, and list a generation's records in epoch order; a restore finds the store id by listing. Every object, `STORE`, records, claim markers and probes included, is an envelope. An uploaded record is its A.2 block alone; the store id is bound by key derivation and associated data. Subkeys and the key check value come from HMAC-SHA-256 of the key and store id; chunk nonces are the nonce base, the chunk index and a final flag, with the header and object key as associated data, so ranges decrypt alone and truncation, reordering and moved objects fail. **The nonce base is derived** (SIV-style, from the key, the object key and the plaintext's SHA-256) rather than random, as the owner's ruling worded it. Scenario: the sink accepts a repeated `put` only with identical bytes, so with a random base a driver that restarts after its upload landed would send other bytes and lose the key for good, unless it kept a local record of each attempt, a new mechanism. Reason: the derived base makes a file's envelope the same at every attempt; it reveals only that two objects under one object key and key are identical, and keys never hold other content. To be confirmed by the owner as a change of wording. Golden files and the code are roadmap 8.1b |
+| Q-162 | Buckets without conditional writes or checksum checks | `spec.md` §8 Bucket and §13, `format.md` A.17 Probe, `api.md` Backup and restore (owner's ruling at roadmap 8.1a: such a bucket is refused, `BackupRefused`; no weaker mode). The engine probes at `attach_backup` and before a restore claims: a second create under a taken key must be refused (scenario (a)), a put with a wrong SHA-256 must be rejected and leave nothing (scenario (b), a bucket that trusts the sent hash), and `stat` must report a hash. Scenario (a) is added to §13, whose metadata fallback is dropped. The probe object stays (no deletion), one per store on a bucket that passes. A checksum check that fails only sometimes is still caught by the sampled download alone. Telling a missing checksum from other sink failures: Q-210 |
 | Q-180 | Stored nodes keep sums, integrals and increases exact | `spec.md` §5.6, §6, invariants 6, 7, 21, 22; `format-tree.md` T.3 (settled at the review of roadmap 7.1a: exact, stored as dyadic numbers, folded with a dyadic accumulator; measurements in the question) |
 | Q-181 | Which zero is the minimum of +0.0 and −0.0 | `spec.md` §5.2, §5.6; `format-tree.md` T.5 (settled at the review of roadmap 7.1a: IEEE total order, −0.0 below +0.0) |
 | Q-182 | A state name declared twice | `spec.md` §2.1 `value type`; `format.md` A.6 field 13 (settled at the review of roadmap 7.1a: names are distinct, a definition repeating one is refused) |

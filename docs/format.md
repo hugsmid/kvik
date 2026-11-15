@@ -2,9 +2,9 @@
 
 Byte-level rules for the files kvik writes. The semantics are in [`spec.md`](spec.md); where the two differ,
 `spec.md` wins and this document is wrong. Part A (common rules, log segments, the durable mark, the store layout,
-the platform operations, the manifest framing, cursor and lease files, the registry file) is complete enough to implement. Part B
-(compacted segments and the remaining files) is an outline; each file is specified here before the roadmap item that
-writes it.
+the platform operations, the manifest framing, cursor and lease files, the registry file, the deep tier's objects)
+is complete enough to implement. Part B (compacted segments and the remaining files) is an outline; each file is
+specified here before the roadmap item that writes it.
 
 ## A. Common rules
 
@@ -653,6 +653,80 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   stays assigned. The writer writes it again at clean shutdown, after the last mark sync. Until log segments can leave
   the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry, so the file is checked,
   never trusted over the log.
+
+## A.17 Deep tier: object keys, uploaded forms, claim marker, envelope
+Every object kvik puts in the bucket (`spec.md` §8 Deep) is an **envelope** (below): backups are always encrypted
+and no object holds plaintext. The sink's keys belong to kvik alone; a sink that shares a bucket maps them under
+its own prefix, which the engine never sees.
+
+- **Keys.** `<sid>` is the store id (A.1) as 32 lower-case hex digits; every key starts with it. Keys are ASCII,
+  at most 128 bytes, hex lower-case and zero-padded as in A.12.
+```
+<sid>/STORE                                          the store descriptor (A.12)
+<sid>/log/<generation:8 hex>-<file_id:16 hex>.kvl    a sealed log segment, under its local name
+<sid>/manifest/<generation:8 hex>/<epoch:16 hex>     one manifest record
+<sid>/claims/<generation:8 hex>                      a generation claim marker
+<sid>/probe                                          the conditional-write probe
+<sid>/probe/<nonce:32 hex>                           a checksum probe; stored only by a bucket that is refused
+<sid>/data/, <sid>/tree/                             reserved for kinds 2, 6 and 9–14, named by roadmap 6.2 and 7.1
+```
+  A listing of `<sid>/manifest/<generation>/` returns a generation's records in epoch order. Generation 0 has no
+  claim marker; it counts as claimed (`spec.md` §8 Generations). A reader ignores a key under `<sid>/` that this
+  table does not name. A restore finds the store id by listing from the first key and refuses a bucket whose keys
+  start with more than one store id; `attach_backup` refuses one with any key outside `<sid>/` (`OtherStore`).
+- **Uploaded forms (the plaintext).** `STORE` and a sealed log segment: the local file, byte for byte, so its
+  plaintext SHA-256 is the one the manifest records. A manifest record: the record's A.2 block (header, body and
+  padding) exactly as `MANIFEST` holds it, and nothing else; checks: one valid record block, its `generation` and
+  `epoch` those of its key. A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
+  The store id is bound by the envelope (key derivation and associated data), not repeated in the plaintext.
+- **Claim marker** (40 bytes): 0 magic ASCII `KVCL`; 4 version `u8` (1); 5 reserved (3); 8 generation `u32`, that
+  of its key; 12 reserved `u32`; 16 reset nonce `u64`, the claiming restore's fresh nonce (`spec.md` §8
+  Generations), never zero; 24 store id (16 bytes). The nonce makes each attempt's marker unique (Q-161). A marker
+  is written once; a restore that restarts before its restore record claims the next generation and never puts a
+  marker again.
+- **Probe** (Q-162). The plaintext of a probe is 16 random bytes, never read. `attach_backup`, and a restore before
+  it claims, refuse a bucket (`BackupRefused`) when: a put of a fresh probe to `<sid>/probe`, where that key was
+  absent, is followed by a second put of another fresh probe that succeeds, or after which `stat` reports the second
+  object (`NoConditionalWrites`; where the key was present, the first put must fail and `stat` must report the
+  earlier object unchanged); or a put of a fresh probe to `<sid>/probe/<nonce>` with a SHA-256 that is not its own
+  (its own with every bit of byte 0 inverted) succeeds, or leaves an object under the key (`NoChecksums`); or a
+  `stat` reports no SHA-256 (`NoChecksums`). A bucket that passes keeps one probe object for ever; the engine never
+  deletes. Versioning or object lock cannot be probed through the sink and is the operator's to confirm. A drill
+  writes nothing and does not probe.
+
+**Envelope.** XChaCha20-Poly1305 from the audited `chacha20poly1305` crate; HMAC-SHA-256 as the key-derivation and
+nonce function. `K` is the application's 256-bit key (`api.md` `Encryption::Key`), `sid` the 16 store id bytes,
+and labels are ASCII without a terminator.
+
+- **Keys derived from `K`.** Encryption key `E = HMAC(K, "kvik envelope 1 encryption" ‖ sid)`; nonce key
+  `N = HMAC(K, "kvik envelope 1 nonce" ‖ sid)`; key check value = bytes 0..8 of
+  `HMAC(K, "kvik envelope 1 key check" ‖ sid)`. The key check value names the key without revealing `E` or `N`.
+- **Header** (64 bytes, plaintext, bound as associated data): 0 magic ASCII `KVKE`; 4 version `u8` (1); 5
+  algorithm `u8` (1: XChaCha20-Poly1305 with the derivation above); 6 reserved (2); 8 plaintext length `u64`; 16
+  key check value (8 bytes); 24 nonce base (19 bytes); 43 reserved (17); 60 `header_crc32c` over bytes 0..60.
+- **Nonce base**: bytes 0..19 of `HMAC(N, object key ‖ SHA-256(plaintext))`, the object key being the full key
+  above as bytes (injective: the hash has a fixed length). The writer hashes the plaintext it encrypts, never a
+  hash handed to it. The envelope is therefore **deterministic** in (`K`, store id, object key, plaintext): a `put`
+  repeated after a crash or a restart sends identical bytes, which the sink accepts (`api.md` No overwrite), with
+  no local record of the attempt. It reveals only that two objects under the same object key and key are identical,
+  and keys are never reused for other content, so nothing is learnt. Two different plaintexts share a nonce base
+  only by a collision of a 152-bit output.
+- **Body**: the plaintext in chunks of 65,536 bytes, all full except the last, which holds 1 to 65,536 bytes; an
+  empty plaintext is one empty chunk, and a length that is a multiple of 65,536 has no empty trailing chunk. So the
+  chunk count is `n = max(1, ⌈length / 65,536⌉)`, at most 2^32 (a longer plaintext is refused, `TooLarge`). Chunk `i`
+  is its ciphertext (as long as its plaintext) then its 16-byte tag, sealed under `E` with nonce
+  `nonce base ‖ i as u32 ‖ final`, `final` a byte 1 for chunk `n − 1` and 0 otherwise, and associated data
+  `header ‖ object key`. Truncation, extension, reordering, a chunk moved from another object, and an object
+  copied under another key all fail authentication.
+- **Size and ranges.** The object is `64 + length + 16 × n` bytes; a reader computes it with checked arithmetic
+  from the header and refuses an object of any other size. Chunk `i` starts at object offset `64 + i × 65,552`.
+  Plaintext bytes `[a, b)` (`a < b ≤ length`) lie in chunks `⌊a / 65,536⌋` to `⌊(b − 1) / 65,536⌋`; a ranged read
+  fetches the header (bytes 0..64) and those chunks and opens each alone.
+- **Reading, in this order.** Magic or `header_crc32c` wrong: a damaged object. A `version` or `algorithm` the
+  reader does not know: a version refusal (`UnsupportedFormat`), never damage. Key check value not the key's:
+  `WrongKey`, before any chunk is opened, never a loss (Q-82). A chunk that fails authentication under the right
+  key: a damaged object. The ciphertext SHA-256 that `put` sends and the bucket reports (`spec.md` §8 Hashes) is
+  over the whole object.
 
 ## B. Outline of the remaining files (not yet normative)
 

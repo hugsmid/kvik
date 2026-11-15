@@ -371,6 +371,8 @@ and the key type of `Encryption::Key` are not defined, nor key rotation.
 **Resolved at roadmap 8.2:** `api.md` Backup and restore (boxed `Send` futures, so `dyn BackupSink` works; std types
 and `SinkError`; create-if-absent `put` that accepts its own repeat; paged `list`). Still open: the seekable envelope
 and the key (FC-33, Q-160), and key rotation.
+**Resolved at roadmap 8.1a:** the seekable envelope and the key check value (`format.md` A.17, Q-160). Still open: key
+rotation (the key check value names a key, so a reader can pick among several; no rotation procedure is defined).
 
 ### AC-24 — Restore, rebuild and export calls
 **Where:** Backup and restore · **Severity:** can wait (8.3) · **Relates to:** §8 Restore, Re-ingest, §11 Ingest

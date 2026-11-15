@@ -497,6 +497,7 @@ are specified nowhere. A restore by another build must be able to read them.
 never written down.
 **Needed:** an object layout section before 8.2.
 **Deferred at gate 3.3** to roadmap 8.2 and 8.3 (needs the sink).
+**Resolved at roadmap 8.1a:** `format.md` A.17 (keys, uploaded forms, claim marker, probe, envelope; Q-160, Q-162).
 
 ### FC-34 — Tree and calendar node layout
 **Where:** B (tree) · **Severity:** can wait (7.1) · **Relates to:** §5.2, §5.6 (bitwise reproducible nodes), Q-60

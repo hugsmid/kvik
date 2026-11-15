@@ -477,10 +477,16 @@ only, boxed `Send` futures):
   SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
   which the sampled download checks. Eviction (roadmap 8.1) requires one.
 
-The S3-compatible implementation, its retries and timeouts, and an in-memory fake bucket with injected faults are in
-the `kvik-sink` crate. The object keys, the uploaded form of a manifest record, the claim marker and the encryption
-envelope are not settled (`format-check.md` FC-33;
-[Q-160](../model/OPEN-QUESTIONS.md#q-160--objects-in-the-deep-tier-keys-claim-marker-and-envelope)).
+The trait and its types are defined in the leaf crate `kvik-sink-api` and re-exported by `kvik` unchanged. The
+S3-compatible implementation, its retries and timeouts, and an in-memory fake bucket with injected faults are in
+the `kvik-sink` crate. The object keys, the uploaded forms, the claim marker and the encryption envelope are
+`format.md` A.17 (Q-160, Q-162 settled).
+- **Always encrypted.** `Encryption::Key` is the only mode; there is no unencrypted backup.
+- **Refused buckets.** `attach_backup` probes the bucket (A.17) before its first upload, and a restore before it
+  claims. A bucket that does not honour conditional writes, does not check or report SHA-256 checksums, holds keys
+  of another store, or whose objects fail the key check, is refused: `BackupError::Refused(BackupRefusal)`, with
+  `BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }`, and health `Reason::BackupRefused`
+  while backup stays unattached. Added with the driver's wiring (roadmap 8.1d); there is no weaker mode.
 
 A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
 `export_series(&reader, id, &ExportOptions, writer)`. Its schema is provisional ([`export.md`](export.md), Q-190 to
