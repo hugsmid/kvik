@@ -139,7 +139,9 @@ systems zero-filling reserves nothing; that is accepted and documented, not refu
 **In use.** A segment is *in use* when its header is valid with `base_sequence ≥ 1`, or the scan (A.2) finds a
 complete batch in it; the *last in use* is the one with the highest `file_id`. A segment is taken into use by the
 header rewrite, made durable by the first batch's sync (a roll) or by its own `sync_data` (a timed seal with no
-batch waiting).
+batch waiting). A recovery batch that opens a segment is written before that header rewrite, and both are made
+durable by the entry's sync, so no stop leaves a segment in use by its header alone (`spec.md` §3 Order of a start,
+step 5).
 
 **Sealing** (off the writer thread) of segment S starts only after the next segment is in use and synced, so a
 segment being sealed is never the last in use: (1) at the offset just past S's last complete batch, write the
@@ -157,7 +159,7 @@ one row:
 |---|---|
 | its last non-zero bytes are a valid trailer and end marker (wherever the mark points; the file may still be longer than the end marker, after a crash between seal steps 1 and 2) | seal again from step 1: after a failed `sync_all` on the same boot the trailer and end marker may be in the page cache only, and a repeated sync would not write them (`spec.md` §3 Recovery rule 3); never truncated |
 | in use, not the last in use, no valid trailer | whatever follows its last complete batch is seal blocks or damage, never a torn batch: seal again from step 1 |
-| in use, the last in use | `spec.md` §3 Recovery rules 1–3 (a torn first batch included); then appended to while a batch fits; if its first batch is then a recovery batch, the header is rewritten with F |
+| in use, the last in use | `spec.md` §3 Recovery rules 1–3 (a torn first batch included); then appended to while a batch fits; if its first batch is then a recovery batch, the header is rewritten with F after that batch is written |
 | header invalid or `base_sequence = 0`, but a complete batch is found | rewrite the header from the file name, the store descriptor and the first batch; then one of the two rows above |
 | not in use (no complete batch; header invalid or `base_sequence = 0`) | unused: kept as the segment created ahead if its header is valid and its length is `segment_size`, else deleted |
 

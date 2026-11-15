@@ -459,30 +459,32 @@ fn plan(
                 Some((pi, end, _)) if pi == i => end,
                 _ => HEADER_LEN as u64,
             };
-            let times = (prev.map(|p| p.2), Some(b.commit_time));
-            // A recovery entry, first in its segment, whose `after` is below the batches kept before it: a reset
-            // that wrote its entry in a new segment and stopped before zeroing what it truncated (`spec.md` §3
-            // Recovery rule 1). Those batches, each the last kept in its segment, are dropped.
+            // A recovery entry, first in its segment, whose `after` is below exactly one batch kept before it, that
+            // batch the last of its own segment: a rule 1 reset that wrote its entry in a new segment and stopped
+            // before zeroing the batch it truncated (`spec.md` §3 Recovery rule 1). That batch is dropped, and what
+            // precedes the entry is the batch before it.
             if let Some(r) = b.recovery()
                 && j == 0
                 && r.after + 1 < e
+                && let Some(&(pi, pj, plast)) = kept_order.last()
+                && pi != i
+                && kept[pi] == pj + 1
+                && plast > r.after
+                && kept_order
+                    .len()
+                    .checked_sub(2)
+                    .is_none_or(|x| kept_order[x].2 <= r.after)
             {
-                let n = kept_order
-                    .iter()
-                    .rev()
-                    .take_while(|&&(pi, pj, plast)| {
-                        plast > r.after && pi != i && kept[pi] == pj + 1
-                    })
-                    .count();
-                let rest = &kept_order[..kept_order.len() - n];
-                if n > 0 && rest.last().is_none_or(|x| x.2 <= r.after) {
-                    for (pi, pj, _) in kept_order.drain(kept_order.len() - n..).rev() {
-                        kept[pi] = pj;
-                        superseded.push((pi, pj));
-                    }
-                    e = r.after + 1;
-                }
+                kept_order.pop();
+                kept[pi] = pj;
+                superseded.push((pi, pj));
+                e = r.after + 1;
+                prev = kept_order.last().map(|&(qi, qj, _)| {
+                    let q = &segs[qi].batches[qj];
+                    (qi, q.end, q.commit_time)
+                });
             }
+            let times = (prev.map(|p| p.2), Some(b.commit_time));
             let gap_to = match b.recovery() {
                 Some(r) => {
                     // Positions between K and F were recorded by the start that wrote the entry.

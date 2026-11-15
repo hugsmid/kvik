@@ -219,6 +219,15 @@ impl Rig {
 
     /// Every complete batch of every segment, current contents: (first, last, items, recovery entry?).
     fn batches(&self) -> Vec<BatchContent> {
+        self.batches_where(|_| true)
+    }
+
+    /// The complete batches of the sealed segments.
+    fn sealed_batches(&self) -> Vec<BatchContent> {
+        self.batches_where(|n| n.sealed)
+    }
+
+    fn batches_where(&self, keep: impl Fn(&SegmentName) -> bool) -> Vec<BatchContent> {
         let mut out = Vec::new();
         let mut segs: Vec<(SegmentName, PathBuf)> = self
             .fs
@@ -227,7 +236,7 @@ impl Rig {
             .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
             .collect();
         segs.sort_by_key(|s| s.0.file_id);
-        for (n, p) in segs {
+        for (n, p) in segs.into_iter().filter(|s| keep(&s.0)) {
             let bytes = self.fs.read(&p).unwrap();
             let id = SegmentIdentity {
                 store_id: STORE_ID,
@@ -980,16 +989,25 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
         };
         // On the same boot, a complete batch above the mark may have been acknowledged on a mark lost with the page
         // cache: once a start finishes, it is gone and a recovery entry after the mark's position is in the log,
-        // however the starts before were cut short (`spec.md` §3 Recovery rule 1). Only a start that found the mark
-        // stale (rule 3) may keep it instead.
+        // however the starts before were cut short (`spec.md` §3 Recovery rule 1). Only when the mark is stale (two or
+        // more complete batches beyond it, or one in a sealed segment) does rule 3 keep it instead; then a start that
+        // keeps it may fail after its entry, and the next one, under rule 1, finds the batch below its mark.
         let mut owed = mark_before.and_then(|m| {
-            r.batches()
-                .into_iter()
+            let all = r.batches();
+            let above = all
+                .iter()
+                .filter(|b| b.last_sequence() > m.last_sequence)
+                .count();
+            let sealed = r
+                .sealed_batches()
+                .iter()
+                .any(|b| b.last_sequence() > m.last_sequence);
+            all.into_iter()
                 .find(|b| b.last_sequence() > m.last_sequence)
-                .map(|b| (m.last_sequence, b))
+                .map(|b| (m.last_sequence, b, above >= 2 || sealed))
         });
-        let paid = |r: &Rig, owed: &Option<(u64, BatchContent)>, rule: StartRule| {
-            if let Some((k, batch)) = owed {
+        let paid = |r: &Rig, owed: &Option<(u64, BatchContent, bool)>| {
+            if let Some((k, batch, stale)) = owed {
                 let now = r.batches();
                 let kept = now.contains(batch);
                 let entry = now.iter().any(|b| {
@@ -1004,17 +1022,17 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                     [Item::Entry(Entry::Recovery(e))] if e.after == *k
                 );
                 assert!(
-                    (entry && (!kept || is_entry)) || (kept && rule != StartRule::SameBoot),
-                    "a complete batch above position {k}: kept {kept}, entry {entry}, {rule:?}"
+                    (entry && (!kept || is_entry)) || (kept && *stale),
+                    "a complete batch above position {k}: kept {kept}, entry {entry}, stale {stale}"
                 );
             }
         };
         // The start itself may be cut short; the next one must finish.
         if let Some(n) = c.crash_start {
             r.fs.crash_after(n);
-            if let Some(rep) = r.open() {
+            if r.open().is_some() {
                 r.check_started();
-                paid(&r, &owed, rep.rule);
+                paid(&r, &owed);
                 continue;
             }
             r.kill();
@@ -1039,9 +1057,9 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
         if armed {
             let started = r.open();
             r.fs.set_free_space(1 << 40);
-            if let Some(rep) = &started {
+            if started.is_some() {
                 r.check_started();
-                paid(&r, &owed, rep.rule);
+                paid(&r, &owed);
                 continue;
             }
             match c.after_fault {
@@ -1061,7 +1079,7 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
         let before = r.batches();
         let rep = r.open().expect("a start finishes");
         r.check_started();
-        paid(&r, &owed, rep.rule);
+        paid(&r, &owed);
         // No corruption is injected: nothing is certainly lost, and each recovery entry follows the batch before
         // it directly.
         assert!(
@@ -1817,4 +1835,98 @@ fn cut_everywhere(setup: &dyn Fn() -> (Rig, MarkSlot, BatchContent)) {
         }
     }
     assert!(finished, "the uncut start finishes");
+}
+
+/// Found by the deep run: a remount leaves two complete batches beyond the mark on disk, so the mark is stale and
+/// rule 3 keeps both; that start fails its mark sync after writing its entry, and the next start, under rule 1, finds
+/// them below the mark its predecessor wrote. Keeping them is rule 3's choice, not a reset owed by rule 1.
+#[test]
+fn kill_loop_a_stale_start_that_fails_after_its_entry() {
+    let cycles = vec![
+        Cycle {
+            calls: vec![],
+            fault: Fault::None,
+            crash: Crash::Kill,
+            crash_start: None,
+            start_fault: Fault::None,
+            after_fault: None,
+            clean: false,
+        },
+        Cycle {
+            calls: vec![(1, false)],
+            fault: Fault::None,
+            crash: Crash::Power(0),
+            crash_start: None,
+            start_fault: Fault::Sync("MARK", 1),
+            after_fault: None,
+            clean: false,
+        },
+        Cycle {
+            calls: vec![(1, false)],
+            fault: Fault::None,
+            crash: Crash::Kill,
+            crash_start: Some(5),
+            start_fault: Fault::None,
+            after_fault: None,
+            clean: false,
+        },
+        Cycle {
+            calls: vec![(1, false)],
+            fault: Fault::None,
+            crash: Crash::Remount(1_678_373_410_284_916_357),
+            crash_start: None,
+            start_fault: Fault::Sync("MARK", 0),
+            after_fault: None,
+            clean: false,
+        },
+    ];
+    for small in [false, true] {
+        kill_loop(&cycles, true, small);
+    }
+}
+
+/// A remount within the boot can leave the next segment taken into use by its header alone (base F) while the batch
+/// beyond the mark sits in the mark's segment: rule 1 still truncates that batch, a reset point, and the recovery
+/// entry opens the header-only segment.
+#[test]
+fn a_batch_beyond_the_mark_before_a_header_only_segment_is_a_reset() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+    r.submit(vec![fact(1, 1)]);
+    r.step();
+    let mark = r.mark().unwrap();
+    r.kill();
+    // The segment created ahead, taken into use by its header with base F and nothing after it.
+    let ahead =
+        r.fs.paths()
+            .into_iter()
+            .find(|p| {
+                SegmentName::parse(p.file_name().unwrap().to_str().unwrap())
+                    .is_some_and(|n| n.file_id > mark.file_id && !n.sealed)
+            })
+            .expect("a segment created ahead");
+    let mut h = kvik_log::header::FileHeader::decode(&r.fs.read(&ahead).unwrap()).unwrap();
+    assert_eq!(h.base_sequence, 0);
+    h.base_sequence = mark.last_sequence + 1;
+    r.fs.poke(&ahead, 0, &h.encode());
+    let beyond: Vec<_> = r
+        .batches()
+        .into_iter()
+        .filter(|b| b.first_sequence > mark.last_sequence)
+        .collect();
+    assert_eq!(beyond.len(), 1);
+    let rep = r.open().expect("the start finishes");
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    let e = rep.entry.as_ref().expect("a reset point");
+    assert!(!e.adopted);
+    assert_eq!(e.entry.after, mark.last_sequence);
+    assert!(!r.batches().contains(&beyond[0]), "the batch is truncated");
+    assert!(
+        r.mark().unwrap().file_id > mark.file_id,
+        "the entry opens the next segment"
+    );
+    assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+    r.check_started();
 }
