@@ -2,7 +2,7 @@
 
 Each item is one pull request. An item is done when its tests pass on Linux, macOS and Windows and its box is
 ticked in the same pull request. A **gate** is a point where work stops until the design has been looked at
-again; nothing after a gate starts before it is passed.
+again; nothing after a gate starts before it is passed. Items that do not depend on an open gate's subject may proceed in parallel; the gate still has to pass before anything that depends on it is ticked.
 
 ## 1. Specification settled
 - [x] 1.1 Apply the outstanding rulings to `docs/spec.md`

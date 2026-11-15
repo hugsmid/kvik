@@ -703,8 +703,9 @@ repeated `put` when the object has the same size and SHA-256 (so that a retry af
 marker has the same content (empty, say), R1 takes R2's marker for its own and both restores own generation 3.
 **Model.** Not modelled; a claim is a create-if-absent step that cannot be confused.
 **Needed.** Marker content unique to the restore attempt. Suggested: the marker holds the restore's reset stamp
-nonce (fresh random, §8 Generations), so a `put` that succeeds proves the marker is this restore's; any other
-content is `Exists` and the restore takes the next generation.
+nonce (fresh random, §8 Generations), so a `put` that succeeds proves the marker is this restore's. Other
+content is `Exists` only when no attempt can have reached the bucket, and `HashMismatch` after an attempt that may have landed (`api.md` Backup and restore);
+either way the restore treats the claim as possibly lost and takes the next generation.
 
 ## Q-162 — Buckets without conditional writes or checksum checks
 Recorded at roadmap 8.2. To be settled before roadmap 8.1 uploads anything.
@@ -739,34 +740,6 @@ attached (AC-25); (c) the restore life cycle (AC-24). None can be decided withou
 **Model.** Not modelled.
 **Needed.** (a) and (b) settled with 8.1, (c) with 8.3. Suggested for (a): `facts` does not fetch; detail not local
 is reported as such and fetched by an asynchronous `Store` call on the maintenance thread.
-
-## Q-150 — Canonical bytes of the zstd-compressed XOR fallback
-Found while implementing the chunk column encodings (roadmap 6.1, `chunk/`).
-**Scenario.** Gate 2.3 kept a zstd-compressed XOR fallback for `f64` blocks (`format-chunk.md` C.8). The common rules
-require one byte sequence per content and golden files byte for byte, but zstd promises neither the same compressed
-bytes nor the same compressed length across library versions or builds. (a) A store written by one build and
-scrubbed by a build with another zstd finds encoding 5 payloads whose bytes differ from what it would write. (b) The
-choice between XOR and compressed XOR (C.9) compares lengths, so another zstd can flip it, and a canonical check
-then reports writer output of the older build as not canonical. (c) A golden file holding a compressed payload breaks
-on a zstd upgrade although the format did not change. (d) Compared by the stream it decompresses to, a payload may
-carry further skippable or concatenated zstd frames, extra bytes that a canonical check then does not see.
-**Implemented first.** An encoding 5 payload was canonical when its frames decompress to exactly its declared length
-and that stream is the canonical XOR stream; `Block::decode_canonical` compares it by the stream, not by its bytes,
-when both bodies use encoding 5; (b) is not covered. The golden file `xor-zstd.blk` is checked by what it decodes to
-(`chunk/tests/golden.rs`). zstd 1.5.7 at level 3, through the `zstd` crate 0.14, is pinned by `Cargo.lock`.
-**Needed.** A rule: (1) treat a zstd upgrade as a format event that regenerates the golden files and accept (a) and
-(b) for files written before it; (2) proposed: make encodings 4 and 5 one canonical class, so that a canonical check
-accepts either for the canonical XOR stream and only a writer compares lengths; (3) replace zstd by a compressor
-specified in `format-chunk.md`; or (4) drop the compressed fallback (the °F→°C shape of roadmap 2.1 grows from 0.87
-to 1.84 bytes per row).
-**Settled at the review of roadmap 6.1** by option (2). The format constrains only decoding, which RFC 8878 fixes, so
-no compression level or library version is pinned: encodings 4 and 5 form one canonical class, canonical when the
-stream they hold is the canonical XOR stream and the payload is shorter than every other candidate; only a writer
-compares the two lengths ((a)–(c)). An encoding 5 payload is exactly one zstd frame with no dictionary and no content
-checksum, ending where the payload ends ((d)), a reader check (`format-chunk.md` C.8, C.10, C.11). Gate 6.5 measures
-a pure-Rust codec on the XOR stream (`ruzstd` or `lz4_flex`): within about 10 % of zstd level 3 on the °F→°C shape,
-it replaces the C library; otherwise zstd stays and CI fails when `ZSTD_SYS_USE_PKG_CONFIG` is set, so that the
-bundled library is always the one built.
 
 ## Q-170 — Durability levels chosen per source
 
@@ -890,7 +863,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`).
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`).
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -927,6 +900,11 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-140 | 5.6 | Gate, with the ruling on Q-16; recorded by roadmap 5.4 |
 | Q-141 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-142 | 5.6 | Gate; recorded by roadmap 5.4 |
+| Q-160 | 8.1 | Deep-tier object layout; recorded by roadmap 8.2; settled before 8.1 uploads anything |
+| Q-161 | 8.3 | Restore's own claim marker; recorded by roadmap 8.2; settled with Q-160 |
+| Q-162 | 8.1 | Buckets without conditional writes or checksum checks; recorded by roadmap 8.2; settled before 8.1 uploads anything |
+| Q-163 | 8.3 | Reading the claims on a lagging bucket; recorded by roadmap 8.2 |
+| Q-164 | 8.1, 8.3 | Interface points deferred to 8.2: (a) and (b) with 8.1, (c) with 8.3; recorded by roadmap 8.2 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 | Q-190 | 6.4 | Parquet export schema; recorded by roadmap 6.4a; owner decision pending |
 | Q-191 | 6.4 | Default export view; recorded by roadmap 6.4a; owner decision pending |
