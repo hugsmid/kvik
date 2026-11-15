@@ -545,6 +545,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvik-chunk"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "kvik-log"
 version = "0.1.0"
 dependencies = [
