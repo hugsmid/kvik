@@ -592,7 +592,7 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded. In every range
   first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
   lost range, is a version refusal. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000
-  listed files (Q-293).
+  listed files (Q-292).
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
   content, 5 unknown: found again by a manifest rebuild with no cause given, `spec.md` §7 Manifest); 8 boot id

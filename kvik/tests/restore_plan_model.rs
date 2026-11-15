@@ -6,11 +6,11 @@
 //! generation and is restored again, from the first plan's record and the new generation's records.
 //!
 //! Left out, with the reason (`model/OPEN-QUESTIONS.md`):
-//! - Lost ranges: the model's restored end stops at one, the specification's does not (Q-295).
+//! - Lost ranges: the model's restored end stops at one, the specification's does not (Q-294).
 //! - A second restore after one that set positions aside: the model reads every generation's files (the model
 //!   differences table, "Restore record and the files a restore reads").
 //! - Recovery entries: the model writes none; the plan's rule for them is pinned in `backup/tests/restore_plan.rs`.
-//! - A bucket holding no file: the model refuses it, the plan does not (Q-295).
+//! - A bucket holding no file: the model refuses it, the plan does not (Q-294).
 
 use std::collections::BTreeSet;
 
@@ -216,7 +216,7 @@ proptest! {
             .define_with("a/b", Kind::Gauge, ValueType::Number, "1", 10 * SECOND, SeriesOptions::expected(SECOND))
             .unwrap();
         let mut run = Run { m, s, t: T0 };
-        // At least one segment is backed up: the model refuses an empty bucket (Q-295).
+        // At least one segment is backed up: the model refuses an empty bucket (Q-294).
         run.apply(Op::Ingest(1));
         run.apply(Op::Seal);
         run.apply(Op::Upload);
