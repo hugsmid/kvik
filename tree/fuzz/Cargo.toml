@@ -1,0 +1,24 @@
+[package]
+name = "kvik-tree-fuzz"
+version = "0.0.0"
+description = "Fuzz targets for kvik-tree; built with nightly cargo-fuzz, outside the workspace"
+edition = "2024"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+kvik-tree = { path = ".." }
+
+# Its own workspace, so the main workspace never builds it.
+[workspace]
+
+[[bin]]
+name = "node"
+path = "fuzz_targets/node.rs"
+test = false
+doc = false
+bench = false

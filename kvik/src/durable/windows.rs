@@ -101,20 +101,21 @@ impl<'a> Of<'a> {
             .current_between(self.id(), versioned, from, to, rev)
     }
 
-    /// A current fact as a summarised reading (spec §5.2): `None` for bad quality, which summaries ignore. A named
-    /// state is folded by its name, as the reference model holds it.
+    /// A current fact as a summarised reading (spec §5.2): `None` for bad quality, which summaries ignore, and for
+    /// a state index the series does not declare. A named state is folded by its index.
     fn reading(&self, s: &Stored) -> Option<Reading> {
         let r = &s.row;
         if r.quality == LogQuality::Bad {
             return None;
         }
         let v = match &r.value {
-            LogValue::F64(bits) => km::types::Value::Num(f64::from_bits(*bits)),
+            LogValue::F64(bits) => kvik_tree::Value::F64(f64::from_bits(*bits)),
             LogValue::State(i) => {
-                km::types::Value::Str(self.series.def.state_names.get(usize::from(*i))?.clone())
+                self.series.def.state_names.get(usize::from(*i))?;
+                kvik_tree::Value::State(*i)
             }
-            LogValue::Bool(b) => km::types::Value::Bool(*b),
-            LogValue::Text(t) => km::types::Value::Str(t.clone()),
+            LogValue::Bool(b) => kvik_tree::Value::Bool(*b),
+            LogValue::Text(t) => kvik_tree::Value::Text(t.clone()),
             // Decimal series are refused at definition until roadmap 6.x.
             LogValue::Decimal { .. } | LogValue::Absent { .. } => return None,
         };
@@ -145,14 +146,19 @@ impl<'a> Of<'a> {
     /// A window `[start, end)` evaluated at `now`.
     fn window(&self, start: i64, end: i64, now: i64) -> Node {
         let readings = self.readings(fold::reach(&self.params, start), end);
-        fold::window(
+        self.model(fold::window(
             &self.params,
             self.prior(start).as_ref(),
             &readings,
             start,
             end,
             now,
-        )
+        ))
+    }
+
+    /// A node as the result rules take it.
+    fn model(&self, n: kvik_tree::Node) -> Node {
+        fold::model_node(n, &self.series.def.state_names)
     }
 }
 
@@ -273,7 +279,7 @@ pub(crate) fn buckets(
         let buckets = rules::bucket_spans(a, b, step)
             .map(|(lo, hi)| {
                 let before = fold::before(&readings, lo).or(prior.as_ref());
-                let node = fold::window(p, before, &readings, lo, hi, now);
+                let node = of.model(fold::window(p, before, &readings, lo, hi, now));
                 rules::bucket(&of.series.spec, &node, lo, hi, false)
             })
             .collect();

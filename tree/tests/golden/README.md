@@ -1,0 +1,20 @@
+# Golden stored nodes, format v1
+
+Stored nodes (`docs/format-tree.md`) that guard the layout against accidental change (`docs/format.md` A.3). They are
+hand-built, deterministically, by [`../golden.rs`](../golden.rs) from synthetic readings (no recorded data). The test
+checks that each file is byte for byte what the encoder writes now and decodes to the node it was built from.
+Regenerate only after a deliberate format change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-tree --test golden`.
+
+| File | Shows |
+|---|---|
+| `gauge-empty.node` | The empty gauge node of a minute |
+| `gauge.node` | Six gauge readings with S = 20 s: −0.0, a subnormal and 1e300, so the sum and integral take long mantissas |
+| `gauge-one.node` | One reading: no last, min equal to max, no coverage |
+| `gauge-quarter.node` | A 15-minute node, the left-to-right merge of fifteen 1-minute nodes of 12 readings each |
+| `counter.node` | A counter with a reset, a regression and a step longer than S |
+| `counter-wrap.node` | A counter wrapping at 65,536 |
+| `state.node` | Named states by index, 65,535 among them, with transitions and a time map |
+| `state-bool.node` | A boolean state |
+| `text.node` | An empty text and one with multi-byte UTF-8 |
+| `interval.node` | Three 5-minute interval readings in a 15-minute node |
+| `unknown-form.node` | `gauge.node` with form `0x11`: a version refusal |

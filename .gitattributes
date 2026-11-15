@@ -4,3 +4,4 @@ log/tests/golden/*.kvl binary
 log/tests/golden/*.mark binary
 chunk/tests/golden/*.blk binary
 files/tests/golden/*.manifest binary
+tree/tests/golden/*.node binary

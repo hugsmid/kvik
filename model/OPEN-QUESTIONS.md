@@ -43,6 +43,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 | Q-173 | §7 Manifest, `api.md` | The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records |
 | Q-175 | §7 Manifest (rebuild step 2) | An intermediate output no record and no local file describes |
+| Q-180 | §5.6, §5.2, §6, invariants 5–8; `format-tree.md` T.3 | Stored nodes keep sums, integrals and increases exact, not in `f64` |
+| Q-181 | §5.2 min and max, §5.6; `format-tree.md` T.5 | Which zero is the minimum of +0.0 and −0.0 |
 | Q-190 | §11; `docs/export.md` | The Parquet export schema as a user contract: columns, types, version |
 | Q-191 | §2.3, §8 Re-ingest; `docs/export.md`; `api.md` Backup and restore | The default view of an export, and Parquet for orphaned and set-aside facts |
 | Q-192 | §2.1 `decimal scale`; `docs/export.md` | Decimal values in the export, and the scale in force on `SeriesInfo` |
@@ -807,6 +809,36 @@ holding their facts. `files/tests/rebuild.rs`, `two_corrupt_merges_retire_every_
 any chain of described files, an undescribed input is retired; or the chunk index of 3 (kind 14, roadmap 6.2), which
 carries its inputs, is kept until every file naming 3 is retired. With roadmap 6.3b.
 
+## Q-180 — Stored nodes keep sums, integrals and increases exact, not in `f64`
+
+**Scenario.** A gauge read every 5 s stores 15-minute nodes. A window over a day takes 96 stored nodes in the middle
+and computes its edges from facts (§6 Evaluation). With `f64` node fields, the window's sum depends on how the parts
+are bracketed: the same day computed from facts alone, or from 1-minute nodes, differs in the last bits, and the
+reference model, which is exact, differs again. §5.6 asks for bitwise reproducible stored nodes and compares other
+orders within a relative 1e-9, but does not say whether the stored fields of a series without a decimal scale are
+`f64` or exact.
+**Now (roadmap 7.1a).** `kvik-tree` keeps sums, integrals and increases as exact rationals, as the model does, and a
+stored node holds them as dyadic numbers (`format-tree.md` T.3): every field a fold or merge gives is a sum of `f64`
+values or their products with whole nanoseconds, so ± an odd mantissa × 2^e with e ≥ −1074 and a magnitude below
+2^1100 represents it exactly in at most 277 bytes, a few bytes for values of similar magnitude. Every aggregate the
+spec defines is then identical to the model's whatever the bracketing, and invariant 6 holds with no tolerance.
+Window results are exact rationals converted to `f64` once, at the end. The cost is node size (the §13 tree-size row
+measures it) and fold time (big-integer arithmetic on every reading).
+**Needed (owner decision pending).** Confirm exact node fields, or rule `f64` in canonical order with the 1e-9
+tolerance. Recommendation: exact; §5.6 then reads "sums, integrals and increases are exact; a series with a decimal
+scale sums in exact `i128`", and invariant 6 drops its tolerance for series without one.
+
+## Q-181 — Which zero is the minimum of +0.0 and −0.0
+
+**Scenario.** A gauge reads 0.0 and then −0.0 in one minute. IEEE `minNum`, and Rust's `f64::min`, may return either
+zero, so two builds, or two orders of merging, can store different bytes for the same readings, and rebuild-equals-live
+(invariant 8) compares bytes. Results do not differ: both zeros give the result 0.
+**Now (roadmap 7.1a).** Min and max are taken in IEEE total order, where −0.0 is below +0.0 (`format-tree.md` T.5),
+so the stored bytes do not depend on the order of folding or the platform. The model's `f64::min` may pick the other
+zero; the two are equal under `==`, so the differential tests compare them as equal, and the byte tests pin the rule.
+**Needed (owner decision pending).** Confirm total order for min and max (one line in §5.2: "min and max in IEEE
+total order, −0.0 below +0.0").
+
 ## Q-190 — The Parquet export schema as a user contract
 
 **Scenario.** A user loads monthly exports into an analytics tool by column name. If a later release renames
@@ -909,7 +941,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 and Q-181.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -954,6 +986,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 | Q-173 | 6.3b | The operator call `rebuild_manifest`; recorded by roadmap 6.3a; its signature and finality come with the call in `api.md`, which 6.3b adds |
 | Q-175 | 6.3b | An intermediate output no record and no local file describes; recorded at the review of roadmap 6.3a; needs two corrupt merges, so it arises only once 6.3b publishes compaction outputs |
+| Q-180 | 7.1 | Exact node fields; recorded by roadmap 7.1a; owner decision pending |
+| Q-181 | 7.1 | Min and max of signed zeros; recorded by roadmap 7.1a; owner decision pending |
 | Q-190 | 6.4 | Parquet export schema; recorded by roadmap 6.4a; owner decision pending |
 | Q-191 | 6.4 | Default export view; recorded by roadmap 6.4a; owner decision pending |
 | Q-192 | 6.4 | Decimal export; recorded by roadmap 6.4a; owner decision pending; the scale in force on `SeriesInfo` comes with decimal series in the durable backend |

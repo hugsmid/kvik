@@ -632,6 +632,7 @@ dependencies = [
  "jiff",
  "kvik-log",
  "kvik-model",
+ "kvik-tree",
  "proptest",
  "thiserror",
 ]
@@ -701,6 +702,18 @@ dependencies = [
  "sha2",
  "thiserror",
  "ureq",
+]
+
+[[package]]
+name = "kvik-tree"
+version = "0.1.0"
+dependencies = [
+ "kvik-model",
+ "num-bigint 0.4.8",
+ "num-rational",
+ "num-traits",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

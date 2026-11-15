@@ -675,6 +675,7 @@ to every stored file.
 - **Registry (`kind = 5`).** Laid out in A.16 by roadmap 5.1; routing changes join it with roadmap 5.2, and its
   copy in tree checkpoints is laid out with roadmap 7.1.
 - **Tree (`kind = 6`).** Per-series stored summary levels with the position up to which they are complete; each node
-  of a decimal series carries its `u8` scale (`spec.md` §5.6).
+  of a decimal series carries its `u8` scale (`spec.md` §5.6). Roadmap 7.1a laid out a stored node's bytes in
+  [`format-tree.md`](format-tree.md); the file, levels and checkpoint are written by roadmap 7.1b.
 
 Each is specified in this document before the roadmap section that implements it.
