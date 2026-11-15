@@ -7,15 +7,18 @@ use std::path::{Path, PathBuf};
 
 use crate::batch::SegmentIdentity;
 use crate::body::{INDEX_HAS_ENTRIES, IndexRecord, SegmentIndex};
+use crate::crc::Crc32c;
 use crate::fs::{Fs, FsFile, OpenMode, is_sharing_error};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::name::SegmentName;
-use crate::segment::{SealSummary, encode_seal};
+use crate::segment::{SealSummary, encode_seal_streamed};
 
 use super::{Fault, FaultOp, Halt};
 
 /// Bytes written per call while zero-filling a new segment.
 const FILL_CHUNK: usize = 1 << 20;
+/// Bytes read per call while a seal computes `file_crc32c`.
+const SEAL_READ: usize = 1 << 20;
 
 /// A segment the writer wants created ahead of use.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,19 +235,27 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
     go()?;
     let path = segment_path(&job.log_dir, &job.id, false);
     let f = |op, e: &io::Error| SealError::Fault(fault(op, &path, e));
-    // The whole segment up to its last batch is read for `file_crc32c` (Q-115 (l)).
-    let mut before = vec![0u8; job.end as usize];
-    let mut at = 0usize;
-    while at < before.len() {
-        match job.file.read_at(&mut before[at..], at as u64) {
+    // `file_crc32c` is computed over the segment up to its last batch, read `SEAL_READ` bytes at a time, so memory
+    // at seal does not grow with `segment_size` (Q-115 (l)).
+    let mut crc = Crc32c::new();
+    let mut buf = vec![0u8; SEAL_READ.min(job.end as usize)];
+    let mut at = 0u64;
+    while at < job.end {
+        go()?;
+        let want = (job.end - at).min(buf.len() as u64) as usize;
+        match job.file.read_at(&mut buf[..want], at) {
             Ok(0) => {
                 let e = io::Error::from(io::ErrorKind::UnexpectedEof);
                 return Err(f(FaultOp::Seal, &e));
             }
-            Ok(n) => at += n,
+            Ok(n) => {
+                crc.update(&buf[..n]);
+                at += n as u64;
+            }
             Err(e) => return Err(f(FaultOp::Seal, &e)),
         }
     }
+    drop(buf);
     let index = SegmentIndex {
         flags: if job.has_entries {
             INDEX_HAS_ENTRIES
@@ -253,7 +264,7 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
         },
         records: job.records.clone(),
     };
-    let seal = encode_seal(&before, &job.summary, &index).map_err(|e| {
+    let seal = encode_seal_streamed(crc, job.end, &job.summary, &index).map_err(|e| {
         SealError::Fault(Fault {
             op: FaultOp::Seal,
             path: path.clone(),
@@ -291,4 +302,87 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
     fs.sync_dir(&job.log_dir)
         .map_err(|e| SealError::Fault(fault(FaultOp::Sync, &job.log_dir, &e)))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::MemFs;
+    use crate::scan::{ScanLimit, scan};
+
+    /// A file that refuses reads of more than 1 MiB.
+    #[derive(Debug)]
+    struct Small(Box<dyn FsFile>);
+
+    impl FsFile for Small {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            if buf.len() > SEAL_READ {
+                return Err(io::Error::other("a read over 1 MiB"));
+            }
+            self.0.read_at(buf, offset)
+        }
+        fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.0.write_at(buf, offset)
+        }
+        fn sync_data(&self) -> io::Result<()> {
+            self.0.sync_data()
+        }
+        fn sync_all(&self) -> io::Result<()> {
+            self.0.sync_all()
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.0.set_len(len)
+        }
+        fn len(&self) -> io::Result<u64> {
+            self.0.len()
+        }
+        fn try_lock_exclusive(&self) -> io::Result<bool> {
+            self.0.try_lock_exclusive()
+        }
+    }
+
+    #[test]
+    fn sealing_reads_at_most_1_mib_at_a_time() {
+        let fs = MemFs::new();
+        let log_dir = PathBuf::from("store/log");
+        let id = SegmentIdentity {
+            store_id: [7; 16],
+            file_id: 1,
+            generation: 0,
+        };
+        let req = SegmentRequest {
+            id,
+            log_dir: log_dir.clone(),
+            len: 4 << 20,
+            created_at: 0,
+        };
+        let halt = Halt::default();
+        let ahead = create_segment(&fs, &req, &halt).unwrap();
+        // Bytes past the header that the checksum must cover, over more than three reads.
+        let end = (3 << 20) + 4096;
+        let body: Vec<u8> = (0..end - HEADER_LEN as u64).map(|i| i as u8).collect();
+        ahead.file.write_at(&body, HEADER_LEN as u64).unwrap();
+        let summary = SealSummary {
+            entry_count: 1,
+            first_sequence: 1,
+            last_sequence: 1,
+            first_commit_time: 0,
+            last_commit_time: 0,
+            batch_count: 1,
+        };
+        let job = SealJob {
+            file: Box::new(Small(ahead.file)),
+            id,
+            log_dir: log_dir.clone(),
+            end,
+            summary,
+            records: Vec::new(),
+            has_entries: false,
+        };
+        seal_segment(&fs, &job, &halt).unwrap();
+        let bytes = fs.read(&segment_path(&log_dir, &id, true)).unwrap();
+        let seal = scan(&bytes, &id, ScanLimit::End).unwrap().seal.unwrap();
+        assert_eq!(seal.start, end);
+        assert!(seal.file_crc_matches(&bytes));
+    }
 }

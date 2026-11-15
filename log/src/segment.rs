@@ -48,7 +48,19 @@ pub fn encode_seal(
     summary: &SealSummary,
     index: &SegmentIndex,
 ) -> Result<Vec<u8>, EncodeError> {
-    let index_offset = before.len() as u64;
+    let mut crc = crate::crc::Crc32c::new();
+    crc.update(before);
+    encode_seal_streamed(crc, before.len() as u64, summary, index)
+}
+
+/// [`encode_seal`] from a running checksum `crc` of the `index_offset` bytes before the seal blocks, so that the
+/// sealer reads the segment in pieces and holds none of it whole (Q-115 (l)).
+pub(crate) fn encode_seal_streamed(
+    mut crc: crate::crc::Crc32c,
+    index_offset: u64,
+    summary: &SealSummary,
+    index: &SegmentIndex,
+) -> Result<Vec<u8>, EncodeError> {
     if index_offset < HEADER_LEN as u64 || !index_offset.is_multiple_of(8) {
         return Err(EncodeError::Misaligned(index_offset));
     }
@@ -60,8 +72,6 @@ pub fn encode_seal(
         &mut seal,
     )?;
     let trailer_offset = index_offset + seal.len() as u64;
-    let mut crc = crate::crc::Crc32c::new();
-    crc.update(before);
     crc.update(&seal);
     let trailer = Trailer {
         entry_count: summary.entry_count,
