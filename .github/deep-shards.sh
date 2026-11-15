@@ -42,6 +42,7 @@ log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
+kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
 files-records   files records

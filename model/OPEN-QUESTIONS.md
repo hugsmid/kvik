@@ -62,6 +62,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-285 | §8 Continuous backup; `format.md` A.12 | Uploading files with no local layout yet, and the hash a file is checked by |
 | Q-291 | §8 Acknowledging a loss, Generations, Restore step 1 | Recovery-entry loss reports of the generation a restore reads |
 | Q-293 | §8 Generations; `format.md` A.2 sizes, A.14 `0x25` | A restore record larger than one block |
+| Q-295 | §8 Restore step 1, Generations; model `Model::restore_from` | Where the model's restore differs from the plan |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 
 ## Q-16 — Which commits refresh live staleness
@@ -1146,6 +1147,19 @@ then not be written and the restore cannot proceed.
 **Needed.** A form for a longer list: several `0x25` records of one restore, each naming the same stamp, read as
 one; or a list of log segments by ranges of ids. Until then such a record fails to encode (`EncodeError::BodyTooLong`).
 
+## Q-295 — Where the model's restore differs from the plan
+Recorded by roadmap 8.3a, whose plan is tested against the model (`kvik/tests/restore_plan_model.rs`). To be settled
+by roadmap 8.3b, with the restore executor.
+**Scenario.** (a) Corruption below the mark loses `0:6`, recorded as a lost range; `0:1` to `0:10` are backed up.
+The model's restored end is `0:5`: it ends at any missing position. §8 Restore step 1 and the plan give `0:10`, since
+a recorded lost range does not end the restored log. (b) A store seals and lists segments but none is uploaded yet;
+its records are in the bucket. The model refuses the restore (`Error::EmptyBucket`); §8 Generations refuses only a
+bucket with no manifest records, and the plan restores an empty log, restored end `0:0`, everything later set aside.
+**Model.** As described; the differential test leaves both cases out by construction.
+**Needed.** (a) The model's restored end to skip recorded lost ranges, as the plan does. (b) Whether a restore whose
+records list no copied file is refused (the model's rule, stated in the text) or restores an empty generation (the
+text as written). Suggested for (b): refuse, with a named error, since nothing would be restored.
+
 ## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
 Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
 **Scenario.** 100 series at 1 Hz, staggered evenly, so a call of one reading every 10 ms; `WriterConfig::default()`
@@ -1277,6 +1291,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-285 | 6.2 | Local layout of kinds other than log segments; the upload driver fails on them until then |
 | Q-291 | Recovery-entry loss reports at a restore; recorded by roadmap 8.3a |
 | Q-293 | Restore record size; recorded by roadmap 8.3a |
+| Q-295 | Model restore against the plan; recorded by roadmap 8.3a |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
