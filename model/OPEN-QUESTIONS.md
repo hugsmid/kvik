@@ -516,8 +516,9 @@ the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments ar
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
 (n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments
-(446–639 MiB) again, after a clean shutdown with a warm page cache, against the 1 s budget; a cold cache, a crash and
-the Linux target are still to measure (`docs/measurements/4.8-commit-latency.md`). (o) A start on the same boot writes the slot of the mark it read again in place and syncs it
+(446–639 MiB) again, after a clean shutdown with a warm page cache, against the 1 s budget, and about 130 ms for two
+empty segments, so the time is mostly reading the unsealed 64 MiB segments whole; a cold cache, a crash and the
+Linux target are still to measure (`docs/measurements/4.8-commit-latency.md`). (o) A start on the same boot writes the slot of the mark it read again in place and syncs it
 before it resumes, in every mode, as `format.md` A.10 Update requires since Q-122; a reader is not held back
 meanwhile. (p) Left as it is: that later
 start writes the header again from the segment's first complete batch; a torn batch alone in the segment is deleted

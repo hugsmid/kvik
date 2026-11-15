@@ -19,7 +19,7 @@ if [ $# -lt 1 ]; then
   echo "usage: scripts/bench-nvme.sh <dir on the NVMe file system> [--disk \"<class>\"] [--repeat <n>]" >&2
   exit 2
 fi
-dir=$1
+dir=$(cd "$1" && pwd)
 shift
 repeat=3
 extra=()

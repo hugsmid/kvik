@@ -46,6 +46,10 @@ jobs:
           {
             echo "# Commit latency on ${{ matrix.os }}: a cloud virtual machine, not the NVMe target"
             echo
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              echo "On Windows the production writer syncs the mark at every commit; the timed-mark rows are for comparison only."
+              echo
+            fi
             cargo run --release --locked -p kvik-log --example commit_latency -- "$RUNNER_TEMP" $flag
           } > commit-latency-${{ matrix.os }}.md
           cat commit-latency-${{ matrix.os }}.md >> "$GITHUB_STEP_SUMMARY"
