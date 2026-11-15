@@ -757,3 +757,27 @@ fn a_damaged_record_stops_the_upload_of_those_after_it_through_the_direct_port()
         d.progress().backed_up_through
     );
 }
+
+#[test]
+fn other_content_under_the_store_key_fails_and_is_never_overwritten() {
+    let mut h = Harness::new();
+    let f = h.seal(20);
+    let keys = Keys::new(ID);
+    h.sink
+        .mem
+        .set(&keys.store(), b"not this store's descriptor");
+    let mut d = h.driver();
+    let s = run(&mut d, &mut Duration::default(), 100);
+    assert!(
+        matches!(
+            s,
+            Step::Failed(UploadError::Verify(VerifyError::Reported { .. }))
+        ),
+        "{s:?}"
+    );
+    assert_eq!(
+        h.sink.mem.objects()[&keys.store()],
+        b"not this store's descriptor"
+    );
+    assert_eq!(h.puts_of(&keys.file(&f)), 0);
+}

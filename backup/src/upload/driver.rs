@@ -244,12 +244,24 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
             self.store_done = true;
             return Ok(true);
         }
-        if self.sink.stat(&key).await.map_err(sink_stop)?.is_some() {
-            self.store_done = true;
-            return Ok(false);
-        }
         let plain = self.read_local(self.local.dir.join(STORE))?;
         let sealed = self.seal(&key, &plain)?;
+        let expected = Stored::new(sealed.len() as u64, sha256(&sealed));
+        // Other content under the key is never overwritten and fails, as for a file (Q-284 (b)).
+        match self.sink.stat(&key).await.map_err(sink_stop)? {
+            Some(s) if s == expected => {
+                self.store_done = true;
+                return Ok(false);
+            }
+            Some(s) => {
+                return Err(Stop::Fail(UploadError::Verify(VerifyError::Reported {
+                    key,
+                    expected,
+                    reported: Some(s),
+                })));
+            }
+            None => {}
+        }
         self.put_verified(&key, sealed, now).await?;
         self.store_done = true;
         Ok(true)

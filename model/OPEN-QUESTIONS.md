@@ -1114,7 +1114,8 @@ lost reply). (b) Another object already under a file's key. (c) The bucket accep
 object for the key.
 **Decided.** (a) `Retry`, with delays doubling from `retry_first` to `retry_max`, reset by the next progress;
 `failing_since` is the first failure of the run, which the caller turns into `BackupStalled`. (b) `Failed` (the
-bucket is never overwritten; how the engine recovers is Q-85's). Other content reported after a `put` likewise fails.
+bucket is never overwritten; how the engine recovers is Q-85's). Other content reported after a `put` likewise fails,
+and so does a `STORE` object other than the sealed local descriptor, found before the first upload.
 (c) The driver asks again, by `stat` alone, without a new `put`; a lookup counts only when another call to the bucket
 answers in the same step. After 3 counted lookups over at least 10 minutes the object is taken as lost and uploaded
 again. Upload never records a loss: the local file is the source. The S3 sink already reads an object back before
