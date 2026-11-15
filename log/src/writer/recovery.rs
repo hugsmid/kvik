@@ -944,6 +944,18 @@ pub(super) fn start(
         zero_after(&ranges, None, 0)
     };
 
+    // The header of the segment the writer resumes in is written again in place before its first sync: a header
+    // taken into use by a sync that failed may be in the page cache only (Q-116 (p)). A header rewritten above, or
+    // with the last batch below, is not written twice.
+    if let Some(r) = p.resume_in
+        && !header_rewritten.contains(&r)
+        && p.rewrite_last.is_none_or(|(i, j)| i != r || j != 0)
+        && let Some(h) = segs[r].header.filter(|h| h.base_sequence >= 1)
+        && let Err(e) = files[&r].write_at(&h.encode(), 0)
+    {
+        return ro(fault(FaultOp::Write, &segs[r].path, &e), report);
+    }
+
     match p.rule {
         StartRule::SameBoot => {
             // Step 2: truncate after the mark; sync the truncated segments, those holding a lost range, and the

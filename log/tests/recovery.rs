@@ -2038,12 +2038,12 @@ fn a_torn_mark_update_never_falls_back_past_the_last_synced_mark() {
     r.check_started();
 }
 
-/// Q-116 (p), as implemented: a timed seal takes the segment created ahead into use and the sync of its header fails;
-/// the start on the same boot resumes in that segment from the header in the page cache without writing it again. A
-/// batch there whose sync also fails, torn by a power loss, lies in a segment whose header on disk reads unused: the
-/// next start deletes it with the torn bytes and reports no loss.
+/// Q-116 (p): a timed seal takes the segment created ahead into use and the sync of its header fails, leaving the
+/// header in the page cache only. The start on the same boot writes the header of the segment it resumes in again,
+/// in place, before its first sync, so a batch committed there makes it durable, and once the segment is sealed and
+/// the power is lost its `.kvl` header reads in use and its `file_crc32c` verifies.
 #[test]
-fn a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_start() {
+fn a_header_put_in_use_by_a_failed_sync_is_written_again_by_a_same_boot_start() {
     let mut r = Rig::new(WriterConfig {
         seal_interval: Duration::from_secs(1),
         ..cfg()
@@ -2058,8 +2058,8 @@ fn a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_star
             .find(|n| !n.sealed && n.file_id > open)
             .expect("a segment created ahead");
     let path = log_path(&ahead.to_string());
-    let base = |b: Option<Vec<u8>>| {
-        kvik_log::header::FileHeader::decode(&b.unwrap())
+    let base = |b: &[u8]| {
+        kvik_log::header::FileHeader::decode(b)
             .unwrap()
             .base_sequence
     };
@@ -2073,33 +2073,50 @@ fn a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_star
     assert_eq!(rep.rule, StartRule::SameBoot);
     assert!(rep.entry.is_none());
     assert_eq!(r.w().stats().open_file_id, Some(ahead.file_id));
-    assert_eq!(base(r.fs.read(&path)), 2);
+    assert_eq!(base(&r.fs.read(&path).unwrap()), 2);
     assert_eq!(
-        base(r.fs.read_durable(&path)),
+        base(&r.fs.read_durable(&path).unwrap()),
         0,
-        "the header is not written again"
+        "not yet synced"
     );
-    // A batch in it whose sync fails too, then a power loss that keeps part of it.
-    r.fs.fail_nth(FaultOp::Sync, &ahead.to_string(), 0, io::ErrorKind::Other);
+    // A batch in it: its sync makes the header written again durable.
     r.submit(vec![fact(1, 1)]);
     r.drain();
-    assert!(r.w().fault().is_some());
-    assert!(r.acked.len() == 1);
-    let bytes = r.fs.read(&path).unwrap();
-    r.w = None;
-    r.fs.power_loss();
-    r.fs.poke(&path, 64, &bytes[64..64 + 48]);
-    r.fs.restart();
-    r.boot += 1;
+    assert!(r.w().fault().is_none());
+    assert_eq!(r.acked.len(), 2);
+    assert_eq!(base(&r.fs.read_durable(&path).unwrap()), 2);
+    // Then a timed seal of that segment, and a power loss.
+    r.advance(Duration::from_secs(2));
+    r.step();
+    r.maint();
+    assert!(r.w().fault().is_none());
+    let sealed = SegmentName {
+        sealed: true,
+        ..ahead
+    };
+    r.power_loss(None);
+    let bytes =
+        r.fs.read_durable(&log_path(&sealed.to_string()))
+            .expect("sealed");
+    assert_eq!(base(&bytes), 2);
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: ahead.file_id,
+        generation: ahead.generation,
+    };
+    let seal = scan(&bytes, &id, ScanLimit::End)
+        .unwrap()
+        .seal
+        .expect("a seal");
+    assert!(seal.file_crc_matches(&bytes), "file_crc32c verifies");
     let rep = r.open().unwrap();
-    assert!(matches!(rep.rule, StartRule::Reboot(_)));
-    assert_eq!(
-        rep.deleted,
-        vec![ahead.file_id],
-        "deleted as unused, with the torn bytes"
-    );
-    assert!(rep.losses.is_empty(), "no loss reported: {rep:?}");
-    assert_eq!(rep.entry.unwrap().entry.tail_bytes, 0);
+    assert!(rep.losses.is_empty(), "nothing lost: {rep:?}");
+    let facts = r
+        .batches()
+        .iter()
+        .filter(|c| matches!(c.items.as_slice(), [Item::Fact(_)]))
+        .count();
+    assert_eq!(facts, 2, "both acknowledged batches kept");
     r.check_started();
 }
 
