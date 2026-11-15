@@ -68,7 +68,8 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   `docs/format-chunk.md`; sizes in `docs/measurements/6.1-encodings.md`; the compressed fallback's canonical class settled in Q-150)
 - [ ] 6.2 Per-series chunks, index, lossless compaction with verification
 - [ ] 6.3 Manifest and atomic publish-and-retire
-- [ ] 6.4 Parquet export and a differential check against it
+- [ ] 6.4a Parquet export: the export schema (provisional, `docs/export.md`) and the Parquet writer (unticked pending Q-190 to Q-197)
+- [ ] 6.4b Differential check of compacted data against the Parquet export (moved from 6.4)
 - [ ] 6.5 **Gate** — compaction looked at as a whole (includes: measure a pure-Rust codec, `ruzstd` or `lz4_flex`, on the XOR
   stream; within about 10 % of zstd level 3 on the °F→°C shape it replaces the C library, otherwise zstd stays and CI
   fails when `ZSTD_SYS_USE_PKG_CONFIG` is set; Q-150)
