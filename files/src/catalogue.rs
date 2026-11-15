@@ -167,6 +167,17 @@ impl Catalogue {
                 ..
             } => {
                 let rr = restore_of(b)?;
+                if rr.generation != r.generation {
+                    return Err(CatalogueError::Restore(RecordError::Invalid(
+                        "a restore record of another generation than its record",
+                    )));
+                }
+                // A generation begins with its one restore record; a rebuilt manifest carries it (spec §8 Generations).
+                if r.old_epoch.is_none() && !self.restores.is_empty() {
+                    return Err(CatalogueError::Restore(RecordError::Invalid(
+                        "a second restore record",
+                    )));
+                }
                 let listed: Vec<FileDescription> =
                     rr.files.iter().map(|f| f.description.clone()).collect();
                 self.check_publish(&listed, &[])
@@ -189,7 +200,7 @@ impl Catalogue {
                 ..
             } => {
                 let rr = restore_of(b)?;
-                self.apply_restore(r.epoch, rr);
+                self.apply_restore(r.epoch, rr, r.old_epoch.is_some());
             }
             Body::Other { .. } => {
                 if let Some(Ok(c)) = CopyVerified::from_body(&r.body) {
@@ -302,7 +313,9 @@ impl Catalogue {
         self.refresh_ack(l.identity);
     }
 
-    fn apply_restore(&mut self, epoch: u64, rr: RestoreRecord) {
+    /// A carried restore record gives its files' copies and no verified mark, as a carried copy-verified record
+    /// (`spec.md` §7 Manifest, Q-295).
+    fn apply_restore(&mut self, epoch: u64, rr: RestoreRecord, carried: bool) {
         for f in &rr.files {
             let e = self
                 .files
@@ -310,7 +323,9 @@ impl Catalogue {
                 .or_insert_with(|| entry(&f.description, Some(epoch)));
             e.tier = f.tier;
             e.deep = Some(f.copy.clone());
-            e.verified.insert(Tier::Deep);
+            if !carried {
+                e.verified.insert(Tier::Deep);
+            }
         }
         for l in &rr.losses {
             self.record_loss(epoch, l);
@@ -709,6 +724,44 @@ mod tests {
         assert_eq!(l.record, rr.losses[0]);
         assert!(l.acknowledged);
         assert_eq!(c.generation(), 1);
+    }
+
+    #[test]
+    fn a_carried_restore_record_gives_copies_but_no_verified_mark() {
+        let rr = restore_record();
+        let carried = Record {
+            old_epoch: Some(1),
+            ..Record::new(2, 1, 0, rr.to_body())
+        };
+        let c = Catalogue::replay(&[
+            Record::new(1, 1, 0, Body::Rebuild(Rebuild::default())),
+            carried,
+        ])
+        .unwrap();
+        let e = c.file(segment(1).file_ref()).unwrap();
+        assert_eq!(e.deep, Some(rr.files[0].copy.clone()));
+        assert!(e.verified.is_empty());
+        assert_eq!(c.restores().len(), 1);
+    }
+
+    #[test]
+    fn a_restore_record_of_another_generation_or_a_second_one_is_refused() {
+        let rr = restore_record();
+        let mut c = Catalogue::new();
+        assert!(matches!(
+            c.apply(&Record::new(1, 2, 0, rr.to_body())),
+            Err(CatalogueError::Restore(RecordError::Invalid(_)))
+        ));
+        c.apply(&Record::new(1, 1, 0, rr.to_body())).unwrap();
+        assert!(matches!(
+            c.apply(&Record::new(2, 1, 0, rr.to_body())),
+            Err(CatalogueError::Restore(RecordError::Invalid(_)))
+        ));
+        let carried = Record {
+            old_epoch: Some(1),
+            ..Record::new(2, 1, 0, rr.to_body())
+        };
+        c.apply(&carried).unwrap();
     }
 
     #[test]
