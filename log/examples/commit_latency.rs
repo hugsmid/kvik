@@ -409,7 +409,8 @@ fn reading(series: u32, n: u64) -> Item {
     })
 }
 
-/// Sleeps, then spins, until `t`: a sleeping thread can wake late.
+/// Sleeps, then spins, until `t`. A sleeping thread can wake late, by up to half the time asked for where the
+/// operating system adds timer slack ([`timer_slack`]), so it sleeps half the time left at a time.
 fn wait_until(t: Instant) {
     loop {
         let now = Instant::now();
@@ -418,11 +419,29 @@ fn wait_until(t: Instant) {
         }
         let left = t - now;
         if left > Duration::from_millis(2) {
-            std::thread::sleep(left - Duration::from_millis(1));
+            std::thread::sleep((left - Duration::from_millis(1)) / 2);
         } else {
             std::hint::spin_loop();
         }
     }
+}
+
+/// How late a 5 ms sleep wakes, p50 and max of 50, in ms. The writer waits on timers too (`min_sync_interval`, the
+/// timed mark sync), so slack added by the operating system shows in the results.
+fn timer_slack() -> String {
+    let mut v: Vec<u64> = (0..50)
+        .map(|_| {
+            let t = Instant::now();
+            std::thread::sleep(Duration::from_millis(5));
+            nanos(t.elapsed().saturating_sub(Duration::from_millis(5)))
+        })
+        .collect();
+    v.sort_unstable();
+    format!(
+        "a 5 ms sleep wakes {} ms late at p50, {} ms at most",
+        ms(percentile(&v, 50.0)),
+        ms(v[v.len() - 1])
+    )
 }
 
 /// A small deterministic generator for the quiet load's pauses.
@@ -990,13 +1009,14 @@ fn main() {
         w,
         "## Environment\n\n| Item | Value |\n|---|---|\n\
          | Run | {} |\n| Platform | {} {}, {} |\n| CPUs | {} |\n| File system | {fstype} |\n| Disk | {disk} |\n\
-         | Sync primitive | {} |\n| Build | {} |\n| Load average at start | {} |",
+         | Sync primitive | {} |\n| Timer slack | {} |\n| Build | {} |\n| Load average at start | {} |",
         if short { "short" } else { "full" },
         std::env::consts::OS,
         std::env::consts::ARCH,
         os_version(),
         std::thread::available_parallelism().map_or(0, |n| n.get()),
         sync_primitive(),
+        timer_slack(),
         if cfg!(debug_assertions) {
             "debug (not a valid measurement)"
         } else {

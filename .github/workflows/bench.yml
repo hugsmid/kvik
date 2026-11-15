@@ -1,0 +1,57 @@
+name: Commit latency
+
+# Roadmap 4.8: the commit-latency harness (`log/examples/commit_latency.rs`) on GitHub's hosted runners. Started by
+# hand only. The runners are cloud virtual machines with virtual disks, not the Linux NVMe target that `design.md`
+# budgets: their figures say how the engine behaves there and nothing about the budget
+# (`docs/measurements/4.8-commit-latency.md`).
+
+on:
+  workflow_dispatch:
+    inputs:
+      length:
+        description: "Run length: short (about 2 minutes per OS) or full (about 8)"
+        required: false
+        default: short
+        type: choice
+        options: [short, full]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  commit-latency:
+    name: commit latency (${{ matrix.os }}, cloud VM)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: bench
+      - run: cargo build --release --locked -p kvik-log --example commit_latency
+      - name: Run (the runner's temporary directory, on its own disk)
+        shell: bash
+        run: |
+          flag=""
+          if [ "${{ inputs.length }}" != "full" ]; then flag="--short"; fi
+          {
+            echo "# Commit latency on ${{ matrix.os }}: a cloud virtual machine, not the NVMe target"
+            echo
+            cargo run --release --locked -p kvik-log --example commit_latency -- "$RUNNER_TEMP" $flag
+          } > commit-latency-${{ matrix.os }}.md
+          cat commit-latency-${{ matrix.os }}.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: commit-latency-${{ matrix.os }}-cloud-vm
+          path: commit-latency-${{ matrix.os }}.md
+          if-no-files-found: warn
