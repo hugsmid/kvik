@@ -9,6 +9,7 @@ use kvik_files::desc::{FileRef, kind};
 use kvik_files::record::{Body, Record};
 use kvik_files::restore::{RestoreRecord, RestoredFile};
 use kvik_log::manifest::{LossCause, LostRange};
+use kvik_log::mark::ResetStamp;
 use kvik_log::store::StoreDescriptor;
 use kvik_sink_api::{BackupSink, SinkError};
 use sha2::{Digest, Sha256};
@@ -48,6 +49,7 @@ struct Pending {
 struct Run<E> {
     env: E,
     keys: Keys,
+    stamp: ResetStamp,
     appender: Appender,
     wall: i64,
     files: Vec<Pending>,
@@ -290,8 +292,9 @@ fn check_plan(
     Ok(())
 }
 
-/// The lost range of a listed file the bucket has lost or corrupted (Q-82, Q-302).
-fn loss_of(f: &RestoredFile) -> Option<LostRange> {
+/// The lost range of a listed file the bucket has lost or corrupted (Q-82, Q-302), under the restore record's reset
+/// stamp, the one in force (spec §7 Readers).
+fn loss_of(f: &RestoredFile, stamp: ResetStamp) -> Option<LostRange> {
     let (first, last) = f.description.range?;
     Some(LostRange {
         identity: first,
@@ -306,7 +309,7 @@ fn loss_of(f: &RestoredFile) -> Option<LostRange> {
         time_before: None,
         time_after: None,
         extends: false,
-        stamp: None,
+        stamp: Some(stamp),
     })
 }
 
@@ -514,7 +517,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         let files = by_position(&record.files)
             .into_iter()
             .map(|file| {
-                let recorded = loss_of(&file).is_some_and(|l| lost.contains(&l));
+                let recorded = loss_of(&file, record.stamp).is_some_and(|l| lost.contains(&l));
                 Pending {
                     done: recorded || local::is_installed(&names, &file.description),
                     file,
@@ -525,6 +528,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         self.run = Some(Run {
             env,
             keys: keys.clone(),
+            stamp: record.stamp,
             appender,
             wall,
             files,
@@ -581,7 +585,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
                 Err(e) => RestoreStep::Failed(e.into()),
             },
             Fetched::Lost => {
-                let Some(loss) = loss_of(&p.file) else {
+                let Some(loss) = loss_of(&p.file, run.stamp) else {
                     return RestoreStep::Failed(invalid(
                         "a listed log segment holding no position",
                     ));

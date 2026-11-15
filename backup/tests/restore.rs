@@ -237,9 +237,10 @@ fn a_file_absent_on_three_tries_over_ten_minutes_is_lost_and_recorded() {
     sink.set(&key, Some(Fault::Lose));
     let fs = MemFs::new();
     let mut r = restorer(sink.clone(), &fs, PlanMode::Full, KEY);
-    let (_, o) = restore(&mut r).unwrap();
+    let (p, o) = restore(&mut r).unwrap();
     assert_eq!(o.installed, [seg(1), seg(3)]);
     let (file, loss, at) = o.lost[0].clone();
+    assert_eq!(loss.stamp, Some(p.record.stamp));
     assert_eq!((o.lost.len(), file), (1, seg(2)));
     assert!(at >= 10 * MIN, "lost at {at:?}");
     assert!(sink.count("stat", &key) >= 3);
