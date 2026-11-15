@@ -9,6 +9,9 @@
 use kvik_log::batch::{BatchBuilder, SegmentIdentity};
 use kvik_log::block::block_type;
 use kvik_log::body::DataPrefix;
+use kvik_log::manifest::{
+    LostRange, ManifestRead, RECORD_LOST_RANGE, Record as ManifestRecord, Recorder, RecorderError,
+};
 use kvik_log::segment::SegmentImage;
 
 /// The identity used by most tests.
@@ -299,4 +302,58 @@ pub fn facts_raw(row_count: u32, columns: &[(u8, u8, Vec<u8>)]) -> Vec<u8> {
         body.extend_from_slice(payload);
     }
     body
+}
+
+/// An in-memory [`Recorder`]: a manifest of lost-range records only, for starts that do not touch `MANIFEST`.
+#[derive(Debug, Default)]
+pub struct MemRecorder {
+    /// The records, in order.
+    pub records: Vec<ManifestRecord>,
+    /// How many times [`Recorder::repair`] ran.
+    pub repairs: u32,
+}
+
+impl Recorder for MemRecorder {
+    fn read(&mut self, _store_id: &[u8; 16]) -> Result<ManifestRead, RecorderError> {
+        Ok(ManifestRead {
+            records: self.records.clone(),
+            valid_end: 0,
+            torn: false,
+        })
+    }
+
+    fn repair(&mut self) -> Result<(), RecorderError> {
+        self.repairs += 1;
+        Ok(())
+    }
+
+    fn record_loss(
+        &mut self,
+        loss: &LostRange,
+        epoch_floor: u64,
+        _wall: i64,
+    ) -> Result<Option<u64>, RecorderError> {
+        let held = self
+            .records
+            .iter()
+            .filter_map(|r| r.lost.as_ref())
+            .any(|l| l.first <= loss.first && loss.last <= l.last);
+        if held {
+            return Ok(None);
+        }
+        let last = self.records.last().map_or(0, |r| r.epoch);
+        let epoch = last
+            .max(epoch_floor)
+            .checked_add(1)
+            .ok_or(RecorderError::EpochsExhausted)?;
+        self.records.push(ManifestRecord {
+            offset: 0,
+            end: 0,
+            record_type: RECORD_LOST_RANGE,
+            epoch,
+            generation: 0,
+            lost: Some(loss.clone()),
+        });
+        Ok(Some(epoch))
+    }
 }

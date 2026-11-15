@@ -12,6 +12,7 @@
 //! - [`scan`]: reading a segment up to the durable mark or to its end, with resynchronisation past invalid regions,
 //!   the tail and the seal (A.2, A.4, A.9).
 //! - [`segment`]: the life cycle of a segment as bytes, and the states recovery may find (A.4).
+//! - [`setaside`]: the positions a restore set aside (`spec.md` §8 Restore).
 //! - [`mark`]: the durable mark's slots (A.10).
 //! - [`manifest`]: the manifest's records as far as the log's start needs them (A.14).
 //! - [`name`]: segment file names (A.12).
@@ -80,6 +81,7 @@ pub mod registry;
 mod rle;
 pub mod scan;
 pub mod segment;
+pub mod setaside;
 pub mod store;
 pub mod writer;
 

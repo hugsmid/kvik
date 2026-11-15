@@ -7,6 +7,7 @@
 //!   acknowledgements, rebuilds and `file_id` floors.
 //! - [`appender`]: the one run-time writer of `MANIFEST`: the start's repair, appends after the previous record's
 //!   sync, and the rule that the last record is not acted on irreversibly until a successor is synced.
+//! - [`tier`], [`restore`]: the copy-verified and restore records as typed views (roadmap 8.1c, 8.3a).
 //! - [`rebuild`]: the manifest rebuild from the local files (`rebuild_manifest`), and the provisional rebuild with
 //!   its holds while deep cannot say whether it holds a copy of the corrupt record.
 //!
@@ -45,6 +46,8 @@ pub mod fuzz;
 pub mod image;
 pub mod rebuild;
 pub mod record;
+pub mod restore;
+pub mod tier;
 
 /// The manifest's file name in the store directory (`format.md` A.12).
 pub const MANIFEST: &str = "MANIFEST";

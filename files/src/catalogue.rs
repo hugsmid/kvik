@@ -14,6 +14,8 @@ use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 
 use crate::desc::{FileDescription, FileRef, kind};
 use crate::record::{Body, Rebuild, Record};
+use crate::restore::RestoreRecord;
+use crate::tier::DeepCopy;
 
 /// A storage tier (`spec.md` §8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,6 +43,8 @@ pub struct FileEntry {
     /// The tiers other than its own where a copy is verified. A rebuild record clears every mark (`spec.md` §7: a
     /// rebuilt manifest takes no file as verified in another tier until it is verified there again).
     pub verified: BTreeSet<Tier>,
+    /// Its verified copy in the deep tier, from a copy-verified record (`0x27`).
+    pub deep: Option<DeepCopy>,
 }
 
 impl FileEntry {
@@ -400,6 +404,20 @@ impl Catalogue {
         }
     }
 
+    /// Records a verified copy `c` of a live file in tier `t`: sets [`FileEntry::deep`] and marks `t` verified. The
+    /// copy-verified record's fold (roadmap 8.1c) calls it.
+    pub fn record_copy(&mut self, f: FileRef, t: Tier, c: DeepCopy) {
+        if let Some(e) = self.files.get_mut(&f) {
+            e.deep = Some(c);
+            e.verified.insert(t);
+        }
+    }
+
+    /// The restore records, in order; empty until their fold (roadmap 8.3a).
+    pub fn restores(&self) -> &[RestoreRecord] {
+        &[]
+    }
+
     /// The cause a recorded loss gives, if a loss holds `p`.
     pub fn cause_at(&self, p: RecordPosition) -> Option<LossCause> {
         self.loss_holding(p).map(|l| l.record.cause)
@@ -413,5 +431,49 @@ fn entry(d: &FileDescription, published: Option<u64>) -> FileEntry {
         retired: None,
         tier: Tier::Hot,
         verified: BTreeSet::new(),
+        deep: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desc::FileClass;
+
+    fn segment(file_id: u64) -> FileDescription {
+        FileDescription {
+            kind: kind::LOG_SEGMENT,
+            class: FileClass::None,
+            generation: 0,
+            file_id,
+            range: Some(((0, 1), (0, 9))),
+            hash: [3; 32],
+            inputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_copy_sets_the_deep_copy_and_marks_the_tier_verified() {
+        let mut c = Catalogue::new();
+        c.apply(&Record::new(2, 0, 0, Body::Sealed(vec![segment(1)])))
+            .unwrap();
+        let f = segment(1).file_ref();
+        assert_eq!(c.file(f).unwrap().deep, None);
+        let copy = DeepCopy {
+            size: 100,
+            sha256: [4; 32],
+        };
+        c.record_copy(f, Tier::Deep, copy.clone());
+        let e = c.file(f).unwrap();
+        assert_eq!(e.deep, Some(copy.clone()));
+        assert!(e.verified.contains(&Tier::Deep));
+        let absent = segment(2).file_ref();
+        c.record_copy(absent, Tier::Deep, copy);
+        assert!(c.file(absent).is_none());
+    }
+
+    #[test]
+    fn no_restore_record_is_folded_yet() {
+        assert!(Catalogue::new().restores().is_empty());
     }
 }

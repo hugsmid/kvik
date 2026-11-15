@@ -360,6 +360,41 @@ impl ManifestRead {
     }
 }
 
+/// Steps 1, 4 and 6 of a start's manifest work (`spec.md` §3 Order of a start), so that the store can route them
+/// through its own manifest writer.
+pub trait Recorder: Send {
+    /// Step 1: reads the manifest.
+    fn read(&mut self, store_id: &[u8; 16]) -> Result<ManifestRead, RecorderError>;
+    /// Step 4: drops a torn tail, writes the last valid record again in place and syncs.
+    fn repair(&mut self) -> Result<(), RecorderError>;
+    /// Steps 4 and 6: appends a lost-range record with an epoch above `epoch_floor`, syncs, and returns its epoch;
+    /// `None` when a record already holds every position of `loss`.
+    fn record_loss(
+        &mut self,
+        loss: &LostRange,
+        epoch_floor: u64,
+        wall: i64,
+    ) -> Result<Option<u64>, RecorderError>;
+}
+
+/// Why a [`Recorder`] call failed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecorderError {
+    /// The manifest cannot be used.
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    /// A write failed.
+    #[error("manifest write failed: {0}")]
+    Write(std::io::Error),
+    /// A sync failed.
+    #[error("manifest sync failed: {0}")]
+    Sync(std::io::Error),
+    /// No epoch is left above the floor.
+    #[error("no manifest epoch is left")]
+    EpochsExhausted,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

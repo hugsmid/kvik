@@ -69,6 +69,26 @@ pub enum Reason {
     /// A series' source clock appears skewed (spec §9 row 5; an addition of
     /// the model backend).
     ClockSkew(SeriesId),
+    /// Uploads have failed for longer than the stall limit.
+    BackupStalled {
+        /// When the failures began.
+        since: Timestamp,
+        /// Files queued.
+        queued_files: u64,
+        /// The last error.
+        error: String,
+    },
+    /// The bucket was refused at attach.
+    BackupRefused(BackupRefusal),
+    /// A restore cannot continue past a file.
+    RestoreFailed {
+        /// The file.
+        file_id: u64,
+        /// Why.
+        reason: String,
+    },
+    /// A restore set positions aside; information, not degraded (Q-90).
+    SetAside(SetAsideReport),
 }
 
 impl fmt::Display for Reason {
@@ -84,8 +104,95 @@ impl fmt::Display for Reason {
                 write!(f, "manifest record of epoch {epoch} rebuilt{how}")
             }
             Reason::ClockSkew(s) => write!(f, "the source clock of {s} appears skewed"),
+            Reason::BackupStalled {
+                queued_files,
+                error,
+                ..
+            } => write!(
+                f,
+                "backup stalled with {queued_files} files queued: {error}"
+            ),
+            Reason::BackupRefused(r) => write!(f, "backup refused: {r}"),
+            Reason::RestoreFailed { file_id, reason } => {
+                write!(f, "restore of file {file_id} failed: {reason}")
+            }
+            Reason::SetAside(r) => write!(f, "positions {} to {} set aside", r.first, r.last),
         }
     }
+}
+
+/// Why a bucket is refused at attach (spec §8 Deep).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BackupRefusal {
+    /// The bucket ignores conditional writes.
+    #[error("the bucket does not honour conditional writes")]
+    NoConditionalWrites,
+    /// The bucket does not check or report checksums.
+    #[error("the bucket does not check checksums")]
+    NoChecksums,
+    /// The bucket holds another store's files.
+    #[error("the bucket holds another store's files")]
+    OtherStore,
+    /// The bucket's store was sealed with another key.
+    #[error("the bucket's store was sealed with another key")]
+    WrongKey,
+}
+
+/// The positions one restore record set aside (spec §8 Restore step 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SetAsideReport {
+    /// The first position set aside.
+    pub first: Position,
+    /// The last position set aside.
+    pub last: Position,
+    /// Facts set aside.
+    pub facts: u64,
+    /// The first commit time set aside.
+    pub commit_time_first: Timestamp,
+    /// The last commit time set aside.
+    pub commit_time_last: Timestamp,
+}
+
+/// Backup statistics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackupStats {
+    /// A sink is attached.
+    pub attached: bool,
+    /// The last position whose files and records are all uploaded.
+    pub backed_up_through: Option<Position>,
+    /// Files queued.
+    pub queued_files: u64,
+    /// Bytes queued.
+    pub queued_bytes: u64,
+    /// Records queued.
+    pub queued_records: u64,
+    /// Files uploaded.
+    pub uploaded_files: u64,
+    /// Bytes uploaded.
+    pub uploaded_bytes: u64,
+    /// Retries.
+    pub retries: u64,
+}
+
+/// Restore statistics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RestoreStats {
+    /// A restore is installing files.
+    pub restoring: bool,
+    /// The store is a drill's.
+    pub drill: bool,
+    /// The generation of the latest restore record.
+    pub generation: u32,
+    /// The end it restored.
+    pub restored_end: Option<Position>,
+    /// Files left.
+    pub files_left: u64,
+    /// Bytes left.
+    pub bytes_left: u64,
 }
 
 /// Whether a loss is certain.

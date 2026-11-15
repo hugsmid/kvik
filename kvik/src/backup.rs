@@ -5,6 +5,10 @@
 //! here unchanged; an S3-compatible implementation and an in-memory fake are
 //! in the `kvik-sink` crate.
 
+use std::ops::Range;
+
+use crate::time::Timestamp;
+
 pub use kvik_sink_api::{
     BackupSink, ListPage, SinkError, SinkFuture, Stored, Verified, VerifyError,
 };
@@ -23,15 +27,25 @@ impl std::fmt::Debug for Encryption {
     }
 }
 
-/// How a restore brings detail back (spec §8 Restore).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What a restore does (spec §8 Restore).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RestoreMode {
-    /// Serve from the checkpoint's summaries first, then bring detail back.
+    /// Claim the next generation and restore every file, then accept ingest.
     #[default]
-    SummariesFirst,
+    Full,
     /// A drill: restore read-only, claim and upload nothing.
     Drill,
+    /// Restore part of the store (roadmap 8.3f; `NotSupportedYet` until then).
+    Partial(RestoreScope),
+}
+
+/// The part of a store a partial restore brings back (roadmap 8.3f).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RestoreScope {
+    /// The commit-time range; `None`: all of it.
+    pub time: Option<Range<Timestamp>>,
 }
 
 /// What [`Store::rebuild`](crate::Store::rebuild) recomputes.

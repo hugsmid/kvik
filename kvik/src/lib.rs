@@ -90,6 +90,9 @@
 
 #![forbid(unsafe_code)]
 
+// The store's drivers and its manifest, wired by roadmap 8.1d and 8.3d.
+use {kvik_backup as _, kvik_files as _};
+
 mod backend;
 mod backup;
 mod config;
@@ -108,8 +111,8 @@ mod types;
 pub mod env;
 
 pub use backup::{
-    BackupSink, Encryption, ListPage, Rebuild, RestoreMode, SinkError, SinkFuture, Stored,
-    Verified, VerifyError,
+    BackupSink, Encryption, ListPage, Rebuild, RestoreMode, RestoreScope, SinkError, SinkFuture,
+    Stored, Verified, VerifyError,
 };
 pub use config::{
     Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,
@@ -124,8 +127,9 @@ pub use error::{
     Wait, WriteError,
 };
 pub use health::{
-    ClockJump, ClockStats, ConsumerStats, DeliveryStats, DiskStats, Health, IngestStats, Latency,
-    LogStats, LossCause, LossKind, LossReport, MarkState, MarkSyncMode, Reason, SeriesStats, Stats,
+    BackupRefusal, BackupStats, ClockJump, ClockStats, ConsumerStats, DeliveryStats, DiskStats,
+    Health, IngestStats, Latency, LogStats, LossCause, LossKind, LossReport, MarkState,
+    MarkSyncMode, Reason, RestoreStats, SeriesStats, SetAsideReport, Stats,
 };
 pub use read::{
     Aggregate, Aggregated, Bucket, CalendarPeriod, CalendarWindow, ChartData, Facts, Live,

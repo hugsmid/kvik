@@ -49,6 +49,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
+| Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -907,6 +908,32 @@ Calendar-length interval series are refused by the export, as neither backend st
 **Needed (owner decision pending).** Recommendation: keep `interval_end`; for calendar lengths (7.3) take each end from
 the interval zone under the tzdata version in force at export, recorded in the metadata.
 
+## Q-198 — The backup and restore interfaces ahead of their implementations
+
+Recorded at the interfaces commit of roadmap 8.1 and 8.3, which defines the types, traits and fakes the parallel
+items build against (`kvik-backup`, `files/src/{tier,restore}.rs`, `log/src/setaside.rs`,
+`log/src/writer/options.rs`). Decided: (a) to (d). Provisional: (e) and (f).
+**Scenario.** (a) A `put` of a sealed segment is stored but its reply is lost; the store restarts and seals the
+same file again. With a random nonce the bytes differ, the sink refuses the repeat (`HashMismatch`), and the
+segment can never be uploaded. (b) An operator points two stores at one bucket under different prefixes; a restore
+must find the store without being told the prefix. (c) A restore is killed after its record is synced but before
+every file is installed; `Store::open` cannot finish it without the sink. (d) The upload driver runs on its own
+thread, so the sink it holds must outlive the call that attached it; and a partial restore needs a scope, which a
+`Copy` mode cannot hold. (e) Two parallel items must agree on every object key before either is merged. (f) Two
+restores race for one generation (Q-161).
+**Decided.** (a) The envelope is deterministic: its nonce is derived from the key, the object key and the
+plaintext hash (`Envelope::seal`), so a repeated `put` sends identical bytes. (b) There is no key prefix in the
+engine: keys start at the store id, a restore finds the store id by listing the bucket, and two store ids fail it
+(`RestoreError::SeveralStores`). (c) An unfinished restore is resumed by calling `Store::restore` again (Q-164 (c)).
+(d) `attach_backup` and `restore` take `S: BackupSink + 'static`; `RestoreMode` is not `Copy`, defaults to `Full`
+and gains `Partial(RestoreScope)`, `NotSupportedYet` until roadmap 8.3f; `RestoreScope` holds only the time range
+until a series selection exists.
+**Provisional.** (e) The key layout of Q-160's suggestion without the prefix, in `backup/src/keys.rs`, the only
+place a key is built or parsed; kinds other than log segments under `files/<kind:2 hex>/`. (f) The claim marker is
+12 bytes, the generation (`u32`) then the restore's reset-stamp nonce (`u64`), little-endian (Q-161's suggestion).
+Both are fixed by `format.md` A.17 (roadmap 8.1b), which may change them before anything is uploaded.
+**Model.** Not modelled.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -919,7 +946,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -969,6 +996,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
+| Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided, (e) and (f) settled by `format.md` A.17 at 8.1b |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

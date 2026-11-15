@@ -122,7 +122,8 @@ pub enum EmitError {               // per call
 pub enum OpenError { Locked, NotAStore, StoreIdMismatch { file }, UnsupportedFormat { file, found, supported },
     SiteZoneMismatch { configured, in_force }, UnknownZone, Corrupt { file }, UnsupportedPlatform { reason },
     MarkUnreadable, Config { key, reason }, Io { path, source } }     // MarkUnreadable: Reader::open only (format.md A.10)
-pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { epoch }, NoSpace { path } }
+pub enum Fault { Io { op, path, kind }, SyncFailed { path }, ManifestCorrupt { epoch }, NoSpace { path },
+    Drill }                        // a restore drill's store refuses writes (spec §8 Restore)
 pub enum WriteError { ReadOnly(Fault), Closed, OutcomeUnknown(Fault),      // any call that appends an entry
     NotFinal }                     // acknowledge_manifest_rebuild while the rebuild is provisional (spec §7 Manifest)
 pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid { field, reason }, UnknownZone,
@@ -364,7 +365,13 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }
 pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64 }, DiskCritical { free: u64 },
     SealBlocked { file_id: u64 },
-    ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool } }
+    ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
+    BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
+    RestoreFailed { file_id: u64, reason: String },
+    SetAside(SetAsideReport) }     // information, not degraded (Q-90)
+pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
+pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
+    pub commit_time_first: Timestamp, pub commit_time_last: Timestamp }
 pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost | PossibleLoss */,
     pub cause: LossCause /* Corruption | TruncatedTail | LostInBucket | InvalidContent | Unknown */,
     pub first: Option<Position>, pub last: Option<Position>, pub file_id: Option<u64>, pub bytes: u64,
@@ -379,6 +386,9 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
 // LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+// Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
+// BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
+//               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }
 pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, duplicates_dropped, duplicates_unchecked,
                                                                    // refused (per Refusal), outranked_on_arrival, late, future, orphaned_facts,
                                                                    // rounded, scale_raises, absent_supplied, out_of_range
@@ -427,8 +437,13 @@ pub struct ListPage { pub keys: Vec<String>, pub more: bool }       // ascending
 pub enum SinkError { Exists { key }, NotFound { key }, HashMismatch { key }, InvalidRange { key },
                      TooLarge { size, limit }, Busy { queued }, Transient { reason }, Failed { reason } }
 pub struct Verified { .. }       // Verified::check(sink, key, &expected).await: the bucket reported `expected`
-store.attach_backup(sink, Encryption::Key(key)).await?;
-let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode::SummariesFirst).await?;
+store.attach_backup(sink, Encryption::Key(key)).await?;           // S: BackupSink + 'static: the sink moves to a thread
+let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode::Full).await?;
+pub enum RestoreMode { Full /* default */, Drill, Partial(RestoreScope) }   // not Copy; Partial: NotSupportedYet until 8.3f
+pub struct RestoreScope { pub time: Option<Range<Timestamp>> }            // non-exhaustive; a series selection arrives with 8.3f
+pub enum BackupError { NotSupportedYet { what }, Sink(SinkError), Refused(BackupRefusal), WrongKey, NotEmpty, NoStore,
+    Superseded { generation: u32 }, AlreadyAttached, RestoreFailed { file_id: u64, reason: String }, Drill,
+    Io { op, path, kind } }
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
 ```
@@ -453,6 +468,11 @@ only, boxed `Send` futures):
 - `Transient` faults (timeouts, lost connections, server errors, throttling, downloads cut short) and `Busy` (the
   sink's queue is full) may be retried; a `put` that failed this way may have stored the object, and repeating it
   is safe. `BackupError::Sink` carries a `SinkError`.
+- **Restore.** A restore finds the store id by listing the bucket (keys start at the store id; there is no key
+  prefix) and fails with `NoStore` on none. An unfinished restore is resumed by calling `Store::restore` again
+  (Q-164 (c)). `WrongKey` comes before any file is fetched. `NotEmpty`: the directory holds files and no restore
+  record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
+  store.
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
   SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
   which the sampled download checks. Eviction (roadmap 8.1) requires one.

@@ -39,6 +39,7 @@
 //! ```
 
 mod maint;
+mod options;
 mod queue;
 pub mod recovery;
 pub mod sources;
@@ -53,6 +54,7 @@ use std::time::Duration;
 
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
 pub use maint::{create_segment, seal_segment};
+pub use options::{GenerationStart, SealListener, StartOptions};
 pub use queue::{CallSource, IngestQueue, QueueFull};
 pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
 pub use threads::{Clock, Log, Pending, SubmitError, SystemClock, Watch};
@@ -480,6 +482,12 @@ pub enum OpenError {
     /// The configuration.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// A [`StartOptions`] field that this build does not act on yet (roadmap 8.3c).
+    #[error("not supported yet: {what}")]
+    NotSupportedYet {
+        /// The field.
+        what: &'static str,
+    },
 }
 
 #[derive(Debug)]
