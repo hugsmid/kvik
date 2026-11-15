@@ -110,8 +110,9 @@ pub enum Body {
     Acknowledgement(Acknowledgement),
     /// `0x28`.
     Rebuild(Rebuild),
-    /// A record type reserved for a later roadmap item (`0x25` to `0x27`), or an unknown type with `skippable` set:
-    /// its fields as read, field 100 excepted, so that it can be carried into a rebuilt manifest.
+    /// A restore record (`0x25`, checked by `crate::restore`), a record type reserved for a later roadmap item
+    /// (`0x26`, `0x27`), or an unknown type with `skippable` set: its fields as read, field 100 excepted, so that it
+    /// can be carried into a rebuilt manifest.
     Other {
         /// The record type.
         record_type: u8,

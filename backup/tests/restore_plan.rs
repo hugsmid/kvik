@@ -480,6 +480,56 @@ fn a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap() {
     assert_eq!(p.fetch.len(), 2);
 }
 
+#[test]
+fn a_compacted_file_left_in_deep_is_listed_but_not_fetched() {
+    let comp = FileDescription {
+        kind: kind::COMPACTED,
+        class: FileClass::Revision,
+        generation: 0,
+        file_id: 1,
+        range: Some(((0, 1), (0, 20))),
+        hash: [8; 32],
+        inputs: vec![seg_ref(1)],
+    };
+    let mut rr = read_record((0, 20), &[(seg(0, 1, 1, 10), 1), (seg(0, 2, 11, 20), 2)]);
+    rr.files.insert(
+        0,
+        RestoredFile {
+            description: comp.clone(),
+            tier: Tier::Deep,
+            copy: copy_of(9),
+        },
+    );
+    rr.files.sort_by_key(|f| {
+        (
+            f.description.kind,
+            f.description.generation,
+            f.description.file_id,
+        )
+    });
+    let mut h = History::new(1);
+    h.push(rr.to_body());
+    let p = plan_of(&h);
+    assert!(
+        p.record
+            .files
+            .iter()
+            .any(|f| f.description == comp && f.tier == Tier::Deep)
+    );
+    assert_eq!(
+        p.fetch
+            .iter()
+            .map(|f| f.description.file_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(
+        p.fetch
+            .iter()
+            .all(|f| f.description.kind == kind::LOG_SEGMENT)
+    );
+}
+
 // ---- Q-108: which records a restore reads ----
 
 /// Old records, then a rebuilt manifest that carries them, cut after `upload` of its records.

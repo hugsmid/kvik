@@ -591,7 +591,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   bucket reported them (ciphertext), then its file description, in strictly ascending order of kind, generation and
   `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded. In every range
   first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
-  lost range, is a version refusal. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000
+  lost range, is a version refusal. A reader keeps a restore record's fields in the order read, as for a reserved
+  type, so it is carried unchanged; canonical writing puts them in ascending id order. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000
   listed files (Q-292).
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
