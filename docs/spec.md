@@ -707,8 +707,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
    a position set aside once stays so in every later restore. The **restored log** is the positions held by the listed
    files that are not set aside. The **restored end** is its last position before the first gap that is not a recorded
    lost range (§3) and is not followed directly by a recovery entry whose `after` is the position before the gap. Such
-   a gap is a recorded lost range before any record lists the segment holding the entry (§3 Order of a start, steps
-   4 and 6), so the end follows from the records alone, before any file is downloaded (Q-290). The
+   a gap is recorded as a lost range by the start that wrote the entry or the next one that can write (§3 Order of a
+   start, steps 4 and 6), before that segment can be sealed; with the sealed-segment record appended after that
+   start (roadmap 6.3b), the end follows from the records alone, before any file is downloaded (Q-290). The
    scan for that gap covers only the generation whose records are read, from its sequence 1; if
    that generation holds no position, the restored end is that of the restore record read. Positions of earlier
    generations at or below a recorded restored end were settled by that restore, and a file missing there is a failure
