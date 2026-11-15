@@ -18,8 +18,12 @@ the same process or another, reads up to the durable mark. It supports series de
 retirement, a change of retention class, site-zone and tzdata entries), writing (`emit`, `emit_with`, `try_emit`
 with every outcome the model backend gives) and reading facts in every view, the fact at a time, the interval of a
 fixed-length interval series and series lookup, with `refresh`, health, statistics and losses, and live state,
-windows, chart buckets and calendar results computed from the kept facts (roadmap 5.4). It decides outcomes and
-answers reads as the model backend does, checked by differential property tests. Every start rebuilds the registry from the kept
+windows, chart buckets and calendar results computed from the kept facts (roadmap 5.4). Differential property tests
+compare its outcomes, facts, live state and window, bucket and calendar results with the model backend's. Some of
+the read path is the model's own code, so those tests cannot catch a fault in it, which only the model's own tests
+cover: the node arithmetic and aggregates (`kvik_model::summary`), calendar spans (`kvik_model::calendar`), and the
+rules in `src/rules.rs` (a window's result from its node, refused aggregates, window spans, bucket steps, spans and
+contents). What is the durable backend's own is which facts are read, from the log, for each call. Every start rebuilds the registry from the kept
 log and writes the registry file (`format.md` A.16) again where it does not match; clean shutdown writes it too. **Not supported yet**, each until its roadmap
 item: consumers and routing (5.2; `ConsumerError::NotSupportedYet`), and what the model backend lacks too (below).
 
@@ -114,9 +118,10 @@ Durable backend, besides consumers:
   replace this).
 - Live state, windows, chart buckets and calendar results are evaluated from the kept facts at every call, in the
   model's exact arithmetic; no summary is stored yet (the tree of roadmap 7 serves the same calls). Calendar results
-  take local days from the time-zone rules the model embeds.
+  take local days from the time-zone rules the model embeds, not from the release `Env::tz` reports (Q-93 (c)).
 - Live staleness of an observed series is measured on the monotonic clock since its last refreshing commit in the
-  writer's process; a reader process, and a writer before its first such commit after opening, measure it in event
+  writer's process, taken when the call's acknowledgement is (a call whose acknowledgement is never taken refreshes
+  nothing); a reader process, and a writer before its first such commit after opening, measure it in event
   time (`now − t` of the live-state fact), as the model backend does after a restart (Q-16, Q-140).
 - The log's timers (group commit, mark sync, sealing) run on the process's monotonic clock, not on `Env::clock`,
   whose wall clock stamps `received_at`: a manual clock that stands still would otherwise hold a sync back.
@@ -136,6 +141,8 @@ Durable backend, besides consumers:
 
 Different from `docs/api.md`:
 
+- **`CounterRules::reset_ceiling` must be a whole number of parts per million**, on both backends: the log keeps it
+  so (`format.md` A.6), and a ceiling it cannot keep exactly is refused at definition (Q-142).
 - **Every seam trait requires `fmt::Debug`** besides `Send + Sync`, so that `Env` can be printed.
 - `Funnel` and `Reading` are plain structs, as `docs/api.md` builds them literally; every other configuration or
   result struct is `#[non_exhaustive]`, built with `new`, the setters, or `default()` and field assignment.

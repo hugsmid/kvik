@@ -34,6 +34,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
 | Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
 | Q-141 | §2.2 `received_at`, `format.md` A.7 `commit_time` | A fact's `received_at` after the wall clock steps back |
+| Q-142 | §5.5, §2.1 counter rules; `format.md` A.6 field 11 | A reset ceiling off the parts-per-million grid |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 
 ## Q-16 — Which commits refresh live staleness
@@ -83,7 +84,7 @@ refresh instant, since the writer's monotonic clock is not in the log.
 **Roadmap 5.4.** The durable backend gives live state and staleness as the model backend does (`kvik/src/durable/`
 `windows.rs` and `clock.rs`): an observed series is stale when more than S has passed on the monotonic clock since its
 last commit, in the writer's process, of a fact that is recorded, not outranked, not bad quality and not `future`
-(the instant is taken when the call is decided, just before its commit); with no such commit since the store was
+(the instant is taken when the call's acknowledgement is); with no such commit since the store was
 opened, in event time, `now − t` of the live-state fact; a scheduled series in event time, a forecast series never.
 So (a) and (b) still refresh it, as in the model, and (d) falls back to event time. A reader process has no refresh
 instant at all (objection 5, Q-140). Not settled: the owner's ruling on the proposal and its objections is pending
@@ -386,6 +387,13 @@ computes as the version in force would, given that reads are not to fail because
 **Needed.** (b) Whether the version must identify the rules (a fingerprint of the zones used) rather than the
 release name. (c) Whether a read-only writer reads as a reader does, and whether interval starts in a reader follow
 the version in force (named by the log) or the reader's own release.
+**Roadmap 5.4 (c).** The durable backend takes local days for calendar results from the zone rules the reference
+model embeds (`kvik_model::calendar::Tzdb`), in the writer's process and in a reader process alike, not from the
+release `Env::tz` reports: the `TzRelease` seam gives offsets and transitions, and the day spans of §5.7 (a midnight
+that does not exist or occurs twice, zone changes) would need a second implementation over it. So `Env::tz` names
+the release in the log, but the rules used are the embedded ones whatever it reports; with the default tzdata seam
+the two are the same. Needed with (c): whether a reader's "own release" is the seam's (then calendar spans move onto
+it) or the build's embedded rules (`kvik/src/durable/windows.rs`).
 
 ## Q-94 — Compaction in position order when the next segment is not local or is quarantined
 **Scenario.** Since Q-71 compaction takes sealed log segments in position order, and a segment at or below the last
@@ -645,6 +653,18 @@ the durable backend shows 12:00:00. Flags are stamped from the wall clock when t
 **Needed.** Which of the two texts holds: a separate `received_at` in the batch (a `format.md` change), or §2.2
 reworded to the raised value.
 
+## Q-142 — A reset ceiling off the parts-per-million grid
+**Scenario.** A counter is defined with `reset_ceiling` 0.3333335; readings 10,000,000 then 3,333,337. §5.5 with
+that ceiling: 3,333,337 is not below 0.3333335 × 10,000,000 = 3,333,335, so the decrease is a regression and
+contributes 0. The log keeps the ceiling in whole parts per million (`format.md` A.6 field 11), 333,334 after
+rounding, so a store read back from the log would take 3,333,337 < 3,333,340 as a reset contributing 3,333,337: the
+increase differs with the arithmetic used.
+**Implemented (roadmap 5.4).** Both backends refuse at definition a ceiling between 0 and 1 that does not survive
+the round trip through parts per million (`DefineError::Invalid` naming `counter`); every ceiling of at most six
+decimal places is kept exactly (`kvik/tests/api.rs`, `a_reset_ceiling_off_the_parts_per_million_grid_is_refused`).
+**Needed.** Whether the refusal stands in `spec.md` §5.5 and `api.md` Series, or the field holds the ratio exactly
+(the `f64` bits or a rational, a `format.md` change).
+
 ## Q-170 — Durability levels chosen per source
 
 Decided by the owner: a source may choose between the default level, where a reading is acknowledged only after the
@@ -677,7 +697,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 and Q-141.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 to Q-142.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -713,6 +733,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
 | Q-140 | 5.6 | Gate, with the ruling on Q-16; recorded by roadmap 5.4 |
 | Q-141 | 5.6 | Gate; recorded by roadmap 5.4 |
+| Q-142 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

@@ -12,7 +12,7 @@ use kvik::{
     Aggregate, Backend, CalendarPeriod, CalendarWindow, ChangedAtKind, ChartData, CounterRules,
     Intent, IntervalLength, Kind, Live, LocalDate, LogConfig, Position, Quality, Reader,
     ReaderConfig, Reading, Resolution, SeriesId, SeriesSpec, Span, StateValues, Store, StoreConfig,
-    Timing, Value, ValueType, Window, ZoneName,
+    Timestamp, Timing, Value, ValueType, Window, ZoneName,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -56,6 +56,9 @@ fn specs() -> Vec<SeriesSpec> {
         number(counter())
             .name("w/c/wraps")
             .counter(CounterRules::new(Some(100.0), 0.25)),
+        number(counter())
+            .name("w/c/third")
+            .counter(CounterRules::new(None, 0.333_333)),
         number(Kind::State {
             values: StateValues::Named(vec!["off".into(), "on".into(), "auto".into()]),
         })
@@ -95,11 +98,51 @@ enum Step {
     SiteZone(usize, i64),
 }
 
-const ZONES: [&str; 3] = ["Europe/London", "Asia/Kolkata", "America/New_York"];
+const ZONES: [&str; 4] = [
+    "Europe/London",
+    "Asia/Kolkata",
+    "America/New_York",
+    "America/Havana",
+];
+
+/// Where a history starts, in which site zone, and the local day and month it starts in: so that windows and
+/// calendar results cross a change to summer time (London, 29 March 2026 at 01:00Z), a month edge (1 February 2026
+/// at 00:00Z), and a local midnight that occurs twice (Havana, 2 November 2025: the day starts at 04:00Z; New York
+/// leaves summer time at 06:00Z).
+const STARTS: [(&str, &str, (i16, u8, u8)); 4] = [
+    ("2026-01-05T12:00:00Z", "Europe/London", (2026, 1, 5)),
+    ("2026-03-29T00:30:00Z", "Europe/London", (2026, 3, 29)),
+    ("2026-02-01T00:10:00Z", "Europe/London", (2026, 2, 1)),
+    ("2025-11-02T05:00:00Z", "America/Havana", (2025, 11, 2)),
+];
+
+/// A history's start.
+#[derive(Clone, Copy, Debug)]
+struct Case {
+    base: Timestamp,
+    zone: &'static str,
+    date: (i16, u8, u8),
+}
+
+impl Case {
+    fn of(i: usize) -> Self {
+        let (base, zone, date) = STARTS[i];
+        Case {
+            base: base.parse().unwrap(),
+            zone,
+            date,
+        }
+    }
+
+    /// Seconds after the start.
+    fn at(&self, secs: i64) -> Timestamp {
+        self.base + Span::from_secs(secs)
+    }
+}
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     let reading = (
-        0usize..12,
+        0usize..13,
         // Mostly the last two hours, some ahead of the clock (future facts) and some far behind (late facts).
         prop_oneof![
             8 => -7_200i64..120,
@@ -122,7 +165,15 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
 
 /// A reading of series `i` from its codes: values that rise, fall back (counter resets and regressions), carry no
 /// value or are bad, at a `t` on the series' phase.
-fn reading(id: SeriesId, spec: &SeriesSpec, secs: i64, v: u8, q: u8, changed: u64) -> Reading {
+fn reading(
+    case: &Case,
+    id: SeriesId,
+    spec: &SeriesSpec,
+    secs: i64,
+    v: u8,
+    q: u8,
+    changed: u64,
+) -> Reading {
     let mut t = secs;
     if let Kind::Interval {
         length: IntervalLength::Fixed { d, phase },
@@ -130,7 +181,8 @@ fn reading(id: SeriesId, spec: &SeriesSpec, secs: i64, v: u8, q: u8, changed: u6
     } = &spec.kind
     {
         let (d, phase) = (d.as_secs() as i64, phase.as_secs() as i64);
-        t -= (t - phase).rem_euclid(d);
+        let base = case.base.as_nanos() / 1_000_000_000;
+        t -= (base + t - phase).rem_euclid(d);
     }
     let value = match (&spec.kind, v % 16) {
         (_, 15) => Value::Absent,
@@ -151,29 +203,44 @@ fn reading(id: SeriesId, spec: &SeriesSpec, secs: i64, v: u8, q: u8, changed: u6
         Quality::Estimated,
         Quality::Bad,
     ][usize::from(q % 4)];
-    let mut r = Reading::new(id, at(t), value).with_quality(quality);
+    let mut r = Reading::new(id, case.at(t), value).with_quality(quality);
     if spec.versioned.is_some() {
         r = r.changed_at(changed);
     }
     r
 }
 
+/// How [`queries`] treats what differs between the backends by design.
+#[derive(Clone, Copy)]
+struct Compare {
+    /// The wall clock stepped back in the history: `received_at` differs (Q-141) and is cleared in facts.
+    wall_back: bool,
+    /// The live staleness of an observed series is replaced by its event-time value at this `now`, as a reader
+    /// process measures it (Q-140), so that the reader process's own value is checked against it.
+    event_time: Option<Timestamp>,
+}
+
 /// Every query result, in a comparable form. Positions and `late` differ between the backends by design
-/// (`tests/durable.rs`), and so does `received_at` after the wall clock steps back (the durable log keeps the
-/// batch's commit time, which never runs backwards); they are cleared in facts.
+/// (`tests/durable.rs`) and are cleared in facts.
 fn queries(
     r: &Reader,
+    case: &Case,
     ids: &[SeriesId],
     specs: &[SeriesSpec],
-    observed_stale: bool,
+    cmp: Compare,
 ) -> Vec<String> {
+    let at = |secs| case.at(secs);
     let mut out = Vec::new();
     let clean = |mut f: kvik::Fact| {
         f.position = Position::ORIGIN;
         f.flags.late = false;
-        f.received_at = kvik::Timestamp(0);
+        if cmp.wall_back {
+            f.received_at = Timestamp(0);
+        }
         f
     };
+    let (year, month, day) = case.date;
+    let today = CalendarPeriod::Day(LocalDate::new(year, month, day));
     let windows = [
         Window::rolling(Duration::from_secs(60)),
         Window::rolling(Duration::from_secs(3_600)),
@@ -185,12 +252,11 @@ fn queries(
         Window::calendar(CalendarWindow::SinceMidnight),
         Window::calendar(CalendarWindow::ThisMonth),
         Window::calendar(CalendarWindow::Day(1)),
+        Window::calendar(CalendarWindow::Day(-1)),
         Window::calendar(CalendarWindow::Month(-1)),
-        Window::calendar(CalendarWindow::Period(CalendarPeriod::Day(LocalDate::new(
-            2026, 1, 5,
-        )))),
+        Window::calendar(CalendarWindow::Period(today)),
         Window::Calendar {
-            window: CalendarWindow::Period(CalendarPeriod::Day(LocalDate::new(2026, 1, 5))),
+            window: CalendarWindow::Period(today),
             zone: Some(ZoneName::new("Asia/Kolkata")),
         },
         Window::Calendar {
@@ -223,10 +289,13 @@ fn queries(
         }
         let live = match r.live(*id) {
             Ok(Live::Value(mut v)) => {
-                v.fact = clean(v.fact);
-                if !observed_stale && spec.timing == Timing::Observed {
-                    v.stale = false;
+                if let Some(now) = cmp.event_time
+                    && spec.timing == Timing::Observed
+                {
+                    let limit = r.series(*id).unwrap().staleness;
+                    v.stale = limit.is_some_and(|s| now.0 - v.fact.t.0 > s.as_nanos() as i64);
                 }
+                v.fact = clean(v.fact);
                 format!("{v:?}")
             }
             other => format!("{other:?}"),
@@ -256,38 +325,43 @@ fn queries(
         }
         out.push(format!(
             "{id} month {:?}",
-            r.calendar(
-                *id,
-                CalendarPeriod::Month {
-                    year: 2026,
-                    month: 1
-                },
-                Aggregate::Count
-            )
+            r.calendar(*id, CalendarPeriod::Month { year, month }, Aggregate::Count)
         ));
     }
     out
 }
 
-/// A history on a store: the results of every query at the middle and at the end.
+/// A history on a store: the series ids and the results of every query at the middle and at the end.
 fn run(
     s: &Store,
     clock: &ManualClock,
+    case: &Case,
     history: &[Step],
     reader: impl Fn() -> Reader,
-) -> Vec<String> {
+) -> (Vec<SeriesId>, Vec<String>) {
     let specs = specs();
     let ids: Vec<SeriesId> = specs
         .iter()
         .map(|spec| block_on(s.define_series(spec.clone())).unwrap())
         .collect();
-    let mut out = Vec::new();
+    // A reset ceiling the log cannot keep exactly is refused on both backends (Q-142).
+    let off_grid = number(counter())
+        .name("w/c/off-grid")
+        .counter(CounterRules::new(None, 0.333_333_5));
+    let mut out = vec![format!(
+        "off-grid {:?}",
+        block_on(s.define_series(off_grid))
+    )];
+    let cmp = Compare {
+        wall_back: history.iter().any(|s| matches!(s, Step::WallBack(_))),
+        event_time: None,
+    };
     for (k, step) in history.iter().enumerate() {
         match step {
             Step::Emit(rs, revise) => {
                 let readings: Vec<Reading> = rs
                     .iter()
-                    .map(|(i, t, v, q, c)| reading(ids[*i], &specs[*i], *t, *v, *q, *c))
+                    .map(|(i, t, v, q, c)| reading(case, ids[*i], &specs[*i], *t, *v, *q, *c))
                     .collect();
                 let intent = if *revise {
                     Intent::Revise
@@ -300,15 +374,15 @@ fn run(
             Step::Advance(secs) => clock.advance(Duration::from_secs(*secs)),
             Step::WallBack(secs) => clock.jump_wall(Span::from_secs(-(*secs as i64))),
             Step::SiteZone(z, t) => {
-                block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t))).unwrap();
+                block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), case.at(*t))).unwrap();
             }
         }
         if k == history.len() / 2 {
-            out.extend(queries(&reader(), &ids, &specs, true));
+            out.extend(queries(&reader(), case, &ids, &specs, cmp));
         }
     }
-    out.extend(queries(&reader(), &ids, &specs, true));
-    out
+    out.extend(queries(&reader(), case, &ids, &specs, cmp));
+    (ids, out)
 }
 
 fn next() -> u64 {
@@ -319,26 +393,28 @@ fn next() -> u64 {
 
 #[test]
 fn durable_results_equal_the_model_s() {
-    // Each case opens a durable store and runs some thousands of queries on each backend: a 32nd of the configured
-    // cases keeps the deep runs in bounds (`.github/workflows/ci.yml`, the `deep` job).
-    let cases = (ProptestConfig::default().cases / 32).max(16);
+    // Each case opens a durable store and runs some thousands of queries on each backend: an eighth of the
+    // configured cases, at most 1,000, keeps the deep runs inside their time limit (`.github/workflows/ci.yml`, the
+    // `deep` job).
+    let cases = (ProptestConfig::default().cases / 8).clamp(16, 1_000);
     let mut runner = TestRunner::new(ProptestConfig {
         cases,
         failure_persistence: None,
         ..ProptestConfig::default()
     });
     runner
-        .run(&steps(), |history| {
+        .run(&(0..STARTS.len(), steps()), |(start, history)| {
+            let case = Case::of(start);
             let n = next();
-            let m_clock = ManualClock::new(start());
+            let m_clock = ManualClock::new(case.base);
             let model = block_on(Store::open(
-                StoreConfig::new(format!("kvik-test/windows/{n}"), "Europe/London")
+                StoreConfig::new(format!("kvik-test/windows/{n}"), case.zone)
                     .create_if_missing(true)
                     .backend(Backend::Model)
                     .env(Env::test(m_clock.clone())),
             ))
             .unwrap();
-            let d_clock = ManualClock::new(start());
+            let d_clock = ManualClock::new(case.base);
             let mut env = Env::test(d_clock.clone());
             env.fs = Arc::new(MemFs::new());
             let dir = format!("windows/{n}");
@@ -346,26 +422,35 @@ fn durable_results_equal_the_model_s() {
             log.segment_size = 16 << 20;
             log.min_sync_interval = Duration::ZERO;
             let durable = block_on(Store::open(
-                StoreConfig::new(&dir, "Europe/London")
+                StoreConfig::new(&dir, case.zone)
                     .create_if_missing(true)
                     .env(env.clone())
                     .log(log),
             ))
             .unwrap();
-            let m = run(&model, &m_clock, &history, || model.reader());
-            let d = run(&durable, &d_clock, &history, || durable.reader());
+            let (m_ids, m) = run(&model, &m_clock, &case, &history, || model.reader());
+            let (ids, d) = run(&durable, &d_clock, &case, &history, || durable.reader());
+            prop_assert_eq!(&m_ids, &ids);
             prop_assert_eq!(m.len(), d.len());
             for (a, b) in m.iter().zip(&d) {
                 prop_assert_eq!(a, b);
             }
-            // A reader process gives the same results, apart from the live staleness of observed series, which it
-            // measures in event time (Q-140). Its window clock starts at its own open, so it is compared only where
-            // the wall clock never stepped back.
+            // A reader process gives the same results; the live staleness of an observed series it measures in event
+            // time (Q-140), checked against the model's live-state fact. Its window clock starts at its own open, so
+            // it is compared only where the wall clock never stepped back (its `now` is then the wall clock).
             if !history.iter().any(|s| matches!(s, Step::WallBack(_))) {
-                let ids: Vec<SeriesId> = (1..=specs().len() as u32).map(SeriesId).collect();
                 let process = Reader::open(ReaderConfig::new(&dir).env(env.clone())).unwrap();
-                let want = queries(&model.reader(), &ids, &specs(), false);
-                let got = queries(&process, &ids, &specs(), false);
+                let cmp = Compare {
+                    wall_back: false,
+                    event_time: None,
+                };
+                let model_cmp = Compare {
+                    event_time: Some(d_clock.wall()),
+                    ..cmp
+                };
+                let want = queries(&model.reader(), &case, &ids, &specs(), model_cmp);
+                let got = queries(&process, &case, &ids, &specs(), cmp);
+                prop_assert_eq!(want.len(), got.len());
                 for (a, b) in want.iter().zip(&got) {
                     prop_assert_eq!(a, b);
                 }

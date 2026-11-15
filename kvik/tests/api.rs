@@ -1610,3 +1610,22 @@ fn reads_of_unknown_and_retired_series_on(b: Backend) {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn a_reset_ceiling_off_the_parts_per_million_grid_is_refused() {
+    for b in BACKENDS {
+        let (s, _clock) = store_on(b, "reset-ceiling");
+        let with = |name: &str, ceiling: f64| {
+            counter(name).counter(kvik::CounterRules::new(None, ceiling))
+        };
+        // The log keeps whole parts per million (`format.md` A.6, Q-142).
+        assert!(matches!(
+            block_on(s.define_series(with("a/b/off", 0.333_333_5))),
+            Err(DefineError::Invalid {
+                field: "counter",
+                ..
+            })
+        ));
+        block_on(s.define_series(with("a/b/on", 0.333_333))).unwrap();
+    }
+}
