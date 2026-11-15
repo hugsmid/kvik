@@ -317,6 +317,11 @@ struct Plan {
     /// Batches superseded by a recovery entry in a later segment whose `after` is below them: a reset that wrote its
     /// entry in a new segment and stopped before zeroing them. They are zeroed once the entry is on disk.
     superseded: Vec<(usize, usize)>,
+    /// Unused segments beyond the mark and the last in use with non-zero bytes after their header: part of the
+    /// entry's tail, deleted once the entry is on disk (Q-125, Q-320).
+    unused_dirty: Vec<usize>,
+    /// Their bytes after the header, and the commit blocks still readable in them.
+    unused_tail: (u64, u32),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,6 +374,26 @@ fn plan(
     // Complete batches beyond a readable mark of the current boot.
     // Rule 1: a recovery entry beyond the mark written by an earlier start that stopped before its mark (Q-117).
     let mut adopt_beyond: Option<(usize, usize)> = None;
+    let floor = last_in_use
+        .map_or(0, |i| segs[i].id.file_id)
+        .max(match mark {
+            MarkRead::Readable { slot, .. } => slot.file_id,
+            _ => 0,
+        });
+    let unused_dirty: Vec<usize> = (0..segs.len())
+        .filter(|&i| {
+            !segs[i].in_use()
+                && segs[i].id.file_id > floor
+                && segs[i].last_nonzero > HEADER_LEN as u64
+        })
+        .collect();
+    let unused_tail = unused_dirty.iter().fold((0u64, 0u32), |(b, c), &i| {
+        let n = u32::try_from(segs[i].tail_commits.len()).unwrap_or(u32::MAX);
+        (
+            b + (segs[i].last_nonzero - HEADER_LEN as u64),
+            c.saturating_add(n),
+        )
+    });
     // Rule selection.
     let (rule, mark_slot) = match mark {
         MarkRead::Readable { slot, .. } => {
@@ -431,6 +456,7 @@ fn plan(
                 // after it was acknowledged), may have been acknowledged (a mark sync lost with the page cache within
                 // the boot): its truncation is a reset point (`spec.md` §3 Recovery rule 1, Q-125).
                 reset = n == 1
+                    || !unused_dirty.is_empty()
                     || targets.iter().any(|&i| {
                         segs[i].id.file_id >= slot.file_id && segs[i].last_nonzero > from_of(i)
                     });
@@ -620,6 +646,8 @@ fn plan(
         last_sequence: k,
         reset,
         superseded,
+        unused_dirty,
+        unused_tail,
     };
     if let StartRule::Reboot(state) = rule {
         // The torn tail of the last segment in use: from the write offset to the last non-zero byte.
@@ -1173,7 +1201,7 @@ pub(super) fn start(
     if let Err(e) = fs.sync_dir(&log_dir) {
         return ro(fault(FaultOp::Sync, &log_dir, &e), report);
     }
-    for &i in &to_delete {
+    for &i in to_delete.iter().filter(|i| !p.unused_dirty.contains(i)) {
         if let Err(e) = fs.remove_file(&segs[i].path) {
             return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
         }
@@ -1338,6 +1366,10 @@ pub(super) fn start(
             }
         } else {
             let (tail_bytes, readable) = p.tail.map_or((0, 0), |(_, s, e, c)| (e - s, c));
+            let (tail_bytes, readable) = (
+                tail_bytes + p.unused_tail.0,
+                readable.saturating_add(p.unused_tail.1),
+            );
             stamp = ResetStamp::new_at(f_seq);
             let entry = Recovery {
                 after: p.k,
@@ -1465,7 +1497,11 @@ pub(super) fn start(
                     identity: f_seq,
                     first: None,
                     last: None,
-                    file_id: p.tail.map_or(0, |t| segs[t.0].id.file_id),
+                    file_id: p
+                        .tail
+                        .map(|t| segs[t.0].id.file_id)
+                        .or(p.unused_dirty.first().map(|&i| segs[i].id.file_id))
+                        .unwrap_or(0),
                     bytes: tail_bytes,
                     readable_commits: readable,
                     recorded: true,
@@ -1476,6 +1512,12 @@ pub(super) fn start(
                 entry,
                 adopted: false,
             });
+        }
+        for &i in &p.unused_dirty {
+            if let Err(e) = fs.remove_file(&segs[i].path) {
+                return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
+            }
+            report.deleted.push(segs[i].id.file_id);
         }
         // Step 6: the mark, updated in place (or created), synced with the directory.
         let (entry_file, entry_end) = match &new_open {

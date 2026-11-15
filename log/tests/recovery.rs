@@ -252,9 +252,9 @@ impl Rig {
         out
     }
 
-    /// Whether an unsealed segment in use holds a non-zero byte beyond the mark: past its offset in the mark's
-    /// segment, past the header in a later one. An unused segment is deleted, and seal blocks that hold in a segment
-    /// not the last in use are sealed again, neither a reset point (`format.md` A.4 States recovery may find, Q-320).
+    /// Whether an unsealed segment holds a non-zero byte beyond the mark: past its offset in the mark's segment, past
+    /// the header in a later one, in use or not (Q-125, Q-320). Seal blocks that hold in a segment not the last in use
+    /// are sealed again, not a reset point (`format.md` A.4 States recovery may find).
     fn nonzero_beyond(&self, m: &MarkSlot) -> bool {
         let segs: Vec<(SegmentName, Vec<u8>)> = self
             .fs
@@ -286,7 +286,7 @@ impl Rig {
             .max();
         segs.iter().any(|(n, bytes)| {
             let (in_use, seal_holds) = report(n, bytes);
-            if n.file_id < m.file_id || !in_use || (seal_holds && Some(n.file_id) != last_in_use) {
+            if n.file_id < m.file_id || (in_use && seal_holds && Some(n.file_id) != last_in_use) {
                 return false;
             }
             let from = if n.file_id == m.file_id {
@@ -1607,6 +1607,16 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                 let extra = usize::from(rep.entry.as_ref().is_some_and(|e| !e.adopted));
                 assert_eq!(after.len(), kept.len() + extra);
                 assert_eq!(after[..kept.len()].iter().collect::<Vec<_>>(), kept);
+                // The dropped batches are the adopted entry's reported tail.
+                let dropped = before.len() - kept.len();
+                if let Some(e) = rep.entry.as_ref().filter(|_| dropped > 0) {
+                    assert!(e.entry.tail_bytes > 0, "{:?}", e.entry);
+                    assert!(
+                        e.entry.readable_commits as usize >= dropped,
+                        "{:?}",
+                        e.entry
+                    );
+                }
             }
             StartRule::FirstStart => assert!(before.is_empty()),
         }
@@ -2426,9 +2436,9 @@ fn kill_cycle(
 }
 
 /// Found by the kill loop: the process stops after taking the segment created ahead into use, and a remount keeps a
-/// torn first batch but not the header rewrite; the segment is unused and deleted, with no reset point (Q-320).
+/// torn first batch but not the header rewrite; the unused segment's bytes are a reset point (Q-125, Q-320).
 #[test]
-fn kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a_reset() {
+fn kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_a_reset_point() {
     let cycles = [kill_cycle(
         &[(1, false)],
         Fault::Stop(2),
@@ -2511,6 +2521,119 @@ fn kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it() {
         ),
     ];
     kill_loop(&cycles, false, true);
+}
+
+/// The kill loop's torn batch in a segment never taken into use, the next start cut at every operation: the bytes
+/// are reported by a recovery entry before the segment is deleted (Q-125, Q-320).
+#[test]
+fn a_torn_batch_in_a_segment_never_taken_into_use_is_reported_before_it_is_deleted() {
+    let seg = log_path("00000000-0000000000000001.open");
+    for n in 0..40 {
+        let mut r = Rig::new(WriterConfig {
+            mark_sync: MarkSync::EveryCommit,
+            ..cfg()
+        });
+        r.fs.crash_after(2);
+        r.submit(vec![fact(0, 0)]);
+        r.step();
+        assert!(r.acked.is_empty());
+        r.w = None;
+        r.fs.power_loss_partial(10_536_856_019_055_052_379);
+        r.fs.restart();
+        let bytes = r.fs.read(&seg).unwrap();
+        assert_eq!(
+            kvik_log::header::FileHeader::decode(&bytes).map(|h| h.base_sequence),
+            Some(0)
+        );
+        assert!(bytes[HEADER_LEN..].iter().any(|&b| b != 0));
+        r.fs.crash_after(n);
+        let cut = r.open();
+        if cut.is_none() {
+            r.kill();
+            r.open().expect("the next start finishes");
+        }
+        r.check_started();
+        assert!(r.fs.read(&seg).is_none(), "cut after {n}: deleted");
+        let entries: Vec<_> = r
+            .batches()
+            .into_iter()
+            .filter_map(|b| match b.items.as_slice() {
+                [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "cut after {n}");
+        assert_eq!(entries[0].after, 0);
+        assert!(entries[0].tail_bytes > 0, "cut after {n}: {:?}", entries[0]);
+    }
+}
+
+/// A damaged header in an unused segment beyond the mark: a reset point when bytes follow it, as any non-zero byte
+/// beyond the mark is; with zeros after it nothing was written there and the segment is only deleted (Q-320).
+#[test]
+fn a_damaged_header_beyond_the_mark_is_a_reset_point_only_with_bytes_after_it() {
+    for written in [false, true] {
+        let mut r = Rig::new(WriterConfig {
+            mark_sync: MarkSync::EveryCommit,
+            ..cfg()
+        });
+        r.submit(vec![fact(1, 0)]);
+        r.drain();
+        let m = r.mark().unwrap();
+        r.w = None;
+        let ahead = log_path(
+            &SegmentName {
+                generation: 0,
+                file_id: m.file_id + 1,
+                sealed: false,
+            }
+            .to_string(),
+        );
+        r.fs.poke(&ahead, 8, &[0xff; 8]);
+        if written {
+            r.fs.poke(&ahead, 400, &[0x5a; 64]);
+        }
+        r.kill();
+        let rep = r.open().unwrap();
+        assert_eq!(rep.rule, StartRule::SameBoot);
+        assert_eq!(rep.entry.is_some(), written, "{rep:?}");
+        assert_eq!(
+            rep.losses
+                .iter()
+                .any(|l| l.kind == LossKind::PossibleLoss && l.bytes > 0),
+            written
+        );
+        assert!(rep.deleted.contains(&(m.file_id + 1)));
+        r.check_started();
+    }
+}
+
+/// A damaged header and a damaged only batch in the mark's segment, the start cut at every operation: the positions
+/// up to the mark's are a recorded `data_lost` before and after the segment is deleted (`spec.md` §3 Recovery rule 2).
+#[test]
+fn a_damaged_header_and_batch_in_the_marks_segment_are_a_recorded_loss_at_every_cut() {
+    let seg = log_path("00000000-0000000000000001.open");
+    for n in 0..40 {
+        let mut r = Rig::new(WriterConfig {
+            mark_sync: MarkSync::EveryCommit,
+            ..cfg()
+        });
+        r.submit(vec![fact(1, 0)]);
+        r.drain();
+        assert_eq!(r.mark().unwrap().file_id, 1);
+        r.w = None;
+        r.fs.poke(&seg, 8, &[0xff; 8]);
+        r.fs.poke(&seg, 64 + 40, &[0xff; 8]);
+        r.kill();
+        r.fs.crash_after(n);
+        if r.open().is_none() {
+            r.kill();
+            r.open().expect("the next start finishes");
+        }
+        let m = read_manifest(&r.fs.read(&dir().join("MANIFEST")).unwrap(), &STORE_ID).unwrap();
+        let lost: Vec<_> = m.lost_ranges().map(|l| (l.first, l.last)).collect();
+        assert_eq!(lost, vec![((0, 1), (0, 1))], "cut after {n}");
+    }
 }
 
 /// A remount within the boot can leave the next segment taken into use by its header alone (base F) while the batch

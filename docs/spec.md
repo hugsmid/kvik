@@ -218,7 +218,7 @@ A.10) is treated as a different boot. The rules apply in this order:
    unmounted or detached within the boot and the page cache lost): rule 3 applies, as for a different boot. A sealed
    segment holding positions above the mark makes the mark stale too (the mark passes every batch of a segment
    before its seal starts). When the truncated bytes hold a complete batch or any non-zero byte (a batch damaged after its sync, or a write
-   cut short), they may hold a batch that was acknowledged (a remount within the boot loses
+   cut short, an unused segment's bytes after its header included, `format.md` A.4; Q-320), they may hold a batch that was acknowledged (a remount within the boot loses
    the mark's update since its last sync with the page cache) or not (its sync or mark update failed); recovery
    cannot tell, so the truncation is a **reset point**: after it, a recovery entry is written as under rule 3, with
    K = the mark's last position, mark state readable, the truncated bytes as its tail and a new reset stamp, and the
@@ -243,7 +243,7 @@ A.10) is treated as a different boot. The rules apply in this order:
    the kept bytes or after the lost region at the tail; in a new segment when the open one is full): `after` = K, a
    new **reset stamp** (the sequence F and a random nonce, never zero; the mark carries it from then on), the
    boot id, the tail's length in bytes up to the last non-zero byte, the readable commit blocks in it (the tail reported
-   is that of the last segment in use), the mark's state, an id floor (§2.1) and the consumers whose cursor file was
+   is that of the last segment in use, with the bytes after the header of any unused segment beyond it and the mark), the mark's state, an id floor (§2.1) and the consumers whose cursor file was
    missing or unreadable.
    Positions between K and F, if any, are a lost range whose cause is a truncated tail. Positions above K may have
    been acknowledged and delivered and are assigned again (F to the entry, then from F + 1), so a recovery entry is

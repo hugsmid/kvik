@@ -65,7 +65,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
-| Q-320 | §3 Recovery rule 1, Order of a start step 2; `format.md` A.4 | Which bytes beyond a same-boot mark make a reset point |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1254,24 +1253,25 @@ with a test of the figure after a restore; with `BackupStats` (8.1d), which repo
 takes a fresh seed (`log/tests/recovery.rs`, one test each). (a) The writer takes the segment created ahead into use
 and stops before its sync; a remount within the boot keeps part of the first batch but not the header rewrite, so the
 segment is not in use (`base_sequence` 0, no complete batch) and holds non-zero bytes after its header
-(`kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a_reset`). (b) Seal blocks that hold
-lie after the last batch of the segment the mark still names, the next segment in use by its header alone
-(`kill_loop_seal_blocks_beyond_a_same_boot_mark_are_not_a_reset`). (c) A rule 1 start writes its entry in a new
-segment and stops before zeroing the batch beyond the mark; the next start finds the mark stale, adopts the entry and
-drops that batch (`kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it`).
-**Now.** The engine follows `format.md` A.4: (a) deletes the unused segment with no recovery entry, (b) seals the
-segment again, (c) drops the batch as Order of a start step 2 says. The kill loop's oracle expected a recovery entry
-for any non-zero byte in any unsealed segment beyond the mark, and every batch kept after a reboot; it now counts only
-segments in use, leaves out seal blocks that hold in a segment that is not the last in use, and expects the batches
-between an adopted entry's `after` and the entry to be dropped. No acknowledged entry is lost in any of the three: in
-(a) the header rewrite is made durable by the same sync as the batch, so a batch whose header rewrite is lost was
-never acknowledged and no reader saw it; in (b) and (c) the kill loop checks every acknowledged position.
-**Needed (owner decision pending).** §3 Recovery rule 1 says "any non-zero byte beyond the mark" without the scope
-A.4 gives; step 2 leaves out seal blocks but not unused segments. Proposed wording for rule 1: "any non-zero byte beyond the mark in a segment in use, other than
-seal blocks that hold in a segment that is not the last in use". The reference model has no headers or seal blocks
-and treats a torn batch as a torn tail with a reset; the engine's deletion in (a) matches the model's outcome for a
-write that never reached the disk. Not yet checked: a header damaged after its sync, in a segment whose batches are
-damaged too, makes that segment unused under A.4; whether a start then reports the loss or only deletes the file.
+(`kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_a_reset_point`). The start deleted it with no recovery
+entry and no report. (b) Seal blocks that hold lie after the last batch of the segment the mark still names, the next
+segment in use by its header alone (`kill_loop_seal_blocks_beyond_a_same_boot_mark_are_not_a_reset`). (c) A rule 1
+start writes its entry in a new segment and stops before zeroing the batch beyond the mark; the next start finds the
+mark stale, adopts the entry and drops that batch
+(`kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it`).
+**Settled by the owner's ruling Q-125:** any non-zero byte beyond the mark is reported. (a) The bytes after the header
+of an unused segment beyond the mark and the last segment in use are part of the recovery entry's tail: under rule 1
+a reset point with a `possible_loss`, under rule 3 counted in the entry's tail. The segment is deleted only once the
+entry is on disk, so a start cut short leaves the bytes for the next one
+(`a_torn_batch_in_a_segment_never_taken_into_use_is_reported_before_it_is_deleted`). A damaged header there counts
+the same way when bytes follow it; with zeros after it nothing was written and the file is only deleted
+(`a_damaged_header_beyond_the_mark_is_a_reset_point_only_with_bytes_after_it`). (b) Valid seal blocks are not lost
+data and are sealed again, as step 2 says. (c) The dropped batch is the adopted entry's reported tail (its bytes and
+readable commit blocks), which the kill loop checks. A damaged header and damaged batches in the mark's segment, or
+below it, are rule 2 corruption: the positions up to the mark's are a recorded `data_lost` before the file is deleted
+(`a_damaged_header_and_batch_in_the_marks_segment_are_a_recorded_loss_at_every_cut`). `spec.md` §3 Recovery rules 1
+and 3 and `format.md` A.4 say so. The reference model has no headers or seal blocks; its torn tail is a reset under
+rule 1 already.
 
 ## Open at v0.2
 
@@ -1351,7 +1351,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
-| Q-320 | 5.6 | Gate; recorded from a kill-loop failure; owner decision pending on the wording of rule 1 and step 2, and on a damaged header in a segment with no complete batch |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1596,6 +1595,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-300 | The restore record's bytes ahead of its layout | `format.md` A.14 `0x25` (settled when roadmap 8.3b was stacked on 8.3a, as the question asked: the executor writes and reads the restore record with `RestoreRecord::to_body` and `from_body`, and the provisional codec is gone; `backup/src/restore/codec.rs` keeps only the uploaded form of a record. Scenario: the provisional codec wrote a carried loss as 100 fixed bytes, which 8.3a's strict check of every `0x25` in `Record::encode` refuses, and could not carry a lost range's reset stamp (field 13). Nothing was written with it. `backup/src/restore/codec.rs` `a_restore_record_round_trips_through_an_uploaded_block`; the executor tests in `backup/tests/restore.rs`) |
 | Q-340 | Objects in the bucket that are not envelopes | `format.md` A.17 (owner's ruling when roadmap 8.3b was stacked on 8.1a's A.17: claim markers and checksum probes are unsealed objects of fixed form whose meaning lies in their key, and the only exceptions to "every object is an envelope"; this amends the Q-160 wording. The probe's content and the change of `restore/probe.rs` from a sealed random probe to it were decided at the stacking, under the ruling. A claim marker is the 12 bytes of A.17, read only by whether its key exists (Q-163); a checksum probe is the 19 ASCII bytes `kvik checksum probe` under a fresh `<sid>/probe/<nonce>`, stored only by a bucket that is refused. Scenario: A.17 said every object is an envelope while the restore executor put claim markers unsealed and sealed a random checksum probe; a sealed probe binds nothing a refused bucket's stray object needs, and a marker's store id and generation are already in its key. Neither holds any of the store's data. `backup/src/restore/probe.rs`; `backup/tests/restore_guards.rs` `a_bucket_without_checksum_checks_is_refused_before_the_claim_and_a_drill_does_not_probe`) |
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
+| Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3; `format.md` A.4 (settled by the owner's ruling Q-125: the bytes after the header of an unused segment beyond the mark are reported in the recovery entry's tail before the file is deleted; valid seal blocks are not) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
