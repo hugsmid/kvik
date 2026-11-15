@@ -823,9 +823,9 @@ fn a_timed_seal_takes_the_next_segment_into_use_without_moving_the_mark() {
     let segs = segments(&h.fs, true);
     let (n1, _) = &segs[&1];
     assert!(n1.sealed);
-    let (n2, b2) = &segs[&2];
+    let (n2, bytes2) = &segs[&2];
     assert!(!n2.sealed);
-    assert_eq!(FileHeader::decode(b2).unwrap().base_sequence, 2);
+    assert_eq!(FileHeader::decode(bytes2).unwrap().base_sequence, 2);
     assert_eq!(
         durable_mark(&h.fs),
         before,
