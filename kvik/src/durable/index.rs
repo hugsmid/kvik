@@ -174,7 +174,7 @@ impl Index {
         let first = region
             .last_sequence_before
             .or(before.map(|(p, _)| p.sequence))
-            .map_or(1, |s| s + 1);
+            .map_or(1, |s| s.saturating_add(1));
         let last = region
             .first_sequence_after
             .map_or(durable.sequence, |s| s.saturating_sub(1));
@@ -192,7 +192,7 @@ impl Index {
             first: Some(Position::new(g, first)),
             last: Some(Position::new(g, last)),
             file_id: Some(file_id),
-            bytes: region.end - region.start,
+            bytes: region.end.saturating_sub(region.start),
             readable_commit_blocks: 0,
             mark_state: MarkState::Readable,
             boot_id: None,
@@ -213,7 +213,7 @@ impl Index {
         if let Some(l) = self.found.last_mut()
             && l.commit_time_after.is_none()
             && l.last
-                .is_some_and(|p| log_pos(p).sequence + 1 == b.first.sequence)
+                .is_some_and(|p| log_pos(p).sequence.checked_add(1) == Some(b.first.sequence))
         {
             l.commit_time_after = Some(Timestamp(b.commit_time));
         }
