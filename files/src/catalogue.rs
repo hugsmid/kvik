@@ -4,14 +4,16 @@
 //!
 //! The fold is [`Catalogue::apply`]; it refuses a record that contradicts the records before it and then changes
 //! nothing. A file a record retires without any record having published it is entered as retired: every record
-//! that names a file repeats its description, so the retirement alone says what the file was.
+//! that names a file repeats its description, so the retirement alone says what the file was. A record of a type
+//! whose layout a later roadmap item gives (restore, quarantine, tier move) or of an unknown skippable type changes
+//! nothing here until its item lays it out; so a quarantined file stays listed as live until roadmap 8.1.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 
 use crate::desc::{FileDescription, FileRef, kind};
-use crate::record::{Body, Rebuild, Record, record_type};
+use crate::record::{Body, Rebuild, Record};
 
 /// A storage tier (`spec.md` §8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -104,9 +106,6 @@ pub enum CatalogueError {
         /// The input.
         input: FileRef,
     },
-    /// A record type whose layout a later roadmap item gives.
-    #[error("record type {0:#04x} is not laid out yet")]
-    NotLaidOut(u8),
 }
 
 /// The fold of a manifest's records.
@@ -151,13 +150,6 @@ impl Catalogue {
         match &r.body {
             Body::Publish(p) => self.check_publish(&p.published, &p.retired),
             Body::Sealed(s) => self.check_publish(s, &[]),
-            Body::Other {
-                record_type,
-                skippable,
-                ..
-            } if !skippable || record_type::is_reserved(*record_type) => {
-                Err(CatalogueError::NotLaidOut(*record_type))
-            }
             _ => Ok(()),
         }
     }

@@ -2,3 +2,4 @@
 log/tests/golden/*.open binary
 log/tests/golden/*.kvl binary
 log/tests/golden/*.mark binary
+files/tests/golden/*.manifest binary

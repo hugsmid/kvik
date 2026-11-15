@@ -92,7 +92,7 @@ proptest! {
         let want = Catalogue::replay(&h.records).unwrap();
         prop_assert_eq!(live(&p.catalogue), live(&want));
         prop_assert_eq!(retired(&p.catalogue), retired(&want));
-        prop_assert!(p.discard.is_empty() && p.undecided.is_empty());
+        prop_assert!(p.discard.is_empty());
         prop_assert_eq!(p.unlocated().count(), 0);
         let rb = p.rebuild_record().unwrap();
         prop_assert_eq!(rb.identities_rebuilt, 0);
@@ -364,15 +364,134 @@ fn q103_a_a_corrupt_merge_whose_output_does_not_verify_is_discarded_and_its_inpu
 }
 
 #[test]
-fn q103_a_an_output_whose_live_inputs_are_not_local_is_undecided_and_kept() {
+fn q103_a_an_output_whose_inputs_are_not_local_is_live_from_its_named_inputs_alone() {
+    // A corrupt merge whose input has left the local tiers: an input leaves only once its replacement is verified
+    // in another tier, so the output is live and its inputs retired without a local verification.
     let mut h = store();
     h.files.retain(|f| f.description.file_ref() != comp_ref(1));
     let (_, img) = image_with_corrupt(&h, &[merge_index(&h)]);
-    let p = plan(&input(&img, &h), &FakeVerifier::default()).unwrap();
-    assert_eq!(p.undecided, vec![comp_ref(4)]);
+    let v = FakeVerifier {
+        bad: [comp_ref(4)].into(),
+    };
+    let p = plan(&input(&img, &h), &v).unwrap();
     let l = live(&p.catalogue);
-    assert!(l.contains(&comp_ref(1)) && l.contains(&comp_ref(3)) && !l.contains(&comp_ref(4)));
-    assert_eq!(p.locations[&comp_ref(1)], Location::Unlocated);
+    assert!(l.contains(&comp_ref(4)) && !l.contains(&comp_ref(1)) && !l.contains(&comp_ref(3)));
+    assert!(p.discard.is_empty());
+    assert_eq!(
+        live(&p.catalogue),
+        live(&Catalogue::replay(&h.records).unwrap())
+    );
+}
+
+#[test]
+fn a_loss_in_a_segment_that_fails_its_own_checks_or_with_a_retired_file_gone_is_found_again() {
+    let h = closed(play(&[
+        Step::Seal {
+            len: 6,
+            lost: Some(2),
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Seal {
+            len: 6,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Merge,
+    ]));
+    let own = index_of(&h, |b| matches!(b, Body::LostRange(_)));
+    for variant in 0..3 {
+        let mut h = h.clone();
+        match variant {
+            // The segment holding the loss fails its own hash.
+            0 => h.files[0].verified = false,
+            // A retired compacted file over the loss is removed from disk.
+            1 => h.files.retain(|f| f.description.file_ref() != comp_ref(1)),
+            // The segment is quarantined.
+            _ => h.files[0].place = Place::Quarantine,
+        }
+        let (_, img) = image_with_corrupt(&h, &[own]);
+        let p = plan(&input(&img, &h), &FakeVerifier::default()).unwrap();
+        let l = p
+            .catalogue
+            .loss((0, 2))
+            .unwrap_or_else(|| panic!("variant {variant}: the loss is lost"));
+        assert_eq!((l.record.first, l.record.last), ((0, 2), (0, 3)));
+    }
+    // A live segment on no local path (moved to deep) holds its range: no loss is made of it.
+    let mut h = h.clone();
+    h.files.retain(|f| f.description.file_ref() != seg_ref(2));
+    h.losses.push(kvik_files::rebuild::FoundLoss {
+        first: (0, 7),
+        last: (0, 12),
+        ..h.losses[0].clone()
+    });
+    let (_, img) = image_with_corrupt(&h, &[own]);
+    let p = plan(&input(&img, &h), &FakeVerifier::default()).unwrap();
+    assert!(p.catalogue.loss((0, 7)).is_none());
+    assert_eq!(p.locations[&seg_ref(2)], Location::Unlocated);
+}
+
+#[test]
+fn a_rebuild_takes_epochs_above_every_lease() {
+    let h = store();
+    let (bytes, _) = image_with_corrupt(&h, &[1]);
+    let fs = fs_with(&bytes);
+    let st = LocalState {
+        lease_epoch: 500,
+        ..state(&h)
+    };
+    let (mut app, p) = rebuild_manifest(
+        &fs,
+        &dir(),
+        STORE_ID,
+        st,
+        &FakeVerifier::default(),
+        Finality::Final,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(p.rebuild_epoch, 501);
+    assert_eq!(
+        app.append(Body::Empty, NOW).unwrap(),
+        p.records.last().unwrap().epoch + 1
+    );
+}
+
+#[test]
+fn a_rebuilt_manifest_carrying_a_restore_record_opens_again() {
+    let mut h = store();
+    for r in &mut h.records {
+        r.epoch += 1;
+        r.generation = 1;
+    }
+    h.records.insert(
+        0,
+        Record::new(
+            1,
+            1,
+            T0,
+            Body::Other {
+                record_type: record_type::RESTORE,
+                skippable: false,
+                fields: vec![(1, vec![0; 12])],
+            },
+        ),
+    );
+    let (bytes, _) = image_with_corrupt(&h, &[3]);
+    let fs = fs_with(&bytes);
+    let (app, p) = rebuild_manifest(
+        &fs,
+        &dir(),
+        STORE_ID,
+        state(&h),
+        &FakeVerifier::default(),
+        Finality::Final,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(app.catalogue(), &p.catalogue);
 }
 
 #[test]
@@ -791,6 +910,57 @@ fn q103_d_deeps_copy_replaces_what_was_reconstructed_by_appended_records() {
     assert_eq!(
         back.records.last().unwrap().record.old_epoch,
         Some(h.records[i].epoch)
+    );
+}
+
+#[test]
+fn q103_d_a_copy_of_a_merge_a_later_record_retired_the_output_of_is_taken() {
+    let h = closed(play(&[
+        Step::Seal {
+            len: 6,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Seal {
+            len: 6,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Merge,
+        Step::Seal {
+            len: 6,
+            lost: None,
+            cause_given: false,
+        },
+        Step::Compact { two: false },
+        Step::Merge,
+    ]));
+    let first_merge = merge_index(&h);
+    let (bytes, img) = image_with_corrupt(&h, &[first_merge]);
+    let fs = fs_with(&bytes);
+    let (mut app, _) = rebuild_manifest(
+        &fs,
+        &dir(),
+        STORE_ID,
+        state(&h),
+        &FakeVerifier::default(),
+        Finality::Provisional,
+        NOW,
+    )
+    .unwrap();
+    let copy = h.records[first_merge].encode().unwrap();
+    let s = resolve(&mut app, &img.corrupt[0], &Answer::Holds(copy)).unwrap();
+    assert!(matches!(s, RebuildState::Final { .. }));
+    assert_eq!(
+        live(app.catalogue()),
+        live(&Catalogue::replay(&h.records).unwrap())
+    );
+    let last = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID).unwrap();
+    assert_eq!(
+        last.records.last().unwrap().record.old_epoch,
+        Some(h.records[first_merge].epoch)
     );
 }
 

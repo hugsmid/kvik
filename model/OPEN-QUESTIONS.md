@@ -33,7 +33,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
 | Q-171 | §7 Manifest (Deep unreachable), §8 Generations, `format.md` A.14 | A provisional manifest rebuild across a restart |
-| Q-172 | §7 Manifest (rebuild step 2) | A rebuilt output whose live inputs are not local |
 | Q-173 | §7 Manifest, `api.md` | The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records |
 | Q-174 | §7 Manifest (rebuild step 3), invariant 27, `format.md` A.14 field 6 | Adjacent corrupt records read as one |
 
@@ -548,7 +547,7 @@ verified copy back in place or by a rewritten manifest (`rebuild::repair_with_co
 and wait from the answers of the mirror path and deep (`rebuild::CorruptStart`), and rebuilds the manifest from the
 local files, final or provisional (`rebuild::rebuild_manifest`); the log reads cause 5 and passes the publish and
 sealed-segment records over. The start still refuses (`StoreError::ManifestCorrupt`) until roadmap 6.3b calls these
-from step 4 and supplies the local files, the scan's losses and the sink. Open points found: Q-171 to Q-174.
+from step 4 and supplies the local files, the scan's losses and the sink. Open points found: Q-171, Q-173 and Q-174.
 **Needed.** (a) with roadmap 6.3 (6.3b), (b) and (m) with 5.2 (derived files with 6.2 and 7.1), (c) with 5.1; (k) the
 owner's decision and (n) the Linux target run, at gate 4.9.
 
@@ -637,19 +636,6 @@ rebuild is provisional (the corrupt record's generation and presumed epoch are f
 that makes it final (an empty record with a field naming the rebuild record's epoch, appended when deep answers
 that it holds none or after the copy is appended); a start that finds a provisional rebuild record with no such
 record asks deep again and holds as before. With roadmap 6.3b.
-
-## Q-172 — A rebuilt output whose live inputs are not local
-Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `rebuild::plan`).
-**Scenario.** The corrupt record merged compacted files A and B into C and retired them. C is on hot; no valid record
-names it. A and B are live by the valid records, but A is on no local path (it was evicted, the record that moved it
-being the corrupt one, or the local copy was lost). §7 step 2 makes C live and its inputs retired if C "verifies
-against them", and discards C if it does not verify; it does not say what happens when C cannot be verified because an
-input is not at hand.
-**Implemented.** C is reported as undecided (`RebuildPlan::undecided`): it is kept on disk and published by nothing; A
-and B stay live (A unlocated). No fact is lost and no epoch lists two files holding one position, but C's space is
-held and queries over A's range return an error until A is found.
-**Needed.** A rule. Proposed: verify C against A's copy in cold or deep when it is found there (A is then located), and
-until then keep C unpublished as implemented. With roadmap 6.3b.
 
 ## Q-173 — The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records
 Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `rebuild::rebuild_manifest`).

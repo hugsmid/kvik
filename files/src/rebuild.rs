@@ -16,8 +16,7 @@
 //! The seams are injected: the local files come described ([`LocalFile`]), an output is verified against its inputs
 //! by a [`Verifier`] (the §7 procedure, roadmap 6.2), and the losses come from the log's scan ([`FoundLoss`]).
 //! What a rebuild cannot settle from the local files is reported, never guessed: a file that no local path holds and
-//! whose location no valid record gives is **unlocated**; an output whose live inputs are not local is
-//! **undecided** (Q-172), kept on disk and published by nothing.
+//! whose location no valid record gives is **unlocated**.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -135,9 +134,6 @@ pub struct RebuildPlan {
     /// Outputs no valid record names that do not verify against their inputs: discarded, as an unlisted output is
     /// (`spec.md` §9 row 10), once the rebuilt manifest is synced and nothing holds removals.
     pub discard: Vec<FileRef>,
-    /// Outputs no valid record names whose live inputs are not local, so they cannot be verified (Q-172): kept on
-    /// disk, published by nothing.
-    pub undecided: Vec<FileRef>,
     /// Files under `quarantine/`: never live.
     pub quarantined: Vec<FileRef>,
     /// Local files that failed their own checksums or plaintext hash.
@@ -181,20 +177,9 @@ pub enum RebuildError {
     EpochsExhausted,
 }
 
-/// The fold of `records`, passing over records whose layouts later roadmap items give (they are carried as field
-/// lists and change nothing the catalogue holds yet).
+/// The fold of `records`, as [`Appender::open`] folds them.
 fn fold<'a>(records: impl IntoIterator<Item = &'a Record>) -> Result<Catalogue, CatalogueError> {
-    let mut c = Catalogue::new();
-    for r in records {
-        if matches!(r.body, Body::Other { .. }) {
-            let mut stand_in = r.clone();
-            stand_in.body = Body::Empty;
-            c.apply(&stand_in)?;
-        } else {
-            c.apply(r)?;
-        }
-    }
-    Ok(c)
+    Catalogue::replay(records)
 }
 
 /// How far above the highest id seen each `file_id` floor is (`format.md` A.14, rebuild record field 5).
@@ -247,7 +232,6 @@ pub fn plan(
     let mut published: Vec<FileDescription> = Vec::new();
     let mut retired: BTreeMap<FileRef, FileDescription> = BTreeMap::new();
     let mut discard = Vec::new();
-    let mut undecided = Vec::new();
     let describe = |f: &FileRef| -> Option<FileDescription> {
         old.file(*f)
             .map(|e| e.description.clone())
@@ -298,17 +282,17 @@ pub fn plan(
             live.insert(*r);
             continue;
         }
-        if live_inputs.iter().any(|i| !local.contains_key(i)) {
-            undecided.push(*r);
-            continue;
-        }
+        // Verified against its inputs where they are local. Where a live input is not, liveness follows from the
+        // named inputs alone: an input leaves the local tiers only once its replacement is verified in another
+        // tier (`spec.md` §7 inputs kept), so the output was published and verified.
+        let at_hand = live_inputs.iter().all(|i| local.contains_key(i));
         let inputs: Vec<&LocalFile> = f
             .description
             .inputs
             .iter()
             .filter_map(|i| local.get(i).copied())
             .collect();
-        if verifier.verify(f, &inputs) {
+        if !at_hand || verifier.verify(f, &inputs) {
             published.push(f.description.clone());
             live.insert(*r);
             for i in live_inputs {
@@ -334,12 +318,22 @@ pub fn plan(
         locations.insert(*f, at);
     }
 
-    // Step 3: lost ranges no valid record holds.
+    // Step 3: lost ranges no valid record holds. A position held by a file a valid record names is not missing:
+    // the scan cannot see a live log segment that is on no local path at all (moved to deep), so a range that such a
+    // segment holds is not a loss. A segment found locally, valid or not, or under `quarantine/`, is the scan's to
+    // judge.
+    let found: BTreeSet<FileRef> = input
+        .files
+        .iter()
+        .map(|f| f.description.file_ref())
+        .collect();
     let held_elsewhere = |l: &FoundLoss| {
-        old.files().any(|e| {
-            !local.contains_key(&e.description.file_ref())
-                && e.description.holds(l.first)
-                && e.description.holds(l.last)
+        old.live().any(|e| {
+            let d = &e.description;
+            d.kind == kind::LOG_SEGMENT
+                && !found.contains(&d.file_ref())
+                && d.holds(l.first)
+                && d.holds(l.last)
         })
     };
     let acks: Vec<_> = old.acknowledged_ranges().collect();
@@ -495,7 +489,6 @@ pub fn plan(
         catalogue,
         locations,
         discard,
-        undecided,
         quarantined,
         invalid,
     })
@@ -776,6 +769,34 @@ pub fn repair_with_copy(
     Ok(())
 }
 
+/// What of `body` the catalogue does not state already: a copy of the corrupt record may publish a file that a
+/// later valid record retired, or restate what the rebuild reconstructed. A publish or sealed-segment record left
+/// naming nothing is carried as an empty record with its old epoch.
+fn news(c: &Catalogue, body: Body) -> Body {
+    let known = |d: &FileDescription| c.file(d.file_ref()).is_some();
+    let gone = |d: &FileDescription| c.file(d.file_ref()).is_some_and(|e| !e.is_live());
+    match body {
+        Body::Publish(mut p) => {
+            p.published.retain(|d| !known(d));
+            p.retired.retain(|d| !gone(d));
+            if p.published.is_empty() && p.retired.is_empty() {
+                Body::Empty
+            } else {
+                Body::Publish(p)
+            }
+        }
+        Body::Sealed(mut s) => {
+            s.retain(|d| !known(d));
+            if s.is_empty() {
+                Body::Empty
+            } else {
+                Body::Sealed(s)
+            }
+        }
+        other => other,
+    }
+}
+
 /// Deep answers after a provisional rebuild (`spec.md` §7 Deep unreachable). With a copy of the corrupt record (the
 /// first corrupt span of the old manifest), the copy is appended, carried with its old epoch, so it replaces what
 /// was reconstructed; with none, the rebuild is final as it stands. Returns the state after the answer.
@@ -793,6 +814,7 @@ pub fn resolve(
         Answer::Holds(copy) => {
             let mut r = check_copy(copy, span)?;
             r.old_epoch = Some(r.old_epoch.unwrap_or(r.epoch));
+            r.body = news(app.catalogue(), r.body);
             app.append_record(r)?;
         }
     }
