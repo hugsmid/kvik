@@ -351,6 +351,31 @@ fn views_revise_and_retire_on(b: Backend) {
 }
 
 #[test]
+fn a_name_given_again_becomes_the_display_name() {
+    for b in BACKENDS {
+        let (s, _clock) = store_on(b, "alias-again");
+        let g = block_on(s.define_series(gauge("a/b/first", 1))).unwrap();
+        block_on(s.alias(g, "a/b/second")).unwrap();
+        assert_eq!(s.series(g).unwrap().name, "a/b/second");
+        // A name the series already carries, given again: a rename back.
+        block_on(s.alias(g, "a/b/first")).unwrap();
+        let info = s.series(g).unwrap();
+        assert_eq!(info.name, "a/b/first", "{b:?}");
+        assert_eq!(
+            info.names,
+            vec!["a/b/first", "a/b/second", "a/b/first"],
+            "{b:?}"
+        );
+        // A name another live series carries is refused.
+        let h = block_on(s.define_series(gauge("a/b/other", 1))).unwrap();
+        assert!(matches!(
+            block_on(s.alias(h, "a/b/second")),
+            Err(DefineError::NameInUse)
+        ));
+    }
+}
+
+#[test]
 fn the_fact_at_a_time() {
     for b in BACKENDS {
         the_fact_at_a_time_on(b);

@@ -31,7 +31,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-115 (e), (f), (j), (k), (n) | §3 Commit, Segments, Disk space, Back-pressure; `format.md` A.8, A.13 | The commit path: the points still open |
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
-| Q-123 (a), (c)–(f) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -125,8 +125,8 @@ no stored label). Requirements 1 and 4 hold for now because no lost range is rec
 one, and the registry is rebuilt after it. Requirements 2 and 3 cannot arise yet: until log segments leave the hot tier
 (roadmap 8.1) or are compacted (6.x) and checkpoints exist (7.1), the kept log holds every registry entry, and the file
 is checked, never trusted over the log. The rest of this question (requirements 1 to 4, the indexes and trees,
-invariants 5 and 8 across a lost range) moves to roadmap 6.2, the next item with derived files, as the review of 5.1
-agreed. The model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is roadmap 5.1a.
+invariants 5 and 8 across a lost range) moved to 6.2 at the 5.1 review (no derived file other than the registry
+exists before 6.2). The model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is roadmap 5.1a.
 
 ## Q-39 (f) — A crash while the restore record is written
 **Scenario.** A restore claims generation g and crashes while writing its restore record locally, leaving a torn
@@ -559,7 +559,7 @@ Not a question: the reset nonce comes from std's OS-seeded hash keys for now; it
 (`api.md` Environment seams) when the interface wires the log in.
 **Needed.** (c) with roadmap 8.3; (f) and (k) with 6.3 (deferred there at gate 4.9).
 
-## Q-123 (a), (c)–(f) — The interface on the durable log: points `spec.md` §2.2, §3 and `api.md` leave open
+## Q-123 (a), (c)–(g) — The interface on the durable log: points `spec.md` §2.2, §3 and `api.md` leave open
 Found while putting the `kvik` interface on the log (roadmap 5.1, `kvik/src/durable/`). Each part names the reading
 implemented for now; `kvik/tests/durable.rs` and `kvik/tests/api.rs` pin it.
 **Scenario.** (a) *Stamping before the commit time.* `future` and the second clause of `late` compare `t` with
@@ -577,7 +577,14 @@ at run time yet. (e) *Counts that are not in the log.* Per-series duplicates, re
 are not recorded anywhere, and a value recorded without one does not say whether it was a supplied `Absent` or a NaN
 (`absent_supplied` against D1). (f) *Definitions and ordering.* A definition resolves after its mark sync (§3 Commit);
 a second definition of the same name, or a reading of the new series, that is decided before the first is
-acknowledged would rest on an entry that may still be lost.
+acknowledged would rest on an entry that may still be lost. (g) *The id floor with both carriers unreadable.* A registry file that
+cannot be read is passed over (`format.md` A.16: the log alone suffices). A definition lost from the log (synced bytes
+damaged) is then remembered by the mark's `max_series_id` and by the registry file; if the mark is also unreadable,
+neither carries its id. What still protects it: the id floor of every recovery entry in the kept log (field 46, the
+floor at that start), every series id in a kept fact (the series' orphaned facts), and a definition still readable in
+the torn tail. A gap remains for a definition written after the last recovery entry, with no kept fact of its series:
+its id can be assigned again. This is the residual §2.1 already accepts for a disk that loses synced data ("an id
+defined only in the lost bytes can be assigned again"), here reached by damage to three files.
 **Implemented.** (a) The wall clock read when the call is decided stamps the flags; the stored `received_at` is the
 log's. (b) Settled at the review of roadmap 5.1, as the existing promise that an acknowledgement means durable
 requires: a duplicate of a reading queued by an earlier call that is not yet acknowledged resolves only when that
@@ -590,13 +597,13 @@ Recorded, late and future facts are counted from the log at every open; the othe
 (f) Calls that append an entry other than facts hold the decision lock until their mark sync returns, blocking the
 calling thread; readings are decided against acknowledged definitions only. An `emit` that waits for the clock to be
 synchronised looks again every millisecond with `std::thread::sleep` on the polling thread, as there is no event to
-wait for.
+wait for. (g) Accepted for now as the §2.1 residual; nothing further is done.
 **Needed.** A rule for each other part: (a) whether a batch's receive time may be taken before it is queued, or flags
 decided at write time on the writer thread; (c)
 whether the seam gains a monotonic clock for the engine's timers or tests take `min_sync_interval` 0; (d) the run-time
 manifest append (with roadmap 6.3 at the latest); (e) whether these counts must survive a restart, which would need
-them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread. To be
-settled at gate 5.6.
+them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
+whether the residual is accepted. To be settled at gate 5.6.
 
 ## Open at v0.2
 
@@ -643,7 +650,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
-| Q-123 (a), (c)–(f) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
+| Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

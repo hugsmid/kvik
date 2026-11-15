@@ -771,26 +771,33 @@ impl Writer {
             }
         };
         d.apply(&plan);
-        drop(d);
-        self.count(readings, &plan);
-        let decisions = plan.decisions;
+        // The call is tracked before the decision lock is released, so a later call that duplicates one of its
+        // readings always finds it (lock order: decisions, then calls in flight).
         let mut inflight = lock(&self.inflight);
         // Calls known to be acknowledged need no tracking: a later outcome resting on them is final.
         inflight.retain(|_, c| !c.acknowledged());
-        let (completion, own) = match queued {
+        let tracked = match queued {
             Some(pending) => {
                 let c = Arc::new(Completion::new(pending));
                 inflight.insert(call, c.clone());
-                (c, true)
+                Some((c, true))
             }
             // Nothing to record. A duplicate of a reading queued by an earlier call that is not yet acknowledged
             // resolves when that call does, with its result (Q-123 (b)): an acknowledgement means durable.
-            None => match plan.depends.and_then(|c| inflight.get(&c).cloned()) {
-                Some(c) => (c, false),
-                None => return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None)))),
-            },
+            None => plan
+                .depends
+                .and_then(|c| inflight.get(&c).cloned())
+                .map(|c| (c, false)),
         };
         drop(inflight);
+        drop(d);
+        #[cfg(test)]
+        tests::after_decision(&self.dir);
+        self.count(readings, &plan);
+        let decisions = plan.decisions;
+        let Some((completion, own)) = tracked else {
+            return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None))));
+        };
         let me = self.clone();
         Ok(Emitted::Queued(Queued {
             completion,
@@ -1162,4 +1169,137 @@ pub(crate) fn not_available(what: &str) -> QueryError {
 /// The reader state of a durable reader.
 pub(crate) fn refresh(r: &DurableReader) -> Result<ReaderState, QueryError> {
     r.refresh()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use super::{Emitted, Writer};
+    use crate::config::{LogConfig, StoreConfig};
+    use crate::env::{Env, ManualClock, MemFs};
+    use crate::error::EmitError;
+    use crate::series::{Kind, SeriesSpec, ValueType};
+    use crate::types::{Intent, Reading, Value};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// A pause point right after a call's decision, for the store in the given directory.
+    static AFTER_DECISION: Mutex<Option<(PathBuf, Hook)>> = Mutex::new(None);
+
+    pub(super) fn after_decision(dir: &Path) {
+        let hook = AFTER_DECISION
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(d, _)| d == dir)
+            .map(|(_, h)| h.clone());
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    /// Polls a queued call to its end on this thread.
+    fn wait(mut q: super::Queued) -> Result<crate::types::Ack, EmitError> {
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(r) = q.poll(&mut cx) {
+                return q.finish(r);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A duplicate decided while the original's call has been decided but not yet returned still finds that call
+    /// and waits for it: here the original's sync fails, so neither is acknowledged (Q-123 (b)).
+    #[test]
+    fn a_duplicate_decided_right_after_the_original_waits_for_it() {
+        let fs = MemFs::new();
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(fs.clone());
+        let mut log = LogConfig::default();
+        log.segment_size = 16 << 20;
+        let dir = PathBuf::from("durable-unit/decided");
+        let config = StoreConfig::new(&dir, "Europe/London")
+            .create_if_missing(true)
+            .env(env)
+            .log(log);
+        let w = Writer::open(&config).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let id = w.define(&spec).unwrap();
+        let reading = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+
+        // The original's batch sync is held, then fails.
+        let (sync_entered, sync_seen) = mpsc::channel::<()>();
+        let (sync_release, sync_wait) = mpsc::channel::<()>();
+        let sync_wait = Mutex::new(sync_wait);
+        let sync_armed = Arc::new(AtomicBool::new(true));
+        let failing = fs.clone();
+        let armed = sync_armed.clone();
+        fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+            let in_use = p
+                .to_str()
+                .is_some_and(|p| p.ends_with("-0000000000000001.open"));
+            if in_use && armed.swap(false, Ordering::SeqCst) {
+                sync_entered.send(()).unwrap();
+                sync_wait.lock().unwrap().recv().unwrap();
+                failing.fail_syncs(true);
+            }
+        })));
+        // The original's call pauses right after its decision.
+        let (paused_tx, paused) = mpsc::channel::<()>();
+        let (resume, resume_rx) = mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let pause_armed = AtomicBool::new(true);
+        *AFTER_DECISION.lock().unwrap() = Some((
+            dir.clone(),
+            Arc::new(move || {
+                if pause_armed.swap(false, Ordering::SeqCst) {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                }
+            }),
+        ));
+
+        let w2 = w.clone();
+        let first = reading.clone();
+        let original = std::thread::spawn(move || match w2.emit(&first, Intent::Normal, false) {
+            Ok(Emitted::Queued(q)) => wait(q),
+            Ok(Emitted::Ready(a)) => Ok(a),
+            Err(e) => Err(e),
+        });
+        paused
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the original paused after its decision");
+        // The duplicate, decided now, must wait for the original's call.
+        let duplicate = match w.emit(&reading, Intent::Normal, false) {
+            Ok(Emitted::Queued(q)) => q,
+            Ok(Emitted::Ready(a)) => panic!("acknowledged before the original: {:?}", a.outcomes),
+            Err(e) => panic!("{e:?}"),
+        };
+        resume.send(()).unwrap();
+        sync_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the original's sync started");
+        sync_release.send(()).unwrap();
+        assert!(matches!(wait(duplicate), Err(EmitError::OutcomeUnknown(_))));
+        assert!(matches!(
+            original.join().unwrap(),
+            Err(EmitError::OutcomeUnknown(_))
+        ));
+        *AFTER_DECISION.lock().unwrap() = None;
+        fs.set_sync_hook(None);
+    }
 }
