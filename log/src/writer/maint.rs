@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::batch::SegmentIdentity;
 use crate::body::{INDEX_HAS_ENTRIES, IndexRecord, SegmentIndex};
-use crate::fs::{Fs, FsFile, OpenMode};
+use crate::fs::{Fs, FsFile, OpenMode, is_sharing_error};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::name::SegmentName;
 use crate::segment::{SealSummary, encode_seal};
@@ -194,8 +194,9 @@ impl SealJob {
 /// Why a seal did not finish.
 #[derive(Debug)]
 pub enum SealError {
-    /// A length change or rename failed (another program holding the file, `format.md` A.13): retried later; the
-    /// segment stays a complete `.open` file and health is degraded (`SealBlocked`).
+    /// A length change or rename failed with a sharing error (another program holding the file, `format.md` A.13),
+    /// or the rename for lack of space: retried later; the segment stays a complete `.open` file and health is
+    /// degraded (`SealBlocked`).
     Blocked(io::ErrorKind),
     /// A write or sync failed: a write or sync failure on the log (`spec.md` §3).
     Fault(Fault),
@@ -207,6 +208,11 @@ pub enum SealError {
 /// past the last complete batch; (2) sets the length to the end marker's end; (3) `sync_all`; (4) renames `.open`
 /// to `.kvl`; (5) syncs the directory. Run again from step 1 after [`SealError::Blocked`]. `halt` is checked before
 /// every step and set on a write or sync failure, as for [`create_segment`].
+///
+/// A failed length change is blocked only for a sharing error ([`crate::fs::is_sharing_error`]); a failed rename
+/// for a sharing error or lack of space. Any other failure of either is a write failure on the log. A rename that
+/// failed although the `.open` name is gone and the `.kvl` name exists took effect and then failed its flush
+/// (`StdFs` on Windows): a failed sync, never retried (`format.md` A.13).
 pub fn seal_segment(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
     let r = seal_inner(fs, job, halt);
     if let Err(SealError::Fault(f)) = &r {
@@ -260,15 +266,27 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
         .write_at(&seal, job.end)
         .map_err(|e| f(FaultOp::Write, &e))?;
     go()?;
-    // A length change or rename that fails is retried later, whatever the error (Q-115 (m)).
-    job.file
-        .set_len(job.end + seal.len() as u64)
-        .map_err(|e| SealError::Blocked(e.kind()))?;
+    job.file.set_len(job.end + seal.len() as u64).map_err(|e| {
+        if is_sharing_error(&e) {
+            SealError::Blocked(e.kind())
+        } else {
+            f(FaultOp::Write, &e)
+        }
+    })?;
     go()?;
     job.file.sync_all().map_err(|e| f(FaultOp::Sync, &e))?;
     go()?;
-    fs.rename(&path, &segment_path(&job.log_dir, &job.id, true))
-        .map_err(|e| SealError::Blocked(e.kind()))?;
+    let sealed = segment_path(&job.log_dir, &job.id, true);
+    if let Err(e) = fs.rename(&path, &sealed) {
+        let exists = |p: &Path| fs.open(p, OpenMode::Read).is_ok();
+        return Err(if !exists(&path) && exists(&sealed) {
+            SealError::Fault(fault(FaultOp::Sync, &sealed, &e))
+        } else if is_sharing_error(&e) || e.kind() == io::ErrorKind::StorageFull {
+            SealError::Blocked(e.kind())
+        } else {
+            f(FaultOp::Write, &e)
+        });
+    }
     go()?;
     fs.sync_dir(&job.log_dir)
         .map_err(|e| SealError::Fault(fault(FaultOp::Sync, &job.log_dir, &e)))?;

@@ -842,17 +842,21 @@ fn a_timed_seal_takes_the_next_segment_into_use_without_moving_the_mark() {
     check(&h);
 }
 
-#[test]
-fn a_blocked_seal_is_retried() {
+/// A writer whose first segment is due for a timed seal at the next step, with `fault` planned first.
+fn due_for_a_seal(fault: impl FnOnce(&MemFs)) -> H {
     let mut h = H::new(WriterConfig {
         seal_interval: Duration::from_secs(1),
         ..cfg()
     });
-    h.fs.fail_nth(MemOp::Rename, ".kvl", 0, io::ErrorKind::PermissionDenied);
+    fault(&h.fs);
     h.submit(vec![fact(1, T0, 0)]);
     h.step();
     h.advance(Duration::from_secs(1));
     h.step();
+    h
+}
+
+fn assert_blocked_then_sealed(mut h: H) {
     assert!(h.w.fault().is_none());
     assert_eq!(h.w.reasons(), vec![Reason::SealBlocked { file_id: 1 }]);
     assert!(!segments(&h.fs, false)[&1].0.sealed);
@@ -861,6 +865,135 @@ fn a_blocked_seal_is_retried() {
     assert!(h.w.reasons().is_empty());
     assert!(segments(&h.fs, false)[&1].0.sealed);
     assert_eq!(h.w.stats().sealed_segments, 1);
+    check(&h);
+}
+
+#[test]
+fn a_seal_blocked_by_a_sharing_error_is_retried() {
+    // At the rename and at the length change (Q-115 (m)).
+    assert_blocked_then_sealed(due_for_a_seal(|fs| {
+        fs.fail_nth(MemOp::Rename, ".kvl", 0, io::ErrorKind::ResourceBusy)
+    }));
+    assert_blocked_then_sealed(due_for_a_seal(|fs| {
+        fs.fail_nth(MemOp::SetLen, "1.open", 0, io::ErrorKind::ResourceBusy)
+    }));
+}
+
+#[test]
+fn no_space_at_a_seal_rename_is_retried() {
+    assert_blocked_then_sealed(due_for_a_seal(|fs| {
+        fs.fail_nth(MemOp::Rename, ".kvl", 0, io::ErrorKind::StorageFull)
+    }));
+}
+
+#[test]
+fn a_failed_rename_or_length_change_of_a_seal_is_a_write_failure() {
+    // Any error that is not a sharing error (lack of space too, at the length change) is never retried
+    // (Q-115 (m)).
+    for (op, path, kind) in [
+        (MemOp::Rename, ".kvl", io::ErrorKind::PermissionDenied),
+        (MemOp::Rename, ".kvl", io::ErrorKind::Other),
+        (MemOp::SetLen, "1.open", io::ErrorKind::Other),
+        (MemOp::SetLen, "1.open", io::ErrorKind::StorageFull),
+    ] {
+        let mut h = due_for_a_seal(|fs| fs.fail_nth(op, path, 0, kind));
+        let f = h.w.fault().cloned().expect("a write failure");
+        assert_eq!((f.op, f.kind), (FaultOp::Write, kind), "{op:?} {kind:?}");
+        assert!(h.w.reasons().is_empty(), "not a blocked seal");
+        assert!(!segments(&h.fs, false)[&1].0.sealed);
+        let n = h.fs.ops().len();
+        h.advance(Duration::from_secs(10));
+        let a = h.submit(vec![fact(1, T0 + 1, 0)]);
+        h.step();
+        assert_eq!(h.done[&a], Err(CommitError::ReadOnly));
+        assert_eq!(h.fs.ops().len(), n, "no retry, nothing after the fault");
+    }
+}
+
+#[test]
+fn a_rename_whose_flush_fails_is_a_failed_sync_not_retried() {
+    // `StdFs` on Windows renames and then flushes the file; a failed flush comes back from the rename with the
+    // name already changed. Retrying would fail with not-found for ever and mask the failed sync.
+    let mut h =
+        due_for_a_seal(|fs| fs.fail_nth(MemOp::RenameFlush, ".kvl", 0, io::ErrorKind::Other));
+    let f = h.w.fault().cloned().expect("a failed sync");
+    assert_eq!(f.op, FaultOp::Sync);
+    assert!(f.path.to_string_lossy().ends_with("1.kvl"), "{:?}", f.path);
+    assert!(h.w.reasons().is_empty(), "not a blocked seal");
+    let n = h.fs.ops().len();
+    h.advance(Duration::from_secs(10));
+    h.step();
+    assert_eq!(h.fs.ops().len(), n, "never retried");
+}
+
+/// On Windows, another program's handle that does not share delete access blocks the seal's rename; once it is
+/// closed the retried seal finishes (`format.md` A.13, Q-115 (m)).
+#[cfg(windows)]
+#[test]
+fn a_seal_blocked_by_another_handle_finishes_after_its_release() {
+    use kvik_log::fs::StdFs;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = std::env::temp_dir().join(format!("kvik-log-share-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let cfg = WriterConfig {
+        seal_interval: Duration::from_secs(1),
+        ..cfg()
+    };
+    let store = StoreDir::open(fs.clone(), &root, Some(&new_store())).unwrap();
+    let mut w = LogWriter::open(store, cfg.clone(), Some(BOOT), Duration::ZERO, T0).unwrap();
+    let mut q = SharedQueue(Arc::new(Mutex::new(IngestQueue::new(cfg.ingest_queue))));
+    let create = |w: &mut LogWriter| {
+        if let Some(req) = w.segment_request(T0) {
+            let r = create_segment(&*fs, &req, &w.halt());
+            w.segment_created(r);
+        }
+    };
+    let seal = |w: &mut LogWriter, now: Duration| {
+        for job in w.take_seal_jobs(now) {
+            let r = seal_segment(&*fs, &job, &w.halt());
+            w.seal_done(job, r, now);
+        }
+    };
+    create(&mut w);
+    let call = Call::new(vec![fact(1, T0, 0)], w.config().call_limit()).unwrap();
+    q.0.lock().unwrap().push(call).unwrap();
+    let s = w.step(Duration::ZERO, T0, &mut q);
+    assert_eq!(s.done.len(), 1);
+    create(&mut w);
+    // The timed seal takes segment 2 into use and hands segment 1 over to be sealed.
+    let mut now = Duration::from_secs(1);
+    w.step(now, T0, &mut q);
+    let name = |sealed| {
+        SegmentName {
+            generation: 0,
+            file_id: 1,
+            sealed,
+        }
+        .to_string()
+    };
+    let open = root.join("log").join(name(false));
+    // Shares read and write (the engine's handle writes), not delete.
+    let other = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2)
+        .open(&open)
+        .unwrap();
+    seal(&mut w, now);
+    assert!(w.fault().is_none(), "{:?}", w.fault());
+    assert_eq!(w.reasons(), vec![Reason::SealBlocked { file_id: 1 }]);
+    assert!(open.exists());
+    drop(other);
+    now += Duration::from_secs(10);
+    w.step(now, T0, &mut q);
+    seal(&mut w, now);
+    assert!(w.fault().is_none(), "{:?}", w.fault());
+    assert!(w.reasons().is_empty());
+    assert!(root.join("log").join(name(true)).exists());
+    assert_eq!(w.stats().sealed_segments, 1);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1051,8 +1184,20 @@ fn fault() -> impl Strategy<Value = Planned> {
         1 => (0..40usize).prop_map(|k| Some((MemOp::Write, "MARK", k, io::ErrorKind::Other))),
         1 => (0..10usize).prop_map(|k| Some((MemOp::Sync, "MARK", k, io::ErrorKind::Other))),
         1 => (0..6usize).prop_map(|k| Some((MemOp::Create, ".open", k, io::ErrorKind::Other))),
-        1 => (0..4usize).prop_map(|k| Some((MemOp::SetLen, ".open", k, io::ErrorKind::Other))),
-        1 => (0..4usize).prop_map(|k| Some((MemOp::Rename, ".kvl", k, io::ErrorKind::PermissionDenied))),
+        // A seal's length change or rename: blocked by a sharing error (and the rename by lack of space), a write
+        // failure otherwise; a rename whose flush fails is a failed sync (Q-115 (m)).
+        1 => (0..4usize, prop_oneof![Just(io::ErrorKind::Other), Just(io::ErrorKind::ResourceBusy)])
+            .prop_map(|(k, e)| Some((MemOp::SetLen, ".open", k, e))),
+        1 => (
+            0..4usize,
+            prop_oneof![
+                Just(io::ErrorKind::PermissionDenied),
+                Just(io::ErrorKind::ResourceBusy),
+                Just(io::ErrorKind::StorageFull),
+            ],
+        )
+            .prop_map(|(k, e)| Some((MemOp::Rename, ".kvl", k, e))),
+        1 => (0..4usize).prop_map(|k| Some((MemOp::RenameFlush, ".kvl", k, io::ErrorKind::Other))),
         1 => (0..10usize).prop_map(|k| Some((MemOp::SyncDir, "log", k, io::ErrorKind::Other))),
     ]
 }

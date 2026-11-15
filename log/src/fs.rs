@@ -217,6 +217,14 @@ impl FsFile for StdFile {
     }
 }
 
+/// Whether `e` is a sharing error: another handle keeps the file from being renamed or resized (`format.md` A.13).
+/// On Windows these are the system errors 5 (access denied), 32 (sharing violation), 33 (lock violation) and 1224
+/// (user-mapped section); on any platform, [`io::ErrorKind::ResourceBusy`].
+pub fn is_sharing_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ResourceBusy
+        || (cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33 | 1224)))
+}
+
 #[cfg(unix)]
 fn statvfs_free(path: &Path) -> io::Result<u64> {
     let s = rustix::fs::statvfs(path).map_err(io::Error::from)?;
@@ -241,6 +249,10 @@ pub enum FaultOp {
     SyncDir,
     /// [`Fs::remove_file`].
     Remove,
+    /// The flush after a rename where the platform has no directory handle (A.13): the rename takes effect, then
+    /// the call fails, as `StdFs::rename` does on Windows when the flush fails. Planned with [`MemFs::fail_nth`]
+    /// only; never recorded as an operation of its own.
+    RenameFlush,
 }
 
 /// A recorded operation of [`MemFs`].
@@ -729,6 +741,23 @@ impl Fs for MemFs {
             from: from.to_path_buf(),
             to: to.to_path_buf(),
         });
+        // A planned failure of the flush after the rename: the rename stands, the call fails. The planned faults
+        // are consulted directly, so no crash point is used and no operation is recorded.
+        let name = to.to_string_lossy();
+        if let Some(i) = s
+            .faults
+            .iter()
+            .position(|f| f.op == FaultOp::RenameFlush && name.contains(f.path_contains.as_str()))
+        {
+            if s.faults[i].skip == 0 {
+                let f = s.faults.remove(i);
+                return Err(io::Error::new(
+                    f.kind,
+                    "injected flush failure after a rename",
+                ));
+            }
+            s.faults[i].skip -= 1;
+        }
         Ok(())
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
