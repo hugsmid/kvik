@@ -338,16 +338,20 @@ pub fn body() -> impl Strategy<Value = Body> {
                     fields,
                 }
             }),
-        (1u8..3, 1u64..20, 1u8..4, any::<u64>(), any::<[u8; 32]>()).prop_map(
-            |(kind, file_id, tier, size, sha256)| {
+        (
+            description(kind::LOG_SEGMENT),
+            1u8..4,
+            any::<u64>(),
+            any::<[u8; 32]>()
+        )
+            .prop_map(|(file, tier, size, sha256)| {
                 CopyVerified {
-                    file: FileRef { kind, file_id },
+                    file,
                     tier: tier_of(tier).unwrap(),
                     copy: DeepCopy { size, sha256 },
                 }
                 .to_body()
-            }
-        ),
+            }),
     ]
 }
 

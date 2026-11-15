@@ -549,7 +549,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
   with field 100 added; the catalogue of files does not apply one. A reserved type stays written and carried as a
   field list once laid out; only its decoding becomes strict.
-- Copy verified (`0x27`, Q-281): 1 the file, 12 bytes (kind `u8`, 3 reserved zero bytes, `file_id` `u64`); 2 the tier
+- Copy verified (`0x27`, Q-281): 1 the file, a file description (below), so the record repeats the file's kind,
+  position range and plaintext hash as every record naming a file does, and a record describing a file otherwise than
+  an earlier record is refused; 2 the tier
   holding the copy, `u8` (1 hot, 2 cold, 3 deep); 3 the object's size `u64`; 4 its SHA-256 as the bucket reported it
   (32 bytes; for deep, of the ciphertext, `spec.md` §8 Hashes). Each field exactly once; another field below `0x8000`
   is unsupported. Written only after the bucket reported that size and hash for the uploaded object. One carried
@@ -760,7 +762,7 @@ to every stored file.
 - **Local restore record (`kind = 12`).** A copy of the restore record, written by every restore beside the
   manifest's, from which a corrupt restore record is read again (`spec.md` §7 Manifest, §8 Generations).
 - **Manifest (`kind = 3`).** Framing, the empty, publish-and-retire, sealed-segment, lost-range, acknowledgement and
-  rebuild records are in A.14, and the copy-verified record (provisional, Q-281). Still to be laid out: the quarantine record and the restore record, which also carries the lost
+  rebuild records are in A.14, and the copy-verified record (Q-281). Still to be laid out: the quarantine record and the restore record, which also carries the lost
   ranges, acknowledgements and recovery-entry loss reports of the generations it restores from. Every record that
   names a file repeats its kind, position range and plaintext hash, and every record that names a loss repeats its
   identity, so that no such fact is held by one record alone once a second names it (`spec.md` §7 Manifest).

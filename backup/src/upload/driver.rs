@@ -138,7 +138,7 @@ fn queue(snap: &Catalogue) -> Vec<&FileEntry> {
 /// A fresh copy-verified record: one written since the last rebuild record, so it carries no field 100.
 fn fresh_copy(r: &Record) -> Option<FileRef> {
     match CopyVerified::from_body(&r.body) {
-        Some(Ok(c)) if r.old_epoch.is_none() && c.tier == Tier::Deep => Some(c.file),
+        Some(Ok(c)) if r.old_epoch.is_none() && c.tier == Tier::Deep => Some(c.file.file_ref()),
         _ => None,
     }
 }
@@ -321,10 +321,9 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
 
     async fn upload_file(&mut self, e: &FileEntry, now: Duration) -> Out<()> {
         let d = &e.description;
-        let file = d.file_ref();
         let key = self.keys.file(d);
         if let Some(v) = self.looked_up(&key, now).await? {
-            self.append_copy(file, v.stored())?;
+            self.append_copy(d, v.stored())?;
             self.count_upload(v.stored().size);
             return Ok(());
         }
@@ -334,17 +333,17 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         {
             let want = Stored::new(c.size, c.sha256);
             if self.sink.stat(&key).await.map_err(sink_stop)? == Some(want.clone()) {
-                return self.append_copy(file, &want);
+                return self.append_copy(d, &want);
             }
         }
         let path = self.local_path(d)?;
         let plain = self.read_local(path)?;
         if sha256(&plain) != d.hash {
-            return Err(Stop::Fail(UploadError::LocalHash { file }));
+            return Err(Stop::Fail(UploadError::LocalHash { file: d.file_ref() }));
         }
         let sealed = self.seal(&key, &plain)?;
         let v = self.put_verified(&key, sealed, now).await?;
-        self.append_copy(file, v.stored())?;
+        self.append_copy(d, v.stored())?;
         self.count_upload(v.stored().size);
         Ok(())
     }
@@ -354,9 +353,9 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         self.progress.uploaded_bytes = self.progress.uploaded_bytes.saturating_add(size);
     }
 
-    fn append_copy(&mut self, file: FileRef, s: &Stored) -> Out<()> {
+    fn append_copy(&mut self, file: &FileDescription, s: &Stored) -> Out<()> {
         let c = CopyVerified {
-            file,
+            file: file.clone(),
             tier: Tier::Deep,
             copy: DeepCopy {
                 size: s.size,

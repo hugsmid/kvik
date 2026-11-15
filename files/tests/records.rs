@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use kvik_files::catalogue::Tier;
-use kvik_files::desc::{FileClass, FileRef, kind};
+use kvik_files::desc::{FileClass, kind};
 use kvik_files::image::read;
 use kvik_files::record::{
     AckedLoss, Acknowledgement, Body, Publish, Rebuild, Record, RecordError, is_canonical,
@@ -405,14 +405,13 @@ fn golden_files_are_what_the_generator_writes_and_read_as_they_show() {
 
 fn copy_verified() -> impl Strategy<Value = CopyVerified> {
     (
-        1u8..15,
-        any::<u64>(),
+        prop_oneof![description(kind::LOG_SEGMENT), description(kind::COMPACTED)],
         prop_oneof![Just(Tier::Hot), Just(Tier::Cold), Just(Tier::Deep)],
         any::<u64>(),
         any::<[u8; 32]>(),
     )
-        .prop_map(|(kind, file_id, tier, size, sha256)| CopyVerified {
-            file: FileRef { kind, file_id },
+        .prop_map(|(file, tier, size, sha256)| CopyVerified {
+            file,
             tier,
             copy: DeepCopy { size, sha256 },
         })
@@ -434,10 +433,7 @@ proptest! {
 #[test]
 fn the_checks_of_a_copy_verified_record() {
     let good = CopyVerified {
-        file: FileRef {
-            kind: kind::LOG_SEGMENT,
-            file_id: 7,
-        },
+        file: segment(7, 1, 9),
         tier: Tier::Deep,
         copy: DeepCopy {
             size: 9,
@@ -460,7 +456,9 @@ fn the_checks_of_a_copy_verified_record() {
         CopyVerified::from_body(&with(f)).unwrap()
     };
     assert!(edit(1, vec![1; 11]).is_err());
-    assert!(edit(1, [vec![1, 0, 1, 0], vec![0; 8]].concat()).is_err());
+    let mut bad = segment(7, 1, 9).encode();
+    bad[1] = 1;
+    assert!(edit(1, bad).is_err());
     assert!(edit(2, vec![0]).is_err());
     assert!(edit(2, vec![4]).is_err());
     assert!(edit(3, vec![0; 7]).is_err());

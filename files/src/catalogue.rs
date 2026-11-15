@@ -157,6 +157,10 @@ impl Catalogue {
         match &r.body {
             Body::Publish(p) => self.check_publish(&p.published, &p.retired),
             Body::Sealed(s) => self.check_publish(s, &[]),
+            Body::Other { .. } => match CopyVerified::from_body(&r.body) {
+                Some(Ok(c)) => self.check_described(&c.file),
+                _ => Ok(()),
+            },
             _ => Ok(()),
         }
     }
@@ -250,15 +254,24 @@ impl Catalogue {
     /// A copy-verified record. A carried one (field 100) was verified before a rebuild, so it gives the copy but no
     /// verified mark (`spec.md` §7 Manifest: verified there again; Q-280).
     fn apply_copy(&mut self, c: CopyVerified, carried: bool) {
+        let f = c.file.file_ref();
         match (c.tier, carried) {
-            (Tier::Deep, false) => self.record_copy(c.file, c.tier, c.copy),
+            (Tier::Deep, false) => self.record_copy(f, c.tier, c.copy),
             (Tier::Deep, true) => {
-                if let Some(e) = self.files.get_mut(&c.file) {
+                if let Some(e) = self.files.get_mut(&f) {
                     e.deep = Some(c.copy);
                 }
             }
-            (t, false) => self.mark_verified(c.file, t),
+            (t, false) => self.mark_verified(f, t),
             (_, true) => {}
+        }
+    }
+
+    /// A record naming a file must describe it as earlier records do.
+    fn check_described(&self, d: &FileDescription) -> Result<(), CatalogueError> {
+        match self.files.get(&d.file_ref()) {
+            Some(e) if e.description != *d => Err(CatalogueError::Conflict(d.file_ref())),
+            _ => Ok(()),
         }
     }
 
@@ -497,7 +510,7 @@ mod tests {
 
     fn copy(file_id: u64, carried: bool, epoch: u64) -> Record {
         let c = CopyVerified {
-            file: segment(file_id).file_ref(),
+            file: segment(file_id),
             tier: Tier::Deep,
             copy: DeepCopy {
                 size: 10 + file_id,
@@ -552,6 +565,33 @@ mod tests {
         let e = c.file(segment(1).file_ref()).unwrap();
         assert!(e.verified.is_empty());
         assert!(e.deep.is_some());
+    }
+
+    #[test]
+    fn q281_a_copy_verified_record_describing_a_file_otherwise_is_refused() {
+        let mut c =
+            Catalogue::replay(&[Record::new(2, 0, 0, Body::Sealed(vec![segment(1)]))]).unwrap();
+        let mut other = segment(1);
+        other.hash = [9; 32];
+        let r = Record::new(
+            3,
+            0,
+            0,
+            CopyVerified {
+                file: other,
+                tier: Tier::Deep,
+                copy: DeepCopy {
+                    size: 1,
+                    sha256: [0; 32],
+                },
+            }
+            .to_body(),
+        );
+        assert_eq!(
+            c.apply(&r),
+            Err(CatalogueError::Conflict(segment(1).file_ref()))
+        );
+        assert!(c.file(segment(1).file_ref()).unwrap().deep.is_none());
     }
 
     #[test]

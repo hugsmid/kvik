@@ -565,7 +565,9 @@ pub fn fresh_copies(records: &[Record], f: FileRef) -> usize {
     records
         .iter()
         .filter(|r| r.old_epoch.is_none())
-        .filter(|r| matches!(CopyVerified::from_body(&r.body), Some(Ok(c)) if c.file == f))
+        .filter(
+            |r| matches!(CopyVerified::from_body(&r.body), Some(Ok(c)) if c.file.file_ref() == f),
+        )
         .count()
 }
 
@@ -600,13 +602,15 @@ pub fn check_order(events: &[Event], records: &[Record], live: &dyn Fn(FileRef) 
             let file_put = first_put(&keys.file(d));
             let copy = events.iter().rposition(|e| {
                 matches!(e, Event::Append(_, b)
-                    if matches!(CopyVerified::from_body(b), Some(Ok(c)) if c.file == d.file_ref()))
+                    if matches!(CopyVerified::from_body(b), Some(Ok(c)) if c.file == *d))
             });
             let copy = copy.or_else(|| {
                 // A copy-verified record whose append reported a failure but reached the disk.
                 records
                     .iter()
-                    .any(|x| matches!(CopyVerified::from_body(&x.body), Some(Ok(c)) if c.file == d.file_ref()))
+                    .any(
+                        |x| matches!(CopyVerified::from_body(&x.body), Some(Ok(c)) if c.file == *d),
+                    )
                     .then_some(0)
             });
             let (Some(fp), Some(cp)) = (file_put, copy) else {
