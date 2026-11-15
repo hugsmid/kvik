@@ -10,9 +10,10 @@
 //! return exactly the log up to the durable mark.
 //!
 //! The differences the specification allows, made explicit here:
-//! - **Recovery entries.** The model writes none; the log writes one after every start under `spec.md` §3 Recovery
-//!   rule 3, at F = K + 1 (no position is named above K here: no cursor file, derived file or lost range exists), so
-//!   every later log position is the model's plus the number of recovery entries before it.
+//! - **Recovery entries.** The model writes none; the log writes one, with a new reset stamp, after every start under
+//!   `spec.md` §3 Recovery rule 3 and after a start under rule 1 that truncates a complete batch, at F = K + 1 (no
+//!   position is named above K here: no cursor file, derived file or lost range exists), so every later log position
+//!   is the model's plus the number of recovery entries before it.
 //! - **Unacknowledged batches.** A batch whose commit was cut short may be kept or not (`spec.md` §3 Write or sync
 //!   failure, §9 rows 7 and 7a). For faults the model names, the log is made to stop at the same point; for stops at
 //!   arbitrary operations the log decides, and the model is given the fault that has the same outcome.
@@ -40,7 +41,7 @@ use std::time::Duration;
 use convert::*;
 use kvik_log::batch::SegmentIdentity;
 use kvik_log::content::{BatchContent, Item};
-use kvik_log::entries::Entry as LogEntry;
+use kvik_log::entries::{Entry as LogEntry, MarkState};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
 use kvik_log::manifest::LossCause;
 use kvik_log::mark::{MarkSlot, read_mark};
@@ -277,8 +278,10 @@ type Write = (PathBuf, u64, Vec<u8>);
 /// What the start after a crash must report.
 #[derive(Clone, Copy, Debug)]
 enum Expect {
-    /// Rule 1: nothing reported.
-    SameBoot,
+    /// Rule 1; with `Some(true)` a complete batch lay beyond the mark, so the start writes a recovery entry with a new
+    /// reset stamp and reports a possible loss (`spec.md` §3 Recovery rule 1); with `Some(false)` none did, and
+    /// nothing is reported; `None` when either may be.
+    SameBoot(Option<bool>),
     /// Rule 3: a recovery entry written, and the tail it reports.
     Reboot(Tail),
 }
@@ -329,6 +332,8 @@ struct Log {
     pending: Option<(WriteOutcome, Vec<Write>)>,
     /// The last power loss left a mark older than the last one synced (Q-122).
     mark_rolled_back: bool,
+    /// The mark as the last start found it, if readable.
+    before: Option<MarkSlot>,
     armed: Arc<Mutex<Option<Arm>>>,
 }
 
@@ -404,6 +409,7 @@ impl Log {
             acked: BTreeMap::new(),
             pending: None,
             mark_rolled_back: false,
+            before: None,
             armed,
         }
     }
@@ -411,6 +417,11 @@ impl Log {
     /// Starts the writer; every start in these histories finishes.
     fn open(&mut self, now: Duration, wall: i64) -> StartReport {
         self.w = None;
+        self.before = self
+            .fs
+            .read(&mark_path())
+            .and_then(|b| read_mark(&b, &STORE_ID).ok().flatten())
+            .map(|m| m.1);
         let store = StoreDir::open(
             Arc::new(self.fs.clone()),
             Path::new("store"),
@@ -951,7 +962,7 @@ impl World {
                 // The call is in the queue when the process stops.
                 self.log.push(items);
                 self.log.kill();
-                Expect::SameBoot
+                Expect::SameBoot(Some(false))
             }
             Fault::Crash(point) => {
                 let n = match point {
@@ -969,7 +980,8 @@ impl World {
                     );
                 }
                 self.log.kill();
-                Expect::SameBoot
+                // Before the mark moved, the batch lies complete beyond it.
+                Expect::SameBoot(Some(n < 2))
             }
             Fault::PowerLoss(outcome) => {
                 let (r, writes) =
@@ -1050,7 +1062,7 @@ impl World {
         let expect = if power {
             Expect::Reboot(Tail::Either)
         } else {
-            Expect::SameBoot
+            Expect::SameBoot(None)
         };
         self.started(&report, expect);
     }
@@ -1072,42 +1084,30 @@ impl World {
         // The log as the start left it, against the model; this also finds the recovery entries.
         self.check();
         match expect {
-            Expect::SameBoot => {
+            Expect::SameBoot(reset) => {
                 assert_eq!(report.rule, StartRule::SameBoot, "{report:?}");
-                assert!(report.losses.is_empty(), "{report:?}");
-                assert!(report.entry.is_none());
+                if let Some(reset) = reset {
+                    assert_eq!(report.entry.is_some(), reset, "a reset point: {report:?}");
+                }
+                let before = self.log.before.expect("a readable mark on the same boot");
+                match &report.entry {
+                    None => {
+                        assert!(report.losses.is_empty(), "{report:?}");
+                        assert_eq!(self.log.mark().stamp, before.stamp, "no reset");
+                    }
+                    Some(entry) => {
+                        // K is the mark's last position; the truncated batch may have been acknowledged.
+                        assert_eq!(entry.entry.after, before.last_sequence);
+                        assert_eq!(entry.entry.mark_state, MarkState::Readable);
+                        self.check_entry(report);
+                        assert_eq!(report.losses.len(), 1, "{report:?}");
+                        assert!(report.losses[0].bytes > 0);
+                    }
+                }
             }
             Expect::Reboot(tail) => {
                 assert!(matches!(report.rule, StartRule::Reboot(_)), "{report:?}");
-                let entry = report.entry.as_ref().expect("a recovery entry");
-                assert!(!entry.adopted, "nothing to adopt: every start finished");
-                assert_eq!(entry.sequence, entry.entry.after + 1, "F = K + 1");
-                assert_eq!(
-                    entry.sequence,
-                    self.log.mark().last_sequence,
-                    "the entry is the last batch"
-                );
-                // The id floor: the highest id defined, all definitions being acknowledged (§2.1).
-                let floor = self
-                    .m
-                    .disk
-                    .live_entries()
-                    .values()
-                    .filter_map(|e| match &e.body {
-                        EntryBody::Registry(RegistryEvent::Define { id, .. }) => Some(id.0),
-                        _ => None,
-                    })
-                    .max()
-                    .unwrap_or(0);
-                // A torn mark update may leave a mark older than the last one synced, and the start reads
-                // definitions only from unsealed segments: the floor may then be lower (Q-122).
-                if entry.entry.id_floor != floor {
-                    assert!(
-                        entry.entry.id_floor < floor && self.log.mark_rolled_back,
-                        "the id floor: {report:?}"
-                    );
-                }
-                self.log.mark_rolled_back = false;
+                self.check_entry(report);
                 let reported = !report.losses.is_empty();
                 match tail {
                     Tail::Either => {}
@@ -1117,21 +1117,67 @@ impl World {
                         "a torn tail is reported: {report:?}"
                     ),
                 }
-                assert!(report.losses.len() <= 1);
-                for l in &report.losses {
-                    assert_eq!(l.kind, LossKind::PossibleLoss);
-                    assert_eq!(l.cause, LossCause::TruncatedTail);
-                    assert_eq!(l.identity, entry.sequence);
-                    assert!(l.bytes > 0 || l.readable_commits > 0);
-                }
             }
+        }
+    }
+
+    /// The recovery entry a start wrote: at F = K + 1, the last batch, with the id floor and a new reset stamp that
+    /// the mark carries; at most one possible loss, identified by F.
+    fn check_entry(&mut self, report: &StartReport) {
+        let entry = report.entry.as_ref().expect("a recovery entry");
+        assert!(!entry.adopted, "nothing to adopt: every start finished");
+        assert_eq!(entry.sequence, entry.entry.after + 1, "F = K + 1");
+        let mark = self.log.mark();
+        assert_eq!(
+            entry.sequence, mark.last_sequence,
+            "the entry is the last batch"
+        );
+        let stamp = entry
+            .entry
+            .stamp
+            .expect("a recovery entry carries a reset stamp");
+        assert_eq!(stamp.sequence, entry.sequence);
+        assert_ne!(stamp.nonce, 0);
+        assert_eq!(mark.stamp, stamp, "the mark carries the entry's stamp");
+        if let Some(before) = self.log.before {
+            assert_ne!(before.stamp, stamp, "a new reset stamp");
+        }
+        // The id floor: the highest id defined, all definitions being acknowledged (§2.1).
+        let floor = self
+            .m
+            .disk
+            .live_entries()
+            .values()
+            .filter_map(|e| match &e.body {
+                EntryBody::Registry(RegistryEvent::Define { id, .. }) => Some(id.0),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        // A torn mark update may leave a mark older than the last one synced, and the start reads
+        // definitions only from unsealed segments: the floor may then be lower (Q-122).
+        if entry.entry.id_floor != floor {
+            assert!(
+                entry.entry.id_floor < floor && self.log.mark_rolled_back,
+                "the id floor: {report:?}"
+            );
+        }
+        self.log.mark_rolled_back = false;
+        assert!(report.losses.len() <= 1);
+        for l in &report.losses {
+            assert_eq!(l.kind, LossKind::PossibleLoss);
+            assert_eq!(l.cause, LossCause::TruncatedTail);
+            assert_eq!(l.identity, entry.sequence);
+            assert!(l.bytes > 0 || l.readable_commits > 0);
         }
     }
 
     fn crash(&mut self) {
         self.m.crash();
+        // A batch whose sync failed lies complete beyond the mark.
+        let reset = self.log.pending.is_some();
         self.log.kill();
-        self.restart(Expect::SameBoot);
+        self.restart(Expect::SameBoot(Some(reset)));
     }
 
     fn power_loss(&mut self) {
@@ -1153,7 +1199,7 @@ impl World {
         }
         self.m.crash();
         self.log.remount();
-        self.restart(Expect::SameBoot);
+        self.restart(Expect::SameBoot(Some(false)));
     }
 
     fn refresh(&mut self) {

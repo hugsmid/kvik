@@ -490,9 +490,10 @@ header.* A.4 keeps an unused segment as the one created ahead by its header and 
 entry's field 47 names consumers whose cursor file was missing or unreadable; cursor files are roadmap 5.2. (n)
 *Restart time.* A start reads every unsealed segment whole, and the last sealed one for its trailer, against the
 restart budget of `design.md`. (o) *A mark from the page cache under `EveryCommit`.* The order of a start syncs the
-mark only under rule 3. Under rule 1 a mark read on the same boot may not be on stable storage, yet a batch it covers
-is read and delivered at once; with the mark synced at every commit, a remount within the boot then truncates that
-batch, which syncing at every commit is said to prevent (Recovery rule 1). Found by roadmap 4.7. (p) *A header put in
+mark only when it writes a recovery entry. Otherwise, under rule 1, a mark read on the same boot may not be on stable
+storage, yet a batch it covers is read and delivered at once; with the mark synced at every commit, a remount within
+the boot then truncates that batch at a reset point, which syncing at every commit is said to avoid (Recovery rule
+1). Found by roadmap 4.7. (p) *A header put in
 use by a failed sync.* When the sync of a batch that takes a segment into use fails, the new header is in the page
 cache only; a start on the same boot keeps the segment in use from that header without writing it again, so after a
 later power loss the segment reads as unused unless a batch in it was synced since. Found by roadmap 4.7.
