@@ -1473,15 +1473,19 @@ fn dup_generator_coverage() {
 /// within the lateness bound in the past and reach days ahead, in any order.
 fn arb_timed_readings() -> impl Strategy<Value = Vec<(usize, Nanos, i32, Nanos)>> {
     proptest::collection::vec(
-        (
-            0usize..3,
-            prop_oneof![
-                -(4 * MINUTE)..(2 * MINUTE),
-                (2 * MINUTE)..(3 * kvik_model::types::DAY),
-            ],
-            -5i32..5,
-            prop_oneof![Just(0), 0..(10 * MINUTE)],
-        ),
+        prop_oneof![
+            6 => (
+                0usize..3,
+                prop_oneof![
+                    -(4 * MINUTE)..(2 * MINUTE),
+                    (2 * MINUTE)..(3 * kvik_model::types::DAY),
+                ],
+                -5i32..5,
+                prop_oneof![Just(0), 0..(10 * MINUTE)],
+            ),
+            // An observed reading more than 2 × S behind: `late` (§2.2).
+            1 => (Just(2usize), -(40 * MINUTE)..-(21 * MINUTE), -5i32..5, Just(0)),
+        ],
         1..40,
     )
 }
@@ -1600,6 +1604,26 @@ proptest! {
                 prop_assert!(!f.flags.future && !f.flags.late, "{:?}", f);
             } else {
                 prop_assert_eq!(f.flags.future, f.t > f.received_at + 60 * SECOND);
+            }
+        }
+    }
+
+    /// 24. On the observed series (S = 10 minutes, lateness bound 5
+    /// minutes) `late` holds exactly where its clauses say, the first against
+    /// the lateness reference, which no `future` fact raises (Q-74).
+    #[test]
+    fn inv24_late_against_the_lateness_reference(readings in arb_timed_readings()) {
+        let (mut m, ids) = timed_machine();
+        emit_timed(&mut m, ids, &readings);
+        let mut facts = m.facts().unwrap();
+        facts.sort_by_key(|f| f.position);
+        let mut reference: Option<Nanos> = None;
+        for f in facts.iter().filter(|f| f.series == ids[2]) {
+            let first = !f.flags.future && reference.is_some_and(|r| f.t < r - 20 * MINUTE);
+            let second = f.received_at - f.t > 5 * MINUTE;
+            prop_assert_eq!(f.flags.late, first || second, "{:?}", f);
+            if !f.flags.future && !f.flags.unsynced_clock {
+                reference = reference.max(Some(f.t));
             }
         }
     }
@@ -2003,7 +2027,8 @@ proptest! {
 /// and forecast facts must arrive more than 60 s ahead (where an observed
 /// fact is `future`) and more than 2 × S behind their series' latest `t`
 /// (where an observed fact is `late` by the first clause), and the observed
-/// series must get both flags.
+/// series must get both flags, `late` from readings well behind its lateness
+/// reference (Q-74).
 #[test]
 fn timed_generator_coverage() {
     use proptest::strategy::ValueTree;

@@ -1,8 +1,7 @@
 //! Deciding a call's outcomes before it is committed (spec §2.2 to §2.5): refusals, stamping and flags, values
 //! recorded without one, the duplicate rule and outranked facts. The reference model makes the same decisions
-//! inside its commit, which is not callable on its own; this follows it rule by rule, except where the
-//! specification has moved on (the first clause of `late` uses the lateness reference, spec §2.2), and the
-//! differential test in `tests/durable.rs` holds the two backends to the same outcomes.
+//! inside its commit, which is not callable on its own; `tests/durable_differential.rs` holds the two backends to
+//! the same outcomes and facts.
 //!
 //! Decisions are made in the order calls are queued in the log, against every fact already queued, so a call
 //! sees the calls before it whether or not their sync has returned yet.
