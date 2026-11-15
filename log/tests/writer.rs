@@ -1030,6 +1030,46 @@ fn a_creation_without_space_deletes_the_partial_file_waits_and_retries() {
 }
 
 #[test]
+fn with_free_space_unknown_a_failed_creation_is_retried_after_30_seconds() {
+    let fs = MemFs::new();
+    fs.set_free_space_unknown(true);
+    fs.set_free_space(40 << 10);
+    let mut h = H::with(cfg(), Some(BOOT), fs.clone());
+    assert!(
+        segments(&fs, false).is_empty(),
+        "the partial file is deleted"
+    );
+    assert!(h.w.fault().is_none());
+    let creations = |fs: &MemFs| {
+        fs.ops()
+            .iter()
+            .filter(|o| o.op == MemOp::Create && o.path.to_string_lossy().ends_with(".open"))
+            .count()
+    };
+    assert_eq!(creations(&fs), 1);
+    // The first check after the failure starts the 30 s; each try zero-fills until it fails, so none comes sooner.
+    let next = h.step();
+    assert_eq!(next, Some(Duration::from_secs(30)));
+    fs.set_free_space(1 << 30);
+    for s in 1..30 {
+        h.advance(Duration::from_secs(1));
+        h.step();
+        assert_eq!(creations(&fs), 1, "no new request at {s} s");
+    }
+    h.advance(Duration::from_secs(1));
+    h.step();
+    assert_eq!(creations(&fs), 2);
+    assert_eq!(
+        segments(&fs, false).keys().copied().collect::<Vec<_>>(),
+        vec![2]
+    );
+    let a = h.submit(vec![fact(1, T0, 0)]);
+    h.step();
+    assert!(h.done[&a].is_ok());
+    check(&h);
+}
+
+#[test]
 fn free_space_below_the_critical_mark_makes_ingest_wait() {
     let fs = MemFs::new();
     let mut h = H::with(

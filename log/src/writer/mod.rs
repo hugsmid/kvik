@@ -73,6 +73,9 @@ const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 /// How often the writer checks free space.
 pub const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a creation that failed for lack of space waits before it is tried again when free space is unknown:
+/// each try zero-fills until it fails, so it is not repeated every second (`spec.md` §3 Segments, Q-115 (d)).
+pub const UNKNOWN_SPACE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a blocked seal waits before it is tried again.
 pub const SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// The most entries in one call, whatever the queue's capacity (`api.md` Writing).
@@ -498,6 +501,9 @@ struct Disk {
     low: bool,
     /// A creation failed for lack of space; it is requested again when a check passes.
     creation_waits: bool,
+    /// The first check after that failure, while free space is unknown: the retry comes
+    /// [`UNKNOWN_SPACE_RETRY_INTERVAL`] later.
+    waits_since: Option<Duration>,
 }
 
 /// The writer's synchronous core. See the module documentation.
@@ -760,7 +766,8 @@ impl LogWriter {
     }
 
     /// The result of a [`SegmentRequest`]. A creation that failed for lack of space is asked for again when a
-    /// free-space check passes; any other failure makes the store read-only.
+    /// free-space check passes (free space at least `disk_critical` + `segment_size`, checked every second; with free
+    /// space unknown, [`UNKNOWN_SPACE_RETRY_INTERVAL`] later); any other failure makes the store read-only.
     pub fn segment_created(&mut self, result: Result<AheadSegment, CreateError>) {
         self.requested = false;
         match result {
@@ -775,6 +782,7 @@ impl LogWriter {
                 // The id is not reused: the next request takes a new one (A.12: never reused).
                 self.disk.creation_waits = true;
                 self.disk.checked_at = None;
+                self.disk.waits_since = None;
             }
             Err(CreateError::Fault(f)) => self.fail_with(f),
             Err(CreateError::Halted) => self.sync_halt(),
@@ -835,9 +843,16 @@ impl LogWriter {
         self.disk.critical = free.is_some_and(|f| f < self.cfg.disk_critical);
         self.disk.low = free.is_some_and(|f| f < self.cfg.disk_low_bytes);
         if self.disk.creation_waits {
-            let passes = free.is_none_or(|f| f >= self.cfg.disk_critical + self.cfg.segment_size);
+            let passes = match free {
+                Some(f) => f >= self.cfg.disk_critical + self.cfg.segment_size,
+                None => {
+                    let since = *self.disk.waits_since.get_or_insert(now);
+                    now >= since + UNKNOWN_SPACE_RETRY_INTERVAL
+                }
+            };
             if passes {
                 self.disk.creation_waits = false;
+                self.disk.waits_since = None;
             }
         }
     }
@@ -911,7 +926,10 @@ impl LogWriter {
             }
         }
         if self.disk.creation_waits {
-            at(self.disk.checked_at.unwrap_or(now) + DISK_CHECK_INTERVAL);
+            match (self.disk.free, self.disk.waits_since) {
+                (None, Some(since)) => at(since + UNKNOWN_SPACE_RETRY_INTERVAL),
+                _ => at(self.disk.checked_at.unwrap_or(now) + DISK_CHECK_INTERVAL),
+            }
         }
         if let (true, MarkSyncMode::Interval(d)) = (self.mark_dirty, self.mark_mode) {
             at(self.last_mark_sync + d);

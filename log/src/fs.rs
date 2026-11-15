@@ -304,6 +304,8 @@ pub struct MemFs {
     /// directory listing holds the state's lock while it reads each file's length, so growth must not wait for the
     /// state's lock (lock order: state, then a file, then this).
     free: Arc<Mutex<u64>>,
+    /// [`Fs::free_space`] reports no source, as on a platform without one.
+    space_unknown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for MemFs {
@@ -428,7 +430,15 @@ impl MemFs {
             })),
             hook: Arc::new(Mutex::new(None)),
             free: Arc::new(Mutex::new(1 << 40)),
+            space_unknown: Arc::default(),
         }
+    }
+
+    /// Makes [`Fs::free_space`] fail with [`io::ErrorKind::Unsupported`], as on a platform with no free-space source
+    /// (or report the free space again). Growth is still bounded by [`MemFs::set_free_space`].
+    pub fn set_free_space_unknown(&self, unknown: bool) {
+        self.space_unknown
+            .store(unknown, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Makes every later sync fail (or succeed again).
@@ -793,6 +803,15 @@ impl Fs for MemFs {
         Ok(())
     }
     fn free_space(&self, _path: &Path) -> io::Result<u64> {
+        if self
+            .space_unknown
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "free space is not available",
+            ));
+        }
         Ok(*lock(&self.free))
     }
 }
