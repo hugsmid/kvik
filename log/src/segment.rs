@@ -315,3 +315,18 @@ pub fn classify_open(
         },
     }
 }
+
+/// A sealed segment as the manifest's sealed-segment record describes it (`format.md` A.14).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedFile {
+    /// The segment.
+    pub id: SegmentIdentity,
+    /// Its length.
+    pub len: u64,
+    /// SHA-256 of the whole file's plaintext.
+    pub sha256: [u8; 32],
+    /// The first and last sequence it holds; `None` for a segment that holds none.
+    pub sequences: Option<(u64, u64)>,
+    /// The first and last commit time it holds.
+    pub commit_times: Option<(i64, i64)>,
+}

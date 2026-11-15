@@ -1,9 +1,10 @@
 //! Backup sinks for the kvik time-series store (roadmap 8.2).
 //!
-//! - [`S3Sink`] implements [`kvik::BackupSink`] over S3-compatible object
-//!   storage: Signature Version 4, single-part conditional uploads carrying
-//!   their SHA-256, read-back of the reported hash, ranged downloads, paged
-//!   listings, timeouts, and retries with backoff on its own worker threads.
+//! - [`S3Sink`] implements [`kvik_sink_api::BackupSink`] (re-exported as
+//!   `kvik::BackupSink`) over S3-compatible object storage: Signature
+//!   Version 4, single-part conditional uploads carrying their SHA-256,
+//!   read-back of the reported hash, ranged downloads, paged listings,
+//!   timeouts, and retries with backoff on its own worker threads.
 //! - [`fake::FakeBucket`] answers the same protocol subset in memory, with
 //!   injected faults, for tests.
 //! - [`verify`] turns uploads and checks into [`verify::Verified`] copies.
@@ -13,7 +14,7 @@
 //!
 //! ```
 //! use std::sync::Arc;
-//! use kvik::BackupSink;
+//! use kvik_sink_api::BackupSink;
 //! use kvik_sink::{block_on, fake::FakeBucket, verify};
 //!
 //! let bucket = FakeBucket::new();

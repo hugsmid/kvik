@@ -28,6 +28,11 @@ kvik-log = { path = "../log" }
 # The reference model: the in-memory backend (`Backend::Model`), and the
 # definition rules both backends share.
 kvik-model = { path = "../model" }
+# The backup and restore drivers (roadmap 8.1d, 8.3d) and the manifest they record in.
+kvik-backup = { path = "../backup" }
+kvik-files = { path = "../files" }
+# The backup sink trait and its types, re-exported unchanged.
+kvik-sink-api = { path = "../sinkapi" }
 # Summary nodes: the fold, merge and edge credit windows are evaluated with.
 kvik-tree = { path = "../tree" }
 thiserror = "2"

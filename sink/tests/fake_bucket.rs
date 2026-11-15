@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use kvik::{BackupSink, ListPage, SinkError, Stored};
 use kvik_sink::fake::{Checksums, FakeBucket, FakeOp, Fault};
 use kvik_sink::transport::{Request, Response, Transport, TransportError};
 use kvik_sink::verify::{self, VerifyError, sha256};
 use kvik_sink::{Addressing, RetryPolicy, S3Sink, block_on};
+use kvik_sink_api::{BackupSink, ListPage, SinkError, Stored};
 
 fn bytes(s: &[u8]) -> Arc<[u8]> {
     Arc::from(s)

@@ -15,7 +15,7 @@ categories = ["database-implementations"]
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 hmac = "0.13"
 # The `BackupSink` trait and its types.
-kvik = { path = "../kvik", default-features = false }
+kvik-sink-api = { path = "../sinkapi" }
 sha2 = "0.11"
 thiserror = "2"
 # A blocking HTTP/1.1 client over rustls, run on the sink's own worker threads

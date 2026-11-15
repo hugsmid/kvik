@@ -1,0 +1,36 @@
+[package]
+name = "kvik-backup"
+version = "0.1.0"
+description = "Backup and restore for the kvik time-series store: the envelope, object keys, upload and restore drivers"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+repository = "https://github.com/hugsmid/kvik"
+keywords = ["time-series", "backup", "restore"]
+categories = ["database-implementations"]
+
+[features]
+# The fakes in `fake`: an in-memory sink, a test envelope, a direct manifest port and scripted drivers.
+test-support = []
+
+[dependencies]
+# The envelope's cipher (roadmap 8.1b).
+chacha20poly1305 = "0.11"
+# The envelope's deterministic nonce derivation, keyed by the store key (roadmap 8.1b).
+hmac = "0.13"
+kvik-files = { path = "../files" }
+kvik-log = { path = "../log" }
+kvik-sink-api = { path = "../sinkapi" }
+sha2 = "0.11"
+thiserror = "2"
+
+[dev-dependencies]
+# The fakes, for the integration tests under `tests/`.
+kvik-backup = { path = ".", features = ["test-support"] }
+# The fake bucket with injected faults.
+kvik-sink = { path = "../sink" }
+proptest = "1"
+
+[lints]
+workspace = true

@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use kvik::BackupSink;
 use kvik_sink::block_on;
 use kvik_sink::fake::{FakeBucket, FakeOp, Fault};
 use kvik_sink::verify;
+use kvik_sink_api::BackupSink;
 
 fn main() {
     let bucket = FakeBucket::new();

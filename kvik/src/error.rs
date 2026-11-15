@@ -101,6 +101,9 @@ pub enum Fault {
         /// The file.
         path: PathBuf,
     },
+    /// The store is a drill's restore: writes are refused.
+    #[error("the store is a restore drill")]
+    Drill,
 }
 
 /// The error of one emit call; nothing was queued unless it says otherwise.
@@ -410,4 +413,46 @@ pub enum BackupError {
     /// The backup sink failed.
     #[error("backup sink: {0}")]
     Sink(#[from] crate::SinkError),
+    /// The bucket is refused at attach.
+    #[error("backup refused: {0}")]
+    Refused(crate::BackupRefusal),
+    /// The bucket's objects were sealed with another key.
+    #[error("the bucket was sealed with another key")]
+    WrongKey,
+    /// The restore directory holds files and no restore record.
+    #[error("the restore directory is not empty")]
+    NotEmpty,
+    /// The bucket holds no store.
+    #[error("the bucket holds no store")]
+    NoStore,
+    /// Another restore claimed a higher generation.
+    #[error("generation {generation} was claimed by another restore")]
+    Superseded {
+        /// The higher generation.
+        generation: u32,
+    },
+    /// A sink is attached already.
+    #[error("a backup sink is attached already")]
+    AlreadyAttached,
+    /// A restore cannot continue past a file.
+    #[error("restore of file {file_id} failed: {reason}")]
+    RestoreFailed {
+        /// The file.
+        file_id: u64,
+        /// Why.
+        reason: String,
+    },
+    /// Refused in a drill's store.
+    #[error("refused in a drill")]
+    Drill,
+    /// A local file operation failed.
+    #[error("{op} on {path:?} failed: {kind}")]
+    Io {
+        /// The operation.
+        op: &'static str,
+        /// The file.
+        path: PathBuf,
+        /// The error kind.
+        kind: io::ErrorKind,
+    },
 }

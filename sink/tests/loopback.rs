@@ -8,11 +8,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kvik::{BackupSink, SinkError};
 use kvik_sink::fake::{FakeBucket, FakeOp};
 use kvik_sink::transport::{Method, Request, Transport};
 use kvik_sink::verify::{self, sha256};
 use kvik_sink::{RetryPolicy, S3Sink, block_on};
+use kvik_sink_api::{BackupSink, SinkError};
 
 /// What the server does with a connection.
 #[derive(Clone, Copy)]

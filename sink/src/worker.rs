@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 
-use kvik::SinkError;
+use kvik_sink_api::SinkError;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 

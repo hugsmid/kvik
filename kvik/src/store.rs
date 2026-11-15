@@ -441,7 +441,7 @@ impl Store {
     }
 
     /// Attaches a backup sink (spec §8). Not supported yet.
-    pub async fn attach_backup<S: BackupSink>(
+    pub async fn attach_backup<S: BackupSink + 'static>(
         &self,
         _sink: S,
         _key: Encryption,
@@ -451,7 +451,7 @@ impl Store {
 
     /// Restores a store onto an empty directory from a sink (spec §8
     /// Restore); returns the restored end. Not supported yet.
-    pub async fn restore<S: BackupSink>(
+    pub async fn restore<S: BackupSink + 'static>(
         _dir: impl Into<PathBuf>,
         _sink: S,
         _key: Encryption,
