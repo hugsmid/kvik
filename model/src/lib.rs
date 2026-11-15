@@ -30,6 +30,7 @@ pub mod calendar;
 pub mod condition;
 pub mod engine;
 pub mod oracle;
+pub mod recovery;
 pub mod registry;
 pub mod summary;
 pub mod tree;

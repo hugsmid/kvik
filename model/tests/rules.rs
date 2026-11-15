@@ -801,7 +801,13 @@ fn s8_corrupt_log_segment_found_while_read_only_or_stopped_is_recorded_later() {
             .ingest(vec![Reading::num(s, now + 2 * SECOND, 3.0)])
             .unwrap()
             .positions[0];
-        assert_eq!(next, p.next(), "positions not reused");
+        // Read-only after a failed sync, the batch lies complete beyond the
+        // mark on the same boot: its truncation is a reset point, with a
+        // recovery entry at the next position (§3 Recovery rule 1).
+        let reset = m.recovery_entries().contains_key(&p.next());
+        assert_eq!(reset, !stopped);
+        let want = if stopped { p.next() } else { p.next().next() };
+        assert_eq!(next, want, "positions not reused");
     }
 }
 
@@ -2290,11 +2296,10 @@ fn s4_resync_replaces_replay_when_cursor_too_far_behind() {
 
 /// §3 Recovery rule 3 and §4 Resync: after a recovery on a new boot, every
 /// consumer receives `resync` before any position above the last kept batch.
-/// The model writes no recovery entry, so the replay stops at the last kept
-/// batch and the resume's `resync` serves as the reset point; the
-/// specification now puts a recovery entry at the first new position, where
-/// that `resync` is, so the later fact takes the next one (see
-/// `OPEN-QUESTIONS.md`).
+/// The recovery entry takes the first new position, so the later fact takes
+/// the next one; the entry's reset point has nothing routed after it within
+/// the resume, so it is the `resync` that ends the resume, carrying
+/// `forget_above` = K, and the later fact follows once it is confirmed.
 #[test]
 fn s4_resync_after_rule_3_recovery_before_later_positions() {
     let (mut m, a, _) = routed_model(100);
@@ -2309,13 +2314,15 @@ fn s4_resync_after_rule_3_recovery_before_later_positions() {
         Err(Error::Crashed)
     );
     m.restart();
-    let kept = m.entries().unwrap().last().unwrap().position;
-    assert_eq!(kept, Position::new(0, 6), "the unsynced batch was kept");
+    let entry = m.entries().unwrap().last().unwrap().position;
+    let kept = Position::new(0, 6);
+    assert_eq!(entry, kept.next(), "the unsynced batch was kept; F = K + 1");
     put(&mut m, a, 4.0);
     m.drain().unwrap();
     let stream = session_stream(&m, C, 2);
-    assert_eq!(labels(&stream), ["R5", "R6", "S", "R7"]);
-    assert_eq!(stream[2].position, kept);
+    assert_eq!(labels(&stream), ["R5", "R6", "S", "R8"]);
+    assert_eq!(stream[2].position, entry);
+    assert_eq!(stream[2].resync().unwrap().forget_above, Some(kept));
 }
 
 /// §8 Restore step 2: a cursor at or below the restored end catches up to it,

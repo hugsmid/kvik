@@ -1250,9 +1250,12 @@ impl Slot {
             K::Resync(r) => {
                 let cause = if r.replaced.is_some() {
                     ResyncCause::CursorBehindLog
+                } else if r.forget_above.is_some() && r.funnels.is_empty() {
+                    ResyncCause::ResetPoint
                 } else {
                     ResyncCause::Resume
                 };
+                let forget_above = r.forget_above.map(pos);
                 let states: Vec<FunnelState> = r
                     .funnels
                     .iter()
@@ -1292,7 +1295,7 @@ impl Slot {
                             position,
                             kind: DeliveryKind::Resync(ResyncPart {
                                 cause,
-                                forget_above: None,
+                                forget_above,
                                 part,
                                 last: k + 1 == n,
                                 funnels,

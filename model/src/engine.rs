@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::calendar::{self, CalendarFile, CalendarWindow, Month, Period, Tzdb, Zoning};
 use crate::condition::{Condition, ConditionState, ResumeHistory, Runner};
+use crate::recovery::{
+    self, Acknowledged, Loss, LossCause, LostRecord, MarkState, PointCheck, RecoveryEntry, Reset,
+    ResetPoint, ResetStamp, SavedPoint, Tail,
+};
 use crate::registry::{
     Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
 };
@@ -77,6 +81,23 @@ pub struct Config {
     /// with none (§5.7, §12 D3: past days keep their zone); a change is
     /// [`Model::set_site_zone`].
     pub site_zone: String,
+    /// When the mark file is synced (§3 Durable mark, `api.md`
+    /// `log.mark_sync`). The model's default is every commit, so a power loss
+    /// loses no acknowledged batch unless a test asks for the timed sync.
+    pub mark_sync: MarkSync,
+}
+
+/// When the mark file is synced (§3 Durable mark).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkSync {
+    /// After every update of the mark (`MarkSync::EveryCommit`).
+    #[default]
+    EveryCommit,
+    /// On the timer (`mark_sync_interval`), which the model fires when
+    /// [`Model::sync_mark_file`] is called; at once after a batch holding an
+    /// entry that is not a fact, by recovery, and before a write that would
+    /// name a position above the last synced mark.
+    Timed,
 }
 
 impl Default for Config {
@@ -101,6 +122,7 @@ impl Default for Config {
             critical_mark: 512 << 20,
             fill_threshold_pct: 70,
             site_zone: "UTC".into(),
+            mark_sync: MarkSync::EveryCommit,
         }
     }
 }
@@ -231,6 +253,8 @@ pub enum EntryBody {
     Registry(RegistryEvent),
     /// A routing change.
     Route(RouteChange),
+    /// A recovery entry (§3 Recovery rules 1 and 3), alone in its batch.
+    Recovery(RecoveryEntry),
 }
 
 /// A log entry: every entry, fact or registry event, has a position.
@@ -249,7 +273,7 @@ impl Entry {
     pub fn fact(&self) -> Option<&Fact> {
         match &self.body {
             EntryBody::Fact(f) => Some(f),
-            EntryBody::Registry(_) | EntryBody::Route(_) => None,
+            EntryBody::Registry(_) | EntryBody::Route(_) | EntryBody::Recovery(_) => None,
         }
     }
 }
@@ -396,13 +420,29 @@ pub enum ManifestOp {
     },
     /// A lost range (§3 Recovery rule 2, §8 Corrupt block): positions from
     /// `from` to `to` of a log segment found corrupt with no other copy, a
-    /// batch of the open segment by recovery or a sealed segment by a scrub.
-    /// Reported as `data_lost`; its positions are not reused.
+    /// batch of the open segment by recovery or a sealed segment by a scrub,
+    /// reported as `data_lost`; or the gap a recovery entry describes (§3
+    /// Recovery rule 3), part of its `possible_loss`. Its positions are not
+    /// reused.
     LostRange {
         /// First lost position.
         from: Position,
         /// Last lost position.
         to: Position,
+        /// The loss's identity (§3 Order of a start, step 4).
+        identity: Position,
+        /// The cause.
+        cause: LossCause,
+        /// The reset stamp the mark carried when the record was written, so
+        /// a saved point can tell the lost ranges recorded since its stamp
+        /// (§7 Readers; see `OPEN-QUESTIONS.md`, Q-124).
+        stamp: ResetStamp,
+    },
+    /// An acknowledgement (§8 Acknowledging a loss): for each `data_lost`
+    /// acknowledged, its identity and its range as reported then.
+    Acknowledge {
+        /// The losses acknowledged.
+        losses: Vec<Acknowledged>,
     },
 }
 
@@ -469,6 +509,9 @@ pub struct RestoreState {
     /// local, the latest `t` per series is known and cursors are settled.
     /// Ingest is accepted only then.
     pub step_one_done: bool,
+    /// The restore record's reset stamp: the generation's first position and
+    /// a fresh nonce, which the mark then carries (§8 Generations).
+    pub stamp: ResetStamp,
 }
 
 /// A restore that claimed a generation but has not yet written its record.
@@ -965,6 +1008,11 @@ pub struct Resync {
     /// stamp of the model, so tests can tell which state of the store it was
     /// issued in).
     pub issued: usize,
+    /// At a reset point, and for a cursor older than the oldest local log
+    /// segment: the consumer drops every position above this from its
+    /// de-duplication memory, and nothing further is delivered to it until
+    /// it has confirmed this `resync` (§4 At-least-once, Resync).
+    pub forget_above: Option<Position>,
 }
 
 /// What a delivery carries.
@@ -1087,6 +1135,9 @@ pub struct Reader {
     pub files: Vec<FileId>,
     /// Its lease file, if it is a reader process.
     pub lease: Option<u64>,
+    /// The reset stamp of the mark it read under (§7 Readers): a position it
+    /// keeps for later use is kept with it as a [`SavedPoint`].
+    pub stamp: ResetStamp,
 }
 
 /// A reader's lease file (§7 Leases).
@@ -1174,6 +1225,26 @@ pub struct Disk {
     pub superseded: bool,
     /// The restore this store came from, once its record is written.
     pub restore: Option<RestoreState>,
+    /// The mark as it is on stable storage (§3 Durable mark): [`Disk::mark`]
+    /// is the mark as the page cache holds it, which a process crash keeps
+    /// and a power loss or a remount drops back to this.
+    pub synced_mark: Option<Mark>,
+    /// What lies after the last complete batch of the last segment in use: a
+    /// batch torn by a power loss, and batches lost from the tail (fault
+    /// injection). The next start that can write truncates it.
+    pub invalid_tail: Tail,
+    /// Set by fault injection: the mark file is missing or has no valid slot.
+    pub mark_damage: Option<MarkState>,
+    /// Set by fault injection: consumers whose cursor file is missing or
+    /// unreadable, until a recovery entry names them (§3 Recovery rule 3).
+    pub lost_cursors: BTreeSet<ConsumerId>,
+    /// Every recovery entry written, by position, as the registry file and
+    /// each tree checkpoint keep them (§2.1, §11 Health): a `possible_loss`
+    /// stays listed when its entry is later lost.
+    pub recoveries: BTreeMap<Position, RecoveryEntry>,
+    /// The last nonce drawn for a reset stamp; the model draws from a counter
+    /// rather than at random, so nonces are distinct and never zero.
+    pub nonce: u64,
     /// A restore that claimed a generation and stopped before its record.
     pub pending_restore: Option<PendingRestore>,
     /// Tree checkpoints taken locally, uploaded once the log up to their
@@ -1225,6 +1296,10 @@ pub struct Mark {
     pub batches: usize,
     /// Last position covered.
     pub last: Position,
+    /// The highest series id assigned (§2.1, §3 Durable mark).
+    pub max_series_id: u32,
+    /// The current reset stamp (§7 Readers).
+    pub stamp: ResetStamp,
 }
 
 impl Disk {
@@ -1273,6 +1348,15 @@ impl Disk {
         retired: Vec<FileId>,
         moved: Vec<Moved>,
     ) -> u64 {
+        let names = added
+            .iter()
+            .chain(moved.iter().map(|m| &m.file))
+            .filter(|f| self.active != Some(**f))
+            .filter_map(|f| self.files.get(f)?.entries().map(|e| e.position).max())
+            .max();
+        if let Some(p) = names {
+            self.cover(p);
+        }
         let epoch = self.epoch();
         let added = added
             .iter()
@@ -1300,10 +1384,85 @@ impl Disk {
         self.manifest
             .iter()
             .filter_map(|r| match r.op {
-                ManifestOp::LostRange { from, to } => Some((from, to)),
+                ManifestOp::LostRange { from, to, .. } => Some((from, to)),
                 _ => None,
             })
             .collect()
+    }
+
+    /// The losses the manifest's lost-range records hold, in record order.
+    pub fn lost_records(&self) -> Vec<LostRecord> {
+        self.manifest
+            .iter()
+            .filter_map(|r| match r.op {
+                ManifestOp::LostRange {
+                    from,
+                    to,
+                    identity,
+                    cause,
+                    ..
+                } => Some(LostRecord {
+                    identity,
+                    from,
+                    to,
+                    cause,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every acknowledgement the manifest holds (§8 Acknowledging a loss).
+    pub fn acknowledged(&self) -> Vec<Acknowledged> {
+        self.manifest
+            .iter()
+            .flat_map(|r| match &r.op {
+                ManifestOp::Acknowledge { losses } => losses.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The positions a manifest record names (§3 Durable mark, invariant
+    /// 26): the positions of the files it adds or moves, once they are no
+    /// longer the open segment, a lost range, an acknowledged range and a
+    /// restored end.
+    pub fn named(&self, r: &ManifestRecord) -> Vec<Position> {
+        let file = |f: &FileId| -> Option<Position> {
+            if self.active == Some(*f) {
+                return None;
+            }
+            self.files.get(f)?.entries().map(|e| e.position).max()
+        };
+        match &r.op {
+            // A file added as it is now: a segment added when it was taken
+            // into use named no position then.
+            ManifestOp::Publish { added, moved, .. } => added
+                .iter()
+                .filter(|a| self.files.get(&a.file).is_some_and(|f| f.hash() == a.hash))
+                .map(|a| a.file)
+                .chain(moved.iter().map(|m| m.file))
+                .filter_map(|f| file(&f))
+                .collect(),
+            // A seal names the segment, not positions: the engine seals by
+            // renaming the file, and its positions are the log's (§3
+            // Sealing), so a sealed segment may hold positions above the
+            // last synced mark, which makes that mark stale (rule 1).
+            ManifestOp::Seal { .. } => Vec::new(),
+            ManifestOp::Restore { restored_end, .. } => vec![*restored_end],
+            ManifestOp::LostRange { to, .. } => vec![*to],
+            ManifestOp::Acknowledge { losses } => losses.iter().map(|a| a.to).collect(),
+        }
+    }
+
+    /// Before a write that names `p`: if the last synced mark is below it,
+    /// the mark file is synced first (§3 Durable mark: "a write that would
+    /// name one waits for the next mark sync or forces one"; invariant 26).
+    pub fn cover(&mut self, p: Position) {
+        let synced = self.synced_mark.map_or(Position::ORIGIN, |m| m.last);
+        if p > synced && self.mark.is_some_and(|m| m.last >= p) {
+            self.synced_mark = self.mark;
+        }
     }
 
     /// Runs of adjacent damaged batches of one segment, as first and last
@@ -1354,7 +1513,8 @@ impl Disk {
                 ManifestOp::Publish { added, .. } => added.iter().map(|a| a.file).collect(),
                 ManifestOp::Seal { .. }
                 | ManifestOp::Restore { .. }
-                | ManifestOp::LostRange { .. } => Vec::new(),
+                | ManifestOp::LostRange { .. }
+                | ManifestOp::Acknowledge { .. } => Vec::new(),
             })
             .collect()
     }
@@ -1541,6 +1701,10 @@ struct ConsumerRt {
     runners: BTreeMap<FunnelId, Runner>,
     /// The last state emitted per condition funnel in this session.
     emitted: BTreeMap<FunnelId, ConditionState>,
+    /// A `resync` carrying `forget_above`, at this position, is waiting for
+    /// the consumer's confirmation: nothing further is delivered until then
+    /// (§4 Resync).
+    awaiting: Option<Position>,
 }
 
 /// State a crash discards.
@@ -1577,6 +1741,9 @@ struct Volatile {
     read_only: bool,
     /// A write or sync failed (§3), as opposed to read-only by design.
     sync_failed: bool,
+    /// The start's own sync failed: nothing is delivered (§3 Recovery rule
+    /// 3, "if it fails the engine stays read-only and nothing is delivered").
+    recovery_failed: bool,
     skew_run: BTreeMap<SeriesId, u32>,
     /// While a restore is bringing detail back (§8 Restore steps 2–4).
     restore: Option<RestoreRt>,
@@ -1796,7 +1963,98 @@ impl Model {
     /// boot, so the page cache and the boot id of the mark are gone (§3).
     pub fn power_loss(&mut self) {
         self.boot += 1;
+        self.drop_page_cache();
         self.crash();
+    }
+
+    /// The store's file system is unmounted and mounted again within the
+    /// boot: the process stops and the page cache is lost, so the mark falls
+    /// back to the last synced mark (§3 Recovery rule 1, row 7c's same boot).
+    pub fn remount(&mut self) {
+        self.drop_page_cache();
+        self.crash();
+    }
+
+    /// A power loss after which the last `n` complete batches of the open
+    /// segment are found invalid, at most those holding only facts beyond the
+    /// last synced mark (all of them with the mark lost): the accepted loss
+    /// of invariant 10, which can hold acknowledged and delivered batches.
+    /// Returns how many were lost.
+    pub fn power_loss_losing(&mut self, n: usize) -> usize {
+        self.boot += 1;
+        self.drop_page_cache();
+        self.crash();
+        let Some(active) = self.disk.active else {
+            return 0;
+        };
+        let floor = match self.disk.synced_mark {
+            Some(m) if m.file == active => m.batches,
+            _ => 0,
+        };
+        let mut lost = 0;
+        while lost < n {
+            let file = self.disk.files.get_mut(&active).expect("segment");
+            let len = file.batches.len();
+            let eligible = len > floor
+                && !self.disk.damaged.contains_key(&(active, len - 1))
+                && file.batches[len - 1]
+                    .iter()
+                    .all(|e| matches!(e.body, EntryBody::Fact(_)))
+                && !file.batches[len - 1].is_empty();
+            if !eligible {
+                break;
+            }
+            file.batches.pop();
+            lost += 1;
+        }
+        self.disk.invalid_tail.batches += u32::try_from(lost).unwrap_or(u32::MAX);
+        lost
+    }
+
+    /// What the page cache held is gone: the batch written and not synced is
+    /// kept, torn or lost as its write outcome says, and the mark falls back
+    /// to the last synced mark.
+    fn drop_page_cache(&mut self) {
+        // Only the last batch of the open segment can have been written and
+        // not synced: a batch is written only after the previous one's sync.
+        if let (Some(active), Some(fate)) = (self.disk.active, self.disk.tail_fate)
+            && fate != WriteOutcome::Survived
+        {
+            self.disk
+                .files
+                .get_mut(&active)
+                .expect("segment")
+                .batches
+                .pop();
+            self.disk.invalid_tail.torn |= fate == WriteOutcome::Torn;
+        }
+        self.disk.tail_fate = None;
+        self.disk.mark = self.disk.synced_mark;
+    }
+
+    /// Fault injection while the engine is down: the mark file is missing or
+    /// holds no valid slot (§3 Recovery rule 3, row 12a).
+    pub fn lose_mark(&mut self, state: MarkState) -> Result<(), Error> {
+        if self.vol.is_some() {
+            return Err(Error::BadFault("stop the engine first"));
+        }
+        self.disk.mark = None;
+        self.disk.synced_mark = None;
+        self.disk.mark_damage = Some(state);
+        Ok(())
+    }
+
+    /// Fault injection while the engine is down: a consumer's cursor file is
+    /// missing or unreadable. The next recovery entry names it, and the
+    /// consumer is treated as having no cursor (§3 Recovery rule 3).
+    pub fn lose_cursor_file(&mut self, c: ConsumerId) -> Result<(), Error> {
+        if self.vol.is_some() {
+            return Err(Error::BadFault("stop the engine first"));
+        }
+        self.disk.cursors.remove(&c);
+        self.disk.latches.retain(|(id, _), _| *id != c);
+        self.disk.lost_cursors.insert(c);
+        Ok(())
     }
 
     /// Whether the engine is up but read-only: after a failed write or sync
@@ -1881,6 +2139,7 @@ impl Model {
         // start is a resume (§6 Restart and resume): replay, then `resync`.
         let mut resuming = Vec::new();
         let mut consumers = Vec::new();
+        let points = self.reset_points();
         for (i, c) in self.consumers.iter().enumerate() {
             let s = self.sessions.entry(c.id).or_insert(0);
             *s += 1;
@@ -1890,15 +2149,16 @@ impl Model {
                 .get(&c.id)
                 .copied()
                 .unwrap_or(Position::ORIGIN);
-            let behind = d.entries.range(cursor.next()..).next().is_some();
-            let mode = if *s == 1 && behind {
+            let behind = d.entries.range(cursor.next()..).next().is_some()
+                || points.iter().any(|r| r.id > cursor);
+            let mode = if *s == 1 && behind && !sync_failed {
                 Mode::CatchUp {
                     next: cursor.next(),
                 }
             } else {
                 Mode::Live
             };
-            if *s > 1 {
+            if *s > 1 && !sync_failed {
                 resuming.push((i, cursor));
             }
             consumers.push(ConsumerRt {
@@ -1911,6 +2171,7 @@ impl Model {
                 resume: None,
                 runners: BTreeMap::new(),
                 emitted: BTreeMap::new(),
+                awaiting: None,
             });
         }
         self.vol = Some(Volatile {
@@ -1930,6 +2191,7 @@ impl Model {
             consumers,
             read_only: sync_failed || self.disk.drill || self.disk.superseded,
             sync_failed,
+            recovery_failed: sync_failed,
             skew_run: BTreeMap::new(),
             restore: d.restore,
             started: self.mono,
@@ -1969,6 +2231,7 @@ impl Model {
                     routes.insert(*p, r.clone());
                 }
                 EntryBody::Fact(f) => facts.push(f.clone()),
+                EntryBody::Recovery(_) => {}
             }
         }
         // The version index: from the checkpoint and the facts after it
@@ -2166,58 +2429,235 @@ impl Model {
         }
     }
 
-    /// Same boot id as the mark: truncate everything after it. Different boot
-    /// id, or no mark: keep the batches that reached the disk whole (a torn or
-    /// lost batch is truncated), sync, and move the mark. Returns whether the
-    /// engine must stay read-only because that sync failed.
+    /// The start's recovery (§3 Recovery rules 1–3, Order of a start steps
+    /// 2–6). Rule 1 truncates after the mark; with exactly one complete batch
+    /// beyond it the truncation is a reset point. Rule 3 (another boot, the
+    /// mark missing, unreadable or stale) keeps every complete batch and
+    /// truncates the invalid tail. Either reset writes a recovery entry at F
+    /// with a new reset stamp, records its gap and moves the mark to it.
+    /// Returns whether the engine must stay read-only because the start's
+    /// sync failed, in which case nothing is truncated or written.
     fn recover_tail(&mut self, sync_fails: bool) -> bool {
-        let Some(active) = self.disk.active else {
-            // No open segment: after a reboot the mark is still synced and
-            // stamped with the new boot id.
+        let generation = self.disk.generation;
+        let mark = self.disk.mark;
+        // The first start of a store, or of a restored generation: no mark
+        // and nothing of the current generation in the log.
+        let in_use = self
+            .disk
+            .files
+            .values()
+            .filter(|f| f.class == FileClass::Segment)
+            .flat_map(StoredFile::entries)
+            .any(|e| e.position.generation == generation);
+        if mark.is_none() && !in_use && self.disk.damaged.is_empty() {
+            self.disk.mark_damage = None;
             self.disk.tail_fate = None;
-            let Some(mark) = self.disk.mark else {
-                return false;
-            };
-            if mark.boot == self.boot {
-                self.record_lost_ranges();
-                return false;
-            }
-            if sync_fails {
-                return true;
-            }
-            self.record_lost_ranges();
-            self.sync_mark();
-            return false;
-        };
-        let visible = self.disk.visible_batches(active).len();
-        let tail = self.disk.files[&active].batches.len() - visible;
-        let same_boot = self.disk.mark.is_some_and(|m| m.boot == self.boot);
-        let keep = if same_boot {
-            false
-        } else {
-            matches!(self.disk.tail_fate, None | Some(WriteOutcome::Survived))
-        };
-        if !keep && tail > 0 {
-            self.disk
-                .files
-                .get_mut(&active)
-                .expect("segment")
-                .batches
-                .truncate(visible);
-            self.counters.batches_discarded += tail as u64;
-        }
-        // What is left on disk is now whole.
-        self.disk.tail_fate = None;
-        if same_boot {
-            self.record_lost_ranges();
+            self.disk.invalid_tail = Tail::default();
             return false;
         }
+        // Damaged batches at the end of the open segment beyond the mark (a
+        // remount or a lost mark moved it below them) are not below a valid
+        // mark and no complete batch follows them: a torn tail, not
+        // corruption (§3 Recovery rules 2 and 3).
+        if let Some(active) = self.disk.active {
+            loop {
+                let n = self.disk.files[&active].batches.len();
+                let Some(&(from, _)) = n
+                    .checked_sub(1)
+                    .and_then(|b| self.disk.damaged.get(&(active, b)))
+                else {
+                    break;
+                };
+                if mark.is_some_and(|m| from <= m.last) {
+                    break;
+                }
+                self.disk.damaged.remove(&(active, n - 1));
+                self.disk
+                    .files
+                    .get_mut(&active)
+                    .expect("segment")
+                    .batches
+                    .pop();
+                self.disk.invalid_tail.torn = true;
+            }
+        }
+        let same_boot = mark.is_some_and(|m| m.boot == self.boot);
+        let (beyond, sealed_beyond) = mark.map_or((Vec::new(), false), |m| self.beyond(m.last));
+        let state = match mark {
+            None => self.disk.mark_damage.unwrap_or(MarkState::Missing),
+            Some(_) if same_boot && (beyond.len() > 1 || sealed_beyond) => MarkState::Stale,
+            Some(_) => MarkState::Readable,
+        };
+        if same_boot && beyond.is_empty() && !sealed_beyond {
+            // Rule 1, nothing complete beyond the mark: torn bytes are
+            // truncated unreported, and the mark is written again and synced.
+            self.disk.tail_fate = None;
+            self.disk.invalid_tail = Tail::default();
+            self.record_lost_ranges();
+            self.disk.synced_mark = self.disk.mark;
+            return false;
+        }
+        // A reset: rule 1 with one complete batch beyond the mark, or rule 3.
         if sync_fails {
             return true;
         }
+        let mut tail = self.disk.invalid_tail;
+        let rule_1 = same_boot && state == MarkState::Readable;
+        if rule_1 {
+            // The one complete batch beyond the mark is truncated.
+            let (f, b) = beyond[0];
+            self.disk
+                .files
+                .get_mut(&f)
+                .expect("segment")
+                .batches
+                .remove(b);
+            self.counters.batches_discarded += 1;
+            tail.batches += 1;
+        }
+        self.disk.tail_fate = None;
+        self.disk.invalid_tail = Tail::default();
+        // Step 4: the lost ranges found.
         self.record_lost_ranges();
-        self.sync_mark();
+        let k = match mark {
+            Some(m) if rule_1 => m.last,
+            _ => self.last_kept(generation),
+        };
+        let f = self.first_new(k);
+        let id_floor = self.id_floor(mark.map(|m| m.max_series_id));
+        self.disk.nonce += 1;
+        let stamp = ResetStamp {
+            sequence: f.sequence,
+            nonce: self.disk.nonce,
+        };
+        let entry = RecoveryEntry {
+            after: k,
+            stamp,
+            boot: self.boot,
+            tail,
+            mark_state: state,
+            id_floor,
+            cursors_missing: std::mem::take(&mut self.disk.lost_cursors)
+                .into_iter()
+                .collect(),
+        };
+        // Step 5: the entry, alone in its batch.
+        self.append_batch(vec![Entry {
+            position: f,
+            received_at: self.wall,
+            body: EntryBody::Recovery(entry.clone()),
+        }]);
+        self.disk.recoveries.insert(f, entry.clone());
+        // Step 6: the mark, synced; then the entry's gap.
+        let active = self.disk.active.expect("active");
+        self.disk.mark = Some(Mark {
+            boot: self.boot,
+            file: active,
+            batches: self.disk.files[&active].batches.len(),
+            last: f,
+            max_series_id: id_floor,
+            stamp,
+        });
+        self.disk.synced_mark = self.disk.mark;
+        self.disk.mark_damage = None;
+        if let Some((from, to)) = entry.gap(f) {
+            let epoch = self.disk.epoch();
+            self.disk.manifest.push(ManifestRecord {
+                epoch,
+                at: self.wall,
+                op: ManifestOp::LostRange {
+                    from,
+                    to,
+                    identity: from,
+                    cause: LossCause::TruncatedTail,
+                    stamp,
+                },
+            });
+        }
         false
+    }
+
+    /// The complete batches of the log beyond `last`, as segment and index,
+    /// and whether a sealed segment holds a position above it (§3 Recovery
+    /// rule 1).
+    fn beyond(&self, last: Position) -> (Vec<(FileId, usize)>, bool) {
+        let mut out = Vec::new();
+        let mut sealed = false;
+        for (id, f) in &self.disk.files {
+            if f.class != FileClass::Segment {
+                continue;
+            }
+            for (b, batch) in f.batches.iter().enumerate() {
+                if batch.first().is_some_and(|e| e.position > last) {
+                    out.push((*id, b));
+                    sealed |= f.sealed;
+                }
+            }
+        }
+        (out, sealed)
+    }
+
+    /// K under rule 3: the last kept position of the current generation, or
+    /// the end of a lost range at the tail (§3 Recovery rule 3).
+    fn last_kept(&self, generation: u32) -> Position {
+        self.disk
+            .files
+            .values()
+            .filter(|f| f.class == FileClass::Segment)
+            .flat_map(StoredFile::entries)
+            .map(|e| e.position)
+            .chain(self.disk.lost_ranges().into_iter().map(|(_, to)| to))
+            .filter(|p| p.generation == generation)
+            .max()
+            .unwrap_or(Position::new(generation, 0))
+    }
+
+    /// F: one above the highest sequence of the current generation among K
+    /// and every position named by a local cursor file, manifest record or
+    /// derived file (§3 Recovery rule 3).
+    fn first_new(&self, k: Position) -> Position {
+        let named = self
+            .disk
+            .cursors
+            .values()
+            .copied()
+            .chain(self.disk.latches.values().map(|l| l.position))
+            .chain(self.disk.manifest.iter().flat_map(|r| self.disk.named(r)))
+            .chain(self.disk.checkpoints.iter().map(|c| c.position))
+            // The registry file keeps every recovery entry with its position
+            // (§2.1): a derived file.
+            .chain(self.disk.recoveries.keys().copied())
+            .filter(|p| p.generation == k.generation);
+        named.fold(k, Position::max).next()
+    }
+
+    /// The id floor (§2.1): the highest id known to the mark, the kept log
+    /// (definitions and the series of kept facts), earlier recovery entries
+    /// and the restore's checkpoint.
+    fn id_floor(&self, mark: Option<u32>) -> u32 {
+        let log = self
+            .disk
+            .live_entries()
+            .into_values()
+            .filter_map(|e| match e.body {
+                EntryBody::Registry(RegistryEvent::Define { id, .. }) => Some(id.0),
+                EntryBody::Fact(f) => Some(f.series.0),
+                EntryBody::Recovery(r) => Some(r.id_floor),
+                _ => None,
+            })
+            .max();
+        let checkpoint = self
+            .disk
+            .restore
+            .as_ref()
+            .and_then(|r| r.checkpoint.as_ref())
+            .map(|c| c.registry.next_id().0 - 1);
+        let earlier = self.disk.recoveries.values().map(|r| r.id_floor).max();
+        [mark, log, checkpoint, earlier]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0)
     }
 
     /// §3 Recovery rule 2: a damaged batch of the open segment lies below the
@@ -2231,28 +2671,40 @@ impl Model {
     /// A recovery whose sync fails writes no record (Q-79), but reports the
     /// ranges it found as `data_lost` (§8 "recorded when found"); the next
     /// recovery that can write records them, with any a scrub found while the
-    /// engine could not write.
+    /// engine could not write. A range that overlaps a recorded loss names its
+    /// identity (§3 Order of a start, step 4).
     fn record_lost_ranges(&mut self) {
         let at = self.wall;
+        let stamp = self.stamp();
         let found = std::mem::take(&mut self.disk.found_lost);
         for (from, to) in found.into_iter().chain(self.disk.damaged_runs()) {
+            let identity = self
+                .disk
+                .lost_records()
+                .iter()
+                .find(|r| r.from <= to && from <= r.to)
+                .map_or(from, |r| r.identity);
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
                 epoch,
                 at,
-                op: ManifestOp::LostRange { from, to },
+                op: ManifestOp::LostRange {
+                    from,
+                    to,
+                    identity,
+                    cause: LossCause::Corruption,
+                    stamp,
+                },
             });
         }
         self.disk.damaged.clear();
     }
 
-    /// Moves the durable mark to the end of the active segment, stamped with
-    /// the current boot id (after a successful sync).
+    /// Moves the durable mark (in the page cache) to the end of the active
+    /// segment, stamped with the current boot id, after a successful sync; the
+    /// mark file is synced too when [`Config::mark_sync`] is every commit.
     fn sync_mark(&mut self) {
         let Some(active) = self.disk.active else {
-            if let Some(mark) = self.disk.mark.as_mut() {
-                mark.boot = self.boot;
-            }
             return;
         };
         let file = &self.disk.files[&active];
@@ -2263,14 +2715,202 @@ impl Model {
             .last()
             .map(|e| e.position)
             .max(self.disk.mark.map(|m| m.last));
+        let defined = file
+            .batches
+            .last()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| match &e.body {
+                EntryBody::Registry(RegistryEvent::Define { id, .. }) => Some(id.0),
+                _ => None,
+            })
+            .max();
         if let Some(last) = last {
+            let prev = self.disk.mark;
             self.disk.mark = Some(Mark {
                 boot: self.boot,
                 file: active,
                 batches: file.batches.len(),
                 last,
+                max_series_id: prev.map(|m| m.max_series_id).max(defined).unwrap_or(0),
+                stamp: self.stamp(),
+            });
+            if self.config.mark_sync == MarkSync::EveryCommit {
+                self.disk.synced_mark = self.disk.mark;
+            }
+        }
+    }
+
+    /// The mark file is synced now: at once after a batch holding an entry
+    /// that is not a fact (§3 Commit).
+    fn force_mark_sync(&mut self) {
+        self.disk.synced_mark = self.disk.mark;
+    }
+
+    /// The timed mark sync fires (§3 Durable mark, `mark_sync_interval`):
+    /// the mark file is synced. Nothing happens while the engine is down or
+    /// read-only.
+    pub fn sync_mark_file(&mut self) {
+        if self.vol.as_ref().is_some_and(|v| !v.read_only) {
+            self.force_mark_sync();
+        }
+    }
+
+    /// The current reset stamp (§7 Readers): the mark's, or with no mark yet
+    /// the restore record's; zero before the first reset.
+    pub fn stamp(&self) -> ResetStamp {
+        self.disk
+            .mark
+            .map(|m| m.stamp)
+            .or_else(|| self.disk.restore.as_ref().map(|r| r.stamp))
+            .unwrap_or(ResetStamp::ZERO)
+    }
+
+    /// The recovery entries the store knows, by position: those of the kept
+    /// log and those the registry file keeps (§11 Health).
+    pub fn recovery_entries(&self) -> BTreeMap<Position, RecoveryEntry> {
+        let mut out = self.disk.recoveries.clone();
+        for (p, e) in self.disk.live_entries() {
+            if let EntryBody::Recovery(r) = e.body {
+                out.insert(p, r);
+            }
+        }
+        out
+    }
+
+    /// The reset points of the log (§4 Resync): the kept recovery entries and
+    /// the lost ranges not described by one.
+    pub fn reset_points(&self) -> Vec<ResetPoint> {
+        let kept: Vec<(Position, RecoveryEntry)> = self
+            .disk
+            .live_entries()
+            .into_iter()
+            .filter_map(|(p, e)| match e.body {
+                EntryBody::Recovery(r) => Some((p, r)),
+                _ => None,
+            })
+            .collect();
+        recovery::reset_points(&kept, &self.disk.lost_ranges())
+    }
+
+    /// The list of losses (§11 Health): every loss, for ever, each once.
+    pub fn losses(&self) -> Vec<Loss> {
+        let mut found = self.disk.found_lost.clone();
+        if self.vol.is_some() {
+            found.extend(self.disk.damaged_runs());
+        }
+        let recoveries: Vec<(Position, RecoveryEntry)> =
+            self.recovery_entries().into_iter().collect();
+        recovery::losses(
+            &self.disk.lost_records(),
+            &found,
+            &recoveries,
+            &self.disk.acknowledged(),
+        )
+    }
+
+    /// Acknowledges the `data_lost` losses named by their identities (§8
+    /// Acknowledging a loss): one manifest record naming each with its range
+    /// as reported now. Acknowledging an acknowledged loss, a `possible_loss`
+    /// or none writes nothing. Refused while read-only and in a drill.
+    pub fn acknowledge_losses(&mut self, identities: &[Position]) -> Result<(), Error> {
+        if self.vol()?.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let losses: Vec<Acknowledged> = self
+            .losses()
+            .into_iter()
+            .filter(|l| {
+                l.kind == recovery::LossKind::DataLost
+                    && !l.acknowledged
+                    && identities.contains(&l.identity)
+            })
+            .filter_map(|l| {
+                Some(Acknowledged {
+                    identity: l.identity,
+                    from: l.first?,
+                    to: l.last?,
+                })
+            })
+            .collect();
+        if let Some(to) = losses.iter().map(|a| a.to).max() {
+            self.disk.cover(to);
+            let epoch = self.disk.epoch();
+            self.disk.manifest.push(ManifestRecord {
+                epoch,
+                at: self.wall,
+                op: ManifestOp::Acknowledge { losses },
             });
         }
+        Ok(())
+    }
+
+    /// The resets the store holds, in the order they were written (§7
+    /// Readers): the kept recovery entries in log order with the restore
+    /// record before the first entry of its generation, and each lost range
+    /// after the reset whose stamp the mark carried when it was recorded.
+    fn resets(&self) -> Vec<Reset> {
+        let mut out = Vec::new();
+        let mut restore = self.disk.restore.as_ref().map(|r| Reset::Restore {
+            stamp: r.stamp,
+            generation: r.generation,
+            restored_end: r.restored_end,
+        });
+        for (at, e) in self.disk.live_entries() {
+            let EntryBody::Recovery(r) = e.body else {
+                continue;
+            };
+            if let Some(Reset::Restore { generation, .. }) = restore
+                && at.generation >= generation
+            {
+                out.extend(restore.take());
+            }
+            out.push(Reset::Recovery {
+                stamp: r.stamp,
+                at,
+                after: r.after,
+            });
+        }
+        out.extend(restore);
+        let mut placed: Vec<(usize, Reset)> = Vec::new();
+        for r in &self.disk.manifest {
+            if let ManifestOp::LostRange {
+                from,
+                to,
+                cause: LossCause::Corruption,
+                stamp,
+                ..
+            } = r.op
+            {
+                let after = if stamp == ResetStamp::ZERO {
+                    0
+                } else {
+                    out.iter()
+                        .position(|x| match x {
+                            Reset::Recovery { stamp: s, .. } | Reset::Restore { stamp: s, .. } => {
+                                *s == stamp
+                            }
+                            Reset::Lost { .. } => false,
+                        })
+                        .map_or(out.len(), |i| i + 1)
+                };
+                placed.push((after, Reset::Lost { from, to }));
+            }
+        }
+        // Insert from the back so that indices stay valid; ranges placed at
+        // one index keep the order they were recorded in.
+        placed.sort_by_key(|x| x.0);
+        for (i, r) in placed.into_iter().rev() {
+            out.insert(i, r);
+        }
+        out
+    }
+
+    /// Judges a saved point against the current mark (§7 Readers, Reset stamp
+    /// and saved points; `api.md` `Reader::check`): kept, void above a
+    /// position, or unknown.
+    pub fn check_point(&self, point: SavedPoint) -> PointCheck {
+        recovery::check_saved_point(point, self.disk.generation, self.stamp(), &self.resets())
     }
 
     // ----- registry -----
@@ -2291,6 +2931,9 @@ impl Model {
         // Durable first; only then does the registry see the change.
         self.append_batch(vec![entry.clone()]);
         self.sync_mark();
+        // A batch holding an entry that is not a fact is acknowledged only
+        // once the mark file is synced past it (§3 Commit).
+        self.force_mark_sync();
         let v = self.vol_mut()?;
         v.registry.apply(&ev);
         v.entries.insert(position, entry);
@@ -3131,6 +3774,9 @@ impl Model {
         // Durable first; only then does routing see the change.
         self.append_batch(vec![entry.clone()]);
         self.sync_mark();
+        // A batch holding an entry that is not a fact is acknowledged only
+        // once the mark file is synced past it (§3 Commit).
+        self.force_mark_sync();
         let v = self.vol_mut()?;
         v.entries.insert(position, entry);
         v.routes.insert(position, change);
@@ -3422,18 +4068,23 @@ impl Model {
     /// entries after its cursor up to the last committed position are
     /// replayed through catch-up, then `resync` follows. If any of them is
     /// not in a local log segment, the cursor is too far behind: `resync`
-    /// replaces the replay (§4 Resync, §8 Behind consumers). After a §3
-    /// Recovery rule 3 recovery the last committed position is the last kept
-    /// batch, so the one `resync` serves both rules.
+    /// replaces the replay, carrying `forget_above` = the cursor (§4 Resync,
+    /// §8 Behind consumers). At each reset point above the cursor the replay
+    /// pauses for a `resync` carrying `forget_above` (§4 Resync).
     fn begin_resume(&mut self, i: usize, cursor: Position) {
+        if self.vol.as_ref().expect("up").recovery_failed {
+            return;
+        }
         let stop = self.head().unwrap_or(cursor).max(cursor);
         let local = self.local_log_positions();
+        let reset = self.reset_points().iter().any(|r| r.id > cursor);
         let v = self.vol.as_mut().expect("up");
         let behind: Vec<Position> = v.entries.range(cursor.next()..).map(|(p, _)| *p).collect();
         let c = &mut v.consumers[i];
-        if behind.is_empty() {
+        c.awaiting = None;
+        if behind.is_empty() && !reset {
             c.mode = Mode::Live;
-            self.issue_resync(i, stop, None);
+            self.issue_resync(i, stop, None, None);
         } else if behind.iter().all(|p| local.contains(p)) {
             c.mode = Mode::CatchUp {
                 next: cursor.next(),
@@ -3441,7 +4092,7 @@ impl Model {
             c.resume = Some(stop);
         } else {
             c.mode = Mode::Live;
-            self.issue_resync(i, stop, Some((cursor, stop)));
+            self.issue_resync(i, stop, Some((cursor, stop)), Some(cursor));
         }
     }
 
@@ -3454,6 +4105,7 @@ impl Model {
         i: usize,
         position: Position,
         replaced: Option<(Position, Position)>,
+        forget_above: Option<Position>,
     ) {
         let v = self.vol.as_ref().expect("up");
         let decl = v.consumers[i].decl.clone();
@@ -3534,6 +4186,7 @@ impl Model {
                 funnels: states,
                 replaced,
                 issued,
+                forget_above,
             }),
         });
         signals.push(Signal::ResyncDue);
@@ -3562,11 +4215,20 @@ impl Model {
     /// each position, flagged `replayed`. On resume it stops at the last
     /// position committed before the resume to queue `resync`. Switches back
     /// to live once it reaches the head.
+    ///
+    /// Reset points apply as on a resume (§4 Resync, Overflow): before the
+    /// first routed fact above a reset point, the consumer receives a
+    /// `resync` carrying `forget_above`, consecutive reset points with
+    /// nothing routed between them as one (the lowest `forget_above`, the
+    /// highest id), and nothing further until it has confirmed it. A reset
+    /// point after the last routed fact of a resume is carried by the
+    /// `resync` that ends it.
     pub fn catch_up(&mut self, id: ConsumerId, max: usize) -> Result<(), Error> {
         self.vol()?;
         let Some(i) = self.consumer_index(id) else {
             return Ok(());
         };
+        let points = self.reset_points();
         let mut reads = 0usize;
         loop {
             let v = self.vol.as_mut().expect("up");
@@ -3574,10 +4236,39 @@ impl Model {
             let Mode::CatchUp { mut next } = c.mode else {
                 return Ok(());
             };
-            // Entries in position order from `next`, across generations.
+            if c.awaiting.is_some() {
+                return Ok(());
+            }
+            // Reset points passed since the last routed fact: merged, and
+            // the position of the first, where a pause starts again.
+            let mut pending: Option<(ResetPoint, Position)> = None;
+            let merge =
+                |pending: &mut Option<(ResetPoint, Position)>, from: Position, to: Position| {
+                    for rp in points.iter().filter(|r| r.id >= from && r.id <= to) {
+                        *pending = Some(match *pending {
+                            None => (*rp, rp.id),
+                            Some((p, first)) => (
+                                ResetPoint {
+                                    id: p.id.max(rp.id),
+                                    forget_above: p.forget_above.min(rp.forget_above),
+                                },
+                                first,
+                            ),
+                        });
+                    }
+                };
             let mut paused = false;
+            let mut flush = None;
             for (p, e) in v.entries.range(next..) {
                 if c.resume.is_some_and(|stop| *p > stop) {
+                    break;
+                }
+                merge(&mut pending, next, *p);
+                let fact = e.fact().filter(|f| routed(&c.decl, &v.routes, f));
+                if fact.is_some()
+                    && let Some((rp, _)) = pending
+                {
+                    flush = Some(rp);
                     break;
                 }
                 if reads >= max || c.queue.len() >= c.decl.capacity {
@@ -3585,9 +4276,7 @@ impl Model {
                     break;
                 }
                 reads += 1;
-                if let Some(f) = e.fact()
-                    && routed(&c.decl, &v.routes, f)
-                {
+                if let Some(f) = fact {
                     c.queue.push_back(Envelope {
                         position: *p,
                         replayed: true,
@@ -3597,13 +4286,67 @@ impl Model {
                 }
                 next = p.next();
             }
-            c.mode = Mode::CatchUp { next };
             if paused {
+                // Read again from the first reset point passed, so it is
+                // not skipped.
+                c.mode = Mode::CatchUp {
+                    next: pending.map_or(next, |(_, first)| first),
+                };
                 return Ok(());
             }
-            if let Some(stop) = c.resume {
-                self.issue_resync(i, stop, None);
+            if flush.is_none() {
+                // Reset points after the last entry read: a lost range at
+                // the tail.
+                merge(&mut pending, next, Position::new(u32::MAX, u64::MAX));
+                flush = pending.map(|(rp, _)| rp);
+            }
+            if let Some(stop) = c.resume
+                && v.entries
+                    .range(next..)
+                    .next()
+                    .is_none_or(|(p, _)| *p > stop)
+            {
+                // The `resync` that ends the resume, carrying a reset point
+                // after the last routed fact.
+                let position = flush.map_or(stop, |rp| rp.id.max(stop));
+                c.mode = Mode::CatchUp {
+                    next: position.next(),
+                };
+                if flush.is_some() {
+                    c.awaiting = Some(position);
+                }
+                self.issue_resync(i, position, None, flush.map(|rp| rp.forget_above));
                 continue;
+            }
+            if let Some(rp) = flush {
+                c.queue.push_back(Envelope {
+                    position: rp.id,
+                    replayed: false,
+                    outranked: false,
+                    kind: DeliveryKind::Resync(Resync {
+                        funnels: Vec::new(),
+                        replaced: None,
+                        issued: 0,
+                        forget_above: Some(rp.forget_above),
+                    }),
+                });
+                c.awaiting = Some(rp.id);
+                c.mode = Mode::CatchUp { next: rp.id.next() };
+                let signals = self.signals.entry(id).or_default();
+                let issued = signals
+                    .iter()
+                    .filter(|x| matches!(x, Signal::ResyncDue))
+                    .count();
+                signals.push(Signal::ResyncDue);
+                let c = &mut self.vol.as_mut().expect("up").consumers[i];
+                if let Some(Envelope {
+                    kind: DeliveryKind::Resync(r),
+                    ..
+                }) = c.queue.back_mut()
+                {
+                    r.issued = issued;
+                }
+                return Ok(());
             }
             c.mode = Mode::Live;
             self.reattach(i);
@@ -3702,8 +4445,17 @@ impl Model {
         let c = &mut v.consumers[i];
         let id = c.decl.id;
         let done: Vec<Envelope> = c.unconfirmed.drain(..n).collect();
+        // A confirmed reset point lets deliveries continue (§4 Resync).
+        if c.awaiting
+            .is_some_and(|a| done.iter().any(|d| d.position == a && d.resync().is_some()))
+        {
+            c.awaiting = None;
+        }
         let funnels = routes_in_force(&c.decl, &v.routes, None);
         let decl = c.decl.clone();
+        // The cursor file and the latches are written only below the last
+        // synced mark (§3 Durable mark, invariant 26).
+        self.disk.cover(p);
         // A latch is written only for the incarnation of the funnel that
         // emitted the state, if it is still in force.
         let mut latch = |f: FunnelId, inc: Position, state: &ConditionState, position: Position| {
@@ -3766,6 +4518,7 @@ impl Model {
         c.runners.clear();
         c.emitted.clear();
         c.resume = None;
+        c.awaiting = None;
         c.session = session;
         c.last_received = cursor;
         self.begin_resume(i, cursor);
@@ -3789,9 +4542,17 @@ impl Model {
             let mut progress = false;
             for &id in &ids {
                 self.catch_up(id, usize::MAX)?;
-                let got = self.receive(id, usize::MAX)?;
-                if let Some(d) = got.last() {
-                    self.confirm_delivery(id, d.id())?;
+                self.receive(id, usize::MAX)?;
+                // Everything taken, in this call or before it, is confirmed:
+                // a reset point waits for its confirmation (§4 Resync).
+                let last = self.consumer_index(id).and_then(|i| {
+                    self.vol.as_ref().expect("up").consumers[i]
+                        .unconfirmed
+                        .last()
+                        .map(Envelope::id)
+                });
+                if let Some(d) = last {
+                    self.confirm_delivery(id, d)?;
                     progress = true;
                 }
             }
@@ -4184,12 +4945,10 @@ impl Model {
         // Not read-only (§3 Recovery rule 2). Ranges found while the engine
         // could not write (by a scrub, or by a recovery whose sync failed, the
         // only way damage is still pending while it is up) are reported as
-        // found, not yet recorded (Q-79).
-        let mut pending = self.disk.found_lost.clone();
-        if self.vol.is_some() {
-            pending.extend(self.disk.damaged_runs());
-        }
-        for (from, to) in self.disk.lost_ranges().into_iter().chain(pending) {
+        // found, not yet recorded (Q-79). A `data_lost` degrades until it is
+        // acknowledged; a `possible_loss` never does (§11 Health).
+        for l in self.losses().into_iter().filter(Loss::degrades) {
+            let (from, to) = (l.first.unwrap_or(l.identity), l.last.unwrap_or(l.identity));
             raise(Level::Degraded, Reason::DataLost(from, to), &mut reasons);
         }
         let free = self.free_bytes();
@@ -4325,7 +5084,10 @@ impl Model {
     /// The input segments stay listed: compaction never retires a log
     /// segment (§7, §8). Returns the new files.
     pub fn compact(&mut self, crash: Option<CompactionCrash>) -> Result<Vec<FileId>, Error> {
-        self.vol()?;
+        // A read-only engine accepts no writes (§3 Write or sync failure).
+        if self.vol()?.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.free_bytes() < self.config.low_mark {
             self.counters.paused += 1;
             return Err(Error::Paused);
@@ -4387,7 +5149,10 @@ impl Model {
     /// merged chunks), and publishes the outputs and retires the inputs in
     /// one manifest record. Returns the new files.
     pub fn merge_chunks(&mut self, crash: Option<CompactionCrash>) -> Result<Vec<FileId>, Error> {
-        self.vol()?;
+        // A read-only engine accepts no writes (§3 Write or sync failure).
+        if self.vol()?.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.free_bytes() < self.config.low_mark {
             self.counters.paused += 1;
             return Err(Error::Paused);
@@ -4459,6 +5224,7 @@ impl Model {
             epoch,
             files: self.disk.listed_at(epoch),
             lease: None,
+            stamp: self.stamp(),
         }
     }
 
@@ -4482,6 +5248,7 @@ impl Model {
             epoch,
             files: self.disk.listed_at(epoch),
             lease: Some(id),
+            stamp: self.stamp(),
         }
     }
 
@@ -4503,6 +5270,7 @@ impl Model {
             epoch,
             files: self.disk.listed_at(epoch),
             lease: r.lease,
+            stamp: self.stamp(),
         }
     }
 
@@ -4522,6 +5290,7 @@ impl Model {
                 epoch: l.epoch,
                 files: self.disk.listed_at(l.epoch),
                 lease: Some(*id),
+                stamp: self.stamp(),
             })
             .collect()
     }
@@ -4785,8 +5554,8 @@ impl Model {
     /// segment, below the durable mark, is damaged (row 11a), on the same boot
     /// or after a power loss. Its entries become unreadable; the next recovery
     /// records the lost range (§3 Recovery rule 2). A batch holding anything
-    /// but facts is refused: what a lost registry, routing or zone entry means
-    /// is Q-33.
+    /// but facts or a recovery entry is refused: what a lost registry, routing
+    /// or zone entry means is Q-33.
     pub fn corrupt_open_batch(&mut self, batch: usize) -> Result<(), Error> {
         if self.vol.is_some() {
             return Err(Error::BadFault(
@@ -4805,7 +5574,11 @@ impl Model {
         if entries.is_empty() {
             return Err(Error::BadFault("the batch is already lost"));
         }
-        if !entries.iter().all(|e| matches!(e.body, EntryBody::Fact(_))) {
+        // A batch of facts, or a recovery entry alone in its batch (which the
+        // registry file keeps, §11 Health).
+        if !entries.iter().all(|e| matches!(e.body, EntryBody::Fact(_)))
+            && !matches!(entries.as_slice(), [e] if matches!(e.body, EntryBody::Recovery(_)))
+        {
             return Err(Error::BadFault(
                 "a lost registry, routing or zone entry is open (Q-33)",
             ));
@@ -4845,6 +5618,7 @@ impl Model {
         // as found and recorded by the next recovery that can write (Q-79).
         let held: BTreeSet<Position> = self.disk.all_entries().into_keys().collect();
         let at = self.wall;
+        let stamp = self.stamp();
         let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
         for f in &bad {
             let file = &self.disk.files[f];
@@ -4876,7 +5650,13 @@ impl Model {
                 self.disk.manifest.push(ManifestRecord {
                     epoch,
                     at,
-                    op: ManifestOp::LostRange { from, to },
+                    op: ManifestOp::LostRange {
+                        from,
+                        to,
+                        identity: from,
+                        cause: LossCause::Corruption,
+                        stamp,
+                    },
                 });
             }
         }
@@ -4904,6 +5684,10 @@ impl Model {
             return Err(Error::Restoring);
         }
         let v = self.vol()?;
+        // A read-only engine writes no file (§3 Write or sync failure).
+        if v.read_only {
+            return Err(Error::ReadOnly);
+        }
         let position = v
             .entries
             .keys()
@@ -4934,6 +5718,9 @@ impl Model {
                 .collect(),
             trees: v.trees.iter().map(|(s, t)| (*s, t.nodes_only())).collect(),
         };
+        // A derived file names no position above the last synced mark (§3
+        // Durable mark, invariant 26).
+        self.disk.cover(position);
         self.disk.checkpoints.push(cp);
         Ok(position)
     }
@@ -5197,6 +5984,13 @@ impl Model {
             differences: Vec::new(),
             kept_cursors: cursors.clone(),
             step_one_done: false,
+            stamp: {
+                m.disk.nonce += 1;
+                ResetStamp {
+                    sequence: 1,
+                    nonce: m.disk.nonce,
+                }
+            },
         });
         if let Stop::AfterRecord(n) = stop {
             for f in m.step_one_files().into_iter().take(n) {

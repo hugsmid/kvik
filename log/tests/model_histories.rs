@@ -9,11 +9,16 @@
 //! the log must keep exactly what the model says is committed, at the positions the model gives, and the reader must
 //! return exactly the log up to the durable mark.
 //!
+//! Recovery entries are compared with the model's: both write one, with a new reset stamp, after every start under
+//! `spec.md` §3 Recovery rule 3 and after a start under rule 1 that truncates a complete batch, at F = K + 1 (no
+//! position is named above K here: no cursor file, derived file or lost range exists), with the same K, mark state,
+//! id floor and stamp sequence, and a possible loss exactly when the model's entry names a tail.
+//!
 //! The differences the specification allows, made explicit here:
-//! - **Recovery entries.** The model writes none; the log writes one, with a new reset stamp, after every start under
-//!   `spec.md` §3 Recovery rule 3 and after a start under rule 1 that truncates a complete batch, at F = K + 1 (no
-//!   position is named above K here: no cursor file, derived file or lost range exists), so every later log position
-//!   is the model's plus the number of recovery entries before it.
+//! - **Starts cut short.** The model has no start cut short: it starts once where the log starts twice, and a cut
+//!   start's entry may be adopted (`spec.md` §3 Recovery rule 3, Adoption) or not, so after one the log may hold
+//!   more or fewer recovery entries than the model. From then on entries are compared with recovery entries left out
+//!   on both sides, positions renumbered by the entries before them.
 //! - **Unacknowledged batches.** A batch whose commit was cut short may be kept or not (`spec.md` §3 Write or sync
 //!   failure, §9 rows 7 and 7a). For faults the model names, the log is made to stop at the same point; for stops at
 //!   arbitrary operations the log decides, and the model is given the fault that has the same outcome.
@@ -64,6 +69,7 @@ use kvik_log::writer::{
 use kvik_model::engine::{
     Config, CrashPoint, Entry as ModelEntry, EntryBody, Fault, Model, WriteOutcome,
 };
+use kvik_model::recovery::{LossKind as ModelLossKind, MarkState as ModelMarkState};
 use kvik_model::registry::{ChangedAtKind, RegistryEvent, RetentionClass, SeriesOptions, Timing};
 use kvik_model::summary::CounterRules;
 use kvik_model::types::{
@@ -783,8 +789,11 @@ struct World {
     log: Log,
     series: Vec<Series>,
     types: BTreeMap<u32, ValueType>,
-    /// Recovery entries in the log: a model position plus this is the log's.
-    offset: u64,
+    /// A model position plus this is the log's: recovery entries in the log less those in the model, zero until a
+    /// start is cut short.
+    offset: i64,
+    /// A start was cut short: the recovery entries need not match one for one.
+    cut: bool,
     names: u32,
     zones: i64,
 }
@@ -794,6 +803,7 @@ fn item_of(e: &ModelEntry, types: &BTreeMap<u32, ValueType>) -> Item {
         EntryBody::Fact(f) => Item::Fact(fact_to_row(f, types[&f.series.0])),
         EntryBody::Registry(ev) => Item::Entry(event_to_entry(ev)),
         EntryBody::Route(_) => unreachable!("no routing change is generated"),
+        EntryBody::Recovery(_) => unreachable!("a recovery entry is never committed"),
     }
 }
 
@@ -805,6 +815,7 @@ impl World {
             series: Vec::new(),
             types: BTreeMap::new(),
             offset: 0,
+            cut: false,
             names: 0,
             zones: 0,
         };
@@ -837,7 +848,10 @@ impl World {
         assert_eq!(ack.first.generation, entries[0].position.generation);
         assert_eq!(
             ack.first.sequence,
-            entries[0].position.sequence + self.offset,
+            entries[0]
+                .position
+                .sequence
+                .wrapping_add_signed(self.offset),
             "the acknowledged position"
         );
         assert_eq!(
@@ -1120,7 +1134,7 @@ impl World {
         }
         let items: Vec<Item> = batch.iter().map(|e| item_of(e, &self.types)).collect();
         let (now, wall) = self.clocks();
-        let first = batch[0].position.sequence + self.offset;
+        let first = batch[0].position.sequence.wrapping_add_signed(self.offset);
         let (r, _) = self
             .log
             .commit_stopped(items.clone(), None, Some(n), now, wall);
@@ -1150,8 +1164,14 @@ impl World {
         }
         let fault = match (power, kept) {
             (false, true) => Fault::Crash(CrashPoint::AfterSync),
-            (false, false) => Fault::Crash(CrashPoint::AfterWrite(WriteOutcome::Lost)),
+            // A complete batch beyond the mark, truncated: a reset point (rule 1).
+            (false, false) if report.entry.is_some() => {
+                Fault::Crash(CrashPoint::AfterWrite(WriteOutcome::Lost))
+            }
+            (false, false) => Fault::Crash(CrashPoint::BeforeWrite),
             (true, true) => Fault::PowerLoss(WriteOutcome::Survived),
+            // Torn when the log found torn bytes.
+            (true, false) if !report.losses.is_empty() => Fault::PowerLoss(WriteOutcome::Torn),
             (true, false) => Fault::PowerLoss(WriteOutcome::Lost),
         };
         assert!(self.m.commit(Some(fault)).is_err());
@@ -1194,6 +1214,7 @@ impl World {
                     }
                     Some(entry) => {
                         count(Count::Rule1Resets);
+                        assert!(self.cut || self.model_tail(entry.sequence) == Some((1, false)));
                         // K is the mark's last position; the truncated batch may have been acknowledged.
                         assert_eq!(entry.entry.after, before.last_sequence);
                         assert_eq!(entry.entry.mark_state, MarkState::Readable);
@@ -1211,12 +1232,17 @@ impl World {
                 assert!(!entry.adopted, "nothing to adopt: every start finished");
                 self.check_entry(report);
                 let reported = !report.losses.is_empty();
+                let model = self.model_tail(entry.sequence).filter(|_| !self.cut);
                 match tail {
                     Tail::Either => {}
-                    Tail::Clean => assert!(!reported, "nothing torn: {report:?}"),
+                    Tail::Clean => {
+                        assert!(!reported, "nothing torn: {report:?}");
+                        assert!(model.is_none_or(|t| t == (0, false)), "{model:?}");
+                    }
                     Tail::Torn { file_id } if reported => {
                         count(Count::TornReported);
                         assert!(!report.deleted.contains(&file_id));
+                        assert!(model.is_none_or(|t| t == (0, true)), "{model:?}");
                     }
                     Tail::Torn { file_id } => {
                         count(Count::TornDeleted);
@@ -1239,6 +1265,14 @@ impl World {
         self.log.torn_header_unused = false;
     }
 
+    /// The tail the model's recovery entry at `sequence` names: complete batches and whether one was torn.
+    fn model_tail(&self, sequence: u64) -> Option<(u32, bool)> {
+        self.m
+            .recovery_entries()
+            .get(&Position::new(0, sequence))
+            .map(|e| (e.tail.batches, e.tail.torn))
+    }
+
     /// The recovery entry a start wrote: at F = K + 1, the last batch, with the id floor and a new reset stamp that
     /// the mark carries; at most one possible loss, identified by F.
     fn check_entry(&mut self, report: &StartReport) {
@@ -1259,19 +1293,27 @@ impl World {
         if let Some(before) = self.log.before {
             assert_ne!(before.stamp, stamp, "a new reset stamp");
         }
-        // The id floor: the highest id defined, all definitions being acknowledged (§2.1).
-        let floor = self
-            .m
-            .disk
-            .live_entries()
-            .values()
-            .filter_map(|e| match &e.body {
-                EntryBody::Registry(RegistryEvent::Define { id, .. }) => Some(id.0),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        assert_eq!(entry.entry.id_floor, floor, "the id floor: {report:?}");
+        // The model's entry at the same position, while the two match one for one: the same id floor, and a
+        // possible loss exactly when it names a tail.
+        if !self.cut {
+            let p = Position::new(0, entry.sequence);
+            let model = self
+                .m
+                .recovery_entries()
+                .get(&p)
+                .cloned()
+                .expect("the model's entry");
+            assert_eq!(
+                entry.entry.id_floor, model.id_floor,
+                "the id floor: {report:?}"
+            );
+            let possible = self
+                .m
+                .losses()
+                .into_iter()
+                .any(|l| l.kind == ModelLossKind::PossibleLoss && l.identity == p);
+            assert_eq!(possible, !model.tail.is_empty(), "{model:?}");
+        }
         if let Some(before) = self.log.before {
             assert!(entry.entry.id_floor >= before.max_series_id, "{report:?}");
         }
@@ -1317,6 +1359,7 @@ impl World {
         let (now, wall) = self.clocks();
         self.log.open_cut(n, now, wall);
         count(Count::CutStarts);
+        self.cut = true;
         if let Some(seed) = then {
             // Whatever the cut start wrote of the mark, a power loss leaves no mark older than the last synced one.
             count(Count::TornAfterCutStarts);
@@ -1362,7 +1405,11 @@ impl World {
             self.crash();
             return;
         }
-        self.m.crash();
+        // A batch whose sync failed never reached the disk in the in-memory file system.
+        if self.m.disk.tail_fate.is_some() {
+            self.m.disk.tail_fate = Some(WriteOutcome::Lost);
+        }
+        self.m.remount();
         self.log.remount();
         self.restart(Expect::SameBoot(Some(false)));
     }
@@ -1393,11 +1440,14 @@ impl World {
         );
     }
 
-    /// The committed log, mapped to model positions, is what the model holds; every acknowledged entry is in it.
+    /// The committed log is what the model holds, recovery entries included, at the model's positions; every
+    /// acknowledged entry is in it. After a start cut short, entries are compared with recovery entries left out on
+    /// both sides.
     fn check(&mut self) {
         let committed = self.log.committed();
         let mut got = Vec::new();
-        let (mut last, mut offset) = (0u64, 0u64);
+        let mut log_rec = Vec::new();
+        let mut last = 0u64;
         for b in committed.values() {
             assert_eq!(
                 b.first_sequence,
@@ -1409,26 +1459,59 @@ impl World {
                     r.after, last,
                     "a recovery entry follows the last kept position"
                 );
-                offset += 1;
+                log_rec.push((b.first_sequence, r.clone()));
             } else {
                 for (k, item) in b.items.iter().enumerate() {
-                    let p = Position::new(0, b.first_sequence + k as u64 - offset);
-                    got.push((p, b.received_at, item));
+                    let seq = b.first_sequence + k as u64 - log_rec.len() as u64;
+                    got.push((seq, b.received_at, item));
                 }
             }
             last = b.last_sequence();
         }
-        let want: Vec<ModelEntry> = self.m.disk.live_entries().into_values().collect();
+        let mut want = Vec::new();
+        let mut model_rec = Vec::new();
+        for e in self.m.disk.live_entries().into_values() {
+            if let EntryBody::Recovery(r) = &e.body {
+                model_rec.push((e.position, r.clone()));
+            } else {
+                want.push((e.position.sequence - model_rec.len() as u64, e));
+            }
+        }
         assert_eq!(got.len(), want.len(), "entries in the log and in the model");
-        for ((p, at, item), w) in got.iter().zip(&want) {
-            assert_eq!(*p, w.position);
+        for ((seq, at, item), (wseq, w)) in got.iter().zip(&want) {
+            assert_eq!(seq, wseq);
+            let p = w.position;
             assert_eq!(*at, w.received_at, "received_at at {p:?}");
             match (item, &w.body) {
                 (Item::Fact(row), EntryBody::Fact(f)) => {
-                    assert_eq!(&row_to_fact(row, *p, *at), f);
+                    assert_eq!(&row_to_fact(row, p, *at), f);
                 }
                 (Item::Entry(e), EntryBody::Registry(ev)) => assert_eq!(&entry_to_event(e), ev),
                 (item, body) => panic!("at {p:?}: {item:?} in the log, {body:?} in the model"),
+            }
+        }
+        if !self.cut {
+            assert_eq!(
+                log_rec.len(),
+                model_rec.len(),
+                "recovery entries in the log and in the model"
+            );
+            for ((seq, l), (p, m)) in log_rec.iter().zip(&model_rec) {
+                assert_eq!(*seq, p.sequence, "the recovery entry's position");
+                assert_eq!(l.after, m.after.sequence, "K at {p:?}");
+                assert_eq!(l.id_floor, m.id_floor, "the id floor at {p:?}");
+                assert_eq!(
+                    l.stamp.map(|s| s.sequence),
+                    Some(m.stamp.sequence),
+                    "the stamp at {p:?}"
+                );
+                let state = match m.mark_state {
+                    ModelMarkState::Readable => MarkState::Readable,
+                    ModelMarkState::Missing => MarkState::Missing,
+                    ModelMarkState::Unreadable => MarkState::Unreadable,
+                    ModelMarkState::Stale => MarkState::Stale,
+                };
+                assert_eq!(l.mark_state, state, "the mark state at {p:?}");
             }
         }
         for (seq, item) in &self.log.acked {
@@ -1438,7 +1521,7 @@ impl World {
                 .and_then(|(first, b)| b.items.get(usize::try_from(seq - first).ok()?));
             assert_eq!(found, Some(item), "acknowledged entry at {seq}");
         }
-        self.offset = offset;
+        self.offset = log_rec.len() as i64 - model_rec.len() as i64;
     }
 
     fn apply(&mut self, op: &Op) {

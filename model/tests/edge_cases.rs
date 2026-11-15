@@ -17,6 +17,7 @@ use kvik_model::engine::{
     Selection, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
+use kvik_model::recovery::{LossKind, MarkState, PointCheck, SavedPoint, Tail};
 use kvik_model::registry::{ChangedAtKind, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Params};
 use kvik_model::tree::{SeriesTree, TreeError, quarters_in_day};
@@ -862,15 +863,19 @@ fn row_06_two_readings_in_one_second() {
 }
 
 /// Row 7: "Process crash after write, before sync. Same boot: truncated to
-/// the durable mark on restart; never delivered." With the mark lost
-/// (row 7, second clause) recovery treats it as a different boot and may keep
-/// the batch: `s3_missing_mark_counts_as_different_boot`. The model's mark is
-/// exact and `possible_loss` is not reported (see `OPEN-QUESTIONS.md`).
+/// the durable mark on restart; never delivered; a complete batch truncated
+/// this way is followed by a recovery entry and reported as `possible_loss`
+/// (§3 Recovery rule 1)." On the same boot the page cache holds the whole
+/// batch whatever its write outcome at a power loss would be. With the mark
+/// lost (row 7, second clause) recovery treats it as a different boot and may
+/// keep the batch: `s3_missing_mark_counts_as_different_boot`.
 #[test]
 fn row_07_process_crash_after_write_before_sync() {
     // Same boot: recovery truncates to the durable mark, whatever reached the
     // page cache, and a batch synced but not yet covered by the mark; the
-    // batch is never delivered.
+    // batch is never delivered. One complete batch lay beyond the mark, so
+    // the truncation is a reset point: a recovery entry at the next position
+    // with K = the mark's last position, and a `possible_loss`.
     for point in [
         CrashPoint::AfterWrite(WriteOutcome::Lost),
         CrashPoint::AfterWrite(WriteOutcome::Torn),
@@ -888,15 +893,49 @@ fn row_07_process_crash_after_write_before_sync() {
         m.restart();
         assert!(m.facts().unwrap().is_empty());
         assert_eq!(m.counters.batches_discarded, 1);
+        let k = mark.unwrap().last;
+        let entry = &m.recovery_entries()[&k.next()];
+        assert_eq!(
+            (entry.after, entry.mark_state, entry.tail),
+            (
+                k,
+                MarkState::Readable,
+                Tail {
+                    batches: 1,
+                    torn: false
+                }
+            )
+        );
+        assert_eq!(m.disk.mark.unwrap().stamp, entry.stamp, "a new reset stamp");
+        let losses = m.losses();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(
+            (losses[0].kind, losses[0].identity),
+            (LossKind::PossibleLoss, k.next())
+        );
+        assert_eq!(
+            m.health().level,
+            Level::Ok,
+            "a possible loss never degrades"
+        );
         m.drain().unwrap();
         assert!(delivered(&m).is_empty());
     }
+    // Nothing reached the page cache: nothing to truncate, no reset.
+    let (mut m, s) = model();
+    m.emit(num(s, T0, 1.0)).unwrap();
+    let r = m.commit(Some(Fault::Crash(CrashPoint::BeforeWrite)));
+    assert_eq!(r, Err(Error::Crashed));
+    m.restart();
+    assert!(m.recovery_entries().is_empty() && m.losses().is_empty());
 }
 
 /// Row 7a: "Power loss after write, before sync. New boot: torn tail truncated
-/// by checksum; complete batches synced on recovery before use." The `resync`
-/// owed after the recovery is
-/// `s4_resync_after_rule_3_recovery_before_later_positions`.
+/// by checksum and reported as `possible_loss`; complete batches synced on
+/// recovery before use; a recovery entry at the first new position." The
+/// `resync` owed after the recovery is
+/// `s4_resync_after_rule_3_recovery_before_later_positions`; on every later
+/// start until the consumer's cursor has passed it, `row_07c_…`.
 #[test]
 fn row_07a_power_loss_after_write_before_sync() {
     // New boot: a torn tail is truncated; a complete batch with valid
@@ -918,7 +957,13 @@ fn row_07a_power_loss_after_write_before_sync() {
         );
         m.restart();
         assert_eq!(!m.facts().unwrap().is_empty(), kept);
-        assert_eq!(m.disk.mark.unwrap().boot, m.boot, "recovery moved the mark");
+        let mark = m.disk.mark.unwrap();
+        assert_eq!(mark.boot, m.boot, "recovery moved the mark");
+        let entry = &m.recovery_entries()[&mark.last];
+        assert_eq!(entry.after.next(), mark.last, "F = K + 1, the mark's last");
+        assert_eq!(entry.tail.torn, outcome == WriteOutcome::Torn);
+        let possible = m.losses().iter().any(|l| l.kind == LossKind::PossibleLoss);
+        assert_eq!(possible, outcome == WriteOutcome::Torn, "{outcome:?}");
         m.drain().unwrap();
         assert_eq!(delivered(&m).len(), usize::from(kept));
     }
@@ -929,6 +974,162 @@ fn row_07a_power_loss_after_write_before_sync() {
     m.restart();
     assert_eq!(m.facts().unwrap().len(), 1);
     assert_eq!(m.counters.batches_discarded, 0);
+}
+
+/// The timed mark sync (§3 Durable mark): the mark file is synced only when
+/// asked, so a power loss can lose acknowledged batches above it.
+fn timed() -> (Model, SeriesId) {
+    model_with(Config {
+        mark_sync: kvik_model::engine::MarkSync::Timed,
+        ..Config::default()
+    })
+}
+
+/// Row 7b: "Export continued by position across a power loss. The export
+/// keeps a saved point (§7 Readers); judged against the mark after the
+/// restart, nothing above the position it is void above is kept as valid,
+/// and an unknown answer starts the export again." An export reads up to the
+/// mark and keeps the last position with the reader's stamp. Kept while
+/// nothing is reset; after a power loss that loses acknowledged batches above
+/// the last synced mark, void above K, the entry's `after`, which lies below
+/// the point; a point kept since that reset is kept, and void above its own
+/// position after a later reset that keeps it; unknown once the recovery entry
+/// the mark names is itself lost.
+#[test]
+fn row_07b_export_continued_by_position_across_a_power_loss() {
+    let (mut m, s) = timed();
+    m.ingest(vec![num(s, T0, 1.0)]).unwrap();
+    m.sync_mark_file();
+    let synced = m.disk.synced_mark.unwrap().last;
+    m.ingest(vec![num(s, T0 + SECOND, 2.0)]).unwrap();
+    m.ingest(vec![num(s, T0 + 2 * SECOND, 3.0)]).unwrap();
+    let reader = m.open_reader();
+    let (_, facts) = m.read(&reader).unwrap();
+    let p = facts.last().unwrap().position;
+    let point = SavedPoint {
+        position: p,
+        stamp: reader.stamp,
+    };
+    assert_eq!(m.check_point(point), PointCheck::Kept, "nothing reset yet");
+    assert_eq!(
+        m.power_loss_losing(2),
+        2,
+        "the acknowledged batches are lost"
+    );
+    m.restart();
+    let k = synced;
+    assert_eq!(m.check_point(point), PointCheck::VoidAbove(k));
+    let entry = m.disk.mark.unwrap().last;
+    assert_eq!(m.recovery_entries()[&entry].after, k);
+    // The export continues from K; positions above it are assigned again.
+    let again = m
+        .ingest(vec![num(s, T0 + 3 * SECOND, 4.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, entry.next());
+    assert!(
+        again <= p,
+        "a position the export held names a different fact"
+    );
+    let reader = m.open_reader();
+    let later = SavedPoint {
+        position: again,
+        stamp: reader.stamp,
+    };
+    assert_eq!(m.check_point(later), PointCheck::Kept);
+    // A later reset that truncates nothing at or below the point: void above
+    // the point itself, which the holder keeps.
+    m.sync_mark_file();
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.check_point(later), PointCheck::VoidAbove(again));
+    // The reset the mark names is lost: unknown.
+    let (mut m, s) = model();
+    m.ingest(vec![num(s, T0, 1.0)]).unwrap();
+    let point = SavedPoint {
+        position: m.disk.mark.unwrap().last,
+        stamp: m.stamp(),
+    };
+    m.power_loss();
+    m.restart();
+    m.ingest(vec![num(s, T0 + SECOND, 2.0)]).unwrap();
+    m.crash();
+    let at = m.disk.mark.unwrap().last;
+    let entry = at.sequence - 1;
+    let f = m.disk.active.unwrap();
+    let b = m.disk.files[&f]
+        .batches
+        .iter()
+        .position(|b| b.iter().any(|e| e.position.sequence == entry))
+        .unwrap();
+    m.corrupt_open_batch(b).unwrap();
+    m.restart();
+    assert_eq!(m.check_point(point), PointCheck::Unknown);
+    assert!(
+        m.losses().iter().any(|l| l.kind == LossKind::DataLost),
+        "the range that took the entry is a `data_lost`"
+    );
+}
+
+/// Row 7c: "Crash on the same boot after a rule 3 recovery, before a consumer
+/// received its `resync`: rule 1 start; the replay meets the recovery entry
+/// before any reused position." A power loss loses an acknowledged and
+/// delivered batch above the last synced mark; the recovery entry takes the
+/// next position and later facts reuse the lost ones. The consumer has not
+/// received its `resync` when the process crashes; the next start is rule 1
+/// (the mark covers the entry, so nothing is reset again), and the replay
+/// delivers the `resync` carrying `forget_above` = K at the entry before any
+/// position above K, and nothing more until it is confirmed. The reset point
+/// is read from the log at every start; nothing is owed on disk.
+#[test]
+fn row_07c_crash_on_the_same_boot_after_a_rule_3_recovery() {
+    let (mut m, s) = timed();
+    m.ingest(vec![num(s, T0, 1.0)]).unwrap();
+    m.drain().unwrap();
+    let k = m.disk.synced_mark.unwrap().last;
+    let lost = m.ingest(vec![num(s, T0 + SECOND, 2.0)]).unwrap().positions[0];
+    assert_eq!(m.poll(C, 10).unwrap()[0].position, lost, "delivered");
+    assert_eq!(m.power_loss_losing(1), 1);
+    m.restart();
+    let entry = k.next();
+    assert_eq!(m.recovery_entries()[&entry].after, k);
+    let reused = m
+        .ingest(vec![num(s, T0 + 2 * SECOND, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert!(reused > k);
+    // The consumer has not received its `resync`.
+    m.crash();
+    let entries = m.recovery_entries().len();
+    m.restart();
+    assert_eq!(
+        m.recovery_entries().len(),
+        entries,
+        "rule 1: no second reset"
+    );
+    m.catch_up(C, usize::MAX).unwrap();
+    let got = m.receive(C, usize::MAX).unwrap();
+    let r = got.last().unwrap();
+    assert_eq!(
+        (r.position, r.resync().and_then(|r| r.forget_above)),
+        (entry, Some(k)),
+        "the reset point first"
+    );
+    assert!(got.iter().all(|d| d.position <= entry));
+    m.catch_up(C, usize::MAX).unwrap();
+    assert!(
+        m.receive(C, usize::MAX).unwrap().is_empty(),
+        "until confirmed"
+    );
+    m.confirm(C, entry).unwrap();
+    assert_eq!(m.disk.cursors[&C], entry);
+    m.drain().unwrap();
+    let after: Vec<Position> = m.received[&C]
+        .iter()
+        .filter(|x| x.delivery.fact().is_some() && x.delivery.position > entry)
+        .map(|x| x.delivery.position)
+        .collect();
+    assert_eq!(after, vec![reused]);
 }
 
 /// Row 8: "Crash after sync, before delivery: delivered on restart from each
@@ -1145,14 +1346,50 @@ fn confirm_upto(m: &mut Model, c: ConsumerId, upto: Position) {
 }
 
 /// Asserts what consumer `c` receives in session `session` after a lost
-/// range: the kept facts above `cursor`, none in the range, then `resync`.
-fn assert_resumed(m: &Model, c: ConsumerId, session: u32, cursor: Position, kept: &[Position]) {
+/// range: the kept facts above `cursor` up to the range, then the reset point
+/// (a `resync` at `reset` carrying `forget_above`), then the kept facts above
+/// it, none in the range, then the `resync` that ends the resume. A reset
+/// point after the last fact is that `resync` (§4 Resync).
+fn assert_resumed(
+    m: &Model,
+    c: ConsumerId,
+    session: u32,
+    cursor: Position,
+    kept: &[Position],
+    reset: (Position, Position),
+) {
     let stream = session_stream(m, c, session);
-    let (last, facts) = stream.split_last().unwrap();
-    let got: Vec<Position> = facts.iter().map(|d| d.fact().unwrap().position).collect();
-    let want: Vec<Position> = kept.iter().copied().filter(|p| *p > cursor).collect();
-    assert_eq!(got, want, "consumer {}", c.0);
+    let (id, forget_above) = reset;
+    let (last, rest) = stream.split_last().unwrap();
     assert!(last.resync().is_some(), "consumer {} ends with resync", c.0);
+    let mut want: Vec<String> = kept
+        .iter()
+        .filter(|p| **p > cursor && **p < id)
+        .map(|p| format!("F{}", p.sequence))
+        .collect();
+    let after: Vec<String> = kept
+        .iter()
+        .filter(|p| **p > id)
+        .map(|p| format!("F{}", p.sequence))
+        .collect();
+    if after.is_empty() {
+        assert_eq!(last.resync().unwrap().forget_above, Some(forget_above));
+    } else {
+        want.push(format!("S{}", id.sequence));
+        want.extend(after);
+        assert_eq!(last.resync().unwrap().forget_above, None);
+    }
+    let got: Vec<String> = rest
+        .iter()
+        .map(|d| match d.resync() {
+            Some(r) => {
+                assert_eq!(r.forget_above, Some(forget_above), "consumer {}", c.0);
+                format!("S{}", d.position.sequence)
+            }
+            None => format!("F{}", d.fact().unwrap().position.sequence),
+        })
+        .collect();
+    assert_eq!(got, want, "consumer {}", c.0);
 }
 
 /// Row 11a: "Corrupt block inside the open segment, or below an old boot's
@@ -1162,11 +1399,11 @@ fn assert_resumed(m: &Model, c: ConsumerId, session: u32, cursor: Position, kept
 /// mark, is damaged while the engine is down. Recovery keeps the later
 /// batches, records the range from the position after the first batch to the
 /// position before the third, reports `data_lost` without going read-only,
-/// and continues above the last batch. A consumer whose cursor is below the
-/// range and one whose cursor is inside it receive the kept facts after their
-/// cursor, never a lost position, then `resync` (the specification now
-/// delivers a `resync` carrying `forget_above` at the range first; see
-/// `OPEN-QUESTIONS.md`). The report stays after another restart, read from
+/// and continues above the last batch. The range is a reset point (§4
+/// Resync): a consumer whose cursor is below it and one whose cursor is
+/// inside it receive a `resync` at its last position carrying `forget_above`
+/// = the position before it, then the kept facts after it, never a lost
+/// position, then `resync`. The report stays after another restart, read from
 /// the manifest, and holds health degraded (§11 Health, Q-34 (c)).
 #[test]
 fn row_11a_corrupt_block_inside_the_open_segment() {
@@ -1194,8 +1431,9 @@ fn row_11a_corrupt_block_inside_the_open_segment() {
     assert!(h.reasons.contains(&Reason::DataLost(lost.0, lost.1)));
     assert!(!m.is_read_only());
     m.drain().unwrap();
-    assert_resumed(&m, below, 2, below_cursor, &kept);
-    assert_resumed(&m, inside, 2, inside_cursor, &kept);
+    let reset = (lost.1, b[0][1]);
+    assert_resumed(&m, below, 2, below_cursor, &kept, reset);
+    assert_resumed(&m, inside, 2, inside_cursor, &kept, reset);
     let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
     assert_eq!(next, b[3][1].next());
     m.restart();
@@ -1209,10 +1447,13 @@ fn row_11a_corrupt_block_inside_the_open_segment() {
 
 /// Row 11a after a power loss: the last batch below the old boot's mark is
 /// damaged, with no complete batch after it, so the range runs to the mark's
-/// last position (§3 Recovery rule 2), and new positions continue above it:
-/// treated as a torn tail (rule 3), the range would be truncated and its
-/// positions issued again. A consumer whose cursor is below it receives
-/// `resync`, and no lost position.
+/// last position (§3 Recovery rule 2): treated as a torn tail (rule 3), the
+/// range would be truncated and its positions issued again. K is the range's
+/// end, so the recovery entry takes the next position and new positions
+/// continue above it. A consumer whose cursor is below the range receives
+/// no lost position and one `resync` at the entry: the two reset points have
+/// nothing routed between them, so they are delivered as one, with the lower
+/// `forget_above`, and it ends the resume (§4 Resync).
 #[test]
 fn row_11a_corrupt_block_below_an_old_boots_mark() {
     let (mut m, s, b) = open_segment_model();
@@ -1233,9 +1474,11 @@ fn row_11a_corrupt_block_below_an_old_boots_mark() {
     );
     m.drain().unwrap();
     let kept: Vec<Position> = b[..3].iter().flatten().copied().collect();
-    assert_resumed(&m, c, 2, b[2][1], &kept);
+    let entry = mark.last.next();
+    assert_eq!(m.recovery_entries()[&entry].after, mark.last, "K");
+    assert_resumed(&m, c, 2, b[2][1], &kept, (entry, b[2][1]));
     let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
-    assert_eq!(next, mark.last.next(), "positions not reused");
+    assert_eq!(next, entry.next(), "positions not reused");
     // Across a later restart too.
     m.crash();
     m.restart();
@@ -1250,9 +1493,9 @@ fn row_11a_corrupt_block_below_an_old_boots_mark() {
 /// power loss, the recovery that finds a damaged batch cannot sync, so the
 /// engine stays read-only and writes nothing. `data_lost` is reported at once,
 /// as found, and the next start that can write records the range once (Q-79).
-/// A read-only engine does not seal (§3 Write or sync failure). New positions
-/// continue above the range (the specification puts a recovery entry there
-/// first; see `OPEN-QUESTIONS.md`).
+/// A read-only engine does not seal (§3 Write or sync failure). The start
+/// that can write puts its recovery entry after the range, and new positions
+/// continue above it.
 #[test]
 fn row_11a_failed_recovery_sync_reports_the_range_as_found() {
     let (mut m, s, b) = open_segment_model();
@@ -1282,8 +1525,12 @@ fn row_11a_failed_recovery_sync_reports_the_range_as_found() {
     assert!(m.health().reasons.contains(&lost));
     m.restart();
     assert_eq!(m.disk.lost_ranges().len(), 1, "recorded once");
+    assert!(
+        m.recovery_entries().contains_key(&b[3][1].next()),
+        "the recovery entry after the range"
+    );
     let next = m.ingest(vec![num(s, T0 + MINUTE, 3.0)]).unwrap().positions[0];
-    assert_eq!(next, b[3][1].next(), "positions not reused");
+    assert_eq!(next, b[3][1].next().next(), "positions not reused");
 }
 
 /// Row 11a in the model: damage to a batch holding a definition is refused,
