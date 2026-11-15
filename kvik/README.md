@@ -120,8 +120,8 @@ Durable backend, besides consumers:
   model's exact arithmetic; no summary is stored yet (the tree of roadmap 7 serves the same calls). Calendar results
   take local days from the time-zone rules the model embeds, not from the release `Env::tz` reports (Q-93 (c)).
 - Live staleness of an observed series is measured on the monotonic clock since its last refreshing commit in the
-  writer's process, taken when the call's acknowledgement is (a call whose acknowledgement is never taken refreshes
-  nothing); a reader process, and a writer before its first such commit after opening, measure it in event
+  writer's process, taken when the log acknowledges the call, after the covering sync, whether or not the caller
+  waits for it; a reader process, and a writer before its first such commit after opening, measure it in event
   time (`now − t` of the live-state fact), as the model backend does after a restart (Q-16, Q-140).
 - The log's timers (group commit, mark sync, sealing) run on the process's monotonic clock, not on `Env::clock`,
   whose wall clock stamps `received_at`: a manual clock that stands still would otherwise hold a sync back.

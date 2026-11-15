@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -198,10 +198,35 @@ impl Wake for FanOut {
     }
 }
 
+/// Resolves a [`Completion`] when the log completes its call: the log wakes it on its writer thread, after the
+/// covering sync, whether or not anyone waits for the call.
 #[derive(Debug)]
+struct Resolver(Weak<Completion>);
+
+impl Wake for Resolver {
+    fn wake(self: Arc<Self>) {
+        if let Some(c) = self.0.upgrade() {
+            let _ = c.poll(None);
+        }
+    }
+}
+
+/// What a call does once the log acknowledges it, whoever waits for it.
+type OnAck = Box<dyn FnOnce() + Send>;
+
 struct CompletionState {
     pending: Option<LogPending>,
     result: Option<Result<LogAck, CommitError>>,
+    on_ack: Option<OnAck>,
+}
+
+impl std::fmt::Debug for CompletionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionState")
+            .field("pending", &self.pending)
+            .field("result", &self.result)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The log's acknowledgement of one queued call, shared by the call's own future and by every later call whose
@@ -210,17 +235,25 @@ struct CompletionState {
 pub(crate) struct Completion {
     state: Mutex<CompletionState>,
     wakers: Arc<FanOut>,
+    resolver: Waker,
 }
 
 impl Completion {
-    fn new(pending: LogPending) -> Self {
-        Completion {
+    /// A completion whose `on_ack` runs once the log acknowledges the call, on the log's writer thread or in the
+    /// first poll that finds the acknowledgement.
+    fn new(pending: LogPending, on_ack: OnAck) -> Arc<Self> {
+        let c = Arc::new_cyclic(|me| Completion {
             state: Mutex::new(CompletionState {
                 pending: Some(pending),
                 result: None,
+                on_ack: Some(on_ack),
             }),
             wakers: Arc::new(FanOut::default()),
-        }
+            resolver: Waker::from(Arc::new(Resolver(me.clone()))),
+        });
+        // Registers the resolver with the log, or resolves at once.
+        let _ = c.poll(None);
+        c
     }
 
     /// The call's result once the log has given it; registers `cx`'s waker otherwise.
@@ -235,17 +268,20 @@ impl Completion {
                 w.push(cx.waker().clone());
             }
         }
-        let fan = Waker::from(self.wakers.clone());
-        let mut fan_cx = Context::from_waker(&fan);
+        let mut resolver_cx = Context::from_waker(&self.resolver);
         let Some(pending) = st.pending.as_mut() else {
             return Poll::Pending;
         };
-        match std::pin::Pin::new(pending).poll(&mut fan_cx) {
+        match std::pin::Pin::new(pending).poll(&mut resolver_cx) {
             Poll::Ready(r) => {
                 st.result = Some(r.clone());
                 st.pending = None;
+                let on_ack = st.on_ack.take().filter(|_| r.is_ok());
                 drop(st);
-                fan.wake_by_ref();
+                if let Some(f) = on_ack {
+                    f();
+                }
+                Waker::from(self.wakers.clone()).wake();
                 Poll::Ready(r)
             }
             Poll::Pending => Poll::Pending,
@@ -785,7 +821,15 @@ impl Writer {
         inflight.retain(|_, c| !c.acknowledged());
         let tracked = match queued {
             Some(pending) => {
-                let c = Arc::new(Completion::new(pending));
+                let (clocks, ids) = (self.clocks.clone(), refreshing(&plan));
+                let c = Completion::new(
+                    pending,
+                    Box::new(move || {
+                        for id in ids {
+                            clocks.refresh(id);
+                        }
+                    }),
+                );
                 inflight.insert(call, c.clone());
                 Some((c, true))
             }
@@ -801,7 +845,6 @@ impl Writer {
         #[cfg(test)]
         tests::after_decision(&self.dir);
         self.count(readings, &plan);
-        let refreshing = refreshing(&plan);
         let decisions = plan.decisions;
         let Some((completion, own)) = tracked else {
             return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None))));
@@ -814,12 +857,7 @@ impl Writer {
                     me.note_latency(started.elapsed());
                 }
                 match r {
-                    Ok(ack) if own => {
-                        for id in &refreshing {
-                            me.clocks.refresh(*id);
-                        }
-                        Ok(Ack::new(outcomes(&decisions, Some(ack.first))))
-                    }
+                    Ok(ack) if own => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),
                     Ok(_) => Ok(Ack::new(outcomes(&decisions, None))),
                     Err(CommitError::ShutDown) => Err(EmitError::Closed),
                     Err(CommitError::ReadOnly) => Err(EmitError::ReadOnly(me.fault_now())),
@@ -1104,9 +1142,9 @@ fn orphaned(i: &Index, range: &std::ops::RangeInclusive<Position>) -> Vec<Fact> 
     out
 }
 
-/// The series whose live staleness a call refreshes once it is acknowledged (spec §5.4): those of its facts that
-/// are recorded, not outranked, not bad quality and not future. A call whose acknowledgement is never taken (a
-/// dropped [`Queued`]) refreshes nothing.
+/// The series whose live staleness a call refreshes when the log acknowledges it, after the covering sync, whether
+/// or not the caller waits (spec §5.4): those of its facts that are recorded, not outranked, not bad quality and not
+/// future.
 fn refreshing(plan: &ingest::Plan) -> Vec<u32> {
     plan.decisions
         .iter()

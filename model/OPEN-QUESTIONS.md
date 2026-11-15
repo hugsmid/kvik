@@ -84,7 +84,7 @@ refresh instant, since the writer's monotonic clock is not in the log.
 **Roadmap 5.4.** The durable backend gives live state and staleness as the model backend does (`kvik/src/durable/`
 `windows.rs` and `clock.rs`): an observed series is stale when more than S has passed on the monotonic clock since its
 last commit, in the writer's process, of a fact that is recorded, not outranked, not bad quality and not `future`
-(the instant is taken when the call's acknowledgement is); with no such commit since the store was
+(the instant is taken when the log acknowledges the call, after the covering sync, whether or not the caller waits); with no such commit since the store was
 opened, in event time, `now − t` of the live-state fact; a scheduled series in event time, a forecast series never.
 So (a) and (b) still refresh it, as in the model, and (d) falls back to event time. A reader process has no refresh
 instant at all (objection 5, Q-140). Not settled: the owner's ruling on the proposal and its objections is pending

@@ -539,3 +539,49 @@ fn a_reader_process_answers_after_shutdown_and_power_loss() {
     assert_eq!(stale(&after), (Some(300.0), true));
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn a_commit_nobody_awaits_refreshes_live_staleness() {
+    let clock = ManualClock::new(start());
+    let mut env = Env::test(clock.clone());
+    env.fs = Arc::new(MemFs::new());
+    let mut log = LogConfig::default();
+    log.segment_size = 16 << 20;
+    let s = block_on(Store::open(
+        StoreConfig::new("windows/unawaited", "Europe/London")
+            .create_if_missing(true)
+            .env(env)
+            .log(log),
+    ))
+    .unwrap();
+    let g = block_on(
+        s.define_series(
+            number(gauge())
+                .name("w/g/unawaited")
+                .expected_interval(Duration::from_secs(1))
+                .staleness(Duration::from_secs(3)),
+        ),
+    )
+    .unwrap();
+    // A reading 10 s old: stale in event time, fresh on the monotonic clock since its commit. Its acknowledgement
+    // is dropped unawaited; the commit still refreshes live staleness once the log acknowledges it.
+    drop(
+        s.try_emit(&[Reading::new(g, at(-10), Value::F64(1.0))])
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Live::Value(v) = s.reader().live(g).unwrap()
+            && !v.stale
+        {
+            assert_eq!(v.fact.number(), Some(1.0));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the commit did not refresh live staleness"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    block_on(s.shutdown()).unwrap();
+}
