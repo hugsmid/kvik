@@ -1,0 +1,469 @@
+//! Shared fixtures for the restore tests: a hand-built source store in a bucket, a hand-written plan (8.3a's stands
+//! in later), a sink wrapper that loses, damages or delays chosen objects and logs every call, and a step loop.
+#![allow(dead_code)]
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use kvik_backup::LocalStore;
+use kvik_backup::envelope::Envelope;
+use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
+use kvik_backup::keys::Keys;
+use kvik_backup::plan::{PlanError, PlanInput, PlanMode, RestorePlan};
+use kvik_backup::restore::{
+    Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreStep, Restorer,
+};
+use kvik_files::MANIFEST;
+use kvik_files::catalogue::Tier;
+use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
+use kvik_files::image;
+use kvik_files::record::{Body, Record, record_type};
+use kvik_files::restore::{RestoreRecord, RestoredFile};
+use kvik_files::tier::DeepCopy;
+use kvik_log::fs::MemFs;
+use kvik_log::manifest::LostRange;
+use kvik_log::mark::ResetStamp;
+use kvik_log::store::StoreDescriptor;
+use kvik_sink_api::{BackupSink, ListPage, SinkError, SinkFuture, Stored};
+use sha2::{Digest, Sha256};
+
+pub const KEY: [u8; 32] = [7; 32];
+pub const OTHER_KEY: [u8; 32] = [8; 32];
+pub const ID: [u8; 16] = [0x5a; 16];
+pub const DIR: &str = "restored";
+pub const MIN: Duration = Duration::from_secs(60);
+
+pub fn sha256(b: &[u8]) -> [u8; 32] {
+    Sha256::digest(b).into()
+}
+
+/// A source store: its descriptor and sealed log segments of generation 0, each with its plaintext.
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub id: [u8; 16],
+    pub store: Vec<u8>,
+    pub segments: Vec<(FileDescription, Vec<u8>)>,
+    pub copies: BTreeMap<FileRef, DeepCopy>,
+}
+
+/// `n` segments of ten positions each; `big` makes the first span several envelope chunks.
+pub fn source(id: [u8; 16], n: u64, big: bool) -> Source {
+    let store = StoreDescriptor {
+        store_id: id,
+        created_at: 1,
+        site_zone: "Etc/UTC".into(),
+        tzdata: "2026a".into(),
+        software: None,
+    }
+    .encode()
+    .unwrap();
+    let segments = (1..=n)
+        .map(|i| {
+            let len = if big && i == 1 {
+                150_000
+            } else {
+                300 + i as usize * 17
+            };
+            let plain: Vec<u8> = (0..len).map(|b| (b as u64 * 31 + i) as u8).collect();
+            let d = FileDescription {
+                kind: kind::LOG_SEGMENT,
+                class: FileClass::None,
+                generation: 0,
+                file_id: i,
+                range: Some(((0, (i - 1) * 10 + 1), (0, i * 10))),
+                hash: sha256(&plain),
+                inputs: Vec::new(),
+            };
+            (d, plain)
+        })
+        .collect();
+    Source {
+        id,
+        store,
+        segments,
+        copies: BTreeMap::new(),
+    }
+}
+
+fn put(sink: &dyn BackupSink, key: &str, bytes: Vec<u8>) -> Stored {
+    let sha = sha256(&bytes);
+    block_on(sink.put(key, bytes.into(), sha)).unwrap()
+}
+
+/// Uploads the source as a backup would: `STORE`, each segment, then its records (an empty record, then one sealed
+/// record per segment). Fills `copies` with what the bucket reports.
+pub fn upload(sink: &dyn BackupSink, src: &mut Source) {
+    let keys = Keys::new(src.id);
+    let env = TestEnvelope::new(KEY);
+    put(
+        sink,
+        &keys.store(),
+        env.seal(&keys.store(), &src.store).unwrap(),
+    );
+    for (d, plain) in &src.segments {
+        let k = keys.file(d);
+        let s = put(sink, &k, env.seal(&k, plain).unwrap());
+        src.copies.insert(
+            d.file_ref(),
+            DeepCopy {
+                size: s.size,
+                sha256: s.sha256,
+            },
+        );
+    }
+    let mut records = vec![Record::new(1, 0, 10, Body::Empty)];
+    for (i, (d, _)) in src.segments.iter().enumerate() {
+        records.push(Record::new(
+            i as u64 + 2,
+            0,
+            11,
+            Body::Sealed(vec![d.clone()]),
+        ));
+    }
+    for r in records {
+        let k = keys.record(0, r.epoch);
+        put(sink, &k, env.seal(&k, &r.encode().unwrap()).unwrap());
+    }
+}
+
+thread_local! {
+    static COPIES: RefCell<BTreeMap<FileRef, DeepCopy>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Gives [`hand_plan`] the copies of `src` (no `0x27` fold exists yet).
+pub fn use_copies(src: &Source) {
+    COPIES.with(|c| *c.borrow_mut() = src.copies.clone());
+}
+
+/// A hand-written plan: every live log segment, restored from its copy, the restored end its last position.
+pub fn hand_plan(input: &PlanInput<'_>) -> Result<RestorePlan, PlanError> {
+    let mut files = Vec::new();
+    for e in input.source.live() {
+        let f = e.description.file_ref();
+        let copy = COPIES
+            .with(|c| c.borrow().get(&f).cloned())
+            .ok_or(PlanError::NotCopied { file: f })?;
+        files.push(RestoredFile {
+            description: e.description.clone(),
+            tier: Tier::Deep,
+            copy,
+        });
+    }
+    if files.is_empty() {
+        return Err(PlanError::NoRecords);
+    }
+    files.sort_by_key(|f| {
+        (
+            f.description.kind,
+            f.description.generation,
+            f.description.file_id,
+        )
+    });
+    let restored_end = files
+        .iter()
+        .filter_map(|f| f.description.range.map(|r| r.1))
+        .max()
+        .unwrap_or((input.source_generation, 0));
+    let mut fetch = files.clone();
+    fetch.sort_by_key(|f| f.description.range.map(|r| r.0));
+    Ok(RestorePlan {
+        record: RestoreRecord {
+            generation: input.generation,
+            stamp: ResetStamp {
+                sequence: 1,
+                nonce: input.nonce,
+            },
+            source_generation: input.source_generation,
+            restored_end,
+            carried_ends: Vec::new(),
+            losses: Vec::new(),
+            acknowledgements: Vec::new(),
+            entry_losses: Vec::new(),
+            files,
+            drill: matches!(input.mode, PlanMode::Drill),
+        },
+        fetch,
+    })
+}
+
+static NONCE: AtomicU64 = AtomicU64::new(1_000);
+
+pub fn cfg(mode: PlanMode) -> RestoreConfig {
+    RestoreConfig {
+        mode,
+        lost_tries: 3,
+        lost_over: 10 * MIN,
+        retry_first: Duration::from_secs(1),
+        retry_max: MIN,
+    }
+}
+
+pub fn local(fs: &MemFs) -> LocalStore {
+    LocalStore {
+        fs: Arc::new(fs.clone()),
+        dir: PathBuf::from(DIR),
+    }
+}
+
+pub fn restorer<S: BackupSink>(
+    sink: S,
+    fs: &MemFs,
+    mode: PlanMode,
+    key: [u8; 32],
+) -> Restorer<S, TestEnvelope> {
+    Restorer::new(
+        sink,
+        Box::new(move |_| TestEnvelope::new(key)),
+        local(fs),
+        hand_plan,
+        Box::new(|| NONCE.fetch_add(1, Ordering::Relaxed)),
+        cfg(mode),
+    )
+}
+
+/// What a run of steps did.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub installed: Vec<FileRef>,
+    pub lost: Vec<(FileRef, LostRange, Duration)>,
+    pub retries: u64,
+    pub now: Duration,
+}
+
+/// Steps to `Done`, advancing time by each `Retry`, until `limit` of virtual time.
+pub fn steps<D: RestoreDriver>(
+    d: &mut D,
+    start: Duration,
+    limit: Duration,
+) -> Result<Outcome, RestoreError> {
+    let mut o = Outcome {
+        now: start,
+        ..Outcome::default()
+    };
+    for _ in 0..100_000 {
+        match block_on(d.step(o.now)) {
+            RestoreStep::Installed { file } => o.installed.push(file),
+            RestoreStep::Lost { file, loss } => o.lost.push((file, loss, o.now)),
+            RestoreStep::Retry { after, .. } => {
+                o.retries += 1;
+                o.now += after;
+                if o.now > limit {
+                    return Ok(o);
+                }
+            }
+            RestoreStep::Done => return Ok(o),
+            RestoreStep::Failed(e) => return Err(e),
+            _ => unreachable!(),
+        }
+    }
+    panic!("no end after 100,000 steps");
+}
+
+/// `prepare`, then steps to `Done` within two hours of virtual time.
+pub fn restore<D: RestoreDriver>(d: &mut D) -> Result<(Prepared, Outcome), RestoreError> {
+    let p = block_on(d.prepare(100))?;
+    let o = steps(d, Duration::ZERO, 120 * MIN)?;
+    Ok((p, o))
+}
+
+/// The restore records and lost ranges in the restored manifest.
+pub fn manifest(fs: &MemFs) -> (Vec<Record>, Vec<LostRange>) {
+    let bytes = fs.read(&Path::new(DIR).join(MANIFEST)).expect("a manifest");
+    let id = kvik_log::header::FileHeader::decode(&bytes)
+        .unwrap()
+        .store_id;
+    let img = image::read(&bytes, &id).unwrap();
+    let restores = img
+        .records()
+        .filter(|r| r.body.record_type() == record_type::RESTORE)
+        .cloned()
+        .collect();
+    let lost = img
+        .records()
+        .filter_map(|r| match &r.body {
+            Body::LostRange(l) => Some(l.clone()),
+            _ => None,
+        })
+        .collect();
+    (restores, lost)
+}
+
+pub fn segment_path(d: &FileDescription) -> PathBuf {
+    Path::new(DIR)
+        .join("log")
+        .join(format!("{:08x}-{:016x}.kvl", d.generation, d.file_id))
+}
+
+/// Every source segment not in `missing` is installed with its plaintext; those in `missing` are not.
+pub fn assert_installed(fs: &MemFs, src: &Source, missing: &[FileRef]) {
+    for (d, plain) in &src.segments {
+        let got = fs.read(&segment_path(d));
+        if missing.contains(&d.file_ref()) {
+            assert_eq!(got, None, "{:?} should be missing", d.file_ref());
+        } else {
+            assert_eq!(got.as_deref(), Some(plain.as_slice()), "{:?}", d.file_ref());
+        }
+    }
+}
+
+/// Claim markers in the bucket.
+pub fn claims(objects: &BTreeMap<String, Vec<u8>>, id: [u8; 16]) -> Vec<String> {
+    let prefix = format!("{}claims/", Keys::new(id).store().trim_end_matches("STORE"));
+    objects
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+/// A fault on one object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The bucket no longer holds it.
+    Lose,
+    /// Its bytes are damaged; the reported hash is unchanged.
+    Damage,
+    /// Downloads fail as `HashMismatch`.
+    Mismatch,
+    /// The next `n` calls on it fail as transient.
+    Delay(u32),
+}
+
+/// A sink over a [`MemSink`] that applies per-key faults and logs every call as (operation, key).
+#[derive(Debug, Default)]
+pub struct FaultSink {
+    pub inner: MemSink,
+    faults: Mutex<BTreeMap<String, Fault>>,
+    log: Mutex<Vec<(&'static str, String)>>,
+}
+
+impl FaultSink {
+    pub fn new(inner: MemSink) -> Self {
+        Self {
+            inner,
+            ..Self::default()
+        }
+    }
+
+    pub fn set(&self, key: &str, f: Option<Fault>) {
+        let mut m = self.faults.lock().unwrap();
+        match f {
+            Some(f) => m.insert(key.into(), f),
+            None => m.remove(key),
+        };
+    }
+
+    pub fn log(&self) -> Vec<(&'static str, String)> {
+        self.log.lock().unwrap().clone()
+    }
+
+    pub fn count(&self, op: &str, key: &str) -> usize {
+        self.log()
+            .iter()
+            .filter(|(o, k)| *o == op && k == key)
+            .count()
+    }
+
+    /// Logs the call; returns the fault to apply, spending one delayed call.
+    fn enter(&self, op: &'static str, key: &str) -> Option<Fault> {
+        self.log.lock().unwrap().push((op, key.into()));
+        let mut m = self.faults.lock().unwrap();
+        match m.get_mut(key) {
+            Some(Fault::Delay(0)) => None,
+            Some(Fault::Delay(n)) => {
+                *n -= 1;
+                Some(Fault::Delay(*n + 1))
+            }
+            other => other.copied(),
+        }
+    }
+}
+
+fn transient(key: &str) -> SinkError {
+    SinkError::Transient {
+        reason: format!("delayed: {key}"),
+    }
+}
+
+impl BackupSink for FaultSink {
+    fn put<'a>(&'a self, key: &'a str, bytes: Arc<[u8]>, sha: [u8; 32]) -> SinkFuture<'a, Stored> {
+        if let Some(Fault::Delay(_)) = self.enter("put", key) {
+            return Box::pin(async move { Err(transient(key)) });
+        }
+        self.inner.put(key, bytes, sha)
+    }
+
+    fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>> {
+        match self.enter("stat", key) {
+            Some(Fault::Delay(_)) => Box::pin(async move { Err(transient(key)) }),
+            Some(Fault::Lose) => Box::pin(async { Ok(None) }),
+            _ => self.inner.stat(key),
+        }
+    }
+
+    fn get<'a>(&'a self, key: &'a str, range: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>> {
+        let r = match self.enter("get", key) {
+            Some(Fault::Delay(_)) => Err(transient(key)),
+            Some(Fault::Lose) => Err(SinkError::NotFound { key: key.into() }),
+            Some(Fault::Mismatch) => Err(SinkError::HashMismatch { key: key.into() }),
+            Some(Fault::Damage) => block_on(self.inner.get(key, None)).and_then(|mut b| {
+                let mid = b.len() / 2;
+                b[mid] ^= 0x40;
+                match range {
+                    None => Ok(b),
+                    Some(r) => b
+                        .get(r.start as usize..r.end as usize)
+                        .map(<[u8]>::to_vec)
+                        .ok_or(SinkError::InvalidRange { key: key.into() }),
+                }
+            }),
+            None => block_on(self.inner.get(key, range)),
+        };
+        Box::pin(async move { r })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+        start_after: Option<&'a str>,
+    ) -> SinkFuture<'a, ListPage> {
+        self.log.lock().unwrap().push(("list", prefix.into()));
+        let lost: Vec<String> = self
+            .faults
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, f)| **f == Fault::Lose)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let r = block_on(self.inner.list(prefix, start_after)).map(|p| {
+            ListPage::new(
+                p.keys.into_iter().filter(|k| !lost.contains(k)).collect(),
+                p.more,
+            )
+        });
+        Box::pin(async move { r })
+    }
+}
+
+/// A [`MemSink`] holding a copy of `objects`.
+pub fn mem_with(objects: &BTreeMap<String, Vec<u8>>) -> MemSink {
+    let m = MemSink::new();
+    for (k, v) in objects {
+        m.set(k, v);
+    }
+    m
+}
+
+/// A bucket holding `src`, with `src.copies` filled; returns its objects too.
+pub fn bucket(src: &mut Source) -> BTreeMap<String, Vec<u8>> {
+    let m = MemSink::new();
+    upload(&m, src);
+    use_copies(src);
+    m.objects()
+}
