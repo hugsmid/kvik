@@ -260,26 +260,30 @@ pub fn plan(
             live.insert(*r);
         }
     }
-    // A file a valid record retires and no valid record published was published by the corrupt record, which
-    // retired its compacted inputs in the same record.
-    for e in old.files().filter(|e| e.published.is_none()) {
+    // A compacted file that a file named by a valid record names as an input is retired: the record that published
+    // the output retired its compacted inputs. Where that record is the corrupt one (a file a valid record retires
+    // and no valid record published), the retirement is restated.
+    let mut gone: BTreeSet<FileRef> = BTreeSet::new();
+    for e in old.files() {
         for i in e
             .description
             .inputs
             .iter()
             .filter(|i| i.kind == kind::COMPACTED)
         {
-            if live.remove(i)
-                && let Some(d) = describe(i)
-            {
-                retired.insert(*i, d);
+            let unnamed = old.file(*i).is_none();
+            if live.remove(i) || unnamed {
+                gone.insert(*i);
+                if let Some(d) = describe(i) {
+                    retired.insert(*i, d);
+                }
             }
         }
     }
     // Outputs no valid record names, oldest first, so that an output of an output is judged after it.
     for (r, f) in local
         .iter()
-        .filter(|(r, _)| r.kind == kind::COMPACTED && old.file(**r).is_none())
+        .filter(|(r, _)| r.kind == kind::COMPACTED && old.file(**r).is_none() && !gone.contains(*r))
     {
         let live_inputs: Vec<FileRef> = f
             .description
@@ -309,7 +313,10 @@ pub fn plan(
             live.insert(*r);
             for i in live_inputs {
                 live.remove(&i);
-                if let Some(d) = describe(&i) {
+                // An output restated above and now an input: retired, with its own description.
+                if let Some(k) = published.iter().position(|d| d.file_ref() == i) {
+                    retired.insert(i, published.remove(k));
+                } else if let Some(d) = describe(&i) {
                     retired.insert(i, d);
                 }
             }
