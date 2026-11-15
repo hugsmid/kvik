@@ -28,7 +28,7 @@ pub mod record_type {
     pub const RESTORE: u8 = 0x25;
     /// A quarantine (laid out by roadmap 8.1).
     pub const QUARANTINE: u8 = 0x26;
-    /// A tier move (laid out by roadmap 8.1).
+    /// A copy-verified record (`crate::tier::CopyVerified`; carried as a field list, decoded strictly).
     pub const TIER_MOVE: u8 = 0x27;
     /// A rebuild record.
     pub const REBUILD: u8 = 0x28;
@@ -272,6 +272,9 @@ impl Record {
                 }
             }
             Body::Other { fields, .. } => {
+                crate::tier::CopyVerified::from_body(&self.body)
+                    .transpose()
+                    .map_err(|_| EncodeError::Invalid("an invalid copy-verified record"))?;
                 if fields.iter().any(|(id, _)| *id == FIELD_OLD_EPOCH) {
                     return Err(EncodeError::Invalid(
                         "field 100 held among a record's fields",
@@ -438,6 +441,7 @@ impl Record {
                 fields: other,
             },
         };
+        crate::tier::CopyVerified::from_body(&body).transpose()?;
         Ok(Self {
             epoch,
             generation,

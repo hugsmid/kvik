@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
 use kvik_files::rebuild::{FoundLoss, LocalFile, Place, Verifier};
 use kvik_files::record::{AckedLoss, Acknowledgement, Body, Publish, Rebuild, Record};
+use kvik_files::tier::{CopyVerified, DeepCopy, tier_of};
 use kvik_log::fs::{Fs, MemFs, OpenMode};
 use kvik_log::header::{FileHeader, kind as file_kind};
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
@@ -322,7 +323,7 @@ pub fn body() -> impl Strategy<Value = Body> {
                     .collect(),
             })),
         (
-            prop_oneof![Just(0x25u8), Just(0x26), Just(0x27), 0x29u8..0x7F],
+            prop_oneof![Just(0x25u8), Just(0x26), 0x29u8..0x7F],
             proptest::collection::vec(
                 (1u16..0x9000, proptest::collection::vec(any::<u8>(), 0..20)),
                 0..4
@@ -333,10 +334,20 @@ pub fn body() -> impl Strategy<Value = Body> {
                 fields.sort_by_key(|(id, _)| *id);
                 Body::Other {
                     record_type: t,
-                    skippable: !(0x25..=0x27).contains(&t),
+                    skippable: !(0x25..=0x26).contains(&t),
                     fields,
                 }
             }),
+        (1u8..3, 1u64..20, 1u8..4, any::<u64>(), any::<[u8; 32]>()).prop_map(
+            |(kind, file_id, tier, size, sha256)| {
+                CopyVerified {
+                    file: FileRef { kind, file_id },
+                    tier: tier_of(tier).unwrap(),
+                    copy: DeepCopy { size, sha256 },
+                }
+                .to_body()
+            }
+        ),
     ]
 }
 

@@ -181,9 +181,9 @@ fn unknown_elements_are_refused_or_skipped_by_the_critical_and_ignorable_rule() 
     let r = decode_block(&b).unwrap();
     assert_eq!(r.old_epoch, Some(7));
     assert!(is_canonical(&b));
-    // A reserved type (restore, quarantine, tier move) is carried as a field list, field 100 added in order.
+    // A reserved type (restore, quarantine) is carried as a field list, field 100 added in order.
     let b = raw(
-        record_type::TIER_MOVE,
+        record_type::QUARANTINE,
         0,
         &[(1, vec![1; 12]), (300, vec![2])],
     );
@@ -490,4 +490,27 @@ fn the_checks_of_a_copy_verified_record() {
     );
     assert_eq!(CopyVerified::from_body(&Body::Empty), None);
     assert_eq!(CopyVerified::from_body(&with(fields)), Some(Ok(good)));
+}
+
+#[test]
+fn a_block_of_type_0x27_is_decoded_and_encoded_strictly() {
+    let b = raw(
+        record_type::TIER_MOVE,
+        0,
+        &[(1, vec![1; 12]), (300, vec![2])],
+    );
+    assert!(matches!(decode_block(&b), Err(RecordError::Unsupported(_))));
+    let b = raw(record_type::TIER_MOVE, 0, &[(1, vec![1; 12])]);
+    assert!(matches!(decode_block(&b), Err(RecordError::Invalid(_))));
+    let r = Record::new(
+        3,
+        0,
+        T0,
+        Body::Other {
+            record_type: record_type::TIER_MOVE,
+            skippable: false,
+            fields: vec![(2, vec![3])],
+        },
+    );
+    assert!(r.encode().is_err());
 }
