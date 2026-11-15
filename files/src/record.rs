@@ -454,7 +454,7 @@ impl Record {
 }
 
 /// The one value of a field that must appear exactly once.
-fn single<'a>(own: &[(u16, &'a [u8])], id: u16) -> Result<&'a [u8], RecordError> {
+pub(crate) fn single<'a>(own: &[(u16, &'a [u8])], id: u16) -> Result<&'a [u8], RecordError> {
     let mut it = own.iter().filter(|(i, _)| *i == id);
     match (it.next(), it.next()) {
         (Some((_, v)), None) => Ok(v),
@@ -464,7 +464,10 @@ fn single<'a>(own: &[(u16, &'a [u8])], id: u16) -> Result<&'a [u8], RecordError>
 }
 
 /// The value of a field that may appear at most once.
-fn optional<'a>(own: &[(u16, &'a [u8])], id: u16) -> Result<Option<&'a [u8]>, RecordError> {
+pub(crate) fn optional<'a>(
+    own: &[(u16, &'a [u8])],
+    id: u16,
+) -> Result<Option<&'a [u8]>, RecordError> {
     let mut it = own.iter().filter(|(i, _)| *i == id);
     match (it.next(), it.next()) {
         (v, None) => Ok(v.map(|(_, v)| *v)),
@@ -476,7 +479,7 @@ fn bad(what: &'static str) -> RecordError {
     RecordError::Invalid(what)
 }
 
-fn decode_lost(own: &[(u16, &[u8])]) -> Result<LostRange, RecordError> {
+pub(crate) fn decode_lost(own: &[(u16, &[u8])]) -> Result<LostRange, RecordError> {
     let pos =
         |id| single(own, id).and_then(|v| position_of(v).ok_or(bad("a position not 12 bytes")));
     let u64f = |id| single(own, id).and_then(|v| u64_of(v).ok_or(bad("a u64 field not 8 bytes")));
@@ -520,7 +523,7 @@ fn decode_lost(own: &[(u16, &[u8])]) -> Result<LostRange, RecordError> {
     })
 }
 
-fn lost_fields(l: &LostRange) -> Vec<(u16, Vec<u8>)> {
+pub(crate) fn lost_fields(l: &LostRange) -> Vec<(u16, Vec<u8>)> {
     let mut v = vec![
         (1, position_bytes(l.identity).to_vec()),
         (2, position_bytes(l.first).to_vec()),

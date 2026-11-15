@@ -542,8 +542,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   before `u64`, in ascending order and not overlapping), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
-  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire and `0x22` sealed log segment are laid out below. Reserved for their roadmap items:
-  `0x25` restore (8.3; it carries the restore's reset stamp, `spec.md` §8 Generations), `0x26` quarantine (8.1) and `0x27` copy verified (laid out below). A rebuild never reconstructs `0x26` or `0x27`: a
+  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore and `0x27` copy verified are laid out below. Reserved for its roadmap item:
+  `0x26` quarantine (8.1). A rebuild never reconstructs `0x26` or `0x27`: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
   another tier" is verified again, so their layouts may hold no fact that only they hold. Until their items lay them
   out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
@@ -577,6 +577,22 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   names as an input (invariant 14 as the records show it).
 - Sealed log segment (`0x22`): repeated field 1, a sealed log segment's description (kind 1), in strictly ascending
   order of id, at least one. When it is appended relative to the seal is roadmap 6.3b's.
+- Restore (`0x25`, `spec.md` §8 Generations, Restore step 1): 1 generation `u32`, the one the restore claimed, at
+  least 1; 2 reset stamp, 16 bytes: sequence `u64`, always 1 (the generation's first position), then nonce `u64`,
+  never zero; 3 source generation `u32`, whose records it read, below field 1; 4 restored end (position), in a
+  generation below field 1; 5 repeated, a restored end carried from the restore record it read: that restore's
+  generation `u32` then its end (position), the read record's own end first and then the ends it carried, in strictly
+  descending order of generation, each generation at most field 3 and each end in a generation below its own; 6
+  repeated, a lost range carried: the fields of a lost-range record (`0x23`) as a nested field list (A.6 framing), in
+  strictly ascending order of identity; 7 repeated, an acknowledged range carried, as `0x24` field 1, in strictly
+  ascending order of identity, first and last; 8 repeated, a recovery-entry loss report carried, nested as field 6, in
+  the order read; 9 repeated, a file it restores from, set-aside segments included: tier `u8` (1 hot, 2 cold, 3 deep:
+  where the restore places it, step 3), 3 reserved, the size `u64` and SHA-256 (32 bytes) of its copy in deep as the
+  bucket reported them (ciphertext), then its file description, in strictly ascending order of kind, generation and
+  `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded. In every range
+  first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
+  lost range, is a version refusal. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000
+  listed files (Q-293).
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
   content, 5 unknown: found again by a manifest rebuild with no cause given, `spec.md` §7 Manifest); 8 boot id
@@ -761,9 +777,9 @@ to every stored file.
   file that is not local (`spec.md` §7 Manifest).
 - **Local restore record (`kind = 12`).** A copy of the restore record, written by every restore beside the
   manifest's, from which a corrupt restore record is read again (`spec.md` §7 Manifest, §8 Generations).
-- **Manifest (`kind = 3`).** Framing, the empty, publish-and-retire, sealed-segment, lost-range, acknowledgement and
-  rebuild records are in A.14, and the copy-verified record (Q-281). Still to be laid out: the quarantine record and the restore record, which also carries the lost
-  ranges, acknowledgements and recovery-entry loss reports of the generations it restores from. Every record that
+- **Manifest (`kind = 3`).** Framing, the empty, publish-and-retire, sealed-segment, lost-range, acknowledgement,
+  restore, copy-verified (Q-281) and rebuild records are in A.14. Still to be laid out: the quarantine record. The restore record also carries
+  the lost ranges, acknowledgements and recovery-entry loss reports of the generations it restores from. Every record that
   names a file repeats its kind, position range and plaintext hash, and every record that names a loss repeats its
   identity, so that no such fact is held by one record alone once a second names it (`spec.md` §7 Manifest).
 - **Cursor (`kind = 4`).** A.15; latches and sequences are added by roadmap 5.2.

@@ -61,6 +61,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-283 | §8 Hashes, Bucket, Generations | The attach probe |
 | Q-284 | §8 Hashes, Upload stalled | Upload failures: retries, other content, an object not reported after its `put` |
 | Q-285 | §8 Continuous backup; `format.md` A.12 | Uploading files with no local layout yet, and the hash a file is checked by |
+| Q-293 | §8 Generations; `format.md` A.2 sizes, A.14 `0x25` | A restore record larger than one block |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 
 ## Q-16 — Which commits refresh live staleness
@@ -1135,6 +1136,17 @@ roadmap 6.3b); a mismatch is `UploadError::LocalHash`.
 **Needed.** The local path of each kind, from the item that lays it out.
 **Model.** Not modelled.
 
+## Q-293 — A restore record larger than one block
+Recorded by roadmap 8.3a, which laid out the restore record. To be settled by roadmap 8.3, before a store can list that many files.
+**Scenario.** A restore record lists every file it restores from (§8 Generations), and log segments are never
+retired by compaction (§7), so the list only grows: each listed log segment takes 128 bytes (field header, tier,
+copy size and hash, file description), so the 16 MiB block body holds about 130,000. A store that seals a segment
+every hour reaches that in about fifteen years; compacted files and their inputs make it sooner. The record can
+then not be written and the restore cannot proceed.
+**Model.** Not modelled; the model's restore record holds no file list.
+**Needed.** A form for a longer list: several `0x25` records of one restore, each naming the same stamp, read as
+one; or a list of log segments by ranges of ids. Until then such a record fails to encode (`EncodeError::BodyTooLong`).
+
 ## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
 Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
 **Scenario.** 100 series at 1 Hz, staggered evenly, so a call of one reading every 10 ms; `WriterConfig::default()`
@@ -1265,6 +1277,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-283 | 8.1 | Attach probe; decided by roadmap 8.1c under the owner's Q-162 ruling, accepted by the owner |
 | Q-284 | 8.1 | Upload failures; decided by roadmap 8.1c, (c) settled by the owner's Q-82 rule |
 | Q-285 | 6.2 | Local layout of kinds other than log segments; the upload driver fails on them until then |
+| Q-293 | Restore record size; recorded by roadmap 8.3a |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
