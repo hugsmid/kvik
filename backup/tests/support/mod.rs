@@ -334,6 +334,10 @@ pub enum Fault {
     Delay(u32),
     /// The next `n` downloads of it fail as transient.
     SlowGet(u32),
+    /// The next `n` uploads to it fail as `HashMismatch` and store nothing.
+    RejectPut(u32),
+    /// Every upload to it is stored, then fails as `HashMismatch`.
+    StoreThenMismatch,
 }
 
 /// A sink over a [`MemSink`] that applies per-key faults and logs every call as (operation, key).
@@ -387,6 +391,12 @@ impl FaultSink {
                 Some(Fault::Delay(*n + 1))
             }
             Some(Fault::SlowGet(_)) => None,
+            Some(Fault::RejectPut(0)) => None,
+            Some(Fault::RejectPut(n)) if op == "put" => {
+                *n -= 1;
+                Some(Fault::RejectPut(*n + 1))
+            }
+            Some(Fault::RejectPut(_) | Fault::StoreThenMismatch) if op != "put" => None,
             other => other.copied(),
         }
     }
@@ -400,10 +410,16 @@ fn transient(key: &str) -> SinkError {
 
 impl BackupSink for FaultSink {
     fn put<'a>(&'a self, key: &'a str, bytes: Arc<[u8]>, sha: [u8; 32]) -> SinkFuture<'a, Stored> {
-        if let Some(Fault::Delay(_)) = self.enter("put", key) {
-            return Box::pin(async move { Err(transient(key)) });
+        let mismatch = || SinkError::HashMismatch { key: key.into() };
+        match self.enter("put", key) {
+            Some(Fault::Delay(_)) => Box::pin(async move { Err(transient(key)) }),
+            Some(Fault::RejectPut(_)) => Box::pin(async move { Err(mismatch()) }),
+            Some(Fault::StoreThenMismatch) => {
+                let r = block_on(self.inner.put(key, bytes, sha)).and(Err(mismatch()));
+                Box::pin(async move { r })
+            }
+            _ => self.inner.put(key, bytes, sha),
         }
-        self.inner.put(key, bytes, sha)
     }
 
     fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>> {
@@ -430,7 +446,9 @@ impl BackupSink for FaultSink {
                         .ok_or(SinkError::InvalidRange { key: key.into() }),
                 }
             }),
-            None | Some(Fault::SlowGet(_)) => block_on(self.inner.get(key, range)),
+            None | Some(Fault::SlowGet(_) | Fault::RejectPut(_) | Fault::StoreThenMismatch) => {
+                block_on(self.inner.get(key, range))
+            }
         };
         Box::pin(async move { r })
     }

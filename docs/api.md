@@ -455,7 +455,9 @@ only, boxed `Send` futures):
   landed (a lost reply, a lost connection, a server error), other content is `HashMismatch`, as the sink cannot tell
   its own upload stored damaged from another writer's object. This is the create-if-absent of generation claims
   (spec §8 Generations): a claim whose `put` fails with `HashMismatch` after such an attempt may or may not be this
-  restore's, so a restore treats it as possibly lost, not as corruption, and claims the next generation.
+  restore's, so a restore treats it as possibly lost, not as corruption: it claims the next generation when `stat`
+  then reports a marker, and tries the same generation again (at most 3 tries) when none is stored, so no unclaimed
+  gap is left below its claim (Q-305).
 - **Hashes.** `put` sends the SHA-256 with a single-part upload, and the bucket must reject a mismatch
   (`HashMismatch`); the returned `Stored` is what the bucket reports when asked after the upload, and `put` fails
   with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`. A whole

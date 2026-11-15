@@ -152,8 +152,12 @@ async fn highest_claimed<S: BackupSink>(
     Ok(g)
 }
 
+/// Tries of one generation's claim that fail with `HashMismatch` while no marker is stored, before the restore fails.
+const CLAIM_TRIES: u32 = 3;
+
 /// Claims the first free generation above `highest` (`spec.md` §8 Generations; Q-161: another marker's content
-/// takes the next).
+/// takes the next). A `HashMismatch` takes the next only if `stat` then reports a marker; with none stored the same
+/// generation is tried again, so no unclaimed gap is left below the claim (Q-305).
 async fn claim<S: BackupSink>(
     sink: &S,
     keys: &Keys,
@@ -163,6 +167,7 @@ async fn claim<S: BackupSink>(
     let mut g = highest
         .checked_add(1)
         .ok_or(PlanError::GenerationsExhausted)?;
+    let mut tries = 0;
     loop {
         let marker = ClaimMarker {
             generation: g,
@@ -170,12 +175,22 @@ async fn claim<S: BackupSink>(
         }
         .encode();
         let sha = sha256(&marker);
-        match sink.put(&keys.claim(g), marker.into(), sha).await {
+        let taken = match sink.put(&keys.claim(g), marker.into(), sha).await {
             Ok(_) => return Ok(g),
-            Err(SinkError::Exists { .. } | SinkError::HashMismatch { .. }) => {
-                g = g.checked_add(1).ok_or(PlanError::GenerationsExhausted)?;
+            Err(SinkError::Exists { .. }) => true,
+            Err(e @ SinkError::HashMismatch { .. }) => {
+                let stored = sink.stat(&keys.claim(g)).await?.is_some();
+                tries += 1;
+                if !stored && tries >= CLAIM_TRIES {
+                    return Err(e.into());
+                }
+                stored
             }
             Err(e) => return Err(e.into()),
+        };
+        if taken {
+            g = g.checked_add(1).ok_or(PlanError::GenerationsExhausted)?;
+            tries = 0;
         }
     }
 }
