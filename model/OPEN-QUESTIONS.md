@@ -992,7 +992,7 @@ reserved bytes, then the key check (`WrongKey`). (c) is `Authentication { chunk:
 a chunk that cannot exist; a shorter object is `Truncated`. (d) is `Truncated`, as the test envelope does. A
 header whose length needs more than 2^32 chunks is `TooLarge`, before anything is allocated. An empty range opens
 to nothing without reading any chunk, and `span` of it is empty. Pinned by `backup/tests/envelope.rs`
-(`a_damaged_header_is_damage_never_a_wrong_key_or_a_version_refusal`, `truncation_and_extension_are_rejected`,
+(`a_damaged_header_is_damage_never_a_wrong_key_or_a_version_refusal`, `truncation_and_extension_are_refused_by_size_before_any_chunk`,
 `a_range_past_the_plaintext_or_inverted_is_refused`). A `Damaged` variant would be clearer; adding one changes the
 seam, so it is the lead's call.
 **Model.** Not modelled.

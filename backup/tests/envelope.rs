@@ -306,14 +306,23 @@ proptest! {
     }
 
     #[test]
-    fn truncation_and_extension_are_rejected(len in length(), seed in any::<u64>(), cut in any::<prop::sample::Index>(), extra in proptest::collection::vec(any::<u8>(), 1..40)) {
+    fn truncation_and_extension_are_refused_by_size_before_any_chunk(len in length(), seed in any::<u64>(), cut in any::<prop::sample::Index>(), extra in proptest::collection::vec(any::<u8>(), 1..40)) {
         let e = envelope();
-        let o = e.seal(&object_key(), &plain(len, seed)).unwrap();
+        let mut o = e.seal(&object_key(), &plain(len, seed)).unwrap();
+        o[HEADER] ^= 1;
         let n = cut.index(o.len());
         let short = e.open(&object_key(), &o[..n]);
         prop_assert_eq!(short, Err(EnvelopeError::Truncated));
         let long = [o.as_slice(), &extra].concat();
-        prop_assert_eq!(e.open(&object_key(), &long), Err(EnvelopeError::Authentication { chunk: chunk_count(len) as u64 }));
+        let chunks = chunk_count(len) as u64;
+        prop_assert_eq!(e.open(&object_key(), &long), Err(EnvelopeError::Authentication { chunk: chunks }));
+        if len > 0 {
+            let r = 0..len as u64;
+            let span = [fetch(&e, &o, r.clone()), &extra].concat();
+            prop_assert_eq!(e.open_span(&object_key(), &o[..HEADER], r.clone(), &span), Err(EnvelopeError::Authentication { chunk: chunks }));
+            let part = fetch(&e, &o, r.clone());
+            prop_assert_eq!(e.open_span(&object_key(), &o[..HEADER], r, &part[..part.len() - 1]), Err(EnvelopeError::Truncated));
+        }
     }
 
     #[test]
