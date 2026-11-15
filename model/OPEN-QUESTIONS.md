@@ -1254,8 +1254,8 @@ with a test of the figure after a restore; with `BackupStats` (8.1d), which repo
 takes a fresh seed (`log/tests/recovery.rs`, one test each). (a) The writer takes the segment created ahead into use
 and stops before its sync; a remount within the boot keeps part of the first batch but not the header rewrite, so the
 segment is not in use (`base_sequence` 0, no complete batch) and holds non-zero bytes after its header
-(`kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a_reset`). (b) A timed seal leaves seal
-blocks after the last batch of the segment the mark still names, the next segment in use by its header alone
+(`kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a_reset`). (b) Seal blocks that hold
+lie after the last batch of the segment the mark still names, the next segment in use by its header alone
 (`kill_loop_seal_blocks_beyond_a_same_boot_mark_are_not_a_reset`). (c) A rule 1 start writes its entry in a new
 segment and stops before zeroing the batch beyond the mark; the next start finds the mark stale, adopts the entry and
 drops that batch (`kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it`).

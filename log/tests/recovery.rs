@@ -2439,8 +2439,8 @@ fn kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a
     kill_loop(&cycles, true, false);
 }
 
-/// Found by the kill loop: a timed seal leaves seal blocks after the last batch of the segment the mark still names,
-/// the next one in use by its header alone; they are sealed again, not a reset point (Q-320).
+/// Found by the kill loop: seal blocks that hold lie after the last batch of the segment the mark still names, the
+/// next one in use by its header alone; the segment is sealed again, not a reset point (Q-320).
 #[test]
 fn kill_loop_seal_blocks_beyond_a_same_boot_mark_are_not_a_reset() {
     let cycles = [
