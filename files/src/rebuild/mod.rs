@@ -19,22 +19,25 @@
 //! whose location no valid record gives is **unlocated**.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
-use std::path::Path;
-use std::time::Duration;
 
-use kvik_log::fs::{Fs, OpenMode};
-use kvik_log::header::{FileHeader, HEADER_LEN, kind as file_kind};
+use kvik_log::header::kind as file_kind;
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 
-use crate::appender::{
-    AppendError, Appender, OpenError, Opened, RebuildState, read_file, remove_leftover,
-};
 use crate::catalogue::{Catalogue, CatalogueError};
 use crate::desc::{FileDescription, FileRef, kind};
-use crate::image::{CorruptSpan, Image, ReadError, read, record_at};
+use crate::image::{CorruptSpan, Image};
 use crate::record::{Body, EncodeError, Publish, Rebuild, Record, record_type};
-use crate::{MANIFEST, MANIFEST_NEW};
+
+mod copies;
+mod write;
+
+pub use copies::{
+    Answer, CopyError, CorruptStart, Decision, RebuildWait, repair_with_copy, resolve,
+};
+pub use write::{
+    Finality, LocalState, RebuildManifestError, WriteError, encode_manifest, rebuild_manifest,
+    replace_manifest, write,
+};
 
 /// Where a local file was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -136,6 +139,9 @@ pub struct RebuildPlan {
     pub discard: Vec<FileRef>,
     /// Files under `quarantine/`: never live.
     pub quarantined: Vec<FileRef>,
+    /// Compacted files a corrupt record retired, named only as an input, that neither a valid record nor a local
+    /// file describes, so their own inputs cannot be followed (Q-175).
+    pub undescribed: Vec<FileRef>,
     /// Local files that failed their own checksums or plaintext hash.
     pub invalid: Vec<FileRef>,
 }
@@ -177,11 +183,6 @@ pub enum RebuildError {
     EpochsExhausted,
 }
 
-/// The fold of `records`, as [`Appender::open`] folds them.
-fn fold<'a>(records: impl IntoIterator<Item = &'a Record>) -> Result<Catalogue, CatalogueError> {
-    Catalogue::replay(records)
-}
-
 /// How far above the highest id seen each `file_id` floor is (`format.md` A.14, rebuild record field 5).
 pub const FLOOR_MARGIN: u64 = 1 << 32;
 
@@ -205,7 +206,7 @@ pub fn plan(
     {
         return Err(RebuildError::RestoreRecord(g));
     }
-    let old = fold(valid.iter().copied())?;
+    let old = Catalogue::replay(valid.iter().copied())?;
     let generation = valid.last().map_or(0, |r| r.generation);
 
     // Step 1: the valid local files.
@@ -246,29 +247,35 @@ pub fn plan(
     }
     // A compacted file that a file named by a valid record names as an input is retired: the record that published
     // the output retired its compacted inputs. Where that record is the corrupt one (a file a valid record retires
-    // and no valid record published), the retirement is restated.
+    // and no valid record published), the retirement is restated. An input no valid record names was itself an
+    // output of a corrupt record, so its own inputs are followed, through its description, to a fixpoint.
     let mut gone: BTreeSet<FileRef> = BTreeSet::new();
-    for e in old.files() {
-        for i in e
-            .description
-            .inputs
-            .iter()
-            .filter(|i| i.kind == kind::COMPACTED)
-        {
+    let mut undescribed = Vec::new();
+    let mut work: Vec<FileDescription> = old.files().map(|e| e.description.clone()).collect();
+    while let Some(d) = work.pop() {
+        for i in d.inputs.iter().filter(|i| i.kind == kind::COMPACTED) {
             let unnamed = old.file(*i).is_none();
-            if live.remove(i) || unnamed {
-                gone.insert(*i);
-                if let Some(d) = describe(i) {
-                    retired.insert(*i, d);
+            if (live.remove(i) || unnamed) && gone.insert(*i) {
+                match describe(i) {
+                    Some(di) => {
+                        if unnamed {
+                            work.push(di.clone());
+                        }
+                        retired.insert(*i, di);
+                    }
+                    None => undescribed.push(*i),
                 }
             }
         }
     }
     // Outputs no valid record names, oldest first, so that an output of an output is judged after it.
-    for (r, f) in local
+    let candidates: Vec<(FileRef, &LocalFile)> = local
         .iter()
         .filter(|(r, _)| r.kind == kind::COMPACTED && old.file(**r).is_none() && !gone.contains(*r))
-    {
+        .map(|(r, f)| (*r, *f))
+        .collect();
+    for (r, f) in candidates {
+        let r = &r;
         let live_inputs: Vec<FileRef> = f
             .description
             .inputs
@@ -276,16 +283,16 @@ pub fn plan(
             .filter(|i| i.kind == kind::COMPACTED && live.contains(i))
             .copied()
             .collect();
-        if live_inputs.is_empty() {
-            // It overlaps no live file it names: the corrupt record published it.
-            published.push(f.description.clone());
-            live.insert(*r);
-            continue;
-        }
-        // Verified against its inputs where they are local. Where a live input is not, liveness follows from the
-        // named inputs alone: an input leaves the local tiers only once its replacement is verified in another
-        // tier (`spec.md` §7 inputs kept), so the output was published and verified.
-        let at_hand = live_inputs.iter().all(|i| local.contains_key(i));
+        // Verified against its inputs (its log segments and its live compacted inputs) where they are local. Where
+        // one is not, liveness follows from the named inputs alone: an input leaves the local tiers only once its
+        // replacement is verified in another tier (`spec.md` §7 inputs kept), so the output was published and
+        // verified.
+        let at_hand = f
+            .description
+            .inputs
+            .iter()
+            .filter(|i| i.kind == kind::LOG_SEGMENT || live_inputs.contains(i))
+            .all(|i| local.contains_key(i));
         let inputs: Vec<&LocalFile> = f
             .description
             .inputs
@@ -302,6 +309,15 @@ pub fn plan(
                     retired.insert(i, published.remove(k));
                 } else if let Some(d) = describe(&i) {
                     retired.insert(i, d);
+                }
+            }
+            // An input that no valid record names and no local path holds was an output of a corrupt record retired
+            // since: nothing describes it, so its own inputs cannot be followed (Q-175).
+            for i in f.description.inputs.iter().filter(|i| {
+                i.kind == kind::COMPACTED && old.file(**i).is_none() && !local.contains_key(*i)
+            }) {
+                if gone.insert(*i) {
+                    undescribed.push(*i);
                 }
             }
         } else {
@@ -337,7 +353,12 @@ pub fn plan(
         })
     };
     let acks: Vec<_> = old.acknowledged_ranges().collect();
-    let several = image.corrupt.len() >= 2;
+    // Two corrupt records, or one corrupt span whose epochs leave room for more than one record (Q-174).
+    let several = image.corrupt.len() >= 2
+        || image
+            .corrupt
+            .iter()
+            .any(|s| s.before_epoch.saturating_sub(s.after_epoch) > 2);
     let mut restated: Vec<LostRange> = Vec::new();
     let mut identities_rebuilt = 0u32;
     for l in input.losses {
@@ -482,7 +503,7 @@ pub fn plan(
     for r in &records {
         r.encode()?;
     }
-    let catalogue = fold(records.iter())?;
+    let catalogue = Catalogue::replay(records.iter())?;
     Ok(RebuildPlan {
         records,
         rebuild_epoch,
@@ -491,333 +512,6 @@ pub fn plan(
         discard,
         quarantined,
         invalid,
+        undescribed,
     })
-}
-
-/// The bytes of a manifest holding `records`.
-pub fn encode_manifest(
-    records: &[Record],
-    store_id: [u8; 16],
-    generation: u32,
-    created_at: i64,
-) -> Result<Vec<u8>, EncodeError> {
-    let mut out = FileHeader::new(file_kind::MANIFEST, generation, 0, created_at, store_id)
-        .encode()
-        .to_vec();
-    for r in records {
-        out.extend(r.encode()?);
-    }
-    Ok(out)
-}
-
-/// Writes `bytes` as `MANIFEST.new`, syncs it, renames it over `MANIFEST` and syncs the directory (`spec.md` §7
-/// step 4). No handle may hold `MANIFEST` open. A crash leaves the old manifest, or the new one, and perhaps a
-/// `MANIFEST.new` that the next open removes.
-pub fn replace_manifest(fs: &dyn Fs, dir: &Path, bytes: &[u8]) -> io::Result<()> {
-    remove_leftover(fs, dir)?;
-    let new = dir.join(MANIFEST_NEW);
-    let f = fs.open(&new, OpenMode::CreateNew)?;
-    f.write_at(bytes, 0)?;
-    f.sync_all()?;
-    drop(f);
-    fs.rename(&new, &dir.join(MANIFEST))?;
-    fs.sync_dir(dir)
-}
-
-/// Writes the rebuilt manifest ([`replace_manifest`]).
-pub fn write(
-    fs: &dyn Fs,
-    dir: &Path,
-    store_id: [u8; 16],
-    plan: &RebuildPlan,
-    created_at: i64,
-) -> Result<(), WriteError> {
-    let generation = plan.records.first().map_or(0, |r| r.generation);
-    let bytes = encode_manifest(&plan.records, store_id, generation, created_at)?;
-    replace_manifest(fs, dir, &bytes)?;
-    Ok(())
-}
-
-/// Why writing a rebuilt or repaired manifest failed.
-#[derive(Debug, thiserror::Error)]
-pub enum WriteError {
-    /// A file-system operation failed.
-    #[error("manifest: {0}")]
-    Io(#[from] io::Error),
-    /// A record cannot be encoded.
-    #[error(transparent)]
-    Encode(#[from] EncodeError),
-}
-
-/// Why `rebuild_manifest` failed.
-#[derive(Debug, thiserror::Error)]
-pub enum RebuildManifestError {
-    /// The manifest could not be read.
-    #[error(transparent)]
-    Read(#[from] ReadError),
-    /// It cannot be rebuilt.
-    #[error(transparent)]
-    Rebuild(#[from] RebuildError),
-    /// The new manifest could not be written.
-    #[error(transparent)]
-    Write(#[from] WriteError),
-    /// The new manifest could not be opened.
-    #[error(transparent)]
-    Open(#[from] OpenError),
-    /// The new manifest is not readable as written.
-    #[error("the rebuilt manifest does not read back")]
-    NotReadBack,
-    /// Reading the old manifest failed.
-    #[error("manifest: {0}")]
-    Io(#[from] io::Error),
-}
-
-/// Whether the rebuild is final or provisional.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Finality {
-    /// Deep has answered that it holds no copy, or none is configured.
-    Final,
-    /// Deep cannot be reached: uploads, evictions, removals and retirements are held until it answers.
-    Provisional,
-}
-
-/// The local inputs of a rebuild besides the manifest.
-#[derive(Clone, Copy, Debug)]
-pub struct LocalState<'a> {
-    /// Every local file found.
-    pub files: &'a [LocalFile],
-    /// The losses the scan of the log finds.
-    pub losses: &'a [FoundLoss],
-    /// The highest epoch any lease file names.
-    pub lease_epoch: u64,
-    /// The mark's `file_id`.
-    pub mark_file_id: u64,
-}
-
-/// The operator call `rebuild_manifest` and the automatic rebuild (`spec.md` §7 Manifest): reads `MANIFEST`,
-/// plans the rebuild, writes it, and opens the new manifest, provisional or final. No handle may hold `MANIFEST`.
-pub fn rebuild_manifest(
-    fs: &dyn Fs,
-    dir: &Path,
-    store_id: [u8; 16],
-    state: LocalState<'_>,
-    verifier: &dyn Verifier,
-    finality: Finality,
-    written_at: i64,
-) -> Result<(Appender, RebuildPlan), RebuildManifestError> {
-    remove_leftover(fs, dir)?;
-    let bytes = read_file(fs, &dir.join(MANIFEST))?;
-    let image = read(&bytes, &store_id)?;
-    let p = plan(
-        &RebuildInput {
-            image: &image,
-            files: state.files,
-            losses: state.losses,
-            lease_epoch: state.lease_epoch,
-            mark_file_id: state.mark_file_id,
-            written_at,
-        },
-        verifier,
-    )?;
-    write(fs, dir, store_id, &p, written_at)?;
-    let Opened::Ready(mut app) = Appender::open(fs, dir, store_id, state.lease_epoch)? else {
-        return Err(RebuildManifestError::NotReadBack);
-    };
-    app.set_rebuild_state(match finality {
-        Finality::Final => RebuildState::Final {
-            epoch: p.rebuild_epoch,
-        },
-        Finality::Provisional => RebuildState::Provisional {
-            epoch: p.rebuild_epoch,
-        },
-    });
-    Ok((*app, p))
-}
-
-/// The configuration `manifest.rebuild_wait` (`api.md` Configuration).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RebuildWait {
-    /// Rebuild provisionally after this long without an answer from deep (default 15 minutes).
-    After(Duration),
-    /// Stay read-only until deep answers.
-    Never,
-}
-
-impl Default for RebuildWait {
-    fn default() -> Self {
-        RebuildWait::After(Duration::from_secs(15 * 60))
-    }
-}
-
-/// What a copy source answered for a corrupt record.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Answer {
-    /// It holds a copy: the record's block.
-    Holds(Vec<u8>),
-    /// It holds none, or none is configured.
-    HoldsNone,
-    /// It could not be reached, so nobody can say whether a copy exists.
-    Unreachable,
-}
-
-/// What the start does next with a corrupt record.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Decision {
-    /// Write this copy back ([`repair_with_copy`]).
-    Repair(Vec<u8>),
-    /// No copy exists: rebuild, final.
-    RebuildFinal,
-    /// Stay read-only (`manifest_corrupt`), writing nothing, until this monotonic time (`None`: until deep answers);
-    /// ask again meanwhile.
-    Wait(Option<Duration>),
-    /// The wait is over: rebuild provisionally.
-    RebuildProvisional,
-}
-
-/// A start that found a corrupt manifest record: the wait counted from its first failed ask (`spec.md` §7 Deep
-/// unreachable). A restart makes a new one, so the wait starts again.
-#[derive(Clone, Copy, Debug)]
-pub struct CorruptStart {
-    wait: RebuildWait,
-    failed_at: Option<Duration>,
-}
-
-impl CorruptStart {
-    /// A start configured with `wait`.
-    pub fn new(wait: RebuildWait) -> Self {
-        Self {
-            wait,
-            failed_at: None,
-        }
-    }
-
-    /// Decides from the answers of the mirror path and of deep, at monotonic time `now`.
-    pub fn decide(&mut self, mirror: &Answer, deep: &Answer, now: Duration) -> Decision {
-        match (mirror, deep) {
-            (Answer::Holds(c), _) | (_, Answer::Holds(c)) => return Decision::Repair(c.clone()),
-            (Answer::HoldsNone, Answer::HoldsNone) => return Decision::RebuildFinal,
-            _ => {}
-        }
-        let since = *self.failed_at.get_or_insert(now);
-        match self.wait {
-            RebuildWait::Never => Decision::Wait(None),
-            RebuildWait::After(d) => {
-                let until = since.saturating_add(d);
-                if now >= until {
-                    Decision::RebuildProvisional
-                } else {
-                    Decision::Wait(Some(until))
-                }
-            }
-        }
-    }
-}
-
-/// Why a copy of a corrupt record was not taken.
-#[derive(Debug, thiserror::Error)]
-pub enum CopyError {
-    /// The copy is not a valid record, or its epoch lies outside the corrupt span's.
-    #[error("the copy is not the corrupt record")]
-    NotTheRecord,
-    /// The manifest has no corrupt record.
-    #[error("the manifest has no corrupt record")]
-    NothingCorrupt,
-    /// Writing it failed.
-    #[error(transparent)]
-    Write(#[from] WriteError),
-    /// Appending it failed.
-    #[error(transparent)]
-    Append(#[from] AppendError),
-}
-
-/// The record in `copy` if it is one valid record whose epoch lies inside `span`.
-fn check_copy(copy: &[u8], span: &CorruptSpan) -> Result<Record, CopyError> {
-    match record_at(copy, 0, span.after_epoch) {
-        Ok(Some(p)) if p.end as usize == copy.len() && p.record.epoch < span.before_epoch => {
-            Ok(p.record)
-        }
-        _ => Err(CopyError::NotTheRecord),
-    }
-}
-
-/// Writes a verified copy of the first corrupt record back (`spec.md` §7 Manifest): in place over the corrupt bytes
-/// when it fills them exactly, else by writing the manifest again with the copy in their place, as `MANIFEST.new`
-/// renamed over `MANIFEST`. No handle may hold `MANIFEST`. The next open finds any other corrupt record.
-pub fn repair_with_copy(
-    fs: &dyn Fs,
-    dir: &Path,
-    image: &Image,
-    bytes: &[u8],
-    copy: &[u8],
-) -> Result<(), CopyError> {
-    let span = image.corrupt.first().ok_or(CopyError::NothingCorrupt)?;
-    check_copy(copy, span)?;
-    if (span.end - span.offset) as usize == copy.len() {
-        let f = fs
-            .open(&dir.join(MANIFEST), OpenMode::ReadWrite)
-            .map_err(WriteError::from)?;
-        f.write_at(copy, span.offset)
-            .and_then(|()| f.sync_data())
-            .map_err(WriteError::from)?;
-        return Ok(());
-    }
-    let mut out = bytes[..span.offset as usize].to_vec();
-    out.extend_from_slice(copy);
-    out.extend_from_slice(&bytes[span.end as usize..]);
-    debug_assert!(out.len() >= HEADER_LEN);
-    replace_manifest(fs, dir, &out).map_err(WriteError::from)?;
-    Ok(())
-}
-
-/// What of `body` the catalogue does not state already: a copy of the corrupt record may publish a file that a
-/// later valid record retired, or restate what the rebuild reconstructed. A publish or sealed-segment record left
-/// naming nothing is carried as an empty record with its old epoch.
-fn news(c: &Catalogue, body: Body) -> Body {
-    let known = |d: &FileDescription| c.file(d.file_ref()).is_some();
-    let gone = |d: &FileDescription| c.file(d.file_ref()).is_some_and(|e| !e.is_live());
-    match body {
-        Body::Publish(mut p) => {
-            p.published.retain(|d| !known(d));
-            p.retired.retain(|d| !gone(d));
-            if p.published.is_empty() && p.retired.is_empty() {
-                Body::Empty
-            } else {
-                Body::Publish(p)
-            }
-        }
-        Body::Sealed(mut s) => {
-            s.retain(|d| !known(d));
-            if s.is_empty() {
-                Body::Empty
-            } else {
-                Body::Sealed(s)
-            }
-        }
-        other => other,
-    }
-}
-
-/// Deep answers after a provisional rebuild (`spec.md` §7 Deep unreachable). With a copy of the corrupt record (the
-/// first corrupt span of the old manifest), the copy is appended, carried with its old epoch, so it replaces what
-/// was reconstructed; with none, the rebuild is final as it stands. Returns the state after the answer.
-pub fn resolve(
-    app: &mut Appender,
-    span: &CorruptSpan,
-    answer: &Answer,
-) -> Result<RebuildState, CopyError> {
-    let RebuildState::Provisional { epoch } = app.rebuild_state() else {
-        return Ok(app.rebuild_state());
-    };
-    match answer {
-        Answer::Unreachable => return Ok(app.rebuild_state()),
-        Answer::HoldsNone => {}
-        Answer::Holds(copy) => {
-            let mut r = check_copy(copy, span)?;
-            r.old_epoch = Some(r.old_epoch.unwrap_or(r.epoch));
-            r.body = news(app.catalogue(), r.body);
-            app.append_record(r)?;
-        }
-    }
-    app.set_rebuild_state(RebuildState::Final { epoch });
-    Ok(app.rebuild_state())
 }

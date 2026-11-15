@@ -11,7 +11,7 @@ use kvik_log::block::{BLOCK_HEADER_LEN, BlockHeader, MAX_BODY_LEN};
 use kvik_log::crc::crc32c;
 use kvik_log::header::{FileHeader, HEADER_LEN, kind};
 
-use crate::record::{Record, RecordError};
+use crate::record::{RECORD_PREFIX, Record, RecordError};
 
 /// A valid record and where it lies.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,13 +91,19 @@ pub(crate) fn record_at(
     let Some(h) = BlockHeader::decode(raw).filter(|h| h.block_type != 0) else {
         return Ok(None);
     };
-    if h.body_len > MAX_BODY_LEN {
+    // Judged on the header and the body's first bytes before the body is checksummed, so that a search over bytes
+    // that imitate headers claiming long bodies checksums only candidates that could be the record looked for: a
+    // body that holds the record prefix and fits in the file, and an epoch above the previous record's.
+    if h.body_len > MAX_BODY_LEN || (h.body_len as usize) < RECORD_PREFIX {
         return Ok(None);
     }
     let body_start = start + BLOCK_HEADER_LEN;
     let Some(body) = bytes.get(body_start..body_start + h.body_len as usize) else {
         return Ok(None);
     };
+    if u64::from_le_bytes(body[..8].try_into().unwrap_or_default()) <= min_epoch {
+        return Ok(None);
+    }
     if crc32c(body) != h.body_crc32c {
         return Ok(None);
     }

@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod rebuild;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -378,6 +380,9 @@ pub enum Step {
     Empty,
     /// The next epoch jumps, as after a start above a lease.
     Jump(u64),
+    /// Retired compacted files are removed locally (after their grace period, once replaced and verified
+    /// elsewhere).
+    RemoveRetired,
 }
 
 pub fn step() -> impl Strategy<Value = Step> {
@@ -390,6 +395,7 @@ pub fn step() -> impl Strategy<Value = Step> {
         1 => any::<usize>().prop_map(Step::Acknowledge),
         1 => Just(Step::Empty),
         1 => (1u64..5).prop_map(Step::Jump),
+        1 => Just(Step::RemoveRetired),
     ]
 }
 
@@ -423,6 +429,7 @@ pub fn play(steps: &[Step]) -> History {
     let mut uncompacted: Vec<FileDescription> = Vec::new();
     let mut live_comp: Vec<FileDescription> = Vec::new();
     let mut losses: Vec<SimLoss> = Vec::new();
+    let mut retired_refs: Vec<FileRef> = Vec::new();
     let mut gap = 0u64;
     let push = |h: &mut History, epoch: &mut u64, gap: &mut u64, body: Body| {
         *epoch += 1 + std::mem::take(gap);
@@ -523,6 +530,7 @@ pub fn play(steps: &[Step]) -> History {
                         retired: current.clone(),
                     }),
                 );
+                retired_refs.extend(inputs);
                 live_comp.retain(|d| d.class != FileClass::Current);
                 live_comp.push(out);
             }
@@ -567,6 +575,10 @@ pub fn play(steps: &[Step]) -> History {
                 );
             }
             Step::Empty => push(&mut h, &mut epoch, &mut gap, Body::Empty),
+            Step::RemoveRetired => {
+                h.files
+                    .retain(|f| !retired_refs.contains(&f.description.file_ref()));
+            }
             Step::Jump(n) => gap = n,
         }
     }

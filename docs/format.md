@@ -579,7 +579,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   (`0x28`), synced, renamed over `MANIFEST`, and the directory synced; a `MANIFEST.new` left by a crash is removed at
   the next start. The rebuild record is acknowledged by an acknowledgement record carrying the rebuild record's own
   epoch in field 2. The rebuilt manifest carries every valid record of the old one, and the rebuild reconstructs
-  only what the corrupt record alone held (`spec.md` §7 Manifest); a restore record is never rebuilt.
+  only what the corrupt record alone held (`spec.md` §7 Manifest); a restore record is never rebuilt. A rebuild record that no
+  acknowledgement record names is provisional at a start: the store holds uploads, evictions, removals and
+  retirements, and refuses to append an acknowledgement of it, until the mirror path and deep have answered in that
+  run for the record its fields 1 and 2 name (`spec.md` §7 Deep unreachable). Field 6 counts restated losses no
+  valid record names where the old manifest held two corrupt spans, or one whose next valid epoch is more than 2
+  above the last valid one before it.
 
 ## A.15 Cursor file and lease file
 - **Cursor**, `cursors/<name>.cur`, kind 4: an A.1 header then blocks of type `0x30`, **appended**, one per cursor

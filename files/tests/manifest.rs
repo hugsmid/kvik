@@ -337,3 +337,25 @@ fn acknowledging_a_rebuild_no_record_names_is_refused() {
         Err(AcknowledgeError::UnknownRebuild(7))
     ));
 }
+
+#[test]
+fn settling_a_record_not_yet_written_is_refused_and_no_false_proof_is_given() {
+    let fs = initial();
+    let mut m = open(&fs);
+    let next = m.next_epoch();
+    assert!(matches!(
+        m.settle(next, T0),
+        Err(kvik_files::appender::AppendError::NoRecord(e)) if e == next
+    ));
+    assert!(matches!(
+        m.settle(0, T0),
+        Err(kvik_files::appender::AppendError::NoRecord(0))
+    ));
+    // Nothing was appended for the refused calls.
+    assert_eq!(m.catalogue().last_epoch(), 1);
+    // The one written record is settled by an empty successor, and only then may be acted on irreversibly.
+    assert_eq!(m.irreversible(1), Err(Held::NotSettled));
+    assert_eq!(m.settle(1, T0).unwrap().epoch(), 1);
+    assert_eq!(m.irreversible(1).unwrap().epoch(), 1);
+    assert!(m.settled(m.catalogue().last_epoch()).is_none());
+}

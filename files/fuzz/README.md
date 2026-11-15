@@ -16,4 +16,4 @@ cargo +nightly fuzz run manifest
 
 The same entry function runs on stable in `tests/fuzz_inputs.rs` over random bytes and mutated golden and generated
 manifests, so the code path is exercised in CI. The libFuzzer macro needs `unsafe` attributes, so this crate does not
-forbid unsafe code; the library it calls does. Its `Cargo.lock` is generated on the first nightly build.
+forbid unsafe code; the library it calls does. Its `Cargo.lock` is committed, so `libfuzzer-sys` is pinned.

@@ -32,9 +32,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
-| Q-171 | §7 Manifest (Deep unreachable), §8 Generations, `format.md` A.14 | A provisional manifest rebuild across a restart |
 | Q-173 | §7 Manifest, `api.md` | The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records |
-| Q-174 | §7 Manifest (rebuild step 3), invariant 27, `format.md` A.14 field 6 | Adjacent corrupt records read as one |
+| Q-175 | §7 Manifest (rebuild step 2) | An intermediate output no record and no local file describes |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -547,7 +546,7 @@ verified copy back in place or by a rewritten manifest (`rebuild::repair_with_co
 and wait from the answers of the mirror path and deep (`rebuild::CorruptStart`), and rebuilds the manifest from the
 local files, final or provisional (`rebuild::rebuild_manifest`); the log reads cause 5 and passes the publish and
 sealed-segment records over. The start still refuses (`StoreError::ManifestCorrupt`) until roadmap 6.3b calls these
-from step 4 and supplies the local files, the scan's losses and the sink. Open points found: Q-171, Q-173 and Q-174.
+from step 4 and supplies the local files, the scan's losses and the sink. Open points found: Q-171 to Q-175; Q-171 and Q-174 settled at the review of 6.3a, Q-172 withdrawn (spec §7 step 2 settles it).
 **Needed.** (a) with roadmap 6.3 (6.3b), (b) and (m) with 5.2 (derived files with 6.2 and 7.1), (c) with 5.1; (k) the
 owner's decision and (n) the Linux target run, at gate 4.9.
 
@@ -616,27 +615,6 @@ manifest append (with roadmap 6.3 at the latest); (e) whether these counts must 
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
 
-## Q-171 — A provisional manifest rebuild across a restart
-Found while building the manifest rebuild (roadmap 6.3a, crate `kvik-files`: `rebuild`, `appender`).
-**Scenario.** A start finds a corrupt manifest record, deep cannot be reached, and after `manifest.rebuild_wait` the
-writer rebuilds provisionally (§7 Deep unreachable): uploads, evictions, removals and retirements are held and
-`acknowledge_manifest_rebuild` is refused with `NotFinal`. The process restarts before deep answers. `MANIFEST` is now
-a valid rebuilt manifest (rebuild record, carried records, restated records, empty record), and nothing in it says
-that the rebuild is provisional: the next start finds no corrupt record, asks deep nothing, and the holds lapse. The
-reconstructed records would then be uploaded (§8 Generations uploads a rebuilt manifest "once the rebuild is final"),
-retired files removed on the strength of the reconstruction, and the acknowledgement accepted, although deep might
-still hold the corrupt record with something the reconstruction lacks (a loss whose file has left the local tiers,
-invariant 27).
-**Implemented.** The state is held in memory only (`appender::RebuildState`): provisional for the rest of the run, final
-when deep answers in that run (`rebuild::resolve`). After a restart the rebuild counts as final. When deep answers with
-a copy, the copy is appended as a carried record (new epoch, field 100 its epoch) and the rebuild is final; the
-catalogue takes a loss's cause from the latest record naming it, so the copy's cause replaces `Unknown`.
-**Needed.** How a later start knows a rebuild is still provisional. Proposed: a rebuild record field 7, present when the
-rebuild is provisional (the corrupt record's generation and presumed epoch are fields 1 and 2 already), and a record
-that makes it final (an empty record with a field naming the rebuild record's epoch, appended when deep answers
-that it holds none or after the copy is appended); a start that finds a provisional rebuild record with no such
-record asks deep again and holds as before. With roadmap 6.3b.
-
 ## Q-173 — The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records
 Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `rebuild::rebuild_manifest`).
 **Scenario.** (a) §7 names `rebuild_manifest` as the way out for a process that restarts more often than the wait, but
@@ -648,19 +626,20 @@ any other; fields 1 and 2 are 0. (c) Fields 1 and 2 name the first corrupt recor
 **Needed.** (a) and (b) with the call's signature in `api.md` (roadmap 6.3b); proposed: provisional unless deep has
 answered, and allowed on a readable manifest. (c) a sentence in A.14 if the first is not what is meant.
 
-## Q-174 — Adjacent corrupt records read as one
-Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `image`, `rebuild::plan`).
-**Scenario.** Two consecutive records are corrupt (one damaged region covering both). The reader searches forward
-from the first invalid record to the next valid one and finds one corrupt span; it cannot tell how many records it
-held, as epochs may jump legitimately after a start above a lease. If the two records were a loss's own record and
-its extension downward, the rebuild lists the loss under its first missing position, which is not its identity
-(invariant 27), and does not count it in field 6, which §7 step 3 counts only "where two corrupt records leave an
-identity unknown".
-**Implemented.** Field 6 counts the restated losses that no valid record names only when the old manifest has two or
-more corrupt spans.
-**Needed.** A rule. Proposed: also count when a corrupt span's epochs leave room for more than one record (the next
-valid epoch more than 2 above the last valid one before it), accepting a count that may include a loss whose identity
-is right.
+## Q-175 — An intermediate output no record and no local file describes
+Found at the review of roadmap 6.3a (`kvik-files` `rebuild::plan`).
+**Scenario.** Merge A (compacted 1 and 2 into 3) and merge B (3 and 4 into 5) are both corrupt records; a later valid
+record retires 5, naming 3 among its inputs. 3 was retired by B and removed locally after its grace period, and no
+valid record describes it, so nothing says what 3's own inputs were: 1 and 2, live by the valid records that
+published them, cannot be retired. If they are still on disk they are listed beside 5's replacement, which holds
+their facts (invariant 14 as the records show it is not broken, as no live file names them; positions are held
+twice). Not reachable with one corrupt record.
+**Implemented.** Each input no valid record names is followed through its description (a valid record or a local
+file) to a fixpoint; one described nowhere is reported (`RebuildPlan::undescribed`) and its inputs stay as the valid
+records leave them. `files/tests/rebuild.rs`, `two_corrupt_merges_retire_every_input_down_the_chain`.
+**Needed.** A rule: proposed, a compacted file whose position range lies within a live output that names, through
+any chain of described files, an undescribed input is retired; or the chunk index of 3 (kind 14, roadmap 6.2), which
+carries its inputs, is kept until every file naming 3 is retired. With roadmap 6.3b.
 
 ## Open at v0.2
 
@@ -924,6 +903,8 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
 | Q-122 | A torn mark update could leave a mark older than the last one synced | `format.md` A.10 Update and Read, `spec.md` §3 Order of a start step 2 (settled by roadmap 4.7: every update between two mark syncs goes to the slot that does not hold the last synced mark, and a start writes the mark file again in place, as read, and syncs it before its own mark write, or, keeping the mark it read, writes that slot again and syncs it before the first update). Scenario: updates alternated between the slots whether or not the last was synced; with a timed mark sync, A held counter c, synced, and B c − 1; c + 1 went to B and c + 2 to A, neither synced, and a power loss that tore the write of c + 2 left A invalid and B at c − 1, older than the mark synced last. Rule 3 kept every complete batch, but the start took its id floor from that mark and the unsealed segments only, so an id defined after c − 1 in a batch then in a sealed segment was above the floor; the low floor was durable, in the recovery entry and in the new mark's highest series id, so ids would have been assigned again once roadmap 5.1 assigns above floors (`log/tests/recovery.rs`, `a_torn_mark_update_never_falls_back_past_the_last_synced_mark`) |
 | Q-121 | Series id 0 against an id floor of 0 | §2.1 `id`, `format.md` A.6 field 46 and A.10 `max_series_id` (settled by roadmap 5.1, which assigns ids: ids start at 1 and 0 names no series, so a highest id assigned or an id floor of 0 means none; the model's registry assigns from 1). Scenario: the model assigned ids from 0, so the mark's `max_series_id` and a recovery entry's id floor were 0 both in a store that had assigned no id and in one whose only series was id 0; read literally, "above every id floor" then forbade id 0 after a power loss in an empty store, and no reader of the floor could tell id 0 from none. Decoders do not refuse id 0, so files written before stay readable (`kvik/tests/durable.rs`, `ids_start_at_one_and_never_reuse_a_floor`) |
+| Q-171 | A provisional manifest rebuild across a restart | `spec.md` §7 Deep unreachable, `format.md` A.14 (owner's decision at the review of roadmap 6.3a, no format change: at open, a rebuild record that no acknowledgement record names is provisional, so the holds survive a restart, until the mirror path and deep answer in that run for the corrupt record its fields 1 and 2 name, or are not configured; a provisional rebuild's acknowledgement is refused, also at append). Residual: after a restart only the first corrupt record a rebuild stands for is known (fields 1 and 2), so the others are asked for only in the run that rebuilt. `files/tests/rebuild_copies.rs`, `q171_a_rebuild_no_acknowledgement_names_stays_provisional_across_a_restart`, `q171_a_final_rebuild_not_yet_acknowledged_holds_again_after_a_restart`, `q171_a_rebuild_of_two_corrupt_records_is_final_only_once_both_have_their_answers` |
+| Q-174 | Adjacent corrupt records read as one | `spec.md` §7 Deep unreachable, `format.md` A.14 field 6 (owner's decision at the review of roadmap 6.3a: a corrupt span whose next valid epoch is more than 2 above the last valid one before it counts as two corrupt records for the field-6 count, accepting a count that may include a loss whose identity is right after a legitimate epoch jump) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

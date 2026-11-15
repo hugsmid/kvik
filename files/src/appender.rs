@@ -10,8 +10,12 @@
 //!   start writes it again.
 //! - **Settled**: the last record is neither uploaded nor acted on irreversibly until a later record has been
 //!   synced. A [`Settled`] is the proof that a record has a synced successor; [`Appender::settle`] appends an empty
-//!   record when one is needed. While a rebuild is provisional nothing is acted on irreversibly at all
-//!   ([`Appender::irreversible`]).
+//!   record when one is needed. An upload, eviction, removal or act on a retirement takes an [`Irreversible`],
+//!   which only [`Appender::irreversible`] gives: the record is settled and no provisional rebuild holds it.
+//! - **Provisional rebuilds** (`spec.md` §7 Deep unreachable): at open, a rebuild record that no acknowledgement
+//!   names is provisional, so its holds survive a restart, until the mirror path and deep have answered in this run
+//!   for the corrupt record it stands for ([`crate::rebuild::resolve`]), or are not configured. A provisional
+//!   rebuild cannot be acknowledged.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -36,6 +40,30 @@ impl Settled {
     }
 }
 
+/// Proof that a record may be acted on irreversibly now (uploaded; a file it retires, moves or quarantines
+/// removed): it has a synced successor and no provisional rebuild holds it. Only [`Appender::irreversible`] gives one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Irreversible {
+    epoch: u64,
+}
+
+impl Irreversible {
+    /// The record's epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// A corrupt record a rebuild stands for, between two epochs (exclusive): a copy of it must lie between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Gap {
+    /// The epoch of the last valid record before it, 0 for none.
+    pub after: u64,
+    /// Above the corrupt record's epoch: the next valid record's epoch, or, after a restart, the presumed epoch + 1
+    /// (the rebuild record's field 1).
+    pub before: u64,
+}
+
 /// Why an irreversible act on a record must wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Held {
@@ -52,14 +80,15 @@ pub enum Held {
 pub enum RebuildState {
     /// No rebuild in this run.
     None,
-    /// Rebuilt while deep could not say whether it holds a copy of the corrupt record; the rebuild record's epoch.
+    /// A rebuild that the mirror path and deep have not yet both answered for, in this run: a rebuild record that no
+    /// acknowledgement names, found at open, or one written in this run while deep could not be reached.
     Provisional {
-        /// The rebuild record's epoch.
+        /// The rebuild record's identity epoch.
         epoch: u64,
     },
-    /// Rebuilt, and deep has answered or none is configured.
+    /// Rebuilt, and the mirror path and deep have answered or are not configured.
     Final {
-        /// The rebuild record's epoch.
+        /// The rebuild record's identity epoch.
         epoch: u64,
     },
 }
@@ -108,6 +137,12 @@ pub enum AppendError {
     /// No epoch is left.
     #[error("no manifest epoch is left")]
     EpochsExhausted,
+    /// No record of that epoch has been written, so none can be settled.
+    #[error("no record of epoch {0}")]
+    NoRecord(u64),
+    /// A rebuild acknowledgement while the rebuild is provisional (`api.md` `WriteError::NotFinal`).
+    #[error("the manifest rebuild is provisional")]
+    NotFinal,
 }
 
 /// Why a rebuild acknowledgement was refused.
@@ -138,6 +173,8 @@ pub struct Appender {
     catalogue: Catalogue,
     faulted: bool,
     rebuild: RebuildState,
+    /// The corrupt records of a provisional rebuild not yet answered for in this run.
+    pending: Vec<Gap>,
     dropped_tail: u64,
 }
 
@@ -184,6 +221,29 @@ impl Appender {
             return Ok(Opened::Corrupt(Box::new(image)));
         }
         let catalogue = Catalogue::replay(image.records())?;
+        // A rebuild record that no acknowledgement names is provisional until the copy sources answer in this run.
+        let (rebuild, pending) = match catalogue
+            .rebuilds()
+            .filter(|r| !r.acknowledged)
+            .max_by_key(|r| r.epoch)
+        {
+            None => (RebuildState::None, Vec::new()),
+            Some(r) if r.record.presumed_epoch == 0 => (
+                RebuildState::Final {
+                    epoch: r.identity_epoch,
+                },
+                Vec::new(),
+            ),
+            Some(r) => (
+                RebuildState::Provisional {
+                    epoch: r.identity_epoch,
+                },
+                vec![Gap {
+                    after: r.record.last_valid_before,
+                    before: r.record.presumed_epoch.saturating_add(1),
+                }],
+            ),
+        };
         let file = fs.open(&path, OpenMode::ReadWrite)?;
         let mut end = image.valid_end;
         let dropped_tail = bytes.len() as u64 - image.valid_end;
@@ -218,7 +278,8 @@ impl Appender {
             generation: image.records.last().map_or(0, |p| p.record.generation),
             catalogue,
             faulted: false,
-            rebuild: RebuildState::None,
+            rebuild,
+            pending,
             dropped_tail,
         })))
     }
@@ -235,6 +296,9 @@ impl Appender {
             return Err(AppendError::ReadOnly);
         }
         r.epoch = self.next_epoch;
+        if self.holds() && matches!(&r.body, Body::Acknowledgement(a) if a.rebuild.is_some()) {
+            return Err(AppendError::NotFinal);
+        }
         self.catalogue.check(&r)?;
         let bytes = r.encode()?;
         let next = self
@@ -258,25 +322,31 @@ impl Appender {
 
     /// A [`Settled`] for the record of `epoch` if a later record has been synced.
     pub fn settled(&self, epoch: u64) -> Option<Settled> {
-        (epoch < self.synced && epoch <= self.catalogue.last_epoch()).then_some(Settled { epoch })
+        (epoch > 0 && epoch < self.synced).then_some(Settled { epoch })
     }
 
-    /// A [`Settled`] for the record of `epoch`, appending an empty record first if it has no synced successor.
+    /// A [`Settled`] for the record of `epoch`, appending an empty record first if it has no synced successor. A
+    /// record not yet written cannot be settled.
     pub fn settle(&mut self, epoch: u64, written_at: i64) -> Result<Settled, AppendError> {
         if let Some(s) = self.settled(epoch) {
             return Ok(s);
         }
+        if epoch == 0 || epoch > self.catalogue.last_epoch() {
+            return Err(AppendError::NoRecord(epoch));
+        }
         self.append(Body::Empty, written_at)?;
-        Ok(Settled { epoch })
+        self.settled(epoch).ok_or(AppendError::NoRecord(epoch))
     }
 
-    /// A [`Settled`] for the record of `epoch` if it may be acted on irreversibly now: it has a synced successor and
-    /// no provisional rebuild holds it.
-    pub fn irreversible(&self, epoch: u64) -> Result<Settled, Held> {
-        if matches!(self.rebuild, RebuildState::Provisional { .. }) {
+    /// An [`Irreversible`] for the record of `epoch` if it may be acted on irreversibly now: it has a synced
+    /// successor and no provisional rebuild holds it.
+    pub fn irreversible(&self, epoch: u64) -> Result<Irreversible, Held> {
+        if self.holds() {
             return Err(Held::Provisional);
         }
-        self.settled(epoch).ok_or(Held::NotSettled)
+        self.settled(epoch)
+            .map(|s| Irreversible { epoch: s.epoch })
+            .ok_or(Held::NotSettled)
     }
 
     /// Whether uploads, evictions, removals and acting on retirements are held by a provisional rebuild.
@@ -332,8 +402,24 @@ impl Appender {
         self.rebuild
     }
 
-    pub(crate) fn set_rebuild_state(&mut self, s: RebuildState) {
+    pub(crate) fn set_rebuild_state(&mut self, s: RebuildState, pending: Vec<Gap>) {
         self.rebuild = s;
+        self.pending = pending;
+    }
+
+    /// The corrupt records of a provisional rebuild that the copy sources have not answered for in this run.
+    pub fn pending(&self) -> &[Gap] {
+        &self.pending
+    }
+
+    /// Records that the copy sources have answered for `gap`; the rebuild is final once none is pending.
+    pub(crate) fn answered(&mut self, gap: Gap) {
+        self.pending.retain(|g| *g != gap);
+        if let RebuildState::Provisional { epoch } = self.rebuild
+            && self.pending.is_empty()
+        {
+            self.rebuild = RebuildState::Final { epoch };
+        }
     }
 
     /// Bytes of a torn tail the open dropped.

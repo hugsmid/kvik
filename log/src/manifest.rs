@@ -1,8 +1,8 @@
 //! The manifest's framing (`format.md` A.14) as far as the log's start needs it (`spec.md` §3 Order of a start,
 //! step 4; §7 Manifest): reading its records, telling a torn last record from a corrupt one, and the empty and
 //! lost-range records. Publish, restore, quarantine and rebuild records belong to later roadmap items; their typed
-//! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire and sealed-segment records
-//! over, taking only their epochs.
+//! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire, sealed-segment and reserved
+//! (restore, quarantine, tier-move) records over as field lists, taking only their epochs.
 
 use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block};
 use crate::error::{Element, FormatError};
@@ -14,6 +14,12 @@ pub const RECORD_EMPTY: u8 = 0x20;
 pub const RECORD_PUBLISH: u8 = 0x21;
 /// A sealed-log-segment record (laid out by roadmap 6.3).
 pub const RECORD_SEALED: u8 = 0x22;
+/// A restore record (laid out by roadmap 8.3); read as a field list until then (`format.md` A.14).
+pub const RECORD_RESTORE: u8 = 0x25;
+/// A quarantine record (laid out by roadmap 8.1); read as a field list until then.
+pub const RECORD_QUARANTINE: u8 = 0x26;
+/// A tier-move record (laid out by roadmap 8.1); read as a field list until then.
+pub const RECORD_TIER_MOVE: u8 = 0x27;
 /// A lost-range record.
 pub const RECORD_LOST_RANGE: u8 = 0x23;
 /// An acknowledgement record.
@@ -194,9 +200,14 @@ fn record_at(bytes: &[u8], at: u64, min_epoch: u64) -> Result<Option<Record>, Ma
             Some(l) => Some(l),
             None => return Ok(None),
         },
-        RECORD_EMPTY | RECORD_PUBLISH | RECORD_SEALED | RECORD_ACKNOWLEDGEMENT | RECORD_REBUILD => {
-            None
-        }
+        RECORD_EMPTY
+        | RECORD_PUBLISH
+        | RECORD_SEALED
+        | RECORD_ACKNOWLEDGEMENT
+        | RECORD_REBUILD
+        | RECORD_RESTORE
+        | RECORD_QUARANTINE
+        | RECORD_TIER_MOVE => None,
         _ if b.header.skippable() => None,
         _ => {
             return Err(ManifestError::Unsupported(FormatError::Unsupported {
@@ -402,5 +413,27 @@ mod tests {
             read_manifest(&unk, &[2; 16]),
             Err(ManifestError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn reserved_and_later_record_types_are_passed_over_with_their_epochs() {
+        let mut m = encode_initial([2; 16], 0);
+        for (t, e) in [
+            (RECORD_PUBLISH, 2u64),
+            (RECORD_SEALED, 3),
+            (RECORD_RESTORE, 4),
+            (RECORD_QUARANTINE, 5),
+            (RECORD_TIER_MOVE, 6),
+        ] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&e.to_le_bytes());
+            body.extend_from_slice(&[0; 16]);
+            body.extend_from_slice(&[1, 0, 4, 0, 9, 9, 9, 9]);
+            encode_block(t, 0, &body, &mut m).unwrap();
+        }
+        let r = read_manifest(&m, &[2; 16]).unwrap();
+        assert_eq!(r.last_epoch(), 6);
+        assert_eq!(r.records.len(), 6);
+        assert!(r.records.iter().all(|x| x.lost.is_none()));
     }
 }
