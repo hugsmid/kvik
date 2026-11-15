@@ -37,6 +37,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-162 | §8 Hashes, Bucket, Generations; §13 | Buckets without conditional writes or checksum checks |
 | Q-163 | §8 Generations, Restore step 1 | Reading the claims again on a bucket whose listings lag |
 | Q-164 | §8 Retention class, Restore; `api.md` Reading, Backup and restore | Interface points deferred to 8.2 that need tiers or restore |
+| Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -671,6 +672,25 @@ attached (AC-25); (c) the restore life cycle (AC-24). None can be decided withou
 **Model.** Not modelled.
 **Needed.** (a) and (b) settled with 8.1, (c) with 8.3. Suggested for (a): `facts` does not fetch; detail not local
 is reported as such and fetched by an asynchronous `Store` call on the maintenance thread.
+## Q-170 — Durability levels chosen per source
+
+Decided by the owner: a source may choose between the default level, where a reading is acknowledged only after the
+sync that covers it, and a faster level, where a reading is acknowledged once it is written (in the operating
+system's cache, before the sync). The faster level survives a crash or restart of the process but not a power cut or
+a kernel crash; the background sync bounds what such an event can lose. The level is chosen per source (per series
+definition), with the default level unless the definition says otherwise.
+
+Scenario: a price feed defined at the faster level emits a reading, gets its acknowledgement within microseconds, and
+a consumer acts on it; a power cut 200 ms later removes it. A meter series in the same store, at the default level,
+is acknowledged only after its sync and never loses an acknowledged reading.
+
+To settle (design at roadmap 5.5a): the definition parameter and its default; the bound on unsynced data (for example
+`max_unsynced`, default 1 s, never beyond the timed sync); what an acknowledgement and `Outcome` say about the level;
+a "durable up to" watermark in health and statistics; how a reading at the faster level that a power cut removes is
+reported (a reset point and `possible_loss`, as rule 1's reported truncation does), and what consumers that acted on
+it receive; batches mixing levels (a batch is acknowledged per reading at its own level; a definition or route
+change is always synced); principle 1 and invariant wording ("acknowledged at its level"); whether a per-call
+override (wait for the sync on a faster-level series) is offered.
 
 ## Open at v0.2
 
@@ -718,6 +738,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
+| Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
