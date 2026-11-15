@@ -371,7 +371,8 @@ pub fn series_stats(&self, id: SeriesId) -> Option<SeriesStats>;   // recorded, 
                                                                    // rounded, scale_raises, absent_supplied, out_of_range
 let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), for re-ingest
 ```
-- A loss's identity is the first position of its range when it was first reported. Reports are read from the
+- A loss's identity is the first position of its range when it was first reported; a `PossibleLoss` has its
+  recovery entry's position, and the gap before that entry is a `DataLost` with cause `TruncatedTail`. Reports are read from the
   manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is acknowledged; a
   `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
   a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with

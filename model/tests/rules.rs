@@ -13,7 +13,9 @@ use kvik_model::engine::{
     Model, Operator, Reason, Refusal, Selection, Signal, Tier, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
-use kvik_model::recovery::{LossKind, MarkState, ResetPoint};
+use kvik_model::recovery::{
+    LossCause, LossKind, MarkState, PointCheck, ResetPoint, SavedPoint, Tail,
+};
 use kvik_model::registry::{ChangedAtKind, RegistryError, RetentionClass, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
@@ -1160,10 +1162,10 @@ fn s3_remount_truncates_one_acknowledged_batch_or_finds_the_mark_stale() {
 
 /// §3 Recovery rule 3: with the mark lost, the torn tail is unbounded and a
 /// cursor file may name a position above K. F is one above the highest
-/// position named, the positions between K and F are a lost range whose
-/// cause is a truncated tail, described by the entry: part of its
-/// `possible_loss` (which names the missing mark), not a `data_lost`, and not
-/// a reset point of its own (§4 Resync).
+/// position named, and the positions between K and F are a lost range whose
+/// cause is a truncated tail: a `data_lost` under its first position, beside
+/// the entry's `possible_loss` (the missing mark) under F (Q-124 (a), (b)).
+/// The entry describes the gap, so the gap is no reset point of its own.
 #[test]
 fn s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry() {
     let (mut m, s) = timed_consumer_model();
@@ -1186,14 +1188,20 @@ fn s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry() {
     assert_eq!(entry.gap(at), Some((k.next(), cursor)));
     assert_eq!(m.disk.lost_ranges(), vec![(k.next(), cursor)]);
     let losses = m.losses();
-    assert_eq!(losses.len(), 1, "{losses:?}");
-    assert_eq!(losses[0].kind, LossKind::PossibleLoss);
-    assert_eq!(losses[0].mark_state, MarkState::Missing);
+    assert_eq!(losses.len(), 2, "{losses:?}");
+    assert_eq!(
+        (losses[0].kind, losses[0].cause, losses[0].identity),
+        (LossKind::DataLost, LossCause::TruncatedTail, k.next())
+    );
     assert_eq!(
         (losses[0].first, losses[0].last),
         (Some(k.next()), Some(cursor))
     );
-    assert_eq!(m.health().level, Level::Ok);
+    assert_eq!(
+        (losses[1].kind, losses[1].identity, losses[1].mark_state),
+        (LossKind::PossibleLoss, at, MarkState::Missing)
+    );
+    assert_eq!(m.health().level, Level::Degraded, "until acknowledged");
     assert_eq!(
         m.reset_points(),
         vec![ResetPoint {
@@ -1287,6 +1295,258 @@ fn s4_bounded_catch_up_delivers_a_reset_point_across_calls() {
     let k = m.recovery_entries()[&entry].after;
     assert_eq!(k.next(), entry);
     assert_eq!(r.forget_above, Some(k));
+}
+
+/// The position of a batch of the open segment, counted from its end.
+fn open_batch_from_end(m: &Model, k: usize) -> usize {
+    let f = m.disk.active.unwrap();
+    m.disk.files[&f].batches.len() - 1 - k
+}
+
+/// §3 Recovery rule 1 (Q-125): after a remount under the timed mark sync, an
+/// acknowledged and delivered batch beyond the synced mark that is found
+/// damaged leaves non-zero bytes after the mark, and no complete batch: the
+/// truncation is still a reset point, with a recovery entry at K + 1, a
+/// `possible_loss`, and `forget_above` = K before the reused position.
+#[test]
+fn s3_damaged_bytes_beyond_a_same_boot_mark_are_a_reset_point() {
+    let (mut m, s) = timed_consumer_model();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.sync_mark_file();
+    let k = m.disk.synced_mark.unwrap().last;
+    let lost = m
+        .ingest(vec![Reading::num(s, T0 + 1, 2.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(m.poll(C, 10).unwrap().last().unwrap().position, lost);
+    m.crash();
+    let b = open_batch_from_end(&m, 0);
+    m.corrupt_open_batch(b).unwrap();
+    m.remount();
+    m.restart();
+    let (at, entry) = m.recovery_entries().into_iter().next_back().unwrap();
+    assert_eq!(
+        (entry.after, at),
+        (k, lost),
+        "the entry takes the lost position"
+    );
+    assert!(entry.tail.torn);
+    assert!(m.disk.lost_ranges().is_empty());
+    assert!(
+        m.losses()
+            .iter()
+            .any(|l| l.kind == LossKind::PossibleLoss && l.identity == at)
+    );
+    assert_eq!(m.reset_points()[0].forget_above, k);
+}
+
+/// §3 Recovery rule 1: a damaged batch and then one complete batch beyond a
+/// same-boot mark are all truncated, in one reset point: one recovery entry
+/// at K + 1 with one `possible_loss`, and no lost range.
+#[test]
+fn s3_damaged_and_complete_batches_beyond_a_same_boot_mark_are_one_reset() {
+    let (mut m, s) = timed_consumer_model();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.sync_mark_file();
+    let k = m.disk.synced_mark.unwrap().last;
+    m.ingest(vec![Reading::num(s, T0 + 1, 2.0)]).unwrap();
+    m.ingest(vec![Reading::num(s, T0 + 2, 3.0)]).unwrap();
+    m.crash();
+    let b = open_batch_from_end(&m, 1);
+    m.corrupt_open_batch(b).unwrap();
+    m.remount();
+    m.restart();
+    let entries = m.recovery_entries();
+    assert_eq!(entries.len(), 1);
+    let (at, entry) = entries.into_iter().next().unwrap();
+    assert_eq!((entry.after, at), (k, k.next()));
+    assert_eq!(
+        entry.tail,
+        Tail {
+            batches: 1,
+            torn: true
+        }
+    );
+    assert!(m.disk.lost_ranges().is_empty());
+    assert_eq!(m.losses().len(), 1);
+}
+
+/// §4 Resync: a cursor older than the oldest local log segment receives one
+/// `resync` carrying `forget_above` = the cursor, which covers the reset
+/// points it passes over; nothing further is delivered until it is confirmed.
+#[test]
+fn s4_resync_for_a_cursor_behind_the_log_waits_for_its_confirmation() {
+    let (mut m, s) = consumer_model();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.drain().unwrap();
+    let cursor = m.disk.cursors[&C];
+    m.ingest(vec![Reading::num(s, T0 + 1, 2.0)]).unwrap();
+    m.power_loss();
+    m.restart();
+    assert!(m.reset_points().iter().any(|r| r.id > cursor));
+    m.ingest(vec![Reading::num(s, T0 + 2, 3.0)]).unwrap();
+    m.seal_active();
+    m.upload();
+    m.advance(91 * DAY);
+    assert!(!m.housekeeping().unwrap().is_empty(), "segments left hot");
+    m.reconnect(C).unwrap();
+    let live = m
+        .ingest(vec![Reading::num(s, T0 + 3, 4.0)])
+        .unwrap()
+        .positions[0];
+    m.catch_up(C, 100).unwrap();
+    let got = m.receive(C, 100).unwrap();
+    assert_eq!(got.len(), 1, "the resync alone");
+    let r = got[0].resync().unwrap();
+    assert_eq!(r.forget_above, Some(cursor));
+    assert!(r.replaced.is_some());
+    m.confirm(C, got[0].position).unwrap();
+    m.catch_up(C, 100).unwrap();
+    let after: Vec<Position> = m.poll(C, 100).unwrap().iter().map(|d| d.position).collect();
+    assert_eq!(after, vec![live]);
+}
+
+/// §3 Recovery rule 3: a start whose own sync fails delivers nothing, not even
+/// a condition delivery on the timer.
+#[test]
+fn s3_a_start_whose_sync_fails_sends_no_condition_delivery() {
+    let (mut m, a, _) = routed_model(100);
+    let stale = Condition::StaleFor {
+        staleness: 10 * SECOND,
+        n: 5 * SECOND,
+    };
+    m.add_route(C, FunnelId(1), Funnel::condition(a, None, stale))
+        .unwrap();
+    put(&mut m, a, 1.0);
+    m.drain().unwrap();
+    m.power_loss();
+    m.restart_with(true);
+    assert!(m.is_read_only());
+    m.advance(MINUTE);
+    m.tick().unwrap();
+    m.catch_up(C, 100).unwrap();
+    assert!(m.receive(C, 100).unwrap().is_empty());
+}
+
+/// §7 Readers, Reset stamp and saved points: a lost range recorded by a start
+/// that found the mark lost carries the stamp of the last kept recovery entry
+/// (Q-124 (c)), so it counts as recorded after the reset that carries the
+/// point's stamp: the point is void above the position before the range.
+#[test]
+fn s7_saved_point_and_a_lost_range_recorded_with_the_mark_lost() {
+    let (mut m, s) = consumer_model();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.power_loss();
+    m.restart();
+    let stamp = m.stamp();
+    let mut p = Vec::new();
+    for i in 0..3 {
+        p.extend(
+            m.ingest(vec![Reading::num(s, T0 + 10 + i, 1.0)])
+                .unwrap()
+                .positions,
+        );
+    }
+    let point = SavedPoint {
+        position: p[2],
+        stamp,
+    };
+    assert_eq!(m.check_point(point), PointCheck::Kept);
+    m.crash();
+    let b = open_batch_from_end(&m, 1);
+    m.corrupt_open_batch(b).unwrap();
+    m.lose_mark(MarkState::Missing).unwrap();
+    m.restart();
+    assert_eq!(m.disk.lost_ranges(), vec![(p[1], p[1])]);
+    assert_eq!(m.check_point(point), PointCheck::VoidAbove(p[0]));
+}
+
+/// §7 Readers: a gap whose recovery entry is later lost is a reset of its
+/// own, recorded before that entry: a point saved before both is void above
+/// the position before the gap; while the mark names the lost entry's stamp
+/// the answer is unknown. A point saved above F under the entry's stamp is
+/// void above itself after a later reset that truncates nothing below it.
+#[test]
+fn s7_saved_points_across_a_gap_and_its_lost_entry() {
+    let (mut m, s) = timed_consumer_model();
+    let mut p = Vec::new();
+    for i in 0..4 {
+        p.extend(
+            m.ingest(vec![Reading::num(s, T0 + i, 1.0)])
+                .unwrap()
+                .positions,
+        );
+    }
+    m.drain().unwrap();
+    let before = SavedPoint {
+        position: p[2],
+        stamp: m.stamp(),
+    };
+    m.crash();
+    m.lose_mark(MarkState::Missing).unwrap();
+    assert_eq!(m.power_loss_losing(2), 2);
+    m.restart();
+    let k = p[1];
+    assert_eq!(m.check_point(before), PointCheck::VoidAbove(k));
+    let above = m
+        .ingest(vec![Reading::num(s, T0 + 9, 9.0)])
+        .unwrap()
+        .positions[0];
+    m.sync_mark_file();
+    let saved = SavedPoint {
+        position: above,
+        stamp: m.stamp(),
+    };
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.check_point(saved), PointCheck::VoidAbove(above));
+    // The entry that describes the gap is lost.
+    m.crash();
+    let entry = m.recovery_entries().into_keys().next().unwrap();
+    let f = m.disk.active.unwrap();
+    let b = m.disk.files[&f]
+        .batches
+        .iter()
+        .position(|b| b.iter().any(|e| e.position == entry))
+        .unwrap();
+    m.corrupt_open_batch(b).unwrap();
+    m.restart();
+    m.power_loss();
+    m.restart();
+    assert_eq!(m.check_point(before), PointCheck::VoidAbove(k));
+}
+
+/// §11 Health, Q-124 (d): a loss a start that could not write reported as
+/// found stays reported when the mark is then lost: the next start finds the
+/// damaged batch as a torn tail, and its positions, named by the consumer's
+/// cursor, are the entry's gap, a `data_lost` under the same identity.
+#[test]
+fn s11_a_found_loss_stays_reported_after_the_mark_is_lost() {
+    let (mut m, s) = consumer_model();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    let last = m
+        .ingest(vec![Reading::num(s, T0 + 1, 2.0)])
+        .unwrap()
+        .positions[0];
+    m.drain().unwrap();
+    m.crash();
+    let b = open_batch_from_end(&m, 0);
+    m.corrupt_open_batch(b).unwrap();
+    m.power_loss();
+    m.restart_with(true);
+    let found = m.losses();
+    assert_eq!(
+        (found[0].identity, found[0].kind, found[0].recorded),
+        (last, LossKind::DataLost, false)
+    );
+    m.crash();
+    m.lose_mark(MarkState::Missing).unwrap();
+    m.restart();
+    assert!(
+        m.losses()
+            .iter()
+            .any(|l| l.identity == last && l.kind == LossKind::DataLost && l.recorded)
+    );
 }
 
 /// §8 Acknowledging a loss: a `data_lost` holds health degraded until it is

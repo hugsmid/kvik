@@ -13,8 +13,8 @@
 //! `spec.md` §3 Recovery rule 3 and after a start under rule 1 that truncates a complete batch, at F = K + 1 (no
 //! position is named above K here: no cursor file, derived file or lost range exists), with the same K, mark state,
 //! id floor and stamp sequence. Where the history fixes the tail (a clean power loss, a torn batch, a truncated
-//! complete batch), the log reports a possible loss exactly when the model's entry names a tail; after a stop at an
-//! arbitrary operation the file system chooses, and the tails are not compared.
+//! complete batch), the log reports a possible loss at the entry exactly when the model lists one there; after a stop
+//! at an arbitrary operation the file system chooses, and the tails are not compared.
 //!
 //! The differences the specification allows, made explicit here:
 //! - **Starts cut short.** The model has no start cut short: it starts once where the log starts twice, and a cut
@@ -1223,7 +1223,7 @@ impl World {
                         assert_eq!(entry.entry.after, before.last_sequence);
                         assert_eq!(entry.entry.mark_state, MarkState::Readable);
                         assert!(!entry.adopted, "nothing to adopt: every start finished");
-                        self.check_entry(report);
+                        self.check_entry(report, true);
                         assert_eq!(report.losses.len(), 1, "{report:?}");
                         assert!(report.losses[0].bytes > 0);
                     }
@@ -1234,7 +1234,7 @@ impl World {
                 count(Count::Reboots);
                 let entry = report.entry.as_ref().expect("a recovery entry");
                 assert!(!entry.adopted, "nothing to adopt: every start finished");
-                self.check_entry(report);
+                self.check_entry(report, !matches!(tail, Tail::Either));
                 let reported = !report.losses.is_empty();
                 let model = self.model_tail(entry.sequence).filter(|_| !self.cut);
                 match tail {
@@ -1262,7 +1262,7 @@ impl World {
                     count(Count::Adoptions);
                 }
                 if report.entry.is_some() {
-                    self.check_entry(report);
+                    self.check_entry(report, false);
                 }
             }
         }
@@ -1279,7 +1279,8 @@ impl World {
 
     /// The recovery entry a start wrote: at F = K + 1, the last batch, with the id floor and a new reset stamp that
     /// the mark carries; at most one possible loss, identified by F.
-    fn check_entry(&mut self, report: &StartReport) {
+    /// With `known`, the history fixes the tail, so the log reports a possible loss exactly when the model does.
+    fn check_entry(&mut self, report: &StartReport, known: bool) {
         let entry = report.entry.as_ref().expect("a recovery entry");
         assert_eq!(entry.sequence, entry.entry.after + 1, "F = K + 1");
         let mark = self.log.mark();
@@ -1297,8 +1298,8 @@ impl World {
         if let Some(before) = self.log.before {
             assert_ne!(before.stamp, stamp, "a new reset stamp");
         }
-        // The model's entry at the same position, while the two match one for one: the same id floor, and a
-        // possible loss exactly when it names a tail.
+        // The model's entry at the same position, while the two match one for one: the same id floor, and, where
+        // the history fixes the tail, a possible loss in both or neither.
         if !self.cut {
             let p = Position::new(0, entry.sequence);
             let model = self
@@ -1316,7 +1317,16 @@ impl World {
                 .losses()
                 .into_iter()
                 .any(|l| l.kind == ModelLossKind::PossibleLoss && l.identity == p);
-            assert_eq!(possible, !model.tail.is_empty(), "{model:?}");
+            if known && !self.log.torn_header_unused {
+                let reported = report
+                    .losses
+                    .iter()
+                    .any(|l| l.kind == LossKind::PossibleLoss && l.identity == entry.sequence);
+                assert_eq!(
+                    reported, possible,
+                    "a possible loss in both or neither: {report:?}, {model:?}"
+                );
+            }
         }
         if let Some(before) = self.log.before {
             assert!(entry.entry.id_floor >= before.max_series_id, "{report:?}");
@@ -1326,7 +1336,11 @@ impl World {
             assert_eq!(l.kind, LossKind::PossibleLoss);
             assert_eq!(l.cause, LossCause::TruncatedTail);
             assert_eq!(l.identity, entry.sequence);
-            assert!(l.bytes > 0 || l.readable_commits > 0);
+            assert!(
+                l.bytes > 0
+                    || l.readable_commits > 0
+                    || entry.entry.mark_state != MarkState::Readable
+            );
         }
     }
 

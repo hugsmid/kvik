@@ -444,6 +444,47 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
     }
 }
 
+/// Q-125: a remount within the boot leaves an acknowledged batch beyond the mark, and its bytes are then damaged, so
+/// no complete batch lies beyond the mark, only non-zero bytes. Rule 1 truncates them; the batch may have been
+/// acknowledged and delivered, so the truncation is a reset point: a recovery entry after the mark's position with a
+/// new stamp, and a possible loss.
+#[test]
+fn damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point() {
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::Interval(Duration::from_secs(1)),
+        ..cfg()
+    });
+    r.submit(vec![fact(1, 0), fact(2, 0)]);
+    r.drain();
+    r.w = None;
+    r.fs.power_loss();
+    r.fs.restart();
+    let seg = log_path("00000000-0000000000000001.open");
+    let bytes = r.fs.read(&seg).unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: 1,
+        generation: 0,
+    };
+    let batch = scan(&bytes, &id, ScanLimit::End).unwrap().batches[0].offset;
+    r.fs.poke(&seg, batch as usize + 40, &[0xff; 8]);
+    let before = read_mark(&r.fs.read(&log_path("MARK")).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1;
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    let e = rep.entry.as_ref().expect("a recovery entry");
+    assert_eq!(e.entry.after, before.last_sequence);
+    assert_ne!(e.entry.stamp, Some(before.stamp), "a new reset stamp");
+    assert!(
+        rep.losses
+            .iter()
+            .any(|l| l.kind == LossKind::PossibleLoss && l.identity == e.sequence)
+    );
+    assert!(rep.truncated_bytes > 0);
+}
+
 #[test]
 fn corruption_below_the_mark_is_a_recorded_loss_and_later_batches_are_kept() {
     let mut r = Rig::new(WriterConfig {
@@ -518,6 +559,7 @@ fn a_position_named_by_the_manifest_raises_the_recovery_entry_and_its_gap_is_rec
         time_before: None,
         time_after: None,
         extends: false,
+        stamp: None,
     };
     let bytes = encode_record(RECORD_LOST_RANGE, m.last_epoch() + 1, 0, T0, Some(&rec));
     let len = r.fs.read(&path).unwrap().len();

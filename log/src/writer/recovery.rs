@@ -343,6 +343,7 @@ fn lost(
         time_before: times.0,
         time_after: times.1,
         extends: false,
+        stamp: None,
     }
 }
 
@@ -365,6 +366,8 @@ fn plan(
     let mut kept: Vec<usize> = segs.iter().map(|s| s.batches.len()).collect();
     let mut zero = Vec::new();
     let mut reset = false;
+    // Complete batches beyond a readable mark of the current boot.
+    let mut beyond_batches = 0u32;
     // Rule 1: a recovery entry beyond the mark written by an earlier start that stopped before its mark (Q-117).
     let mut adopt_beyond: Option<(usize, usize)> = None;
     // Rule selection.
@@ -391,9 +394,6 @@ fn plan(
                 StartRule::Reboot(MarkState::Stale)
             };
             if rule == StartRule::SameBoot {
-                // A complete batch beyond the mark may have been acknowledged (a mark sync lost with the page cache
-                // within the boot): its truncation is a reset point (`spec.md` §3 Recovery rule 1).
-                reset = n == 1;
                 // Truncate everything after the mark: in the mark's segment from its offset, in every later segment
                 // in use from the header's end.
                 // A segment that is not the last in use holds no batch beyond a current mark, and may hold seal
@@ -417,16 +417,27 @@ fn plan(
                                 && only_headers_after(i))
                     })
                     .collect();
+                let from_of = |i: usize| {
+                    if segs[i].id.file_id == slot.file_id {
+                        slot.offset.max(HEADER_LEN as u64)
+                    } else {
+                        HEADER_LEN as u64
+                    }
+                };
+                // A complete batch beyond the mark, or any non-zero byte there (a batch whose bytes were damaged
+                // after it was acknowledged), may have been acknowledged (a mark sync lost with the page cache within
+                // the boot): its truncation is a reset point (`spec.md` §3 Recovery rule 1, Q-125).
+                beyond_batches = u32::try_from(n).unwrap_or(u32::MAX);
+                reset = n == 1
+                    || targets.iter().any(|&i| {
+                        segs[i].id.file_id >= slot.file_id && segs[i].last_nonzero > from_of(i)
+                    });
                 for i in targets {
                     let s = &segs[i];
                     if s.id.file_id < slot.file_id {
                         continue;
                     }
-                    let from = if s.id.file_id == slot.file_id {
-                        slot.offset.max(HEADER_LEN as u64)
-                    } else {
-                        HEADER_LEN as u64
-                    };
+                    let from = from_of(i);
                     kept[i] = s.batches.iter().filter(|b| b.end <= from).count();
                     // The one complete batch beyond the mark is a recovery entry after the mark's position, written
                     // at the write position by a start that stopped before its mark, and nothing after it shows a
@@ -669,7 +680,7 @@ fn plan(
             p.last_sequence = b.first;
             p.tail = seg.map(|r| (r, 0, total, 0));
         } else {
-            p.tail = seg.map(|r| (r, 0, total, 1));
+            p.tail = seg.map(|r| (r, 0, total, beyond_batches));
             p.last_sequence = 1 + k.max(manifest_highest);
         }
     } else {
@@ -1155,10 +1166,21 @@ pub(super) fn start(
         }
     }
 
+    // The reset stamp in force, which each loss recorded here carries (Q-124 (c)): the mark's, or with the mark
+    // lost that of the last kept recovery entry; none known otherwise.
+    let stamp_in_force = match &mark {
+        MarkRead::Readable { slot, .. } => Some(slot.stamp),
+        _ => in_use_idx
+            .iter()
+            .rev()
+            .flat_map(|&i| segs[i].batches.iter().take(p.kept[i]).rev())
+            .find_map(|b| b.recovery().and_then(|r| r.stamp)),
+    };
     // Step 4: repair the manifest's tail and record the losses found.
     let mut losses = p.losses.clone();
     for l in &mut losses {
         l.id_floor = id_floor;
+        l.stamp = stamp_in_force;
     }
     // New epochs continue above every epoch named by the last valid record and by any lease file (§7 Manifest).
     let leases = store.dir().join(LEASES_DIR);
@@ -1351,7 +1373,13 @@ pub(super) fn start(
             write_offset = at + bytes.len() as u64;
             last_commit_time = commit_time;
             entry_batch = Some((at, content, commit_time));
-            if tail_bytes > 0 || readable > 0 {
+            // A possible loss: a non-empty tail, a mark not readable or stale, or a missing or unreadable cursor
+            // file (`spec.md` §11 Health; Q-124 (a)); its identity is the entry's position (Q-124 (b)).
+            if tail_bytes > 0
+                || readable > 0
+                || state != MarkState::Readable
+                || !entry.consumers.is_empty()
+            {
                 report.losses.push(FoundLoss {
                     kind: LossKind::PossibleLoss,
                     cause: LossCause::TruncatedTail,
@@ -1436,6 +1464,7 @@ pub(super) fn start(
         if report.entry.as_ref().is_some_and(|e| !e.adopted) && f_seq > p.k + 1 {
             let l = LostRange {
                 id_floor,
+                stamp: Some(stamp),
                 ..lost(
                     p.k + 1,
                     f_seq - 1,

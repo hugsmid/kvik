@@ -88,6 +88,10 @@ pub struct LostRange {
     pub time_after: Option<i64>,
     /// 12: the record extends the loss named by its identity.
     pub extends: bool,
+    /// 13: the reset stamp in force when the start recorded it (`spec.md` §7 Readers): the mark's, or with the mark
+    /// lost that of the last kept recovery entry; absent when none was known, which counts as later than every
+    /// reset (Q-124 (c)).
+    pub stamp: Option<crate::mark::ResetStamp>,
 }
 
 /// One valid record.
@@ -174,6 +178,7 @@ fn decode_lost(list: &[(u16, &[u8])]) -> Option<LostRange> {
         time_before: get(10).and_then(u64_of).map(|t| t as i64),
         time_after: get(11).and_then(u64_of).map(|t| t as i64),
         extends: get(12).is_some(),
+        stamp: get(13).and_then(crate::mark::ResetStamp::decode),
     })
 }
 
@@ -314,6 +319,9 @@ pub fn encode_record(
         if l.extends {
             push_field(&mut body, 12, &[]);
         }
+        if let Some(stamp) = l.stamp {
+            push_field(&mut body, 13, &stamp.encode());
+        }
     }
     let mut out = Vec::new();
     // A record body this short always fits a block.
@@ -370,6 +378,7 @@ mod tests {
             time_before: Some(5),
             time_after: None,
             extends: false,
+            stamp: None,
         }
     }
 

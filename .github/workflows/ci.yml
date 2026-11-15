@@ -136,7 +136,7 @@ jobs:
 
   deep:
     # Many more random cases, in release mode, one job per shard: the
-    # invariants file is split by invariant number into 9 shards, each other
+    # invariants file is split by invariant number into 8 shards, each other
     # property-test file of the model, and the property, fuzz-input, batch,
     # model-differential, model-histories, writer, recovery and reader tests of kvik-log, the property and
     # fuzz-input tests of kvik-chunk, the windows differential of kvik, and the record, manifest, rebuild and

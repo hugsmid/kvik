@@ -411,18 +411,24 @@ impl Index {
             e.first = e.first.min(Some(first));
             e.last = e.last.max(Some(last));
         }
+        // A recovery entry is a possible loss when it names a non-empty tail, a mark not readable or stale, or a
+        // missing or unreadable cursor file; its identity is its own position (`spec.md` §11 Health, §3 step 4).
         for (p, r) in &self.recoveries {
-            if r.tail_bytes == 0 && r.readable_commits == 0 {
+            if r.tail_bytes == 0
+                && r.readable_commits == 0
+                && r.mark_state == LogMarkState::Readable
+                && r.consumers.is_empty()
+            {
                 continue;
             }
-            let identity = Position::new(p.generation, r.after + 1);
+            let identity = Position::new(p.generation, p.sequence);
             out.insert(
                 (identity, true),
                 LossReport {
                     identity,
                     kind: LossKind::PossibleLoss,
                     cause: LossCause::TruncatedTail,
-                    first: Some(identity),
+                    first: None,
                     last: None,
                     file_id: None,
                     bytes: r.tail_bytes,

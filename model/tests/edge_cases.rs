@@ -862,13 +862,10 @@ fn row_06_two_readings_in_one_second() {
     leaf_ok(&m, s, t);
 }
 
-/// Row 7: "Process crash after write, before sync. Same boot: truncated to
-/// the durable mark on restart; never delivered; a complete batch truncated
-/// this way is followed by a recovery entry and reported as `possible_loss`
-/// (§3 Recovery rule 1)." On the same boot the page cache holds the whole
-/// batch whatever its write outcome at a power loss would be. With the mark
-/// lost (row 7, second clause) recovery treats it as a different boot and may
-/// keep the batch: `s3_missing_mark_counts_as_different_boot`.
+/// Row 7: a process crash after the write, before the sync. On the same boot
+/// the page cache holds the whole batch, so its truncation is a reset point
+/// (§3 Recovery rule 1). With the mark lost, see
+/// `s3_missing_mark_counts_as_different_boot`.
 #[test]
 fn row_07_process_crash_after_write_before_sync() {
     // Same boot: recovery truncates to the durable mark, whatever reached the
@@ -930,12 +927,10 @@ fn row_07_process_crash_after_write_before_sync() {
     assert!(m.recovery_entries().is_empty() && m.losses().is_empty());
 }
 
-/// Row 7a: "Power loss after write, before sync. New boot: torn tail truncated
-/// by checksum and reported as `possible_loss`; complete batches synced on
-/// recovery before use; a recovery entry at the first new position." The
-/// `resync` owed after the recovery is
-/// `s4_resync_after_rule_3_recovery_before_later_positions`; on every later
-/// start until the consumer's cursor has passed it, `row_07c_…`.
+/// Row 7a: a power loss after the write, before the sync. The recovery entry
+/// takes the first new position; a torn tail is a `possible_loss`. The
+/// `resync` owed is `s4_resync_after_rule_3_recovery_before_later_positions`,
+/// and on later starts `row_07c_…`.
 #[test]
 fn row_07a_power_loss_after_write_before_sync() {
     // New boot: a torn tail is truncated; a complete batch with valid
@@ -985,16 +980,10 @@ fn timed() -> (Model, SeriesId) {
     })
 }
 
-/// Row 7b: "Export continued by position across a power loss. The export
-/// keeps a saved point (§7 Readers); judged against the mark after the
-/// restart, nothing above the position it is void above is kept as valid,
-/// and an unknown answer starts the export again." An export reads up to the
-/// mark and keeps the last position with the reader's stamp. Kept while
-/// nothing is reset; after a power loss that loses acknowledged batches above
-/// the last synced mark, void above K, the entry's `after`, which lies below
-/// the point; a point kept since that reset is kept, and void above its own
-/// position after a later reset that keeps it; unknown once the recovery entry
-/// the mark names is itself lost.
+/// Row 7b: an export continued by position across a power loss keeps a saved
+/// point (§7 Readers): kept while nothing is reset; void above K after a power
+/// loss that loses acknowledged batches; void above itself after a later reset
+/// below nothing it holds; unknown once the entry the mark names is lost.
 #[test]
 fn row_07b_export_continued_by_position_across_a_power_loss() {
     let (mut m, s) = timed();
@@ -1071,16 +1060,10 @@ fn row_07b_export_continued_by_position_across_a_power_loss() {
     );
 }
 
-/// Row 7c: "Crash on the same boot after a rule 3 recovery, before a consumer
-/// received its `resync`: rule 1 start; the replay meets the recovery entry
-/// before any reused position." A power loss loses an acknowledged and
-/// delivered batch above the last synced mark; the recovery entry takes the
-/// next position and later facts reuse the lost ones. The consumer has not
-/// received its `resync` when the process crashes; the next start is rule 1
-/// (the mark covers the entry, so nothing is reset again), and the replay
-/// delivers the `resync` carrying `forget_above` = K at the entry before any
-/// position above K, and nothing more until it is confirmed. The reset point
-/// is read from the log at every start; nothing is owed on disk.
+/// Row 7c: a crash on the same boot after a rule 3 recovery, before the
+/// consumer received its `resync`. The next start is rule 1 and resets
+/// nothing; the replay meets the recovery entry, read from the log, before any
+/// reused position, and nothing follows until the `resync` is confirmed.
 #[test]
 fn row_07c_crash_on_the_same_boot_after_a_rule_3_recovery() {
     let (mut m, s) = timed();
@@ -1590,14 +1573,9 @@ fn row_12_sync_error_read_only_fatal_restart_truncates() {
     }
 }
 
-/// Row 12a: "Mark deleted or damaged on the same boot after a failed sync:
-/// rule 3; the last complete batch is written again and synced before use;
-/// kept only if that sync succeeds, else read-only; reported as
-/// `possible_loss` with the mark's state." The batch whose sync failed lies
-/// complete in the page cache; with the mark gone, the start keeps it, writes
-/// a recovery entry after it naming the mark's state, and lists a
-/// `possible_loss`; a start whose sync fails stays read-only and writes
-/// nothing.
+/// Row 12a: the mark lost on the same boot after a failed sync. The batch,
+/// whole in the page cache, is kept, and a recovery entry after it names the
+/// mark's state as a `possible_loss`; a start whose sync fails writes nothing.
 #[test]
 fn row_12a_mark_lost_on_the_same_boot_after_a_failed_sync() {
     for state in [MarkState::Missing, MarkState::Unreadable] {

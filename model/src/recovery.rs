@@ -92,12 +92,11 @@ impl RecoveryEntry {
             .then(|| (self.after.next(), before(at)))
     }
 
-    /// Whether the entry at `at` is a `possible_loss` (§11 Health): it names a
-    /// non-empty tail, a gap, a mark that was not readable or stale, or a
-    /// missing or unreadable cursor file.
-    pub fn possible_loss(&self, at: Position) -> bool {
+    /// Whether the entry is a `possible_loss` (§11 Health): it names a
+    /// non-empty tail, a mark that was not readable or stale, or a missing or
+    /// unreadable cursor file. Its gap, if any, is a `data_lost` (Q-124 (a)).
+    pub fn possible_loss(&self) -> bool {
         !self.tail.is_empty()
-            || self.gap(at).is_some()
             || self.mark_state != MarkState::Readable
             || !self.cursors_missing.is_empty()
     }
@@ -151,11 +150,12 @@ pub fn reset_points(
 /// Whether a loss is certain (§11 Health).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LossKind {
-    /// A lost range caused by corruption: health degraded until acknowledged.
+    /// A lost range, by corruption or a recovery entry's gap: health degraded
+    /// until acknowledged.
     DataLost,
-    /// A recovery entry that names a non-empty tail, a gap, a mark not
-    /// readable or stale, or a missing cursor file: listed and counted, never
-    /// degrading, needing no acknowledgement.
+    /// A recovery entry that names a non-empty tail, a mark not readable or
+    /// stale, or a missing cursor file: listed and counted, never degrading,
+    /// needing no acknowledgement.
     PossibleLoss,
 }
 
@@ -165,7 +165,8 @@ pub enum LossCause {
     /// An invalid region below a valid mark or followed by a complete batch
     /// (§3 Recovery rule 2), or a corrupt sealed segment with no other copy.
     Corruption,
-    /// A truncated tail: a recovery entry's tail and gap (§3 Recovery rule 3).
+    /// A truncated tail: a recovery entry's tail (a `possible_loss`) and its
+    /// gap (a `data_lost`), §3 Recovery rules 1 and 3.
     TruncatedTail,
 }
 
@@ -173,8 +174,8 @@ pub enum LossCause {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loss {
     /// The first position of its range when it was first reported; for a
-    /// `possible_loss`, the recovery entry's position, F (two entries can
-    /// share K; see `OPEN-QUESTIONS.md`, Q-124).
+    /// `possible_loss`, its recovery entry's position, F. Identities are
+    /// unique within a kind (§3 Order of a start, step 4).
     pub identity: Position,
     /// Certain or possible.
     pub kind: LossKind,
@@ -235,42 +236,40 @@ pub struct Acknowledged {
 /// The list of losses (§11 Health), from the manifest's lost-range records,
 /// the ranges found but not yet recorded, the recovery entries and the
 /// acknowledgements. Each loss is listed once, under its identity, with the
-/// union of the ranges its records name. A gap a recovery entry describes is
-/// part of that entry's `possible_loss`, not a further loss.
+/// union of the ranges its records name. A recovery entry's gap is a
+/// `data_lost` of cause truncated tail; the entry itself is a `possible_loss`
+/// when it names a tail, a mark not readable or stale, or a missing cursor
+/// file.
 pub fn losses(
     recorded: &[LostRecord],
     found: &[(Position, Position)],
     recoveries: &[(Position, RecoveryEntry)],
     acknowledged: &[Acknowledged],
 ) -> Vec<Loss> {
-    let gaps: Vec<(Position, Position)> =
-        recoveries.iter().filter_map(|(at, e)| e.gap(*at)).collect();
     let mut out: Vec<Loss> = Vec::new();
-    let mut add = |identity: Position, from: Position, to: Position, recorded: bool| {
-        if let Some(l) = out.iter_mut().find(|l| l.identity == identity) {
-            l.first = l.first.min(Some(from));
-            l.last = l.last.max(Some(to));
-            l.recorded |= recorded;
-        } else {
-            out.push(Loss {
-                identity,
-                kind: LossKind::DataLost,
-                cause: LossCause::Corruption,
-                first: Some(from),
-                last: Some(to),
-                tail: Tail::default(),
-                mark_state: MarkState::Readable,
-                cursors_missing: Vec::new(),
-                recorded,
-                acknowledged: false,
-            });
-        }
-    };
+    let mut add =
+        |identity: Position, cause: LossCause, from: Position, to: Position, recorded: bool| {
+            if let Some(l) = out.iter_mut().find(|l| l.identity == identity) {
+                l.first = l.first.min(Some(from));
+                l.last = l.last.max(Some(to));
+                l.recorded |= recorded;
+            } else {
+                out.push(Loss {
+                    identity,
+                    kind: LossKind::DataLost,
+                    cause,
+                    first: Some(from),
+                    last: Some(to),
+                    tail: Tail::default(),
+                    mark_state: MarkState::Readable,
+                    cursors_missing: Vec::new(),
+                    recorded,
+                    acknowledged: false,
+                });
+            }
+        };
     for r in recorded {
-        if r.cause == LossCause::TruncatedTail && gaps.contains(&(r.from, r.to)) {
-            continue;
-        }
-        add(r.identity, r.from, r.to, true);
+        add(r.identity, r.cause, r.from, r.to, true);
     }
     for (from, to) in found {
         // A range found again before it is recorded is the same loss.
@@ -278,7 +277,7 @@ pub fn losses(
             .iter()
             .find(|r| r.from <= *to && *from <= r.to)
             .map_or(*from, |r| r.identity);
-        add(identity, *from, *to, false);
+        add(identity, LossCause::Corruption, *from, *to, false);
     }
     for l in &mut out {
         l.acknowledged = acknowledged.iter().any(|a| {
@@ -287,17 +286,13 @@ pub fn losses(
                 && l.last.is_some_and(|t| t <= a.to)
         });
     }
-    for (at, e) in recoveries {
-        if !e.possible_loss(*at) {
-            continue;
-        }
-        let gap = e.gap(*at);
+    for (at, e) in recoveries.iter().filter(|(_, e)| e.possible_loss()) {
         out.push(Loss {
             identity: *at,
             kind: LossKind::PossibleLoss,
             cause: LossCause::TruncatedTail,
-            first: gap.map(|g| g.0),
-            last: gap.map(|g| g.1),
+            first: None,
+            last: None,
             tail: e.tail,
             mark_state: e.mark_state,
             cursors_missing: e.cursors_missing.clone(),
@@ -526,8 +521,19 @@ mod tests {
             cursors_missing: Vec::new(),
         };
         assert_eq!(e.gap(p(7)), Some((p(5), p(6))));
-        assert!(e.possible_loss(p(7)));
-        assert!(!e.possible_loss(p(5)));
+        assert!(!e.possible_loss(), "a gap alone is a `data_lost`");
+        let gap = LostRecord {
+            identity: p(5),
+            from: p(5),
+            to: p(6),
+            cause: LossCause::TruncatedTail,
+        };
+        let l = losses(&[gap], &[], &[(p(7), e.clone())], &[]);
+        assert_eq!(l.len(), 1);
+        assert_eq!(
+            (l[0].kind, l[0].cause, l[0].identity),
+            (LossKind::DataLost, LossCause::TruncatedTail, p(5))
+        );
         let rp = reset_points(&[(p(7), e)], &[(p(5), p(6)), (p(9), p(9))]);
         assert_eq!(
             rp,
