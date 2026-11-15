@@ -4,6 +4,8 @@
 //! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire, sealed-segment and reserved
 //! (restore, quarantine, tier-move) records over as field lists, taking only their epochs.
 
+use std::collections::BTreeSet;
+
 use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block};
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
@@ -335,6 +337,34 @@ pub fn encode_initial(store_id: [u8; 16], created_at: i64) -> Vec<u8> {
         .encode()
         .to_vec();
     out.extend(encode_record(RECORD_EMPTY, 1, 0, created_at, None));
+    out
+}
+
+/// The file ids of the log segments that valid records name (`format.md` A.14): field 1 of a sealed-segment record and
+/// fields 1 and 2 of a publish-and-retire record, each a file description, of kind 1. A value too short to hold a
+/// kind and `file_id` names nothing.
+pub fn listed_segments(bytes: &[u8], read: &ManifestRead) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    for r in &read.records {
+        let named: &[u16] = match r.record_type {
+            RECORD_SEALED => &[1],
+            RECORD_PUBLISH => &[1, 2],
+            _ => continue,
+        };
+        let Ok(b) = read_block(bytes, r.offset, bytes.len() as u64) else {
+            continue;
+        };
+        let Some(list) = b.body.get(RECORD_PREFIX..).and_then(fields) else {
+            continue;
+        };
+        for (_, v) in list.iter().filter(|(id, _)| named.contains(id)) {
+            if v.first() == Some(&kind::LOG_SEGMENT)
+                && let Some(id) = v.get(8..16).and_then(u64_of)
+            {
+                out.insert(id);
+            }
+        }
+    }
     out
 }
 

@@ -45,7 +45,7 @@ pub mod recovery;
 pub mod sources;
 mod threads;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +69,7 @@ use crate::fs::{Fs, FsFile};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::lease::LeaseTable;
 use crate::mark::{MarkSlot, SLOT_OFFSETS};
-use crate::segment::SealSummary;
+use crate::segment::{SealSummary, SegmentDescription};
 use crate::store::{LEASES_DIR, MARK, StoreDir, StoreError};
 
 const MIB: u64 = 1 << 20;
@@ -555,6 +555,10 @@ pub struct LogWriter {
     blocked: Vec<(SealJob, Duration)>,
     seal_blocked: BTreeSet<u64>,
     sealing: usize,
+    /// Sealed segments no manifest record listed at the start, described one at a time (Q-221).
+    unlisted: VecDeque<SegmentIdentity>,
+    describing: bool,
+    described: Vec<SegmentDescription>,
     disk: Disk,
     waiting: Option<Wait>,
     stats: LogStats,
@@ -661,6 +665,9 @@ impl LogWriter {
             blocked: Vec::new(),
             seal_blocked: BTreeSet::new(),
             sealing: 0,
+            unlisted: r.unlisted.into(),
+            describing: false,
+            described: Vec::new(),
             disk: Disk::default(),
             waiting: None,
             report: r.report,
@@ -820,7 +827,7 @@ impl LogWriter {
     }
 
     /// Seal jobs ready to run: segments whose successor is in use and synced, and blocked seals whose retry time
-    /// has come.
+    /// has come; with none of those, one sealed segment that no manifest record listed at the start, to describe.
     pub fn take_seal_jobs(&mut self, now: Duration) -> Vec<SealJob> {
         self.sync_halt();
         if self.fault.is_some() {
@@ -833,16 +840,38 @@ impl LogWriter {
         self.blocked = wait;
         out.extend(due.into_iter().map(|(j, _)| j));
         self.sealing += out.len();
+        if out.is_empty()
+            && !self.describing
+            && let Some(id) = self.unlisted.pop_front()
+        {
+            self.describing = true;
+            out.push(SealJob::describe(id, self.log_dir.clone()));
+        }
         out
     }
 
     /// The result of a seal job.
-    pub fn seal_done(&mut self, job: SealJob, result: Result<(), SealError>, now: Duration) {
+    pub fn seal_done(
+        &mut self,
+        job: SealJob,
+        result: Result<Option<SegmentDescription>, SealError>,
+        now: Duration,
+    ) {
+        if job.describes_only() {
+            self.describing = false;
+            match result {
+                Ok(d) => self.described.extend(d),
+                Err(SealError::Fault(f)) => self.fail_with(f),
+                Err(_) => self.sync_halt(),
+            }
+            return;
+        }
         self.sealing = self.sealing.saturating_sub(1);
         match result {
-            Ok(()) => {
+            Ok(d) => {
                 self.seal_blocked.remove(&job.file_id());
                 self.stats.sealed_segments += 1;
+                self.described.extend(d);
             }
             Err(SealError::Blocked(_)) => {
                 self.seal_blocked.insert(job.file_id());
@@ -853,7 +882,14 @@ impl LogWriter {
         }
     }
 
-    /// Whether seal jobs are ready to run or running; blocked seals waiting for their retry are not counted.
+    /// The descriptions of segments sealed, and of sealed segments no manifest record listed at the start, since the
+    /// last call, each once (`format.md` A.14, Q-220).
+    pub fn take_sealed(&mut self) -> Vec<SegmentDescription> {
+        std::mem::take(&mut self.described)
+    }
+
+    /// Whether seal jobs are ready to run or running; blocked seals waiting for their retry and descriptions are not
+    /// counted.
     pub fn seals_running(&self) -> bool {
         !self.seals.is_empty() || self.sealing > 0
     }
@@ -1105,15 +1141,15 @@ impl LogWriter {
         if let Some(old) = self.open.replace(next)
             && let Some(summary) = old.summary
         {
-            self.seals.push(SealJob {
-                end: old.write_offset,
-                file: old.file,
-                id: old.id,
-                log_dir: self.log_dir.clone(),
+            self.seals.push(SealJob::seal(
+                old.file,
+                old.id,
+                self.log_dir.clone(),
+                old.write_offset,
                 summary,
-                records: old.index.into_values().collect(),
-                has_entries: old.has_entries,
-            });
+                old.index.into_values().collect(),
+                old.has_entries,
+            ));
         }
     }
 

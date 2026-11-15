@@ -20,6 +20,7 @@ use super::{
 };
 use crate::content::Item;
 use crate::fs::Fs;
+use crate::segment::SegmentDescription;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -153,7 +154,7 @@ struct Maint {
     request: Option<SegmentRequest>,
     created: Option<Result<AheadSegment, CreateError>>,
     jobs: VecDeque<SealJob>,
-    results: Vec<(SealJob, Result<(), SealError>)>,
+    results: Vec<(SealJob, Result<Option<SegmentDescription>, SealError>)>,
     stop: bool,
 }
 
@@ -166,6 +167,7 @@ struct Info {
     progress: u64,
     /// The writer thread has ended.
     stopped: bool,
+    sealed: Vec<SegmentDescription>,
 }
 
 #[derive(Debug)]
@@ -293,6 +295,7 @@ impl Log {
                 fault: None,
                 progress: 0,
                 stopped: false,
+                sealed: Vec::new(),
             }),
             progress_cv: Condvar::new(),
             halt: writer.halt(),
@@ -409,6 +412,12 @@ impl Log {
         self.watch().sync_mark()
     }
 
+    /// The descriptions of segments sealed, and of sealed segments no manifest record listed at the start, since the
+    /// last call ([`LogWriter::take_sealed`]).
+    pub fn take_sealed(&self) -> Vec<SegmentDescription> {
+        std::mem::take(&mut lock(&self.shared.info).sealed)
+    }
+
     /// Entries queued.
     pub fn queue_depth(&self) -> usize {
         lock(&self.shared.front).queue.depth()
@@ -493,13 +502,14 @@ fn complete(s: &Shared, done: Vec<Done>) {
     }
 }
 
-fn publish(s: &Shared, w: &LogWriter) {
+fn publish(s: &Shared, w: &mut LogWriter) {
     {
         let mut i = lock(&s.info);
         i.stats = w.stats().clone();
         i.reasons = w.reasons();
         i.fault = w.fault().cloned();
         i.progress += 1;
+        i.sealed.extend(w.take_sealed());
     }
     s.progress_cv.notify_all();
     let mut f = lock(&s.front);
@@ -561,7 +571,7 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         // A roll or a seal in this step asks for maintenance work at once. Statistics and the read-only state are
         // published before any call of this step completes, so a caller that holds its acknowledgement sees them.
         exchange(s, &mut w);
-        publish(s, &w);
+        publish(s, &mut w);
         complete(s, step.done);
         s.room_cv.notify_all();
         let mut f = lock(&s.front);
@@ -613,7 +623,7 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         }
     }
     let r = w.shutdown(s.clock.monotonic());
-    publish(s, &w);
+    publish(s, &mut w);
     lock(&s.info).stopped = true;
     s.progress_cv.notify_all();
     r

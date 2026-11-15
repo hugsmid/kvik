@@ -20,7 +20,7 @@ use crate::fs::{FsFile, OpenMode};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::manifest::{
     LossCause, LostRange, ManifestError, ManifestRead, RECORD_LOST_RANGE, encode_record,
-    read_manifest,
+    listed_segments, read_manifest,
 };
 use crate::mark::{
     MARK_LEN, MarkSlot, ResetStamp, SLOT_OFFSETS, encode_mark_file, read_mark, read_slots,
@@ -117,6 +117,8 @@ pub(super) struct Resume {
     pub open: Option<OpenSegment>,
     pub ahead: Option<AheadSegment>,
     pub seals: Vec<SealJob>,
+    /// Sealed segments no manifest record lists, to be described (`spec.md` §7 Manifest, Q-221).
+    pub unlisted: Vec<SegmentIdentity>,
     pub next_file_id: u64,
     pub last_sequence: u64,
     pub last_commit_time: i64,
@@ -835,6 +837,16 @@ pub(super) fn start(
         *last = scan_segment(store, name, last.path.clone(), true)?;
     }
     sealed.sort();
+    let listed = listed_segments(&manifest_bytes, &manifest);
+    let unlisted: Vec<SegmentIdentity> = sealed
+        .iter()
+        .filter(|(n, _)| !listed.contains(&n.file_id))
+        .map(|(n, _)| SegmentIdentity {
+            store_id,
+            file_id: n.file_id,
+            generation: n.generation,
+        })
+        .collect();
     if let MarkRead::Readable { slot, .. } = &mark {
         max_id = max_id.max(slot.file_id);
     }
@@ -964,6 +976,7 @@ pub(super) fn start(
             open: None,
             ahead,
             seals: Vec::new(),
+            unlisted: Vec::new(),
             next_file_id: max_id + 1,
             last_sequence: 0,
             last_commit_time: i64::MIN,
@@ -1703,15 +1716,15 @@ pub(super) fn start(
         let seg = open_segment(file, s.id, s.len, end, batches.into_iter(), &intervals, now);
         if let Some(summary) = seg.summary {
             report.to_seal.push(s.id.file_id);
-            seals.push(SealJob {
-                file: seg.file,
-                id: seg.id,
-                log_dir: log_dir.clone(),
+            seals.push(SealJob::seal(
+                seg.file,
+                seg.id,
+                log_dir.clone(),
                 end,
                 summary,
-                records: seg.index.into_values().collect(),
-                has_entries: seg.has_entries,
-            });
+                seg.index.into_values().collect(),
+                seg.has_entries,
+            ));
         }
     }
     // A segment created ahead whose id is not above the one in use cannot be taken into use: removed.
@@ -1734,6 +1747,7 @@ pub(super) fn start(
         open,
         ahead,
         seals,
+        unlisted,
         next_file_id,
         last_sequence: p.last_sequence,
         last_commit_time,
@@ -1904,6 +1918,7 @@ fn read_only(f: Fault, report: StartReport, halt: &Halt) -> Resume {
         open: None,
         ahead: None,
         seals: Vec::new(),
+        unlisted: Vec::new(),
         next_file_id: 0,
         last_sequence: 0,
         last_commit_time: i64::MIN,

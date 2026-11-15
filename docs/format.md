@@ -377,6 +377,13 @@ input, and by the scrub; not at open and not on reads. A mismatch while every ba
 padding or seal blocks: the segment is copied to a new segment (A.4) and swapped in by one manifest record, with no
 loss report.
 
+**Plaintext hash** (`spec.md` §8 Hashes). A log segment's plaintext SHA-256 is over every byte of the sealed file,
+header to end marker. The trailer has no room for it (4 reserved bytes), so the file description of a manifest record
+(A.14) alone holds it; the trailer is unchanged and no version rule applies. The sealer computes it in the pass that
+computes `file_crc32c`, off the commit thread. A start computes it for every sealed segment that no record names,
+after checking the header against the name, the trailer, the end marker and `file_crc32c`; a segment that fails a
+check, or cannot be read whole, is left unnamed (Q-220, Q-221).
+
 ## A.10 Durable mark (`log/MARK`, version 3)
 `log/MARK` is 4,224 bytes: two 128-byte slots at offsets 0 and 4,096 (separate sectors). It has no A.1 header. It is
 read and written by positional I/O and never mapped; it is synced on the timer (`mark_sync_interval`, on the writer
@@ -606,7 +613,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
   synced.
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
-  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
+  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body; a log segment's
+  hash is computed from its bytes, A.9). A corrupt record
   with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator
   call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
   (`0x28`), synced, renamed over `MANIFEST`, and the directory synced; a `MANIFEST.new` left by a crash is removed at

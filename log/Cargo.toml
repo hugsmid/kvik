@@ -13,6 +13,8 @@ categories = ["database-implementations"]
 
 [dependencies]
 crc = "3.4"
+# The plaintext SHA-256 of a sealed segment (`spec.md` §8 Hashes, `format.md` A.9).
+sha2 = { version = "0.11", default-features = false }
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]

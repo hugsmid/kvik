@@ -561,7 +561,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   fetched from deep (by generation and epoch) or from the mirror path, verified, written again in place over the
   corrupt bytes and synced; where that cannot be done, the manifest is rewritten to a new file and renamed while no
   handle holds the old one open (§3 Sync primitive). Every file is self-describing: its header and trailer carry everything a publish record says
-  about it (`format.md` A.14). **If no copy exists** (the mirror path holds none and deep has answered that it holds
+  about it (`format.md` A.14; a log segment's plaintext hash is computed from its bytes, A.9). **If no copy exists** (the mirror path holds none and deep has answered that it holds
   none, or none is configured), the writer **rebuilds the manifest** from the local files by itself, with the
   procedure of the operator call `rebuild_manifest` (roadmap 6.3), and continues; the files are kept, so no fact is
   lost. Only the corrupt record is lost; every valid record, before and after it, is still readable. The rebuilt

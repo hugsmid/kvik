@@ -48,6 +48,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
 | Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
 | Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
+| Q-220 | §8 Hashes, §7 Manifest; `format.md` A.9, A.14 | Where a log segment's plaintext hash lives, what it covers, and when it is computed |
+| Q-221 | §3 Write or sync failure, §7 Manifest, §8 Corrupt block; `format.md` A.9 | A read that fails while hashing, and sealed segments no record names |
 | Q-270 | §8 Encryption; `format.md` A.17 Reading | Envelope damage that `EnvelopeError` has no variant for |
 | Q-280 | §7 Manifest (rebuild), §8 Continuous backup, Hashes | How a rebuilt manifest queues files for upload again |
 | Q-281 | §8 Hashes; `format.md` A.14 | The copy-verified record (`0x27`): layout and fold |
@@ -1330,6 +1332,42 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-220 — Where a log segment's plaintext hash lives, what it covers, and when it is computed
+Found while computing the plaintext SHA-256 at seal (`kvik-log` `writer::seal_segment`).
+**Scenario.** §8 Hashes and the A.14 file description need a log segment's plaintext SHA-256, and A.14 says a file's
+header and trailer carry everything a record says about it. The A.9 trailer has 4 reserved bytes, and no hash can sit
+inside the bytes it covers. A blocked seal (A.13) runs again from step 1. A seal on `kvik-maint` would still hold up
+an acknowledgement if the commit thread waited for it.
+**Decided.** (a) The hash is over every byte of the sealed file, header to end marker, and only the file description
+holds it: the trailer is unchanged, so no version rule applies, and a rebuild computes the hash from the file
+(`format.md` A.9, A.14; `spec.md` §7 Manifest). (b) It is computed in the pass that computes `file_crc32c`, on
+`kvik-maint`; the commit thread never waits for it. (c) Once per seal: a blocked seal's retry reuses the seal blocks
+and hash of its first pass. (d) Each description is handed over once (`LogWriter::take_sealed`, `Log::take_sealed`)
+with the segment's size, which A.14 does not hold. `log/tests/seal_hash.rs`,
+`the_hash_is_sha256_of_the_sealed_files_bytes`, `a_blocked_seal_reads_and_hashes_its_segment_once`,
+`the_commit_thread_acknowledges_while_a_seal_is_hashing`; `files/tests/segment_description.rs`.
+**Needed.** The item that appends the sealed-segment record takes the descriptions from there; when that record is
+appended relative to the seal stays with it (A.14).
+
+## Q-221 — A read that fails while hashing, and sealed segments no record names
+Found with Q-220. The spec names write and sync failures (§3) but no read failure outside them.
+**Scenario.** (a) A read of the segment fails during the seal's pass. (b) A start finds sealed segments that no record
+names (§7 Manifest: an unlisted sealed log segment is listed again); until records are appended at seal that is
+every sealed segment, at every start. (c) Such a segment cannot be read whole, its header disagrees with its name,
+its trailer or end marker is not valid, or its `file_crc32c` does not match.
+**Decided (the conservative choice in each case).** (a) As before the hash: the seal fails as a write failure on the
+log (read-only, fatal health; the next start seals it again from step 1), so no segment takes its `.kvl` name
+without a hash. (b) The start does not read them: the writer hands them to `kvik-maint` one at a time, only when no
+seal is ready to run, outside `seals_running` and `sealed_segments`, so neither a start nor a shutdown waits for
+them; one not described when the writer stops is found again at the next start. (c) No description: the segment
+stays unnamed, nothing is written, no fault is set, and the next start tries again; a damaged file's hash is never
+taken as the hash at seal. `log/tests/seal_hash.rs`, `a_read_error_while_sealing_is_a_write_failure_on_the_log`,
+`a_start_describes_every_sealed_segment_no_record_names`,
+`a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed`.
+**Needed.** (c) leaves a segment that is never uploaded with nothing in health. Proposed: a degraded health reason
+naming the file (a new `Reason` variant, `api.md` Health), and the damaged case handed to §8 Corrupt block (scrub and
+quarantine), with backup.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1391,6 +1429,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
 | Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
 | Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
+| Q-220 | 6.3c | Plaintext hash at seal; decided as recorded, settled when the sealed-segment record is appended at seal |
+| Q-221 | 8.1 | Failures while hashing; decided as recorded; health for an unnamed segment before backup uploads anything |
 | Q-270 | 8.1 | Envelope damage mapped onto the existing error variants; recorded by roadmap 8.1b; a `Damaged` variant is the lead's call |
 | Q-280 | 8.1 | Rebuilt manifest and the upload queue; decided by roadmap 8.1c, accepted by the owner |
 | Q-281 | 8.1 | Copy-verified record layout; decided by roadmap 8.1c, field 1 a whole file description by the owner's ruling |
