@@ -6,12 +6,7 @@ use crate::ints::{
     decode_delta, decode_plain, decode_run_length, encode_delta, encode_plain, encode_run_length,
 };
 
-/// Feeds `data` to the block decoder and, with a value count taken from its first two bytes, to every column
-/// decoder. Panics only if a check fails (a bug), never for any input:
-/// - whatever decodes is within the row limit and encodes again to bytes that decode to the same content;
-/// - whatever decodes canonically is what the encoder writes for it (compressed XOR compared by its stream);
-/// - a column payload that decodes gives values that its encoder writes back to the same payload whenever the
-///   payload was in that encoder's form.
+/// Feeds `data` to the block decoder and every column decoder; panics only when a round-trip or canonical check fails.
 pub fn decode_all(data: &[u8]) {
     if let Ok(b) = Block::decode(data) {
         assert!(!b.is_empty() && b.len() <= crate::MAX_ROWS);

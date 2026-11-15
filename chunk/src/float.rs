@@ -136,7 +136,6 @@ pub fn decode_decimal(payload: &[u8], n: usize) -> Result<Vec<u64>, ColumnError>
         if let Some((_, b)) = exceptions.next_if(|&(i, _)| i == row) {
             out.push(b);
         } else if let Some(v) = ns.next() {
-            // n − count scaled integers for the n − count rows that are not exceptions.
             out.push((v as f64 / p).to_bits());
         }
     }
@@ -262,8 +261,6 @@ pub fn encode_xor_zstd(xor: &[u8]) -> Result<Vec<u8>, EncodeError> {
 /// Whether `frame` is exactly one zstd frame (not a skippable frame) with no dictionary id and no content
 /// checksum, and nothing after it (`docs/format-chunk.md` C.8).
 fn frame_is_allowed(frame: &[u8]) -> bool {
-    // The frame header descriptor follows the magic: bit 2 is the content checksum flag, bits 0–1 the dictionary
-    // id flag (RFC 8878 §3.1.1.1.1).
     frame.len() > 4
         && frame[..4] == ZSTD_MAGIC
         && frame[4] & 0b0000_0111 == 0
@@ -344,24 +341,19 @@ mod tests {
     fn decimal_rejects_bad_tables() {
         let vs = bits(&[1.5, 0.1 + 0.2, 2.5, 0.1 + 0.7]);
         let enc = encode_decimal(&vs, 1);
-        // Exponent above 18.
         let mut b = enc.clone();
         b[0] = 19;
         assert_eq!(decode_decimal(&b, 4), Err(ColumnError::Exponent));
-        // More exceptions than values.
         let mut b = enc.clone();
         b[1] = 5;
         assert_eq!(decode_decimal(&b, 4), Err(ColumnError::ExceptionCount));
-        // Indexes out of order (3 then 1).
         let mut b = enc.clone();
         b[3] = 3;
         b[13] = 1;
         assert_eq!(decode_decimal(&b, 4), Err(ColumnError::ExceptionIndex));
-        // Index at or above n.
         let mut b = enc.clone();
         b[13] = 9;
         assert_eq!(decode_decimal(&b, 4), Err(ColumnError::ExceptionIndex));
-        // Repeated index.
         let mut b = enc.clone();
         b[13] = 1;
         assert_eq!(decode_decimal(&b, 4), Err(ColumnError::ExceptionIndex));
@@ -393,11 +385,9 @@ mod tests {
         let mut long = enc.clone();
         long.push(0);
         assert_eq!(decode_xor(&long, vs.len()), Err(ColumnError::TrailingBytes));
-        // `10` before any window: first value 0, then bits 1, 0.
         let mut b = vec![0u8; 8];
         b.push(0b1000_0000);
         assert_eq!(decode_xor(&b, 2), Err(ColumnError::XorWindow));
-        // `11` with 31 leading zeros and 64 meaningful bits.
         let mut w = BitWriter::default();
         w.write(0, 64);
         w.write(0b11, 2);
@@ -405,7 +395,6 @@ mod tests {
         w.write(63, 6);
         w.write(0, 64);
         assert_eq!(decode_xor(&w.finish(), 2), Err(ColumnError::XorWindow));
-        // Worst case stays inside the bound.
         let worst: Vec<u64> = (0..4096u64)
             .map(|i| if i % 2 == 0 { 1 } else { 1 << 63 })
             .collect();
@@ -428,7 +417,6 @@ mod tests {
         short[..4].copy_from_slice(&(raw.len() as u32 - 1).to_le_bytes());
         assert_eq!(decode_xor_zstd(&short, 4096), Err(ColumnError::Compressed));
         assert_eq!(decode_xor_zstd(&enc[..10], 4096), Err(ColumnError::Frame));
-        // A trailing skippable frame (magic 0x184D2A50, length 1), a second frame, a frame with a checksum: rejected.
         let mut skip = enc.clone();
         skip.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 1, 0, 0, 0, 0]);
         assert_eq!(decode_xor_zstd(&skip, 4096), Err(ColumnError::Frame));
@@ -441,7 +429,6 @@ mod tests {
         let mut sum = enc[..4].to_vec();
         sum.extend_from_slice(&c.compress(&raw).unwrap());
         assert_eq!(decode_xor_zstd(&sum, 4096), Err(ColumnError::Frame));
-        // Another level is another valid frame of the same stream.
         let mut other = enc[..4].to_vec();
         other.extend_from_slice(&zstd::bulk::compress(&raw, 19).unwrap());
         assert_eq!(decode_xor_zstd(&other, 4096).unwrap(), vs);

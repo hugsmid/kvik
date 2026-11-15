@@ -12,14 +12,8 @@ use crate::ints::{
 };
 use crate::{MAX_ROWS, MAX_TEXT_LEN, column, encoding, flag, value_type};
 
-/// The rows of one block, as columns of equal length (`row_count`), except `heap`.
-///
-/// The representation follows a facts block (`format.md` A.5) without `series_id` and with the position:
-/// - `value` holds, per row, the `f64` bits, the decimal integer (two's complement), the state index, 0 or 1 for a
-///   bool, or the length of a text; 0 for a row flagged `no_value`.
-/// - `heap` holds the texts of the rows of value type 5 that have a value, in row order, none shared; a text's
-///   offset is the sum of the lengths before it.
-/// - `changed_at` is 0 for a row without flag bit 6; `scale` is 0 for a row whose value type is not 2.
+/// The rows of one block as equal-length columns, laid out as a facts block (`format.md` A.5) without `series_id`;
+/// `heap` holds the texts in row order.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Block {
     /// Event time, UTC nanoseconds.
@@ -34,13 +28,13 @@ pub struct Block {
     pub flags: Vec<u16>,
     /// Value type, 1–5.
     pub value_type: Vec<u8>,
-    /// Value word.
+    /// Value word: `f64` bits, decimal integer, state index, bool or text length; 0 for a row without a value.
     pub value: Vec<u64>,
     /// Text bytes.
     pub heap: Vec<u8>,
-    /// `changed_at`.
+    /// `changed_at`; 0 for a row without flag bit 6.
     pub changed_at: Vec<u64>,
-    /// Stored decimal scale, 0–18.
+    /// Stored decimal scale, 0–18; 0 for a row whose value type is not 2.
     pub scale: Vec<u8>,
 }
 

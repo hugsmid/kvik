@@ -227,9 +227,7 @@ mod tests {
 
     #[test]
     fn delta_layout() {
-        // A perfect grid: first value, then one frame with min 10 (zigzag 20) and width 0.
         assert_eq!(encode_delta(&[5, 15, 25]), [5, 0, 0, 0, 0, 0, 0, 0, 20, 0]);
-        // Width above 64 is rejected.
         assert_eq!(
             decode_delta(&[5, 0, 0, 0, 0, 0, 0, 0, 20, 65], 2),
             Err(ColumnError::Width)

@@ -103,8 +103,8 @@ jobs:
       - run: cargo test -p commit --locked
 
   export:
-    # The Parquet export (roadmap 6.4) is outside the default members, so the core jobs never build parquet or
-    # zstd-sys; its checks run here, on one OS.
+    # The Parquet export (roadmap 6.4) is outside the default members, so the core jobs never build parquet (they
+    # do build zstd-sys, through kvik-chunk); its checks run here, on one OS.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
