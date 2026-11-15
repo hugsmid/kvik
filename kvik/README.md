@@ -6,6 +6,11 @@ the [specification](../docs/spec.md). Two backends stand behind it, chosen with 
 
 ## Backends
 
+> [!NOTE]
+> **Migration.** The default is now the durable backend. Choose `Backend::Model` explicitly
+> (`StoreConfig::backend`, and `ReaderConfig::backend` for its readers) for in-memory use. The `model-backend`
+> feature is empty and deprecated; it goes in the next release.
+
 **Durable (`Backend::Durable`, the default).** The log engine of [`kvik-log`](../log/): `Store::open` runs the log's
 start (recovery, `spec.md` §3), rebuilds the series registry from the kept log and starts the `kvik-writer` and
 `kvik-maint` threads; every write is committed to the log and acknowledged only once it is durable; a `Reader`, in

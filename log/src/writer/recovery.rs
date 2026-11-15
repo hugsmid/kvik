@@ -717,11 +717,7 @@ pub(super) fn start(
     // The registry file (A.16) is a derived file: its `through` is a source of F, and every id it names counts toward
     // the id floor (`spec.md` §2.1, §3 Recovery rule 3).
     let registry = crate::registry::read_latest(&*fs, store.dir(), &store_id)
-        .map_err(|e| match e {
-            crate::registry::RegistryError::Io(e) => StoreError::Io(e),
-            crate::registry::RegistryError::Unsupported(e) => StoreError::Unsupported(e),
-            crate::registry::RegistryError::Invalid(_) => StoreError::Corrupt("registry"),
-        })?
+        .map_err(StoreError::Unsupported)?
         .map(|(_, f)| f)
         .filter(|f| f.generation == 0);
     let mark_path = log_dir.join(MARK);

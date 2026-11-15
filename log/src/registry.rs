@@ -80,9 +80,6 @@ pub enum RegistryError {
     /// A newer major version or an unknown critical element: a version refusal.
     #[error(transparent)]
     Unsupported(FormatError),
-    /// A file operation failed.
-    #[error(transparent)]
-    Io(#[from] io::Error),
 }
 
 /// The file name of a registry file.
@@ -165,7 +162,13 @@ pub fn encode(
     let mut summary = [0u8; SUMMARY_LEN];
     summary[..8].copy_from_slice(&file.through.to_le_bytes());
     summary[8..12].copy_from_slice(&file.max_series_id.to_le_bytes());
-    let count = u32::try_from(file.entries.len()).map_err(|_| EncodeError::TooLarge)?;
+    // The entries written: an ignored entry is not.
+    let written = file
+        .entries
+        .iter()
+        .filter(|(_, _, e)| !matches!(e, Entry::Ignored { .. }))
+        .count();
+    let count = u32::try_from(written).map_err(|_| EncodeError::TooLarge)?;
     summary[12..16].copy_from_slice(&count.to_le_bytes());
     summary[16..20].copy_from_slice(&blocks.to_le_bytes());
     encode_block(SUMMARY, 0, &summary, &mut out)?;
@@ -273,19 +276,18 @@ fn names(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<(u32, u64, PathBuf)>> {
 }
 
 /// The valid registry file of the store in `store_dir` with the highest `file_id`, with that id; `None` when there
-/// is none. Invalid files are passed over; a version refusal is returned.
+/// is none. Files that are invalid or cannot be read, and a directory that cannot be listed, are passed over: the log
+/// alone suffices (A.16). Only a version refusal is returned.
 pub fn read_latest(
     fs: &dyn Fs,
     store_dir: &Path,
     store_id: &[u8; 16],
-) -> Result<Option<(u64, RegistryFile)>, RegistryError> {
-    let mut found = names(fs, &store_dir.join(REGISTRY_DIR))?;
+) -> Result<Option<(u64, RegistryFile)>, FormatError> {
+    let mut found = names(fs, &store_dir.join(REGISTRY_DIR)).unwrap_or_default();
     found.sort_by_key(|(_, id, _)| std::cmp::Reverse(*id));
     for (generation, id, path) in found {
-        let bytes = match read_all(fs, &path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+        let Ok(bytes) = read_all(fs, &path) else {
+            continue;
         };
         match decode(&bytes, store_id) {
             Ok(f)
@@ -295,7 +297,7 @@ pub fn read_latest(
                 return Ok(Some((id, f)));
             }
             Ok(_) | Err(RegistryError::Invalid(_)) => continue,
-            Err(e) => return Err(e),
+            Err(RegistryError::Unsupported(e)) => return Err(e),
         }
     }
     Ok(None)
@@ -471,6 +473,14 @@ mod tests {
         assert_eq!(read_latest(&fs, dir, &[3; 16]).unwrap().unwrap().0, 2);
         assert_eq!(write(&fs, dir, [3; 16], 4, &f).unwrap(), 4);
         assert_eq!(names(&fs, &dir.join(REGISTRY_DIR)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignored_entries_are_neither_written_nor_counted() {
+        let mut f = sample();
+        f.entries.insert(2, (3, 100, Entry::Ignored { count: 2 }));
+        let bytes = encode(&f, [3; 16], 9, 1).unwrap();
+        assert_eq!(decode(&bytes, &[3; 16]).unwrap(), sample());
     }
 
     #[test]

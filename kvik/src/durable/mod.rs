@@ -1132,11 +1132,14 @@ pub(crate) fn interval(
                 length: IntervalLength::Fixed { d, phase },
                 ..
             } => {
-                let (d, phase) = (convert::dur_nanos(d)?, convert::dur_nanos(phase)?);
-                let start = (t.0 - phase).div_euclid(d) * d + phase;
-                let end = start
-                    .checked_add(d)
-                    .ok_or_else(|| Error::InvalidQuery("interval outside the time range".into()))?;
+                let (d, phase) = (
+                    i128::from(convert::dur_nanos(d)?),
+                    i128::from(convert::dur_nanos(phase)?),
+                );
+                let start = (i128::from(t.0) - phase).div_euclid(d) * d + phase;
+                let outside = || Error::InvalidQuery("interval outside the time range".into());
+                let end = i64::try_from(start + d).map_err(|_| outside())?;
+                let start = i64::try_from(start).map_err(|_| outside())?;
                 Ok((Timestamp(start), Timestamp(end)))
             }
             Kind::Interval { .. } => Err(Error::NotSupportedYet(

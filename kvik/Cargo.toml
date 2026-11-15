@@ -13,6 +13,9 @@ categories = ["database-implementations"]
 
 [features]
 default = ["bundled-tzdb"]
+# Deprecated and empty, kept for one release: the model backend is always built and chosen with
+# `Backend::Model`; the default backend is now the durable one.
+model-backend = []
 # Embeds the IANA time-zone database in the binary instead of reading the
 # system's. The model backend embeds it in any case.
 bundled-tzdb = ["jiff/tzdb-bundle-always"]
