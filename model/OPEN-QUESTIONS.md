@@ -59,7 +59,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-291 | §8 Acknowledging a loss, Generations, Restore step 1 | Recovery-entry loss reports of the generation a restore reads |
 | Q-292 | §8 Generations; `format.md` A.2 sizes, A.14 `0x25` | A restore record larger than one block |
 | Q-294 | §8 Restore step 1, Generations; model `Model::restore_from` | Where the model's restore differs from the plan |
-| Q-300 | §8 Generations, Restore; `format.md` A.14 | The restore record's bytes ahead of its layout |
 | Q-301 | §8 Restore (the paragraph after step 4) | The files a resumed restore fetches |
 | Q-302 | §8 Restore (Failures and end), §8 Corrupt block | The lost range of a listed file the bucket has lost, and files other than log segments |
 | Q-303 | §8 Generations, §7 Readers; `format.md` A.1 kind 12 | The local restore record file |
@@ -1118,17 +1117,6 @@ bucket with no manifest records, and the plan restores an empty log, restored en
 **Needed.** (a) The model's restored end to skip recorded lost ranges, as the plan does. (b) Whether a restore whose
 records list no copied file is refused (the model's rule, stated in the text) or restores an empty generation (the
 text as written). Suggested for (b): refuse, with a named error, since nothing would be restored.
-## Q-300 — The restore record's bytes ahead of its layout
-Recorded by roadmap 8.3b, which writes the restore record before roadmap 8.3a lays it out.
-**Scenario.** The restore executor syncs its `0x25` record in `MANIFEST`, uploads it, and reads it back to resume
-after a crash; `format.md` A.14 reserves `0x25` and `RestoreRecord::to_body` and `from_body` are roadmap 8.3a's.
-**Provisional.** A private codec in `backup/src/restore/codec.rs` with the same two signatures (fields 1 generation,
-2 reset stamp, 3 source generation, 4 restored end, 5 carried end, 6 loss, 7 acknowledgement, 8 entry loss, 9 file:
-tier, copy size and SHA-256, then the description, 10 drill). No real data is restored before 8.3a, so nothing
-written with it has to stay readable.
-**Needed.** 8.3a's layout in A.14; the executor then calls `RestoreRecord::to_body` and `from_body` and the
-provisional codec goes.
-
 ## Q-301 — The files a resumed restore fetches
 Recorded by roadmap 8.3b.
 **Scenario.** A plan returns the restore record and the files to fetch; only the record is durable. A restore killed
@@ -1252,7 +1240,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1312,7 +1300,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-291 | 8.3d | Recovery-entry loss reports at a restore; recorded by roadmap 8.3a |
 | Q-292 | 8.3 | Restore record size; recorded by roadmap 8.3a |
 | Q-294 | 8.3b | Model restore against the plan; recorded by roadmap 8.3a |
-| Q-300 | 8.3 | The restore record's bytes; recorded by roadmap 8.3b; settled by 8.3a's layout |
 | Q-301 | 8.3 | The files a resumed restore fetches; recorded by roadmap 8.3b; exact for a log-only restore |
 | Q-302 | 8.3 | A restore's lost range and files other than log segments; recorded by roadmap 8.3b |
 | Q-303 | 8.3 | The local restore record file (kind 12); recorded by roadmap 8.3b |
@@ -1559,6 +1546,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-213 | The checksum probe's key, which the key contract cannot build | `backup/src/keys.rs` (settled by roadmap 8.3b at its review, by Q-213's suggestion: the checksum probe keeps its own key `<sid>/probe/<nonce:32 hex>`, built by `Keys::checksum_probe` and parsed as `ObjectName::ChecksumProbe`, so a refused bucket's wrong-hash probe never lands on `<sid>/probe` and a later probe cannot mistake it for an earlier one) |
 | Q-214 | A restore that meets a bucket it must refuse | `api.md` Backup and restore, Restore (settled by roadmap 8.3b at its review, by Q-214's suggestion: `RestoreDriver::prepare` probes the bucket in a full restore after the key check and `STORE` and before reading the claims, with the probe `format.md` A.17 defines for `attach_backup` (`<sid>/probe` for conditional writes, then a wrong-hash `put` to a fresh `<sid>/probe/<nonce>` that must fail and leave nothing); a failure is the additive `RestoreError::Refused(Refused)` (`NoConditionalWrites`, `NoChecksums`), which `Store::restore` maps to `BackupError::Refused`; a sink fault during the probe stays `RestoreError::Sink`; a drill and a resumed restore do not probe; the probe's bytes come from the restorer's nonce source. `RestoreError::SeveralStores` maps to the additive `BackupError::SeveralStores { store_ids }`. A `stat` that reports no SHA-256 reaches the probe as the sink's `Failed` (the S3 sink refuses such a reply), so it fails the restore as `Sink`, not as `Refused(NoChecksums)`. `backup/src/restore/probe.rs`, `backup/tests/restore_guards.rs`) |
 | Q-305 | A claim refused with `HashMismatch` while nothing is stored | §8 Generations; `api.md` Backup and restore, No overwrite (settled by roadmap 8.3b at its review. Scenario: a restore's claim `put` for generation g fails with `HashMismatch` and stores nothing; taking g + 1 leaves g unclaimed, and a later drill, which runs one above the highest claimed generation read by `stat` in ascending order (Q-163), stops at the gap, plans from an older generation and passes while ignoring the live one. Ruling: after a `HashMismatch` the restore reads the marker by `stat`; present, it takes the next generation (Q-161: the marker may be another restore's); absent, it tries g again, at most 3 tries of g, then fails with the sink's `HashMismatch` without taking another generation, since a sink that rejects every upload must not walk the generations. `backup/src/restore/driver.rs` `claim`, `backup/tests/restore_guards.rs`) |
+| Q-300 | The restore record's bytes ahead of its layout | `format.md` A.14 `0x25` (settled when roadmap 8.3b was stacked on 8.3a, as the question asked: the executor writes and reads the restore record with `RestoreRecord::to_body` and `from_body`, and the provisional codec is gone; `backup/src/restore/codec.rs` keeps only the uploaded form of a record. Scenario: the provisional codec wrote a carried loss as 100 fixed bytes, which 8.3a's strict check of every `0x25` in `Record::encode` refuses, and could not carry a lost range's reset stamp (field 13). Nothing was written with it. `backup/src/restore/codec.rs` `a_restore_record_round_trips_through_an_uploaded_block`; the executor tests in `backup/tests/restore.rs`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

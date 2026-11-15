@@ -18,7 +18,7 @@ use kvik_log::manifest::LostRange;
 use kvik_log::name::SegmentName;
 use kvik_log::store::{LOG_DIR, STORE};
 
-use super::{RestoreError, codec};
+use super::RestoreError;
 use crate::LocalStore;
 
 const STORE_TMP: &str = "STORE.tmp";
@@ -88,7 +88,7 @@ pub(crate) fn inspect(local: &LocalStore) -> Result<Found, RestoreError> {
     let mut found = None;
     let mut lost = Vec::new();
     for r in img.records() {
-        if let Some(rec) = codec::from_body(&r.body) {
+        if let Some(rec) = RestoreRecord::from_body(&r.body) {
             if found.is_none() {
                 found = Some((Box::new(r.clone()), Box::new(rec?)));
             }

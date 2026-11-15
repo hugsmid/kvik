@@ -460,7 +460,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             recovery_after: &[],
         })?;
         check_plan(&plan, generation, nonce, source_generation, self.drill())?;
-        let written = Record::new(1, generation, wall, codec::to_body(&plan.record));
+        let written = Record::new(1, generation, wall, plan.record.to_body());
         local::write_manifest(&self.local, store_id, &written, wall)?;
         let appender = local::open_appender(&self.local, store_id)?;
         self.finish(
