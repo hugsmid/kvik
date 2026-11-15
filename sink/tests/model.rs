@@ -1,6 +1,5 @@
-//! A property: under transient faults (lost replies, timeouts, server
-//! errors, cut uploads), the sink keeps the rules of a create-if-absent
-//! store with no overwrite, as a plain map models it.
+//! Under transient faults the sink keeps the rules of a create-if-absent store
+//! with no overwrite, modelled by a map.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,14 +34,22 @@ proptest! {
         let sink = bucket.sink();
         let mut model: BTreeMap<&str, &[u8]> = BTreeMap::new();
         for (k, c, f1, f2) in ops {
+            let put_fault = [f1, f2].iter().flatten().any(|(op, _)| *op == FakeOp::Put);
             for (op, f) in [f1, f2].into_iter().flatten() {
                 bucket.inject(op, f);
             }
             let (key, content) = (KEYS[k], CONTENTS[c]);
             let got = block_on(sink.put(key, Arc::from(content), sha256(content)));
             match model.get(key) {
+                // After an upload of ours may have landed, other content
+                // reads as our upload stored damaged.
                 Some(existing) if *existing != content => {
-                    prop_assert_eq!(got, Err(SinkError::Exists { key: key.into() }));
+                    let expected = if put_fault {
+                        SinkError::HashMismatch { key: key.into() }
+                    } else {
+                        SinkError::Exists { key: key.into() }
+                    };
+                    prop_assert_eq!(got, Err(expected));
                 }
                 _ => {
                     let stored = got.unwrap();

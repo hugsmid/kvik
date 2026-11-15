@@ -214,13 +214,14 @@ impl Inner {
     /// reply or a failed read-back does not send the body again.
     fn put(&self, key: &str, bytes: &Arc<[u8]>, sha256: [u8; 32]) -> Result<Stored, SinkError> {
         let mut first = true;
+        let mut landed = false;
         self.retry(|| {
             if !std::mem::take(&mut first)
                 && let Some(s) = self.head(key)?
             {
-                return same_or_exists(key, s, bytes.len() as u64, sha256);
+                return judge(key, s, bytes.len() as u64, sha256, landed);
             }
-            self.put_attempt(key, bytes, sha256)
+            self.put_attempt(key, bytes, sha256, &mut landed)
         })
     }
 
@@ -329,6 +330,7 @@ impl Inner {
         key: &str,
         bytes: &Arc<[u8]>,
         sha256: [u8; 32],
+        landed: &mut bool,
     ) -> Result<Stored, SinkError> {
         let request = self.request(
             Method::Put,
@@ -341,17 +343,18 @@ impl Inner {
             Some(Arc::clone(bytes)),
             &sigv4::hex(&sha256),
         );
-        let resp = self.send(&request)?;
-        let existed = match resp.status {
-            200..=299 => false,
-            412 => true,
-            _ => return Err(self.status_error(key, &resp, Op::Put)),
-        };
-        let size = bytes.len() as u64;
+        let resp = self.send(&request).inspect_err(|_| *landed = true)?;
+        match resp.status {
+            200..=299 => *landed = true,
+            412 => {}
+            status => {
+                // A server error does not say the upload was not applied.
+                *landed |= (500..=599).contains(&status);
+                return Err(self.status_error(key, &resp, Op::Put));
+            }
+        }
         match self.head(key)? {
-            Some(s) if existed => same_or_exists(key, s, size, sha256),
-            Some(s) if s.size == size && s.sha256 == sha256 => Ok(s),
-            Some(_) => Err(SinkError::HashMismatch { key: key.into() }),
+            Some(s) => judge(key, s, bytes.len() as u64, sha256, *landed),
             None => Err(transient(format!(
                 "{key} not found just after its upload was accepted"
             ))),
@@ -557,9 +560,20 @@ impl Inner {
     }
 }
 
-fn same_or_exists(key: &str, s: Stored, size: u64, sha256: [u8; 32]) -> Result<Stored, SinkError> {
+/// What the bucket holds under a key, against what this call uploads. Once an
+/// upload of this call may have landed, other content is taken for that upload
+/// stored damaged (`HashMismatch`), not for another writer's (`Exists`).
+fn judge(
+    key: &str,
+    s: Stored,
+    size: u64,
+    sha256: [u8; 32],
+    landed: bool,
+) -> Result<Stored, SinkError> {
     if s.size == size && s.sha256 == sha256 {
         Ok(s)
+    } else if landed {
+        Err(SinkError::HashMismatch { key: key.into() })
     } else {
         Err(SinkError::Exists { key: key.into() })
     }

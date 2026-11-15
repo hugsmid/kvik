@@ -227,6 +227,46 @@ fn a_lost_reply_after_the_upload_is_repeated_safely() {
 }
 
 #[test]
+fn our_own_damaged_upload_found_on_a_retry_is_a_hash_mismatch_not_exists() {
+    for fault in [
+        (FakeOp::Put, Fault::TimeoutAfter),
+        (FakeOp::Head, Fault::Status(503)),
+    ] {
+        let bucket = FakeBucket::new();
+        bucket.set_corrupt_on_store(true);
+        let sink = bucket.sink();
+        bucket.inject(fault.0, fault.1);
+        assert_eq!(
+            put(&sink, "data/own", b"ours"),
+            Err(SinkError::HashMismatch {
+                key: "data/own".into()
+            }),
+            "{fault:?}"
+        );
+        assert_eq!(bucket.count(FakeOp::Put), 1);
+    }
+}
+
+#[test]
+fn other_content_found_before_any_upload_of_ours_is_exists() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink();
+    put(&sink, "data/theirs", b"theirs").unwrap();
+    bucket.inject(FakeOp::Put, Fault::Status(403));
+    bucket.inject(FakeOp::Put, Fault::Coded(400, "RequestTimeout"));
+    assert!(matches!(
+        put(&sink, "data/theirs", b"ours"),
+        Err(SinkError::Failed { .. })
+    ));
+    assert_eq!(
+        put(&sink, "data/theirs", b"ours"),
+        Err(SinkError::Exists {
+            key: "data/theirs".into()
+        })
+    );
+}
+
+#[test]
 fn a_failed_read_back_is_retried_without_sending_the_body_again() {
     let bucket = FakeBucket::new();
     let sink = bucket.sink();
