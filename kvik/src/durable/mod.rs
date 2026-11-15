@@ -1223,8 +1223,10 @@ mod tests {
         let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
         let mut env = Env::test(clock.clone());
         env.fs = Arc::new(fs.clone());
-        let mut log = LogConfig::default();
-        log.segment_size = 16 << 20;
+        let log = LogConfig {
+            segment_size: 16 << 20,
+            ..LogConfig::default()
+        };
         let dir = PathBuf::from("durable-unit/decided");
         let config = StoreConfig::new(&dir, "Europe/London")
             .create_if_missing(true)
