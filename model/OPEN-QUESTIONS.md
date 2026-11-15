@@ -32,6 +32,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-130 | §3 Recovery rule 3, §4 Consumer state; `format.md` A.6 field 47 | A consumer's missing cursor file that a start cannot tell |
+| Q-131 | §4 Resync, New consumer; `api.md` Consuming | The resync of a consumer with no cursor file |
+| Q-132 | §4 Consumer state, At-least-once, §6 Latch | A confirmed latch lost with the last second of a cursor file |
 | Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
 | Q-141 | §2.2 `received_at`, `format.md` A.7 `commit_time` | A fact's `received_at` after the wall clock steps back |
 | Q-142 | §5.5, §2.1 counter rules; `format.md` A.6 field 11 | A reset ceiling off the parts-per-million grid |
@@ -340,6 +343,12 @@ characters within it (so `plant/line-*/power` works); a live series matches if a
 re-evaluated when a series is defined or aliased, so a retired series leaves the selection at the next
 re-evaluation; a condition funnel's pattern is resolved once, when routed, and must match exactly one series. It has
 no overlap test, as it compiles no `emits`.
+**Implemented (roadmap 5.2).** The durable backend keeps a pattern as declared in the routing change (`format.md`
+A.6 field 55) and matches it as the in-memory backend does: a fact funnel's pattern is resolved again whenever a
+definition or alias is applied, a condition funnel's once, when routed, its ids carried in the entry (field 54). The
+cycle check of `emits` takes two patterns to overlap when they have as many segments and, in each, some string that
+both match (`*` within a segment; `kvik/src/durable/routing.rs`, `patterns_overlap`); an id overlaps a pattern when
+any name of its series matches it. Both remain provisional until the grammar is ruled.
 **Needed.** The pattern grammar and its overlap test.
 **Proposal.** A pattern has the three segments of a name, each a literal or `*`, which matches any one whole segment;
 two patterns overlap when, in each segment, they are equal or either is `*`; an id overlaps a pattern when any name
@@ -370,6 +379,12 @@ drop its latch, so a condition that became true while the consumer was down is n
 on resume (row 16).
 **Model.** Funnels are added with an id chosen by the test (`Model::add_route`); there is no configuration, and a
 removed funnel's latch is dropped.
+**Implemented (roadmap 5.2).** On the durable backend a funnel is identified by its consumer's name and its funnel
+id, both in the routing change; the id is one above the highest any routing change of the consumer named, removed
+funnels included, so an id is never given again, and the routing table is rebuilt from the log at every start. The
+interface has no funnels declared in configuration yet, so (a) and (b) do not arise; for (c), `Consumer::route` at
+every start adds another funnel on both backends. A latch belongs to the incarnation that wrote it (the position of
+the routing change that added the funnel) and is dropped with the funnel.
 **Needed.** What identifies a funnel across starts; whether configuration can remove or change one; and whether a
 changed funnel keeps its latch.
 
@@ -436,6 +451,13 @@ in the table below); a consumer restart resumes from the cursor with a replay an
 **Settled since.** For (a), what the consumer forgets: §4 Resync gives a consumer with no cursor file, before its
 first delivery, a `resync` with `forget_above` = the position before its start (the mark's last position for `start:
 now`, before the first fact at or after T for `start: time`, P for `start: position` P).
+**Implemented (roadmap 5.2).** On the durable backend: (a) a consumer with no readable cursor file, whether known
+from its routing changes or new, starts with no latches and receives first a resync of cause `NoCursor` whose
+`forget_above` is the last position, carrying the state now of each funnel in force (a transition, there being no
+latch), and nothing further until it is confirmed; its confirmation writes the cursor file (Q-131). (b) A consumer
+taken again during a run resumes from its confirmed cursor, with its confirmed latches, by a replay and a resync,
+as after downtime; condition delivery sequences continue within the run. The in-memory backend resumes from its
+cursor in both cases.
 **Needed.** The first state, the latches and the delivery identity in both cases.
 
 ## Q-96 — A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer
@@ -556,12 +578,16 @@ nothing can be written until it exists. (m) *Consumers.* The entry's field 47 na
 missing or unreadable; cursor files are roadmap 5.2. (n) *Restart time.* A start reads every unsealed segment whole,
 and the last sealed one for its trailer, against the restart budget of `design.md`.
 **Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Lost-range records of the
-manifest count, and since roadmap 5.1 the registry file's `through` (`format.md` A.16). (c) A start reports what it found and what the manifest holds. Since roadmap 5.1 the interface reads
+manifest count, since roadmap 5.1 the registry file's `through` (`format.md` A.16), and since roadmap 5.2 every
+position a cursor file names (its cursor, its latches' positions, its last reset point), each kind of file
+contributing through the list of position sources a start reads (`log/src/writer/sources.rs`), to which derived
+files are to be added. (c) A start reports what it found and what the manifest holds. Since roadmap 5.1 the interface reads
 every recovery entry of the kept log at every start and every reader refresh, as it reads the whole kept log to
 rebuild the registry anyway: `losses()` lists the manifest's lost-range records and, for each recovery entry that
 reports a torn tail, a `PossibleLoss` (`kvik/src/durable/index.rs`). The cost is that of reading the log, which
 roadmap 6.x bounds. (k) The start stays read-only; the next start retries. (m)
-Always empty. (n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments (446–639 MiB) again,
+Since roadmap 5.2 the consumers named by the routing changes the start sees whose cursor file is missing, and those
+whose cursor file is unreadable (Q-130 for the limit). (n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments (446–639 MiB) again,
 after a clean shutdown with a warm page cache, against the 1 s budget, and 129–138 ms for two segments holding almost
 nothing, so the time is mostly reading the unsealed 64 MiB segments whole. The cloud runners of `bench.yml` (warm
 cache, not durability-representative) took 0.24–0.68 s for 3–5 segments. A cold cache, a crash and the Linux target
@@ -653,6 +679,38 @@ manifest append (with roadmap 6.3 at the latest); (e) whether these counts must 
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
 
+## Q-130 — A consumer's missing cursor file that a start cannot tell
+**Scenario.** §3 Recovery rule 3 names in the recovery entry (field 47) the consumers whose cursor file was missing
+or unreadable. An unreadable file names itself; a missing one can be told only from the consumers the start knows.
+A start reads the registry file and the unsealed segments, not the sealed ones; the registry file is written at
+every start and at clean shutdown. A consumer whose routing changes all lie in segments sealed since the last
+registry file was written, and whose cursor file is then lost, is not named.
+**Implemented.** The start names the consumers of the routing changes in the registry file and the unsealed segments
+(`log/src/writer/recovery.rs`). Whatever the entry names, the interface treats a consumer with no readable cursor
+file as having none (Q-95 (a)).
+**Needed.** Whether the registry file is also written after each routing change, the start reads every segment's
+routing changes, or the limit is accepted.
+
+## Q-131 — The resync of a consumer with no cursor file
+**Scenario.** §4 Resync gives a consumer with no cursor file, before its first delivery, a resync whose
+`forget_above` is the position before its start; `api.md` lists the causes `Resume`, `ResetPoint`,
+`GenerationChanged` and `CursorBehindLog`, none of which it is. It is not said whether it carries funnel states (it
+does not end a resume), nor whether a new consumer, which has nothing to forget, receives it. The in-memory backend
+sends none.
+**Implemented.** The durable backend sends it to every consumer with no cursor, new ones included, with the added
+cause `ResyncCause::NoCursor`, `forget_above` the last position, and the state now of each funnel in force (none
+for a new consumer); its confirmation writes the cursor file at once, as for any resync carrying `forget_above`.
+**Needed.** Its cause in `api.md`, whether a new consumer receives it, and whether it carries funnel states.
+
+## Q-132 — A confirmed latch lost with the last second of a cursor file
+**Scenario.** §4 Consumer state writes the cursor file, with the latches, at most every 1 s. A condition delivery
+confirmed less than a second before a crash may not be in the file; the resync that ends the resume then finds the
+latch as it was and reports the same state as a transition, to be acted on again, although §4 At-least-once says a
+condition delivery is never delivered twice. The transition is correct against the latch on disk, and commands
+carry ids, but a consumer that acted on the first delivery acts again.
+**Implemented.** As described: a confirmation writes the file when a second has passed since the last write, the
+`kvik-deliver` thread and `Store::tick` write what is due, and clean shutdown writes every file.
+**Needed.** Whether this is accepted, or a confirmation that changes a latch writes the file at once.
 ## Q-140 — Live staleness of an observed series in a reader process
 **Scenario.** S = 3 s. The writer commits a reading for `t` = −2 s at 0 s; at 2 s a reader in another process asks
 `live()`. The writer's own reader answers fresh (2 s since the commit, §5.4 monotonic rule); the reader process
@@ -949,7 +1007,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -963,13 +1021,14 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
 | Q-86 (b) | 4.9 | Settled on Linux by the Btrfs job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decisions on the `chattr +C` sentence and the macOS and Windows wording |
-| Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
+| Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling; implemented provisionally by roadmap 5.2, the grammar awaiting the owner's ruling |
 | Q-90 | 8.3 | Restore |
-| Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
+| Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings; implemented by roadmap 5.2 as the question says, (a) and (b) awaiting funnels in configuration |
 | Q-92 | 6.2 | Revised-key index; recorded after the tag, from the review of the Q-72 ruling |
 | Q-93 (b) and (c) | 7.3 | Calendar; (a) settled at gate 3.3 by the owner |
 | Q-94 | 6.3b | Compaction order; recorded after the tag, from the review of the Q-71 ruling; with 6.3b, which publishes compaction outputs (6.3a lays out the records only) |
-| Q-95 | 5.2 | Durable cursors; recorded after the tag |
+| Q-95 | 5.2 | Durable cursors; recorded after the tag; implemented by roadmap 5.2 (see the question), awaiting the owner's ruling |
+| Q-130 to Q-132 | 5.6 | Recorded by roadmap 5.2 |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2; owner decision pending on the trust-boundary wording |
@@ -977,7 +1036,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-115 (e), (j), (n) | 4.9 | Gate; owner decisions pending: the `space()` seam, the Windows wording, and bounds on the ingest queue's bytes and on blocked seals |
 | Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9; both implemented by roadmap 5.1 (see the question) |
 | Q-116 (a) | 6.3b | Deep fetch or manifest rebuild for a corrupt record; deferred by gate 4.9; roadmap 6.3a builds both in `kvik-files` (see the question), the start's call into them is 6.3b |
-| Q-116 (b), (m) | 5.2 | Durable cursors as a source of F and in the recovery entry (derived files as sources of F at 6.2 and 7.1; the registry file is one since roadmap 5.1); deferred by gate 4.9 |
+| Q-116 (b), (m) | 5.2 | Durable cursors as a source of F and in the recovery entry (derived files as sources of F at 6.2 and 7.1; the registry file is one since roadmap 5.1); deferred by gate 4.9; implemented by roadmap 5.2 (see the question), Q-130 recorded |
 | Q-116 (c) | 5.1 | The interface reads loss history; deferred by gate 4.9; implemented by roadmap 5.1 (see the question) |
 | Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |

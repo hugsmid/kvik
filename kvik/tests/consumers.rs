@@ -238,7 +238,7 @@ fn a_reset_point_in_the_replay_waits_for_its_confirmation() {
     let mut w = World::new("reset-middle");
     let s = w.open();
     let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
-    let mut c = new_consumer(&s, "log", Select::None);
+    let c = new_consumer(&s, "log", Select::None);
     block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
     block_on(s.shutdown()).unwrap();
     drop((c, s));
@@ -579,7 +579,7 @@ fn run(
             }
             Step::Restart => {
                 block_on(s.shutdown()).unwrap();
-                cs = vec![None, None];
+                cs.clear();
                 drop(s);
                 for n in CONSUMERS {
                     held(n);

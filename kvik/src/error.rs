@@ -353,8 +353,8 @@ pub enum QueryError {
     Closed,
 }
 
-/// The error of a consumer call. `docs/api.md` leaves funnel compilation
-/// errors to roadmap 5.2; this is the model backend's set.
+/// The error of a consumer call, funnel compilation errors included
+/// ([`ConsumerError::Route`], [`ConsumerError::RouteCycle`]).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConsumerError {

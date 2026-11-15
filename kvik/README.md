@@ -24,8 +24,18 @@ the read path is the model's own code, so those tests cannot catch a fault in it
 cover: the node arithmetic and aggregates (`kvik_model::summary`), calendar spans (`kvik_model::calendar`), and the
 rules in `src/rules.rs` (a window's result from its node, refused aggregates, window spans, bucket steps, spans and
 contents). What is the durable backend's own is which facts are read, from the log, for each call. Every start rebuilds the registry from the kept
-log and writes the registry file (`format.md` A.16) again where it does not match; clean shutdown writes it too. **Not supported yet**, each until its roadmap
-item: consumers and routing (5.2; `ConsumerError::NotSupportedYet`), and what the model backend lacks too (below).
+log and writes the registry file (`format.md` A.16) again where it does not match; clean shutdown writes it too.
+Consumers (roadmap 5.2): routing changes are log entries (`format.md` A.6 type 5) and the routing table is rebuilt
+from the log at every start; fact funnels by ids, name pattern or all; condition funnels without an operator,
+evaluated as the model evaluates them; bounded queues that fall back to reading the log when full; latches and the
+cursor in a cursor file per consumer (`format.md` A.15), written at most once a second, when a resync carrying
+`forget_above` is confirmed and at clean shutdown; resume after a restart with a replay and a resync carrying each
+funnel's state, pausing at every reset point (a recovery entry, a lost range) for a resync carrying `forget_above`;
+`emits` with the cycle check, and `Consumer::try_emit`. Cursor files are a source of F at every start, and the
+recovery entry names the consumers whose cursor file is missing or unreadable. Delivery runs on the calling thread
+and on a `kvik-deliver` thread, never on the writer's. **Not supported yet**, each until its roadmap item: windowed
+operators in funnels (`ConsumerError::NotSupportedYet`), starting a consumer at a position or a time (5.3), and what
+the model backend lacks too (below).
 
 **Model (`Backend::Model`).** The executable [reference model](../model/): exact, slow and entirely in memory. Nothing
 is written to disk: `Store::open` only uses the directory as a name, and every store lives in the memory of the
@@ -49,7 +59,7 @@ cargo run -p kvik --example quickstart
 
 [`examples/quickstart.rs`](examples/quickstart.rs) opens a store, defines a gauge and a counter, emits readings,
 receives and confirms a threshold condition's transition, and queries a rolling window and a calendar day; as the
-durable backend has no consumers yet, it runs on the model backend.
+durable backend has no windowed operators in funnels yet, it runs on the model backend.
 
 ## Coverage
 
@@ -58,7 +68,10 @@ What the model backend supports, each with a test in [`tests/`](tests/) or the c
 that it says so where it does not; [`tests/durable.rs`](tests/durable.rs) covers durability (acknowledged readings
 after a power loss), a reader in another handle, the registry and its file after crashes and damage, ids never
 assigned twice, orphaned facts, writers on several threads, a store on the system environment, and the differential
-test of the durable backend against the model.
+test of the durable backend against the model; [`tests/consumers.rs`](tests/consumers.rs) covers consumers on the
+durable backend: routes, cursors and latches over restarts, reset points after power losses, `emits` and cycles, a
+differential test of deliveries against the model backend over clean restarts and a property test of the crash
+rules.
 
 | Area | Supported |
 |---|---|
@@ -111,7 +124,18 @@ Model backend:
 
 - **`ReaderState.stamp`** is always the zero stamp: the model has no resets. The durable backend gives the mark's.
 
-Durable backend, besides consumers:
+Durable backend, besides windowed operators in funnels:
+
+- **A consumer with no cursor** (a new one, or one whose cursor file was missing or unreadable at the start) is first
+  sent a resync of the added cause `ResyncCause::NoCursor`, whose `forget_above` is the last position (spec §4
+  Resync); nothing further is delivered until it is confirmed. The model backend sends none.
+- **Cursor files are written at most once a second** (spec §4 Consumer state): after a crash a consumer may resume
+  from an earlier confirmation, and a latch confirmed within the last second may be lost, so its resync is a
+  transition again. The model backend keeps the cursor and the latches durable at once.
+- Condition delivery sequences start at 1 at every start (spec §4 Order); a trigger's `value` and `coverage` are
+  `None`, as on the model backend.
+- A consumer's own `try_emit` refuses a reading on a series outside its `emits` with `Refusal::NotDeclared`, and
+  emits the others without waiting.
 
 - `Reader::facts` collects a query's facts before it returns, as the model backend does, rather than streaming
   block by block; every process holds the facts of the kept log in memory (the indexes and tree of roadmap 6 and 7
@@ -135,7 +159,7 @@ Durable backend, besides consumers:
   counted.
 - Not produced: `Wait::UnsyncedClock` in `stats().ingest.waiting` and health (the call waits, and `waits` counts
   it), `ManifestRebuilt`, `loss_identities_rebuilt`, `WriteError::NotFinal`, `Outcome::Recorded.unchecked` and
-  `duplicates_unchecked` (all detail is local), `ConditionState`s and deliveries of any kind, `scale_raises`,
+  `duplicates_unchecked` (all detail is local), the `Unknown` condition state, `scale_raises`,
   `interval_displaced`, `counter_regressions` and `SeriesStats.orphaned_facts` (orphaned facts are left out of every
   view and returned by `export_orphaned`, but not counted yet).
 
@@ -147,8 +171,9 @@ Different from `docs/api.md`:
 - `Funnel` and `Reading` are plain structs, as `docs/api.md` builds them literally; every other configuration or
   result struct is `#[non_exhaustive]`, built with `new`, the setters, or `default()` and field assignment.
 - **Errors**: the backend adds `NotSupportedYet` to `DefineError`, `ConsumerError::NotSupportedYet`,
-  `QueryError::Invalid` (a malformed query) and `QueryError::Closed`. `ConsumerError` and `BackupError` stand in for
-  the funnel-compilation and backup errors that roadmap 5.2 and 8.2 settle.
+  `QueryError::Invalid` (a malformed query) and `QueryError::Closed`. `ConsumerError` carries the funnel-compilation
+  errors (`Route`, `RouteCycle`) and `DefineError::RouteCycle` refuses an alias that closes a cycle; `BackupError`
+  stands in for the backup errors that roadmap 8.2 settles.
 - **`Health::Closed`** after the writer shuts down, and **`Reason::ClockSkew`** (spec §9 row 5).
 - **`Backend`**, `StoreConfig::backend` and `ReaderConfig::backend` choose the backend.
 - **`Live::Value` carries a `LiveValue`** (the fact and whether it is stale), where `docs/api.md` shows the fact alone
@@ -175,5 +200,6 @@ Different from `docs/api.md`:
   `counter_regressions`, `IngestStats.waits`, and `Limits.consumer_queue` and `max_consumers` (keys of later
   sections that the backend needs).
 
-Name patterns in a funnel's selection work, but their grammar is provisional (`*` within one `/`-separated segment),
-as the specification does not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).
+Name patterns in a funnel's selection and in `emits` work, but their grammar is provisional (`*` within one
+`/`-separated segment; two patterns overlap when every segment has a string both match), as the specification does
+not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).

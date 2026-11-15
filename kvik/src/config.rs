@@ -206,7 +206,7 @@ pub struct Limits {
     /// Lateness bound of a series that declares none (default 5 minutes).
     pub default_lateness_bound: Duration,
     /// Deliveries a consumer's queue holds before it switches to catch-up
-    /// (default 4,096; a key of roadmap 5.2, used by the model backend).
+    /// (default 4,096; a key of roadmap 5.2).
     pub consumer_queue: usize,
     /// Consumers a store can have; the model backend reserves this many
     /// consumer slots when the store is created (default 64).

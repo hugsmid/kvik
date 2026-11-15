@@ -131,7 +131,9 @@ pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timesta
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source } }
 ```
-Funnel compilation errors (`RouteCycle` among them) and backup errors are added by roadmap 5.2 and 8.2.
+Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence) and
+`ConsumerError::RouteCycle` (a route or a change of `emits`), and `DefineError::RouteCycle` for an alias, each naming
+the cycle (roadmap 5.2). Backup errors are added by roadmap 8.2.
 
 ## Handles and life cycle (accepted at gate 3.3)
 - `Store` is `Clone + Send + Sync`; clones share the one writer. `Consumer` is `Send`, not `Clone`, and owns a share

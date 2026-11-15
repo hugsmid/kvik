@@ -13,8 +13,8 @@
 //!   [`env::Env`], and acknowledged only once it is durable; a [`Reader`], in
 //!   this process or another, reads up to the durable mark. It supports
 //!   series definitions, writing, facts in every view, series lookup, live
-//!   state, windows, chart buckets and calendar results so far; consumers
-//!   return `NotSupportedYet` until their roadmap item.
+//!   state, windows, chart buckets, calendar results and consumers so far;
+//!   windowed operators in funnels return `NotSupportedYet`.
 //! - [`Backend::Model`]: the executable reference model (`kvik-model`), an
 //!   in-memory, exact and slow implementation of the whole interface. Nothing
 //!   is written to disk: [`Store::open`] only uses the directory as a name,
