@@ -593,7 +593,7 @@ impl LogWriter {
         if r.fault.is_none() {
             let _ = leases.scan(&*store.fs().clone(), &leases_dir, &store_id, now);
         }
-        Ok(Self {
+        let mut w = Self {
             leases,
             stats: LogStats {
                 durable: at(r.last_sequence),
@@ -640,7 +640,14 @@ impl LogWriter {
             disk: Disk::default(),
             waiting: None,
             report: r.report,
-        })
+        };
+        // A mark read from the page cache on this boot may not be on stable storage. With the mark synced at every
+        // commit nothing may rest on such a mark: a batch it covers would be read and delivered, then lost by a
+        // remount within the boot (`spec.md` §3 Recovery rule 1). A failed sync leaves the writer read-only.
+        if w.mark_dirty && matches!(w.mark_mode, MarkSyncMode::EveryCommit { .. }) {
+            w.sync_mark(now);
+        }
+        Ok(w)
     }
 
     /// What the start found and did (`spec.md` §3 Recovery).

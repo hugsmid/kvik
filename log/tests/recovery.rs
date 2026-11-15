@@ -1514,6 +1514,31 @@ fn a_mark_read_from_the_page_cache_at_a_same_boot_start_is_synced_on_the_timer()
     assert_eq!(durable.last_sequence, last);
 }
 
+/// Found by the differential test against the model (`model_histories.rs`): with the mark synced at every commit, a
+/// batch whose mark was written but not synced when the process stopped is kept by the next start on the same boot,
+/// read and delivered; that start syncs the mark, so a remount within the boot does not lose the batch.
+#[test]
+fn with_the_mark_synced_at_every_commit_a_start_syncs_a_mark_read_from_the_page_cache() {
+    let mut r = rig_with_batches(1, cfg());
+    r.kill();
+    r.cfg.mark_sync = MarkSync::EveryCommit;
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    let durable = read_mark(&r.fs.read_durable(&log_path("MARK")).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(durable.last_sequence, 1);
+    // The file system is unmounted and mounted again within the boot.
+    r.w = None;
+    r.fs.power_loss();
+    r.fs.restart();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    assert!(rep.losses.is_empty());
+    r.check_started();
+}
+
 #[test]
 fn a_start_begins_with_a_directory_sync_and_stops_if_it_fails() {
     let mut r = rig_with_batches(1, cfg());
