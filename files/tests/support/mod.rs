@@ -281,7 +281,12 @@ pub fn restore_record() -> impl Strategy<Value = RestoreRecord> {
                     .collect();
                 acknowledgements.sort();
                 acknowledgements.dedup();
-                let mut files = files;
+                let mut files: Vec<RestoredFile> = files
+                    .into_iter()
+                    .map(|f| (f.description.file_ref(), f))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_values()
+                    .collect();
                 files.sort_by_key(|f| {
                     (
                         f.description.kind,
@@ -289,7 +294,6 @@ pub fn restore_record() -> impl Strategy<Value = RestoreRecord> {
                         f.description.file_id,
                     )
                 });
-                files.dedup_by_key(|f| f.description.file_ref());
                 RestoreRecord {
                     generation,
                     stamp: ResetStamp { sequence: 1, nonce },
