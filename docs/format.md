@@ -692,8 +692,9 @@ its own prefix, which the engine never sees.
   object (`NoConditionalWrites`; where the key was present, the first put must fail and `stat` must report the
   earlier object unchanged); or a put of a fresh probe to `<sid>/probe/<nonce>` with a SHA-256 that is not its own
   (its own with every bit of byte 0 inverted) succeeds, or leaves an object under the key (`NoChecksums`); or a
-  `stat` reports no SHA-256 (`NoChecksums`); or `<sid>/STORE` is present and its envelope's key check value is not
-  the key's (`WrongKey`). A bucket that passes keeps one probe object for ever; the engine never
+  `stat` reports no SHA-256 (`NoChecksums`). `attach_backup` also refuses a bucket whose `<sid>/STORE` is present
+  with another key check value (`WrongKey`); a restore reports a wrong key as `WrongKey` (`api.md` Backup and
+  restore). A bucket that passes keeps one probe object for ever; the engine never
   deletes. Versioning or object lock cannot be probed through the sink and is the operator's to confirm. A drill
   writes nothing and does not probe. How a restore reports a refusal: Q-214.
 

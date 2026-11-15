@@ -887,7 +887,7 @@ the interval zone under the tzdata version in force at export, recorded in the m
 
 Recorded at the interfaces commit of roadmap 8.1 and 8.3, which defines the types, traits and fakes the parallel
 items build against (`kvik-backup`, `files/src/{tier,restore}.rs`, `log/src/setaside.rs`,
-`log/src/writer/options.rs`). Decided: (a) to (d). Provisional: (e) and (f).
+`log/src/writer/options.rs`). Decided: (a) to (d); (e) and (f) settled at roadmap 8.1a.
 **Scenario.** (a) A `put` of a sealed segment is stored but its reply is lost; the store restarts and seals the
 same file again. With a random nonce the bytes differ, the sink refuses the repeat (`HashMismatch`), and the
 segment can never be uploaded. (b) An operator points two stores at one bucket under different prefixes; a restore
@@ -903,10 +903,10 @@ engine: keys start at the store id, a restore finds the store id by listing the 
 (d) `attach_backup` and `restore` take `S: BackupSink + 'static`; `RestoreMode` is not `Copy`, defaults to `Full`
 and gains `Partial(RestoreScope)`, `NotSupportedYet` until roadmap 8.3f; `RestoreScope` holds only the time range
 until a series selection exists.
-**Provisional.** (e) The key layout of Q-160's suggestion without the prefix, in `backup/src/keys.rs`, the only
+**Provisional at the interfaces commit.** (e) The key layout of Q-160's suggestion without the prefix, in `backup/src/keys.rs`, the only
 place a key is built or parsed; kinds other than log segments under `files/<kind:2 hex>/`. (f) The claim marker is
 12 bytes, the generation (`u32`) then the restore's reset-stamp nonce (`u64`), little-endian (Q-161's suggestion).
-Both are fixed by `format.md` A.17 (roadmap 8.1b), which may change them before anything is uploaded.
+Both were to be fixed by `format.md` A.17 before anything is uploaded.
 **Settled at roadmap 8.1a.** (e) and (f) as above: `format.md` A.17 takes this contract's keys (other kinds under
 `files/<kind:2 hex>/`, the probe at `<sid>/probe`) and its 12-byte marker, which repeats neither the store id (in the
 key, bound by the envelope) nor a version (in the envelope header). This contract was ruled authoritative over the
@@ -968,11 +968,11 @@ Recorded at roadmap 8.1a. To be settled by roadmap 8.3b.
 **Scenario.** A.17 and §8 Bucket: a restore probes the bucket before it claims and refuses one that fails
 (`BackupRefused`). `RestoreDriver::prepare` names no probe step, and `RestoreError` has no refusal variant, so the
 executor can report such a bucket only as `Sink` or not at all, and `Store::restore` cannot return
-`BackupError::Refused`.
+`BackupError::Refused`. Likewise `RestoreError::SeveralStores` (A.17) has no `BackupError` counterpart in `api.md`.
 **Model.** Not modelled.
 **Needed.** Suggested: an additive `RestoreError::Refused(Refused)` (the enum is non-exhaustive), the probe as the
 step of `prepare` before the claim (`Full` only; a drill does not probe), and `Store::restore` mapping it to
-`BackupError::Refused`.
+`BackupError::Refused`; `SeveralStores` mapped to an additive `BackupError` variant named in `api.md`.
 
 ## Open at v0.2
 
@@ -1023,11 +1023,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-161 | 8.3 | Restore's own claim marker; recorded by roadmap 8.2; the marker's layout, with the nonce, is in `format.md` A.17 (roadmap 8.1a) |
 | Q-163 | 8.3 | Reading the claims on a lagging bucket; recorded by roadmap 8.2 |
 | Q-164 | 8.1, 8.3 | Interface points deferred to 8.2: (a) and (b) with 8.1, (c) with 8.3; recorded by roadmap 8.2 |
-| Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
-| Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
-| Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
-| Q-213 | 8.1c | The checksum probe's key; recorded by roadmap 8.1a; needs a change to `backup/src/keys.rs`, roadmap 8.1b's file |
-| Q-214 | 8.3b | A restore's refusal of a bucket; recorded by roadmap 8.1a; needs a change to `backup/src/restore.rs`, roadmap 8.3b's file |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 | Q-173 | 6.3b | The operator call `rebuild_manifest`; recorded by roadmap 6.3a; its signature and finality come with the call in `api.md`, which 6.3b adds |
 | Q-175 | 6.3b | An intermediate output no record and no local file describes; recorded at the review of roadmap 6.3a; needs two corrupt merges, so it arises only once 6.3b publishes compaction outputs |
@@ -1040,6 +1035,11 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; remaining mismatches in Q-213 and Q-214 |
+| Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
+| Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
+| Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
+| Q-213 | 8.1c | The checksum probe's key; recorded by roadmap 8.1a; needs a change to `backup/src/keys.rs`, roadmap 8.1b's file |
+| Q-214 | 8.3b | A restore's refusal of a bucket; recorded by roadmap 8.1a; needs a change to `backup/src/restore.rs`, roadmap 8.3b's file |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
