@@ -32,6 +32,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-160 | §8 Deep, Encryption, Hashes, Generations; `format.md` A.12, A.14 | Objects in the deep tier: keys, claim marker and envelope |
+| Q-161 | §8 Generations; `api.md` Backup and restore | Telling a restore's own claim marker from another restore's |
+| Q-162 | §8 Hashes, Bucket, Generations; §13 | Buckets without conditional writes or checksum checks |
+| Q-163 | §8 Generations, Restore step 1 | Reading the claims again on a bucket whose listings lag |
+| Q-164 | §8 Retention class, Restore; `api.md` Reading, Backup and restore | Interface points deferred to 8.2 that need tiers or restore |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -604,6 +609,68 @@ whether the seam gains a monotonic clock for the engine's timers or tests take `
 manifest append (with roadmap 6.3 at the latest); (e) whether these counts must survive a restart, which would need
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
+
+## Q-160 — Objects in the deep tier: keys, claim marker and envelope
+Recorded at roadmap 8.2, which built the sink with opaque keys. To be settled before roadmap 8.1 uploads anything.
+**Scenario.** Roadmap 8.1 uploads a sealed segment, then its manifest record; a newer build later restores the store
+from the bucket. Nothing says under which key either object lies, what an uploaded manifest record holds (the A.14
+block alone, or with a header carrying the store id and generation), what the generation claim marker is
+(`format-check.md` FC-33 left it to 8.2), or how a file is encrypted: algorithm, nonce, key identification, and a
+layout that allows the ranged reads `BackupSink::get` offers (a chunk index fetched by range, `format.md` Part B).
+§8 also refuses backup on a bucket holding files of another store id, which needs the store id findable from keys
+or object headers. The restore that reads them (8.3) cannot be written against an unwritten layout.
+**Model.** Not modelled; the sink (`kvik-sink`) takes any key of 1 to 1,024 bytes and stores bytes as given.
+**Needed.** An object layout section in `format.md`. Suggested: keys under a configured prefix and the store id,
+mirroring local names (`<prefix>/<store_id:32 hex>/STORE`, `.../log/<generation:8 hex>-<file_id:16 hex>.kvl`,
+`.../manifest/<generation:8 hex>/<epoch:16 hex>`, `.../claims/<generation:8 hex>`), so that listing a generation's
+records returns them in epoch order; each uploaded file an envelope of fixed-size authenticated chunks with a header
+naming the algorithm, key id and nonce base, so that a range decrypts on its own.
+
+## Q-161 — Telling a restore's own claim marker from another restore's
+Recorded at roadmap 8.2. To be settled with Q-160, before roadmap 8.3.
+**Scenario.** Restores R1 and R2 of the same bucket both read generation 2 as the highest claimed and try to claim
+3 at once. R1's create-if-absent upload of the marker is stored but its reply is lost; R2's is refused. R2 moves on
+to 4. Had R2's upload landed first instead, R1's retry would meet a marker for 3 already there. The sink accepts a
+repeated `put` when the object has the same size and SHA-256 (so that a retry after a lost reply succeeds); if every
+marker has the same content (empty, say), R1 takes R2's marker for its own and both restores own generation 3.
+**Model.** Not modelled; a claim is a create-if-absent step that cannot be confused.
+**Needed.** Marker content unique to the restore attempt. Suggested: the marker holds the restore's reset stamp
+nonce (fresh random, §8 Generations), so a `put` that succeeds proves the marker is this restore's; any other
+content is `Exists` and the restore takes the next generation.
+
+## Q-162 — Buckets without conditional writes or checksum checks
+Recorded at roadmap 8.2. To be settled before roadmap 8.1 uploads anything.
+**Scenario.** (a) A bucket that ignores `If-None-Match` overwrites one restore's claim marker with another's;
+versioning keeps the first, but both restores believe they claimed the generation, and a sealed file uploaded twice
+silently replaces the first copy's current version. (b) A bucket that stores an upload without checking its SHA-256
+reports the hash it was sent: `put` and the scheduled reported-hash check pass on damaged bytes, and only a sampled
+download finds them (tested in `kvik-sink`, `a_bucket_that_does_not_check_is_caught_by_the_sampled_download`).
+§13 lists (b) as a risk with the fallback "hash in object metadata plus sampled downloads", whose metadata is not
+named; (a) is not listed. A bucket that reports no SHA-256 at all is refused by the sink (`SinkError::Failed`).
+**Model.** Not modelled.
+**Needed.** Whether the engine checks the bucket when backup is attached (a probe object, which stays, since the
+engine never deletes), or the operator does; (a) added to §13; and the metadata of the fallback, if it is kept.
+
+## Q-163 — Reading the claims again on a bucket whose listings lag
+Recorded at roadmap 8.2. To be settled with roadmap 8.3.
+**Scenario.** §8 Generations: after uploading its restore record, a restore "reads the claims again" and stops if a
+higher generation is claimed. Restore R1 claims 3; R2 claims 4 a moment later. R1 lists the claims, but the
+bucket's listing does not yet show R2's marker (some S3-compatible stores list with a delay; the fake injects it,
+`a_lagging_listing_does_not_decide_whether_a_key_is_taken`). R1 accepts ingest in generation 3 while R2 does in 4.
+**Model.** Not modelled.
+**Needed.** A way of reading claims that does not depend on listings. Suggested: read the claims by `stat` of
+the markers above one's own generation, in ascending order, until one is absent; a `stat` of a key is consistent
+after its write on buckets with read-after-write consistency, which the bucket requirements would then name.
+
+## Q-164 — Interface points deferred to 8.2 that need tiers or restore
+Recorded at roadmap 8.2, which settled the sink only. To be settled by roadmap 8.1 and 8.3.
+**Scenario.** Three interface points were deferred at gate 3.3 to roadmap 8.2: (a) whether `Reader::facts` fetches
+detail that is not local itself (`api-check.md` AC-12), which would put network calls in a `Reader`,
+whose calls are blocking file I/O and which owns no thread; (b) what happens to files sealed while no sink is
+attached (AC-25); (c) the restore life cycle (AC-24). None can be decided without tiering (8.1) or restore (8.3).
+**Model.** Not modelled.
+**Needed.** (a) and (b) settled with 8.1, (c) with 8.3. Suggested for (a): `facts` does not fetch; detail not local
+is reported as such and fetched by an asynchronous `Store` call on the maintenance thread.
 
 ## Open at v0.2
 

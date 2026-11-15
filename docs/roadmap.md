@@ -77,7 +77,7 @@ again; nothing after a gate starts before it is passed.
 
 ## 8. Tiers and backup
 - [ ] 8.1 Tier policy and verified eviction
-- [ ] 8.2 Backup sink interface with an S3-compatible implementation, tested against a local fake
+- [x] 8.2 Backup sink interface with an S3-compatible implementation, tested against a local fake
 - [ ] 8.3 Restore, partial restore and rebuild
 - [ ] 8.4 **Gate** — restore passes end to end
 
