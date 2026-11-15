@@ -530,6 +530,9 @@ fn take(c: &mut Cursor, records: Vec<Record>, snap: &Catalogue) {
         if r.epoch <= c.scanned || r.epoch > snap.last_epoch() {
             continue;
         }
+        // Defensive, with the field-100 test in `fresh_copy`: a carried copy never reaches `backed_up_through`
+        // anyway, since a file's publishing record goes up only once it is verified, and its fresh `0x27`, appended
+        // first, replaces the entry (Q-280). They keep that so if the publishing rule ever loosens.
         if matches!(r.body, Body::Rebuild(_)) {
             c.copied_at.clear();
         }

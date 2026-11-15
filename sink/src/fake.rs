@@ -99,6 +99,7 @@ struct State {
     bucket_missing: bool,
     list_lag: u64,
     list_calls: u64,
+    ignores_conditions: bool,
     log: Vec<(Method, String)>,
     pauses: Vec<Duration>,
 }
@@ -228,6 +229,12 @@ impl FakeBucket {
     /// whose listings lag behind its writes.
     pub fn set_list_lag(&self, calls: u64) {
         self.lock().list_lag = calls;
+    }
+
+    /// Ignores `If-None-Match` on uploads, so an upload replaces what the key
+    /// holds: a bucket without conditional writes, which the backup refuses.
+    pub fn set_ignores_conditions(&self, on: bool) {
+        self.lock().ignores_conditions = on;
     }
 
     /// Changes a stored object's bytes without changing its reported hash,
@@ -463,7 +470,10 @@ impl FakeBucket {
 
     fn put(&self, req: &Request, key: &str, body: &[u8]) -> Response {
         let mut s = self.lock();
-        if req.header("if-none-match") == Some("*") && s.objects.contains_key(key) {
+        if req.header("if-none-match") == Some("*")
+            && !s.ignores_conditions
+            && s.objects.contains_key(key)
+        {
             return error(412, "PreconditionFailed", "the key exists");
         }
         let actual: [u8; 32] = Sha256::digest(body).into();

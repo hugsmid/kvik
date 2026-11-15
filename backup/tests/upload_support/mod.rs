@@ -571,8 +571,8 @@ pub fn fresh_copies(records: &[Record], f: FileRef) -> usize {
         .count()
 }
 
-/// Per live file: its upload, then its copy-verified record, then the upload of each record naming it; record
-/// uploads first reach the bucket in epoch order.
+/// Per live file: its upload, then its copy-verified record, then the upload of each sealed-segment or publish
+/// record naming it; record uploads first reach the bucket in epoch order.
 pub fn check_order(events: &[Event], records: &[Record], live: &dyn Fn(FileRef) -> bool) {
     let keys = Keys::new(ID);
     let first_put = |key: &str| {
@@ -594,7 +594,11 @@ pub fn check_order(events: &[Event], records: &[Record], live: &dyn Fn(FileRef) 
         "record uploads out of order: {seen:?}"
     );
     for r in records {
-        let Body::Sealed(s) = &r.body else { continue };
+        let s = match &r.body {
+            Body::Sealed(s) => s,
+            Body::Publish(p) => &p.published,
+            _ => continue,
+        };
         let Some(rec_put) = first_put(&keys.record(r.generation, r.epoch)) else {
             continue;
         };

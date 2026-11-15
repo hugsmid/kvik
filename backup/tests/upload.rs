@@ -781,3 +781,97 @@ fn other_content_under_the_store_key_fails_and_is_never_overwritten() {
     );
     assert_eq!(h.puts_of(&keys.file(&f)), 0);
 }
+
+fn rebuild_final(h: &Harness) -> kvik_files::appender::Appender {
+    let files = local_files(h);
+    let state = LocalState {
+        files: &files,
+        losses: &[],
+        lease_epoch: 0,
+        mark_file_id: 0,
+    };
+    rebuild_manifest(&h.fs, &h.dir, ID, state, &AllVerify, Finality::Final, T0)
+        .unwrap()
+        .0
+}
+
+#[test]
+fn q280_a_rebuilt_copy_the_bucket_reports_otherwise_fails_and_is_not_marked_verified() {
+    let h = three();
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let keys = Keys::new(ID);
+    let first = &h.segments[0].0;
+    h.sink.mem.set(&keys.file(first), b"damaged or replaced");
+    h.close();
+    h.set_app(rebuild_final(&h));
+    let mut d = h.driver();
+    let s = run(&mut d, &mut Duration::default(), 100);
+    assert!(
+        matches!(
+            s,
+            Step::Failed(UploadError::Verify(VerifyError::Sink(
+                SinkError::Exists { .. }
+            )))
+        ),
+        "{s:?}"
+    );
+    assert_eq!(fresh_copies(&h.records(), first.file_ref()), 0);
+    let snap = upload_support::lock(&h.app()).catalogue().clone();
+    assert!(
+        !snap
+            .file(first.file_ref())
+            .unwrap()
+            .verified
+            .contains(&Tier::Deep)
+    );
+}
+
+/// Steps the driver over a rebuilt manifest; between the upload of the last carried record and that of the first
+/// fresh copy-verified record, `backed_up_through` must not count the carried copies.
+fn no_progress_from_carried_copies(h: &Harness, d: &mut Driver) {
+    let keys = Keys::new(ID);
+    let mut checked = false;
+    for _ in 0..200 {
+        let records = h.records();
+        let up =
+            |r: &kvik_files::record::Record| h.puts_of(&keys.record(r.generation, r.epoch)) > 0;
+        let carried_up = records.iter().filter(|r| r.old_epoch.is_some()).all(up);
+        let fresh_up = records
+            .iter()
+            .filter(|r| r.old_epoch.is_none() && CopyVerified::from_body(&r.body).is_some())
+            .any(up);
+        if carried_up && !fresh_up {
+            assert_eq!(d.progress().backed_up_through, None);
+            checked = true;
+        }
+        match block_on(d.step(Duration::ZERO)) {
+            Step::Progress => {}
+            Step::Idle => break,
+            s => panic!("{s:?}"),
+        }
+    }
+    assert!(checked);
+    assert_eq!(d.progress().backed_up_through, Some((0, 30)));
+    h.check_done();
+}
+
+#[test]
+fn q280_backed_up_through_on_a_rebuilt_manifest_waits_for_the_fresh_copies() {
+    let h = three();
+    run_idle(&mut h.driver(), &mut Duration::default());
+    h.close();
+    h.set_app(rebuild_final(&h));
+    let mut d = h.driver();
+    no_progress_from_carried_copies(&h, &mut d);
+}
+
+#[test]
+fn q280_a_driver_that_outlives_a_rebuild_forgets_the_copies_before_it() {
+    let h = three();
+    let mut d = h.driver();
+    run_idle(&mut d, &mut Duration::default());
+    // The rebuilt manifest replaces the one the running driver reads, through the same port.
+    let rebuilt = rebuild_final(&h);
+    *upload_support::lock(&h.app()) = rebuilt;
+    no_progress_from_carried_copies(&h, &mut d);
+}

@@ -272,3 +272,45 @@ fn q283_the_bucket_this_store_uploaded_to_passes_the_probe_again() {
     idle(&mut d);
     assert_eq!(block_on(driver_over(&h, mem.clone()).probe()), Ok(()));
 }
+
+#[test]
+fn q162_a_bucket_without_conditional_writes_is_refused_through_the_s3_sink() {
+    let h = Harness::new();
+    let bucket = FakeBucket::new();
+    bucket.set_ignores_conditions(true);
+    for _ in 0..2 {
+        assert_eq!(
+            block_on(driver_over(&h, bucket.sink()).probe()),
+            Err(Refused::NoConditionalWrites)
+        );
+    }
+}
+
+/// A bucket that refuses a wrong hash on upload but reports another hash for what it stores.
+struct Misreports(MemSink);
+
+impl BackupSink for Misreports {
+    fn put<'a>(&'a self, key: &'a str, bytes: Arc<[u8]>, sha: [u8; 32]) -> SinkFuture<'a, Stored> {
+        self.0.put(key, bytes, sha)
+    }
+    fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>> {
+        let r = block_on(self.0.stat(key)).map(|s| s.map(|s| Stored::new(s.size, [0; 32])));
+        Box::pin(async move { r })
+    }
+    fn get<'a>(&'a self, key: &'a str, range: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>> {
+        self.0.get(key, range)
+    }
+    fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>) -> SinkFuture<'a, ListPage> {
+        self.0.list(prefix, after)
+    }
+}
+
+#[test]
+fn q283_a_bucket_reporting_another_hash_for_the_probe_object_is_refused() {
+    let h = Harness::new();
+    let sink = Arc::new(Misreports(MemSink::new()));
+    assert_eq!(
+        block_on(driver_over(&h, sink).probe()),
+        Err(Refused::NoChecksums)
+    );
+}
