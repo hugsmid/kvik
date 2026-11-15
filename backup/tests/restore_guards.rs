@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
-use kvik_backup::keys::{ClaimMarker, Keys};
+use kvik_backup::keys::{ClaimMarker, Keys, ObjectName};
 use kvik_backup::plan::PlanMode;
 use kvik_backup::restore::{Prepared, RestoreDriver, RestoreError};
 use kvik_backup::upload::Refused;
@@ -154,12 +154,23 @@ fn a_bucket_without_conditional_writes_is_refused_before_the_claim() {
 fn a_bucket_without_checksum_checks_is_refused_before_the_claim_and_a_drill_does_not_probe() {
     let mut src = source(ID, 2, false);
     let objects = bucket(&mut src);
+    let keys = Keys::new(ID);
     for hashes in [Hashes::Trusted, Hashes::StoreRejected, Hashes::Swallowed] {
         let sink = Arc::new(FaultSink::new(mem_with(&objects)));
         sink.set_hashes(hashes);
         let fs = MemFs::new();
         let r = block_on(restorer(sink.clone(), &fs, PlanMode::Full, KEY).prepare(1));
         assert_eq!(refused(r), Some(Refused::NoChecksums), "{hashes:?}");
+        if matches!(hashes, Hashes::Trusted) {
+            let probes: Vec<Vec<u8>> = sink
+                .inner
+                .objects()
+                .into_iter()
+                .filter(|(k, _)| matches!(keys.parse(k), Some(ObjectName::ChecksumProbe(_))))
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(probes, [b"kvik checksum probe".to_vec()]);
+        }
         assert!(claims(&sink.inner.objects(), ID).is_empty());
         assert!(fs.paths().is_empty());
         let before = sink.log().len();

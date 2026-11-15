@@ -8,6 +8,9 @@ use crate::envelope::Envelope;
 use crate::keys::Keys;
 use crate::upload::Refused;
 
+/// A checksum probe's content, stored unsealed: its meaning lies in its key (format A.17 Probe; Q-340).
+const CHECKSUM_PROBE: &[u8] = b"kvik checksum probe";
+
 fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
@@ -59,10 +62,9 @@ pub(super) async fn probe<S: BackupSink, E: Envelope>(
         return refused(Refused::NoConditionalWrites);
     }
     let key = keys.checksum_probe(random16(random));
-    let bytes = fresh(random, &key)?;
-    let mut wrong = sha256(&bytes);
+    let mut wrong = sha256(CHECKSUM_PROBE);
     wrong[0] = !wrong[0];
-    match sink.put(&key, bytes.into(), wrong).await {
+    match sink.put(&key, CHECKSUM_PROBE.to_vec().into(), wrong).await {
         Ok(_) => return refused(Refused::NoChecksums),
         Err(SinkError::HashMismatch { .. }) => {}
         Err(e) => return Err(e.into()),

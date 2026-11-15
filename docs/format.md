@@ -681,8 +681,10 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   never trusted over the log.
 
 ## A.17 Deep tier: object keys, uploaded forms, claim marker, envelope
-Every object kvik puts in the bucket (`spec.md` §8 Deep) is an **envelope** (below): backups are always encrypted
-and no object holds plaintext. The sink's keys belong to kvik alone; a sink that shares a bucket maps them under
+Every object kvik puts in the bucket (`spec.md` §8 Deep) is an **envelope** (below), with two exceptions: claim
+markers and checksum probes are stored unsealed, in the fixed forms given below, since their meaning lies in their
+key (Q-340). Backups are always encrypted: no other object holds plaintext, and neither exception holds any of the
+store's data. The sink's keys belong to kvik alone; a sink that shares a bucket maps them under
 its own prefix, which the engine never sees.
 
 - **Keys.** `<sid>` is the store id (A.1) as 32 lower-case hex digits; every key starts with it. Keys are ASCII,
@@ -707,22 +709,24 @@ its own prefix, which the engine never sees.
   padding) in its canonical encoding, which for a record this build wrote is the bytes `MANIFEST` holds, and
   nothing else; checks: one valid record block, its `generation` and `epoch` those of its key. A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
   The store id is bound by the envelope (key derivation and associated data), not repeated in the plaintext.
-- **Claim marker** (12 bytes, exactly): 0 generation `u32`, that of its key; 4 reset nonce `u64`, the claiming
-  restore's fresh nonce (`spec.md` §8 Generations), never zero. The store id is in the key and bound by the
-  envelope, and the envelope header carries the format version, so the marker repeats neither. The nonce makes
+- **Claim marker** (12 bytes, exactly, unsealed): 0 generation `u32`, that of its key; 4 reset nonce `u64`, the
+  claiming restore's fresh nonce (`spec.md` §8 Generations), never zero. The store id and the generation are in the
+  key, and a claim is read by whether its key exists (`stat`, Q-163), so the marker holds no store id or version. The nonce makes
   each attempt's marker unique (Q-161). A marker is written once; a restore that restarts before its restore record claims the next generation and never puts a
   marker again.
-- **Probe** (Q-162). The plaintext of a probe is 16 random bytes, never read. `attach_backup`, and a restore before
-  it claims, refuse a bucket (`BackupRefused`) when: a put of a fresh probe to `<sid>/probe`, where that key was
-  absent, is followed by a second put of another fresh probe that succeeds, or after which `stat` reports the second
-  object (`NoConditionalWrites`; where the key was present, the first put must fail and `stat` must report the
-  earlier object unchanged); or a put of a fresh probe to `<sid>/probe/<nonce>` with a SHA-256 that is not its own
-  (its own with every bit of byte 0 inverted) succeeds, or leaves an object under the key (`NoChecksums`); or a
-  `stat` reports no SHA-256 (`NoChecksums`). `attach_backup` also refuses a bucket whose `<sid>/STORE` is present
-  with another key check value (`WrongKey`); a restore reports a wrong key as `WrongKey` (`api.md` Backup and
-  restore). A bucket that passes keeps one probe object for ever; the engine never
-  deletes. Versioning or object lock cannot be probed through the sink and is the operator's to confirm. A drill
-  writes nothing and does not probe. How a restore reports a refusal: Q-214.
+- **Probe** (Q-162). The conditional-write probe at `<sid>/probe` is an envelope whose plaintext is never read. A
+  checksum probe at `<sid>/probe/<nonce>` is unsealed: the 19 ASCII bytes `kvik checksum probe` (Q-340).
+  `attach_backup`, and a restore before it claims, refuse a bucket (`BackupRefused`) when: a put of a fresh probe to
+  `<sid>/probe`, where that key was absent, is followed by a second put of another fresh probe that succeeds, or
+  after which `stat` reports the second object (`NoConditionalWrites`; where the key was present, the first put must
+  fail and `stat` must report the earlier object unchanged); or a put of the checksum probe to a fresh
+  `<sid>/probe/<nonce>` with a SHA-256 that is not its own (its own with every bit of byte 0 inverted) succeeds, or
+  leaves an object under the key (`NoChecksums`); or a `stat` reports no SHA-256 (`NoChecksums`). `attach_backup`
+  also refuses a bucket whose `<sid>/STORE` is present with another key check value (`WrongKey`); a restore reports a
+  wrong key as `WrongKey` (`api.md` Backup and restore). A bucket that passes keeps one probe object for ever; the
+  engine never deletes. Versioning or object lock cannot be probed through the sink and is the operator's to
+  confirm. A drill writes nothing and does not probe. A restore reports a refusal as `RestoreError::Refused`
+  (Q-214).
 
 **Envelope.** XChaCha20-Poly1305 from the audited `chacha20poly1305` crate; HMAC-SHA-256 as the key-derivation and
 nonce function. `K` is the application's 256-bit key (`api.md` `Encryption::Key`), `sid` the 16 store id bytes,
