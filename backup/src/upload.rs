@@ -1,5 +1,7 @@
-//! The upload driver (roadmap 8.1c): per file `seal` → `put` → `Verified::check` → a copy-verified record; then each
-//! record whose files are all copied, `STORE` first. The queue is recomputed from the manifest's snapshot.
+//! The upload driver (roadmap 8.1c, `spec.md` §8 Continuous backup, Hashes): `STORE` first; per file `seal` → `put`
+//! → `Verified::check` → a copy-verified record (`0x27`); then each record whose live files are all copied, in epoch
+//! order, after `settle`. The queue is recomputed from the manifest's snapshot (Q-280, Q-282); the record cursor from
+//! a listing of the bucket at the first step.
 
 use std::io;
 use std::time::Duration;
@@ -11,6 +13,11 @@ use kvik_sink_api::{SinkError, VerifyError};
 use crate::DriverFuture;
 use crate::envelope::EnvelopeError;
 use crate::port::PortError;
+
+mod driver;
+mod probe;
+
+pub use driver::Uploader;
 
 /// Drives uploads one object at a time.
 pub trait BackupDriver: Send {

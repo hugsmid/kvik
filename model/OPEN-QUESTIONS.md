@@ -47,7 +47,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
-| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 | Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
 | Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
 | Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
@@ -56,6 +55,13 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-214 | §8 Bucket, Restore; `api.md` Backup and restore; `backup/src/restore.rs` | A restore that meets a bucket it must refuse |
 | Q-270 | §8 Encryption; `format.md` A.17 Reading | Envelope damage that `EnvelopeError` has no variant for |
 | Q-271 | §8 Deep, Generations; `format.md` A.17 Keys, Claim marker, Probe | Where `format.md` A.17 and the backup interfaces disagree |
+| Q-280 | §7 Manifest (rebuild), §8 Continuous backup, Hashes | How a rebuilt manifest queues files for upload again |
+| Q-281 | §8 Hashes; `format.md` A.14 | The copy-verified record (`0x27`): layout and fold |
+| Q-282 | §8 Continuous backup, Generations; §7 Manifest | The upload queue, the record cursor and which records wait |
+| Q-283 | §8 Hashes, Bucket, Generations | The attach probe |
+| Q-284 | §8 Hashes, Upload stalled | Upload failures: retries, other content, an object not reported after its `put` |
+| Q-285 | §8 Continuous backup; `format.md` A.12 | Uploading files with no local layout yet, and the hash a file is checked by |
+| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -889,62 +895,6 @@ Calendar-length interval series are refused by the export, as neither backend st
 **Needed (owner decision pending).** Recommendation: keep `interval_end`; for calendar lengths (7.3) take each end from
 the interval zone under the tzdata version in force at export, recorded in the metadata.
 
-## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
-Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
-**Scenario.** 100 series at 1 Hz, staggered evenly, so a call of one reading every 10 ms; `WriterConfig::default()`
-(`min_sync_interval` 10 ms, mark timed). `design.md` Budgets sets p50 ≤ 5 ms "while syncs are not back to back,
-roughly up to 100 synced batches a second". Three runs: p50 6.95, 6.75 and 7.02 ms; p90 11.54, 11.40 and 11.50; p99
-12.33, 12.33 and 12.24 (inside 20 ms); 99 syncs a second, 1.0 call per batch. The same load with the bound at 0:
-p50 2.36, 0.68 and 2.24 ms. Quiet and 10 × 1 Hz loads pass at the default (p50 2.30–2.52 ms).
-**Cause.** The bound counted from the previous sync's start (spec §3 Group commit, `LogWriter::sync_ready_at`).
-With calls exactly one interval apart, each late timed wake of the writer (about 0.1 ms here) delays every later
-sync, so the wait climbs to the whole interval before two calls share a batch, and latency spreads evenly from the
-sync (2.2 ms here) to the sync plus 10 ms: p50 is the sync plus about 5 ms. Only a wake with no lateness avoids it.
-`design.md`'s statement that the default adds its wait "only when syncs are back to back" does not hold at the rate
-equal to one call per interval. The cause rests on the code and the fit of that spread (predicted p50 / p90 / p99
-7.2 / 11.2 / 12.2 ms), not on a trace. The miss is not the bound's average wait on random arrivals: the harness
-spaces calls evenly, and random arrivals would give about 73 syncs a second with 1.4 calls per batch (measured 99
-and 1.0), p99 about 11 ms at 10 × 1 Hz (measured 2.71–2.79) and p50 about 7 ms on macOS (measured 4.14). So it is
-not inherent in the interval and this drive's sync time; option (b) below would remove it. macOS shows a tail of
-the same size (p90 12.0 ms) without a budget.
-**Options.** (a) Word the p50 budget as applying below 100 synced batches a second at the default, putting this
-load with the higher rates. (b) Stop the lateness compounding: after a wait on the bound, count the next interval
-from when the sync was due, not when it started; two syncs could then start up to the lateness less than the
-interval apart, so spec §3 Group commit's "at least `min_sync_interval` apart" would need rewording, with tests. (c)
-A lower default interval moves the edge to a higher rate, at the cost of the host-write cap roadmap 2.2 measured.
-**Settled** by an engineering fix, pending the next run on the Linux NVMe target. The writer thread confirms the
-cause: it sleeps until `sync_ready_at` with a timed wait and stamps the sync's start when it wakes, so any lateness
-moved the next deadline. Two more ways to start late give the same lasting delay at one call per interval, with no
-spare slot to recover in: a turn entered late with the bound already passed (a call arriving during the timed mark
-sync), and the sync that takes a segment into use at a timed seal, which took a slot of the bound at whatever phase
-it fell. A rule correcting only syncs that waited on the bound misses the first; capping the correction at half an
-interval leaves a stall over half an interval, and a seal late in the interval, as a lasting delay.
-**Rule.** Two clocks. A batch sync is due when the previous one's due time let it start, but at most one interval
-before it starts; the next may start once `min_sync_interval` has passed since that due time and half of it since
-the previous log sync started, a timed seal's included. The seal's sync spaces the next batch but takes no slot.
-So late wakes and stalls are caught up at half-interval spacing and delay later syncs only while the load stays at
-the bound (below), under saturation batch syncs keep to a grid one interval apart, any n + 1 consecutive batch syncs
-span at least n − 1 intervals, no batch sync starts less than half the interval after any log sync, and a call
-during a sync still waits for the next batch. Costs: after a
-quiet period a burst's first batch follows the lone first reading after half the interval rather than a whole one;
-a seal adds one sync per seal interval beyond the bound and delays at most one call, by under half an interval;
-spec §3 Sealing's "counts as the previous log sync for the next batch" now holds for the spacing only.
-**At the bound (owner's ruling: accepted, no rule change).** The catch-up is the one interval by which a due time
-may trail its start; a late start stays stored in the due time. One extra batch (a stray call between two periodic
-ones) spends that interval, and at exactly one call per interval no slot is ever missed to regain it, so every later
-call waits for the stored lateness, under one interval. Scenario: one call every 10 ms, call 10 starting 3 ms late,
-one extra call 6 ms after call 30: calls 11 to 29 wait 20 µs, every call after the extra one waits about 3.1 ms.
-Any rule that bounds the long-run rate at 1/interval has no slack when the load runs at exactly that rate, so an
-extra call can delay later calls until the load drops below the bound; at a 10.1 ms period the same history drains
-within 20 calls. Pinned by
-`at_the_bound_a_stray_call_after_a_late_start_delays_later_calls_until_the_load_drops`.
-**Rejected.** (a) would have kept a known miss at the named load; (c) only moves the edge and spends host writes.
-Anchoring to the oldest call's arrival avoids the burst cost but needs a monotonic stamp on every call and a change
-to the call source, for one batch after a quiet period.
-**Tests.** `log/tests/cadence.rs`: late wakes, stalls of 3, 8 and 30 ms, a seal early and late in the interval
-after a late start, saturation with late wakes and stalls, a burst after a quiet period, a stray call at and just
-below the bound. macOS before and after:
-`docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
 ## Q-198 — The backup and restore interfaces ahead of their implementations
 
 Recorded at the interfaces commit of roadmap 8.1 and 8.3, which defines the types, traits and fakes the parallel
@@ -1071,6 +1021,162 @@ builder for it, and `parse` returns `None` for it, which A.17 allows (a reader i
 change (for (b), a store id field or argument) before anything is uploaded.
 **Model.** Not modelled.
 
+## Q-280 — How a rebuilt manifest queues files for upload again
+
+Recorded and decided by roadmap 8.1c.
+**Scenario.** Segments 1 to 3 are uploaded and each has a copy-verified record (`0x27`). A record is then found
+corrupt and the manifest is rebuilt: the rebuild record comes first and every valid record follows it, carried
+with field 100 (`format.md` A.14), the three `0x27` records included. §7 says a rebuilt manifest takes no file as
+verified in another tier until it is verified there again. Folded as written, the carried `0x27` records would mark
+the files verified again after the rebuild record cleared the marks; ignored, they would leave no copy, and every
+file would be uploaded again.
+**Decided.** A `0x27` carried into a rebuilt manifest (it holds field 100) sets the file's deep copy (`FileEntry::deep`)
+and no verified mark; a `0x27` written since then sets both. The upload queue is every live file not verified in deep
+(not `deep == None`). For a queued file with a copy, the driver asks the bucket for the object's reported size and
+hash; if they equal the copy, it appends a fresh `0x27` with no upload, and otherwise uploads the file as for one with
+no copy (the envelope is deterministic, so the same key takes the same bytes; other content under the key fails,
+Q-284). A copy of a corrupt record appended later (`rebuild::resolve`) carries field 100 too, so it is checked the
+same way. Reason: the copy is a fact about the bucket that the rebuild does not change, so a restore reading the
+rebuilt records still finds it, while eviction and removal wait for the fresh check §7 asks for. Pinned by
+`files/src/catalogue.rs` `q280_a_carried_copy_verified_record_sets_the_copy_but_no_verified_mark` and
+`backup/tests/upload.rs` `q280_a_rebuilt_manifest_verifies_each_copy_again_without_a_new_upload`,
+`q280_a_rebuilt_copy_the_bucket_no_longer_reports_is_uploaded_again`.
+**Model.** Not modelled.
+
+## Q-281 — The copy-verified record (`0x27`): layout and fold
+
+Recorded and decided by roadmap 8.1c. Provisional until review: the layout may change before anything is uploaded.
+**Scenario.** A.14 reserved `0x27` for a tier move; the backup and restore interfaces (Q-198) use it for the
+copy-verified record, which a restore reads to know which files have a copy in deep.
+**Decided.** `0x27` copy verified: 1 the file (12 bytes: kind `u8`, 3 reserved, `file_id` `u64`); 2 the tier `u8`
+(1 hot, 2 cold, 3 deep); 3 the object's size `u64`; 4 its SHA-256 as the bucket reported it (32 bytes); each exactly
+once, other fields below `0x8000` refused as unsupported. Written as a reserved type, so older readers carry it as a
+field list. It names the file by reference only: a rebuild never reconstructs it (A.14), and a file's other facts are
+in the records that publish it. The fold sets the deep copy and the verified mark (Q-280 for a carried one); for a
+file the catalogue does not know it changes nothing. The strict decoding lands in `record.rs` with the last commit
+of 8.1c, as the interfaces commit staged it.
+**Model.** Not modelled.
+
+## Q-282 — The upload queue, the record cursor and which records wait
+
+Recorded and decided by roadmap 8.1c.
+**Scenario.** (a) The store restarts after uploading records up to epoch 40; nothing local says so, and a queue file
+would be a new durable structure. (b) A compacted file is published at epoch 5 and retired by a merge at epoch 9
+before it was uploaded; if record 5 waits for its file, it waits for ever. (c) Settling the last record appends an
+empty record, which is then the last; settling that one too never ends. (d) Files sealed while no sink is attached
+(Q-164 (b)).
+**Decided.** (a) No queue file: the file queue is recomputed at each step from the manifest's snapshot (live files not
+verified in deep, ascending position), and the record cursor is the highest epoch a listing of the generation's
+records shows, read at the driver's first step. A listing that lags only makes the driver `put` records it had
+uploaded, with identical bytes, which the sink accepts. (b) A record waits only for the files it publishes or lists
+that are still live; a file retired before its upload is not uploaded (the files that replace it hold its facts).
+So the files records wait for are exactly the queue. (c) The last record is uploaded only after `settle`; an empty
+last record is never settled, so a drained queue appends at most one empty record and the driver is then `Idle`,
+also after a restart, since the rule reads only the manifest. (d) They are in the snapshot, so they are queued at the
+first step after attach, oldest first (input to Q-164 (b), which roadmap 8.1d settles). Only records at or below the
+snapshot's last epoch are uploaded, so a record whose sync failed never goes up.
+**Model.** Not modelled.
+
+## Q-283 — The attach probe
+
+Recorded and decided by roadmap 8.1c, applying the owner's ruling on Q-162 (a bucket without conditional writes is
+refused).
+**Scenario.** §8 refuses a bucket that holds another store's files and requires a bucket that rejects a hash mismatch
+and honours create-if-absent; the engine never deletes, so the probe's object stays, and a second attach meets it.
+**Decided.** In this order, reads first: (1) the bucket is listed around this store's keys and any key under another
+store id refuses it (`OtherStore`; a lagging listing can miss one, so this is best effort); (2) the bucket's `STORE`,
+if any, must open under the key (`WrongKey`; an unreadable header is a sink failure). Then, on this store's probe
+key: (3) a `put` with a wrong hash must be refused (`NoChecksums` otherwise); (4) the probe content, put with its own
+hash, must be reported back with that size and hash (`NoChecksums` otherwise); (5) a `put` of other content must be
+refused (`NoConditionalWrites` otherwise). At a later attach `Exists` and `HashMismatch` both count as refusals in
+(3) and (5). A bucket that checks the signed payload hash refuses (3) whatever it does with the checksum header, so
+it passes; that is the check the hash rule needs. A sink failure is `Refused::Sink`.
+**Model.** Not modelled.
+
+## Q-284 — Upload failures: retries, other content, an object not reported after its `put`
+
+Recorded and decided by roadmap 8.1c, applying the owner's ruling on Q-82 (an object is lost after 3 failed lookups
+over at least 10 minutes while other calls answer).
+**Scenario.** (a) Transient faults, a busy sink, and a `put` refused with `HashMismatch` (damaged in transit, or after a
+lost reply). (b) Another object already under a file's key. (c) The bucket accepts a `put` and then reports no
+object for the key.
+**Decided.** (a) `Retry`, with delays doubling from `retry_first` to `retry_max`, reset by the next progress;
+`failing_since` is the first failure of the run, which the caller turns into `BackupStalled`. (b) `Failed` (the
+bucket is never overwritten; how the engine recovers is Q-85's). Other content reported after a `put` likewise fails.
+(c) The driver asks again, by `stat` alone, without a new `put`; a lookup counts only when another call to the bucket
+answers in the same step. After 3 counted lookups over at least 10 minutes the object is taken as lost and uploaded
+again. Upload never records a loss: the local file is the source.
+**Model.** Not modelled.
+
+## Q-285 — Uploading files with no local layout yet, and the hash a file is checked by
+
+Recorded by roadmap 8.1c. Open.
+**Scenario.** `format.md` A.12 lays out local paths only for log segments; compacted files, tree checkpoints and the
+other kinds under `data/` and `tree/` have none yet. A compacted file published by roadmap 6.2 or 6.3 is live and
+queued.
+**Decided for now.** The driver reads only log segments; a queued file of another kind fails the upload by name
+(`UploadError::Io`, unsupported), so the gap is visible in health, never skipped silently. A file is checked before
+upload by the SHA-256 of the whole local file against its description's hash (the hash a sealed segment records,
+roadmap 6.3b); a mismatch is `UploadError::LocalHash`.
+**Needed.** The local path of each kind, from the item that lays it out.
+**Model.** Not modelled.
+
+## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
+Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
+**Scenario.** 100 series at 1 Hz, staggered evenly, so a call of one reading every 10 ms; `WriterConfig::default()`
+(`min_sync_interval` 10 ms, mark timed). `design.md` Budgets sets p50 ≤ 5 ms "while syncs are not back to back,
+roughly up to 100 synced batches a second". Three runs: p50 6.95, 6.75 and 7.02 ms; p90 11.54, 11.40 and 11.50; p99
+12.33, 12.33 and 12.24 (inside 20 ms); 99 syncs a second, 1.0 call per batch. The same load with the bound at 0:
+p50 2.36, 0.68 and 2.24 ms. Quiet and 10 × 1 Hz loads pass at the default (p50 2.30–2.52 ms).
+**Cause.** The bound counted from the previous sync's start (spec §3 Group commit, `LogWriter::sync_ready_at`).
+With calls exactly one interval apart, each late timed wake of the writer (about 0.1 ms here) delays every later
+sync, so the wait climbs to the whole interval before two calls share a batch, and latency spreads evenly from the
+sync (2.2 ms here) to the sync plus 10 ms: p50 is the sync plus about 5 ms. Only a wake with no lateness avoids it.
+`design.md`'s statement that the default adds its wait "only when syncs are back to back" does not hold at the rate
+equal to one call per interval. The cause rests on the code and the fit of that spread (predicted p50 / p90 / p99
+7.2 / 11.2 / 12.2 ms), not on a trace. The miss is not the bound's average wait on random arrivals: the harness
+spaces calls evenly, and random arrivals would give about 73 syncs a second with 1.4 calls per batch (measured 99
+and 1.0), p99 about 11 ms at 10 × 1 Hz (measured 2.71–2.79) and p50 about 7 ms on macOS (measured 4.14). So it is
+not inherent in the interval and this drive's sync time; option (b) below would remove it. macOS shows a tail of
+the same size (p90 12.0 ms) without a budget.
+**Options.** (a) Word the p50 budget as applying below 100 synced batches a second at the default, putting this
+load with the higher rates. (b) Stop the lateness compounding: after a wait on the bound, count the next interval
+from when the sync was due, not when it started; two syncs could then start up to the lateness less than the
+interval apart, so spec §3 Group commit's "at least `min_sync_interval` apart" would need rewording, with tests. (c)
+A lower default interval moves the edge to a higher rate, at the cost of the host-write cap roadmap 2.2 measured.
+**Settled** by an engineering fix, pending the next run on the Linux NVMe target. The writer thread confirms the
+cause: it sleeps until `sync_ready_at` with a timed wait and stamps the sync's start when it wakes, so any lateness
+moved the next deadline. Two more ways to start late give the same lasting delay at one call per interval, with no
+spare slot to recover in: a turn entered late with the bound already passed (a call arriving during the timed mark
+sync), and the sync that takes a segment into use at a timed seal, which took a slot of the bound at whatever phase
+it fell. A rule correcting only syncs that waited on the bound misses the first; capping the correction at half an
+interval leaves a stall over half an interval, and a seal late in the interval, as a lasting delay.
+**Rule.** Two clocks. A batch sync is due when the previous one's due time let it start, but at most one interval
+before it starts; the next may start once `min_sync_interval` has passed since that due time and half of it since
+the previous log sync started, a timed seal's included. The seal's sync spaces the next batch but takes no slot.
+So late wakes and stalls are caught up at half-interval spacing and delay later syncs only while the load stays at
+the bound (below), under saturation batch syncs keep to a grid one interval apart, any n + 1 consecutive batch syncs
+span at least n − 1 intervals, no batch sync starts less than half the interval after any log sync, and a call
+during a sync still waits for the next batch. Costs: after a
+quiet period a burst's first batch follows the lone first reading after half the interval rather than a whole one;
+a seal adds one sync per seal interval beyond the bound and delays at most one call, by under half an interval;
+spec §3 Sealing's "counts as the previous log sync for the next batch" now holds for the spacing only.
+**At the bound (owner's ruling: accepted, no rule change).** The catch-up is the one interval by which a due time
+may trail its start; a late start stays stored in the due time. One extra batch (a stray call between two periodic
+ones) spends that interval, and at exactly one call per interval no slot is ever missed to regain it, so every later
+call waits for the stored lateness, under one interval. Scenario: one call every 10 ms, call 10 starting 3 ms late,
+one extra call 6 ms after call 30: calls 11 to 29 wait 20 µs, every call after the extra one waits about 3.1 ms.
+Any rule that bounds the long-run rate at 1/interval has no slack when the load runs at exactly that rate, so an
+extra call can delay later calls until the load drops below the bound; at a 10.1 ms period the same history drains
+within 20 calls. Pinned by
+`at_the_bound_a_stray_call_after_a_late_start_delays_later_calls_until_the_load_drops`.
+**Rejected.** (a) would have kept a known miss at the named load; (c) only moves the edge and spends host writes.
+Anchoring to the oldest call's arrival avoids the burst cost but needs a monotonic stamp on every call and a change
+to the call source, for one batch after a quiet period.
+**Tests.** `log/tests/cadence.rs`: late wakes, stalls of 3, 8 and 30 ms, a seal early and late in the interval
+after a late start, saturation with late wakes and stalls, a burst after a quiet period, a stray call at and just
+below the bound. macOS before and after:
+`docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1083,7 +1189,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1131,7 +1237,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
-| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; remaining mismatches in Q-213 and Q-214 |
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
 | Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
@@ -1140,6 +1245,13 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-214 | 8.3b | A restore's refusal of a bucket; recorded by roadmap 8.1a; needs a change to `backup/src/restore.rs`, roadmap 8.3b's file |
 | Q-270 | 8.1 | Envelope damage mapped onto the existing error variants; recorded by roadmap 8.1b; a `Damaged` variant is the lead's call |
 | Q-271 | 8.1 | A.17 against the interfaces: other kinds' keys, the claim marker, the checksum probe key; recorded by roadmap 8.1b; ruled at the merge of 8.1a and 8.1b |
+| Q-280 | 8.1 | Rebuilt manifest and the upload queue; decided by roadmap 8.1c, for review at the 8.1 gate |
+| Q-281 | 8.1 | Copy-verified record layout; decided by roadmap 8.1c, provisional until the 8.1 gate |
+| Q-282 | 8.1 | Upload queue and record cursor; decided by roadmap 8.1c, for review at the 8.1 gate |
+| Q-283 | 8.1 | Attach probe; decided by roadmap 8.1c under the owner's Q-162 ruling, for review at the 8.1 gate |
+| Q-284 | 8.1 | Upload failures; decided by roadmap 8.1c under the owner's Q-82 ruling, for review at the 8.1 gate |
+| Q-285 | 6.2 | Local layout of kinds other than log segments; the upload driver fails on them until then |
+| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
