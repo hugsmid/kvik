@@ -45,6 +45,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
 | Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
+| Q-202 | §3 Back-pressure, Commit; `api.md` Writing | A definition waiting for its acknowledgement holds up every other decision |
 | Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
 | Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
 | Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
@@ -896,6 +897,21 @@ canonical encoding (`Record::encode`, as the manifest port hands out decoded rec
 key against `<sid>/STORE` (`Refused::WrongKey`). Two mismatches remained, Q-213 and Q-214; roadmap 8.3b settled both.
 **Model.** Not modelled.
 
+## Q-202 — A definition waiting for its acknowledgement holds up every other decision
+
+**Scenario.** The ingest queue holds 60,000 readings behind a slow sync. A `define_series`, `alias`, `retire`,
+parameter or zone change finds room, queues its entry and waits for its acknowledgement (after its batch's sync and
+the forced mark sync) with the durable backend's decision lock held, so that no later decision sees an entry that is
+not yet durable and two definitions of one name cannot take two ids. Until then every `emit` and `try_emit` waits
+for that lock: `try_emit` does not wait for room in the queue, but it does wait for the definition.
+**Now.** No lock is held while a call waits for room (`kvik/tests/durable.rs`
+`with_the_queue_full_try_emit_is_busy_at_once_while_other_calls_wait_for_room`); the wait for an entry's
+acknowledgement is under the lock. A routing change (roadmap 5.2) is decided with the lock already held, so it
+waits for room in a full queue with the lock held too.
+**Needed.** A choice between taking an entry into the decision state when it is queued (a failure leaves the store
+read-only, so nothing is decided after it) and keeping the present wait as an accepted limit of `try_emit`, measured
+with the routing and delivery benchmarks of roadmap 5.5.
+
 ## Q-210 — Telling a bucket that reports no checksum from another sink failure
 Recorded at roadmap 8.1a. To be settled by roadmap 8.1c.
 **Scenario.** The owner ruled that a bucket reporting no checksums is refused (`BackupRefusal::NoChecksums`). The
@@ -1388,6 +1404,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; the remaining mismatches, Q-213 and Q-214, settled by 8.3b |
+| Q-202 | 5.5 | Entries acknowledged under the decision lock; recorded by the review of the durable backend |
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
 | Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
 | Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
