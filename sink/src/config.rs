@@ -1,6 +1,6 @@
 //! [`S3Config`] and its validation.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use kvik::SinkError;
@@ -53,8 +53,9 @@ pub struct S3Config {
     /// Worker threads, that is, calls in flight at once. Default 2.
     pub workers: usize,
     /// Calls waiting for a worker; more fail with `SinkError::Busy`. Dropping
-    /// the sink waits for them: at worst `queue × attempts × exchange_timeout`.
-    /// Default 64.
+    /// the sink waits for them and the running calls: at worst
+    /// `(⌈queue / workers⌉ + 1) × attempts × (5 × exchange_timeout + retry.max)`,
+    /// as one attempt of `put` makes up to five exchanges. Default 64.
     pub queue: usize,
     /// The largest object `put` and `get` handle, held whole in memory;
     /// 1 to [`SINGLE_PART_LIMIT`]. Default [`DEFAULT_MAX_OBJECT_SIZE`].
@@ -225,45 +226,52 @@ fn parse_endpoint(endpoint: &str) -> Result<(&'static str, String), SinkError> {
     Ok((scheme, authority.to_ascii_lowercase()))
 }
 
-/// `host[:port]`: a name of letters, digits, `.` and `-`, or `[v6]`; a port of
-/// 1 to 65535.
+/// `host[:port]`: a DNS name, an IPv4 address or a bracketed IPv6 address,
+/// and a port of 1 to 65535.
 fn is_authority(a: &str) -> bool {
-    let (host, port) = if let Some(rest) = a.strip_prefix('[') {
+    let (host_ok, port) = if let Some(rest) = a.strip_prefix('[') {
         let Some((v6, after)) = rest.split_once(']') else {
             return false;
         };
-        let v6_ok = !v6.is_empty()
-            && v6
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
-        if !v6_ok {
-            return false;
-        }
-        match after {
-            "" => return true,
-            p => (None, p.strip_prefix(':')),
-        }
+        let port = match after {
+            "" => None,
+            p => match p.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return false,
+            },
+        };
+        (v6.parse::<Ipv6Addr>().is_ok(), port)
     } else {
-        match a.split_once(':') {
-            Some((h, p)) => (Some(h), Some(p)),
-            None => (Some(a), None),
-        }
+        let (h, p) = match a.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (a, None),
+        };
+        (h.parse::<Ipv4Addr>().is_ok() || is_dns_name(h), p)
     };
-    let host_ok = host.is_none_or(|h| {
-        !h.is_empty()
-            && h.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    let port_ok = port.is_none_or(|p| {
+        !p.is_empty()
+            && p.len() <= 5
+            && p.chars().all(|c| c.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
     });
-    let port_ok = match port {
-        None => host.is_some(),
-        Some(p) => {
-            !p.is_empty()
-                && p.len() <= 5
-                && p.chars().all(|c| c.is_ascii_digit())
-                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
-        }
-    };
     host_ok && port_ok
+}
+
+/// Labels of 1–63 letters, digits and inner `-`, at most 253 characters in
+/// all; the last label is not all digits (that would be a malformed IPv4).
+fn is_dns_name(h: &str) -> bool {
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    (1..=253).contains(&h.len())
+        && h.split('.').all(label_ok)
+        && !h
+            .rsplit('.')
+            .next()
+            .is_some_and(|l| l.bytes().all(|c| c.is_ascii_digit()))
 }
 
 /// The host of `host[:port]` or `[v6][:port]`.
@@ -309,6 +317,18 @@ mod tests {
         );
         assert!(parse_endpoint("http://[::1]:9000").is_ok());
         assert!(parse_endpoint("http://[::1]").is_ok());
+        for ok in [
+            "https://objects.test",
+            "https://a-b.c-d.test:443",
+            "https://localhost",
+            "https://s3.r-1.objects.test",
+            "https://10.0.0.1:9000",
+            "https://[2001:db8::1]:9000",
+            "https://[::ffff:10.0.0.1]",
+            "https://123abc.test",
+        ] {
+            assert!(parse_endpoint(ok).is_ok(), "{ok}");
+        }
         for bad in [
             "objects.test",
             "https://",
@@ -325,6 +345,22 @@ mod tests {
             "https://[zz]",
             "https://[::1]x",
             "https://a%20b",
+            "https://..",
+            "https://.",
+            "https://-",
+            "https://a..b",
+            "https://.a",
+            "https://a.",
+            "https://-a.test",
+            "https://a-.test",
+            "https://1.2.3",
+            "https://1.2.3.4.5",
+            "https://256.0.0.1",
+            "https://[::1]:",
+            "https://[1.2.3.4]",
+            "https://[::1::2]",
+            "https://[fe80::1%25eth0]",
+            "https://:9000",
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad}");
         }

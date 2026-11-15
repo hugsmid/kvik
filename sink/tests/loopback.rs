@@ -191,3 +191,34 @@ fn a_silent_server_times_out_as_a_transient_fault() {
     assert!(matches!(r, Err(SinkError::Transient { .. })), "{r:?}");
     assert!(started.elapsed() < Duration::from_secs(10));
 }
+
+#[test]
+fn the_http_transport_holds_object_bodies_to_max_object_size() {
+    let bucket = FakeBucket::new();
+    let port = serve(bucket.clone(), Mode::Serve);
+    let sink = sink_for(
+        &bucket,
+        port,
+        RetryPolicy::default(),
+        Duration::from_secs(30),
+    );
+    block_on(sink.put(
+        "log/ten",
+        Arc::from(&b"0123456789"[..]),
+        sha256(b"0123456789"),
+    ))
+    .unwrap();
+    let mut config = sink.config().clone().with_max_object_size(8);
+    config.endpoint = format!("http://127.0.0.1:{port}");
+    let small = S3Sink::new(config).unwrap();
+    assert_eq!(
+        block_on(small.get("log/ten", None)),
+        Err(SinkError::TooLarge { size: 10, limit: 8 })
+    );
+    assert_eq!(
+        block_on(small.get("log/none", None)),
+        Err(SinkError::NotFound {
+            key: "log/none".into()
+        })
+    );
+}

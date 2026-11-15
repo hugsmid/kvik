@@ -48,8 +48,9 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     /// The body of a `PUT`.
     pub body: Option<Arc<[u8]>>,
-    /// The largest response body to read; a longer one is
-    /// [`TransportError::Fatal`].
+    /// The largest body of a 2xx response; a longer one is
+    /// [`TransportError::TooLarge`]. Other statuses are read up to
+    /// [`META_BODY_LIMIT`]; a longer one is [`TransportError::Fatal`].
     pub max_response: u64,
 }
 
@@ -99,7 +100,7 @@ impl Request {
         }
     }
 
-    /// Sets the largest response body to read.
+    /// Sets the largest body of a 2xx response.
     pub fn with_max_response(mut self, limit: u64) -> Self {
         self.max_response = limit;
         self
@@ -108,6 +109,15 @@ impl Request {
     /// The value of a header, by its lower-case name.
     pub fn header(&self, name: &str) -> Option<&str> {
         header(&self.headers, name)
+    }
+
+    /// The largest body read for a response of `status`.
+    pub fn body_limit(&self, status: u16) -> u64 {
+        if (200..300).contains(&status) {
+            self.max_response
+        } else {
+            META_BODY_LIMIT
+        }
     }
 
     /// The full URL, query encoded.
@@ -179,9 +189,30 @@ pub enum TransportError {
     #[error("connection: {0}")]
     Connection(String),
     /// A fault that repeating will not cure (an invalid URL, a refused
-    /// certificate, a body above the read limit).
+    /// certificate, an error body above [`META_BODY_LIMIT`]).
     #[error("{0}")]
     Fatal(String),
+    /// A 2xx body above [`Request::max_response`]; `size` is its declared
+    /// length, or a lower bound when it declared none.
+    #[error("response body of {size} bytes above the limit of {limit}")]
+    TooLarge {
+        /// The body's size, or a lower bound.
+        size: u64,
+        /// The limit.
+        limit: u64,
+    },
+}
+
+/// The error for a body of `size` bytes (or more) above the limit for `status`.
+pub(crate) fn body_too_large(request: &Request, status: u16, size: u64) -> TransportError {
+    let limit = request.body_limit(status);
+    if (200..300).contains(&status) {
+        TransportError::TooLarge { size, limit }
+    } else {
+        TransportError::Fatal(format!(
+            "response body of {size} bytes above the limit of {limit}"
+        ))
+    }
 }
 
 /// One HTTP exchange. Called on the sink's worker threads, so it may block.
@@ -270,12 +301,26 @@ impl Transport for HttpTransport {
         let body = if request.method == Method::Head {
             Vec::new()
         } else {
+            let limit = request.body_limit(status);
+            let declared = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            if let Some(n) = declared.filter(|&n| n > limit) {
+                return Err(body_too_large(request, status, n));
+            }
             response
                 .body_mut()
                 .with_config()
-                .limit(request.max_response)
+                .limit(limit)
                 .read_to_vec()
-                .map_err(map_error)?
+                .map_err(|e| match e {
+                    ureq::Error::BodyExceedsLimit(_) => {
+                        body_too_large(request, status, limit.saturating_add(1))
+                    }
+                    e => map_error(e),
+                })?
         };
         Ok(Response {
             status,

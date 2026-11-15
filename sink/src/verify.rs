@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use kvik::BackupSink;
+use kvik::{BackupSink, SinkError};
 pub use kvik::{Stored, Verified, VerifyError};
 use sha2::{Digest, Sha256};
 
@@ -41,13 +41,17 @@ pub async fn check<S: BackupSink + ?Sized>(
 }
 
 /// The sampled download: the whole object's SHA-256 is the expected one
-/// (decrypting and the plaintext hash are the engine's part).
+/// (decrypting and the plaintext hash are the engine's part). Bytes that do
+/// not match the hash the bucket reports are `Content` too.
 pub async fn download<S: BackupSink + ?Sized>(
     sink: &S,
     key: &str,
     sha256_expected: [u8; 32],
 ) -> Result<Vec<u8>, VerifyError> {
-    let bytes = sink.get(key, None).await?;
+    let bytes = match sink.get(key, None).await {
+        Err(SinkError::HashMismatch { key }) => return Err(VerifyError::Content { key }),
+        other => other?,
+    };
     if sha256(&bytes) != sha256_expected {
         return Err(VerifyError::Content { key: key.into() });
     }

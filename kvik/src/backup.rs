@@ -66,6 +66,8 @@ pub enum SinkError {
     /// sent with it, or reported other content than the one sent. After an
     /// attempt that may have landed this includes another writer's object,
     /// which the sink cannot tell from its own damaged upload (`docs/api.md`).
+    /// From `get`: a whole download whose bytes do not match the SHA-256 the
+    /// bucket reports.
     #[error("the bucket rejected or misreported the SHA-256 of {key}")]
     HashMismatch {
         /// The key.
@@ -92,8 +94,7 @@ pub enum SinkError {
         queued: usize,
     },
     /// A fault that a later attempt may not meet: a timeout, a lost
-    /// connection, a server error, throttling, or a download whose bytes do
-    /// not match what the bucket reports. A `put` that fails this way may
+    /// connection, a server error, throttling, or a download cut short. A `put` that fails this way may
     /// have stored the object; repeating it is safe.
     #[error("transient: {reason}")]
     Transient {

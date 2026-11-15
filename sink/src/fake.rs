@@ -13,7 +13,7 @@ use crate::config::S3Config;
 use crate::retry::{Pause, RetryPolicy, SystemWallClock};
 use crate::s3::S3Sink;
 use crate::sigv4::{self, Credentials, ToSign};
-use crate::transport::{Method, Request, Response, Transport, TransportError};
+use crate::transport::{Method, Request, Response, Transport, TransportError, body_too_large};
 use crate::xml;
 
 /// The endpoint a fake answers for (a reserved name: it never resolves).
@@ -406,12 +406,8 @@ impl Transport for FakeBucket {
             _ => {}
         }
         let mut resp = self.handle(req);
-        if resp.body.len() as u64 > req.max_response {
-            return Err(TransportError::Fatal(format!(
-                "response body of {} bytes above the limit of {}",
-                resp.body.len(),
-                req.max_response
-            )));
+        if resp.body.len() as u64 > req.body_limit(resp.status) {
+            return Err(body_too_large(req, resp.status, resp.body.len() as u64));
         }
         match fault {
             Some(Fault::TimeoutAfter) => Err(TransportError::Timeout(

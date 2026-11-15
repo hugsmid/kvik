@@ -430,11 +430,14 @@ only, boxed `Send` futures):
   restore's, so a restore treats it as possibly lost, not as corruption, and claims the next generation.
 - **Hashes.** `put` sends the SHA-256 with a single-part upload, and the bucket must reject a mismatch
   (`HashMismatch`); the returned `Stored` is what the bucket reports when asked after the upload, and `put` fails
-  with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`.
+  with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`. A whole
+  `get` whose bytes do not match the SHA-256 the bucket reports is `HashMismatch`, not retried: the whole declared body
+  arrived, so the damage did not happen in transit (what the engine then concludes is Q-82). The sampled download
+  reports it as `VerifyError::Content`.
 - **Ranges** are half-open; an empty range within the object returns no bytes; one past its end is `InvalidRange`.
 - **Listings** are paged and may lag behind writes on some buckets: absence from a listing proves nothing, and `put`
   alone decides whether a key is taken.
-- `Transient` faults (timeouts, lost connections, server errors, throttling, damaged downloads) and `Busy` (the
+- `Transient` faults (timeouts, lost connections, server errors, throttling, downloads cut short) and `Busy` (the
   sink's queue is full) may be retried; a `put` that failed this way may have stored the object, and repeating it
   is safe. `BackupError::Sink` carries a `SinkError`.
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and

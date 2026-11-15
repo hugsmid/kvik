@@ -120,10 +120,19 @@ fn a_bucket_that_does_not_check_is_caught_by_the_sampled_download() {
     assert!(bucket.damage("data/t"));
     assert!(block_on(verify::check(&sink, "data/t", copy.stored())).is_ok());
     let r = block_on(verify::download(&sink, "data/t", sha256(good)));
-    assert!(matches!(
+    assert_eq!(
         r,
-        Err(VerifyError::Sink(SinkError::Transient { .. }))
-    ));
+        Err(VerifyError::Content {
+            key: "data/t".into()
+        })
+    );
+    assert_eq!(bucket.count(FakeOp::Get), 1);
+    assert_eq!(
+        block_on(sink.get("data/t", None)),
+        Err(SinkError::HashMismatch {
+            key: "data/t".into()
+        })
+    );
     assert_eq!(
         block_on(sink.get("data/t", Some(1..4))).unwrap(),
         good[1..4].to_vec()
@@ -597,7 +606,21 @@ fn invalid_keys_are_refused() {
         block_on(sink.stat(&long)),
         Err(SinkError::Failed { .. })
     ));
+    for dotted in ["..", ".", "a/../b", "./a", "a/.", "a/..", "../a"] {
+        assert!(
+            matches!(put(&sink, dotted, b"x"), Err(SinkError::Failed { .. })),
+            "{dotted}"
+        );
+        assert!(
+            matches!(
+                block_on(sink.get(dotted, None)),
+                Err(SinkError::Failed { .. })
+            ),
+            "{dotted}"
+        );
+    }
     assert_eq!(bucket.count(FakeOp::Any), 0);
+    put(&sink, "a/..b/.c/d..", b"x").unwrap();
 }
 
 #[test]

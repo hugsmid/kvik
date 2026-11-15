@@ -28,7 +28,7 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// A policy.
+    /// `attempts` in all (at least 1), pausing `base` and doubling up to `max`.
     pub fn new(attempts: u32, base: Duration, max: Duration) -> Self {
         RetryPolicy {
             attempts: attempts.max(1),

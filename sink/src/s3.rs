@@ -121,6 +121,12 @@ fn check_key(key: &str) -> Result<(), SinkError> {
             key.len()
         )));
     }
+    // Clients and servers may normalise dot segments away, so the object named would not be the key.
+    if key.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(failed(format!(
+            "a key must have no `.` or `..` segment: {key:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -282,10 +288,17 @@ impl Inner {
     }
 
     fn send(&self, request: &Request) -> Result<Response, SinkError> {
-        self.transport.send(request).map_err(|e| match e {
+        self.transport
+            .send(request)
+            .map_err(|e| self.transport_error(e))
+    }
+
+    fn transport_error(&self, e: TransportError) -> SinkError {
+        match e {
             TransportError::Timeout(_) | TransportError::Connection(_) => transient(e.to_string()),
             TransportError::Fatal(r) => failed(r),
-        })
+            e @ TransportError::TooLarge { .. } => failed(e.to_string()),
+        }
     }
 
     /// The error for a status the operation did not expect.
@@ -356,8 +369,8 @@ impl Inner {
         }
     }
 
-    /// Whether the bucket exists, asked on every 404 of a key, so that a
-    /// missing bucket is `Failed`, never an absent key.
+    /// Whether the bucket exists, asked on every 404 to a `HEAD` of a key, so
+    /// that a missing bucket is `Failed`, never an absent key.
     fn check_bucket(&self) -> Result<(), SinkError> {
         let request = self.request(
             Method::Head,
@@ -426,16 +439,16 @@ impl Inner {
                 format!("bytes={}-{}", r.start, r.end - 1),
             )];
         }
-        let limit = match &range {
-            Some(r) => r.end - r.start,
-            None => self.cfg.max_object_size,
-        };
-        if limit > self.cfg.max_object_size {
+        let limit = self.cfg.max_object_size;
+        if let Some(r) = &range
+            && r.end - r.start > limit
+        {
             return Err(SinkError::TooLarge {
-                size: limit,
-                limit: self.cfg.max_object_size,
+                size: r.end - r.start,
+                limit,
             });
         }
+        // A bucket may answer a range with the whole object (200), so ranged bodies get the object cap too.
         let request = self
             .request(
                 Method::Get,
@@ -445,8 +458,13 @@ impl Inner {
                 None,
                 EMPTY_SHA256,
             )
-            .with_max_response(limit.max(META_BODY_LIMIT));
-        let resp = self.send(&request)?;
+            .with_max_response(limit);
+        let resp = match self.transport.send(&request) {
+            Err(TransportError::TooLarge { size, .. }) => {
+                return Err(SinkError::TooLarge { size, limit });
+            }
+            other => other.map_err(|e| self.transport_error(e))?,
+        };
         let declared = resp
             .header("content-length")
             .and_then(|v| v.trim().parse::<u64>().ok());
@@ -465,28 +483,27 @@ impl Inner {
                         "the bucket reported no whole-object SHA-256 for {key}"
                     ))
                 })?;
+                // The whole declared body arrived, so a mismatch is in the bucket, not in transit.
                 if <[u8; 32]>::from(Sha256::digest(&resp.body)) != reported {
-                    return Err(transient(format!(
-                        "{key}: downloaded bytes do not match the reported SHA-256"
-                    )));
+                    return Err(SinkError::HashMismatch { key: key.into() });
                 }
                 Ok(resp.body)
             }
             (206, Some(r)) => {
-                let (first, last, total) = resp
+                let (first, end, total) = resp
                     .header("content-range")
                     .and_then(parse_content_range)
                     .ok_or_else(|| failed(format!("{key}: no readable Content-Range")))?;
-                if first != r.start || last < first {
+                if first != r.start {
                     return Err(failed(format!(
                         "{key}: Content-Range does not match the request"
                     )));
                 }
-                if resp.body.len() as u64 != last - first + 1 {
+                if resp.body.len() as u64 != end - first {
                     return Err(transient(format!("{key}: ranged body cut short")));
                 }
-                if last + 1 < r.end {
-                    return if total.is_some_and(|t| t <= last + 1) {
+                if end < r.end {
+                    return if total.is_some_and(|t| t <= end) {
                         Err(invalid())
                     } else {
                         Err(transient(format!("{key}: fewer bytes than asked for")))
@@ -599,17 +616,21 @@ fn reported_sha256(resp: &Response) -> Option<[u8; 32]> {
     B64.decode(v.trim()).ok()?.try_into().ok()
 }
 
-/// `bytes first-last/total` (total may be `*`).
+/// `bytes first-last/total` (total may be `*`) as the half-open
+/// `(first, last + 1, total)`; `None` unless `first <= last < total` and
+/// `last + 1` fits.
 fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = v.trim().strip_prefix("bytes ")?;
     let (span, total) = rest.split_once('/')?;
     let (a, b) = span.split_once('-')?;
-    let total = if total == "*" {
+    let total: Option<u64> = if total == "*" {
         None
     } else {
         Some(total.parse().ok()?)
     };
-    Some((a.parse().ok()?, b.parse().ok()?, total))
+    let (first, last): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
+    let end = last.checked_add(1)?;
+    (first <= last && total.is_none_or(|t| end <= t)).then_some((first, end, total))
 }
 
 #[cfg(test)]
@@ -620,10 +641,19 @@ mod tests {
     fn content_range_is_parsed() {
         assert_eq!(
             parse_content_range("bytes 0-9/100"),
-            Some((0, 9, Some(100)))
+            Some((0, 10, Some(100)))
         );
-        assert_eq!(parse_content_range("bytes 5-6/*"), Some((5, 6, None)));
-        assert_eq!(parse_content_range("items 0-9/100"), None);
+        assert_eq!(parse_content_range("bytes 5-6/*"), Some((5, 7, None)));
+        assert_eq!(parse_content_range("bytes 0-9/10"), Some((0, 10, Some(10))));
+        for bad in [
+            "items 0-9/100",
+            "bytes 0-18446744073709551615/*",
+            "bytes 9-0/100",
+            "bytes 0-9/9",
+            "bytes 0-x/*",
+        ] {
+            assert_eq!(parse_content_range(bad), None, "{bad}");
+        }
     }
 
     #[test]
