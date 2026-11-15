@@ -26,3 +26,7 @@ proptest = "1"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "commit_latency"
+test = true

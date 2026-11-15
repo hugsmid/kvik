@@ -28,7 +28,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -210,10 +210,14 @@ fn sorted(mut v: Vec<u64>) -> Vec<u64> {
 
 // ----- acknowledgement stamps -----
 
+/// How long an acknowledged call may wait for its waker before the run fails.
+const STAMP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Records when the writer thread completes a call: the waker of its [`Pending`].
 #[derive(Debug, Default)]
 struct Stamp {
     at: Mutex<Option<Instant>>,
+    set: Condvar,
 }
 
 impl Stamp {
@@ -221,7 +225,19 @@ impl Stamp {
         let mut at = lock(&self.at);
         if at.is_none() {
             *at = Some(Instant::now());
+            self.set.notify_all();
         }
+    }
+
+    /// Blocks until the stamp is set. The writer publishes a call's result before it wakes the waker, so a caller
+    /// can see the result first; once `poll` has returned `Pending` the wake is certain.
+    fn wait(&self) -> Instant {
+        let at = lock(&self.at);
+        let (at, _) = self
+            .set
+            .wait_timeout_while(at, STAMP_TIMEOUT, |at| at.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        at.expect("the writer acknowledged a call but did not wake its waker")
     }
 }
 
@@ -263,7 +279,7 @@ fn track(t0: Instant, mut pending: Pending) -> Sent {
 
 /// Waits for every call sent and returns their latencies in ns and the number that failed.
 fn collector(rx: mpsc::Receiver<Sent>) -> JoinHandle<(Vec<u64>, u64, Option<Instant>)> {
-    std::thread::spawn(move || {
+    let run = move || {
         let mut lat = Vec::new();
         let mut failed = 0;
         let mut last = None;
@@ -276,12 +292,16 @@ fn collector(rx: mpsc::Receiver<Sent>) -> JoinHandle<(Vec<u64>, u64, Option<Inst
                 failed += 1;
                 continue;
             }
-            let at = lock(&s.stamp.at).expect("a completed call has been stamped");
+            let at = s.stamp.wait();
             lat.push(nanos(at.saturating_duration_since(s.t0)));
             last = Some(last.map_or(at, |l: Instant| l.max(at)));
         }
         (lat, failed, last)
-    })
+    };
+    std::thread::Builder::new()
+        .name("collector".into())
+        .spawn(run)
+        .expect("start the collector")
 }
 
 // ----- loads -----
@@ -540,7 +560,10 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                     }
                     Err(e) => panic!("submit failed: {e}"),
                 };
-                tx.send(track(t0, p)).expect("collector runs");
+                // A send fails only once the collector has panicked; its join below reports why.
+                if tx.send(track(t0, p)).is_err() {
+                    break;
+                }
                 calls += 1;
                 readings += 1;
             }
@@ -556,7 +579,9 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                 if let Outcome::Pending(p) = s.outcome {
                     s.outcome = Outcome::Ready(p.wait());
                 }
-                tx.send(s).expect("collector runs");
+                if tx.send(s).is_err() {
+                    break;
+                }
                 calls += 1;
                 readings += 1;
             }
@@ -578,7 +603,9 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                                 .collect();
                             let t0 = Instant::now();
                             let p = log.submit(items).expect("submit under saturation");
-                            tx.send(track(t0, p)).expect("collector runs");
+                            if tx.send(track(t0, p)).is_err() {
+                                break;
+                            }
                             n += 1;
                         }
                         n
@@ -593,7 +620,8 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
         }
     }
     drop(tx);
-    let (lat, failed, last) = coll.join().expect("the collector");
+    // The collector's panic hook has printed the reason; carry its panic on without a second message.
+    let (lat, failed, last) = coll.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
     let secs = last.map_or(0.0, |l| l.saturating_duration_since(start).as_secs_f64());
     let after = log.stats();
     Run {
@@ -1240,4 +1268,37 @@ fn main() {
         let _ = std::fs::remove_dir_all(&root);
     }
     assert_eq!(failed, 0, "every call was acknowledged");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamp_wait_blocks_until_a_late_wake() {
+        let stamp = Arc::new(Stamp::default());
+        let waker = Waker::from(stamp.clone());
+        let before = Instant::now();
+        let waking = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            waker.wake();
+        });
+        let at = stamp.wait();
+        waking.join().expect("the waking thread");
+        assert!(at >= before + Duration::from_millis(50));
+        assert!(
+            before.elapsed() < STAMP_TIMEOUT / 2,
+            "the wake notifies the waiter"
+        );
+    }
+
+    #[test]
+    fn stamp_keeps_the_first_wake() {
+        let stamp = Arc::new(Stamp::default());
+        stamp.set_now();
+        let first = stamp.wait();
+        std::thread::sleep(Duration::from_millis(5));
+        stamp.set_now();
+        assert_eq!(stamp.wait(), first);
+    }
 }
