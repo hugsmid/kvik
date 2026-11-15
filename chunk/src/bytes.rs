@@ -163,22 +163,23 @@ pub(crate) fn unpack(
     let total_bits = count as u64 * u64::from(width);
     let len = usize::try_from(total_bits.div_ceil(8)).map_err(|_| ColumnError::Truncated)?;
     let bytes = r.bytes(len)?;
-    let mut acc: u128 = 0;
-    let mut n: u32 = 0;
-    let mut it = bytes.iter();
     let m = mask(width);
-    for _ in 0..count {
-        while n < width {
-            // `len` covers every bit read here.
-            let b = it.next().copied().unwrap_or(0);
-            acc |= u128::from(b) << n;
-            n += 8;
+    let w = width as usize;
+    for i in 0..count {
+        let bit = i * w;
+        let (byte, shift) = (bit >> 3, (bit & 7) as u32);
+        // A value spans at most 9 bytes (64 bits at an offset of 7); read 16 where they exist.
+        let mut a = [0u8; 16];
+        if byte + 16 <= bytes.len() {
+            a.copy_from_slice(&bytes[byte..byte + 16]);
+        } else {
+            let tail = &bytes[byte.min(bytes.len())..];
+            a[..tail.len()].copy_from_slice(tail);
         }
-        f((acc as u64) & m);
-        acc >>= width;
-        n -= width;
+        f(((u128::from_le_bytes(a) >> shift) as u64) & m);
     }
-    if acc != 0 {
+    let used = (total_bits % 8) as u32;
+    if used != 0 && bytes.last().is_some_and(|&b| b >> used != 0) {
         return Err(ColumnError::Padding);
     }
     Ok(())

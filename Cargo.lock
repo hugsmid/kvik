@@ -310,6 +310,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bytes",
+ "kvik-chunk",
  "parquet",
  "proptest",
  "zstd",
