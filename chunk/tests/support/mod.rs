@@ -217,3 +217,80 @@ pub fn temperature(n: usize) -> Block {
             .collect(),
     )
 }
+
+/// A block of `f64` values drawn in runs from a few readings that share their high bits and do not fit a decimal
+/// exponent, so that the XOR class is usually the canonical choice, in either encoding.
+pub fn xor_block() -> impl Strategy<Value = Block> {
+    (
+        prop::collection::vec(any::<u64>(), 1..=6),
+        prop::collection::vec((any::<prop::sample::Index>(), 1usize..=4), 1..=1_000),
+    )
+        .prop_map(|(pool, runs)| {
+            let readings: Vec<u64> = pool
+                .iter()
+                .map(|m| (1.0 + (m >> 12) as f64 / (1u64 << 52) as f64).to_bits() | 1)
+                .collect();
+            let mut values = Vec::new();
+            for (at, len) in runs {
+                values.extend(std::iter::repeat_n(readings[at.index(readings.len())], len));
+            }
+            values.truncate(kvik_chunk::MAX_ROWS);
+            let mut b = temperature(values.len());
+            b.value = values;
+            b
+        })
+}
+
+/// The value words of a block: the rows that have a value, in row order.
+pub fn value_words(b: &Block) -> Vec<u64> {
+    (0..b.len())
+        .filter(|&i| b.flags[i] & flag::NO_VALUE == 0)
+        .map(|i| b.value[i])
+        .collect()
+}
+
+/// `body` with its value column (id 6) replaced; the directory is rewritten in place.
+pub fn with_value(body: &[u8], enc: u8, payload: &[u8]) -> Vec<u8> {
+    let count = usize::from(body[2]);
+    let mut dir = Vec::with_capacity(count);
+    let mut at = 3;
+    for _ in 0..count {
+        let (id, e) = (body[at], body[at + 1]);
+        at += 2;
+        let (mut len, mut shift) = (0usize, 0);
+        loop {
+            let b = body[at];
+            at += 1;
+            len |= usize::from(b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        dir.push((id, e, len));
+    }
+    let mut payloads = Vec::with_capacity(count);
+    for &(_, _, len) in &dir {
+        payloads.push(&body[at..at + len]);
+        at += len;
+    }
+    let mut out = body[..3].to_vec();
+    for (i, &(id, e, _)) in dir.iter().enumerate() {
+        let (e, p) = if id == 6 {
+            (enc, payload)
+        } else {
+            (e, payloads[i])
+        };
+        out.extend_from_slice(&[id, e]);
+        let mut len = p.len();
+        while len >= 0x80 {
+            out.push(len as u8 | 0x80);
+            len >>= 7;
+        }
+        out.push(len as u8);
+    }
+    for (i, &(id, _, _)) in dir.iter().enumerate() {
+        out.extend_from_slice(if id == 6 { payload } else { payloads[i] });
+    }
+    out
+}

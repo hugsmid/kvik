@@ -8,6 +8,7 @@ use kvik_chunk::float::{
     best_decimal, decode_decimal, decode_xor, decode_xor_zstd, encode_decimal, encode_xor,
     encode_xor_zstd, max_xor_len, min_exponent, scaled,
 };
+use kvik_chunk::fuzz::equivalent_canonical;
 use kvik_chunk::ints::{
     decode_delta, decode_plain, decode_run_length, delta_len, encode_delta, encode_plain,
     encode_run_length,
@@ -16,13 +17,36 @@ use kvik_chunk::{Block, DecodeError, encoding};
 use proptest::prelude::*;
 use support::*;
 
+/// Every value column a writer could consider for `b`, each in a copy of `body`.
+fn value_alternatives(b: &Block, body: &[u8]) -> Vec<Vec<u8>> {
+    let words = value_words(b);
+    let ints: Vec<i64> = words.iter().map(|&w| w as i64).collect();
+    let mut payloads = vec![
+        (encoding::PLAIN, encode_plain(&words)),
+        (encoding::RUN_LENGTH, encode_run_length(&words)),
+        (encoding::DELTA, encode_delta(&ints)),
+    ];
+    payloads.extend((0..=18).map(|e| (encoding::DECIMAL, encode_decimal(&words, e))));
+    let xor = encode_xor(&words);
+    for level in [1, 3, 19] {
+        let mut p = (xor.len() as u32).to_le_bytes().to_vec();
+        p.extend_from_slice(&zstd::bulk::compress(&xor, level).unwrap());
+        payloads.push((encoding::XOR_ZSTD, p));
+    }
+    payloads.push((encoding::XOR, xor));
+    payloads
+        .iter()
+        .map(|(enc, p)| with_value(body, *enc, p))
+        .collect()
+}
+
 /// Checks what any body that decodes must satisfy.
 fn check_decoded(body: &[u8]) {
     if let Ok(b) = Block::decode(body) {
         let again = b.encode().expect("decoded content is valid");
         assert_eq!(Block::decode(&again), Ok(b.clone()));
         if Block::decode_canonical(body).is_ok() {
-            // Canonical means the encoder's own output (the XOR class compared by its stream, C.10).
+            assert!(equivalent_canonical(body, &again));
             assert_eq!(Block::decode_canonical(&again), Ok(b));
         }
     }
@@ -35,6 +59,17 @@ proptest! {
         prop_assert_eq!(Block::decode(&body), Ok(b.clone()));
         prop_assert_eq!(Block::decode_canonical(&body), Ok(b.clone()));
         prop_assert_eq!(Block::decode(&body).unwrap().encode().unwrap(), body);
+    }
+
+    #[test]
+    fn a_body_accepted_as_canonical_is_encoder_output(b in prop_oneof![any_block(), xor_block()]) {
+        let body = b.encode().unwrap();
+        for alt in value_alternatives(&b, &body) {
+            if let Ok(d) = Block::decode_canonical(&alt) {
+                prop_assert_eq!(&d, &b);
+                prop_assert!(equivalent_canonical(&alt, &body));
+            }
+        }
     }
 
     #[test]
