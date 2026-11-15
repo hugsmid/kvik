@@ -35,7 +35,7 @@ again; nothing after a gate starts before it is passed.
 - [x] 4.2 Segment container: header, blocks, checksums; reader up to the durable mark; golden files; fuzz target
 - [x] 4.3 Arrival batches: encode, decode, round-trip property tests
 - [x] 4.4 Commit path: group commit, sync, durable mark, positions (the Windows name-durability check of `format.md`
-  A.13 moved to 4.8; the 5 % low disk mark waits for a file-system size in the seam, Q-115 (e))
+  A.13 moved to 4.8 and then to gate 4.9; the 5 % low disk mark waits for a file-system size in the seam, Q-115 (e))
 - [x] 4.5 Recovery: boot identity rule, torn tail; kill-loop harness; injected sync errors and full disk (points left
   to later items in Q-116)
 - [x] 4.6 Second-process reader and leases (in `kvik-log`; the interface `Reader`'s `facts` and series lookup moved to 5.1)
@@ -43,7 +43,8 @@ again; nothing after a gate starts before it is passed.
 - [x] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/` (recorded on macOS; pending:
   the run on the Linux NVMe target that checks the delivery budget, `scripts/bench-nvme.sh`, and the cloud-runner
   figures of the `bench.yml` workflow; Q-52 (b), Q-86 (b) and Q-115 (j) moved to gate 4.9)
-- [ ] 4.9 **Gate** — log looked at as a whole
+- [ ] 4.9 **Gate** — log looked at as a whole (inputs include the 4.8 run on the Linux NVMe target,
+  `scripts/bench-nvme.sh`)
 
 ## 5. Delivery
 - [ ] 5.1 Series registry; the `kvik` crate on the durable log: writing, and `facts`, series lookup and `refresh` for

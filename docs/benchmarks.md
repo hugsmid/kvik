@@ -204,7 +204,7 @@ Planned as a workspace crate, `bench/`, kept out of the engine's dependencies.
 ## When
 | Stage | After | Scope |
 |---|---|---|
-| Preview 1 | roadmap 4.8 (log benchmarks) | M1, M3, M4 (kill loop and fault injection only) and M8 on W2, against SQLite and one other tool |
+| Preview 1 | roadmap 4.8 (log benchmarks); now due, not part of 4.8 | M1, M3, M4 (kill loop and fault injection only) and M8 on W2, against SQLite and one other tool |
 | Preview 2 | roadmap 5.5 (delivery benchmarks) | M2 and M6 on W1, against the message-log pairing |
 | Full run | roadmap 10.1 (scale test) | every workload and metric, every candidate, real power cuts; roadmap 10.2 |
 

@@ -38,15 +38,17 @@ jobs:
         with:
           key: bench
       - run: cargo build --release --locked -p kvik-log --example commit_latency
-      - name: Run (the runner's temporary directory, on its own disk)
+      - name: Run (in the runner's temporary directory)
         shell: bash
+        env:
+          LENGTH: ${{ inputs.length }}
         run: |
           flag=""
-          if [ "${{ inputs.length }}" != "full" ]; then flag="--short"; fi
+          if [ "$LENGTH" != "full" ]; then flag="--short"; fi
           {
             echo "# Commit latency on ${{ matrix.os }}: a cloud virtual machine, not the NVMe target"
             echo
-            if [ "${{ runner.os }}" = "Windows" ]; then
+            if [ "$RUNNER_OS" = "Windows" ]; then
               echo "On Windows the production writer syncs the mark at every commit; the timed-mark rows are for comparison only."
               echo
             fi

@@ -1130,18 +1130,20 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Commit latency per acknowledged call, ms\n\n\
-         | Load | `min_sync_interval` | Mark sync |{rh} Calls | p50 | p90 | p99 | p99.9 | max | Lag p99 | Busy |\n\
-         |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|"
+         | Load | `min_sync_interval` | Mark sync |{rh} Calls | p50 | p90 | p99 | p99.9 | max | Lag p99 | Lag max | Busy |\n\
+         |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for (rep, r) in &runs {
-        let lag = if matches!(r.load, Load::BackToBack | Load::Saturation { .. }) {
-            "–".into()
+        // How late the generator sent, for the open-loop loads: latency counts from the submit call, so lateness
+        // would not show in it (coordinated omission) but would bunch arrivals.
+        let (lag, lag_max) = if matches!(r.load, Load::BackToBack | Load::Saturation { .. }) {
+            ("–".into(), "–".into())
         } else {
-            pct(&r.lag, 99.0)
+            (pct(&r.lag, 99.0), ms(r.lag.last().copied().unwrap_or(0)))
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} |{} {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} |{} {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.load.name(),
             r.setup.interval(),
             r.setup.mark(),
@@ -1153,6 +1155,7 @@ fn main() {
             pct(&r.lat, 99.9),
             ms(r.lat.last().copied().unwrap_or(0)),
             lag,
+            lag_max,
             r.busy,
         );
     }

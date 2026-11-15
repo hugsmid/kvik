@@ -163,9 +163,9 @@ fails writes on demand), that each rewrite reaches the disk. If it does not, the
 manifest, rewrite it to a new file and rename it; for the log, copy the kept batches to a new segment and rename it;
 for a seal, the same copy before the rename to `.kvl`.
 To be settled on each platform. Roadmap 4.8 did not settle it: the check needs a device that fails writes on demand
-(on Linux, for example a device-mapper target that fails or drops writes) or power cuts, which its timing harness on
-a development machine and on cloud runners cannot give (`docs/measurements/4.8-commit-latency.md`, Pending). Moved to
-gate 4.9, with the owner's run on the target hardware.
+(on Linux, for example a device-mapper target that fails or drops writes) or power cuts, which its timing runs do not
+give (`docs/measurements/4.8-commit-latency.md`). A hosted Linux runner with root could build such a device-mapper
+target; gate 4.9 will try that, with the owner's run on the target hardware.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -247,9 +247,10 @@ may find. (b) stays a write failure (`spec.md` §3 Segments); what remains is to
 file system of roadmap 4.5 that no acknowledged byte or dirty page is lost. **Roadmap 4.5** does not confirm it: its
 in-memory file system fails a write for lack of space only when a file grows, so a batch written into a preallocated
 segment never meets the case; it is confirmed by trials on a copy-on-write file system at roadmap 4.8. **Roadmap 4.8**
-ran none: filling a copy-on-write file system needs a small volume of its own (a loop device with Btrfs, or a disk
-image with APFS), which its timing harness does not create, and filling the development machine's own disk is not
-an option. The trial moves to gate 4.9, with the owner's hardware run (`docs/measurements/4.8-commit-latency.md`).
+ran none: filling a copy-on-write file system needs a small volume of its own, which its timing harness does not
+create, and filling the development machine's own disk is not an option. A hosted Linux runner with root could fill
+Btrfs on a loop device; gate 4.9 will try that, with the owner's hardware run
+(`docs/measurements/4.8-commit-latency.md`).
 
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
@@ -515,10 +516,11 @@ lease file names, a void lease's included; an unreadable lease file counts as in
 the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
-(n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments
-(446–639 MiB) again, after a clean shutdown with a warm page cache, against the 1 s budget, and about 130 ms for two
-empty segments, so the time is mostly reading the unsealed 64 MiB segments whole; a cold cache, a crash and the
-Linux target are still to measure (`docs/measurements/4.8-commit-latency.md`). (o) A start on the same boot writes the slot of the mark it read again in place and syncs it
+(n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments (446–639 MiB) again, after a clean
+shutdown with a warm page cache, against the 1 s budget, and 129–138 ms for two segments holding almost nothing, so
+the time is mostly reading the unsealed 64 MiB segments whole; a cold cache, a crash and the Linux target are still to
+measure (`docs/measurements/4.8-commit-latency.md`).
+(o) A start on the same boot writes the slot of the mark it read again in place and syncs it
 before it resumes, in every mode, as `format.md` A.10 Update requires since Q-122; a reader is not held back
 meanwhile. (p) Left as it is: that later
 start writes the header again from the segment's first complete batch; a torn batch alone in the segment is deleted
