@@ -491,8 +491,9 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         resumed: bool,
     ) -> Result<Prepared, RestoreError> {
         let g = record.generation;
-        // A drill never writes to the bucket, whatever the directory holds.
-        if !record.drill && !self.drill() {
+        // `record.drill` is the configured mode here: `prepare_inner` refuses a directory of the other mode and
+        // `check_plan` a plan of it, so a drill never writes to the bucket.
+        if !record.drill {
             appender.settle(written.epoch, wall)?;
             let key = keys.record(g, written.epoch);
             let sealed = env.seal(
