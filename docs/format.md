@@ -462,7 +462,7 @@ exists; a new file is created only when none exists.
 <dir>/cursors/<consumer name>.cur            kind 4 (A.15)
 <dir>/leases/<reader_id:32 hex>.lease        kind 8 (A.15)
 <dir>/registry/<generation:8 hex>-<file_id:16 hex>.reg   kind 5 (A.16)
-<dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.1, 7.1 and 8.1
+<dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.2, 7.1 and 8.1
 ```
 - Hex is lower-case and zero-padded to the stated width; extensions are lower-case. Readers match names exactly and
   ignore any other name. A consumer name is `[a-z0-9][a-z0-9._-]{0,63}`, so it is its own file name.
