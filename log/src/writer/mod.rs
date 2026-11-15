@@ -101,7 +101,8 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// `log.seal_interval`: a segment in use this long is sealed, if it holds a batch.
     pub seal_interval: Duration,
-    /// `log.min_sync_interval`: log syncs start at least this far apart; zero disables the bound.
+    /// `log.min_sync_interval`: log syncs are due at least this far apart (spec §3 Group commit, Q-310); zero
+    /// disables the bound.
     pub min_sync_interval: Duration,
     /// `log.max_batch_bytes`: 64 KiB to 8 MiB.
     pub max_batch_bytes: u64,
@@ -544,7 +545,8 @@ pub struct LogWriter {
     last_commit_time: i64,
     max_series_id: u32,
     intervals: HashMap<u32, IntervalLength>,
-    last_sync_start: Option<Duration>,
+    /// When the previous log sync was due (spec §3 Group commit, Q-310).
+    last_sync_due: Option<Duration>,
     fault: Option<Fault>,
     halt: Arc<Halt>,
     seals: Vec<SealJob>,
@@ -649,7 +651,7 @@ impl LogWriter {
             last_commit_time: r.last_commit_time,
             max_series_id: r.max_series_id,
             intervals: r.intervals,
-            last_sync_start: None,
+            last_sync_due: None,
             fault: r.fault,
             halt,
             seals: r.seals,
@@ -725,10 +727,19 @@ impl LogWriter {
         r
     }
 
-    /// The earliest time the next log sync may start: `min_sync_interval` after the previous one started.
+    /// The earliest time the next log sync may start: `min_sync_interval` after the previous one was due (spec §3
+    /// Group commit, Q-310).
     pub fn sync_ready_at(&self) -> Duration {
-        self.last_sync_start
+        self.last_sync_due
             .map_or(Duration::ZERO, |s| s + self.cfg.min_sync_interval)
+    }
+
+    /// When a batch sync starting at `now` was due: when the bound let it start, but no more than half the interval
+    /// before `now`, so a late start does not push later syncs back and no two start under half the interval apart
+    /// (Q-310).
+    fn batch_sync_due(&self, now: Duration) -> Duration {
+        self.sync_ready_at()
+            .max(now.saturating_sub(self.cfg.min_sync_interval / 2))
     }
 
     fn fail(&mut self, op: FaultOp, path: &Path, e: &io::Error) {
@@ -1045,7 +1056,7 @@ impl LogWriter {
             self.fail(FaultOp::Sync, &p, &e);
             return;
         }
-        self.last_sync_start = Some(now);
+        self.last_sync_due = Some(now);
         self.stats.syncs += 1;
         self.roll_to(next);
     }
@@ -1165,7 +1176,7 @@ impl LogWriter {
         if self.halted() {
             return Some(Self::unknown(&calls));
         }
-        self.last_sync_start = Some(now);
+        self.last_sync_due = Some(self.batch_sync_due(now));
         self.stats.syncs += 1;
         let seg = next
             .as_ref()

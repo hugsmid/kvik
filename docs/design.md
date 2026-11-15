@@ -20,7 +20,7 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 
 ## Intended shape
 1. **Log.** Readings are validated, stamped and appended to the log in batches; a batch is synced before
-   anything else sees it (group commit; no added delay after a quiet period; log syncs at least
+   anything else sees it (group commit; no added delay after a quiet period; log syncs due at least
    `min_sync_interval`, default 10 ms, apart).
 2. **Delivery.** Only after the sync, funnels deliver to consumers and live state updates. A funnel is a route
    compiled from configuration: series selection, optional windowed operator, condition, consumer. A consumer
@@ -57,8 +57,9 @@ footprint is small for embedded use, and decoding is fast for large scans. Parqu
 the mark synced at every commit (it has no verified boot identity), and is held neither to these budgets nor to the
 durability guarantees of spec §3 Sync primitive. The relaxed figure is enough, as device and human reaction times in automation
 are tens to hundreds of milliseconds. Roadmap 2.2 found that each durable sync writes a minimum amount, which
-unbatched small writers multiply, so log syncs start at least `min_sync_interval` apart (spec §3 Group commit). The
-default of 10 ms adds on average under half the interval, and only when syncs are back to back, inside the p99 budget;
+unbatched small writers multiply, so log syncs are due at least `min_sync_interval` apart (spec §3 Group commit); a
+late start does not delay later syncs (Q-310). The default of 10 ms adds on average under half the interval, and only
+when syncs are back to back, inside the p99 budget;
 the first reading after a pause is synced at once; and it caps host writes from many staggered writers. The p50
 ≤ 5 ms budget applies while syncs are not back to back, roughly up to 100 synced batches a second; above that rate
 batching adds a wait of up to `min_sync_interval` (about half of it at the median) in exchange for fewer syncs, and

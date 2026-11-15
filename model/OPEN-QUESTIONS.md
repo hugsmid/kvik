@@ -47,7 +47,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
-| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound |
+| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 | Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
 | Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
 | Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
@@ -896,7 +896,7 @@ Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-co
 roughly up to 100 synced batches a second". Three runs: p50 6.95, 6.75 and 7.02 ms; p90 11.54, 11.40 and 11.50; p99
 12.33, 12.33 and 12.24 (inside 20 ms); 99 syncs a second, 1.0 call per batch. The same load with the bound at 0:
 p50 2.36, 0.68 and 2.24 ms. Quiet and 10 × 1 Hz loads pass at the default (p50 2.30–2.52 ms).
-**Cause.** The bound counts from the previous sync's start (spec §3 Group commit, `LogWriter::sync_ready_at`).
+**Cause.** The bound counted from the previous sync's start (spec §3 Group commit, `LogWriter::sync_ready_at`).
 With calls exactly one interval apart, each late timed wake of the writer (about 0.1 ms here) delays every later
 sync, so the wait climbs to the whole interval before two calls share a batch, and latency spreads evenly from the
 sync (2.2 ms here) to the sync plus 10 ms: p50 is the sync plus about 5 ms. Only a wake with no lateness avoids it.
@@ -907,13 +907,26 @@ spaces calls evenly, and random arrivals would give about 73 syncs a second with
 and 1.0), p99 about 11 ms at 10 × 1 Hz (measured 2.71–2.79) and p50 about 7 ms on macOS (measured 4.14). So it is
 not inherent in the interval and this drive's sync time; option (b) below would remove it. macOS shows a tail of
 the same size (p90 12.0 ms) without a budget.
-**Now.** Nothing changed; the budget and the bound stand.
 **Options.** (a) Word the p50 budget as applying below 100 synced batches a second at the default, putting this
 load with the higher rates. (b) Stop the lateness compounding: after a wait on the bound, count the next interval
 from when the sync was due, not when it started; two syncs could then start up to the lateness less than the
 interval apart, so spec §3 Group commit's "at least `min_sync_interval` apart" would need rewording, with tests. (c)
 A lower default interval moves the edge to a higher rate, at the cost of the host-write cap roadmap 2.2 measured.
-**Needed.** An engineering fix or the owner's decision on the wording, at gate 4.9.
+**Settled** by an engineering fix, pending the next run on the Linux NVMe target. The writer thread confirms the
+cause: it sleeps until `sync_ready_at` with a timed wait and stamps the sync's start when it wakes, so any lateness
+moved the next deadline. A late start can also come from a turn entered late with the bound already passed (a call
+arriving during the timed mark sync), which a rule correcting only syncs that waited on the bound would turn into a
+permanent offset. The rule now: a batch sync is due when the bound let it start, but no more than half the interval
+before it starts; the next may start `min_sync_interval` after that. So a late wake or a stall of up to half the
+interval delays no later sync; under saturation syncs keep to a grid one interval apart, so any n + 1 consecutive
+syncs start at least n intervals less a half apart and none less than half an interval apart; a call during a sync
+still waits for the next batch. The cost: after a quiet period, which credits the full half, a burst's first batch
+follows the lone first reading after half the interval rather than a whole one. The sync that takes a segment into
+use at a timed seal stays due when it starts. Option (a) would have kept a known miss at the named load; option (c)
+only moves the edge and spends host writes. Anchoring to the oldest call's arrival would avoid the burst cost but
+needs a monotonic stamp on every call and a change to the call source; not worth it for one batch after a quiet
+period. Pinned by `log/tests/cadence.rs` (late wakes, a stall, saturation with stalls, a burst after a quiet period).
+macOS before and after: `docs/measurements/4.8-commit-latency.md`, macOS, the Q-310 fix.
 ## Q-198 — The backup and restore interfaces ahead of their implementations
 
 Recorded at the interfaces commit of roadmap 8.1 and 8.3, which defines the types, traits and fakes the parallel
@@ -1100,7 +1113,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
-| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; owner decision pending on the budget's wording or the bound |
+| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; remaining mismatches in Q-213 and Q-214 |
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
 | Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
@@ -1453,7 +1466,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Cursor file synced at most every 1 s | §4 Consumer state (and at once when a confirmation changes a latch, Q-132) | The cursor and the latches are durable at once on confirmation; the mark file is synced first when the cursor would name a position above the last synced mark (§3 Durable mark) | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Group commit and `min_sync_interval` | §3 Group commit: log syncs start at least the interval apart; a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
+| Group commit and `min_sync_interval` | §3 Group commit: log syncs are due at least the interval apart (Q-310); a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
 | Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
 | Unknown condition and live state during a restore | §6 Conditions, §2.3 Live state, §4 Resync, §8 Restore step 2, invariant 16 (Q-49 (b)): an evaluation with no local detail is skipped and counted (`evaluations_unknown`), the condition keeps its latched state, `resync` reports "unknown", and the first evaluation with detail is a transition if it differs from the latch or there is none; live state of a series whose latest recorded `t` no local fact or stored node holds is unknown, not none | Not modelled: a series that stores no level answers windows and live state during a restore from its local facts, without a flag; nothing is reported unknown or counted | — |
