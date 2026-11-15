@@ -310,17 +310,23 @@ impl Transport for HttpTransport {
             if let Some(n) = declared.filter(|&n| n > limit) {
                 return Err(body_too_large(request, status, n));
             }
-            response
+            // ureq refuses any read once its limit is spent, even one that would meet the end of a body of exactly
+            // `limit` bytes, so it is given one byte more and the limit is checked here.
+            let body = response
                 .body_mut()
                 .with_config()
-                .limit(limit)
+                .limit(limit.saturating_add(1))
                 .read_to_vec()
                 .map_err(|e| match e {
                     ureq::Error::BodyExceedsLimit(_) => {
                         body_too_large(request, status, limit.saturating_add(1))
                     }
                     e => map_error(e),
-                })?
+                })?;
+            if body.len() as u64 > limit {
+                return Err(body_too_large(request, status, body.len() as u64));
+            }
+            body
         };
         Ok(Response {
             status,

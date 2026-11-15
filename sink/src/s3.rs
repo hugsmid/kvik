@@ -483,9 +483,14 @@ impl Inner {
                         "the bucket reported no whole-object SHA-256 for {key}"
                     ))
                 })?;
-                // The whole declared body arrived, so a mismatch is in the bucket, not in transit.
                 if <[u8; 32]>::from(Sha256::digest(&resp.body)) != reported {
-                    return Err(SinkError::HashMismatch { key: key.into() });
+                    // Without a declared length a close-delimited body cut short looks whole.
+                    return Err(match declared {
+                        Some(_) => SinkError::HashMismatch { key: key.into() },
+                        None => transient(format!(
+                            "{key}: bytes of undeclared length do not match the reported SHA-256"
+                        )),
+                    });
                 }
                 Ok(resp.body)
             }

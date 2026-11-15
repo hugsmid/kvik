@@ -18,6 +18,8 @@ use kvik_sink::{RetryPolicy, S3Sink, block_on};
 #[derive(Clone, Copy)]
 enum Mode {
     Serve,
+    /// Serve, sending `GET` bodies chunked, with no `Content-Length`.
+    Chunked,
     /// Read the request, then never answer.
     Silent,
 }
@@ -89,18 +91,31 @@ fn connection(stream: TcpStream, bucket: &FakeBucket, mode: Mode) -> std::io::Re
             .collect();
         let request = request(method, path, query, headers, body);
         let response = bucket.send(&request).unwrap();
+        let chunked = matches!(mode, Mode::Chunked) && method == Method::Get;
         let mut head = format!("HTTP/1.1 {} X\r\n", response.status);
         let mut has_length = false;
         for (k, v) in &response.headers {
+            if chunked && k == "content-length" {
+                continue;
+            }
             has_length |= k == "content-length";
             head.push_str(&format!("{k}: {v}\r\n"));
         }
-        if !has_length {
+        if chunked {
+            head.push_str("transfer-encoding: chunked\r\n");
+        } else if !has_length {
             head.push_str(&format!("content-length: {}\r\n", response.body.len()));
         }
         head.push_str("\r\n");
         stream.write_all(head.as_bytes())?;
-        if method != Method::Head {
+        if chunked {
+            for part in response.body.chunks(3) {
+                stream.write_all(format!("{:x}\r\n", part.len()).as_bytes())?;
+                stream.write_all(part)?;
+                stream.write_all(b"\r\n")?;
+            }
+            stream.write_all(b"0\r\n\r\n")?;
+        } else if method != Method::Head {
             stream.write_all(&response.body)?;
         }
         stream.flush()?;
@@ -192,33 +207,35 @@ fn a_silent_server_times_out_as_a_transient_fault() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+fn capped_sink(bucket: &FakeBucket, port: u16, max_object_size: u64) -> S3Sink {
+    let mut config = bucket.config().with_max_object_size(max_object_size);
+    config.endpoint = format!("http://127.0.0.1:{port}");
+    S3Sink::new(config).unwrap()
+}
+
 #[test]
 fn the_http_transport_holds_object_bodies_to_max_object_size() {
     let bucket = FakeBucket::new();
-    let port = serve(bucket.clone(), Mode::Serve);
-    let sink = sink_for(
-        &bucket,
-        port,
-        RetryPolicy::default(),
-        Duration::from_secs(30),
-    );
-    block_on(sink.put(
-        "log/ten",
-        Arc::from(&b"0123456789"[..]),
-        sha256(b"0123456789"),
-    ))
-    .unwrap();
-    let mut config = sink.config().clone().with_max_object_size(8);
-    config.endpoint = format!("http://127.0.0.1:{port}");
-    let small = S3Sink::new(config).unwrap();
-    assert_eq!(
-        block_on(small.get("log/ten", None)),
-        Err(SinkError::TooLarge { size: 10, limit: 8 })
-    );
-    assert_eq!(
-        block_on(small.get("log/none", None)),
-        Err(SinkError::NotFound {
-            key: "log/none".into()
-        })
-    );
+    let sized = serve(bucket.clone(), Mode::Serve);
+    let chunked = serve(bucket.clone(), Mode::Chunked);
+    let sink = capped_sink(&bucket, sized, 1 << 20);
+    for (key, b) in [("log/eight", &b"01234567"[..]), ("log/ten", b"0123456789")] {
+        block_on(sink.put(key, Arc::from(b), sha256(b))).unwrap();
+    }
+    // A declared length is refused before the body is read; a chunked body when it passes the cap.
+    for (port, size) in [(sized, 10), (chunked, 9)] {
+        let small = capped_sink(&bucket, port, 8);
+        assert_eq!(
+            block_on(small.get("log/ten", None)),
+            Err(SinkError::TooLarge { size, limit: 8 }),
+            "port {port}"
+        );
+        assert_eq!(block_on(small.get("log/eight", None)).unwrap(), b"01234567");
+        assert_eq!(
+            block_on(small.get("log/none", None)),
+            Err(SinkError::NotFound {
+                key: "log/none".into()
+            })
+        );
+    }
 }

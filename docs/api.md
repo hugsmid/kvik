@@ -431,9 +431,9 @@ only, boxed `Send` futures):
 - **Hashes.** `put` sends the SHA-256 with a single-part upload, and the bucket must reject a mismatch
   (`HashMismatch`); the returned `Stored` is what the bucket reports when asked after the upload, and `put` fails
   with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`. A whole
-  `get` whose bytes do not match the SHA-256 the bucket reports is `HashMismatch`, not retried: the whole declared body
-  arrived, so the damage did not happen in transit (what the engine then concludes is Q-82). The sampled download
-  reports it as `VerifyError::Content`.
+  `get` whose body has its declared length but does not match the SHA-256 the bucket reports is `HashMismatch`, which
+  the sink does not retry; whether to fetch the object again is Q-82. The sampled download reports it as
+  `VerifyError::Content`. Without a declared length such a mismatch is `Transient`.
 - **Ranges** are half-open; an empty range within the object returns no bytes; one past its end is `InvalidRange`.
 - **Listings** are paged and may lag behind writes on some buckets: absence from a listing proves nothing, and `put`
   alone decides whether a key is taken.

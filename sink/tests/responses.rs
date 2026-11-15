@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use kvik::{BackupSink, SinkError};
-use kvik_sink::fake::{FakeBucket, FakeOp};
+use kvik_sink::fake::{Checksums, FakeBucket, FakeOp};
 use kvik_sink::transport::{Request, Response, Transport, TransportError};
 use kvik_sink::verify::sha256;
-use kvik_sink::{S3Sink, block_on};
+use kvik_sink::{RetryPolicy, S3Sink, block_on};
 
 fn put(sink: &S3Sink, key: &str, b: &[u8]) {
     block_on(sink.put(key, Arc::from(b), sha256(b))).unwrap();
@@ -98,4 +99,44 @@ fn a_malformed_content_range_is_a_protocol_error_not_retried() {
         );
         assert_eq!(transport.gets.load(Ordering::Relaxed), 1, "{content_range}");
     }
+}
+
+/// Drops `Content-Length` from every response, as a close-delimited body has none.
+struct Undeclared(FakeBucket);
+
+impl Transport for Undeclared {
+    fn send(&self, r: &Request) -> Result<Response, TransportError> {
+        let resp = self.0.send(r)?;
+        let headers = resp
+            .headers
+            .into_iter()
+            .filter(|(k, _)| k != "content-length")
+            .collect();
+        Ok(Response::new(resp.status, headers, resp.body))
+    }
+}
+
+#[test]
+fn a_hash_mismatch_without_a_declared_length_is_transient_not_damage() {
+    let bucket = FakeBucket::new();
+    bucket.set_checksums(Checksums::Trusted);
+    put(&bucket.sink(), "data/u", b"undeclared");
+    assert!(bucket.damage("data/u"));
+    let config = bucket
+        .config()
+        .with_retry(RetryPolicy::new(2, Duration::ZERO, Duration::ZERO));
+    let undeclared =
+        S3Sink::with_transport(config.clone(), Arc::new(Undeclared(bucket.clone()))).unwrap();
+    assert!(matches!(
+        block_on(undeclared.get("data/u", None)),
+        Err(SinkError::Transient { .. })
+    ));
+    assert_eq!(bucket.count(FakeOp::Get), 2);
+    assert_eq!(
+        block_on(bucket.sink_with(config).get("data/u", None)),
+        Err(SinkError::HashMismatch {
+            key: "data/u".into()
+        })
+    );
+    assert_eq!(bucket.count(FakeOp::Get), 3);
 }
