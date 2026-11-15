@@ -744,6 +744,48 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
     r.check_started();
 }
 
+/// Q-130: a routing change in a segment sealed above the registry file's `through` (here there is no registry file)
+/// still names its consumer, whose cursor file is missing, in the recovery entry.
+#[test]
+fn a_routing_change_sealed_above_the_registry_file_names_its_consumer() {
+    use kvik_log::entries::{RouteOp, Routing, Selection};
+    let mut r = Rig::new(cfg());
+    r.submit(vec![Item::Entry(Entry::Routing(Box::new(Routing {
+        consumer: "sealed".into(),
+        op: RouteOp::Emits,
+        funnel: None,
+        selection: None,
+        operator: None,
+        emits: Selection::None,
+        condition: None,
+    })))]);
+    r.drain();
+    r.advance(Duration::from_secs(301));
+    for _ in 0..10 {
+        r.step();
+        r.maint();
+        r.advance(10 * MS);
+    }
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    let routing = |bs: Vec<BatchContent>| {
+        bs.iter().any(|b| {
+            b.items
+                .iter()
+                .any(|i| matches!(i, Item::Entry(Entry::Routing(_))))
+        })
+    };
+    assert!(routing(r.sealed_batches()), "the routing change is sealed");
+    assert!(!routing(r.batches_where(|n| !n.sealed)));
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    assert_eq!(
+        rep.entry.unwrap().entry.consumers,
+        vec!["sealed".to_string()]
+    );
+    r.check_started();
+}
+
 #[test]
 fn a_crash_between_the_entry_and_the_mark_adopts_the_entry() {
     let mut adopted = 0;

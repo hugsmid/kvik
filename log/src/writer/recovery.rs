@@ -939,6 +939,42 @@ pub(super) fn start(
             consumers.insert(r.consumer.clone());
         }
     }
+    // Routing changes sealed above the registry file's `through`: the file is written after each routing change
+    // (Q-130), so these are at most the changes whose segment was sealed before the file was written.
+    let through = registry.as_ref().map_or(0, |f| f.through);
+    for (name, path) in sealed.iter().rev().filter(|(n, _)| n.generation == 0) {
+        let Ok(bytes) = store.read_file(path) else {
+            continue;
+        };
+        let id = SegmentIdentity {
+            store_id,
+            file_id: name.file_id,
+            generation: name.generation,
+        };
+        let Ok(r) = scan(&bytes, &id, ScanLimit::End) else {
+            continue;
+        };
+        for b in r
+            .batches
+            .iter()
+            .filter(|b| b.commit.last_sequence > through)
+        {
+            let Ok(content) = BatchContent::decode(b) else {
+                continue;
+            };
+            for i in &content.items {
+                if let Item::Entry(Entry::Routing(r)) = i {
+                    consumers.insert(r.consumer.clone());
+                }
+            }
+        }
+        if r.batches
+            .first()
+            .is_none_or(|b| b.commit.first_sequence <= through)
+        {
+            break;
+        }
+    }
     let sourced = super::sources::read_all(&super::sources::SourceContext {
         fs: &*fs,
         store_dir: store.dir(),
