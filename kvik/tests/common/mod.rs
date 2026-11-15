@@ -74,7 +74,7 @@ impl Wake for Flag {
     }
 }
 
-/// Noon UTC on a Monday in January, when London is on UTC.
+/// Noon UTC on a Monday in January, when the site zone is on UTC.
 pub fn start() -> Timestamp {
     "2026-01-05T12:00:00Z".parse().unwrap()
 }

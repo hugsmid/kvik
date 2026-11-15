@@ -28,8 +28,9 @@ sources must be acted on quickly, kept for years and restored to a known, record
 >   [commit and sync latency](docs/measurements/2.2-commit-latency.md) (gate 2.3 has looked at both) and the log
 >   writer's [commit latency and throughput](docs/measurements/4.8-commit-latency.md), on macOS only so far: the run
 >   on the Linux NVMe target that checks the delivery budget is pending.
-> - The public interface ([`kvik/`](kvik/)) has two backends: the durable log (the default), which so far defines
->   series, writes and reads facts and series in this or another process, and the reference model in memory (**not
+> - The public interface ([`kvik/`](kvik/)) has two backends: the durable log (the default), which defines series,
+>   writes and reads facts and series in this or another process, and holds live state, windows, buckets and calendar
+>   results (roadmap 5.4 stays open pending a question), and the reference model in memory (**not
 >   durable, for development and tests**), which covers the whole interface.
 >
 > | [Roadmap](docs/roadmap.md) section | Progress |
@@ -39,9 +40,13 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, with the Linux NVMe target run pending) |
 > | 5. Delivery | 0 of 8 done (5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.1a, model support for recovery entries and reset points, added) |
-> | 6–10. Compaction, summary tree, tiers and backup, query, scale | not started |
+> | 6. Compacted segments | 1 of 6 done (6.1, value and timestamp encodings; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
+> | 7. Summary tree | not started |
+> | 8. Tiers and backup | 1 of 4 done (8.2, the backup sink interface) |
+> | 9. Query | not started |
+> | 10. Scale | not started |
 >
-> 22 of 49 roadmap items are done, including 3 of 9 gates.
+> 24 of 50 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -120,7 +125,7 @@ engine does not exist yet, so each item below says what it is designed to do, no
 ### What it is not
 kvik is a storage engine, not a complete system. **Not planned for v1:** a network server, SQL, multiple writers,
 clustering, conditions over several series, interval readings over irregular billing periods, or any form of
-deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export is planned for other tools. An application
+deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export for other tools exists, with a provisional schema ([`docs/export.md`](docs/export.md)). An application
 built on it would add:
 
 - adapters for the protocols its devices speak, such as OPC UA, Modbus or MQTT;
@@ -267,6 +272,8 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Plan for comparative benchmarks against other tools; not yet run |
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |
 | [`log/`](log/) | `kvik-log`: the on-disk log format (segment container, checksums, the reader up to the durable mark, the mark's slots, typed arrival batches), with golden files, property tests, a differential test against the model and a fuzz target |
+| [`chunk/`](chunk/) | `kvik-chunk`: the column encodings and block bodies of compacted chunks (delta bit-packing, scaled decimals with exceptions, XOR with a compressed fallback, run-length), with golden files, property tests and a fuzz target |
+| [`export/`](export/) | `kvik-export`: Parquet export of a series' facts; the schema is provisional ([`docs/export.md`](docs/export.md)) |
 | [`sink/`](sink/) | `kvik-sink`: the backup sink over S3-compatible object storage (signing, conditional single-part uploads with their SHA-256, retries and timeouts) and an in-memory fake bucket with injected faults |
 | [`model/OPEN-QUESTIONS.md`](model/OPEN-QUESTIONS.md) | Open questions in the specification, and where the model still differs from it |
 | [`spikes/encodings/`](spikes/encodings/) | The encoding spike behind roadmap item 2.1; not part of the engine |

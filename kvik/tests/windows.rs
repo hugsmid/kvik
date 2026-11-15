@@ -106,7 +106,7 @@ const ZONES: [&str; 4] = [
 ];
 
 /// Where a history starts, in which site zone, and the local day and month it starts in: so that windows and
-/// calendar results cross a change to summer time (London, 29 March 2026 at 01:00Z), a month edge (1 February 2026
+/// calendar results cross a change to summer time (`Europe/London`, 29 March 2026 at 01:00Z), a month edge (1 February 2026
 /// at 00:00Z), and a local midnight that occurs twice (Havana, 2 November 2025: the day starts at 04:00Z; New York
 /// leaves summer time at 06:00Z).
 const STARTS: [(&str, &str, (i16, u8, u8)); 4] = [

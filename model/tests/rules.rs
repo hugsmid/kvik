@@ -3735,7 +3735,7 @@ fn s5_7_calendar_day_is_a_window_with_edge_stretches() {
 
 /// §5.7: a month result is a window over the month's span, taking the stored
 /// month node as an input; its days, adjacent windows, add up to it. March
-/// 2026 in London has a 23-hour day.
+/// 2026 in `Europe/London` has a 23-hour day.
 #[test]
 fn s5_7_month_result_takes_the_stored_month_node() {
     use kvik_model::calendar::{Month, Period};

@@ -118,43 +118,43 @@ Each metric names the workloads it is run on. Latency is reported as p50, p99, p
 
 | # | Metric | What is measured | Workloads |
 |---|---|---|---|
-| M1 | Ingest to durable acknowledgement | time from sending a batch to its acknowledgement, at several rates from idle to near the limit; class stated | W1, W2, W4 |
-| M2 | Ingest to consumer | time from sending a reading to in-process code receiving it (for a server tool, to a subscribed client on the same machine) | W1, W2, W4 |
-| M3 | Sustained throughput | highest rate held for an hour with p99 of M1 within a stated limit; behaviour past that rate | W2, W4 |
-| M4 | Durability under power loss | the power-cut loop: acknowledged readings missing after recovery; whether the tool reported a loss; whether it started at all | W1, W2 |
-| M5 | Late, out-of-order and corrected data | whether earlier values are kept; whether a replay of older data reverts a correction; as-of queries; cost of a late write | W1, W3 |
-| M6 | Missed alarms | conditions that became true while the consumer was down: delivered on resume, delivered twice, or lost; replayed history told apart from live | W1 |
-| M7 | Storage per reading | bytes per reading after compaction or the tool's equivalent, for the data alone and with indexes and summaries | all |
-| M8 | Host write volume | bytes written to the drive per day at the workload's steady rate, from the block device's counters | W1, W2 |
-| M9 | Chart query latency | a chart of fixed width over spans from years to seconds, cold and warm cache; correctness against direct computation | all |
-| M10 | Restart | time from start to serving after a clean stop and after a power cut | W1, W2 |
-| M11 | Restore | time to restore from an object-store backup onto an empty disk, and whether the restored data equals the source up to a stated point | W2, W3 |
-| M12 | Footprint | binary size, resident memory and CPU time at the steady rate, on a small ARM machine and on a server-class machine | W1, W2 |
-| M13 | Operations | processes and services to install and keep alive; steps to back up and to restore; what an unattended site needs after a power cut | all |
+| L1 | Ingest to durable acknowledgement | time from sending a batch to its acknowledgement, at several rates from idle to near the limit; class stated | W1, W2, W4 |
+| L2 | Ingest to consumer | time from sending a reading to in-process code receiving it (for a server tool, to a subscribed client on the same machine) | W1, W2, W4 |
+| L3 | Sustained throughput | highest rate held for an hour with p99 of L1 within a stated limit; behaviour past that rate | W2, W4 |
+| L4 | Durability under power loss | the power-cut loop: acknowledged readings missing after recovery; whether the tool reported a loss; whether it started at all | W1, W2 |
+| L5 | Late, out-of-order and corrected data | whether earlier values are kept; whether a replay of older data reverts a correction; as-of queries; cost of a late write | W1, W3 |
+| L6 | Missed alarms | conditions that became true while the consumer was down: delivered on resume, delivered twice, or lost; replayed history told apart from live | W1 |
+| L7 | Storage per reading | bytes per reading after compaction or the tool's equivalent, for the data alone and with indexes and summaries | all |
+| L8 | Host write volume | bytes written to the drive per day at the workload's steady rate, from the block device's counters | W1, W2 |
+| L9 | Chart query latency | a chart of fixed width over spans from years to seconds, cold and warm cache; correctness against direct computation | all |
+| L10 | Restart | time from start to serving after a clean stop and after a power cut | W1, W2 |
+| L11 | Restore | time to restore from an object-store backup onto an empty disk, and whether the restored data equals the source up to a stated point | W2, W3 |
+| L12 | Footprint | binary size, resident memory and CPU time at the steady rate, on a small ARM machine and on a server-class machine | W1, W2 |
+| L13 | Operations | processes and services to install and keep alive; steps to back up and to restore; what an unattended site needs after a power cut | all |
 
 Notes on individual metrics:
 
-- **M4, the power-cut loop.** A client outside the machine under test records every acknowledgement it receives.
+- **L4, the power-cut loop.** A client outside the machine under test records every acknowledgement it receives.
   Power is cut at a random time, the machine restarts, and the store's contents are compared with the client's
   record. A run is several hundred cuts per tool and configuration. Reported: acknowledged readings missing;
   readings present that were never acknowledged (allowed, but counted); whether the tool said anything was lost
   and how exactly (kvik's equivalents are `possible_loss` and `data_lost`); corruption found later by a full
   read. The loop builds on kvik's own kill-loop harness (roadmap 4.5).
-- **M5.** The script writes a value, corrects it, then replays the original from the source, as a re-import
+- **L5.** The script writes a value, corrects it, then replays the original from the source, as a re-import
   would. Reported per tool: the value a plain read returns afterwards; whether the superseded value can still be
   read; whether "what did the store show on date D" can be answered, and by what means. For tools without a
   built-in rule, the driver implements the usual pattern from that tool's documentation (for example a version
   column and an upsert), and its extra storage and latency are counted as that tool's cost.
-- **M6.** Where a tool has no conditions or delivery, the driver uses the pairing listed under Candidates, and
+- **L6.** Where a tool has no conditions or delivery, the driver uses the pairing listed under Candidates, and
   the result is that of the pair.
-- **M7 and M8.** Sizes are taken after each tool has finished its background work. M8 is measured at the block
+- **L7 and L8.** Sizes are taken after each tool has finished its background work. L8 is measured at the block
   device, so it includes journals, write-ahead logs and compaction rewrites.
-- **M9.** Each tool may use the summaries its documentation recommends (materialised views, continuous
-  aggregates, roll-up tables); their storage counts in M7 and their upkeep in M1, M3 and M8. A query that returns
+- **L9.** Each tool may use the summaries its documentation recommends (materialised views, continuous
+  aggregates, roll-up tables); their storage counts in L7 and their upkeep in L1, L3 and L8. A query that returns
   a wrong or unflagged approximate answer is reported as such, not timed as a success.
-- **M11.** Uses a local S3-compatible fake for timing and one real bucket for the final run. Tools without a
+- **L11.** Uses a local S3-compatible fake for timing and one real bucket for the final run. Tools without a
   built-in backup use the method their documentation recommends.
-- **M13** is descriptive: a table, not a score.
+- **L13** is descriptive: a table, not a score.
 
 ## Candidate comparisons
 Open-source builds only (rule 12), chosen per workload. Exact versions and settings are fixed when the benchmarks run; a tool may
@@ -168,7 +168,7 @@ be replaced by a closer equivalent then, with the reason recorded.
 | An embedded key-value store with a time-series schema (RocksDB or a similar log-structured store) | W2, W4 | what an application often builds itself for high-rate ingest |
 | An embedded or edge time-series database (candidates: an edge build of InfluxDB, QuestDB, TDengine; one or two chosen at run time) | W1, W2, W4 | purpose-built for this data, though usually as a service |
 | A server time-series database (TimescaleDB on PostgreSQL) | W1, W2, W3 | for contrast: mature SQL, continuous aggregates and tooling, at the cost of a service to run |
-| A message log with a database (an MQTT broker with persistent sessions, or a message log such as NATS JetStream, feeding SQLite or the server database) | W1 | the usual way to get durable delivery and alarms beside storage; compared on M2, M4, M6 and M13 |
+| A message log with a database (an MQTT broker with persistent sessions, or a message log such as NATS JetStream, feeding SQLite or the server database) | W1 | the usual way to get durable delivery and alarms beside storage; compared on L2, L4, L6 and L13 |
 
 Not every tool runs every workload: a tool is left out of a workload it is plainly not meant for, and the table
 published with the results says so. Licence terms are checked before publication (rule 12).
@@ -204,8 +204,8 @@ Planned as a workspace crate, `bench/`, kept out of the engine's dependencies.
 ## When
 | Stage | After | Scope |
 |---|---|---|
-| Preview 1 | roadmap 4.8 (log benchmarks); now due, not part of 4.8 | M1, M3, M4 (kill loop and fault injection only) and M8 on W2, against SQLite and one other tool |
-| Preview 2 | roadmap 5.5 (delivery benchmarks) | M2 and M6 on W1, against the message-log pairing |
+| Preview 1 | roadmap 4.8 (log benchmarks); now due, not part of 4.8 | L1, L3, L4 (kill loop and fault injection only) and L8 on W2, against SQLite and one other tool |
+| Preview 2 | roadmap 5.5 (delivery benchmarks) | L2 and L6 on W1, against the message-log pairing |
 | Full run | roadmap 10.1 (scale test) | every workload and metric, every candidate, real power cuts; roadmap 10.2 |
 
 Previews are published as previews: partial, on an unfinished engine, and replaced by the full run. Each uses the
@@ -215,6 +215,6 @@ same harness and the same fairness rules, so the drivers are exercised early.
 - Synthetic data. The generators imitate device data; they are not recordings. Compression and query results on
   real installations will differ, and the generator's parameters are published so others can vary them.
 - One or two machines. Results hold for the hardware tested; the harness is meant to be run elsewhere.
-- Embedded and server tools are not like for like. M13 and the notes say what each tool gives that the numbers
+- Embedded and server tools are not like for like. L13 and the notes say what each tool gives that the numbers
   do not show: SQL, concurrent writers, replication and an ecosystem on one side; no service on the other.
 - The comparison is run by the project being compared. Rules 4, 5, 8 and 11 are there so that others can check the work.

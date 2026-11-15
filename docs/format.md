@@ -22,7 +22,8 @@ writes it.
   version may use them. Padding between blocks is covered only by a sealed file's `file_crc32c` (A.9).
 - **Canonical writing.** For given content a v1 writer produces one byte sequence (field order, run-length form,
   block splitting, heap layout, all stated below); decoding and encoding again any writer output gives identical
-  bytes. Golden files rely on it. A reader applies only the listed checks, so a block that passes them but is not
+  bytes, except that encodings 4 and 5 of an `f64` block are one canonical class (`format-chunk.md` C.10, Q-150).
+  Golden files rely on it. A reader applies only the listed checks, so a block that passes them but is not
   canonical (run-length where plain is not larger, an optional column of defaults only, non-zero padding or reserved
   bytes, bytes after the last payload or entry, readings split over more blocks than A.4 allows) is read; a
   canonical check, for writer output, golden files and a scrub, also requires the canonical bytes.

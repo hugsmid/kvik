@@ -331,7 +331,7 @@ impl BatchBuilder {
         let mut n = 0;
         for (i, (t, f, b)) in other.enumerate() {
             match self.blocks.get(i) {
-                Some((t2, f2, b2)) if *t2 == t && *f2 == f && b2.as_slice() == b => n += 1,
+                Some((t2, f2, bs2)) if *t2 == t && *f2 == f && bs2.as_slice() == b => n += 1,
                 _ => return false,
             }
         }

@@ -1493,8 +1493,8 @@ fn a_crash_while_creating_the_store_or_in_its_first_start_is_recovered() {
 
 #[test]
 fn a_sealed_segment_above_the_mark_makes_the_mark_stale() {
-    // b1 is sealed in segment 1 and b2 committed in segment 2; the mark, synced only on its timer, still names
-    // nothing when a remount loses the page cache. Rule 1 would truncate b2; the mark is stale.
+    // b_one is sealed in segment 1 and b_two committed in segment 2; the mark, synced only on its timer, still names
+    // nothing when a remount loses the page cache. Rule 1 would truncate b_two; the mark is stale.
     let mut r = Rig::new(WriterConfig {
         segment_size: 4096,
         min_sync_interval: Duration::ZERO,
@@ -1526,7 +1526,7 @@ fn a_sealed_segment_above_the_mark_makes_the_mark_stale() {
 
 #[test]
 fn a_loss_at_the_tail_below_the_mark_is_not_overwritten() {
-    // b1 in segment 1, b2 in segment 2 with the mark after it; b2 is then damaged. The positions up to the mark's
+    // b_one in segment 1, b_two in segment 2 with the mark after it; b_two is then damaged. The positions up to the mark's
     // are lost, and writing resumes after the damaged bytes.
     let mut r = Rig::new(WriterConfig {
         segment_size: 4096,

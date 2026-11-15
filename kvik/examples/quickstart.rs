@@ -137,7 +137,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let date = LocalDate::new(2026, 3, 2);
     let day = reader.calendar(energy, date, Aggregate::Increase)?;
     println!(
-        "energy on {} (London): {:.2} Wh, from {} to {}",
+        "energy on {}: {:.2} Wh, from {} to {}",
         date,
         day.number().unwrap_or(0.0),
         day.from,
