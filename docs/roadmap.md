@@ -38,13 +38,14 @@ again; nothing after a gate starts before it is passed.
   A.13 moved to 4.8; the 5 % low disk mark waits for a file-system size in the seam, Q-115 (e))
 - [x] 4.5 Recovery: boot identity rule, torn tail; kill-loop harness; injected sync errors and full disk (points left
   to later items in Q-116)
-- [ ] 4.6 Second-process reader and leases
+- [x] 4.6 Second-process reader and leases (in `kvik-log`; the interface `Reader`'s `facts` and series lookup moved to 5.1)
 - [x] 4.7 Differential tests: engine log against the model on generated histories
 - [ ] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/`
 - [ ] 4.9 **Gate** — log looked at as a whole
 
 ## 5. Delivery
-- [ ] 5.1 Series registry
+- [ ] 5.1 Series registry; the `kvik` crate on the durable log: writing, and `facts`, series lookup and `refresh` for
+  reader processes
 - [ ] 5.2 Routing table, conditions, consumer queues, durable cursors
 - [ ] 5.3 Catch-up, resync and replay flags; the saved-point check (`Reader::check`, `Start::Position`, row 7b)
 - [ ] 5.4 Live state and windowed operators over recent facts
