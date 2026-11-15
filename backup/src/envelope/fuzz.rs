@@ -24,6 +24,11 @@ pub fn open_all(data: &[u8]) {
         fixed[6..8].fill(0);
         fixed[16..24].copy_from_slice(&e.key_check().0);
         fixed[43..60].fill(0);
+        let declared = u64::from_le_bytes(fixed[8..16].try_into().expect("8 bytes"));
+        if declared > data.len() as u64 {
+            let fits_one_chunk = (data.len() - HEADER).saturating_sub(16) as u64;
+            fixed[8..16].copy_from_slice(&fits_one_chunk.to_le_bytes());
+        }
         let crc = crc32c(&fixed[..60]);
         fixed[60..64].copy_from_slice(&crc.to_le_bytes());
         e.check_header(&fixed).expect("a repaired header passes");
