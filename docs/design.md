@@ -58,7 +58,7 @@ the mark synced at every commit (it has no verified boot identity), and is held 
 durability guarantees of spec §3 Sync primitive. The relaxed figure is enough, as device and human reaction times in automation
 are tens to hundreds of milliseconds. Roadmap 2.2 found that each durable sync writes a minimum amount, which
 unbatched small writers multiply, so batch syncs are due at least `min_sync_interval` apart (spec §3 Group commit);
-a late start delays no later sync (Q-310). The default of 10 ms adds on average under half the interval, and only
+a late start delays later syncs only while the load stays at the bound (Q-310). The default of 10 ms adds on average under half the interval, and only
 when syncs are back to back, inside the p99 budget;
 the first reading after a pause is synced at once; and it caps host writes from many staggered writers. The p50
 ≤ 5 ms budget applies while syncs are not back to back, roughly up to 100 synced batches a second; above that rate

@@ -121,27 +121,45 @@ fn one_call_per_interval(
     late: Duration,
     seal_interval: Duration,
 ) -> Vec<Duration> {
+    periodic(n, INTERVAL, wake, late, seal_interval, &[])
+}
+
+/// As [`one_call_per_interval`] with one call every `period`, plus one-off calls at `extra` (from `START`, woken
+/// 20 µs after arrival). Returns the waits of the periodic calls.
+fn periodic(
+    n: usize,
+    period: Duration,
+    wake: impl Fn(usize) -> Duration,
+    late: Duration,
+    seal_interval: Duration,
+    extra: &[Duration],
+) -> Vec<Duration> {
     let mut s = Sim::new(seal_interval);
-    let arrivals: Vec<Duration> = (0..n).map(|k| START + INTERVAL * k as u32).collect();
+    let mut arrivals: Vec<(Duration, Option<usize>)> = (0..n)
+        .map(|k| (START + period * k as u32, Some(k)))
+        .collect();
+    arrivals.extend(extra.iter().map(|e| (START + *e, None)));
+    arrivals.sort();
+    let m = arrivals.len();
     let mut ids = Vec::new();
     let (mut k, mut free, mut next) = (0, Duration::ZERO, None);
-    for _ in 0..100 * n {
-        if k == n && s.q.is_empty() {
-            let waits = ids
+    for _ in 0..100 * m {
+        if k == m && s.q.is_empty() {
+            return ids
                 .iter()
                 .zip(&arrivals)
-                .map(|(id, a)| s.covered[id] - *a)
+                .filter(|(_, a)| a.1.is_some())
+                .map(|(id, a)| s.covered[id] - a.0)
                 .collect();
-            return waits;
         }
-        let by_call = (k < n).then(|| arrivals[k] + wake(k));
+        let by_call = (k < m).then(|| arrivals[k].0 + arrivals[k].1.map_or(20 * US, &wake));
         let at = [by_call, timed(next, free, late)]
             .into_iter()
             .flatten()
             .min()
             .unwrap()
             .max(free);
-        while k < n && arrivals[k] <= at {
+        while k < m && arrivals[k].0 <= at {
             ids.push(s.push());
             k += 1;
         }
@@ -183,10 +201,16 @@ fn a_stalled_turn_delays_no_call_after_the_stall_is_caught_up() {
 
 #[test]
 fn a_timed_seal_delays_at_most_one_call_by_under_half_an_interval() {
+    // The start 3 ms late at call 10 spends the catch-up, so a seal that took a slot would delay every later call.
     for (phase, delayed) in [(3, 0), (7, 1)] {
         let seal = Duration::from_secs(2) + MS * phase;
-        let waits = one_call_per_interval(300, |_| 20 * US, 100 * US, seal);
-        let late: Vec<_> = waits.iter().filter(|w| **w > 20 * US).collect();
+        let waits = one_call_per_interval(
+            300,
+            |k| if k == 10 { 3 * MS } else { 20 * US },
+            100 * US,
+            seal,
+        );
+        let late: Vec<_> = waits[11..].iter().filter(|w| **w > 20 * US).collect();
         assert_eq!(
             late.len(),
             delayed,
@@ -194,6 +218,36 @@ fn a_timed_seal_delays_at_most_one_call_by_under_half_an_interval() {
         );
         assert!(late.iter().all(|w| **w < INTERVAL / 2), "{late:?}");
     }
+}
+
+#[test]
+fn at_the_bound_a_stray_call_after_a_late_start_delays_later_calls_until_the_load_drops() {
+    // Q-310, accepted: at exactly one call per interval the bound has no slack to drain a stored lateness.
+    let stray = |period: Duration| [period * 30 + 6 * MS];
+    let wake = |k| if k == 10 { 3 * MS } else { 20 * US };
+    let waits = periodic(300, INTERVAL, wake, 100 * US, NO_SEAL, &stray(INTERVAL));
+    assert!(
+        waits[11..30].iter().all(|w| *w <= 20 * US),
+        "caught up before the stray call"
+    );
+    assert!(
+        waits[31..]
+            .iter()
+            .all(|w| *w >= 3 * MS && *w < INTERVAL / 2),
+        "every later call waits for the stored lateness: {:?}",
+        &waits[31..40]
+    );
+    let slower = INTERVAL + 100 * US;
+    let waits = periodic(300, slower, wake, 100 * US, NO_SEAL, &stray(slower));
+    let delayed = waits[31..].iter().filter(|w| **w > 20 * US).count();
+    assert!(
+        delayed > 0 && delayed <= 20,
+        "{delayed} calls delayed at a 10.1 ms period"
+    );
+    assert!(
+        waits[51..].iter().all(|w| *w <= 20 * US),
+        "drained within 20 calls"
+    );
 }
 
 #[test]

@@ -66,7 +66,7 @@ The keys roadmap section 4 needs; all may change between opens.
 |---|---|---|---|
 | `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
-| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays no later one) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
+| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |

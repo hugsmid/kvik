@@ -745,8 +745,8 @@ impl LogWriter {
     }
 
     /// When a batch sync starting at `now` was due: when the previous one's due time let it start, but at most one
-    /// interval before `now`. A late start so moves no later sync, and a long stall is caught up at half-interval
-    /// spacing rather than kept as a lasting delay (Q-310).
+    /// interval before `now`. A late start or a stall is so caught up at half-interval spacing, and delays later syncs
+    /// only while the load stays at the bound (Q-310).
     fn batch_sync_due(&self, now: Duration) -> Duration {
         self.grid_ready_at()
             .max(now.saturating_sub(self.cfg.min_sync_interval))

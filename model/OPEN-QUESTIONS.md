@@ -922,17 +922,28 @@ interval leaves a stall over half an interval, and a seal late in the interval, 
 **Rule.** Two clocks. A batch sync is due when the previous one's due time let it start, but at most one interval
 before it starts; the next may start once `min_sync_interval` has passed since that due time and half of it since
 the previous log sync started, a timed seal's included. The seal's sync spaces the next batch but takes no slot.
-So late wakes and stalls delay no later sync (a stall is caught up at half-interval spacing), under saturation batch
-syncs keep to a grid one interval apart, any n + 1 consecutive batch syncs span at least n − 1 intervals, no two log
-syncs start under half an interval apart, and a call during a sync still waits for the next batch. Costs: after a
+So late wakes and stalls are caught up at half-interval spacing and delay later syncs only while the load stays at
+the bound (below), under saturation batch syncs keep to a grid one interval apart, any n + 1 consecutive batch syncs
+span at least n − 1 intervals, no batch sync starts less than half the interval after any log sync, and a call
+during a sync still waits for the next batch. Costs: after a
 quiet period a burst's first batch follows the lone first reading after half the interval rather than a whole one;
 a seal adds one sync per seal interval beyond the bound and delays at most one call, by under half an interval;
 spec §3 Sealing's "counts as the previous log sync for the next batch" now holds for the spacing only.
+**At the bound (owner's ruling: accepted, no rule change).** The catch-up is the one interval by which a due time
+may trail its start; a late start stays stored in the due time. One extra batch (a stray call between two periodic
+ones) spends that interval, and at exactly one call per interval no slot is ever missed to regain it, so every later
+call waits for the stored lateness, under one interval. Scenario: one call every 10 ms, call 10 starting 3 ms late,
+one extra call 6 ms after call 30: calls 11 to 29 wait 20 µs, every call after the extra one waits about 3.1 ms.
+Any rule that bounds the long-run rate at 1/interval has no slack when the load runs at exactly that rate, so an
+extra call can delay later calls until the load drops below the bound; at a 10.1 ms period the same history drains
+within 20 calls. Pinned by
+`at_the_bound_a_stray_call_after_a_late_start_delays_later_calls_until_the_load_drops`.
 **Rejected.** (a) would have kept a known miss at the named load; (c) only moves the edge and spends host writes.
 Anchoring to the oldest call's arrival avoids the burst cost but needs a monotonic stamp on every call and a change
 to the call source, for one batch after a quiet period.
-**Tests.** `log/tests/cadence.rs`: late wakes, stalls of 3, 8 and 30 ms, a seal early and late in the interval,
-saturation with late wakes and stalls, a burst after a quiet period. macOS before and after:
+**Tests.** `log/tests/cadence.rs`: late wakes, stalls of 3, 8 and 30 ms, a seal early and late in the interval
+after a late start, saturation with late wakes and stalls, a burst after a quiet period, a stray call at and just
+below the bound. macOS before and after:
 `docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
 ## Q-198 — The backup and restore interfaces ahead of their implementations
 
