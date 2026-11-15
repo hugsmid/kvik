@@ -1590,6 +1590,43 @@ fn row_12_sync_error_read_only_fatal_restart_truncates() {
     }
 }
 
+/// Row 12a: "Mark deleted or damaged on the same boot after a failed sync:
+/// rule 3; the last complete batch is written again and synced before use;
+/// kept only if that sync succeeds, else read-only; reported as
+/// `possible_loss` with the mark's state." The batch whose sync failed lies
+/// complete in the page cache; with the mark gone, the start keeps it, writes
+/// a recovery entry after it naming the mark's state, and lists a
+/// `possible_loss`; a start whose sync fails stays read-only and writes
+/// nothing.
+#[test]
+fn row_12a_mark_lost_on_the_same_boot_after_a_failed_sync() {
+    for state in [MarkState::Missing, MarkState::Unreadable] {
+        let (mut m, s) = model();
+        m.ingest(vec![num(s, T0, 1.0)]).unwrap();
+        m.emit(num(s, T0 + SECOND, 2.0)).unwrap();
+        assert_eq!(
+            m.commit(Some(Fault::SyncError(WriteOutcome::Survived))),
+            Err(Error::SyncFailed)
+        );
+        m.crash();
+        m.lose_mark(state).unwrap();
+        m.restart_with(true);
+        assert!(m.is_read_only() && m.recovery_entries().is_empty());
+        m.restart();
+        assert!(!m.is_read_only());
+        assert_eq!(m.facts().unwrap().len(), 2, "the batch kept");
+        let (at, entry) = m.recovery_entries().into_iter().next_back().unwrap();
+        assert_eq!(entry.mark_state, state);
+        assert_eq!(entry.after.next(), at);
+        let loss = m
+            .losses()
+            .into_iter()
+            .find(|l| l.kind == LossKind::PossibleLoss)
+            .unwrap();
+        assert_eq!((loss.identity, loss.mark_state), (at, state));
+    }
+}
+
 /// Row 13: "Disk fills: degrade, then ingest waits; compaction ENOSPC abandons
 /// the job; nothing deleted." Here compaction pauses at the low mark before any
 /// ENOSPC.

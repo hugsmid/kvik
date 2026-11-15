@@ -9,10 +9,11 @@ use common::*;
 use kvik_model::condition::{Condition, ConditionState};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
-    Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, Locality, ManifestOp, Model,
-    Operator, Reason, Refusal, Selection, Signal, Tier, TriggerCause, Wait, WriteOutcome,
+    Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, Locality, ManifestOp, MarkSync,
+    Model, Operator, Reason, Refusal, Selection, Signal, Tier, TriggerCause, Wait, WriteOutcome,
 };
 use kvik_model::oracle;
+use kvik_model::recovery::{LossKind, MarkState, ResetPoint};
 use kvik_model::registry::{ChangedAtKind, RegistryError, RetentionClass, SeriesOptions, Timing};
 use kvik_model::summary::{AggValue, Aggregate, Body, Params, direct};
 use kvik_model::tree::SeriesTree;
@@ -1029,6 +1030,247 @@ fn s3_missing_mark_counts_as_different_boot() {
     m.restart();
     assert_eq!(m.facts().unwrap().len(), 1);
     assert_eq!(m.disk.mark.unwrap().boot, m.boot);
+}
+
+/// A consumer model with the timed mark sync (§3 Durable mark).
+fn timed_consumer_model() -> (Model, SeriesId) {
+    let consumer = ConsumerDecl {
+        id: C,
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let cfg = Config {
+        mark_sync: MarkSync::Timed,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![consumer], T0 + HOUR);
+    let s = m
+        .define_with(
+            "site/pump-2/flow",
+            Kind::Gauge,
+            ValueType::Number,
+            "l/min",
+            10 * SECOND,
+            SeriesOptions::expected(SECOND),
+        )
+        .unwrap();
+    (m, s)
+}
+
+/// §3 Durable mark: under the timed sync a batch of facts is acknowledged
+/// before the mark file is synced past it; a definition forces the sync, and
+/// a cursor file naming a position above the last synced mark forces one
+/// first (invariant 26).
+#[test]
+fn s3_timed_mark_sync_forced_by_a_definition_and_a_cursor() {
+    let (mut m, s) = timed_consumer_model();
+    let p = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    assert!(
+        m.disk.synced_mark.unwrap().last < p,
+        "acknowledged, not synced"
+    );
+    assert_eq!(m.disk.mark.unwrap().last, p);
+    let d = m
+        .define(
+            "site/pump-2/pressure",
+            Kind::Gauge,
+            ValueType::Number,
+            "bar",
+            10 * SECOND,
+        )
+        .unwrap();
+    assert_eq!(
+        m.disk.synced_mark, m.disk.mark,
+        "a definition forces the sync"
+    );
+    assert_eq!(m.disk.mark.unwrap().max_series_id, d.0);
+    let q = m
+        .ingest(vec![Reading::num(s, T0 + SECOND, 2.0)])
+        .unwrap()
+        .positions[0];
+    for x in m.poll(C, 10).unwrap() {
+        if x.position == q {
+            assert!(m.disk.synced_mark.unwrap().last < q);
+            m.confirm(C, q).unwrap();
+        }
+    }
+    assert!(m.disk.synced_mark.unwrap().last >= m.disk.cursors[&C]);
+}
+
+/// §3 Recovery rule 1, accepted limit: a remount within the boot loses the
+/// mark's updates since its last sync; with exactly one complete batch beyond
+/// the synced mark, recovery truncates it, though it was acknowledged and
+/// delivered, writes a recovery entry with K = the mark's last position, and
+/// reports a `possible_loss`; the consumer forgets above K before the reused
+/// position. With two or more batches beyond it the mark is stale: rule 3
+/// keeps them all.
+#[test]
+fn s3_remount_truncates_one_acknowledged_batch_or_finds_the_mark_stale() {
+    for batches in [1usize, 2] {
+        let (mut m, s) = timed_consumer_model();
+        m.drain().unwrap();
+        let k = m.disk.synced_mark.unwrap().last;
+        let mut acked = Vec::new();
+        for i in 0..batches {
+            acked.extend(
+                m.ingest(vec![Reading::num(s, T0 + i as i64, 1.0)])
+                    .unwrap()
+                    .positions,
+            );
+        }
+        let seen: Vec<Position> = m.poll(C, 10).unwrap().iter().map(|d| d.position).collect();
+        assert_eq!(seen, acked, "delivered");
+        m.remount();
+        m.restart();
+        let (at, entry) = m.recovery_entries().into_iter().next_back().unwrap();
+        if batches == 1 {
+            assert_eq!(entry.mark_state, MarkState::Readable);
+            assert_eq!(entry.after, k);
+            assert_eq!(entry.tail.batches, 1);
+            assert!(
+                m.facts().unwrap().iter().all(|f| f.position <= k),
+                "truncated"
+            );
+            assert!(
+                m.losses()
+                    .iter()
+                    .any(|l| l.kind == LossKind::PossibleLoss && l.identity == at)
+            );
+            let reused = m
+                .ingest(vec![Reading::num(s, T0 + 9, 9.0)])
+                .unwrap()
+                .positions[0];
+            assert_eq!(reused, at.next());
+            m.drain().unwrap();
+            let stream = session_stream(&m, C, 2);
+            let reset = stream.iter().position(|d| d.resync().is_some()).unwrap();
+            assert_eq!(stream[reset].resync().unwrap().forget_above, Some(k));
+            assert!(stream[..reset].iter().all(|d| d.position <= k));
+        } else {
+            assert_eq!(entry.mark_state, MarkState::Stale);
+            assert_eq!(entry.after, *acked.last().unwrap(), "every batch kept");
+            assert_eq!(m.facts().unwrap().len(), batches);
+            assert!(
+                m.losses().iter().any(|l| l.kind == LossKind::PossibleLoss),
+                "a stale mark is a `possible_loss`"
+            );
+        }
+    }
+}
+
+/// §3 Recovery rule 3: with the mark lost, the torn tail is unbounded and a
+/// cursor file may name a position above K. F is one above the highest
+/// position named, the positions between K and F are a lost range whose
+/// cause is a truncated tail, described by the entry: part of its
+/// `possible_loss` (which names the missing mark), not a `data_lost`, and not
+/// a reset point of its own (§4 Resync).
+#[test]
+fn s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry() {
+    let (mut m, s) = timed_consumer_model();
+    for i in 0..3 {
+        m.ingest(vec![Reading::num(s, T0 + i, 1.0)]).unwrap();
+    }
+    m.drain().unwrap();
+    let cursor = m.disk.cursors[&C];
+    m.crash();
+    m.lose_mark(MarkState::Missing).unwrap();
+    assert_eq!(m.power_loss_losing(2), 2);
+    m.restart();
+    let k = m.facts().unwrap().last().unwrap().position;
+    let (at, entry) = m.recovery_entries().into_iter().next_back().unwrap();
+    assert_eq!((entry.after, at), (k, cursor.next()), "F above the cursor");
+    assert_eq!(entry.gap(at), Some((k.next(), cursor)));
+    assert_eq!(m.disk.lost_ranges(), vec![(k.next(), cursor)]);
+    let losses = m.losses();
+    assert_eq!(losses.len(), 1, "{losses:?}");
+    assert_eq!(losses[0].kind, LossKind::PossibleLoss);
+    assert_eq!(losses[0].mark_state, MarkState::Missing);
+    assert_eq!(
+        (losses[0].first, losses[0].last),
+        (Some(k.next()), Some(cursor))
+    );
+    assert_eq!(m.health().level, Level::Ok);
+    assert_eq!(
+        m.reset_points(),
+        vec![ResetPoint {
+            id: at,
+            forget_above: k
+        }]
+    );
+}
+
+/// §3 Recovery rule 3: a consumer whose cursor file was missing or unreadable
+/// is named by the recovery entry, reported as a `possible_loss`, and treated
+/// as having no cursor.
+#[test]
+fn s3_missing_cursor_file_is_named_by_the_recovery_entry() {
+    let (mut m, s) = consumer_model();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.drain().unwrap();
+    m.power_loss();
+    m.lose_cursor_file(C).unwrap();
+    m.restart();
+    let (_, entry) = m.recovery_entries().into_iter().next_back().unwrap();
+    assert_eq!(entry.cursors_missing, vec![C]);
+    assert!(
+        m.losses()
+            .iter()
+            .any(|l| l.kind == LossKind::PossibleLoss && l.cursors_missing == vec![C])
+    );
+    m.drain().unwrap();
+    assert!(
+        m.observed[&C].iter().filter(|o| o.session == 2).count() == 1,
+        "replayed from no cursor"
+    );
+}
+
+/// §8 Acknowledging a loss: a `data_lost` holds health degraded until it is
+/// acknowledged by a manifest record naming its identity and range; the loss
+/// stays listed; acknowledging it again, or a `possible_loss`, writes
+/// nothing; the call is refused while read-only.
+#[test]
+fn s8_acknowledging_a_loss_ends_only_the_degraded_state() {
+    let (mut m, s) = consumer_model();
+    for i in 0..3 {
+        m.ingest(vec![Reading::num(s, T0 + i, 1.0)]).unwrap();
+    }
+    m.crash();
+    m.corrupt_open_batch(2).unwrap();
+    m.restart();
+    let lost = m.losses()[0].clone();
+    assert!(lost.degrades());
+    assert_eq!(m.health().level, Level::Degraded);
+    let records = m.disk.manifest.len();
+    m.acknowledge_losses(&[lost.identity]).unwrap();
+    assert_eq!(m.disk.manifest.len(), records + 1);
+    assert_eq!(m.health().level, Level::Ok);
+    let after = m.losses();
+    assert_eq!(after.len(), 1);
+    assert!(after[0].acknowledged && after[0].identity == lost.identity);
+    m.acknowledge_losses(&[lost.identity]).unwrap();
+    assert_eq!(m.disk.manifest.len(), records + 1, "nothing written again");
+    m.restart();
+    assert_eq!(m.losses(), after, "read from the manifest at every start");
+    m.power_loss();
+    m.restart();
+    let possible = m
+        .losses()
+        .into_iter()
+        .map(|l| l.identity)
+        .collect::<Vec<_>>();
+    let records = m.disk.manifest.len();
+    m.acknowledge_losses(&possible).unwrap();
+    assert_eq!(
+        m.disk.manifest.len(),
+        records,
+        "only a `data_lost` is acknowledged"
+    );
+    m.emit(Reading::num(s, T0 + 9, 1.0)).unwrap();
+    assert_eq!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Lost))),
+        Err(Error::SyncFailed)
+    );
+    assert_eq!(m.acknowledge_losses(&possible), Err(Error::ReadOnly));
 }
 
 fn backed_up_model() -> (Model, SeriesId) {

@@ -26,6 +26,7 @@ invariants-5    model invariants      inv09_ inv12_
 invariants-6    model invariants      inv10_ inv17_ inv18_
 invariants-7    model invariants      inv06_ inv19_ inv20_ inv22_
 invariants-8    model invariants      --rest
+invariants-9    model invariants      inv25_ inv26_ inv27_
 edge_cases      model edge_cases
 rules           model rules
 open_questions  model open_questions

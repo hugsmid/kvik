@@ -27,9 +27,11 @@
 //!
 //! Left out, with the reason:
 //! - Routing changes: the log has no entry for them yet (`format.md` A.6, type 5 is reserved for roadmap 5.2).
-//! - Remounts under a timed mark sync: the accepted limit of `spec.md` §3 Recovery rule 1 may lose one acknowledged
-//!   batch, which the model has no counterpart for; remounts run with the mark synced at every commit, and are a crash
-//!   on the same boot otherwise.
+//! - The timed mark sync in the model: the model can lose acknowledged batches above its last synced mark
+//!   (`MarkSync::Timed`, `Model::remount`, `Model::power_loss_losing`), but the log syncs its mark on its own timer, so
+//!   the model runs with the mark synced at every commit; remounts run with the log's mark synced at every commit too,
+//!   and are a crash on the same boot otherwise. Matching the two timers is left to the differential tests of roadmap
+//!   5.2 and 5.3.
 //! - Wall-clock steps backwards: the batch's `received_at` is then open (Q-115 (i)); the wall clock only moves on.
 //! - Defaults of a definition: resolving them is the registry's (roadmap 5.1); every definition here sets them.
 //! - Corruption below the mark and tzdata entries: covered by `recovery.rs` and `model_differential.rs`.

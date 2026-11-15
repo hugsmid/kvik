@@ -39,14 +39,14 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, with the Linux NVMe target run pending) |
-> | 5. Delivery | 0 of 8 done (5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.1a, model support for recovery entries and reset points, added) |
+> | 5. Delivery | 1 of 8 done (5.1a, model support for recovery entries, reset points and loss reports; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c)) |
 > | 6. Compacted segments | 2 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
 > | 7. Summary tree | not started |
 > | 8. Tiers and backup | 1 of 4 done (8.2, the backup sink interface) |
 > | 9. Query | not started |
 > | 10. Scale | not started |
 >
-> 25 of 51 roadmap items are done, including 3 of 9 gates.
+> 26 of 51 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*

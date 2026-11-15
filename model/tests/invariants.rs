@@ -2933,6 +2933,15 @@ impl RWorld {
                 );
             }
         }
+        // 1. Gap-free except lost ranges, each recorded in the manifest or
+        // described by a recovery entry (the positions between K and F),
+        // checked at every step of every recovery history.
+        let mut held: BTreeSet<u64> = seqs(m.disk.all_entries().into_keys()).into_iter().collect();
+        for (from, to) in m.disk.lost_ranges() {
+            held.extend(from.sequence..=to.sequence);
+        }
+        let top = held.iter().next_back().copied().unwrap_or(0);
+        prop_assert_eq!(held.len() as u64, top, "a gap that no lost range holds");
         // 27. The list of losses never loses a loss, each keeps one identity
         // and its range only grows; health is degraded by exactly the
         // unacknowledged `data_lost`.

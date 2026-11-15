@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-124 | §3 Recovery rule 3 and Order of a start step 4, §7 Readers, §11 Health, invariant 27 | Loss reports of recovery entries, and the order of lost ranges against saved points |
 | Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
 | Q-141 | §2.2 `received_at`, `format.md` A.7 `commit_time` | A fact's `received_at` after the wall clock steps back |
 | Q-142 | §5.5, §2.1 counter rules; `format.md` A.6 field 11 | A reset ceiling off the parts-per-million grid |
@@ -154,7 +155,7 @@ one, and the registry is rebuilt after it. Requirements 2 and 3 cannot arise yet
 (roadmap 8.1) or are compacted (6.x) and checkpoints exist (7.1), the kept log holds every registry entry, and the file
 is checked, never trusted over the log. The rest of this question (requirements 1 to 4, the indexes and trees,
 invariants 5 and 8 across a lost range) moved to 6.2 at the 5.1 review (no derived file other than the registry
-exists before 6.2). The model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is roadmap 5.1a.
+exists before 6.2). Recovery entries, reset points, rows 7b and 7c and invariants 25–27 are modelled since roadmap 5.1a.
 
 ## Q-39 (f) — A crash while the restore record is written
 **Scenario.** A restore claims generation g and crashes while writing its restore record locally, leaving a torn
@@ -199,7 +200,7 @@ disk before a successor is appended. Since Q-87, §3 Recovery rule 3 does the sa
 (and its segment's header) whenever the mark is missing, unreadable or stale, and `format.md` A.4 seals again from
 step 1 an `.open` file whose trailer is found, writing the segment index, trailer and end marker again. Whether the next sync then writes those
 bytes, on each platform, was not measured by the roadmap 2.2 spike.
-**Model.** Not modelled; manifest records are not corrupted and the mark is exact.
+**Model.** Not modelled; manifest records are not corrupted and no batch is written again.
 **Needed.** A check, with the page-tracking fault file system and on each platform (on Linux, with a device that
 fails writes on demand), that each rewrite reaches the disk. If it does not, the proposed fallbacks are: for the
 manifest, rewrite it to a new file and rename it; for the log, copy the kept batches to a new segment and rename it;
@@ -653,6 +654,31 @@ manifest append (with roadmap 6.3 at the latest); (e) whether these counts must 
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
 
+## Q-124 — Loss reports of recovery entries, and the order of lost ranges against saved points
+Found while modelling recovery entries (roadmap 5.1a). Each part names what the model does; `tests/rules.rs`,
+`tests/edge_cases.rs` and `tests/invariants.rs` (`inv27_…`) pin it.
+**Scenario.** (a) *Which entries are a `possible_loss`, and the gap.* §11 lists one per recovery entry that names a
+non-empty tail, a gap, a mark not readable or stale, or a missing cursor file. The engine (`kvik-log` start report,
+`kvik` loss list) lists one only for a non-empty tail, and reports the gap's lost-range record (cause truncated tail)
+as a separate `data_lost`, which then holds health degraded until acknowledged, though §11 limits `data_lost` to
+corruption and losses in the bucket. (b) *The identity of a `possible_loss`.* §3 step 4 defines a loss's identity as
+the first position of its range when first reported; for a recovery entry the engine uses F in its start report and
+K + 1 in its loss list. Two entries can share K: an entry at K + 1 is lost with its batch while the mark is lost, a
+tree checkpoint names K + 1, and the next start writes its entry at K + 2 with `after` = K; K + 1 then names two
+losses. (c) *"The lost ranges recorded since"* (§7 Readers). A saved point (P, S) is void above the position before
+each lost range recorded after the reset that carries S. A lost-range record (`format.md` A.14) carries no stamp or
+other sign of when it was written against the recovery entries, so a range found later below that entry (row 11a,
+below an old boot's mark) cannot be told from one recorded before it. (d) *A loss reported as found, then gone.* A
+start whose sync fails reports a damaged batch below the mark as `data_lost`, found and not recorded; if a remount or
+a lost mark then leaves that batch beyond the mark at the end of the open segment, the next start finds a torn tail
+and reports a `possible_loss` under another identity, and the found loss is in no list, against invariant 27.
+**Model.** (a) Follows §11: a `possible_loss` for any of the four, its range the gap, and no `data_lost` for the gap.
+(b) The entry's position, F. (c) Each lost-range record keeps the stamp the mark carried when it was written, and
+counts as later than the reset that carries that stamp. (d) As described; `inv27_…` follows recorded losses only.
+**Needed.** (a) and (b): which the engine or the specification follows. (c): a stamp in the lost-range record, or
+counting every lost range of P's generation as later (voiding more than needed). (d): whether a start that finds a
+torn tail where a found loss was reported keeps reporting it.
+
 ## Q-140 — Live staleness of an observed series in a reader process
 **Scenario.** S = 3 s. The writer commits a reading for `t` = −2 s at 0 s; at 2 s a reader in another process asks
 `live()`. The writer's own reader answers fresh (2 s since the commit, §5.4 monotonic rule); the reader process
@@ -907,12 +933,12 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
 | Q-16 | 5.4 | Live state and staleness are built there; built by roadmap 5.4 as the model backend has them (see the question), not settled: needs the owner's ruling on the proposal and its objections |
-| Q-33 | 6.2 | Moved from 4.5, which has no derived file to check, to 5.1, which did the registry file's check and requirement 5, then to 6.2 at the review of 5.1 (indexes at 6.2, trees at 7.1): the rest of the Derived check (requirements 1–4) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is roadmap 5.1a (see the table below) |
+| Q-33 | 6.2 | Moved from 4.5, which has no derived file to check, to 5.1, which did the registry file's check and requirement 5, then to 6.2 at the review of 5.1 (indexes at 6.2, trees at 7.1): the rest of the Derived check (requirements 1–4) and invariants 5 and 8 across a lost range. Recovery entries, reset points, rows 7b and 7c and invariants 25–27 are modelled since roadmap 5.1a |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing; not settled by roadmap 5.1, which needs the owner's ruling on the proposal and its objections (see the question) |
 | Q-52 (b) | 4.9 | Settled on Linux (ext4 and XFS) by the rewrite job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decision on the macOS and Windows wording |
@@ -941,6 +967,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3b | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9; with 6.3b, which retires files (6.3a gives `Catalogue::at_epoch` and the settled and provisional holds) |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
+| Q-124 | 5.3 | Saved points and loss reports; recorded by roadmap 5.1a |
 | Q-140 | 5.6 | Gate, with the ruling on Q-16; recorded by roadmap 5.4 |
 | Q-141 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-142 | 5.6 | Gate; recorded by roadmap 5.4 |
@@ -1288,7 +1315,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Catch-up after overflow from deep | §4 Overflow, §8 Behind consumers: catch-up reads hot and cold only; where its next entry is on no local tier it ends with `resync`; transitions not delivered meanwhile are counted (`transitions_not_delivered`) | Catch-up after overflow reads an entry wherever it is held; the transitions in between are not counted | — |
 | Funnels with an operator and no condition; conditions over a selection of several series; held-for over a windowed operator | §4 Funnel, §6 | Refused when routed (§6 Multi-series leaves composition to the consumer); held-for is modelled on the live-state value only, so that its resume can be rebuilt exactly from the facts | — |
 | Timer cadence | §6 Cadence: every 1 s, configurable per funnel | Condition funnels are evaluated on the timer when `Model::tick` is called | — |
-| Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation | — |
+| Cursor file synced at most every 1 s | §4 Consumer state | The cursor and the latches are durable at once on confirmation; the mark file is synced first when the cursor would name a position above the last synced mark (§3 Durable mark) | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
 | Group commit and `min_sync_interval` | §3 Group commit: log syncs start at least the interval apart; a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
@@ -1313,11 +1340,10 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Lateness reference | §2.2, §4 Future facts, §8 tree checkpoints, row 4a, invariant 24 (Q-74) | The first clause of `late` compares with the latest recorded `t`, `future` facts included, and a tree checkpoint carries only the latest recorded `t`; not modelled yet | `tests/open_questions.rs` `q74_…` (expects the model's result) |
 | Queries over a quarantined range return an error | §8 Corrupt block | The range reads from another tier | — |
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
-| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2 and Order of a start, §4 Resync, §8 Corrupt block (reported when found; for the open segment, recorded by the next start that can write), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches. A lost range is not a reset point: the `resync` for a cursor below or inside it is the one every resume sends, after the kept facts above the range, where the specification delivers a `resync` carrying `forget_above` at the range, before them. `tests/edge_cases.rs` `row_11a_corrupt_block_inside_the_open_segment` now contradicts the specification on that order | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
+| Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2 and Order of a start, §4 Resync, §8 Corrupt block (reported when found; for the open segment, recorded by the next start that can write), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts or a recovery entry alone in its batch below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches. A damaged batch that a remount or a lost mark leaves beyond the mark, at the end of the open segment, is a torn tail. A lost range recorded at run time (a scrub of a sealed segment) sends no plain `resync` to consumers past it | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost, recorded as a lost range and reported as `data_lost`, so its positions are not issued again; the quarantine stays, with fatal health | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
-| Timed mark sync; recovery entries and reset points; `possible_loss`; `forget_above` | §3 Durable mark, Commit, Recovery rule 3 and Order of a start, §4 At-least-once, Resync, Overflow and Consumer state, §6 Restart and resume, §7 Readers, §8 Behind consumers, rows 7, 7a and 7c, invariants 25–27 (Q-47, Q-48) | Not yet supported; model support is roadmap 5.1a (moved from 4.5, then from before 5.1). The mark is always exact (so neither a stale mark under rule 1 nor its one-batch limit arises), so no delivered position is reused and no cursor is at or above a truncated tail. A recovery under rule 3 writes no recovery entry and takes no position; the mark carries no highest series id; `resync` carries no `forget_above` and no consumer waits for its confirmation; a truncation after a reboot is not reported; a reader does not void what it took above a recovery entry. The `resync` owed to every consumer after a recovery under rule 3 is the one every resume sends, after the replay up to the last kept batch. Since the specification puts the recovery entry at the first new position, these tests now contradict it: `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` (the new fact takes `0:7`, the entry's position, and the `resync` is at `0:6`), and `tests/edge_cases.rs` `row_11a_corrupt_block_below_an_old_boots_mark` and `row_11a_failed_recovery_sync_reports_the_range_as_found` (the next fact after a rule 3 recovery takes the position the entry would take) | `tests/rules.rs` `s4_resync_after_rule_3_recovery_before_later_positions` |
-| Acknowledging a loss | §8 Acknowledging a loss, §11 Health, invariant 27 (Q-34 (c)) | No acknowledgement call or record: a `data_lost` holds health degraded for ever, which agrees with the specification until a loss is acknowledged | `tests/edge_cases.rs` `row_11a_corrupt_block_inside_the_open_segment` |
-| Orphaned facts and id floors | §2.1, §3 Commit, invariants 2 and 4 (Q-33) | A batch holding anything but facts cannot be damaged, so no fact is orphaned and no id floor arises; a batch holding a definition is acknowledged at once, the mark being exact | `tests/edge_cases.rs` `row_11a_fault_injection_limits` |
+| Recovery: the default mark sync, torn bytes, Adoption and the last batch written again | §3 Durable mark, Recovery rules 1 and 3, Order of a start, `api.md` `log.mark_sync` (default `Interval(1 s)`) | The model's default is the mark synced at every commit, so existing histories lose no acknowledged batch; the timed sync is `MarkSync::Timed`, fired by `Model::sync_mark_file`. A tail is a count of batches and whether one was torn, not bytes. A start is never cut short, so no recovery entry is adopted, and no batch or header is written again. A reset stamp's nonce comes from a counter. A start whose own sync fails delivers nothing, and compaction and tree checkpoints are refused while read-only | `tests/edge_cases.rs` `row_07_…`, `row_07a_…`, `row_12a_…` |
+| Orphaned facts and id floors | §2.1, §3 Commit, invariants 2 and 4 (Q-33) | A batch holding anything but facts cannot be damaged or lost from a tail (the mark file is synced at once after it, and the fault injections refuse it), so no fact is orphaned; recovery entries carry the id floor, which no definition can exceed | `tests/edge_cases.rs` `row_11a_fault_injection_limits` |
 | Torn and corrupt manifest records | §7 Manifest, §8 Corrupt block, invariant 10 (Q-52) | Manifest records are written atomically and never corrupted; there is no empty record and no rewrite of the last record at start | — |
 | Positions set aside beyond the restored end | §8 Restore step 1: excluded by position also in reader processes; a set-aside definition keeps its id reserved; the set-aside range reported in health from the restore record at every start (see Q-90); exported for re-ingest (`api.md` `export_set_aside`) | Downloaded in step 1, kept and excluded by position from views, trees, the registry and delivery in the writer; not reported; their series ids are not reserved; reader epochs (§7) still read them; no export | `tests/rules.rs` `s8_restored_end_before_first_gap`, `tests/open_questions.rs` `q38_…` |
 | Restore record and the files a restore reads | §8 Generations, §8 Restore step 1: the restore record lists every file it restores from, set-aside segments included, each with its position range, and carries the earlier restored ends; it is uploaded before any other file of its generation, and the claims are then read again; a restore reads only the records of the highest generation below its own that has any, and a position set aside once stays so | The record is local and holds generation, checkpoint and restored end; a restore reads every file in the bucket whatever its generation, except files retired by a record whose added files are all in the bucket, and does not read the claims again. A second restore after a restore with a gap therefore finds the old gap again and sets aside the generation that restore started; under the specification its restored end is `1:1` and generation 1 is kept | `tests/open_questions.rs` `q37_second_restore_finds_the_old_gap_again` (expects the model's result) |
