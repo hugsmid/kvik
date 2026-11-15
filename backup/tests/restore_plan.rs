@@ -238,6 +238,15 @@ fn a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end
 }
 
 #[test]
+fn a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing() {
+    let mut h = gen0();
+    h.seal(seg(0, 3, 25, 30)).seal(seg(0, 4, 31, 40)).copy(4);
+    let c = catalogue(&h.records());
+    let p = plan(&input(&c, &[(0, 20)])).unwrap();
+    assert_eq!(p.record.restored_end, (0, 20));
+}
+
+#[test]
 fn a_store_whose_first_position_is_not_copied_restores_to_the_origin() {
     let mut h = History::new(0);
     h.seal(seg(0, 1, 1, 10)).seal(seg(0, 2, 11, 20)).copy(2);
@@ -645,6 +654,7 @@ fn history() -> impl Strategy<Value = Gen> {
 
 /// The restored end of `spec.md` §8 Restore step 1, walked one position at a time.
 fn walked_end(g: &Gen) -> RecordPosition {
+    let listed = |q: u64| g.segments.iter().any(|s| s.1 <= q && q <= s.2);
     let held = |q: u64| g.segments.iter().any(|s| s.3 && s.1 <= q && q <= s.2);
     let lost = |q: u64| g.losses.iter().any(|l| l.0 <= q && q <= l.1);
     let top = g.segments.iter().map(|s| s.2).max().unwrap_or(0);
@@ -654,10 +664,11 @@ fn walked_end(g: &Gen) -> RecordPosition {
         if held(q) {
             end = q;
         } else if !lost(q) {
-            let Some(next) = (q..=top).find(|x| held(*x)) else {
+            let Some(next) = (q..=top).find(|x| listed(*x)) else {
                 break;
             };
-            let bridged = (q..next).all(|x| !lost(x)) && g.after.contains(&(0, q - 1));
+            let bridged =
+                held(next) && (q..next).all(|x| !lost(x)) && g.after.contains(&(0, q - 1));
             if !bridged {
                 break;
             }

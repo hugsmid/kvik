@@ -222,30 +222,38 @@ impl Scope<'_> {
     /// Scans generation `g` from sequence 1 (to `to`, if given): the last sequence held before the first gap that no
     /// loss covers and no recovery entry bridges, and that gap's first sequence.
     fn scan(&self, g: u32, to: Option<u64>) -> Result<(Option<u64>, Option<u64>), PlanError> {
-        let mut held = Vec::new();
-        for e in self.segments.iter().filter(|e| e.deep.is_some()) {
+        let (mut held, mut uncopied) = (Vec::new(), Vec::new());
+        for e in self.segments.iter() {
             if let Some(r) = clip(e, g)? {
-                held.push(r);
+                if e.deep.is_some() {
+                    &mut held
+                } else {
+                    &mut uncopied
+                }
+                .push(r);
             }
         }
         let held = merged(held);
-        let losses = merged(
-            self.losses
+        let gap = Gap {
+            losses: merged(
+                self.losses
+                    .iter()
+                    .filter_map(|(a, b)| clip_range(*a, *b, g))
+                    .collect(),
+            ),
+            uncopied: merged(uncopied),
+            after: self
+                .after
                 .iter()
-                .filter_map(|(a, b)| clip_range(*a, *b, g))
+                .filter(|p| p.0 == g)
+                .map(|p| p.1)
                 .collect(),
-        );
-        let after: BTreeSet<u64> = self
-            .after
-            .iter()
-            .filter(|p| p.0 == g)
-            .map(|p| p.1)
-            .collect();
+        };
         let mut covered = 0u64;
         let mut last_held = None;
         for &(a, b) in &held {
             if a > covered + 1
-                && let Some(u) = first_unbridged(covered + 1, a - 1, &losses, &after, true)
+                && let Some(u) = gap.first_unbridged(covered + 1, a - 1, true)
             {
                 return Ok((last_held, Some(u)));
             }
@@ -259,7 +267,7 @@ impl Scope<'_> {
         }
         let tail = to
             .filter(|t| *t > covered)
-            .and_then(|t| first_unbridged(covered + 1, t, &losses, &after, false));
+            .and_then(|t| gap.first_unbridged(covered + 1, t, false));
         Ok((last_held, tail))
     }
 
@@ -306,32 +314,37 @@ fn merged(mut v: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
-/// The first sequence of `lo..=hi` that no loss covers, unless a recovery entry right after `hi` names the sequence
-/// before the uncovered rest as its `after` (`spec.md` §8 Restore step 1). `None`: the gap does not end the log.
-fn first_unbridged(
-    lo: u64,
-    hi: u64,
-    losses: &[(u64, u64)],
-    after: &BTreeSet<u64>,
-    entry_follows: bool,
-) -> Option<u64> {
-    let i = losses.partition_point(|&(_, b)| b < lo);
-    let u = match losses.get(i) {
-        Some(&(a, b)) if a <= lo => b.checked_add(1)?,
-        _ => lo,
-    };
-    if u > hi {
-        return None;
+/// What may fill a gap between copied segments in one generation.
+struct Gap {
+    losses: Vec<(u64, u64)>,
+    uncopied: Vec<(u64, u64)>,
+    after: BTreeSet<u64>,
+}
+
+impl Gap {
+    /// The first sequence of `lo..=hi` that ends the restored log (`spec.md` §8 Restore step 1): one a listed segment
+    /// without a copy holds, or one no loss covers, unless a recovery entry right after `hi` names the sequence before
+    /// the uncovered rest as its `after`. `None`: the gap does not end the log.
+    fn first_unbridged(&self, lo: u64, hi: u64, entry_follows: bool) -> Option<u64> {
+        let first_in = |v: &[(u64, u64)]| {
+            let j = v.partition_point(|&(_, b)| b < lo);
+            v.get(j).filter(|r| r.0 <= hi).map(|r| r.0.max(lo))
+        };
+        let i = self.losses.partition_point(|&(_, b)| b < lo);
+        let unlost = match self.losses.get(i) {
+            Some(&(a, b)) if a <= lo => b.checked_add(1).filter(|u| *u <= hi),
+            _ => Some(lo),
+        };
+        if let Some(w) = first_in(&self.uncopied) {
+            return Some(unlost.map_or(w, |u| u.min(w)));
+        }
+        let u = unlost?;
+        let loss_inside = self.losses[i..].iter().any(|&(a, _)| a > u && a <= hi);
+        if entry_follows && !loss_inside && self.after.contains(&(u - 1)) {
+            return None;
+        }
+        Some(u)
     }
-    let loss_inside = losses
-        .get(i..)
-        .unwrap_or_default()
-        .iter()
-        .any(|&(a, _)| a > u && a <= hi);
-    if entry_follows && !loss_inside && after.contains(&(u - 1)) {
-        return None;
-    }
-    Some(u)
 }
 
 /// The records a restore reads, from one generation's records in epoch order (Q-108): from the last rebuild record
