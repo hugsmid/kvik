@@ -54,6 +54,8 @@ again; nothing after a gate starts before it is passed.
 ## 5. Delivery
 - [ ] 5.1 Series registry; the `kvik` crate on the durable log: writing, and `facts`, series lookup and `refresh` for
   reader processes
+- [ ] 5.1a Model: recovery entries, reset points, rows 7b and 7c, invariants 25–27 (the oracle for 5.2 and 5.3;
+  moved from before 5.1)
 - [ ] 5.2 Routing table, conditions, consumer queues, durable cursors
 - [ ] 5.3 Catch-up, resync and replay flags; the saved-point check (`Reader::check`, `Start::Position`, row 7b)
 - [ ] 5.4 Live state and windowed operators over recent facts
