@@ -474,7 +474,8 @@ only, boxed `Send` futures):
   prefix) and fails with `NoStore` on none. An unfinished restore is resumed by calling `Store::restore` again
   (Q-164 (c)). `WrongKey` comes before any file is fetched. `NotEmpty`: the directory holds files and no restore
   record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
-  store.
+  store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a
+  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304).
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
   SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
   which the sampled download checks. Eviction (roadmap 8.1) requires one.

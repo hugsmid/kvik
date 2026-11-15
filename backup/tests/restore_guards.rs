@@ -10,6 +10,7 @@ use kvik_backup::keys::{ClaimMarker, Keys};
 use kvik_backup::plan::PlanMode;
 use kvik_backup::restore::{RestoreDriver, RestoreError};
 use kvik_log::fs::MemFs;
+use kvik_sink::fake::FakeBucket;
 use kvik_sink_api::SinkError;
 use support::*;
 
@@ -73,4 +74,28 @@ fn a_claim_rejected_three_times_with_nothing_stored_fails_and_skips_no_generatio
     );
     assert_eq!(sink.count("put", &claim), 3);
     assert!(claims(&sink.inner.objects(), ID).is_empty());
+}
+
+#[test]
+fn a_generation_whose_records_list_empty_while_its_restore_record_is_stored_is_refused_not_skipped()
+{
+    let mut src = source(ID, 2, false);
+    let bucket = FakeBucket::new();
+    upload(&bucket.sink(), &mut src);
+    use_copies(&src);
+    bucket.set_list_lag(1_000);
+    let first = MemFs::new();
+    let (p, _) = restore(&mut restorer(bucket.sink(), &first, PlanMode::Full, KEY)).unwrap();
+    assert_eq!(p.record.generation, 1);
+    let record = Keys::new(ID).record(1, 1);
+    assert!(bucket.object(&record).is_some());
+    for mode in [PlanMode::Drill, PlanMode::Full] {
+        let fs = MemFs::new();
+        let r = block_on(restorer(bucket.sink(), &fs, mode.clone(), KEY).prepare(1));
+        assert!(
+            matches!(r, Err(RestoreError::ListingIncomplete { generation: 1 })),
+            "{mode:?}: {r:?}"
+        );
+        assert!(fs.paths().is_empty(), "{mode:?}");
+    }
 }

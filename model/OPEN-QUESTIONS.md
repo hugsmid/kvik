@@ -65,7 +65,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-301 | §8 Restore (the paragraph after step 4) | The files a resumed restore fetches |
 | Q-302 | §8 Restore (Failures and end), §8 Corrupt block | The lost range of a listed file the bucket has lost, and files other than log segments |
 | Q-303 | §8 Generations, §7 Readers; `format.md` A.1 kind 12 | The local restore record file |
-| Q-304 | §8 Generations, Restore step 1 | A manifest record object the bucket has lost |
+| Q-304 | §8 Generations, Restore step 1 | A manifest record object the bucket has lost or a listing does not show |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 
 ## Q-16 — Which commits refresh live staleness
@@ -1187,17 +1187,25 @@ no layout, and the committed interface (`RestoreDriver::prepare`) names `MANIFES
 `kvik-files`.
 **Needed.** A layout for kind 12 and who writes it, or the spec text without it.
 
-## Q-304 — A manifest record object the bucket has lost
-Recorded by roadmap 8.3b.
-**Scenario.** A restore lists the records of the generation it reads and fetches each. An object the bucket has lost
-is simply not listed; epochs may jump after a start (`format.md` A.14), so the gap is not visible. The plan is then
-made from fewer records: a file those records listed is missing from the restore, or the restored end is earlier,
-with nothing reported. A record that is listed but damaged fails the restore by name (`RestoreError::Envelope` or
-`Record`), as does a missing or damaged `STORE`.
+## Q-304 — A manifest record object the bucket has lost or a listing does not show
+Recorded by roadmap 8.3b. To be settled by roadmap 8.3.
+**Scenario.** A restore lists the records of the generation it reads and fetches each. A record object can be
+missing from that listing for two reasons: the bucket has lost it, or the listing lags behind the write, which is
+ordinary (`api.md` Backup and restore, Listings: absence from a listing proves nothing). Epochs may jump after a
+start (`format.md` A.14), so the gap is not visible. The plan is then made from fewer records: a file those records
+listed is missing from the restore, or the restored end is earlier, with nothing reported. A record that is listed
+but damaged fails the restore by name (`RestoreError::Envelope` or `Record`), as does a missing or damaged `STORE`.
+**Decided at the review of roadmap 8.3b, for a generation that lists no record at all.** A restore record is
+always epoch 1 of its generation, so the restore reads `record(g, 1)` by `stat`; if it is present the listing is
+incomplete and the restore fails with `RestoreError::ListingIncomplete { generation }`, to be retried, rather than
+falling back to an older generation and dropping everything in g. If it is absent, the generation counts as having
+no records (a claim whose restore stopped before its record). `backup/src/restore/driver.rs` `source_records`,
+`backup/tests/restore_guards.rs`.
 **Model.** Not modelled.
-**Needed.** A way to see a missing record: for example each uploaded record naming the previous record's epoch
-(`format.md` A.17), so that a restore checks the chain, and what a broken chain does (refuse, or restore to the record
-before the gap with a reported loss).
+**Needed.** A way to see a record missing from a listing that shows others: for example each uploaded record naming
+the previous record's epoch (`format.md` A.17), so that a restore checks the chain and the tail, and what a broken
+chain does (refuse, or restore to the record before the gap with a reported loss). This is its own item, settled by
+roadmap 8.3.
 
 ## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
 Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
@@ -1333,7 +1341,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-301 | 8.3 | The files a resumed restore fetches; recorded by roadmap 8.3b; exact for a log-only restore |
 | Q-302 | 8.3 | A restore's lost range and files other than log segments; recorded by roadmap 8.3b |
 | Q-303 | 8.3 | The local restore record file (kind 12); recorded by roadmap 8.3b |
-| Q-304 | 8.3 | A lost manifest record object; recorded by roadmap 8.3b; with `format.md` A.17 (8.1b) |
+| Q-304 | 8.3 | A manifest record lost or not listed; recorded by roadmap 8.3b; an empty listing decided at its review; the chain of epochs and tail check is its own item, with `format.md` A.17 (8.1b) |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

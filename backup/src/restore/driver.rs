@@ -196,6 +196,7 @@ async fn claim<S: BackupSink>(
 }
 
 /// The records of the highest generation below `generation` that has any, from its last rebuild record on (Q-108).
+/// A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304).
 async fn source_records<S: BackupSink, E: Envelope>(
     sink: &S,
     env: &E,
@@ -216,6 +217,10 @@ async fn source_records<S: BackupSink, E: Envelope>(
             })
             .collect();
         if listed.is_empty() {
+            // Q-304: absence from a listing proves nothing; a generation's first record is at epoch 1.
+            if sink.stat(&keys.record(g, 1)).await?.is_some() {
+                return Err(RestoreError::ListingIncomplete { generation: g });
+            }
             continue;
         }
         listed.sort();

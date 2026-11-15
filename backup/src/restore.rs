@@ -112,6 +112,12 @@ pub enum RestoreError {
         /// The higher generation.
         by: u32,
     },
+    /// A generation's records list empty while `stat` reports its first record: the listing lags; retry (Q-304).
+    #[error("the listing of generation {generation}'s records is incomplete; retry")]
+    ListingIncomplete {
+        /// The generation.
+        generation: u32,
+    },
     /// No plan can be made.
     #[error(transparent)]
     Plan(#[from] PlanError),
