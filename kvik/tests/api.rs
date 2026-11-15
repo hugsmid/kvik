@@ -1561,3 +1561,52 @@ fn consumer_emits() {
     assert_eq!(refused(&ack), vec![(0, Refusal::NotDeclared)]);
     assert_eq!(s.series_stats(g).unwrap().refused[&Refusal::NotDeclared], 1);
 }
+
+#[test]
+fn reads_of_unknown_and_retired_series() {
+    for b in BACKENDS {
+        reads_of_unknown_and_retired_series_on(b);
+    }
+}
+
+fn reads_of_unknown_and_retired_series_on(b: Backend) {
+    let (s, clock) = store_on(b, "unknown-retired");
+    let g = block_on(s.define_series(gauge("a/b/old", 1))).unwrap();
+    block_on(s.emit(&[num(g, -10, 1.0), num(g, -5, 3.0)])).unwrap();
+    block_on(s.retire(g, at(-1))).unwrap();
+    clock.advance(Duration::from_secs(1));
+    let r = s.reader();
+    let unknown = SeriesId(99);
+    assert!(matches!(r.live(unknown), Err(QueryError::UnknownSeries)));
+    assert!(matches!(
+        r.window(
+            unknown,
+            Window::rolling(Duration::from_secs(60)),
+            Aggregate::Avg
+        ),
+        Err(QueryError::UnknownSeries)
+    ));
+    assert!(matches!(
+        r.buckets(unknown, at(-60)..at(0), Resolution::Auto { max_points: 10 }),
+        Err(QueryError::UnknownSeries)
+    ));
+    // A retired series keeps its facts and their results.
+    let w = r
+        .window(g, Window::absolute(at(-20)..at(0)), Aggregate::Count)
+        .unwrap();
+    assert_eq!(w.number(), Some(2.0));
+    match r.live(g).unwrap() {
+        Live::Value(v) => assert_eq!(v.fact.number(), Some(3.0)),
+        other => panic!("{other:?}"),
+    }
+    match r
+        .buckets(g, at(-60)..at(0), Resolution::Step(Duration::from_secs(30)))
+        .unwrap()
+    {
+        ChartData::Buckets { buckets, .. } => {
+            let counts: Vec<u64> = buckets.iter().map(|b| b.count).collect();
+            assert_eq!(counts, vec![0, 2]);
+        }
+        other => panic!("{other:?}"),
+    }
+}

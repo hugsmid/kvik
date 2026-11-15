@@ -33,6 +33,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
 | Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
+| Q-141 | §2.2 `received_at`, `format.md` A.7 `commit_time` | A fact's `received_at` after the wall clock steps back |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 
 ## Q-16 — Which commits refresh live staleness
@@ -86,22 +87,8 @@ last commit, in the writer's process, of a fact that is recorded, not outranked,
 opened, in event time, `now − t` of the live-state fact; a scheduled series in event time, a forecast series never.
 So (a) and (b) still refresh it, as in the model, and (d) falls back to event time. A reader process has no refresh
 instant at all (objection 5, Q-140). Not settled: the owner's ruling on the proposal and its objections is pending
-(`kvik/tests/windows.rs`, `a_reader_process_answers_after_shutdown_and_power_loss`).
-
-## Q-140 — Live staleness of an observed series in a reader process
-**Scenario.** S = 3 s. The writer commits a reading for `t` = −2 s at 0 s; at 2 s a reader in another process asks
-`live()`. The writer's own reader answers fresh (2 s since the commit, §5.4 monotonic rule); the reader process
-cannot, since the commit instant on the writer's monotonic clock is in no file (Q-16 objection 5). The same holds for
-the writer's own process after a restart, before its next refreshing commit (Q-16 (d)).
-**Implemented (roadmap 5.4).** A reader process, and a writer before its first refreshing commit since it was opened,
-measure live staleness in event time, `now − t` of the live-state fact against S: stale at 2 s in the scenario
-(4 s since `t`). This is the model backend's fallback after a restart. A reader process keeps its own window clock
-`now` from its open (max(wall clock, previous value), advanced by the monotonic clock), so it can also differ from
-the writer's after the wall clock stepped back before the reader opened. Every other result (windows, buckets,
-calendar results) is a function of the facts and `now`, and agrees (`kvik/tests/windows.rs`).
-**Needed.** Whether `live().stale` in a reader process may differ from the writer's, or the refresh instant must be
-made a function of the log (with Q-16), or the reader must say it cannot tell (an `Unknown` staleness, an `api.md`
-change).
+(`kvik/tests/windows.rs`, `a_reader_process_answers_after_shutdown_and_power_loss`), and 5.4 stays unticked until it
+is given.
 
 ## Q-33 — The Derived check: derived files after a lost range
 **Scenario.** The kept-log principle, orphaned facts and id floors are settled (§2.1; see Settled). A lost range
@@ -630,6 +617,34 @@ manifest append (with roadmap 6.3 at the latest); (e) whether these counts must 
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
 
+## Q-140 — Live staleness of an observed series in a reader process
+**Scenario.** S = 3 s. The writer commits a reading for `t` = −2 s at 0 s; at 2 s a reader in another process asks
+`live()`. The writer's own reader answers fresh (2 s since the commit, §5.4 monotonic rule); the reader process
+cannot, since the commit instant on the writer's monotonic clock is in no file (Q-16 objection 5). The same holds for
+the writer's own process after a restart, before its next refreshing commit (Q-16 (d)).
+**Implemented (roadmap 5.4).** A reader process, and a writer before its first refreshing commit since it was opened,
+measure live staleness in event time, `now − t` of the live-state fact against S: stale at 2 s in the scenario
+(4 s since `t`). This is the model backend's fallback after a restart. A reader process keeps its own window clock
+`now` from its open (max(wall clock, previous value), advanced by the monotonic clock), so it can also differ from
+the writer's after the wall clock stepped back before the reader opened. Every other result (windows, buckets,
+calendar results) is a function of the facts and `now`, and agrees (`kvik/tests/windows.rs`).
+**Needed.** Whether `live().stale` in a reader process may differ from the writer's, or the refresh instant must be
+made a function of the log (with Q-16), or the reader must say it cannot tell (an `Unknown` staleness, an `api.md`
+change).
+
+## Q-141 — A fact's `received_at` after the wall clock steps back
+**Scenario.** A batch commits at wall-clock 12:00:00; the clock is corrected back by 1 s; the next batch is formed at
+11:59:59.5. §2.2 defines `received_at` as the host clock at commit (11:59:59.5) and `commit_time` as
+`max(received_at, previous commit_time)` (12:00:00). The `commit_time` row of `format.md` A.7 (commit block body) says
+"`received_at` and the commit time are the wall clock when the batch is formed, raised to the previous batch's commit
+time", so the log keeps one value, 12:00:00, as both. The model backend shows 11:59:59.5 in the fact's `received_at`;
+the durable backend shows 12:00:00. Flags are stamped from the wall clock when the call is decided (Q-123 (a)), so
+`future` and `late` agree; only `received_at` differs, and with it anything a client derives from it.
+**Implemented.** As the log has it: `received_at` is the batch's commit time. The differential tests clear
+`received_at` when the wall clock stepped back (`kvik/tests/windows.rs`).
+**Needed.** Which of the two texts holds: a separate `received_at` in the batch (a `format.md` change), or §2.2
+reworded to the raised value.
+
 ## Q-170 — Durability levels chosen per source
 
 Decided by the owner: a source may choose between the default level, where a reading is acknowledged only after the
@@ -662,7 +677,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 and Q-141.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -697,6 +712,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
 | Q-140 | 5.6 | Gate, with the ruling on Q-16; recorded by roadmap 5.4 |
+| Q-141 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
