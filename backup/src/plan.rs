@@ -82,7 +82,7 @@ pub type PlanFn = fn(&PlanInput<'_>) -> Result<RestorePlan, PlanError>;
 /// The restored log is scanned in the source generation only, from sequence 1, over the copied log segments' ranges:
 /// a gap that a recorded loss covers, or that a recovery entry named in `recovery_after` follows directly, does not
 /// end it (Q-290). Positions of earlier generations at or below a carried end must be held by copied segments or
-/// recorded losses. Every live file with a copy verified in deep is listed, set-aside ones included; no other file is.
+/// recorded losses. Every live file with a recorded copy in deep is listed, set-aside ones included; no other file is.
 pub fn plan(input: &PlanInput<'_>) -> Result<RestorePlan, PlanError> {
     let src = input.source;
     let s = input.source_generation;
@@ -279,10 +279,10 @@ impl Scope<'_> {
     }
 }
 
-/// A file's copy in deep, if it is verified there (Q-280): a copy-verified record carried into a rebuilt manifest
-/// gives the copy without the mark.
+/// A file's recorded copy in deep, verified there or not since a rebuild (Q-295): a copy gone since is found at fetch
+/// and recorded lost.
 fn backed_up(e: &FileEntry) -> Option<&kvik_files::tier::DeepCopy> {
-    e.deep.as_ref().filter(|_| e.verified.contains(&Tier::Deep))
+    e.deep.as_ref()
 }
 
 /// The sequences of generation `g` a segment holds.

@@ -106,8 +106,7 @@ fn copy_body(file_id: u64) -> Body {
     }
 }
 
-/// The fold of `records`, the placeholder copy records folded by [`Catalogue::record_copy`]. A carried one (field
-/// 100) marks no copy verified (Q-280), so it is not folded.
+/// The fold of `records`, the placeholder copy records folded by [`Catalogue::record_copy`].
 fn catalogue(records: &[Record]) -> Catalogue {
     let mut c = Catalogue::new();
     for r in records {
@@ -117,7 +116,6 @@ fn catalogue(records: &[Record]) -> Catalogue {
             fields,
             ..
         } = &r.body
-            && r.old_epoch.is_none()
         {
             let id = u64::from_le_bytes(fields[0].1[..].try_into().unwrap());
             c.record_copy(seg_ref(id), Tier::Deep, copy_of(id));
@@ -249,14 +247,14 @@ fn a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing() {
 }
 
 #[test]
-fn a_copy_no_longer_marked_verified_in_deep_is_not_restored_from() {
+fn a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark() {
     let mut h = gen0();
     h.push(Body::Rebuild(Rebuild::default()));
     let c = catalogue(&h.records());
-    assert!(c.file(seg_ref(1)).unwrap().deep.is_some());
+    assert!(!c.file(seg_ref(1)).unwrap().verified.contains(&Tier::Deep));
     let p = plan(&input(&c, &[])).unwrap();
-    assert_eq!(p.record.restored_end, (0, 0));
-    assert!(p.record.files.is_empty());
+    assert_eq!(p.record.restored_end, (0, 20));
+    assert_eq!(listed(&p), vec![1, 2]);
 }
 
 #[test]
@@ -562,25 +560,17 @@ fn q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read() {
             (0, 30)
         );
     }
-    // Whole, it is read; its files count once verified in deep again after the rebuild (Q-280, Q-294).
+    // Whole, it is read, its carried copies restorable (Q-295).
     let whole = rebuilt(&old, n + 2);
     let read = records_to_read(&whole);
     assert_eq!(read, &whole[n..]);
-    let end = |r: &[Record]| {
-        plan(&input(&catalogue(r), &[]))
+    assert_eq!(
+        plan(&input(&catalogue(read), &[]))
             .unwrap()
             .record
-            .restored_end
-    };
-    assert_eq!(end(read), (0, 0));
-    let mut again = History::new(0);
-    again.bodies = whole
-        .iter()
-        .map(|r| (r.body.clone(), r.old_epoch))
-        .collect();
-    again.copy(1).copy(2).copy(3);
-    let records = again.records();
-    assert_eq!(end(records_to_read(&records)), (0, 30));
+            .restored_end,
+        (0, 30)
+    );
     // Reading from the rebuild record as soon as it is uploaded would read a truncated list of files.
     let partial = rebuilt(&old, 3);
     assert_eq!(catalogue(&partial[n..]).files().count(), 1);
@@ -597,7 +587,7 @@ fn q108_records_after_a_whole_rebuilt_manifest_are_read_with_it_and_a_later_part
         .iter()
         .map(|r| (r.body.clone(), r.old_epoch))
         .collect();
-    later.copy(1).copy(2).seal(seg(0, 3, 21, 30)).copy(3);
+    later.seal(seg(0, 3, 21, 30)).copy(3);
     records = later.records();
     let read = records_to_read(&records);
     assert_eq!(read, &records[n..]);
@@ -647,13 +637,13 @@ fn gap() -> impl Strategy<Value = Gap> {
     ]
 }
 
-/// A generation-0 history: segments with gaps between them, copies made late and in any order, and, if `rebuild`
-/// holds, a whole rebuilt manifest after some record.
-fn history(rebuild: bool) -> impl Strategy<Value = Gen> {
+/// A generation-0 history: segments with gaps between them, copies made late and in any order, and perhaps a whole
+/// rebuilt manifest after some record.
+fn history() -> impl Strategy<Value = Gen> {
     (
         proptest::collection::vec((gap(), 1u64..4, 1u64..6, prop::bool::weighted(0.8)), 1..10),
         proptest::collection::vec(any::<prop::sample::Index>(), 10),
-        proptest::option::of(any::<prop::sample::Index>()).prop_map(move |r| r.filter(|_| rebuild)),
+        proptest::option::of(any::<prop::sample::Index>()),
     )
         .prop_map(|(segs, places, rebuild)| {
             let mut h = History::new(0);
@@ -748,7 +738,7 @@ fn walked_end(g: &Gen) -> RecordPosition {
 
 proptest! {
     #[test]
-    fn the_restored_end_is_the_one_the_spec_walks_to(g in history(false)) {
+    fn the_restored_end_is_the_one_the_spec_walks_to(g in history()) {
         let records = g.history.records();
         let c = catalogue(records_to_read(&records));
         let p = plan(&input(&c, &g.after)).unwrap();
@@ -756,7 +746,7 @@ proptest! {
     }
 
     #[test]
-    fn the_plan_names_every_copied_file_and_never_one_without_a_copy(g in history(true)) {
+    fn the_plan_names_every_copied_file_and_never_one_without_a_copy(g in history()) {
         let records = g.history.records();
         let c = catalogue(records_to_read(&records));
         let p = plan(&input(&c, &g.after)).unwrap();
@@ -765,14 +755,14 @@ proptest! {
         }
         let named: BTreeSet<FileRef> = p.record.files.iter().map(|f| f.description.file_ref()).collect();
         let copied: BTreeSet<FileRef> =
-            c.live().filter(|e| e.deep.is_some() && e.verified.contains(&Tier::Deep)).map(|e| e.description.file_ref()).collect();
+            c.live().filter(|e| e.deep.is_some()).map(|e| e.description.file_ref()).collect();
         prop_assert_eq!(&named, &copied);
         prop_assert!(p.fetch.iter().all(|f| named.contains(&f.description.file_ref())));
         prop_assert_eq!(RestoreRecord::from_body(&p.record.to_body()), Some(Ok(p.record.clone())));
     }
 
     #[test]
-    fn the_plan_is_deterministic_and_independent_of_the_order_copies_arrive_in(g in history(true)) {
+    fn the_plan_is_deterministic_and_independent_of_the_order_copies_arrive_in(g in history()) {
         let records = g.history.records();
         let read = records_to_read(&records);
         let a = plan(&input(&catalogue(read), &g.after));
@@ -789,7 +779,7 @@ proptest! {
     }
 
     #[test]
-    fn the_plan_is_monotone_in_the_records_uploaded(g in history(false), cut in any::<prop::sample::Index>()) {
+    fn the_plan_is_monotone_in_the_records_uploaded(g in history(), cut in any::<prop::sample::Index>()) {
         let records = g.history.records();
         let k = cut.index(records.len()) + 1;
         let full = catalogue(records_to_read(&records));
