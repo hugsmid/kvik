@@ -38,6 +38,9 @@ log-histories   log   model_histories
 log-writer      log   writer
 log-recovery    log   recovery
 log-reader      log   reader
+kvik-windows    kvik  windows
+chunk-properties chunk properties
+chunk-fuzz-inputs chunk fuzz_inputs
 files-records   files records
 files-manifest  files manifest
 files-rebuild   files rebuild

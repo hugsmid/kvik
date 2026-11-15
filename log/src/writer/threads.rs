@@ -89,12 +89,16 @@ struct Slot {
 
 impl Slot {
     fn complete(&self, r: Result<Ack, CommitError>) {
-        let mut s = lock(&self.state);
-        s.result = Some(r);
-        if let Some(w) = s.waker.take() {
+        let waker = {
+            let mut s = lock(&self.state);
+            s.result = Some(r);
+            s.waker.take()
+        };
+        self.cv.notify_all();
+        // Woken outside the slot's lock, so that the waker may poll the call at once.
+        if let Some(w) = waker {
             w.wake();
         }
-        self.cv.notify_all();
     }
 }
 

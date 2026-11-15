@@ -12,10 +12,9 @@
 //!   committed to the log in the store directory, on the file system of
 //!   [`env::Env`], and acknowledged only once it is durable; a [`Reader`], in
 //!   this process or another, reads up to the durable mark. It supports
-//!   series definitions, writing, facts in every view and series lookup so
-//!   far; consumers, live state, windows and calendar results return
-//!   `NotSupportedYet` (or, for reads, `QueryError::NotAvailable`) until
-//!   their roadmap items.
+//!   series definitions, writing, facts in every view, series lookup, live
+//!   state, windows, chart buckets and calendar results so far; consumers
+//!   return `NotSupportedYet` until their roadmap item.
 //! - [`Backend::Model`]: the executable reference model (`kvik-model`), an
 //!   in-memory, exact and slow implementation of the whole interface. Nothing
 //!   is written to disk: [`Store::open`] only uses the directory as a name,
@@ -97,8 +96,10 @@ mod config;
 mod consume;
 mod durable;
 mod error;
+mod fold;
 mod health;
 mod read;
+mod rules;
 mod series;
 mod store;
 mod time;
@@ -106,7 +107,10 @@ mod types;
 
 pub mod env;
 
-pub use backup::{BackupSink, Encryption, Rebuild, RestoreMode, Stored};
+pub use backup::{
+    BackupSink, Encryption, ListPage, Rebuild, RestoreMode, SinkError, SinkFuture, Stored,
+    Verified, VerifyError,
+};
 pub use config::{
     Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,
 };

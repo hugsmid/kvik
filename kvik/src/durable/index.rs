@@ -3,6 +3,7 @@
 //! (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::Duration;
 
 use kvik_log::content::Item;
@@ -210,6 +211,65 @@ impl Index {
     /// The facts of a series in `(t, position)` order.
     pub(crate) fn series_facts(&self, id: u32) -> impl Iterator<Item = &Stored> {
         self.facts.get(&id).into_iter().flat_map(|m| m.values())
+    }
+
+    /// The current facts of a series (the fact of highest rank per `t`, spec §2.2) with `t` from `from` to `to`
+    /// (bounds inclusive or not as given), in `t` order, or in reverse with `rev`. The rank is the position, or
+    /// `(changed_at, position)` in a versioned series.
+    pub(crate) fn current_between(
+        &self,
+        id: u32,
+        versioned: bool,
+        from: Bound<i64>,
+        to: Bound<i64>,
+        rev: bool,
+    ) -> impl Iterator<Item = &Stored> {
+        const FIRST: LogPos = LogPos {
+            generation: 0,
+            sequence: 0,
+        };
+        const LAST: LogPos = LogPos {
+            generation: u32::MAX,
+            sequence: u64::MAX,
+        };
+        let lo = match from {
+            Bound::Included(t) => Bound::Included((t, FIRST)),
+            Bound::Excluded(t) => Bound::Excluded((t, LAST)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let hi = match to {
+            Bound::Included(t) => Bound::Included((t, LAST)),
+            Bound::Excluded(t) => Bound::Excluded((t, FIRST)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        // An empty or inverted range reads nothing (`BTreeMap::range` panics on one).
+        let empty = match (&lo, &hi) {
+            (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
+                a > b || (a == b && !matches!((&lo, &hi), (Bound::Included(_), Bound::Included(_))))
+            }
+            _ => false,
+        };
+        let facts = self.facts.get(&id).filter(|_| !empty);
+        let mut it: Box<dyn Iterator<Item = &Stored>> = match facts {
+            None => Box::new(std::iter::empty()),
+            Some(m) if rev => Box::new(m.range((lo, hi)).rev().map(|(_, s)| s)),
+            Some(m) => Box::new(m.range((lo, hi)).map(|(_, s)| s)),
+        };
+        let mut pending = it.next();
+        let rank = move |s: &Stored| (if versioned { s.row.changed_at } else { None }, s.position);
+        std::iter::from_fn(move || {
+            let mut best = pending.take()?;
+            for s in it.by_ref() {
+                if s.row.t != best.row.t {
+                    pending = Some(s);
+                    break;
+                }
+                if rank(s) > rank(best) {
+                    best = s;
+                }
+            }
+            Some(best)
+        })
     }
 
     /// Every series id that has a kept fact.

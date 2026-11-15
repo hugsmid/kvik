@@ -21,7 +21,7 @@ use km::engine::{ConsumerDecl, ConsumerId, EmitError, Model, Selection};
 use kvik_model as km;
 
 pub(crate) use error::Error;
-use error::Result;
+pub(crate) use error::Result;
 
 use crate::config::StoreConfig;
 use crate::consume::{
@@ -35,8 +35,12 @@ use crate::health::{
     LossKind, LossReport, MarkState, Reason, SeriesStats, Stats,
 };
 use crate::read::{
-    Aggregate, Bucket, CalendarPeriod, CalendarWindow, ChartData, Facts, Live, LiveValue,
-    ReaderState, Resolution, ResultFlags, View, Window, WindowResult,
+    Aggregate, ChartData, Facts, Live, LiveValue, ReaderState, Resolution, View, Window,
+    WindowResult,
+};
+use crate::rules::{
+    aggregate_for, auto_step, bucket, bucket_spans, calendar_window, chart_range, fixed_step,
+    plain_span, window_result,
 };
 use crate::series::{
     ExcessPrecision, IntervalLength, Kind, ParameterChange, RetentionClass, SeriesInfo, SeriesKey,
@@ -1373,43 +1377,8 @@ impl Slot {
         Ok(self.live_of(id, f.as_ref()))
     }
 
-    fn window_result(
-        &self,
-        id: SeriesId,
-        node: &km::summary::Node,
-        agg: &km::summary::Aggregate,
-        span: (i64, i64),
-        restoring: bool,
-        summary_stale: bool,
-    ) -> WindowResult {
-        let (from, to) = span;
-        let width = i128::from(to) - i128::from(from);
-        WindowResult {
-            value: node
-                .aggregate(agg)
-                .map(|v| convert::aggregated(&v, self.specs.get(&id))),
-            count: node.count,
-            coverage: dur(node.coverage),
-            coverage_fraction: if width > 0 {
-                node.coverage as f64 / width as f64
-            } else {
-                0.0
-            },
-            from: ts(from),
-            to: ts(to),
-            flags: ResultFlags {
-                restoring,
-                apportioned: node.apportioned(),
-                summary_stale,
-                rate_flagged: matches!(agg, km::summary::Aggregate::Rate) && node.rate_flagged(),
-                ..ResultFlags::default()
-            },
-        }
-    }
-
     fn model_aggregate(&self, id: SeriesId, agg: &Aggregate) -> Result<km::summary::Aggregate> {
         let spec = self.spec(id)?;
-        let a = convert::aggregate(agg, Some(spec))?;
         let kind = self
             .model
             .registry()
@@ -1417,13 +1386,7 @@ impl Slot {
             .get(msid(id))
             .map(|d| d.kind)
             .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
-        if km::summary::refused(kind, &a) {
-            return Err(Error::AggregateRefused(
-                "avg, integral, increase and time-in-state are refused on an interval series"
-                    .into(),
-            ));
-        }
-        Ok(a)
+        aggregate_for(spec, kind, agg)
     }
 
     pub(crate) fn window(
@@ -1434,50 +1397,40 @@ impl Slot {
     ) -> Result<WindowResult> {
         self.readable()?;
         let a = self.model_aggregate(id, agg)?;
-        let now = self.model.now;
-        let span = match window {
-            Window::Relative { start, end } => {
-                let at = |d: Span| {
-                    now.checked_add(d.0)
-                        .ok_or_else(|| Error::InvalidQuery("window outside the time range".into()))
-                };
-                (at(*start)?, at(*end)?)
-            }
-            Window::Absolute(r) => (nanos(r.from), nanos(r.to)),
-            Window::Calendar { window, zone } => {
-                let cw = match window {
-                    CalendarWindow::SinceMidnight => km::calendar::CalendarWindow::SinceMidnight,
-                    CalendarWindow::ThisMonth => km::calendar::CalendarWindow::ThisMonth,
-                    CalendarWindow::Day(k) => km::calendar::CalendarWindow::Day(*k),
-                    CalendarWindow::Month(k) => km::calendar::CalendarWindow::Month(*k),
-                    CalendarWindow::Period(p) => {
-                        km::calendar::CalendarWindow::Period(model_period(*p)?)
-                    }
-                };
-                let ans = self
-                    .model
-                    .calendar_window(msid(id), cw, zone.as_ref().map(|z| z.as_str()))
-                    .map_err(convert::error)?;
-                return Ok(self.window_result(
-                    id,
-                    &ans.node,
-                    &a,
-                    (ans.from, ans.to),
-                    ans.restoring,
-                    ans.summary_stale,
-                ));
-            }
-        };
-        if span.0 >= span.1 {
-            return Err(Error::InvalidQuery(
-                "a window's start must be before its end".into(),
+        let spec = self.specs.get(&id);
+        let Some(span) = plain_span(window, self.model.now)? else {
+            let Window::Calendar { window, zone } = window else {
+                unreachable!("a window without a plain span is a calendar window")
+            };
+            let ans = self
+                .model
+                .calendar_window(
+                    msid(id),
+                    calendar_window(window)?,
+                    zone.as_ref().map(|z| z.as_str()),
+                )
+                .map_err(convert::error)?;
+            return Ok(window_result(
+                spec,
+                &ans.node,
+                &a,
+                (ans.from, ans.to),
+                ans.restoring,
+                ans.summary_stale,
             ));
-        }
+        };
         let ans = self
             .model
             .query_window(msid(id), span.0, span.1)
             .map_err(convert::error)?;
-        Ok(self.window_result(id, &ans.node, &a, span, ans.restoring, ans.summary_stale))
+        Ok(window_result(
+            spec,
+            &ans.node,
+            &a,
+            span,
+            ans.restoring,
+            ans.summary_stale,
+        ))
     }
 
     pub(crate) fn buckets(
@@ -1488,89 +1441,26 @@ impl Slot {
     ) -> Result<ChartData> {
         self.readable()?;
         let spec = self.spec(id)?.clone();
-        let (a, b) = (nanos(range.from), nanos(range.to));
-        if a >= b {
-            return Err(Error::InvalidQuery(
-                "a range's start must be before its end".into(),
-            ));
-        }
+        let (a, b) = chart_range(range)?;
         let s = msid(id);
-        const MINUTE: i64 = 60_000_000_000;
-        const QUARTER: i64 = 15 * MINUTE;
-        let span = b - a;
         let step = match resolution {
             Resolution::Auto { max_points } => {
-                let max_points = max_points.max(1);
                 let current = self.model.current().map_err(convert::error)?;
                 let raw: Vec<Fact> = current
                     .range((s, a)..(s, b))
                     .map(|(_, f)| fact_out(f, Some(&spec)))
                     .collect();
-                if raw.len() <= max_points {
+                if raw.len() <= max_points.max(1) {
                     return Ok(ChartData::Facts(raw));
                 }
-                let max = i64::try_from(max_points).unwrap_or(i64::MAX);
-                // Buckets are aligned to UTC, so they are counted from the
-                // aligned floor of the start, not from the start.
-                let buckets = |step: i64| {
-                    let first = a.div_euclid(step) * step;
-                    (b - first + step - 1) / step
-                };
-                if buckets(MINUTE) <= max {
-                    MINUTE
-                } else if buckets(QUARTER) <= max {
-                    QUARTER
-                } else {
-                    let mut k = ((span + QUARTER - 1) / QUARTER + max - 1) / max;
-                    while buckets(QUARTER * k) > max {
-                        k += 1;
-                    }
-                    QUARTER * k
-                }
+                auto_step(a, b, max_points)
             }
-            Resolution::Step(d) => {
-                let step = dur_nanos(d)?;
-                if step <= 0 || span / step > 1_000_000 {
-                    return Err(Error::InvalidQuery(
-                        "a step must be positive and give at most 1,000,000 buckets".into(),
-                    ));
-                }
-                step
-            }
+            Resolution::Step(d) => fixed_step(d, a, b)?,
         };
         let mut buckets = Vec::new();
-        let mut t = a.div_euclid(step) * step;
-        while t < b {
-            let (lo, hi) = (t.max(a), (t + step).min(b));
+        for (lo, hi) in bucket_spans(a, b, step) {
             let node = self.model.window(s, lo, hi).map_err(convert::error)?;
-            let num = |agg: km::summary::Aggregate| node.aggregate(&agg).and_then(|v| v.to_f64());
-            let numeric = !matches!(spec.kind, Kind::State { .. } | Kind::Text);
-            // Min and max are over readings that start in the bucket only;
-            // the mean can come from a value carried in.
-            let readings = numeric && node.count > 0;
-            buckets.push(Bucket {
-                from: ts(lo),
-                to: ts(hi),
-                count: node.count,
-                min: readings
-                    .then(|| num(km::summary::Aggregate::Min))
-                    .flatten()
-                    .map(Value::F64),
-                max: readings
-                    .then(|| num(km::summary::Aggregate::Max))
-                    .flatten()
-                    .map(Value::F64),
-                mean: matches!(spec.kind, Kind::Gauge { .. })
-                    .then(|| num(km::summary::Aggregate::Avg))
-                    .flatten(),
-                coverage: dur(node.coverage),
-                flags: ResultFlags {
-                    restoring: self.model.restoring(),
-                    apportioned: node.apportioned(),
-                    ..ResultFlags::default()
-                },
-            });
-            t += step;
+            buckets.push(bucket(&spec, &node, lo, hi, self.model.restoring()));
         }
         Ok(ChartData::Buckets {
             step: dur(i128::from(step)),
@@ -1880,22 +1770,6 @@ impl Slot {
         }
         ts(self.model.now)
     }
-}
-
-fn model_period(p: CalendarPeriod) -> Result<km::calendar::Period> {
-    Ok(match p {
-        CalendarPeriod::Day(d) => km::calendar::Period::Day(
-            d.to_jiff()
-                .ok_or_else(|| Error::InvalidQuery(format!("no date {d}")))?,
-        ),
-        CalendarPeriod::Month { year, month } => {
-            let month = i8::try_from(month)
-                .ok()
-                .filter(|m| (1..=12).contains(m))
-                .ok_or_else(|| Error::InvalidQuery("a month is 1 to 12".into()))?;
-            km::calendar::Period::Month(km::calendar::Month { year, month })
-        }
-    })
 }
 
 #[cfg(test)]

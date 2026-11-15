@@ -509,7 +509,7 @@ facts; rebuild-equals-live compares them byte for byte.
 **Deferred at gate 3.3** to roadmap 7.1 and 7.3 (needs the tree).
 
 ### FC-35 — The compacted segment depends on 2.1, and Parquet has no A.1 header
-**Where:** B (compacted segment) · **Severity:** can wait (6.1) · **Relates to:** roadmap 2.1, 10.3, §7, §8 Hashes
+**Where:** B (compacted segment) · **Severity:** can wait (6.2) · **Relates to:** roadmap 2.1, 10.3, §7, §8 Hashes
 **Problem.** The layout and encodings wait for 2.1, as the outline says. If compacted data is stored as Parquet, A.1's
 "every file except the mark" carries a header no longer holds: a Parquet file cannot start with `KVIK`, so the store
 id check, the kind and the format version must live elsewhere (for example in its key-value metadata), and chunk
@@ -517,4 +517,4 @@ summaries and the chunk index must be described for Parquet files too.
 **Scenario.** Item 2.1 finds that the own format does not clearly beat Parquet. Compacted files become Parquet, and
 the store id check at open (A.1) has no header to read.
 **Needed:** after 2.1, either the kind 2 layout or the rules for Parquet files in place of A.1.
-**Deferred at gate 3.3** to roadmap 6.1. Roadmap 2.1 kept the own format, so A.1 applies to every stored file and Parquet is export only; the decided encodings are recorded in `format.md` Part B.
+**Deferred at gate 3.3** to roadmap 6.1. Roadmap 2.1 kept the own format, so A.1 applies to every stored file and Parquet is export only; the decided encodings are recorded in `format.md` Part B. Roadmap 6.1 laid out the block bodies and column encodings (`format-chunk.md`); the kind 2 layout moved to roadmap 6.2.

@@ -294,9 +294,10 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
   epoch on its next call. There is no background task.
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
-  (roadmap 4.6). `live` and windows in a reader process (they need a tree checkpoint plus the log since it) are
-  specified with roadmap 5.4 and 7.1; until then they return
-  `QueryError::NotAvailable { reason }` rather than a stale value.
+  (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
+  reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
+  own window clock, `now`, from its open. It has no instant of the writer's last commit, so it measures the live
+  staleness of an observed series in event time, `now − t` of the live-state fact (open: Q-140).
 - `reader.health()` reports what the files hold (loss reports), not the writer's counters.
 
 ## Reading
@@ -400,19 +401,53 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 
 ## Backup and restore
 ```rust
-trait BackupSink {
-    async fn put(&self, key: &str, bytes: Bytes, sha256: [u8; 32]) -> Result<Stored>;
-    async fn stat(&self, key: &str) -> Result<Option<Stored>>;   // reported hash and size
-    async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Bytes>;
-    async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+pub type SinkFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SinkError>> + Send + 'a>>;
+pub trait BackupSink: Send + Sync {                                 // object-safe: `dyn BackupSink` works
+    fn put<'a>(&'a self, key: &'a str, bytes: Arc<[u8]>, sha256: [u8; 32]) -> SinkFuture<'a, Stored>;
+    fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>>;    // reported size and hash
+    fn get<'a>(&'a self, key: &'a str, range: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>>;
+    fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>) -> SinkFuture<'a, ListPage>;
 }
+pub struct Stored { pub size: u64, pub sha256: [u8; 32] }           // as the bucket reports it
+pub struct ListPage { pub keys: Vec<String>, pub more: bool }       // ascending; ask again after the last key
+pub enum SinkError { Exists { key }, NotFound { key }, HashMismatch { key }, InvalidRange { key },
+                     TooLarge { size, limit }, Busy { queued }, Transient { reason }, Failed { reason } }
+pub struct Verified { .. }       // Verified::check(sink, key, &expected).await: the bucket reported `expected`
 store.attach_backup(sink, Encryption::Key(key)).await?;
 let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode::SummariesFirst).await?;
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
 ```
-The sink has no delete. An S3-compatible implementation lives in a separate crate. The sink's signatures are
-settled with roadmap 8.2, under the stable-shapes and runtime-neutral principles.
+The sink has no delete. Settled with roadmap 8.2, under the stable-shapes and runtime-neutral principles (std types
+only, boxed `Send` futures):
+- **No overwrite.** `put` creates an object only where the key is absent. An existing object with the same size and
+  reported SHA-256 makes it succeed (an upload repeated after a lost reply or a restart). Other content is
+  `SinkError::Exists` only when no attempt of this call can have reached the bucket; after an attempt that may have
+  landed (a lost reply, a lost connection, a server error), other content is `HashMismatch`, as the sink cannot tell
+  its own upload stored damaged from another writer's object. This is the create-if-absent of generation claims
+  (spec §8 Generations): a claim whose `put` fails with `HashMismatch` after such an attempt may or may not be this
+  restore's, so a restore treats it as possibly lost, not as corruption, and claims the next generation.
+- **Hashes.** `put` sends the SHA-256 with a single-part upload, and the bucket must reject a mismatch
+  (`HashMismatch`); the returned `Stored` is what the bucket reports when asked after the upload, and `put` fails
+  with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`.
+- **Ranges** are half-open; an empty range within the object returns no bytes; one past its end is `InvalidRange`.
+- **Listings** are paged and may lag behind writes on some buckets: absence from a listing proves nothing, and `put`
+  alone decides whether a key is taken.
+- `Transient` faults (timeouts, lost connections, server errors, throttling, damaged downloads) and `Busy` (the
+  sink's queue is full) may be retried; a `put` that failed this way may have stored the object, and repeating it
+  is safe. `BackupError::Sink` carries a `SinkError`.
+- **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
+  SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
+  which the sampled download checks. Eviction (roadmap 8.1) requires one.
+
+The S3-compatible implementation, its retries and timeouts, and an in-memory fake bucket with injected faults are in
+the `kvik-sink` crate. The object keys, the uploaded form of a manifest record, the claim marker and the encryption
+envelope are not settled (`format-check.md` FC-33;
+[Q-160](../model/OPEN-QUESTIONS.md#q-160--objects-in-the-deep-tier-keys-claim-marker-and-envelope)).
+
+A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
+`export_series(&reader, id, &ExportOptions, writer)`. Its schema is provisional ([`export.md`](export.md), Q-190 to
+Q-197).
 
 ## Environment seams (accepted at gate 3.3)
 ```rust

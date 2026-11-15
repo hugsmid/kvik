@@ -60,14 +60,18 @@ again; nothing after a gate starts before it is passed.
 - [ ] 5.3 Catch-up, resync and replay flags; the saved-point check (`Reader::check`, `Start::Position`, row 7b)
 - [ ] 5.4 Live state and windowed operators over recent facts
 - [ ] 5.5 Differential tests against the model; routing and delivery benchmarks
+- [ ] 5.5a Durability levels chosen per source: acknowledged once written or after the sync (Q-170)
 - [ ] 5.6 **Gate** — delivery looked at as a whole
 
 ## 6. Compacted segments
-- [ ] 6.1 Value and timestamp encodings with property and fuzz tests
+- [x] 6.1 Value and timestamp encodings with property and fuzz tests (block bodies and column encodings in
+  `docs/format-chunk.md`; sizes in `docs/measurements/6.1-encodings.md`; the compressed fallback's canonical class settled in Q-150)
 - [ ] 6.2 Per-series chunks, index, lossless compaction with verification
 - [ ] 6.3 Manifest and atomic publish-and-retire
 - [ ] 6.4 Parquet export and a differential check against it
-- [ ] 6.5 **Gate** — compaction looked at as a whole
+- [ ] 6.5 **Gate** — compaction looked at as a whole (includes: measure a pure-Rust codec, `ruzstd` or `lz4_flex`, on the XOR
+  stream; within about 10 % of zstd level 3 on the °F→°C shape it replaces the C library, otherwise zstd stays and CI
+  fails when `ZSTD_SYS_USE_PKG_CONFIG` is set; Q-150)
 
 ## 7. Summary tree
 - [ ] 7.1 Stored levels, checkpoints, rebuild-equals-live
@@ -77,7 +81,7 @@ again; nothing after a gate starts before it is passed.
 
 ## 8. Tiers and backup
 - [ ] 8.1 Tier policy and verified eviction
-- [ ] 8.2 Backup sink interface with an S3-compatible implementation, tested against a local fake
+- [x] 8.2 Backup sink interface with an S3-compatible implementation, tested against a local fake
 - [ ] 8.3 Restore, partial restore and rebuild
 - [ ] 8.4 **Gate** — restore passes end to end
 

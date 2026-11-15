@@ -17,11 +17,15 @@ start (recovery, `spec.md` §3), rebuilds the series registry from the kept log 
 the same process or another, reads up to the durable mark. It supports series definitions (defining again, aliases,
 retirement, a change of retention class, site-zone and tzdata entries), writing (`emit`, `emit_with`, `try_emit`
 with every outcome the model backend gives) and reading facts in every view, the fact at a time, the interval of a
-fixed-length interval series and series lookup, with `refresh`, health, statistics and losses. It decides outcomes
-as the model backend does, checked by a differential property test. Every start rebuilds the registry from the kept
+fixed-length interval series and series lookup, with `refresh`, health, statistics and losses, and live state,
+windows, chart buckets and calendar results computed from the kept facts (roadmap 5.4). Differential property tests
+compare its outcomes, facts, live state and window, bucket and calendar results with the model backend's. Some of
+the read path is the model's own code, so those tests cannot catch a fault in it, which only the model's own tests
+cover: the node arithmetic and aggregates (`kvik_model::summary`), calendar spans (`kvik_model::calendar`), and the
+rules in `src/rules.rs` (a window's result from its node, refused aggregates, window spans, bucket steps, spans and
+contents). What is the durable backend's own is which facts are read, from the log, for each call. Every start rebuilds the registry from the kept
 log and writes the registry file (`format.md` A.16) again where it does not match; clean shutdown writes it too. **Not supported yet**, each until its roadmap
-item: consumers and routing (5.2; `ConsumerError::NotSupportedYet`), live state, windows, chart buckets and calendar
-results (5.4, 7.x; `QueryError::NotAvailable`), and what the model backend lacks too (below).
+item: consumers and routing (5.2; `ConsumerError::NotSupportedYet`), and what the model backend lacks too (below).
 
 **Model (`Backend::Model`).** The executable [reference model](../model/): exact, slow and entirely in memory. Nothing
 is written to disk: `Store::open` only uses the directory as a name, and every store lives in the memory of the
@@ -45,7 +49,7 @@ cargo run -p kvik --example quickstart
 
 [`examples/quickstart.rs`](examples/quickstart.rs) opens a store, defines a gauge and a counter, emits readings,
 receives and confirms a threshold condition's transition, and queries a rolling window and a calendar day; as the
-durable backend has no consumers or windows yet, it runs on the model backend.
+durable backend has no consumers yet, it runs on the model backend.
 
 ## Coverage
 
@@ -107,11 +111,18 @@ Model backend:
 
 - **`ReaderState.stamp`** is always the zero stamp: the model has no resets. The durable backend gives the mark's.
 
-Durable backend, besides consumers, live state, windows, chart buckets and calendar results:
+Durable backend, besides consumers:
 
 - `Reader::facts` collects a query's facts before it returns, as the model backend does, rather than streaming
   block by block; every process holds the facts of the kept log in memory (the indexes and tree of roadmap 6 and 7
   replace this).
+- Live state, windows, chart buckets and calendar results are evaluated from the kept facts at every call, in the
+  model's exact arithmetic; no summary is stored yet (the tree of roadmap 7 serves the same calls). Calendar results
+  take local days from the time-zone rules the model embeds, not from the release `Env::tz` reports (Q-93 (c)).
+- Live staleness of an observed series is measured on the monotonic clock since its last refreshing commit in the
+  writer's process, taken when the log acknowledges the call, after the covering sync, whether or not the caller
+  waits for it; a reader process, and a writer before its first such commit after opening, measure it in event
+  time (`now − t` of the live-state fact), as the model backend does after a restart (Q-16, Q-140).
 - The log's timers (group commit, mark sync, sealing) run on the process's monotonic clock, not on `Env::clock`,
   whose wall clock stamps `received_at`: a manual clock that stands still would otherwise hold a sync back.
 - A call that defines, aliases, retires or changes a series waits for its mark sync on the calling thread, holding
@@ -130,6 +141,8 @@ Durable backend, besides consumers, live state, windows, chart buckets and calen
 
 Different from `docs/api.md`:
 
+- **`CounterRules::reset_ceiling` must be a whole number of parts per million**, on both backends: the log keeps it
+  so (`format.md` A.6), and a ceiling it cannot keep exactly is refused at definition (Q-142).
 - **Every seam trait requires `fmt::Debug`** besides `Send + Sync`, so that `Env` can be printed.
 - `Funnel` and `Reading` are plain structs, as `docs/api.md` builds them literally; every other configuration or
   result struct is `#[non_exhaustive]`, built with `new`, the setters, or `default()` and field assignment.
@@ -151,7 +164,10 @@ Different from `docs/api.md`:
   yet (roadmap 5.3).
 - **`Reader::interval`** returns the interval that contains `t`, whether or not `t` is its start.
 - **`Consumer::next`** ends with `None` on any error, not only after a shutdown; `try_next` returns the error.
-- `BackupSink` takes and returns `Vec<u8>` until roadmap 8.2 settles its signatures.
+- `BackupSink` takes `Arc<[u8]>` and returns `Vec<u8>` where `docs/api.md` showed `Bytes` (std types only, by the
+  stable-shapes principle); its futures are boxed (`SinkFuture`) so that `dyn BackupSink` works, it fails with
+  `SinkError`, and `list` returns one page (`ListPage`) at a time. `Verified` (made only by `Verified::check`) is
+  the proof of a copy in the deep tier.
 - **Added**: `Store::tick` (temporary), `Store::now`, `Store::is_durable`, `Store::consumer_stats`,
   `Consumer::try_next`, `Consumer::unroute`, `Consumer::routes`, `Reader::series`, `Ack::recorded`, `Start::Time`,
   `Trigger.cause`, `DeliveryFlags.outranked`, `WindowResult.count` and `coverage_fraction`,

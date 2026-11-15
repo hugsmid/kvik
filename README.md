@@ -38,10 +38,10 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, with the Linux NVMe target run pending) |
-> | 5. Delivery | 0 of 7 done (5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.1a, model support for recovery entries and reset points, added) |
+> | 5. Delivery | 0 of 8 done (5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.1a, model support for recovery entries and reset points, added) |
 > | 6–10. Compaction, summary tree, tiers and backup, query, scale | not started |
 >
-> 22 of 48 roadmap items are done, including 3 of 9 gates.
+> 22 of 49 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -267,6 +267,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Plan for comparative benchmarks against other tools; not yet run |
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |
 | [`log/`](log/) | `kvik-log`: the on-disk log format (segment container, checksums, the reader up to the durable mark, the mark's slots, typed arrival batches), with golden files, property tests, a differential test against the model and a fuzz target |
+| [`sink/`](sink/) | `kvik-sink`: the backup sink over S3-compatible object storage (signing, conditional single-part uploads with their SHA-256, retries and timeouts) and an in-memory fake bucket with injected faults |
 | [`model/OPEN-QUESTIONS.md`](model/OPEN-QUESTIONS.md) | Open questions in the specification, and where the model still differs from it |
 | [`spikes/encodings/`](spikes/encodings/) | The encoding spike behind roadmap item 2.1; not part of the engine |
 | [`spikes/commit/`](spikes/commit/) | The commit and sync spike behind roadmap item 2.2; not part of the engine |

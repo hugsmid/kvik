@@ -5,23 +5,25 @@
 //! starts the writer's threads. Every call that appends an entry is decided against that state and queued in the
 //! log; it resolves when the log acknowledges it (after the sync and the mark update, and for an entry that is
 //! not a fact after the mark sync). Reads go through a log reader, in this process or another, and so see only
-//! what is durable.
+//! what is durable. Live state, windows, chart buckets and calendar results are evaluated from the reader's facts
+//! (roadmap 5.4, [`windows`]).
 //!
 //! Not supported yet, with the roadmap item that brings each: consumers and routing (5.2), catch-up and saved
-//! points (5.3), live state and windows (5.4, 7.x), calendar results (7.3), decimal series, calendar-length
-//! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore
-//! (8.x).
+//! points (5.3), stored summaries (7.x), decimal series, calendar-length interval series and parameter changes
+//! other than the retention class, compaction (6.x), backup and restore (8.x).
 
+mod clock;
 mod index;
 mod ingest;
 pub(crate) mod reader;
 mod registry;
+mod windows;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,7 @@ use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, Time
 use index::{Index, fact_out, pos};
 use ingest::{Decider, Decision};
 pub(crate) use reader::DurableReader;
+pub(crate) use windows::{buckets, live, window};
 
 /// The most readings in one call, whatever the ingest queue (`docs/api.md` Writing).
 const CALL_READINGS: usize = 65_536;
@@ -175,7 +178,8 @@ pub(crate) struct Writer {
     inflight: Mutex<BTreeMap<u64, Arc<Completion>>>,
     next_call: AtomicU64,
     closed: AtomicBool,
-    now: AtomicI64,
+    /// The window clock and the refresh instants of live staleness, shared with the reader of this process.
+    clocks: Arc<clock::Clocks>,
 }
 
 /// How a queued call's acknowledgement becomes its [`Ack`].
@@ -194,10 +198,35 @@ impl Wake for FanOut {
     }
 }
 
+/// Resolves a [`Completion`] when the log completes its call: the log wakes it on its writer thread, after the
+/// covering sync, whether or not anyone waits for the call.
 #[derive(Debug)]
+struct Resolver(Weak<Completion>);
+
+impl Wake for Resolver {
+    fn wake(self: Arc<Self>) {
+        if let Some(c) = self.0.upgrade() {
+            let _ = c.poll(None);
+        }
+    }
+}
+
+/// What a call does once the log acknowledges it, whoever waits for it.
+type OnAck = Box<dyn FnOnce() + Send>;
+
 struct CompletionState {
     pending: Option<LogPending>,
     result: Option<Result<LogAck, CommitError>>,
+    on_ack: Option<OnAck>,
+}
+
+impl std::fmt::Debug for CompletionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionState")
+            .field("pending", &self.pending)
+            .field("result", &self.result)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The log's acknowledgement of one queued call, shared by the call's own future and by every later call whose
@@ -206,17 +235,25 @@ struct CompletionState {
 pub(crate) struct Completion {
     state: Mutex<CompletionState>,
     wakers: Arc<FanOut>,
+    resolver: Waker,
 }
 
 impl Completion {
-    fn new(pending: LogPending) -> Self {
-        Completion {
+    /// A completion whose `on_ack` runs once the log acknowledges the call, on the log's writer thread or in the
+    /// first poll that finds the acknowledgement.
+    fn new(pending: LogPending, on_ack: OnAck) -> Arc<Self> {
+        let c = Arc::new_cyclic(|me| Completion {
             state: Mutex::new(CompletionState {
                 pending: Some(pending),
                 result: None,
+                on_ack: Some(on_ack),
             }),
             wakers: Arc::new(FanOut::default()),
-        }
+            resolver: Waker::from(Arc::new(Resolver(me.clone()))),
+        });
+        // Registers the resolver with the log, or resolves at once.
+        let _ = c.poll(None);
+        c
     }
 
     /// The call's result once the log has given it; registers `cx`'s waker otherwise.
@@ -231,17 +268,20 @@ impl Completion {
                 w.push(cx.waker().clone());
             }
         }
-        let fan = Waker::from(self.wakers.clone());
-        let mut fan_cx = Context::from_waker(&fan);
+        let mut resolver_cx = Context::from_waker(&self.resolver);
         let Some(pending) = st.pending.as_mut() else {
             return Poll::Pending;
         };
-        match std::pin::Pin::new(pending).poll(&mut fan_cx) {
+        match std::pin::Pin::new(pending).poll(&mut resolver_cx) {
             Poll::Ready(r) => {
                 st.result = Some(r.clone());
                 st.pending = None;
+                let on_ack = st.on_ack.take().filter(|_| r.is_ok());
                 drop(st);
-                fan.wake_by_ref();
+                if let Some(f) = on_ack {
+                    f();
+                }
+                Waker::from(self.wakers.clone()).wake();
                 Poll::Ready(r)
             }
             Poll::Pending => Poll::Pending,
@@ -407,7 +447,7 @@ impl Writer {
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),
-            now: AtomicI64::new(wall),
+            clocks: Arc::new(clock::Clocks::new(env.clock.clone())),
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
@@ -449,10 +489,9 @@ impl Writer {
         Ok(())
     }
 
-    /// The store's `now`, which never runs backwards.
+    /// The store's `now`, which never runs backwards (spec §6 `now`).
     pub(crate) fn now(&self) -> Timestamp {
-        let w = self.env.clock.wall().0;
-        Timestamp(self.now.fetch_max(w, Ordering::SeqCst).max(w))
+        Timestamp(self.clocks.now())
     }
 
     /// The reader this process uses for its own reads, opened on first use.
@@ -462,11 +501,15 @@ impl Writer {
             return Ok(r.clone());
         }
         let opened = Arc::new(
-            DurableReader::open(&self.dir, &self.env, Duration::from_secs(30 * 60)).map_err(
-                |e| QueryError::NotAvailable {
-                    reason: e.to_string(),
-                },
-            )?,
+            DurableReader::open_with(
+                &self.dir,
+                &self.env,
+                Duration::from_secs(30 * 60),
+                self.clocks.clone(),
+            )
+            .map_err(|e| QueryError::NotAvailable {
+                reason: e.to_string(),
+            })?,
         );
         *r = Some(opened.clone());
         Ok(opened)
@@ -778,7 +821,15 @@ impl Writer {
         inflight.retain(|_, c| !c.acknowledged());
         let tracked = match queued {
             Some(pending) => {
-                let c = Arc::new(Completion::new(pending));
+                let (clocks, ids) = (self.clocks.clone(), refreshing(&plan));
+                let c = Completion::new(
+                    pending,
+                    Box::new(move || {
+                        for id in ids {
+                            clocks.refresh(id);
+                        }
+                    }),
+                );
                 inflight.insert(call, c.clone());
                 Some((c, true))
             }
@@ -1091,6 +1142,32 @@ fn orphaned(i: &Index, range: &std::ops::RangeInclusive<Position>) -> Vec<Fact> 
     out
 }
 
+/// The series whose live staleness a call refreshes when the log acknowledges it, after the covering sync, whether
+/// or not the caller waits (spec §5.4): those of its facts that are recorded, not outranked, not bad quality and not
+/// future.
+fn refreshing(plan: &ingest::Plan) -> Vec<u32> {
+    plan.decisions
+        .iter()
+        .filter_map(|d| match d {
+            Decision::Record {
+                item,
+                outranked: false,
+                ..
+            } => match plan.items.get(*item) {
+                Some(Item::Fact(row))
+                    if row.quality != kvik_log::facts::Quality::Bad
+                        && !matches!(row.value, kvik_log::facts::Value::Absent { .. })
+                        && !row.flags.future =>
+                {
+                    Some(row.series_id)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// Reads of a durable store: the queries a log reader can answer.
 pub(crate) fn facts(
     r: &DurableReader,
@@ -1154,16 +1231,6 @@ pub(crate) fn interval(
             _ => Err(Error::InvalidQuery("not an interval series".into())),
         }
     })
-}
-
-/// What a durable reader does not answer yet.
-pub(crate) fn not_available(what: &str) -> QueryError {
-    QueryError::NotAvailable {
-        reason: format!(
-            "not supported yet by the durable backend: {what} (needs live state, windows or calendar results, \
-             roadmap 5.4 and 7.x)"
-        ),
-    }
 }
 
 /// The reader state of a durable reader.
