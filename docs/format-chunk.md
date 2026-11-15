@@ -114,17 +114,19 @@ choice (this writer: level 3), so compressed bytes are never compared (C.10).
   - decimal at its best exponent: among the distinct smallest exponents at which the block's values fit (C.6), the
     one giving the shortest decimal payload, the lowest on a tie; no decimal candidate if no value fits any exponent;
   - the **XOR class** (encodings 4 and 5), when there is no decimal candidate or it has more than one exception per
-    eight values: the shorter of XOR and the writer's compressed XOR (XOR on a tie), which wins only when strictly
-    shorter than every other candidate.
+    eight values. The class wins when the XOR payload (encoding 4) is strictly shorter than every other candidate;
+    no compressed length takes part, so every writer makes the same choice whatever its zstd build. Within the
+    class a writer writes its compressed XOR when that is strictly shorter than XOR, else XOR.
 
 ## C.10 Canonical body
 For given rows a v1 writer produces one body (`format.md` common rules, canonical writing): every mandatory column, an
 optional column exactly when its presence rule or a non-default value requires it (`quality` when a row is not good,
 `flags` when a row has a flag), each in the encoding C.9 chooses, in canonical form, in ascending id order, with no
-unknown column. The XOR class is one canonical class: a value column in encoding 4 or 5 is canonical when the class
-is a candidate (C.9), the stream it holds is the canonical encoding 4 stream of the values, and its payload is
-shorter than every other candidate; which of the two, and which valid frame, is not compared. Any other body read
-and encoded again gives the same bytes.
+unknown column. The XOR class is one canonical class: a value column in encoding 4 or 5 is canonical exactly when C.9
+chooses the class and the column holds the canonical encoding 4 stream of the values, as encoding 4 or as an
+encoding 5 payload shorter than that stream (what some writer's compressed XOR can be); which of the two, and which
+valid frame, is not compared. When C.9 does not choose the class, no column in encoding 4 or 5 is canonical. Any
+other body read and encoded again gives the same bytes.
 
 ## C.11 Checks
 A body that fails one of these is invalid (for a block reached in a valid file, invalid content, `format.md` A.2):

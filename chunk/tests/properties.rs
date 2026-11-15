@@ -181,7 +181,12 @@ fn value_encodings_are_chosen_as_specified() {
     for (i, v) in ninths.value.iter_mut().enumerate() {
         *v = (f64::from((i % 5) as u32) / 9.0 + 1.0).to_bits();
     }
-    assert_eq!(enc_of(&ninths), encoding::XOR_ZSTD);
+    assert_eq!(enc_of(&ninths), encoding::DELTA);
+    let mut pairs = temperature(4096);
+    for (i, v) in pairs.value.iter_mut().enumerate() {
+        *v = (f64::from((i / 2 % 5) as u32) / 9.0 + 1.0).to_bits();
+    }
+    assert_eq!(enc_of(&pairs), encoding::XOR_ZSTD);
     let mut random = temperature(40);
     let mut x = 0x2545_F491_4F6C_DD1Du64;
     for v in random.value.iter_mut() {

@@ -89,23 +89,41 @@ fn other_candidates(words: &[u64], all_f64: bool) -> ((u8, Vec<u8>), bool) {
     (best, xor)
 }
 
-/// The value column (C.9): the shortest of [`other_candidates`] and, where the XOR class is a candidate, the
-/// shorter of XOR and compressed XOR (XOR on a tie), which must be strictly shorter to win.
-fn value_column(words: &[u64], all_f64: bool) -> Result<Column, EncodeError> {
-    let (mut best, xor_class) = other_candidates(words, all_f64);
+/// The canonical value choice up to the XOR class, independent of the zstd build (C.9, Q-150).
+enum ValueChoice {
+    /// The XOR class, holding this encoding 4 stream.
+    Xor(Vec<u8>),
+    /// Another encoding and its payload.
+    Other(u8, Vec<u8>),
+}
+
+/// The XOR class when it is a candidate and its encoding 4 payload is strictly shorter than [`other_candidates`];
+/// compressed lengths never enter (C.9).
+fn value_choice(words: &[u64], all_f64: bool) -> ValueChoice {
+    let ((enc, payload), xor_class) = other_candidates(words, all_f64);
     if xor_class {
         let xor = encode_xor(words);
-        let zstd = encode_xor_zstd(&xor)?;
-        let class = if zstd.len() < xor.len() {
-            (encoding::XOR_ZSTD, zstd)
-        } else {
-            (encoding::XOR, xor)
-        };
-        if class.1.len() < best.1.len() {
-            best = class;
+        if xor.len() < payload.len() {
+            return ValueChoice::Xor(xor);
         }
     }
-    Ok((column::VALUE, best.0, best.1))
+    ValueChoice::Other(enc, payload)
+}
+
+/// The value column (C.9): [`value_choice`], and within the XOR class compressed XOR when strictly shorter.
+fn value_column(words: &[u64], all_f64: bool) -> Result<Column, EncodeError> {
+    let (enc, payload) = match value_choice(words, all_f64) {
+        ValueChoice::Other(enc, payload) => (enc, payload),
+        ValueChoice::Xor(xor) => {
+            let zstd = encode_xor_zstd(&xor)?;
+            if zstd.len() < xor.len() {
+                (encoding::XOR_ZSTD, zstd)
+            } else {
+                (encoding::XOR, xor)
+            }
+        }
+    };
+    Ok((column::VALUE, enc, payload))
 }
 
 impl Block {
@@ -277,9 +295,8 @@ impl Block {
         decode(body)
     }
 
-    /// Decodes a body and also requires it to be what [`Block::encode`] writes for its content (C.10). In the XOR
-    /// class (encodings 4 and 5) either representation is canonical when it holds the canonical XOR stream and is
-    /// shorter than every other candidate; compressed bytes are not compared (C.10, Q-150).
+    /// Decodes a body and also requires it to be what a writer on any zstd build writes for its content (C.10): in
+    /// the XOR class, encoding 4 or a single frame of encoding 5 shorter than the stream it holds (Q-150).
     pub fn decode_canonical(body: &[u8]) -> Result<Self, DecodeError> {
         let b = decode(body)?;
         let again = b.encode().map_err(|_| DecodeError::NonCanonical)?;
@@ -292,7 +309,7 @@ impl Block {
 }
 
 /// The directory of a body that has decoded: (id, encoding, payload) per column.
-fn directory(body: &[u8]) -> Option<Vec<(u8, u8, &[u8])>> {
+pub(crate) fn directory(body: &[u8]) -> Option<Vec<(u8, u8, &[u8])>> {
     let mut r = Reader::new(body);
     r.u16().ok()?;
     let count = r.u8().ok()?;
@@ -311,7 +328,8 @@ fn directory(body: &[u8]) -> Option<Vec<(u8, u8, &[u8])>> {
 }
 
 /// Whether `body`, which differs from the writer's output `again` for the same rows, differs only in a value
-/// column of the XOR class that is canonical by the class rule of C.10.
+/// column that another zstd build could have written: the XOR class is the canonical choice and the column holds
+/// its stream as encoding 4, or as encoding 5 with a payload shorter than that stream (C.10).
 fn canonical_in_xor_class(body: &[u8], again: &[u8], block: &Block) -> bool {
     let (Some(da), Some(db)) = (directory(body), directory(again)) else {
         return false;
@@ -320,20 +338,24 @@ fn canonical_in_xor_class(body: &[u8], again: &[u8], block: &Block) -> bool {
         return false;
     }
     da.iter().zip(&db).all(|(x, y)| {
-        if (x.0, x.1, x.2) == (y.0, y.1, y.2) {
+        if x == y {
             return true;
         }
         if x.0 != y.0 || x.0 != column::VALUE {
             return false;
         }
         let (words, all_f64) = block.value_words();
-        let (other, xor_class) = other_candidates(&words, all_f64);
-        let stream = match x.1 {
-            encoding::XOR => Some(x.2.to_vec()),
-            encoding::XOR_ZSTD => decompress_xor(x.2, words.len()).ok(),
-            _ => None,
+        let ValueChoice::Xor(stream) = value_choice(&words, all_f64) else {
+            return false;
         };
-        xor_class && x.2.len() < other.1.len() && stream.is_some_and(|s| s == encode_xor(&words))
+        match x.1 {
+            encoding::XOR => x.2 == stream.as_slice(),
+            encoding::XOR_ZSTD => {
+                x.2.len() < stream.len()
+                    && decompress_xor(x.2, words.len()).is_ok_and(|s| s == stream)
+            }
+            _ => false,
+        }
     })
 }
 

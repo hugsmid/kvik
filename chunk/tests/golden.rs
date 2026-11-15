@@ -64,7 +64,7 @@ fn xor_zstd() -> Block {
                 row(
                     i,
                     value_type::F64,
-                    (f64::from((i % 5) as u32) / 9.0 + 1.0).to_bits(),
+                    (f64::from((i / 2 % 5) as u32) / 9.0 + 1.0).to_bits(),
                 )
             })
             .collect(),
@@ -237,12 +237,14 @@ fn generated() -> Vec<(&'static str, Block)> {
     ]
 }
 
-/// The value column's encoding in each generated file.
-const VALUE_ENCODINGS: [(&str, u8); 4] = [
+/// A golden file for each value encoding (C.12).
+const VALUE_ENCODINGS: [(&str, u8); 6] = [
+    ("mixed-types.blk", encoding::PLAIN),
+    ("state.blk", encoding::RUN_LENGTH),
+    ("scaled-i64.blk", encoding::DELTA),
     ("decimal.blk", encoding::DECIMAL),
     ("xor.blk", encoding::XOR),
     ("xor-zstd.blk", encoding::XOR_ZSTD),
-    ("state.blk", encoding::RUN_LENGTH),
 ];
 
 /// A body with one more column appended after the last (hand-built, not canonical).

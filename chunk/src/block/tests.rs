@@ -299,11 +299,25 @@ fn directory_checks() {
     );
 }
 
-/// 2,000 `f64` values from five non-decimal readings: the writer picks compressed XOR.
-fn ninths() -> Block {
+/// 2,000 `f64` values cycling through five non-decimal readings, `run` rows each.
+fn ninths(run: usize) -> Block {
     let mut b = sample(2_000);
     for (i, v) in b.value.iter_mut().enumerate() {
-        *v = (f64::from((i % 5) as u32) / 9.0 + 1.0).to_bits();
+        *v = (f64::from(((i / run) % 5) as u32) / 9.0 + 1.0).to_bits();
+    }
+    b
+}
+
+/// 40 `f64` values with random signs and 20 random mantissa bits: encoding 4 wins and zstd finds nothing.
+fn noisy() -> Block {
+    let mut b = sample(40);
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for v in b.value.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let m = 1.0 + (x % (1 << 20)) as f64 / f64::from(1u32 << 20);
+        *v = (if x >> 63 == 1 { -m } else { m }).to_bits();
     }
     b
 }
@@ -316,28 +330,94 @@ fn with_value(body: &[u8], enc: u8, payload: &[u8]) -> Vec<u8> {
     rebuild(u16::from_le_bytes([body[0], body[1]]), &d)
 }
 
+fn value_of(body: &[u8]) -> (u8, Vec<u8>) {
+    let d = directory(body).unwrap();
+    let v = d.iter().find(|c| c.0 == column::VALUE).unwrap();
+    (v.1, v.2.to_vec())
+}
+
+fn zstd_payload(stream: &[u8], level: i32) -> Vec<u8> {
+    let mut p = (stream.len() as u32).to_le_bytes().to_vec();
+    p.extend_from_slice(&zstd::bulk::compress(stream, level).unwrap());
+    p
+}
+
 #[test]
-fn xor_class_is_one_canonical_class() {
-    let b = ninths();
+fn xor_class_membership_ignores_compressed_length() {
+    let b = ninths(1);
+    let (words, _) = b.value_words();
+    let (other, class) = other_candidates(&words, true);
+    let xor = encode_xor(&words);
+    let zstd = encode_xor_zstd(&xor).unwrap();
+    assert!(class && zstd.len() < other.1.len() && other.1.len() <= xor.len());
+    assert!(matches!(
+        value_choice(&words, true),
+        ValueChoice::Other(encoding::DELTA, _)
+    ));
     let body = b.encode().unwrap();
-    let d = directory(&body).unwrap();
-    let value = d.iter().find(|c| c.0 == column::VALUE).unwrap();
-    assert_eq!(value.1, encoding::XOR_ZSTD);
+    assert_eq!(value_of(&body).0, encoding::DELTA);
+    for (enc, payload) in [(encoding::XOR_ZSTD, &zstd), (encoding::XOR, &xor)] {
+        let x = with_value(&body, enc, payload);
+        assert_eq!(Block::decode(&x).as_ref(), Ok(&b), "{enc}");
+        assert_eq!(
+            Block::decode_canonical(&x),
+            Err(DecodeError::NonCanonical),
+            "{enc}"
+        );
+    }
+}
+
+#[test]
+fn xor_class_is_canonical_in_either_encoding_and_any_frame() {
+    let b = ninths(2);
+    let body = b.encode().unwrap();
+    assert_eq!(value_of(&body).0, encoding::XOR_ZSTD);
     let (words, _) = b.value_words();
     let xor = encode_xor(&words);
-    // Other compression levels are other valid frames of the same stream: canonical.
+    let raw = with_value(&body, encoding::XOR, &xor);
+    assert_eq!(Block::decode_canonical(&raw).as_ref(), Ok(&b));
     for level in [1, 9, 19] {
-        let mut p = (xor.len() as u32).to_le_bytes().to_vec();
-        p.extend_from_slice(&zstd::bulk::compress(&xor, level).unwrap());
-        let other = with_value(&body, encoding::XOR_ZSTD, &p);
+        let other = with_value(&body, encoding::XOR_ZSTD, &zstd_payload(&xor, level));
         assert_eq!(
             Block::decode_canonical(&other).as_ref(),
             Ok(&b),
             "level {level}"
         );
     }
-    // A trailing skippable frame is not exactly one frame: invalid.
-    let mut p = value.2.to_vec();
+}
+
+#[test]
+fn non_xor_body_is_rejected_when_the_xor_class_is_chosen() {
+    for b in [ninths(2), noisy()] {
+        let (words, _) = b.value_words();
+        assert!(matches!(value_choice(&words, true), ValueChoice::Xor(_)));
+        let ((enc, payload), _) = other_candidates(&words, true);
+        let body = with_value(&b.encode().unwrap(), enc, &payload);
+        assert_eq!(Block::decode(&body).as_ref(), Ok(&b));
+        assert_eq!(
+            Block::decode_canonical(&body),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+}
+
+#[test]
+fn compressed_payload_not_shorter_than_its_stream_is_rejected() {
+    let b = noisy();
+    let body = b.encode().unwrap();
+    let (enc, xor) = value_of(&body);
+    assert_eq!(enc, encoding::XOR);
+    let p = zstd_payload(&xor, 3);
+    assert!(p.len() >= xor.len());
+    let z = with_value(&body, encoding::XOR_ZSTD, &p);
+    assert_eq!(Block::decode(&z).as_ref(), Ok(&b));
+    assert_eq!(Block::decode_canonical(&z), Err(DecodeError::NonCanonical));
+}
+
+#[test]
+fn a_trailing_skippable_frame_is_invalid() {
+    let body = ninths(2).encode().unwrap();
+    let (_, mut p) = value_of(&body);
     p.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]);
     assert_eq!(
         Block::decode(&with_value(&body, encoding::XOR_ZSTD, &p)),
@@ -346,16 +426,10 @@ fn xor_class_is_one_canonical_class() {
             error: ColumnError::Frame
         })
     );
-    // The same stream uncompressed is in the class, but here not shorter than every other candidate.
-    let raw = with_value(&body, encoding::XOR, &xor);
-    assert_eq!(Block::decode(&raw).as_ref(), Ok(&b));
-    let (other, class) = other_candidates(&words, true);
-    assert!(class);
-    assert_eq!(
-        Block::decode_canonical(&raw).is_ok(),
-        xor.len() < other.1.len()
-    );
-    // A stream that is valid but not the canonical XOR stream is not canonical.
+}
+
+/// A valid XOR stream of `words` that always opens a new window, never the canonical one.
+fn new_window_stream(words: &[u64]) -> Vec<u8> {
     let mut w = crate::bytes::BitWriter::default();
     w.write(words[0], 64);
     for pair in words.windows(2) {
@@ -363,7 +437,6 @@ fn xor_class_is_one_canonical_class() {
         if x == 0 {
             w.bit(false);
         } else {
-            // Always a new window, never a reused one.
             let (l, t) = (x.leading_zeros().min(31), x.trailing_zeros());
             w.write(0b11, 2);
             w.write(u64::from(l), 5);
@@ -371,16 +444,28 @@ fn xor_class_is_one_canonical_class() {
             w.write(x >> t, 64 - l - t);
         }
     }
-    let odd = w.finish();
-    assert_ne!(odd, xor);
-    let mut p = (odd.len() as u32).to_le_bytes().to_vec();
-    p.extend_from_slice(&zstd::bulk::compress(&odd, 3).unwrap());
-    let body_odd = with_value(&body, encoding::XOR_ZSTD, &p);
-    assert_eq!(Block::decode(&body_odd).as_ref(), Ok(&b));
-    assert_eq!(
-        Block::decode_canonical(&body_odd),
-        Err(DecodeError::NonCanonical)
-    );
+    w.finish()
+}
+
+#[test]
+fn a_valid_but_non_canonical_xor_stream_is_rejected() {
+    let b = ninths(2);
+    let body = b.encode().unwrap();
+    let (words, _) = b.value_words();
+    let odd = new_window_stream(&words);
+    assert_ne!(odd, encode_xor(&words));
+    for (enc, payload) in [
+        (encoding::XOR, odd.clone()),
+        (encoding::XOR_ZSTD, zstd_payload(&odd, 3)),
+    ] {
+        let x = with_value(&body, enc, &payload);
+        assert_eq!(Block::decode(&x).as_ref(), Ok(&b), "{enc}");
+        assert_eq!(
+            Block::decode_canonical(&x),
+            Err(DecodeError::NonCanonical),
+            "{enc}"
+        );
+    }
 }
 
 #[test]

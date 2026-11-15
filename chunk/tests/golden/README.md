@@ -10,14 +10,14 @@ format change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-chunk --test golden`.
 |---|---|
 | `decimal.blk` | 300 `f64` readings at 0.01 resolution: scaled decimal (encoding 3) with exceptions for −0.0, 0.1 + 0.2, a NaN with a payload and a signalling NaN |
 | `xor.blk` | 40 `f64` values with random signs and 20 random mantissa bits: XOR (encoding 4) |
-| `xor-zstd.blk` | 2,000 `f64` values from five non-decimal readings: XOR compressed with zstd (encoding 5) |
+| `xor-zstd.blk` | 2,000 `f64` values from five non-decimal readings, each held for two rows: XOR compressed with zstd (encoding 5) |
 | `scaled-i64.blk` | A decimal counter at scale 3, raised to 4 from row 50, two rows flagged `rounded`: value delta, scale run-length |
-| `state.blk` | State indexes 0, 3 and 65,535 in long runs: run-length |
+| `state.blk` | State indexes 0, 3 and 65,535 in long runs: value run-length |
 | `bool.blk` | A bool switching every 97 rows |
 | `text.blk` | Texts, two empty, two with multi-byte UTF-8, and one row without a value |
 | `versioned.blk` | Two issues of a 15-minute forecast: flag bit 6 and `changed_at` on every row |
 | `gappy.blk` | Host-stamped `t` with nanosecond jitter, `host_time` on every row, a suspect run, rows without a value, a `late` row |
-| `mixed-types.blk` | Rows of all five value types in one block: the value column in a general encoding |
+| `mixed-types.blk` | Rows of all five value types in one block: value plain |
 | `generations.blk` | Positions in generation 1, then in generation 2 from sequence 1 |
 | `full.blk` | 4,096 rows: a full block |
 | `unknown-ignorable.blk` | Five rows and an unknown ignorable column `0x90`: read, skipped, not canonical |
