@@ -84,10 +84,13 @@ proptest! {
     }
 
     #[test]
-    fn parsing_any_string_never_panics_and_only_accepts_canonical_keys(id in any::<[u8; 16]>(), tail in "[0-9a-fA-F/.\\-a-z]{0,48}") {
+    fn a_built_key_with_one_character_edited_parses_only_if_it_is_canonical(id in any::<[u8; 16]>(), kd in any::<u8>(), g in any::<u32>(), f in any::<u64>(), epoch in any::<u64>(), pick in any::<prop::sample::Index>(), at in any::<prop::sample::Index>(), c in prop::sample::select(b"0123456789abcdefABCDEFg/.-xSTORE".to_vec())) {
         let k = Keys::new(id);
-        let root = &k.store()[..33];
-        let key = format!("{root}{tail}");
+        let keys = named(&k, kd, g, f, epoch);
+        let mut b = keys[pick.index(keys.len())].0.clone().into_bytes();
+        let i = at.index(b.len());
+        b[i] = c;
+        let key = String::from_utf8(b).unwrap();
         if let Some(name) = k.parse(&key) {
             let rebuilt = match name {
                 ObjectName::Store => k.store(),
@@ -97,8 +100,10 @@ proptest! {
                 ObjectName::Claim(g) => k.claim(g),
                 other => panic!("{other:?}"),
             };
-            prop_assert_eq!(rebuilt, key);
+            prop_assert_eq!(&rebuilt, &key);
         }
-        let _ = Keys::store_id_of(&tail);
+        if let Some(sid) = Keys::store_id_of(&key) {
+            prop_assert_eq!(Keys::new(sid).store()[..33].to_owned(), key[..33].to_owned());
+        }
     }
 }

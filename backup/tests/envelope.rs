@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
-use kvik_backup::envelope::{CHUNK, ChunkedXChaCha, Envelope, EnvelopeError};
+use kvik_backup::envelope::{CHUNK, ChunkedXChaCha, Envelope, EnvelopeError, fuzz};
 use kvik_backup::keys::Keys;
 use kvik_log::crc::crc32c;
 use proptest::prelude::*;
@@ -426,6 +426,14 @@ fn golden_objects_are_unchanged_and_open() {
         assert_eq!(file, sealed, "{name} differs from what sealing gives now");
         assert_eq!(e.open(&key, &file).unwrap(), p, "{name}");
     }
+    let fuzz = ChunkedXChaCha::new(fuzz::KEY, fuzz::STORE_ID);
+    let seed: Vec<u8> = (0..100u8).collect();
+    let sealed = fuzz.seal(fuzz::OBJECT_KEY, &seed).unwrap();
+    let path = dir.join("fuzz-seed.kve");
+    if bless {
+        fs::write(&path, &sealed).unwrap();
+    }
+    assert_eq!(fs::read(&path).unwrap(), sealed, "fuzz-seed.kve");
     let k = Keys::new(SID).probe();
     for (len, want) in GOLDEN_DIGESTS {
         let o = e.seal(&k, &plain(len, 7)).unwrap();
