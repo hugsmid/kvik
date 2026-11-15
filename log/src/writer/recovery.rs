@@ -333,6 +333,8 @@ fn plan(
     let mut kept: Vec<usize> = segs.iter().map(|s| s.batches.len()).collect();
     let mut zero = Vec::new();
     let mut reset = false;
+    // Rule 1: a recovery entry beyond the mark written by an earlier start that stopped before its mark (Q-117).
+    let mut adopt_beyond: Option<(usize, usize)> = None;
     // Rule selection.
     let (rule, mark_slot) = match mark {
         MarkRead::Readable { slot, .. } => {
@@ -375,6 +377,23 @@ fn plan(
                         HEADER_LEN as u64
                     };
                     kept[i] = s.batches.iter().filter(|b| b.end <= from).count();
+                    // The one complete batch beyond the mark is a recovery entry after the mark's position, written
+                    // at the write position by a start that stopped before its mark, and nothing after it shows a
+                    // later write: adopted, as under rule 3.
+                    if reset
+                        && let Some(b) = s.batches.get(kept[i])
+                        && let Some(rec) = b.recovery()
+                        && rec.after == slot.last_sequence
+                        && b.offset == from
+                        && s.last_nonzero <= b.offset + rec.tail_bytes.max(b.end - b.offset)
+                        && !s
+                            .tail_commits
+                            .iter()
+                            .any(|(o, t)| *o >= b.end && *t >= b.commit_time)
+                    {
+                        adopt_beyond = Some((i, kept[i]));
+                        kept[i] += 1;
+                    }
                     if s.last_nonzero > from {
                         zero.push((i, from, s.last_nonzero));
                     }
@@ -556,12 +575,21 @@ fn plan(
             p.rewrite_last = last_kept;
         }
     } else if p.reset {
-        // The entry follows the mark; the bytes rule 1 zero-fills are the tail it reports.
-        let zeroed: u64 = p.zero.iter().map(|z| z.2 - z.1).sum();
-        if let Some(r) = resume_in {
-            p.tail = Some((r, p.write_offset, p.write_offset + zeroed, 1));
+        // The entry is written over the truncated bytes, and only then are the rest zeroed (steps 5 and 6), so a start
+        // that stops before the entry is on disk leaves the batch for the next start to find. The zero-fill range,
+        // in the segment the writer resumes in, is the tail the entry reports.
+        let tail = p.zero.iter().find(|z| Some(z.0) == resume_in).copied();
+        if let Some((i, j)) = adopt_beyond {
+            let b = &segs[i].batches[j];
+            p.adopt = Some((i, j));
+            p.rewrite_last = Some((i, j));
+            p.write_offset = b.end;
+            p.last_sequence = b.first;
+            p.tail = tail.map(|(r, _, to)| (r, b.end, to.max(b.end), 0));
+        } else {
+            p.tail = tail.map(|(r, from, to)| (r, from, to, 1));
+            p.last_sequence = 1 + k.max(manifest_highest);
         }
-        p.last_sequence = 1 + k.max(manifest_highest);
     } else {
         p.last_sequence = k.max(mark_slot.map_or(0, |m| m.last_sequence));
     }
@@ -834,14 +862,37 @@ pub(super) fn start(
     match p.rule {
         StartRule::SameBoot => {
             // Step 2: truncate after the mark; sync the truncated segments, those holding a lost range, and the
-            // directory.
-            for &(i, from, to) in &p.zero {
-                if let Err(e) = zero_fill(&*files[&i], from, to) {
+            // directory. A complete batch beyond the mark is truncated only by the recovery entry written over it
+            // (steps 5 and 6), never before; an adopted entry is written again in place (Q-117).
+            if !p.reset {
+                for &(i, from, to) in &p.zero {
+                    if let Err(e) = zero_fill(&*files[&i], from, to) {
+                        return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
+                    }
+                    report.truncated_bytes += to - from;
+                }
+            }
+            let mut to_sync: Vec<usize> = if p.reset {
+                Vec::new()
+            } else {
+                p.zero.iter().map(|z| z.0).collect()
+            };
+            if let Some((i, j)) = p.rewrite_last {
+                let b = &segs[i].batches[j];
+                let mut r = files[&i].write_at(&b.bytes, b.offset);
+                if r.is_ok()
+                    && j == 0
+                    && !header_rewritten.contains(&i)
+                    && let Some(h) = segs[i].header
+                {
+                    r = files[&i].write_at(&h.encode(), 0);
+                }
+                if let Err(e) = r {
                     return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
                 }
-                report.truncated_bytes += to - from;
+                report.rewrote_last_batch = true;
+                to_sync.push(i);
             }
-            let mut to_sync: Vec<usize> = p.zero.iter().map(|z| z.0).collect();
             to_sync.extend(header_rewritten.iter().copied());
             for l in &p.losses {
                 if let Some(i) = segs.iter().position(|s| s.id.file_id == l.file_id) {
@@ -1097,15 +1148,21 @@ pub(super) fn start(
             if let Err(e) = file.write_at(&bytes, at).and_then(|()| file.sync_data()) {
                 return ro(fault(FaultOp::Sync, &path, &e), report);
             }
-            // The rest of the torn tail is zeroed after the entry is on disk (rule 1 zeroed its tail in step 2).
-            if let Some((ti, ts, te, _)) = p.tail.filter(|_| !p.reset) {
+            // The rest of the torn tail, or of the bytes rule 1 truncates, is zeroed after the entry is on disk.
+            if let Some((ti, ts, te, _)) = p.tail {
                 let from = if fits { at + bytes.len() as u64 } else { ts };
                 if te > from {
                     let r = zero_fill(&*files[&ti], from, te).and_then(|()| files[&ti].sync_data());
                     if let Err(e) = r {
                         return ro(fault(FaultOp::Write, &segs[ti].path, &e), report);
                     }
-                    report.truncated_bytes += te - from;
+                    if !p.reset {
+                        report.truncated_bytes += te - from;
+                    }
+                }
+                // Under rule 1 every byte after the mark is truncated, those the entry covers included.
+                if p.reset {
+                    report.truncated_bytes += te.saturating_sub(ts);
                 }
             }
             write_offset = at + bytes.len() as u64;

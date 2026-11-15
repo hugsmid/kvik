@@ -142,7 +142,10 @@ impl MarkSlot {
             offset: u64_at(b, 64),
             last_sequence: u64_at(b, 72),
             max_series_id: u32_at(b, 80),
-            stamp: ResetStamp::decode(&b[84..100]).unwrap_or_default(),
+            // A zero nonce is no stamp, whatever the sequence (A.10).
+            stamp: ResetStamp::decode(&b[84..100])
+                .filter(|st| st.nonce != 0)
+                .unwrap_or_default(),
         })
     }
 }
@@ -232,6 +235,17 @@ mod tests {
         assert_eq!(&b[92..100], &0x0102u64.to_le_bytes());
         assert_eq!(&b[100..124], &[0; 24]);
         assert_eq!(&b[124..], &crc32c(&b[..124]).to_le_bytes());
+    }
+
+    #[test]
+    fn a_zero_nonce_is_no_stamp() {
+        let mut s = slot(7);
+        s.stamp.nonce = 0;
+        let MarkSlot { stamp, .. } = match MarkSlot::decode(&s.encode(), &[9; 16]) {
+            SlotRead::Valid(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(stamp, ResetStamp::default());
     }
 
     #[test]

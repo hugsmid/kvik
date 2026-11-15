@@ -8,8 +8,8 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 - **Solid first.** Nothing a consumer reacted to may differ from what is on disk. Every block is checksummed. On
   storage that honours sync, a crash at any point loses nothing that was acknowledged; on storage that does not,
   a loss is detected and reported (`possible_loss`, `data_lost`), never silent. One limit is accepted: a store whose
-  file system is remounted within one boot can lose the one batch committed since the last mark sync, unreported,
-  unless the mark is synced at every commit (spec §3 Recovery rule 1).
+  file system is remounted within one boot can lose the one batch committed since the last mark sync, reported as
+  `possible_loss` and delivered as a reset point, unless the mark is synced at every commit (spec §3 Recovery rule 1).
 - **Fast reaction.** A reading should reach in-process consumers within a few milliseconds of arrival,
   including the sync.
 - **Granularity.** Per-second data, with drill-down from years to seconds at interactive speed.

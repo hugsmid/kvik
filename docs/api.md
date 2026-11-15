@@ -68,7 +68,7 @@ The keys roadmap section 4 needs; all may change between opens.
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
 | `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: log syncs start at least this far apart, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
-| `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` closes the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
+| `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
 | `limits.series_ceiling` | `u32` | 100,000 | |
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
@@ -415,7 +415,7 @@ pub struct Env { pub clock: Arc<dyn Clock>, pub fs: Arc<dyn Fs>, pub boot: Arc<d
 pub struct Monotonic(pub u64);       // ns from an origin fixed per process; never stored, never compared across processes
 pub trait Clock: Send + Sync { fn wall(&self) -> Timestamp; fn monotonic(&self) -> Monotonic; fn synchronised(&self) -> bool; }
 pub trait BootId: Send + Sync { fn current(&self) -> Option<[u8; 16]>; }
-pub trait Entropy: Send + Sync { fn fill(&self, out: &mut [u8]); }               // store id, reader id
+pub trait Entropy: Send + Sync { fn fill(&self, out: &mut [u8]); }               // store id, reader id, reset nonce
 pub trait TzSource: Send + Sync { fn current(&self) -> Arc<dyn TzRelease>; }      // the host's release now
 pub trait TzRelease: Send + Sync {
     fn version(&self) -> &str;                                                  // the release name

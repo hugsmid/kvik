@@ -389,7 +389,8 @@ exists; a new file is created only when none exists.
   the slot that does not hold the highest valid `counter`. The writer writes the next batch only after that update
   (`spec.md` §3 Recovery rule 1).
 - **Reset stamp.** Bytes 84..100 were reserved in version 3 and are read as zero in a slot that predates them, so
-  the version is unchanged. A start that writes a recovery entry writes the entry's stamp into the mark; a restore
+  the version is unchanged. A zero `reset_nonce` is no stamp, whatever `reset_sequence` holds. A start that writes or
+  adopts a recovery entry writes the entry's stamp into the mark; a restore
   writes its restore record's; every other update carries the stamp unchanged.
 - **Read.** Read both slots; the mark is the valid slot (magic, known version, checksum, store id) with the higher
   `counter`; a checksum-valid slot of unknown version is refused as above, never treated as invalid. One slot is always stable, so a torn or concurrent write costs at most one update of staleness. If

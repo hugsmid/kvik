@@ -104,7 +104,8 @@ Different from `docs/api.md`:
   15 minutes and multiples of 15 minutes that fits `max_points` (`docs/api.md` says the coarsest), counted from the
   UTC-aligned start.
 - **`ReaderState.stamp`** is always the zero stamp: the model has no resets. `Start::Position` takes a `SavedPoint`
-  (spec §7 Readers) and is `NotSupportedYet`.
+  (spec §7 Readers) and is `NotSupportedYet`; `Reader::check` and `PointCheck` (`docs/api.md`) are not in the crate
+  yet (roadmap 5.3).
 - **`Reader::interval`** returns the interval that contains `t`, whether or not `t` is its start.
 - **`Consumer::next`** ends with `None` on any error, not only after a shutdown; `try_next` returns the error.
 - `BackupSink` takes and returns `Vec<u8>` until roadmap 8.2 settles its signatures.

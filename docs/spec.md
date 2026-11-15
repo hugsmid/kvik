@@ -217,7 +217,10 @@ A.10) is treated as a different boot. The rules apply in this order:
    the mark's update since its last sync with the page cache) or not (its sync or mark update failed); recovery
    cannot tell, so the truncation is a **reset point**: after it, a recovery entry is written as under rule 3, with
    K = the mark's last position, mark state readable, the truncated bytes as its tail and a new reset stamp, and the
-   loss is reported as `possible_loss`. Accepted limit: an acknowledged batch can be truncated this way; it is
+   loss is reported as `possible_loss`. If the one complete batch beyond the mark is such an entry, written by an
+   earlier start that stopped before its mark (its `after` is the mark's position, it starts at the mark's offset and
+   nothing after it shows a later write, as for Adoption under rule 3), it is adopted and written again in place,
+   and no second entry is written. Accepted limit: an acknowledged batch can be truncated this way; it is
    reported and consumers and readers forget above K. A store on media that may be remounted within a boot avoids
    it by syncing the mark at every commit (`api.md` `log.mark_sync`).
 2. **Corruption:** an invalid region that lies below a valid mark (a valid slot, `format.md` A.10) of any boot, or that is
@@ -267,9 +270,11 @@ A.10) is treated as a different boot. The rules apply in this order:
 
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
-2. Rule 1: truncate after the mark; sync every segment holding a lost range found (rule 2) and the directory, with
-   step 3's rule for a failed sync; go to step 4 (and, when a complete batch was truncated, on to steps 5 and 6 as
-   for rule 3).
+2. Rule 1: truncate after the mark, unless a complete batch lies beyond it; sync every segment holding a lost range
+   found (rule 2) and the directory, with step 3's rule for a failed sync; go to step 4. A complete batch beyond the
+   mark is left in place here: step 5 writes the recovery entry over it, or adopts the entry an earlier start wrote
+   there (written again in place first, as in step 3), and only then zeroes the rest, so a start that stops before
+   the entry is on disk leaves the batch for the next start to find.
 3. With the mark missing, unreadable or stale, or a recovery entry adopted, first write the last complete batch again
    in place, with its segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
    the manifest as they are and writes nothing more; what it found is reported in health as found and recorded by the
@@ -282,9 +287,9 @@ A.10) is treated as a different boot. The rules apply in this order:
    was first reported, so a loss reported before any record holds it can be acknowledged at once, and the record,
    when written, carries that identity. Sync the
    manifest.
-5. Rule 3, or rule 1 after truncating a complete batch: write or adopt the recovery entry and sync; zero the rest
-   of the torn tail and sync.
-6. Rule 3, or rule 1 after truncating a complete batch: write the mark (current boot id, last position F, highest
+5. Rule 3, or rule 1 with a complete batch beyond the mark: write or adopt the recovery entry and sync; zero the rest
+   of the torn tail, or of the bytes after the mark, and sync.
+6. Rule 3, or rule 1 with a complete batch beyond the mark: write the mark (current boot id, last position F, highest
    series id assigned, the entry's reset stamp) and sync the
    mark file and the directory. An existing mark file is updated in place, whatever its content (except a slot of unknown version,
    `format.md` A.10); a new file is created only when none exists. Then record the entry's gap, if any, as in step 4.
@@ -615,7 +620,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
     later restore record's restored end in P's generation, and the position before each later lost range of P's
     generation; the holder forgets every position above that and continues from it.
   - If no kept recovery entry or restore record carries S' (the reset the mark names is in a lost range, or was
-    lost with a manifest record), the answer is **unknown**: the holder starts again as if it kept no position.
+    lost with a manifest record), the answer is **unknown**: the holder starts again as if it kept no position. An
+    adopted recovery entry written before the stamp existed carries none; the mark then takes a fresh stamp that no
+    entry carries, so every saved point is unknown until the next reset.
   A reader opens the mark by path for every read of it and
   reads files by position, never mapping them (`format.md` A.10, A.13), so it never reads past a mark the writer no
   longer maintains (invariant 11).
@@ -747,7 +754,7 @@ A disaster loses facts in files not backed up, which may already have been acted
 | 4a | Observed series: one reading a day ahead, then on-time readings | The on-time readings are not `late`; the reference follows them; duplicate checks still see the future reading | model |
 | 5 | Device clock stuck or far in the past | Late data; adapter health reports skew when `received_at − t` is persistently large | unit |
 | 6 | Two readings in one second | Both facts; the minute node folds both | unit |
-| 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered. With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and described by a recovery entry, which reports the lost mark and the tail as `possible_loss` | kill loop |
+| 7 | Process crash after write, before sync | Same boot: truncated to the durable mark on restart; never delivered; a complete batch truncated this way is followed by a recovery entry and reported as `possible_loss` (§3 Recovery rule 1). With the mark lost, recovery treats it as a different boot and may keep the batch, which was never acknowledged; an invalid tail is truncated and described by a recovery entry, which reports the lost mark and the tail as `possible_loss` | kill loop |
 | 7a | Power loss after write, before sync | New boot: torn tail truncated by checksum and reported as `possible_loss`; complete batches synced on recovery before use; a recovery entry at the first new position; every consumer below it receives `resync` with `forget_above` before any later position, on this start and on every later one until its synced cursor has passed the entry | power-loss rig |
 | 7b | Export continued by position across a power loss | The export keeps a saved point (§7 Readers); judged against the mark after the restart, nothing above the position it is void above is kept as valid, and an unknown answer starts the export again | power-loss rig |
 | 7c | Crash on the same boot after a rule 3 recovery, before a consumer received its `resync` | Rule 1 start; the replay meets the recovery entry before any reused position | kill loop |

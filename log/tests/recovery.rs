@@ -428,7 +428,9 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
             let e = rep.entry.as_ref().expect("a recovery entry");
             assert_eq!(e.entry.after, 0);
             assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
-            assert_eq!(r.positions().len(), 1);
+            let p = r.positions();
+            assert_eq!(p.len(), 1);
+            assert!(matches!(p.get(&1), Some(Item::Entry(Entry::Recovery(e))) if e.after == 0));
         }
     }
 }
@@ -973,11 +975,37 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
                 None
             }
         };
+        // On the same boot, a complete batch above the mark may have been acknowledged on a mark lost with the page
+        // cache: once a start finishes, a recovery entry after the mark's position must be in the log, however the
+        // starts before it were cut short (Q-118 (e)).
+        // On the same boot, a complete batch above the mark may have been acknowledged on a mark lost with the page
+        // cache: once a start finishes, it is either still in the log (kept, as under rule 3 for a stale mark) or
+        // followed by a recovery entry after the mark's position, however the starts before were cut short.
+        let mut owed = mark_before.and_then(|m| {
+            r.batches()
+                .into_iter()
+                .find(|b| b.last_sequence() > m.last_sequence)
+                .map(|b| (m.last_sequence, b))
+        });
+        let paid = |r: &Rig, owed: &Option<(u64, BatchContent)>| {
+            if let Some((k, batch)) = owed {
+                let now = r.batches();
+                assert!(
+                    now.contains(batch)
+                        || now.iter().any(|b| matches!(
+                            b.items.as_slice(),
+                            [Item::Entry(Entry::Recovery(e))] if e.after == *k
+                        )),
+                    "a complete batch above position {k} was truncated without a recovery entry"
+                );
+            }
+        };
         // The start itself may be cut short; the next one must finish.
         if let Some(n) = c.crash_start {
             r.fs.crash_after(n);
             if r.open().is_some() {
                 r.check_started();
+                paid(&r, &owed);
                 continue;
             }
             r.kill();
@@ -1004,12 +1032,14 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
             r.fs.set_free_space(1 << 40);
             if started.is_some() {
                 r.check_started();
+                paid(&r, &owed);
                 continue;
             }
             match c.after_fault {
                 Some(seed) => {
                     r.power_loss(Some(seed));
                     mark_before = None;
+                    owed = None;
                 }
                 None => {
                     r.kill();
@@ -1022,6 +1052,7 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
         let before = r.batches();
         let rep = r.open().expect("a start finishes");
         r.check_started();
+        paid(&r, &owed);
         // No corruption is injected: nothing is certainly lost, and each recovery entry follows the batch before
         // it directly.
         assert!(
@@ -1046,8 +1077,10 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
                     .iter()
                     .filter(|b| b.last_sequence() <= m.last_sequence)
                     .collect();
-                // A complete batch truncated beyond the mark is followed by a recovery entry (Q-118 (e)).
-                let extra = usize::from(rep.entry.is_some());
+                // A recovery entry, written or adopted, exactly when a complete batch lay beyond the mark (Q-118 (e)).
+                let beyond = before.iter().any(|b| b.last_sequence() > m.last_sequence);
+                assert_eq!(rep.entry.is_some(), beyond, "{:?}", rep.entry);
+                let extra = usize::from(beyond);
                 assert_eq!(after.len(), expect.len() + extra);
                 assert_eq!(after[..expect.len()].iter().collect::<Vec<_>>(), expect);
                 if let Some(e) = &rep.entry {
@@ -1558,5 +1591,75 @@ fn an_unadopted_entry_that_is_its_segments_first_batch_is_written_again() {
         "{:?}",
         rep.losses
     );
+    r.check_started();
+}
+
+/// A start that truncates a complete batch under rule 1 and stops before its recovery entry is on disk leaves the
+/// batch in place, so the next start on the same boot finds it again and writes the entry: positions are never
+/// assigned again without a reset point, whichever step the first start stopped at.
+#[test]
+fn a_rule_1_reset_cut_short_is_done_again_by_the_next_start() {
+    for stop in ["MANIFEST", ".open"] {
+        let mut r = Rig::new(cfg());
+        r.submit(vec![fact(1, 0)]);
+        r.drain();
+        // A complete batch beyond the mark: synced, its mark write failed.
+        r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+        r.submit(vec![fact(1, 1)]);
+        r.step();
+        let mark = r.mark().unwrap();
+        r.kill();
+        // The start stops at step 4 (the manifest's sync) or at the entry's own sync (step 5).
+        r.fs.fail_nth(FaultOp::Sync, stop, 0, io::ErrorKind::Other);
+        assert!(r.open().is_none(), "stopped at {stop}");
+        r.kill();
+        let rep = r.open().expect("the next start finishes");
+        assert_eq!(rep.rule, StartRule::SameBoot);
+        let e = rep.entry.as_ref().expect("the reset is done again");
+        assert_eq!(e.entry.after, mark.last_sequence);
+        assert_eq!(r.mark().unwrap().stamp, e.entry.stamp.unwrap());
+        r.check_started();
+    }
+}
+
+/// A start that wrote its rule 1 recovery entry but stopped before its mark: the next start on the same boot adopts
+/// the entry, as rule 3 does (Q-117), so the reset is reported once and its position is not assigned twice.
+#[test]
+fn a_rule_1_entry_written_before_a_stop_is_adopted() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+    r.submit(vec![fact(1, 1)]);
+    r.step();
+    let mark = r.mark().unwrap();
+    r.kill();
+    // The entry is written and synced; the mark's write fails.
+    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+    assert!(r.open().is_none());
+    r.kill();
+    let first = r
+        .batches()
+        .into_iter()
+        .find_map(|b| match b.items.as_slice() {
+            [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
+            _ => None,
+        })
+        .expect("the entry the stopped start wrote");
+    let rep = r.open().expect("the next start finishes");
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    let e = rep.entry.as_ref().expect("the entry");
+    assert!(e.adopted);
+    assert_eq!(e.entry, first);
+    assert_eq!(e.entry.after, mark.last_sequence);
+    assert!(rep.rewrote_last_batch);
+    assert!(rep.losses.iter().all(|l| l.kind != LossKind::PossibleLoss));
+    assert_eq!(r.mark().unwrap().stamp, first.stamp.unwrap());
+    let entries = r
+        .batches()
+        .iter()
+        .filter(|b| matches!(b.items.as_slice(), [Item::Entry(Entry::Recovery(_))]))
+        .count();
+    assert_eq!(entries, 1);
     r.check_started();
 }
