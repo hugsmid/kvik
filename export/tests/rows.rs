@@ -9,7 +9,7 @@ use kvik_export::{
     ChangedAt, ExportError, ExportOptions, ExportRow, Flags, KindName, SeriesSchema, ValueKind,
     column, export_rows,
 };
-use parquet::basic::{LogicalType, TimeUnit, Type as PhysicalType};
+use parquet::basic::{LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use proptest::prelude::*;
 
 fn decimal_series(scale: u8) -> SeriesSchema {
@@ -145,6 +145,103 @@ fn the_parquet_types_alone_carry_the_schema() {
     }
     let names: Vec<&str> = c.keys().map(String::as_str).collect();
     assert_eq!(names.len(), 6 + 1 + 2 + 7 + 2);
+}
+
+/// A column name and whether it is optional.
+type Column = (&'static str, bool);
+
+#[test]
+fn columns_come_in_the_documented_order_with_the_documented_nullability() {
+    let head = [
+        ("series_id", false),
+        ("series_name", false),
+        ("t", false),
+        ("generation", false),
+        ("sequence", false),
+        ("received_at", false),
+    ];
+    let tail = [
+        ("quality", false),
+        ("supplied_quality", false),
+        ("future", false),
+        ("late", false),
+        ("revise", false),
+        ("host_time", false),
+        ("unsynced_clock", false),
+        ("no_value", false),
+        ("rounded", false),
+    ];
+    let cases: [(SeriesSchema, &[Column], &[Column]); 3] = [
+        (
+            SeriesSchema {
+                changed_at: Some(ChangedAt::Version),
+                interval: Some(900_000_000_000),
+                kind: KindName::Interval,
+                ..f64_series(1)
+            },
+            &[("value", true)],
+            &[("changed_at", false), ("interval_end", false)],
+        ),
+        (
+            decimal_series(4),
+            &[("value", true), ("stored_scale", true)],
+            &[],
+        ),
+        (
+            SeriesSchema {
+                value: ValueKind::State(vec!["off".into()]),
+                kind: KindName::State,
+                changed_at: Some(ChangedAt::Time),
+                ..f64_series(1)
+            },
+            &[("value", true), ("state_name", true)],
+            &[("changed_at", false)],
+        ),
+    ];
+    for (series, value, extra) in cases {
+        let file = export_to_vec(&series, &[], &ExportOptions::default()).unwrap();
+        let expected: Vec<(String, bool)> = head
+            .iter()
+            .chain(value)
+            .chain(&tail)
+            .chain(extra)
+            .map(|(n, o)| (n.to_string(), *o))
+            .collect();
+        assert_eq!(column_order(&file), expected, "{:?}", series.value);
+    }
+}
+
+#[test]
+fn every_column_chunk_is_zstd_compressed() {
+    let rows = [row(1, 0, 1, Value::F64(1.0))];
+    let file = export_to_vec(&f64_series(1), &rows, &ExportOptions::default()).unwrap();
+    let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(&file),
+    )
+    .unwrap();
+    let group = b.metadata().row_group(0);
+    for c in group.columns() {
+        assert!(
+            matches!(c.compression(), parquet::basic::Compression::ZSTD(_)),
+            "{}",
+            c.column_path()
+        );
+    }
+    assert_eq!(kvik_export::ZSTD_LEVEL, 1);
+}
+
+#[test]
+fn fact_flags_count_matches_the_flag_columns() {
+    assert_eq!(size_of::<kvik::FactFlags>(), column::FLAGS.len());
+}
+
+#[test]
+fn a_decimal_scale_above_eighteen_is_refused() {
+    let err = export_to_vec(&decimal_series(19), &[], &ExportOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, ExportError::UnsupportedSeries { .. }),
+        "{err}"
+    );
 }
 
 #[test]
@@ -390,6 +487,22 @@ proptest! {
         let file = export_to_vec(&series, &decimals, &ExportOptions::default()).unwrap();
         prop_assert_eq!(read_back(&file), decimals);
     }
+}
+
+/// Each leaf column's name and whether it is optional, in file order.
+fn column_order(file: &[u8]) -> Vec<(String, bool)> {
+    let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(file),
+    )
+    .unwrap();
+    b.parquet_schema()
+        .columns()
+        .iter()
+        .map(|c| {
+            let optional = c.self_type().get_basic_info().repetition() == Repetition::OPTIONAL;
+            (c.name().to_string(), optional)
+        })
+        .collect()
 }
 
 /// Each leaf column's logical and physical type, by name.

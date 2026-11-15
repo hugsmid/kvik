@@ -29,10 +29,13 @@ Reading); today both backends gather the range before the first fact is returned
 
 - One file per series per call. Row groups hold at most `row_group_rows` rows; an empty export is a valid file with
   the schema and no row group.
-- Columns are compressed with zstd (level 1) and dictionary-encoded where the writer finds it pays, so repeated
-  names and quality strings cost little.
+- Columns are compressed with zstd at level 1 (`ZSTD_LEVEL`) and dictionary-encoded where the writer finds it
+  pays, so repeated names and quality strings cost little.
 - The contract is the Parquet physical and logical types below. The Arrow schema is embedded as well
   (`ARROW:schema`) for Arrow readers; the crate's own read-back ignores it and reads the Parquet types alone.
+
+Caveat (Q-196): zstd is the crate's only C dependency (`zstd-sys`). Snappy or LZ4, both available in pure Rust,
+would remove it at some cost in size; every common Parquet reader reads all three.
 
 ## Columns (Q-190)
 
@@ -61,7 +64,15 @@ Reading); today both backends gather the range before the first fact is returned
 | named state | `INT32`, `INT(16, false)`: the index into the declared names, with `state_name` beside it |
 | text | `BYTE_ARRAY`, `STRING` |
 
-Calendar-length interval series are not exported yet; neither backend stores them (Q-197).
+A decimal series' scale is at most 18 (`spec.md` §2.1); a series with a higher scale is refused before any row is
+written. Calendar-length interval series are not exported yet; neither backend stores them (Q-197).
+
+Caveats:
+- (Q-190) `TIMESTAMP(NANOS)` and unsigned `INT(64, false)` are not read natively by every engine: some read
+  nanosecond timestamps only as microseconds or as plain `INT64`, and some read `UINT_64` as signed, so a `sequence`
+  or a `changed_at` of kind `version` above `i64::MAX` shows negative there.
+- (Q-192) The decimal column's type follows the series' scale, so a raise changes it: files exported before and
+  after a raise have `DECIMAL(19, 2)` and `DECIMAL(19, 4)`, say, and may not concatenate without a cast.
 
 ## Metadata
 
@@ -86,4 +97,5 @@ An export never writes a null or a rounded value in place of a fact it cannot re
 is incomplete. It fails on: a value that does not match the series' value type, or a state index beyond the
 declared names; a decimal stored above the column's scale, or beyond 19 digits after rescaling; `changed_at` missing
 on a versioned series or present on another; a `changed_at` of kind `time` above `i64::MAX` (Q-195); an interval
-end beyond the timestamp range; a fact of another series; a series kind the schema does not cover.
+end beyond the timestamp range; a fact of another series; a series kind the schema does not cover, or a decimal
+scale above 18 (`UnsupportedSeries`).

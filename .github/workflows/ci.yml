@@ -102,6 +102,25 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test -p commit --locked
 
+  export:
+    # The Parquet export (roadmap 6.4) is outside the default members, so the core jobs never build parquet or
+    # zstd-sys; its checks run here, on one OS.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: export
+      - run: cargo clippy -p kvik-export --all-targets --locked
+      - run: cargo doc -p kvik-export --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test -p kvik-export --locked
+        env:
+          PROPTEST_CASES: "1024"
+
   deep-shards:
     # The deep job's matrix, generated from the table in .github/deep-shards.sh.
     runs-on: ubuntu-latest

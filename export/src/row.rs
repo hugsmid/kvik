@@ -58,6 +58,9 @@ impl Flags {
     }
 }
 
+// Every `FactFlags` field is a `bool`, so its size counts them: a new flag fails the build until it has a column.
+const _: () = assert!(size_of::<FactFlags>() == crate::column::FLAGS.len());
+
 impl From<FactFlags> for Flags {
     fn from(f: FactFlags) -> Self {
         Flags {

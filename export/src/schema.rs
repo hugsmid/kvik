@@ -16,6 +16,19 @@ pub const EXPORT_VERSION: &str = "0";
 /// Precision of the decimal value column: every `i64` units value fits (Q-192).
 pub const DECIMAL_PRECISION: u8 = 19;
 
+/// The highest decimal scale a series may have (spec §2.1 `decimal scale`).
+pub const MAX_DECIMAL_SCALE: u8 = 18;
+
+/// The Arrow scale of a decimal column; a scale above [`MAX_DECIMAL_SCALE`] is refused.
+pub(crate) fn decimal_scale(scale: u8) -> Result<i8, ExportError> {
+    if scale > MAX_DECIMAL_SCALE {
+        return Err(ExportError::UnsupportedSeries {
+            reason: "a decimal scale above 18",
+        });
+    }
+    Ok(i8::try_from(scale).expect("at most 18"))
+}
+
 /// Column names (`docs/export.md` Columns).
 pub mod column {
     /// Series id.
@@ -58,6 +71,7 @@ pub mod column {
 
 /// What a series' value column holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValueKind {
     /// `f64`.
     F64,
@@ -76,6 +90,7 @@ pub enum ValueKind {
 
 /// A series' kind (spec §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KindName {
     /// Gauge.
     Gauge,
@@ -91,6 +106,7 @@ pub enum KindName {
 
 /// What `changed_at` holds in a versioned series (spec §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChangedAt {
     /// UTC nanoseconds, exported as a timestamp.
     Time,
@@ -100,6 +116,7 @@ pub enum ChangedAt {
 
 /// A series' timing (spec §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimingName {
     /// Observed.
     Observed,
@@ -136,7 +153,10 @@ impl SeriesSchema {
         let unsupported = |reason| ExportError::UnsupportedSeries { reason };
         let numeric = |v: &ValueType| match v {
             ValueType::F64 => Ok(ValueKind::F64),
-            ValueType::Decimal { scale } => Ok(ValueKind::Decimal { scale: *scale }),
+            ValueType::Decimal { scale } => {
+                decimal_scale(*scale)?;
+                Ok(ValueKind::Decimal { scale: *scale })
+            }
             _ => Err(unsupported("an unknown value type")),
         };
         let (kind, value, interval) = match &info.spec.kind {
@@ -185,7 +205,7 @@ impl SeriesSchema {
     }
 
     /// The Arrow schema of the series' export file (`docs/export.md` Columns).
-    pub fn arrow_schema(&self) -> SchemaRef {
+    pub fn arrow_schema(&self) -> Result<SchemaRef, ExportError> {
         let ts = timestamp();
         let mut fields = vec![
             Field::new(column::SERIES_ID, DataType::UInt32, false),
@@ -198,7 +218,7 @@ impl SeriesSchema {
         match &self.value {
             ValueKind::F64 => fields.push(Field::new(column::VALUE, DataType::Float64, true)),
             ValueKind::Decimal { scale } => {
-                let scale = i8::try_from(*scale).unwrap_or(i8::MAX);
+                let scale = decimal_scale(*scale)?;
                 fields.push(Field::new(
                     column::VALUE,
                     DataType::Decimal128(DECIMAL_PRECISION, scale),
@@ -228,7 +248,7 @@ impl SeriesSchema {
         if self.interval.is_some() {
             fields.push(Field::new(column::INTERVAL_END, ts, false));
         }
-        Arc::new(Schema::new(fields))
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     /// The series' entries of the file's key-value metadata (`docs/export.md` Metadata).

@@ -10,7 +10,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use kvik::{Quality, Value};
 
-use crate::schema::{ChangedAt, DECIMAL_PRECISION, SeriesSchema, ValueKind};
+use crate::schema::{ChangedAt, DECIMAL_PRECISION, SeriesSchema, ValueKind, decimal_scale};
 use crate::{ExportError, ExportRow};
 
 /// The quality names of the `quality` columns (Q-194), best to worst.
@@ -101,10 +101,8 @@ impl Columns {
             ValueKind::F64 => ValueColumn::F64(Float64Builder::with_capacity(n)),
             ValueKind::Decimal { scale } => ValueColumn::Decimal {
                 scale: *scale,
-                value: Decimal128Builder::with_capacity(n).with_precision_and_scale(
-                    DECIMAL_PRECISION,
-                    i8::try_from(*scale).unwrap_or(i8::MAX),
-                )?,
+                value: Decimal128Builder::with_capacity(n)
+                    .with_precision_and_scale(DECIMAL_PRECISION, decimal_scale(*scale)?)?,
                 stored: UInt8Builder::with_capacity(n),
             },
             ValueKind::Bool => ValueColumn::Bool(BooleanBuilder::with_capacity(n)),
@@ -116,7 +114,7 @@ impl Columns {
             ValueKind::Text => ValueColumn::Text(StringBuilder::new()),
         };
         Ok(Columns {
-            schema: series.arrow_schema(),
+            schema: series.arrow_schema()?,
             series: series.id,
             name: series.name.clone(),
             interval: series.interval,

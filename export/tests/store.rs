@@ -7,9 +7,11 @@ use std::time::Duration;
 use common::{BACKENDS, at, bits, block_on, open, read_back, store_on};
 use kvik::{
     Backend, ChangedAtKind, Intent, IntervalLength, Kind, Quality, Reader, Reading, SeriesId,
-    SeriesSpec, StateValues, Store, Timing, Value, ValueType, View,
+    SeriesSpec, StateValues, Store, Timestamp, Timing, Value, ValueType, View,
 };
-use kvik_export::{ExportOptions, ExportRow, column, export_series};
+use kvik_export::{
+    ExportError, ExportOptions, ExportRow, SeriesSchema, ValueKind, column, export_series,
+};
 
 fn facts(r: &Reader, id: SeriesId, view: View) -> Vec<ExportRow> {
     r.facts(id, at(-1_000_000)..at(1_000_000), view)
@@ -245,6 +247,68 @@ fn versioned_series_export_current_and_history_with_typed_changed_at() {
         assert_eq!(read_back(&file)[0].changed_at, Some(u64::MAX));
         block_on(store.shutdown()).unwrap();
     }
+}
+
+#[test]
+fn as_of_position_and_as_of_time_exports_match_the_store_on_both_backends() {
+    for backend in BACKENDS {
+        let (store, clock) = store_on(backend, "as-of");
+        let g = define(&store, gauge("site/meter/power"));
+        clock.advance(Duration::from_secs(60));
+        let first = block_on(store.emit(&[
+            Reading::new(g, at(0), Value::F64(1.0)),
+            Reading::new(g, at(1), Value::F64(2.0)),
+        ]))
+        .unwrap();
+        let before = clock.wall();
+        clock.advance(Duration::from_secs(10));
+        emit(
+            &store,
+            &[
+                Reading::new(g, at(0), Value::F64(1.5)),
+                Reading::new(g, at(2), Value::F64(3.0)),
+            ],
+        );
+        let r = store.reader();
+        let as_of = View::AsOf(first.last().unwrap());
+        let as_of_time = View::AsOfTime(Timestamp(before.0 + 5_000_000_000));
+        for view in [as_of, as_of_time] {
+            let rows = read_back(&assert_round_trip(&r, g, view));
+            let values: Vec<_> = rows.iter().map(|r| r.value.clone()).collect();
+            assert_eq!(
+                values,
+                [Value::F64(1.0), Value::F64(2.0)],
+                "{backend:?} {view:?}"
+            );
+        }
+        assert_eq!(read_back(&export(&r, g, View::Current)).len(), 3);
+        let file = export(&r, g, as_of);
+        let p = first.last().unwrap();
+        let want = format!("as_of {}:{}", p.generation, p.sequence);
+        assert_eq!(open(&file).metadata("kvik.view"), Some(want.as_str()));
+        block_on(store.shutdown()).unwrap();
+    }
+}
+
+#[test]
+fn a_series_schema_refuses_a_decimal_scale_above_eighteen() {
+    let (store, _clock) = store_on(Backend::Durable, "scale");
+    let g = define(&store, gauge("site/meter/power"));
+    let mut info = store.reader().series(g).unwrap();
+    info.spec.kind = Kind::Gauge {
+        value: ValueType::Decimal { scale: 18 },
+    };
+    let schema = SeriesSchema::from_info(&info).unwrap();
+    assert_eq!(schema.value, ValueKind::Decimal { scale: 18 });
+    info.spec.kind = Kind::Gauge {
+        value: ValueType::Decimal { scale: 19 },
+    };
+    let err = SeriesSchema::from_info(&info).unwrap_err();
+    assert!(
+        matches!(err, ExportError::UnsupportedSeries { .. }),
+        "{err}"
+    );
+    block_on(store.shutdown()).unwrap();
 }
 
 #[test]

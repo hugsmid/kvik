@@ -48,9 +48,12 @@ pub use error::ExportError;
 pub use read::{ExportReader, read_rows};
 pub use row::{ExportRow, Flags};
 pub use schema::{
-    ChangedAt, DECIMAL_PRECISION, EXPORT_VERSION, KindName, SeriesSchema, TimingName, ValueKind,
-    column,
+    ChangedAt, DECIMAL_PRECISION, EXPORT_VERSION, KindName, MAX_DECIMAL_SCALE, SeriesSchema,
+    TimingName, ValueKind, column,
 };
+
+/// The zstd level of every column (`docs/export.md` File layout, Q-196).
+pub const ZSTD_LEVEL: i32 = 1;
 
 /// How an export reads and writes (`docs/export.md` Options).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,18 +169,11 @@ where
     W: Write + Send,
     I: IntoIterator<Item = Result<ExportRow, ExportError>>,
 {
-    if let ValueKind::Decimal { scale } = series.value
-        && scale > 18
-    {
-        return Err(ExportError::UnsupportedSeries {
-            reason: "a decimal scale above 18",
-        });
-    }
     let mut kv = series.metadata();
     kv.extend(options.metadata()?);
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(options.row_group_rows))
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
         .set_key_value_metadata(Some(
             kv.into_iter().map(|(k, v)| KeyValue::new(k, v)).collect(),
         ))
