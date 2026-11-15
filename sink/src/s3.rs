@@ -8,8 +8,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use kvik::{BackupSink, ListPage, SinkError, SinkFuture, Stored};
 use sha2::{Digest, Sha256};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::config::{Addressing, S3Config};
 use crate::retry::{Jitter, Pause, SystemWallClock, ThreadSleep, WallClock};
 use crate::sigv4::{self, EMPTY_SHA256, ToSign};
@@ -60,8 +58,6 @@ struct Inner {
     clock: Arc<dyn WallClock>,
     pause: Arc<dyn Pause>,
     jitter: Jitter,
-    /// The bucket answered a `HEAD`, so a key's 404 means the key is absent.
-    bucket_seen: AtomicBool,
 }
 
 impl S3Sink {
@@ -108,7 +104,6 @@ impl S3Sink {
             transport,
             clock,
             pause,
-            bucket_seen: AtomicBool::new(false),
         });
         Ok(S3Sink { inner, pool })
     }
@@ -361,12 +356,9 @@ impl Inner {
         }
     }
 
-    /// Whether the bucket exists, asked once per sink; a missing bucket is
-    /// `Failed`, never an absent key.
+    /// Whether the bucket exists, asked on every 404 of a key, so that a
+    /// missing bucket is `Failed`, never an absent key.
     fn check_bucket(&self) -> Result<(), SinkError> {
-        if self.bucket_seen.load(Ordering::Acquire) {
-            return Ok(());
-        }
         let request = self.request(
             Method::Head,
             None,
@@ -377,10 +369,7 @@ impl Inner {
         );
         let resp = self.send(&request)?;
         match resp.status {
-            200 => {
-                self.bucket_seen.store(true, Ordering::Release);
-                Ok(())
-            }
+            200 => Ok(()),
             404 => Err(failed(format!("bucket {} not found", self.cfg.bucket))),
             _ => Err(self.status_error(&self.cfg.bucket, &resp, Op::Head)),
         }
@@ -441,6 +430,12 @@ impl Inner {
             Some(r) => r.end - r.start,
             None => self.cfg.max_object_size,
         };
+        if limit > self.cfg.max_object_size {
+            return Err(SinkError::TooLarge {
+                size: limit,
+                limit: self.cfg.max_object_size,
+            });
+        }
         let request = self
             .request(
                 Method::Get,

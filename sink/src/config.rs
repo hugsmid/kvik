@@ -135,7 +135,10 @@ impl S3Config {
     /// Checks every field; returns the endpoint's scheme and authority.
     pub(crate) fn validate(&self) -> Result<(&'static str, String), SinkError> {
         let (scheme, authority) = parse_endpoint(&self.endpoint)?;
-        if scheme == "http" && !self.allow_plain_http && !is_loopback(host_of(&authority)) {
+        // With virtual-host addressing the host contacted is `bucket.<authority>`,
+        // which is not the loopback host judged here.
+        let loopback = self.addressing == Addressing::Path && is_loopback(host_of(&authority));
+        if scheme == "http" && !self.allow_plain_http && !loopback {
             return Err(failed(format!(
                 "plain http to {authority} needs allow_plain_http"
             )));
@@ -151,6 +154,8 @@ impl S3Config {
         let bucket_ok = match self.addressing {
             Addressing::Path => {
                 !self.bucket.is_empty()
+                    && self.bucket != "."
+                    && self.bucket != ".."
                     && self.bucket.len() <= 255
                     && self
                         .bucket
@@ -212,15 +217,53 @@ fn parse_endpoint(endpoint: &str) -> Result<(&'static str, String), SinkError> {
         )));
     };
     let authority = rest.strip_suffix('/').unwrap_or(rest);
-    if authority.is_empty()
-        || authority.contains(['/', '?', '#', '@'])
-        || !authority.chars().all(|c| c.is_ascii_graphic())
-    {
+    if !is_authority(authority) {
         return Err(failed(format!(
             "endpoint {endpoint:?} must be scheme://host[:port] with no path"
         )));
     }
     Ok((scheme, authority.to_ascii_lowercase()))
+}
+
+/// `host[:port]`: a name of letters, digits, `.` and `-`, or `[v6]`; a port of
+/// 1 to 65535.
+fn is_authority(a: &str) -> bool {
+    let (host, port) = if let Some(rest) = a.strip_prefix('[') {
+        let Some((v6, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let v6_ok = !v6.is_empty()
+            && v6
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+        if !v6_ok {
+            return false;
+        }
+        match after {
+            "" => return true,
+            p => (None, p.strip_prefix(':')),
+        }
+    } else {
+        match a.split_once(':') {
+            Some((h, p)) => (Some(h), Some(p)),
+            None => (Some(a), None),
+        }
+    };
+    let host_ok = host.is_none_or(|h| {
+        !h.is_empty()
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    });
+    let port_ok = match port {
+        None => host.is_some(),
+        Some(p) => {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+        }
+    };
+    host_ok && port_ok
 }
 
 /// The host of `host[:port]` or `[v6][:port]`.
@@ -264,12 +307,24 @@ mod tests {
             parse_endpoint("https://Objects.test:9000/").unwrap(),
             ("https", "objects.test:9000".to_owned())
         );
+        assert!(parse_endpoint("http://[::1]:9000").is_ok());
+        assert!(parse_endpoint("http://[::1]").is_ok());
         for bad in [
             "objects.test",
             "https://",
             "https://a/b",
             "ftp://a",
             "https://u@a",
+            "https://a_b",
+            "https://a:",
+            "https://a:0",
+            "https://a:65536",
+            "https://a:1:2",
+            "https://a:x",
+            "https://[::1",
+            "https://[zz]",
+            "https://[::1]x",
+            "https://a%20b",
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad}");
         }
@@ -293,6 +348,9 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+        let virtual_host = config("http://127.0.0.1:9000").with_addressing(Addressing::VirtualHost);
+        assert!(virtual_host.validate().is_err());
+        assert!(virtual_host.with_plain_http(true).validate().is_ok());
     }
 
     #[test]
@@ -323,6 +381,11 @@ mod tests {
         let mut c = base.clone();
         c.region = "a b".into();
         bad.push(c);
+        for name in [".", ".."] {
+            let mut c = base.clone();
+            c.bucket = name.into();
+            bad.push(c);
+        }
         for c in bad {
             assert!(c.validate().is_err(), "{c:?}");
         }

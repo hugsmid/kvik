@@ -290,7 +290,12 @@ fn an_absent_key_is_none_only_when_the_bucket_exists() {
     let sink = bucket.sink();
     assert_eq!(block_on(sink.stat("data/none")).unwrap(), None);
     assert_eq!(block_on(sink.stat("data/none")).unwrap(), None);
-    assert_eq!(bucket.count(FakeOp::Head), 3);
+    assert_eq!(bucket.count(FakeOp::Head), 4);
+    bucket.set_bucket_missing(true);
+    assert!(matches!(
+        block_on(sink.stat("data/none")),
+        Err(SinkError::Failed { .. })
+    ));
 
     let bucket = FakeBucket::new();
     bucket.set_bucket_missing(true);
@@ -560,6 +565,22 @@ fn objects_above_the_single_part_limit_are_refused_without_a_request() {
             .with_max_object_size(u64::MAX)
             .max_object_size,
         kvik_sink::SINGLE_PART_LIMIT
+    );
+}
+
+#[test]
+fn a_range_longer_than_the_object_limit_is_too_large_without_a_request() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink_with(bucket.config().with_max_object_size(8));
+    assert_eq!(
+        block_on(sink.get("data/r", Some(0..9))),
+        Err(SinkError::TooLarge { size: 9, limit: 8 })
+    );
+    assert_eq!(bucket.count(FakeOp::Any), 0);
+    put(&sink, "data/r", b"12345678").unwrap();
+    assert_eq!(
+        block_on(sink.get("data/r", Some(0..8))).unwrap(),
+        b"12345678"
     );
 }
 

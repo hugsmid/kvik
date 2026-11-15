@@ -420,8 +420,12 @@ store.rebuild(Rebuild::Derived).await?;       // recompute every derived structu
 The sink has no delete. Settled with roadmap 8.2, under the stable-shapes and runtime-neutral principles (std types
 only, boxed `Send` futures):
 - **No overwrite.** `put` creates an object only where the key is absent. An existing object with the same size and
-  reported SHA-256 makes it succeed (an upload repeated after a lost reply or a restart); other content is
-  `SinkError::Exists`. This is the create-if-absent of generation claims (spec §8 Generations).
+  reported SHA-256 makes it succeed (an upload repeated after a lost reply or a restart). Other content is
+  `SinkError::Exists` only when no attempt of this call can have reached the bucket; after an attempt that may have
+  landed (a lost reply, a lost connection, a server error), other content is `HashMismatch`, as the sink cannot tell
+  its own upload stored damaged from another writer's object. This is the create-if-absent of generation claims
+  (spec §8 Generations): a claim whose `put` fails with `HashMismatch` after such an attempt may or may not be this
+  restore's, so a restore treats it as possibly lost, not as corruption, and claims the next generation.
 - **Hashes.** `put` sends the SHA-256 with a single-part upload, and the bucket must reject a mismatch
   (`HashMismatch`); the returned `Stored` is what the bucket reports when asked after the upload, and `put` fails
   with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`.

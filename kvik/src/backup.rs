@@ -49,7 +49,8 @@ impl ListPage {
 #[non_exhaustive]
 pub enum SinkError {
     /// `put` found an object under the key with other content (size or
-    /// reported SHA-256). Nothing was overwritten.
+    /// reported SHA-256) before any attempt of the call could have reached the
+    /// bucket. Nothing was overwritten.
     #[error("an object with other content exists under {key}")]
     Exists {
         /// The key.
@@ -62,7 +63,9 @@ pub enum SinkError {
         key: String,
     },
     /// The bucket rejected an upload whose bytes do not match the SHA-256
-    /// sent with it, or reported a SHA-256 other than the one sent.
+    /// sent with it, or reported other content than the one sent. After an
+    /// attempt that may have landed this includes another writer's object,
+    /// which the sink cannot tell from its own damaged upload (`docs/api.md`).
     #[error("the bucket rejected or misreported the SHA-256 of {key}")]
     HashMismatch {
         /// The key.
