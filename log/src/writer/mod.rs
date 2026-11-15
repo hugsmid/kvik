@@ -514,7 +514,10 @@ pub struct LogWriter {
     mark: Option<Box<dyn FsFile>>,
     mark_path: PathBuf,
     mark_slot: MarkSlot,
+    /// The slot that does not hold the last synced mark: every update until the next mark sync goes there.
     mark_next_slot: usize,
+    /// An update was written since the last mark sync.
+    mark_written: bool,
     mark_dirty: bool,
     mark_synced: u64,
     last_mark_sync: Duration,
@@ -619,6 +622,7 @@ impl LogWriter {
             mark: r.mark,
             mark_slot: r.mark_slot,
             mark_next_slot: r.mark_next_slot,
+            mark_written: false,
             mark_dirty: r.mark_dirty,
             mark_synced: synced,
             last_mark_sync: now,
@@ -641,10 +645,12 @@ impl LogWriter {
             waiting: None,
             report: r.report,
         };
-        // A mark read from the page cache on this boot may not be on stable storage. With the mark synced at every
-        // commit nothing may rest on such a mark: a batch it covers would be read and delivered, then lost by a
-        // remount within the boot (`spec.md` §3 Recovery rule 1). A failed sync leaves the writer read-only.
-        if w.mark_dirty && matches!(w.mark_mode, MarkSyncMode::EveryCommit { .. }) {
+        // A mark read from the page cache on this boot may not be on stable storage, and which slot holds the last
+        // synced mark is unknown, so the first update could overwrite it (`format.md` A.10 Update, Q-122). With the
+        // mark synced at every commit, nothing may rest on such a mark either: a batch it covers would be read and
+        // delivered, then lost by a remount within the boot (`spec.md` §3 Recovery rule 1). It is synced now; a
+        // failed sync leaves the writer read-only.
+        if w.mark_dirty {
             w.sync_mark(now);
         }
         Ok(w)
@@ -976,6 +982,11 @@ impl LogWriter {
             self.fail(FaultOp::MarkSync, &p, &e);
             return;
         }
+        // The slot written since the last sync now holds the last synced mark.
+        if self.mark_written {
+            self.mark_next_slot = 1 - self.mark_next_slot;
+            self.mark_written = false;
+        }
         self.mark_dirty = false;
         self.last_mark_sync = now;
         self.mark_synced = self.mark_slot.last_sequence;
@@ -1197,7 +1208,8 @@ impl LogWriter {
         self.stats.bytes += bytes.len() as u64;
         self.stats.batches += 1;
         self.stats.max_series_id = self.max_series_id;
-        // The mark moves: one positional write of the slot that does not hold the mark (A.10 Update).
+        // The mark moves: one positional write of the slot that does not hold the last synced mark; until the next
+        // mark sync, later updates replace this one in the same slot (A.10 Update).
         let slot = MarkSlot {
             counter: self.mark_slot.counter + 1,
             file_id,
@@ -1220,7 +1232,7 @@ impl LogWriter {
             return Some(Self::unknown(&calls));
         }
         self.mark_slot = slot;
-        self.mark_next_slot = 1 - self.mark_next_slot;
+        self.mark_written = true;
         self.mark_dirty = true;
         let forced = matches!(self.mark_mode, MarkSyncMode::EveryCommit { .. })
             || calls.iter().any(Call::has_non_fact);

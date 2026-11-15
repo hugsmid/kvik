@@ -33,7 +33,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
 | Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
 | Q-121 | §2.1 `id`, id floors; `format.md` A.6, A.10 | Series id 0 against an id floor of 0 |
-| Q-122 | §3 Durable mark, §2.1 id floors; `format.md` A.10 Update | A torn mark update can leave a mark older than the last one synced |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -489,13 +488,14 @@ new segment for its entry, nothing can be written until it exists. (l) *Unused s
 header.* A.4 keeps an unused segment as the one created ahead by its header and length alone. (m) *Consumers.* The
 entry's field 47 names consumers whose cursor file was missing or unreadable; cursor files are roadmap 5.2. (n)
 *Restart time.* A start reads every unsealed segment whole, and the last sealed one for its trailer, against the
-restart budget of `design.md`. (o) *A mark from the page cache under `EveryCommit`.* The order of a start syncs the
-mark only when it writes a recovery entry. Otherwise, under rule 1, a mark read on the same boot may not be on stable
-storage, yet a batch it covers is read and delivered at once; with the mark synced at every commit, a remount within
-the boot then truncates that batch at a reset point, which syncing at every commit is said to avoid (Recovery rule
-1). Found by roadmap 4.7. (p) *A header put in
-use by a failed sync.* When the sync of a batch that takes a segment into use fails, the new header is in the page
-cache only; a start on the same boot keeps the segment in use from that header without writing it again, so after a
+restart budget of `design.md`. (o) *A mark from the page cache under `EveryCommit`.* Before roadmap 4.7 the order of a
+start synced the mark only when it wrote a recovery entry. Otherwise, under rule 1, a mark read on the same boot may
+not be on stable storage, yet a batch it covers is read and delivered at once; with the mark synced at every commit, a
+remount within the boot then truncated that batch at a reset point, which syncing at every commit is said to avoid
+(Recovery rule 1). A reader process can still read the mark from the page cache before the start's sync, or after
+that sync failed, and return such a batch. Found by roadmap 4.7. (p) *A header put in
+use by a failed sync.* When the sync that takes a segment into use fails (a timed seal's, which carries no batch; a
+batch's own is written over by rule 1's recovery entry, header included), the new header is in the page cache only; a start on the same boot keeps the segment in use from that header without writing it again, so after a
 later power loss the segment reads as unused unless a batch in it was synced since. Found by roadmap 4.7.
 **Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
 manifest count. (c) A start reports what it found and what the manifest holds; earlier recovery entries are read by
@@ -507,10 +507,11 @@ lease file names, a void lease's included; an unreadable lease file counts as in
 the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
-(n) Measured by roadmap 4.8. (o) With `mark_sync = EveryCommit`, or no boot identity, a start on the same boot syncs
-the mark it read before it resumes. (p) Left as it is: that later start writes the header again from the segment's
-first complete batch; a torn batch alone in the segment is deleted with it under (l) and not reported
-(`log/tests/model_histories.rs`).
+(n) Measured by roadmap 4.8. (o) A start on the same boot syncs the mark it read before it resumes, in every mode, as
+`format.md` A.10 Update requires since Q-122; a reader is not held back meanwhile. (p) Left as it is: that later
+start writes the header again from the segment's first complete batch; a torn batch alone in the segment is deleted
+with it under (l) and not reported (`log/tests/recovery.rs`,
+`a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_start`).
 **Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (n) with
 4.8.
 To be settled at gate 4.9.
@@ -580,21 +581,6 @@ id defined, 0 with none, and takes the model's ids from 0.
 **Needed.** Either ids start at 1 (0 meaning none in the mark and the floor, and the model changed to match), or the
 floor tells none from id 0 another way (the next free id, or a flag). To be settled by roadmap 5.1, which assigns ids.
 
-## Q-122 — A torn mark update can leave a mark older than the last one synced
-Found by the differential test of the log against the model (roadmap 4.7).
-**Scenario.** A.10 writes each update to "the slot that does not hold the highest valid `counter`", so updates
-alternate between the slots whether or not the last one was synced. With a timed mark sync, slot A holds counter c,
-synced, and slot B holds c − 1; update c + 1 goes to B and c + 2 to A, neither synced. A power loss that keeps part of
-the write of c + 2 leaves A invalid and B at c − 1: the mark is older than the one synced last, against A.10's "one
-slot is always stable, so a torn or concurrent write costs at most one update of staleness". Rule 3 keeps every
-complete batch, so no position is lost, but the start's id floor comes from that mark and the unsealed segments only:
-an id defined after c − 1 in a batch that is now in a sealed segment is above the floor (the test saw a floor of 18
-with id 19 defined and acknowledged). Rule 2 judges an invalid region against the older mark too.
-**Implemented.** As A.10 says. `log/tests/model_histories.rs` accepts a lower floor only after a power loss that left a
-mark older than the last one synced.
-**Needed.** Either every update between two mark syncs goes to the slot that does not hold the last synced mark (A.10
-changed), or the id floor also takes the highest id defined in the sealed segments. To be settled at gate 4.9.
-
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -604,7 +590,7 @@ after gate 3.3; such a change is made by the item that settles the question, in 
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
 Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119, Q-46 and parts (e) and (l) of Q-118 were settled after it by
-the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7.
+the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -631,7 +617,6 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7.
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2 |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
 | Q-121 | 5.1 | Series registry: ids are assigned there; recorded by roadmap 4.7 |
-| Q-122 | 4.9 | Gate; recorded by roadmap 4.7 |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
@@ -837,6 +822,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-117 | A recovery entry adopted after its own sync failed | §3 Recovery rule 3, Last batch written again, and Order of a start step 3 (an adopted entry is written again in place before the sync of step 3, whatever the mark; extends the Q-87 ruling). Scenario: a readable mark of the old boot; the start's sync of its recovery entry fails, so the entry is in the page cache only; the next start on the same boot adopts it, and its sync writes nothing; the mark then names F, a batch is acknowledged at F + 1, and a power loss removes the entry, which the following start reports as `data_lost` with nothing damaged (`log/tests/recovery.rs`, `an_adopted_entry_whose_own_sync_failed_is_written_again`) |
 | Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
 | Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
+| Q-122 | A torn mark update could leave a mark older than the last one synced | `format.md` A.10 Update and Read, `spec.md` §3 Order of a start step 2 (settled by roadmap 4.7: every update between two mark syncs goes to the slot that does not hold the last synced mark, and a start that keeps a mark read on the same boot syncs it before its first update). Scenario: updates alternated between the slots whether or not the last was synced; with a timed mark sync, A held counter c, synced, and B c − 1; c + 1 went to B and c + 2 to A, neither synced, and a power loss that tore the write of c + 2 left A invalid and B at c − 1, older than the mark synced last. Rule 3 kept every complete batch, but the start took its id floor from that mark and the unsealed segments only, so an id defined after c − 1 in a batch then in a sealed segment was above the floor; the low floor was durable, in the recovery entry and in the new mark's highest series id, so ids would have been assigned again once roadmap 5.1 assigns above floors (`log/tests/recovery.rs`, `a_torn_mark_update_never_falls_back_past_the_last_synced_mark`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

@@ -13,7 +13,7 @@ use kvik_log::entries::{Entry, MarkState};
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
 use kvik_log::manifest::{LossCause, RECORD_LOST_RANGE, encode_record, read_manifest};
-use kvik_log::mark::{MarkSlot, read_mark};
+use kvik_log::mark::{MarkSlot, SLOT_LEN, SLOT_OFFSETS, read_mark};
 use kvik_log::name::SegmentName;
 use kvik_log::scan::{ScanLimit, Tail, scan};
 use kvik_log::store::{NewStore, StoreDir};
@@ -1125,19 +1125,29 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: ProptestConfig::default().cases / 8, ..ProptestConfig::default() })]
-
-    /// The kill loop: every acknowledged entry survives every crash; positions are never reused without a reset
-    /// point; each start keeps exactly the image's committed prefix and leaves a readable mark and a clean tail.
-    #[test]
-    fn kill_loop_keeps_every_acknowledged_entry(
-        cycles in prop::collection::vec(cycle(), 1..8),
-        every in any::<bool>(),
-        small in any::<bool>(),
-    ) {
-        kill_loop(&cycles, every, small);
-    }
+/// The kill loop: every acknowledged entry survives every crash; positions are never reused without a reset point;
+/// each start keeps exactly the image's committed prefix and leaves a readable mark and a clean tail. It runs an
+/// eighth of the configured cases, each a whole loop: through a runner of its own, since `proptest!` would set the
+/// cases from `PROPTEST_CASES` again.
+#[test]
+fn kill_loop_keeps_every_acknowledged_entry() {
+    let d = ProptestConfig::default();
+    proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: (d.cases / 8).max(1),
+        ..d
+    })
+    .run(
+        &(
+            prop::collection::vec(cycle(), 1..8),
+            any::<bool>(),
+            any::<bool>(),
+        ),
+        |(cycles, every, small)| {
+            kill_loop(&cycles, every, small);
+            Ok(())
+        },
+    )
+    .unwrap();
 }
 
 /// A long kill loop, for a local soak run: `cargo test --release -p kvik-log --test recovery -- --ignored`.
@@ -1499,14 +1509,12 @@ fn the_manifests_last_record_is_written_again_at_a_start() {
 }
 
 #[test]
-fn a_mark_read_from_the_page_cache_at_a_same_boot_start_is_synced_on_the_timer() {
+fn a_mark_read_from_the_page_cache_at_a_same_boot_start_is_synced_before_the_writer_resumes() {
     let mut r = rig_with_batches(2, cfg());
     let last = r.acked.len() as u64;
     r.kill();
     let rep = r.open().unwrap();
     assert_eq!(rep.rule, StartRule::SameBoot);
-    r.advance(Duration::from_secs(2));
-    r.step();
     let durable = read_mark(&r.fs.read_durable(&log_path("MARK")).unwrap(), &STORE_ID)
         .unwrap()
         .unwrap()
@@ -1953,5 +1961,144 @@ fn a_batch_beyond_the_mark_before_a_header_only_segment_is_a_reset() {
         "the entry opens the next segment"
     );
     assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+    r.check_started();
+}
+
+/// A definition entry of a gauge.
+fn definition(id: u32) -> Item {
+    use kvik_log::entries::{Definition, Kind, Retention, Timing, Versioning};
+    Item::Entry(Entry::Definition(Box::new(Definition {
+        id,
+        name: format!("s{id}"),
+        kind: Kind::Gauge,
+        value_type: kvik_log::facts::ValueType::F64,
+        scale: None,
+        unit: "u".into(),
+        expected_interval: None,
+        staleness: None,
+        record_on_change: false,
+        counter: None,
+        lateness_bound: 1_000_000_000,
+        state_names: vec![],
+        versioning: Versioning::None,
+        timing: Timing::Observed,
+        interval: None,
+        retention: Retention::LongTerm,
+        excess_precision: None,
+        staleness_set: false,
+    })))
+}
+
+/// Q-122: updates between two mark syncs go to the slot that does not hold the last synced mark, so a power loss that
+/// tears the last of two unsynced updates leaves the last synced mark, never an older one (`format.md` A.10 Update).
+/// Before, the second update overwrote the synced slot and the start fell back to the mark before it, with a lower
+/// highest series id, which the recovery entry's id floor and the new mark then kept.
+#[test]
+fn a_torn_mark_update_never_falls_back_past_the_last_synced_mark() {
+    let mut r = Rig::new(cfg());
+    // Each definition forces a mark sync: both slots then hold synced marks, the later one naming series 2.
+    r.submit(vec![definition(1)]);
+    r.drain();
+    r.submit(vec![definition(2)]);
+    r.drain();
+    let mark_file = log_path("MARK");
+    let synced = read_mark(&r.fs.read_durable(&mark_file).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(synced.max_series_id, 2);
+    // Two updates the timer has not synced yet.
+    r.submit(vec![fact(1, 1)]);
+    r.drain();
+    r.submit(vec![fact(1, 2)]);
+    r.drain();
+    let current = r.fs.read(&mark_file).unwrap();
+    let last = read_mark(&current, &STORE_ID).unwrap().unwrap();
+    assert_eq!(
+        last.1.counter,
+        synced.counter + 2,
+        "both updates are unsynced"
+    );
+    // A power loss tears the last update: half of its slot reaches the disk.
+    r.w = None;
+    r.fs.power_loss();
+    let at = SLOT_OFFSETS[last.0];
+    r.fs.poke(&mark_file, at, &current[at..at + SLOT_LEN / 2]);
+    r.fs.restart();
+    r.boot += 1;
+    let found = read_mark(&r.fs.read(&mark_file).unwrap(), &STORE_ID)
+        .unwrap()
+        .expect("the other slot is valid")
+        .1;
+    assert_eq!(found, synced, "the last synced mark");
+    let rep = r.open().unwrap();
+    let entry = rep.entry.expect("a recovery entry");
+    assert_eq!(entry.entry.mark_state, MarkState::Readable);
+    assert!(entry.entry.id_floor >= synced.max_series_id);
+    r.check_started();
+}
+
+/// Q-116 (p), as implemented: a timed seal takes the segment created ahead into use and the sync of its header fails;
+/// the start on the same boot resumes in that segment from the header in the page cache without writing it again. A
+/// batch there whose sync also fails, torn by a power loss, lies in a segment whose header on disk reads unused: the
+/// next start deletes it with the torn bytes and reports no loss.
+#[test]
+fn a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_start() {
+    let mut r = Rig::new(WriterConfig {
+        seal_interval: Duration::from_secs(1),
+        ..cfg()
+    });
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    let open = r.w().stats().open_file_id.unwrap();
+    let ahead =
+        r.fs.paths()
+            .into_iter()
+            .filter_map(|p| SegmentName::parse(p.file_name()?.to_str()?))
+            .find(|n| !n.sealed && n.file_id > open)
+            .expect("a segment created ahead");
+    let path = log_path(&ahead.to_string());
+    let base = |b: Option<Vec<u8>>| {
+        kvik_log::header::FileHeader::decode(&b.unwrap())
+            .unwrap()
+            .base_sequence
+    };
+    // The timed seal: the header write that takes the segment into use is not synced.
+    r.fs.fail_nth(FaultOp::Sync, &ahead.to_string(), 0, io::ErrorKind::Other);
+    r.advance(Duration::from_secs(2));
+    r.step();
+    assert!(r.w().fault().is_some());
+    r.kill();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    assert!(rep.entry.is_none());
+    assert_eq!(r.w().stats().open_file_id, Some(ahead.file_id));
+    assert_eq!(base(r.fs.read(&path)), 2);
+    assert_eq!(
+        base(r.fs.read_durable(&path)),
+        0,
+        "the header is not written again"
+    );
+    // A batch in it whose sync fails too, then a power loss that keeps part of it.
+    r.fs.fail_nth(FaultOp::Sync, &ahead.to_string(), 0, io::ErrorKind::Other);
+    r.submit(vec![fact(1, 1)]);
+    r.drain();
+    assert!(r.w().fault().is_some());
+    assert!(r.acked.len() == 1);
+    let bytes = r.fs.read(&path).unwrap();
+    r.w = None;
+    r.fs.power_loss();
+    r.fs.poke(&path, 64, &bytes[64..64 + 48]);
+    r.fs.restart();
+    r.boot += 1;
+    let rep = r.open().unwrap();
+    assert!(matches!(rep.rule, StartRule::Reboot(_)));
+    assert_eq!(
+        rep.deleted,
+        vec![ahead.file_id],
+        "deleted as unused, with the torn bytes"
+    );
+    assert!(rep.losses.is_empty(), "no loss reported: {rep:?}");
+    assert_eq!(rep.entry.unwrap().entry.tail_bytes, 0);
     r.check_started();
 }

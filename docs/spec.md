@@ -271,7 +271,8 @@ A.10) is treated as a different boot. The rules apply in this order:
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.
 1. Sync the log directory. Read the manifest (§7) and the mark; scan every unsealed segment to its end.
 2. Rule 1: truncate after the mark, unless a complete batch lies beyond it; sync every segment holding a lost range
-   found (rule 2) and the directory, with step 3's rule for a failed sync; go to step 4. A complete batch beyond the
+   found (rule 2) and the directory, with step 3's rule for a failed sync; unless step 6 writes the mark, sync the
+   mark file, which may hold an update not yet on stable storage (`format.md` A.10 Update); go to step 4. A complete batch beyond the
    mark is left in place here: step 5 writes the recovery entry over it, or adopts the entry an earlier start wrote
    there (written again in place first, as in step 3), and only then zeroes the rest, so a start that stops before
    the entry is on disk leaves the batch for the next start to find. When the entry does not fit after the mark, it

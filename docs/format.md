@@ -388,14 +388,17 @@ exists; a new file is created only when none exists.
 | 124 | 4 | `crc32c` | over bytes 0..124 of the slot |
 
 - **Update.** After the batch's sync has returned, the writer writes the whole slot, with one positional write, to
-  the slot that does not hold the highest valid `counter`. The writer writes the next batch only after that update
-  (`spec.md` §3 Recovery rule 1).
+  the slot that does not hold the last synced mark; until the mark file is next synced, every later update goes to
+  the same slot, replacing the unsynced one before it, so a torn update falls back no further than the last synced
+  mark (Q-122). A start that keeps a mark read on the same boot (`spec.md` §3 Recovery rule 1) cannot tell which slot
+  was last synced, and syncs the mark file before its first update. The writer writes the next batch only after that
+  update (`spec.md` §3 Recovery rule 1).
 - **Reset stamp.** Bytes 84..100 were reserved in version 3 and are read as zero in a slot that predates them, so
   the version is unchanged. A zero `reset_nonce` is no stamp, whatever `reset_sequence` holds. A start that writes or
   adopts a recovery entry writes the entry's stamp into the mark; a restore
   writes its restore record's; every other update carries the stamp unchanged.
 - **Read.** Read both slots; the mark is the valid slot (magic, known version, checksum, store id) with the higher
-  `counter`; a checksum-valid slot of unknown version is refused as above, never treated as invalid. One slot is always stable, so a torn or concurrent write costs at most one update of staleness. If
+  `counter`; a checksum-valid slot of unknown version is refused as above, never treated as invalid. One slot always holds the last synced mark, so a torn or concurrent write falls back no further than it. If
   neither slot is valid, a reader retries (8 times, then `MarkUnreadable`); for recovery the mark is unreadable. After
   a power loss the older slot is still a valid mark of any boot for `spec.md` §3 Recovery rule 2.
 - **Boot identity.** Linux: `/proc/sys/kernel/random/boot_id` (a file read). macOS: `kern.bootsessionuuid`, through

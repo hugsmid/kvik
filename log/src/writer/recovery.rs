@@ -1386,7 +1386,7 @@ pub(super) fn start(
             Ok(f) => Some(f),
             Err(e) => return ro(fault(FaultOp::MarkWrite, &mark_path, &e), report),
         };
-        // The mark read on this boot may not be on stable storage yet: the timer syncs it.
+        // The mark read on this boot may not be on stable storage yet: the writer syncs it before it resumes (A.10).
         mark_dirty = true;
         id_floor = id_floor.max(slot.max_series_id);
     }
