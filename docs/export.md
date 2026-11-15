@@ -21,8 +21,9 @@ aside by a restore (`export_set_aside`) stay separate calls that return facts fo
 | `row_group_rows` | 131,072 | most rows in a row group |
 | `batch_rows` | 8,192 | rows gathered before they are handed to the writer |
 
-The writer holds the open row group in memory, so memory is bounded by `row_group_rows` plus one batch, whatever
-the number of facts. Rows are written in the order `Reader::facts` returns them.
+The writer holds the open row group in memory, so the exporter's memory is bounded by `row_group_rows` plus one
+batch, whatever the number of facts. The bound holds end to end once `Reader::facts` streams block by block (`api.md`
+Reading); today both backends gather the range before the first fact is returned. Rows are written in the order `Reader::facts` returns them.
 
 ## File layout (Q-196)
 
