@@ -274,7 +274,14 @@ A.10) is treated as a different boot. The rules apply in this order:
    found (rule 2) and the directory, with step 3's rule for a failed sync; go to step 4. A complete batch beyond the
    mark is left in place here: step 5 writes the recovery entry over it, or adopts the entry an earlier start wrote
    there (written again in place first, as in step 3), and only then zeroes the rest, so a start that stops before
-   the entry is on disk leaves the batch for the next start to find.
+   the entry is on disk leaves the batch for the next start to find. When the entry does not fit after the mark, it
+   goes to a new segment, and the batch, in the mark's segment, is zeroed after it. A start that stopped between the
+   two leaves a recovery entry, first in a later segment, whose `after` is below the batches kept before it: those
+   batches are dropped, zeroed once the entry is adopted, and the entry stands (the stale mark this shows makes it
+   rule 3, with Adoption). The mark's segment is truncated, though not the last in use, when it holds a complete
+   batch beyond the mark and every later segment in use holds only its header (a batch beyond the mark rules out
+   seal blocks there); and a segment's header is rewritten with F only after the entry is written in it, so no stop
+   leaves a later segment in use by its header alone.
 3. With the mark missing, unreadable or stale, or a recovery entry adopted, first write the last complete batch again
    in place, with its segment's header when it is the segment's first (Recovery rule 3). Sync the kept segments and the directory. If that sync fails the engine stays read-only, leaves the old mark and
    the manifest as they are and writes nothing more; what it found is reported in health as found and recorded by the
@@ -287,8 +294,10 @@ A.10) is treated as a different boot. The rules apply in this order:
    was first reported, so a loss reported before any record holds it can be acknowledged at once, and the record,
    when written, carries that identity. Sync the
    manifest.
-5. Rule 3, or rule 1 with a complete batch beyond the mark: write or adopt the recovery entry and sync; zero the rest
-   of the torn tail, or of the bytes after the mark, and sync.
+5. Rule 3, or rule 1 with a complete batch beyond the mark: write or adopt the recovery entry (in the open segment,
+   or first in a new segment when it does not fit, its header written after it) and sync; zero the rest of the torn
+   tail, or the bytes after the mark in whichever segment holds them, and batches a stopped reset's entry dropped
+   (step 2), and sync.
 6. Rule 3, or rule 1 with a complete batch beyond the mark: write the mark (current boot id, last position F, highest
    series id assigned, the entry's reset stamp) and sync the
    mark file and the directory. An existing mark file is updated in place, whatever its content (except a slot of unknown version,

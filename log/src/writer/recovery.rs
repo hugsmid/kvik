@@ -285,6 +285,9 @@ struct Plan {
     /// Rule 1 truncates a complete batch: a recovery entry is written as under rule 3, a reset point
     /// (`spec.md` §3 Recovery rule 1).
     reset: bool,
+    /// Batches superseded by a recovery entry in a later segment whose `after` is below them: a reset that wrote its
+    /// entry in a new segment and stopped before zeroing them. They are zeroed once the entry is on disk.
+    superseded: Vec<(usize, usize)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -365,8 +368,27 @@ fn plan(
                 // Truncate everything after the mark: in the mark's segment from its offset, in every later segment
                 // in use from the header's end.
                 // A segment that is not the last in use holds no batch beyond a current mark, and may hold seal
-                // blocks, which are never truncated (A.4).
-                for &i in in_use.iter().filter(|&&i| Some(i) == last_in_use) {
+                // blocks, which are never truncated (A.4). One exception: the mark's segment holds a complete batch
+                // beyond the mark and every later segment in use holds only its header, as a start leaves that took
+                // the next segment into use for its recovery entry and stopped before writing it. A batch beyond the
+                // mark rules out seal blocks there (the mark passes every batch of a segment before its seal).
+                let only_headers_after = |i: usize| {
+                    in_use
+                        .iter()
+                        .filter(|&&j| segs[j].id.file_id > segs[i].id.file_id)
+                        .all(|&j| segs[j].batches.is_empty())
+                };
+                let targets: Vec<usize> = in_use
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        Some(i) == last_in_use
+                            || (segs[i].id.file_id == slot.file_id
+                                && segs[i].batches.iter().any(|b| beyond(i, b))
+                                && only_headers_after(i))
+                    })
+                    .collect();
+                for i in targets {
                     let s = &segs[i];
                     if s.id.file_id < slot.file_id {
                         continue;
@@ -409,6 +431,8 @@ fn plan(
     let mut expect: Option<u64> = sealed_last.map(|(_, l, _)| l + 1);
     let mut prev: Option<(usize, u64, i64)> = None;
     let mut last_kept: Option<(usize, usize)> = None;
+    let mut kept_order: Vec<(usize, usize, u64)> = Vec::new();
+    let mut superseded: Vec<(usize, usize)> = Vec::new();
     for &i in &chain {
         let s = &segs[i];
         let mut e = expect.or(s.base()).unwrap_or(1);
@@ -436,6 +460,29 @@ fn plan(
                 _ => HEADER_LEN as u64,
             };
             let times = (prev.map(|p| p.2), Some(b.commit_time));
+            // A recovery entry, first in its segment, whose `after` is below the batches kept before it: a reset
+            // that wrote its entry in a new segment and stopped before zeroing what it truncated (`spec.md` §3
+            // Recovery rule 1). Those batches, each the last kept in its segment, are dropped.
+            if let Some(r) = b.recovery()
+                && j == 0
+                && r.after + 1 < e
+            {
+                let n = kept_order
+                    .iter()
+                    .rev()
+                    .take_while(|&&(pi, pj, plast)| {
+                        plast > r.after && pi != i && kept[pi] == pj + 1
+                    })
+                    .count();
+                let rest = &kept_order[..kept_order.len() - n];
+                if n > 0 && rest.last().is_none_or(|x| x.2 <= r.after) {
+                    for (pi, pj, _) in kept_order.drain(kept_order.len() - n..).rev() {
+                        kept[pi] = pj;
+                        superseded.push((pi, pj));
+                    }
+                    e = r.after + 1;
+                }
+            }
             let gap_to = match b.recovery() {
                 Some(r) => {
                     // Positions between K and F were recorded by the start that wrote the entry.
@@ -470,6 +517,7 @@ fn plan(
             e = b.last + 1;
             prev = Some((i, b.end, b.commit_time));
             last_kept = Some((i, j));
+            kept_order.push((i, j, b.last));
         }
         expect = Some(e);
     }
@@ -527,6 +575,7 @@ fn plan(
         write_offset,
         last_sequence: k,
         reset,
+        superseded,
     };
     if let StartRule::Reboot(state) = rule {
         // The torn tail of the last segment in use: from the write offset to the last non-zero byte.
@@ -578,16 +627,18 @@ fn plan(
         // The entry is written over the truncated bytes, and only then are the rest zeroed (steps 5 and 6), so a start
         // that stops before the entry is on disk leaves the batch for the next start to find. The zero-fill range,
         // in the segment the writer resumes in, is the tail the entry reports.
-        let tail = p.zero.iter().find(|z| Some(z.0) == resume_in).copied();
+        // Under rule 1 `tail` only counts: every zero-fill range of `zero` is the reported tail.
+        let total: u64 = p.zero.iter().map(|z| z.2 - z.1).sum();
+        let seg = p.zero.first().map(|z| z.0).or(resume_in);
         if let Some((i, j)) = adopt_beyond {
             let b = &segs[i].batches[j];
             p.adopt = Some((i, j));
             p.rewrite_last = Some((i, j));
             p.write_offset = b.end;
             p.last_sequence = b.first;
-            p.tail = tail.map(|(r, _, to)| (r, b.end, to.max(b.end), 0));
+            p.tail = seg.map(|r| (r, 0, total, 0));
         } else {
-            p.tail = tail.map(|(r, from, to)| (r, from, to, 1));
+            p.tail = seg.map(|r| (r, 0, total, 1));
             p.last_sequence = 1 + k.max(manifest_highest);
         }
     } else {
@@ -859,6 +910,38 @@ pub(super) fn start(
         Ok(())
     };
 
+    // Zero-fills `ranges` once a recovery entry is on disk, from past the entry in its own segment, and syncs each
+    // segment zeroed; returns the bytes zeroed.
+    let zero_after = |ranges: &[(usize, u64, u64)],
+                      entry_seg: Option<usize>,
+                      entry_end: u64|
+     -> Result<u64, (usize, io::Error)> {
+        let mut n = 0;
+        for &(i, from, to) in ranges {
+            let from = if Some(i) == entry_seg {
+                from.max(entry_end)
+            } else {
+                from
+            };
+            if to > from {
+                zero_fill(&*files[&i], from, to)
+                    .and_then(|()| files[&i].sync_data())
+                    .map_err(|e| (i, e))?;
+                n += to - from;
+            }
+        }
+        Ok(n)
+    };
+    // Batches superseded by an entry a stopped start wrote in a later segment (`Plan::superseded`).
+    let zero_superseded = || {
+        let ranges: Vec<(usize, u64, u64)> = p
+            .superseded
+            .iter()
+            .map(|&(i, j)| (i, segs[i].batches[j].offset, segs[i].batches[j].end))
+            .collect();
+        zero_after(&ranges, None, 0)
+    };
+
     match p.rule {
         StartRule::SameBoot => {
             // Step 2: truncate after the mark; sync the truncated segments, those holding a lost range, and the
@@ -956,6 +1039,16 @@ pub(super) fn start(
             id_floor = s.tail_ids.iter().copied().fold(id_floor, u32::max);
         }
     }
+    // A batch superseded by a stopped reset's entry may have been acknowledged too.
+    for &(i, j) in &p.superseded {
+        for item in &segs[i].batches[j].content.items {
+            match item {
+                Item::Fact(r) => id_floor = id_floor.max(r.series_id),
+                Item::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
+                _ => {}
+            }
+        }
+    }
     // A complete batch truncated by rule 1 may have been acknowledged: its ids stay assigned.
     if p.reset {
         for &i in &in_use_idx {
@@ -1049,7 +1142,12 @@ pub(super) fn start(
                 adopted: true,
             });
             write_offset = b.end;
-            if let Some((_, _, end, _)) = p.tail
+            if p.reset {
+                match zero_after(&p.zero, Some(i), b.end) {
+                    Ok(n) => report.truncated_bytes += n,
+                    Err((i, e)) => return ro(fault(FaultOp::Write, &segs[i].path, &e), report),
+                }
+            } else if let Some((_, _, end, _)) = p.tail
                 && end > b.end
             {
                 if let Err(e) =
@@ -1058,6 +1156,10 @@ pub(super) fn start(
                     return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
                 }
                 report.truncated_bytes += end - b.end;
+            }
+            match zero_superseded() {
+                Ok(n) => report.truncated_bytes += n,
+                Err((i, e)) => return ro(fault(FaultOp::Write, &segs[i].path, &e), report),
             }
         } else {
             let (tail_bytes, readable) = p.tail.map_or((0, 0), |(_, s, e, c)| (e - s, c));
@@ -1081,10 +1183,12 @@ pub(super) fn start(
             let builder: BatchBuilder = content.builder().expect("a recovery entry encodes");
             let need = builder.data_len() + 64;
             let fits = open_idx.is_some_and(|i| segs[i].len >= write_offset + need);
+            let mut header_after: Option<FileHeader> = None;
             // In a new segment when the open one is full, or when no segment is in use.
             let (file, id, at, path): (&dyn FsFile, SegmentIdentity, u64, PathBuf) = if fits {
                 let i = open_idx.expect("fits");
-                // The recovery batch as the segment's first batch: its header is rewritten with F (A.4).
+                // The recovery batch as the segment's first batch: its header is rewritten with F (A.4), after the
+                // entry, so that no stop leaves a segment in use by its header alone.
                 if p.kept[i] == 0 {
                     let mut h = FileHeader::new(
                         kind::LOG_SEGMENT,
@@ -1094,9 +1198,7 @@ pub(super) fn start(
                         store_id,
                     );
                     h.base_sequence = f_seq;
-                    if let Err(e) = files[&i].write_at(&h.encode(), 0) {
-                        return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
-                    }
+                    header_after = Some(h);
                 }
                 (&*files[&i], segs[i].id, write_offset, segs[i].path.clone())
             } else {
@@ -1135,9 +1237,7 @@ pub(super) fn start(
                     store_id,
                 );
                 h.base_sequence = f_seq;
-                if let Err(e) = a.file.write_at(&h.encode(), 0) {
-                    return ro(fault(FaultOp::Write, &a.path, &e), report);
-                }
+                header_after = Some(h);
                 new_open = Some((a.file, a.id, a.len, a.path));
                 let n = new_open.as_ref().expect("just set");
                 (&*n.0, n.1, HEADER_LEN as u64, n.3.clone())
@@ -1145,25 +1245,34 @@ pub(super) fn start(
             let bytes = builder
                 .encode(&id, at, commit_time)
                 .expect("a recovery batch encodes");
-            if let Err(e) = file.write_at(&bytes, at).and_then(|()| file.sync_data()) {
+            let r = file.write_at(&bytes, at).and_then(|()| match header_after {
+                Some(h) => file.write_at(&h.encode(), 0),
+                None => Ok(()),
+            });
+            if let Err(e) = r.and_then(|()| file.sync_data()) {
                 return ro(fault(FaultOp::Sync, &path, &e), report);
             }
-            // The rest of the torn tail, or of the bytes rule 1 truncates, is zeroed after the entry is on disk.
-            if let Some((ti, ts, te, _)) = p.tail {
+            // The rest of the torn tail, or the bytes rule 1 truncates, are zeroed after the entry is on disk.
+            let entry_seg = if fits { open_idx } else { None };
+            if p.reset {
+                if let Err((i, e)) = zero_after(&p.zero, entry_seg, at + bytes.len() as u64) {
+                    return ro(fault(FaultOp::Write, &segs[i].path, &e), report);
+                }
+                // Every byte after the mark is truncated, those the entry covers included.
+                report.truncated_bytes += p.zero.iter().map(|z| z.2 - z.1).sum::<u64>();
+            } else if let Some((ti, ts, te, _)) = p.tail {
                 let from = if fits { at + bytes.len() as u64 } else { ts };
                 if te > from {
                     let r = zero_fill(&*files[&ti], from, te).and_then(|()| files[&ti].sync_data());
                     if let Err(e) = r {
                         return ro(fault(FaultOp::Write, &segs[ti].path, &e), report);
                     }
-                    if !p.reset {
-                        report.truncated_bytes += te - from;
-                    }
+                    report.truncated_bytes += te - from;
                 }
-                // Under rule 1 every byte after the mark is truncated, those the entry covers included.
-                if p.reset {
-                    report.truncated_bytes += te.saturating_sub(ts);
-                }
+            }
+            match zero_superseded() {
+                Ok(n) => report.truncated_bytes += n,
+                Err((i, e)) => return ro(fault(FaultOp::Write, &segs[i].path, &e), report),
             }
             write_offset = at + bytes.len() as u64;
             last_commit_time = commit_time;
