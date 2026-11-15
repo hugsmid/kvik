@@ -209,6 +209,10 @@ impl Columns {
     fn cell<'r>(&self, row: &'r ExportRow) -> Result<Cell<'r>, ExportError> {
         let position = row.position;
         let wrong = ExportError::WrongValue { position };
+        // `value` is null exactly when the fact has no value (`docs/export.md` Columns).
+        if matches!(row.value, Value::Absent) != row.flags.no_value {
+            return Err(ExportError::NoValueMismatch { position });
+        }
         Ok(match (&self.value, &row.value) {
             (_, Value::Absent) => Cell::Null,
             (ValueColumn::F64(_), Value::F64(x)) => Cell::F64(*x),

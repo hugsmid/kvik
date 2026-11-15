@@ -883,7 +883,8 @@ uses it; decimal series are not stored by either backend yet, and the tests use 
 `stored_scale` (numeric in every tool, lossless). Alternatives: `units` (`INT64`) and `scale` (`INT(8, false)`)
 columns, lossless but not directly numeric; or `DECIMAL(38, 18)` for every decimal series, numeric and lossless
 without knowing the scale in force, but showing 18 places. (b) `SeriesInfo` (or the export call) gains the scale in
-force when decimal series reach the durable backend.
+force when decimal series reach the durable backend. Until then (roadmap 6.4b) the export refuses a series whose
+stored scale exceeds the definition's (`ScaleAboveExport`), rather than taking the raised scale.
 
 ## Q-193 — Fact flags as boolean columns or a bitfield
 

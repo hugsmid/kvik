@@ -55,6 +55,9 @@ pub use schema::{
 /// The zstd level of every column (`docs/export.md` File layout, Q-196).
 pub const ZSTD_LEVEL: i32 = 1;
 
+/// The most rows [`ExportOptions::batch_rows`] may ask for; the batch's builders are allocated up front.
+pub const MAX_BATCH_ROWS: usize = 1 << 20;
+
 /// How an export reads and writes (`docs/export.md` Options).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -65,7 +68,7 @@ pub struct ExportOptions {
     pub range: TimeRange,
     /// Most rows in a row group: the bound on the writer's memory. Default 131,072.
     pub row_group_rows: usize,
-    /// Rows buffered before they are handed to the writer. Default 8,192.
+    /// Rows buffered before they are handed to the writer, 1 to [`MAX_BATCH_ROWS`]. Default 8,192.
     pub batch_rows: usize,
 }
 
@@ -106,9 +109,14 @@ impl ExportOptions {
     }
 
     fn metadata(&self) -> Result<Vec<(String, String)>, ExportError> {
-        if self.row_group_rows == 0 || self.batch_rows == 0 {
+        if self.row_group_rows == 0 {
             return Err(ExportError::InvalidOptions {
-                reason: "row_group_rows and batch_rows must be at least 1",
+                reason: "row_group_rows must be at least 1",
+            });
+        }
+        if !(1..=MAX_BATCH_ROWS).contains(&self.batch_rows) {
+            return Err(ExportError::InvalidOptions {
+                reason: "batch_rows must be 1 to MAX_BATCH_ROWS",
             });
         }
         let view = match self.view {
@@ -147,6 +155,7 @@ pub fn export_series<W: Write + Send>(
     options: &ExportOptions,
     out: W,
 ) -> Result<ExportSummary, ExportError> {
+    options.metadata()?;
     let series = SeriesSchema::from_info(&reader.series(id)?)?;
     let facts = reader.facts(id, options.range, options.view)?;
     export_rows(

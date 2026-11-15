@@ -6,8 +6,8 @@ mod common;
 use common::{at, bits, export_to_vec, f64_series, open, read_back, row};
 use kvik::{Position, Quality, SeriesId, Value, View};
 use kvik_export::{
-    ChangedAt, ExportError, ExportOptions, ExportRow, Flags, KindName, SeriesSchema, ValueKind,
-    column, export_rows,
+    ChangedAt, ExportError, ExportOptions, ExportRow, Flags, KindName, MAX_BATCH_ROWS,
+    SeriesSchema, ValueKind, column, export_rows, read_rows,
 };
 use parquet::basic::{LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use proptest::prelude::*;
@@ -91,23 +91,104 @@ fn a_decimal_beyond_nineteen_digits_after_rescaling_is_an_error() {
     );
 }
 
+/// A row whose only flags are `flags`, without a value exactly when `no_value` is among them.
+fn flagged(secs: i64, flags: [bool; 7]) -> ExportRow {
+    let flags = Flags::from_array(flags);
+    let value = if flags.no_value {
+        Value::Absent
+    } else {
+        Value::F64(secs as f64)
+    };
+    ExportRow {
+        flags,
+        ..row(1, secs, secs as u64 + 1, value)
+    }
+}
+
+/// Rows 0 to 6 each set one flag, in `column::FLAGS` order; row 7 sets all, row 8 none.
+fn flag_rows() -> Vec<ExportRow> {
+    let mut rows: Vec<ExportRow> = (0..7)
+        .map(|i| {
+            let mut a = [false; 7];
+            a[i] = true;
+            flagged(i as i64, a)
+        })
+        .collect();
+    rows.push(flagged(7, [true; 7]));
+    rows.push(flagged(8, [false; 7]));
+    rows
+}
+
 #[test]
 fn every_flag_round_trips_alone_and_together() {
-    let series = f64_series(1);
-    let mut rows = Vec::new();
-    for i in 0..7 {
-        let mut a = [false; 7];
-        a[i] = true;
-        let mut r = row(1, i as i64, i as u64 + 1, Value::F64(i as f64));
-        r.flags = Flags::from_array(a);
+    let rows = flag_rows();
+    let file = export_to_vec(&f64_series(1), &rows, &ExportOptions::default()).unwrap();
+    assert_eq!(read_back(&file), rows);
+}
+
+type SetFlag = fn(&mut Flags);
+
+#[test]
+fn each_flag_lands_in_the_column_of_its_name() {
+    let mut rows: Vec<ExportRow> = Vec::new();
+    let named: [(&str, SetFlag); 7] = [
+        ("future", |f| f.future = true),
+        ("late", |f| f.late = true),
+        ("revise", |f| f.revise = true),
+        ("host_time", |f| f.host_time = true),
+        ("unsynced_clock", |f| f.unsynced_clock = true),
+        ("no_value", |f| f.no_value = true),
+        ("rounded", |f| f.rounded = true),
+    ];
+    for (i, (_, set)) in named.iter().enumerate() {
+        let mut r = row(1, i as i64, i as u64 + 1, Value::F64(1.0));
+        set(&mut r.flags);
+        if r.flags.no_value {
+            r.value = Value::Absent;
+        }
         rows.push(r);
     }
-    let mut all = row(1, 7, 8, Value::F64(7.0));
-    all.flags = Flags::from_array([true; 7]);
-    rows.push(all);
-    rows.push(row(1, 8, 9, Value::F64(8.0)));
-    let file = export_to_vec(&series, &rows, &ExportOptions::default()).unwrap();
-    assert_eq!(read_back(&file), rows);
+    let file = export_to_vec(&f64_series(1), &rows, &ExportOptions::default()).unwrap();
+    for (i, (name, _)) in named.iter().enumerate() {
+        let expected: Vec<bool> = (0..named.len()).map(|j| j == i).collect();
+        assert_eq!(column_bools(&file, name), expected, "{name}");
+    }
+}
+
+#[test]
+fn quality_columns_hold_the_documented_strings() {
+    let qualities = [
+        (Quality::Good, "good"),
+        (Quality::Estimated, "estimated"),
+        (Quality::Suspect, "suspect"),
+        (Quality::Bad, "bad"),
+    ];
+    let rows: Vec<ExportRow> = qualities
+        .iter()
+        .enumerate()
+        .map(|(i, (q, _))| ExportRow {
+            quality: *q,
+            supplied_quality: qualities[3 - i].0,
+            ..row(1, i as i64, i as u64 + 1, Value::F64(1.0))
+        })
+        .collect();
+    let file = export_to_vec(&f64_series(1), &rows, &ExportOptions::default()).unwrap();
+    let names: Vec<&str> = qualities.iter().map(|(_, n)| *n).collect();
+    let reversed: Vec<&str> = names.iter().rev().copied().collect();
+    assert_eq!(column_strings(&file, column::QUALITY), names);
+    assert_eq!(column_strings(&file, column::SUPPLIED_QUALITY), reversed);
+}
+
+#[test]
+fn a_value_against_its_no_value_flag_is_an_error_not_a_null() {
+    let mut absent = row(1, 0, 1, Value::Absent);
+    absent.flags.no_value = false;
+    let mut present = row(1, 0, 1, Value::F64(1.0));
+    present.flags.no_value = true;
+    for r in [absent, present] {
+        let err = export_to_vec(&f64_series(1), &[r], &ExportOptions::default()).unwrap_err();
+        assert!(matches!(err, ExportError::NoValueMismatch { .. }), "{err}");
+    }
 }
 
 #[test]
@@ -227,7 +308,6 @@ fn every_column_chunk_is_zstd_compressed() {
             c.column_path()
         );
     }
-    assert_eq!(kvik_export::ZSTD_LEVEL, 1);
 }
 
 #[test]
@@ -251,7 +331,8 @@ fn a_named_state_is_an_unsigned_16_bit_index_with_its_name() {
         kind: KindName::State,
         ..f64_series(1)
     };
-    let rows = [row(1, 0, 1, Value::State(1)), row(1, 1, 2, Value::Absent)];
+    let mut rows = [row(1, 0, 1, Value::State(1)), row(1, 1, 2, Value::Absent)];
+    rows[1].flags.no_value = true;
     let file = export_to_vec(&series, &rows, &ExportOptions::default()).unwrap();
     assert_eq!(read_back(&file), rows);
     let c = parquet_columns(&file);
@@ -384,10 +465,12 @@ fn an_interval_end_past_the_timestamp_range_is_an_error() {
 }
 
 #[test]
-fn zero_rows_per_group_or_batch_is_refused() {
+fn zero_or_unbounded_rows_per_group_or_batch_is_refused() {
     for options in [
         ExportOptions::default().row_group_rows(0),
         ExportOptions::default().batch_rows(0),
+        ExportOptions::default().batch_rows(MAX_BATCH_ROWS + 1),
+        ExportOptions::default().batch_rows(usize::MAX),
     ] {
         let err = export_to_vec(&f64_series(1), &[], &options).unwrap_err();
         assert!(matches!(err, ExportError::InvalidOptions { .. }), "{err}");
@@ -395,13 +478,19 @@ fn zero_rows_per_group_or_batch_is_refused() {
 }
 
 #[test]
-fn a_read_error_stops_the_export() {
+fn a_read_error_stops_the_export_and_leaves_a_file_without_a_footer() {
     let rows = [
         Ok(row(1, 0, 1, Value::F64(1.0))),
+        Ok(row(1, 1, 2, Value::F64(2.0))),
         Err(ExportError::Query(kvik::QueryError::UnknownSeries)),
     ];
-    let err = export_rows(&f64_series(1), rows, &ExportOptions::default(), Vec::new()).unwrap_err();
+    let options = ExportOptions::default().row_group_rows(1).batch_rows(1);
+    let mut out = Vec::new();
+    let err = export_rows(&f64_series(1), rows, &options, &mut out).unwrap_err();
     assert!(matches!(err, ExportError::Query(_)), "{err}");
+    assert!(out.len() > 4, "a row group was written before the error");
+    assert!(!out.ends_with(b"PAR1"));
+    assert!(read_rows(bytes::Bytes::from(out)).is_err());
 }
 
 fn quality() -> impl Strategy<Value = Quality> {
@@ -423,16 +512,20 @@ fn arb_row(value: BoxedStrategy<Value>) -> impl Strategy<Value = ExportRow> {
         quality(),
         any::<[bool; 7]>(),
     )
-        .prop_map(|(t, (g, s), rx, value, q, sq, f)| ExportRow {
-            series: SeriesId(1),
-            t: kvik::Timestamp(t),
-            position: Position::new(g, s),
-            received_at: kvik::Timestamp(rx),
-            value,
-            quality: q,
-            supplied_quality: sq,
-            flags: Flags::from_array(f),
-            changed_at: None,
+        .prop_map(|(t, (g, s), rx, value, q, sq, f)| {
+            let mut flags = Flags::from_array(f);
+            flags.no_value = matches!(value, Value::Absent);
+            ExportRow {
+                series: SeriesId(1),
+                t: kvik::Timestamp(t),
+                position: Position::new(g, s),
+                received_at: kvik::Timestamp(rx),
+                value,
+                quality: q,
+                supplied_quality: sq,
+                flags,
+                changed_at: None,
+            }
         })
 }
 
@@ -521,6 +614,45 @@ fn parquet_columns(
                 c.name().to_string(),
                 (c.logical_type_ref().cloned(), c.physical_type()),
             )
+        })
+        .collect()
+}
+
+fn batches(file: &[u8]) -> Vec<arrow_array::RecordBatch> {
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(file),
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// A boolean column by name, from the Parquet file itself.
+fn column_bools(file: &[u8], name: &str) -> Vec<bool> {
+    use arrow_array::cast::AsArray;
+    batches(file)
+        .iter()
+        .flat_map(|b| {
+            let c = b.column_by_name(name).unwrap().as_boolean();
+            (0..c.len()).map(|i| c.value(i)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A non-null string column by name, from the Parquet file itself.
+fn column_strings(file: &[u8], name: &str) -> Vec<String> {
+    use arrow_array::cast::AsArray;
+    batches(file)
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name(name)
+                .unwrap()
+                .as_string::<i32>()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect::<Vec<_>>()
         })
         .collect()
 }

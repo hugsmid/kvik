@@ -43,6 +43,12 @@ pub enum ExportError {
         /// The fact's position.
         position: Position,
     },
+    /// A fact with a value and the `no_value` flag, or without a value and without the flag (spec §2.5).
+    #[error("fact at {position}: value present or absent against its no_value flag")]
+    NoValueMismatch {
+        /// The fact's position.
+        position: Position,
+    },
     /// A decimal fact is stored at a higher scale than the file's decimal column (Q-192).
     #[error("fact at {position}: stored scale {stored} above the export scale {export}")]
     ScaleAboveExport {

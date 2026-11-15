@@ -332,7 +332,7 @@ fn an_empty_series_exports_a_file_with_its_schema_and_no_rows() {
 }
 
 #[test]
-fn an_unknown_series_is_a_query_error() {
+fn an_unknown_series_is_a_query_error_after_the_options_are_checked() {
     let (store, _clock) = store_on(Backend::Durable, "unknown");
     let err = export_series(
         &store.reader(),
@@ -342,6 +342,17 @@ fn an_unknown_series_is_a_query_error() {
     )
     .unwrap_err();
     assert!(matches!(err, kvik_export::ExportError::Query(_)), "{err}");
+    let err = export_series(
+        &store.reader(),
+        SeriesId(42),
+        &ExportOptions::default().batch_rows(usize::MAX),
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ExportError::InvalidOptions { .. }),
+        "options are checked before the read: {err}"
+    );
     block_on(store.shutdown()).unwrap();
 }
 

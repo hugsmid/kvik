@@ -19,7 +19,7 @@ aside by a restore (`export_set_aside`) stay separate calls that return facts fo
 | `view` | `Current` (Q-191) | `Current`, `AsOf(P)`, `AsOfTime(T)` or `History` |
 | `range` | every `t` below `i64::MAX` | half-open range of event time |
 | `row_group_rows` | 131,072 | most rows in a row group |
-| `batch_rows` | 8,192 | rows gathered before they are handed to the writer |
+| `batch_rows` | 8,192 | rows gathered before they are handed to the writer; 1 to `MAX_BATCH_ROWS` (1,048,576) |
 
 The writer holds the open row group in memory, so the exporter's memory is bounded by `row_group_rows` plus one
 batch, whatever the number of facts. The bound holds end to end once `Reader::facts` streams block by block (`api.md`
@@ -59,7 +59,7 @@ would remove it at some cost in size; every common Parquet reader reads all thre
 | Value type (`spec.md` §2.1) | `value` column |
 |---|---|
 | `f64` | `DOUBLE`, bit for bit (`-0.0` is kept) |
-| decimal | `FIXED_LEN_BYTE_ARRAY(9)`, `DECIMAL(19, s)`, `s` the series' scale; each value rescaled exactly from its stored scale, which `stored_scale` keeps, so the fact's units and scale come back unchanged (Q-192) |
+| decimal | `FIXED_LEN_BYTE_ARRAY(9)`, `DECIMAL(19, s)`, `s` the series' scale; each value rescaled exactly from its stored scale, which `stored_scale` keeps, so the fact's units and scale come back unchanged (Q-192). Until 6.4b `s` is the definition's scale, so a series raised after definition is refused (`ScaleAboveExport`) once a fact is stored above it |
 | boolean state | `BOOLEAN` |
 | named state | `INT32`, `INT(16, false)`: the index into the declared names, with `state_name` beside it |
 | text | `BYTE_ARRAY`, `STRING` |
@@ -72,7 +72,9 @@ Caveats:
   nanosecond timestamps only as microseconds or as plain `INT64`, and some read `UINT_64` as signed, so a `sequence`
   or a `changed_at` of kind `version` above `i64::MAX` shows negative there.
 - (Q-192) The decimal column's type follows the series' scale, so a raise changes it: files exported before and
-  after a raise have `DECIMAL(19, 2)` and `DECIMAL(19, 4)`, say, and may not concatenate without a cast.
+  after a raise have `DECIMAL(19, 2)` and `DECIMAL(19, 4)`, say, and may not concatenate without a cast. Until 6.4b
+  the exporter knows only the definition's scale (`SeriesInfo`), so it refuses a series with a fact stored above it
+  rather than taking the raised scale. Neither backend stores decimal series yet, so this cannot happen today.
 
 ## Metadata
 
@@ -94,8 +96,10 @@ File key-value metadata, every value a string:
 ## Errors
 
 An export never writes a null or a rounded value in place of a fact it cannot represent; it fails, and its output
-is incomplete. It fails on: a value that does not match the series' value type, or a state index beyond the
-declared names; a decimal stored above the column's scale, or beyond 19 digits after rescaling; `changed_at` missing
-on a versioned series or present on another; a `changed_at` of kind `time` above `i64::MAX` (Q-195); an interval
-end beyond the timestamp range; a fact of another series; a series kind the schema does not cover, or a decimal
-scale above 18 (`UnsupportedSeries`).
+is incomplete: it has no Parquet footer, and `read_rows` refuses it. Options are checked before anything is read. It
+fails on: a value that does not match the series' value type, or a state index beyond the declared names; a value
+present with the `no_value` flag, or absent without it (`NoValueMismatch`; facts from either backend never do this,
+so only rows given to `export_rows` can); a decimal stored above the column's scale, or beyond 19 digits after
+rescaling; `changed_at` missing on a versioned series or present on another; a `changed_at` of kind `time` above
+`i64::MAX` (Q-195); an interval end beyond the timestamp range; a fact of another series; a series kind the schema
+does not cover, or a decimal scale above 18 (`UnsupportedSeries`).
