@@ -582,7 +582,7 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   the next start. The rebuild record is acknowledged by an acknowledgement record carrying the rebuild record's own
   epoch in field 2. The rebuilt manifest carries every valid record of the old one, and the rebuild reconstructs
   only what the corrupt record alone held (`spec.md` §7 Manifest); a restore record is never rebuilt. A rebuild record that no
-  acknowledgement record names is provisional at a start: the store holds uploads, evictions, removals and
+  acknowledgement record names is provisional at a start, also one that was final before it: the store holds uploads, evictions, removals and
   retirements, and refuses to append an acknowledgement of it, until the mirror path and deep have answered in that
   run for every corrupt span its field 7 names (`spec.md` §7 Deep unreachable); a copy is a valid record whose epoch
   lies strictly between the span's two epochs. Field 6 counts restated losses no

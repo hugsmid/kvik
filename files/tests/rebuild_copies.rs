@@ -421,6 +421,51 @@ fn q171_a_final_rebuild_not_yet_acknowledged_holds_again_after_a_restart() {
 }
 
 #[test]
+fn q171_a_final_unacknowledged_rebuild_restarted_with_deep_unreachable_is_provisional_until_deep_answers()
+ {
+    let (h, i) = lost_record_history();
+    let (bytes, _) = image_with_corrupt(&h, &[i]);
+    let fs = fs_with(&bytes);
+    let (app, p) = rebuild_manifest(
+        &fs,
+        &dir(),
+        STORE_ID,
+        state(&h),
+        &FakeVerifier::default(),
+        Finality::Final,
+        NOW,
+    )
+    .unwrap();
+    let e = p.rebuild_epoch;
+    assert_eq!(app.rebuild_state(), RebuildState::Final { epoch: e });
+    drop(app);
+    for _ in 0..2 {
+        let mut app = reopen(&fs);
+        let last = app.catalogue().last_epoch();
+        app.append(Body::Empty, NOW).unwrap();
+        let g = app.pending()[0];
+        assert_eq!(
+            resolve(&mut app, g, &Answer::HoldsNone, &Answer::Unreachable).unwrap(),
+            RebuildState::Provisional { epoch: e }
+        );
+        assert!(app.holds());
+        assert_eq!(app.irreversible(last), Err(Held::Provisional));
+        assert!(matches!(
+            app.acknowledge_rebuild(e, NOW),
+            Err(AcknowledgeError::NotFinal)
+        ));
+    }
+    let mut app = reopen(&fs);
+    let g = app.pending()[0];
+    assert_eq!(
+        resolve(&mut app, g, &Answer::HoldsNone, &Answer::HoldsNone).unwrap(),
+        RebuildState::Final { epoch: e }
+    );
+    assert!(!app.holds());
+    assert!(app.acknowledge_rebuild(e, NOW).unwrap());
+}
+
+#[test]
 fn q171_a_rebuild_of_two_corrupt_records_is_final_only_once_both_have_their_answers() {
     let h = closed(play(&[
         Step::Seal {
