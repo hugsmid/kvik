@@ -54,6 +54,7 @@ backup-envelope backup envelope
 backup-fuzz     backup fuzz_inputs
 backup-keys     backup keys
 backup-upload   backup upload_histories
+backup-plan     backup restore_plan
 '
 
 cd "$(dirname "$0")/.."

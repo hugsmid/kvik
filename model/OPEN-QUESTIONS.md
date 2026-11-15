@@ -23,7 +23,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-93 (b) and (c) | §5.7 tzdata version in force, §7 Readers | A release name standing for its rules; a writer that cannot write, and values other than calendar results in a reader of another release |
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
-| Q-108 | §8 Generations, §7 Manifest, §8 Restore step 1 | A restore from a rebuilt manifest only partly uploaded |
 | Q-110 | `format.md` A.2 Resynchronisation | The residual cost of resynchronising over nested batch images |
 | Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
 | Q-115 (e), (f), (j), (k), (n) | §3 Commit, Segments, Disk space, Back-pressure; `format.md` A.8, A.13 | The commit path: the points still open |
@@ -61,6 +60,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-283 | §8 Hashes, Bucket, Generations | The attach probe |
 | Q-284 | §8 Hashes, Upload stalled | Upload failures: retries, other content, an object not reported after its `put` |
 | Q-285 | §8 Continuous backup; `format.md` A.12 | Uploading files with no local layout yet, and the hash a file is checked by |
+| Q-291 | §8 Acknowledging a loss, Generations, Restore step 1 | Recovery-entry loss reports of the generation a restore reads |
 | Q-293 | §8 Generations; `format.md` A.2 sizes, A.14 `0x25` | A restore record larger than one block |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 
@@ -437,21 +437,6 @@ deliveries it has seen" on `resync` depends on which.
 middle is not examined. One `resync` delivery carries the state of every funnel in force (`engine::Resync`).
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
-
-## Q-108 — A restore from a rebuilt manifest only partly uploaded
-Recorded at the review of the Q-103 ruling. To be settled by roadmap item 8.3.
-**Scenario.** A manifest is rebuilt (§7 Manifest) and becomes final; its records are uploaded in epoch order under
-their new epochs: the rebuild record, the carried records, the restated records, the closing empty record. The
-records of the old manifest, before the rebuild, were all uploaded earlier. A disaster strikes after the rebuild
-record and some carried records are in the bucket, but before the rest. §8 Generations says a restore "starts at the
-last" rebuild record and does not read the records before it, so it restores from a truncated list: files named only
-by old records whose carried copies were not yet uploaded are missing from the restore, and their positions become a
-gap or a set-aside range although the bucket holds both the files and the records naming them.
-**Model.** Not modelled; manifest records are not corrupted.
-**Needed.** A rule for which records a restore reads. Suggested: a rebuilt manifest counts for a restore only once
-its closing record is in the bucket (records are uploaded in order, so it is then complete); until then the restore
-reads the records before its rebuild record, as if the rebuild had not happened, and the uploaded part of the
-rebuilt manifest is not read. To be settled with roadmap 8.3 (restore).
 
 ## Q-110 — The residual cost of resynchronising over nested batch images
 Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9.
@@ -1136,6 +1121,20 @@ roadmap 6.3b); a mismatch is `UploadError::LocalHash`.
 **Needed.** The local path of each kind, from the item that lays it out.
 **Model.** Not modelled.
 
+## Q-291 — Recovery-entry loss reports of the generation a restore reads
+Recorded by roadmap 8.3a. To be settled by roadmap 8.3d.
+**Scenario.** A restore record carries the recovery-entry loss reports of the generations it restores from, so a loss
+whose entry the restore sets aside stays listed (§8 Acknowledging a loss). A `possible_loss` (§3 Recovery rule 1) is
+held only by its recovery entry, inside a log segment, and the record is written before any file is downloaded
+(§8 Restore, Failures and end). A store restores generation 0 to `0:20`; the recovery entry at `0:25`, which reports
+a possible loss, is set aside. The plan, made from the records, carries only the reports of the record it read
+(`RestoreRecord::entry_losses`), so generation 1's record lists none, and with set-aside positions excluded nothing
+reports that loss.
+**Model.** Not modelled; the model writes no recovery entries.
+**Needed.** Where the source generation's reports come from. Suggested: read from the listed segments once step 1
+has installed them (set-aside ones included; they stay local) and reported at every start, as the set-aside range
+is; the record keeps carrying the earlier generations' reports.
+
 ## Q-293 — A restore record larger than one block
 Recorded by roadmap 8.3a, which laid out the restore record. To be settled by roadmap 8.3, before a store can list that many files.
 **Scenario.** A restore record lists every file it restores from (§8 Generations), and log segments are never
@@ -1235,7 +1234,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-93 (b) and (c) | 7.3 | Calendar; (a) settled at gate 3.3 by the owner |
 | Q-94 | 6.3b | Compaction order; recorded after the tag, from the review of the Q-71 ruling; with 6.3b, which publishes compaction outputs (6.3a lays out the records only) |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
-| Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2; owner decision pending on the trust-boundary wording |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3; owner decision pending on the call-limit wording in `api.md` |
 | Q-115 (e), (j), (n) | 4.9 | Gate; owner decisions pending: the `space()` seam, the Windows wording, and bounds on the ingest queue's bytes and on blocked seals |
@@ -1277,6 +1275,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-283 | 8.1 | Attach probe; decided by roadmap 8.1c under the owner's Q-162 ruling, accepted by the owner |
 | Q-284 | 8.1 | Upload failures; decided by roadmap 8.1c, (c) settled by the owner's Q-82 rule |
 | Q-285 | 6.2 | Local layout of kinds other than log segments; the upload driver fails on them until then |
+| Q-291 | Recovery-entry loss reports at a restore; recorded by roadmap 8.3a |
 | Q-293 | Restore record size; recorded by roadmap 8.3a |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 
@@ -1511,6 +1510,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-180 | Stored nodes keep sums, integrals and increases exact | `spec.md` §5.6, §6, invariants 6, 7, 21, 22; `format-tree.md` T.3 (settled at the review of roadmap 7.1a: exact, stored as dyadic numbers, folded with a dyadic accumulator; measurements in the question) |
 | Q-181 | Which zero is the minimum of +0.0 and −0.0 | `spec.md` §5.2, §5.6; `format-tree.md` T.5 (settled at the review of roadmap 7.1a: IEEE total order, −0.0 below +0.0) |
 | Q-182 | A state name declared twice | `spec.md` §2.1 `value type`; `format.md` A.6 field 13 (settled at the review of roadmap 7.1a: names are distinct, a definition repeating one is refused) |
+| Q-108 | A restore from a rebuilt manifest only partly uploaded | §8 Generations (settled by roadmap 8.3a, as the question suggested: a rebuilt manifest counts for a restore only once it is whole in the bucket, its closing empty record, the one without field 100, uploaded; the restore reads from the last such rebuild record up to the next rebuild record, and with none whole it reads the records before the first rebuild record that opens a rebuilt manifest, which the old manifest uploaded before it; records upload in epoch order, so a whole rebuilt manifest is self-contained). Scenario: a rebuild record and some carried records are in the bucket, the rest not; read from the rebuild record, a restore misses files named only by records not yet carried, and their positions become a gap or a set-aside range although the bucket holds the files and the records naming them. A rule keyed on the rebuild record alone reads that truncated list, and a restore could then end earlier with more records uploaded. The selection is `kvik_backup::plan::records_to_read`, which the restore driver applies before the fold (`backup/tests/restore_plan.rs` `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `q108_records_after_a_whole_rebuilt_manifest_are_read_with_it_and_a_later_partial_one_is_not`, `the_plan_is_monotone_in_the_records_uploaded`) |
+| Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, which the interfaces design asked to rule the general case, its flag F2). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`). The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The rule rests on the sealed-segment record being appended after the start that recorded the gaps (its timing is roadmap 6.3b's, `format.md` A.14); the hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `the_restored_end_is_the_one_the_spec_walks_to` |
+| Q-294 | What a restore plan lists, places and fetches | §8 Restore steps 1 and 3, Generations; `format.md` A.14 `0x25` (decided by roadmap 8.3a). Every live file with a verified copy in deep is listed, set-aside files included, and no other file. A listed file's tier is the one the source records give it, which is where the restore places it (step 3). The files fetched are every listed log segment (with no tree checkpoint, step 1 downloads the whole sealed log) and every other listed file placed on hot or cold, in ascending position. The restored log is scanned over log segments only: a compacted file holds only some positions of its range, and log segments are never retired by compaction (§7). When the source generation's sequence 1 is not held, the restored end is that of the restore record read, or `0:0` in generation 0. Positions of an earlier generation at or below a carried end that no copied segment or recorded loss holds fail the plan: `NotCopied` when a listed segment without a copy holds them, else `MissingBelowEnd`. Scenario: a store compacted some segments into a current file in deep and lost no segment; the plan fetches the segments, lists the compacted file and leaves it in deep. Tests: `backup/tests/restore_plan.rs` `a_listed_segment_with_no_copy_ends_the_restored_log_and_is_not_named`, `a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap`, `a_file_missing_at_or_below_a_carried_end_fails_the_plan`, `the_plan_names_every_copied_file_and_never_one_without_a_copy` |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
