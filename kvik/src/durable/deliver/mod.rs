@@ -458,10 +458,13 @@ impl Deliverer {
 
     fn void(&mut self, above: LogPos) {
         self.pending.retain(|b| b.last <= above);
-        self.index.apply(&[ReadEvent::Void {
+        self.index.apply(
+            &[ReadEvent::Void {
+                above,
+                cause: kvik_log::reader::VoidCause::Rewritten,
+            }],
             above,
-            cause: kvik_log::reader::VoidCause::Rewritten,
-        }]);
+        );
         self.items.retain(|p, _| *p <= above);
         self.items_from = self.items_from.min(next(above));
         self.entries.retain(|p, _| *p <= above);
@@ -475,7 +478,7 @@ impl Deliverer {
     }
 
     fn take_batch(&mut self, b: ReadBatch, ctx: &Ctx<'_>) {
-        self.index.apply(&[ReadEvent::Batch(b.clone())]);
+        self.index.apply(&[ReadEvent::Batch(b.clone())], b.last);
         let mut fed: Vec<u32> = Vec::new();
         let mut sequence = b.first.sequence;
         let names: Vec<String> = self.consumers.keys().cloned().collect();

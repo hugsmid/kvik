@@ -19,6 +19,7 @@ mod consumers;
 mod deliver;
 mod index;
 mod ingest;
+mod loss;
 pub(crate) mod reader;
 mod registry;
 mod routing;
@@ -56,6 +57,7 @@ use crate::time::{TimeRange, Timestamp, ZoneName};
 use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
 use index::{Index, fact_out, pos};
 use ingest::{Decider, Decision};
+use loss::Latch;
 pub(crate) use reader::DurableReader;
 pub(crate) use windows::{buckets, live, window};
 
@@ -65,6 +67,8 @@ const CALL_READINGS: usize = 65_536;
 const CALL_BYTES: usize = 8 << 20;
 /// Commit latencies kept for the percentiles.
 const LATENCIES: usize = 1_024;
+/// The lease refresh of the reader the writer's process keeps.
+const READER_LEASE: Duration = Duration::from_secs(30 * 60);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -187,6 +191,8 @@ pub(crate) struct Writer {
     clocks: Arc<clock::Clocks>,
     /// Consumers and routing; `None` when the start left the store read-only before the log could be read.
     hub: Option<Arc<deliver::Hub>>,
+    /// The losses the reader of this process finds (Q-200).
+    latch: Arc<Latch>,
 }
 
 /// How a queued call's acknowledgement becomes its [`Ack`].
@@ -294,11 +300,6 @@ impl Completion {
             Poll::Pending => Poll::Pending,
         }
     }
-
-    /// Whether the call is acknowledged.
-    fn acknowledged(&self) -> bool {
-        matches!(self.poll(None), Poll::Ready(Ok(_)))
-    }
 }
 
 /// A call waiting for the log: its own queued batch, or the queued call an outcome of it depends on; and how that
@@ -378,24 +379,23 @@ impl Writer {
             },
         })?;
         let start_fault = writer.fault().cloned();
-        // The kept log, read once: the registry and the history of every key.
-        let index = match DurableReader::open(&dir, &env, Duration::from_secs(30 * 60)) {
-            Ok(r) => {
-                let mut index = None;
-                r.with(|i, _| {
-                    index = Some(i.clone());
-                    Ok(())
-                })
-                .map_err(|e| OpenError::Io {
-                    path: dir.clone(),
-                    source: io::Error::other(e.to_string()),
-                })?;
-                index.unwrap_or_default()
-            }
-            // A start that could not write may leave no readable mark: the store opens read-only.
-            Err(_) if start_fault.is_some() => Index::default(),
-            Err(e) => return Err(e),
-        };
+        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
+        let latch = Arc::new(Latch::default());
+        // The kept log, read once by the reader this process keeps: the registry and the history of every key.
+        let (reader, index) =
+            match DurableReader::open_with(&dir, &env, READER_LEASE, clocks.clone(), latch.clone())
+            {
+                Ok(r) => {
+                    let index = r.with(|i, _| Ok(i.clone())).map_err(|e| OpenError::Io {
+                        path: dir.clone(),
+                        source: io::Error::other(e.to_string()),
+                    })?;
+                    (Some(Arc::new(r)), index)
+                }
+                // A start that could not write may leave no readable mark: the store opens read-only.
+                Err(_) if start_fault.is_some() => (None, Index::default()),
+                Err(e) => return Err(e),
+            };
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
         let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
@@ -474,13 +474,14 @@ impl Writer {
             store_id: descriptor.store_id,
             decider: Mutex::new(Decider::from_index(&index)),
             counters: Mutex::new(counters),
-            reader: Mutex::new(None),
+            reader: Mutex::new(reader),
             acknowledged: Mutex::new(BTreeSet::new()),
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             clocks,
             hub,
+            latch,
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
@@ -538,8 +539,9 @@ impl Writer {
             DurableReader::open_with(
                 &self.dir,
                 &self.env,
-                Duration::from_secs(30 * 60),
+                READER_LEASE,
                 self.clocks.clone(),
+                self.latch.clone(),
             )
             .map_err(|e| QueryError::NotAvailable {
                 reason: e.to_string(),
@@ -844,6 +846,7 @@ impl Writer {
             return self.busy(Wait::UnsyncedClock);
         }
         let mut d = lock(&self.decider);
+        self.settle(&mut d);
         let call = self.next_call.fetch_add(1, Ordering::SeqCst);
         let plan = d.plan(readings, intent, clock, call);
         let started = Instant::now();
@@ -885,8 +888,6 @@ impl Writer {
         // The call is tracked before the decision lock is released, so a later call that duplicates one of its
         // readings always finds it (lock order: decisions, then calls in flight).
         let mut inflight = lock(&self.inflight);
-        // Calls known to be acknowledged need no tracking: a later outcome resting on them is final.
-        inflight.retain(|_, c| !c.acknowledged());
         let tracked = match queued {
             Some(pending) => {
                 let (clocks, ids) = (self.clocks.clone(), refreshing(&plan));
@@ -938,6 +939,22 @@ impl Writer {
                 }
             }),
         }))
+    }
+
+    /// Takes into the decisions the positions of calls acknowledged since the last decision and the ranges the
+    /// reader of this process found lost. Calls known to be acknowledged need no tracking: a later outcome resting
+    /// on them is final.
+    fn settle(&self, d: &mut Decider) {
+        lock(&self.inflight).retain(|call, c| match c.poll(None) {
+            Poll::Ready(Ok(ack)) => {
+                d.placed(*call, ack.first, ack.last);
+                false
+            }
+            _ => true,
+        });
+        for (first, last) in self.latch.take_fresh() {
+            d.lose(first, last);
+        }
     }
 
     /// The wait a call meets.
@@ -1004,15 +1021,12 @@ impl Writer {
 
     pub(crate) fn losses(&self) -> Vec<LossReport> {
         let acked = lock(&self.acknowledged).clone();
-        self.reader()
-            .and_then(|r| r.losses())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|mut l| {
-                l.acknowledged = acked.contains(&l.identity);
-                l
-            })
-            .collect()
+        let mut out = self.reader().and_then(|r| r.losses()).unwrap_or_default();
+        loss::merge(&mut out, self.latch.found());
+        for l in &mut out {
+            l.acknowledged = acked.contains(&l.identity);
+        }
+        out
     }
 
     /// Acknowledges losses. Held in memory for this process: the manifest's acknowledgement record is not

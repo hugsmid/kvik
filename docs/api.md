@@ -396,7 +396,9 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 ```
 - A loss's identity is the first position of its range when it was first reported; a `PossibleLoss` has its
   recovery entry's position, and the gap before that entry is a `DataLost` with cause `TruncatedTail`. Reports are read from the
-  manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is acknowledged; a
+  manifest and the recovery entries at every start. A loss found while the store is open, by a read of that process,
+  or by a start that could not write, is reported at once with `recorded` false, and is the same loss, recorded,
+  after the next start that can write (spec §3 Recovery rule 2, Q-200). A `DataLost` holds health `Degraded` until it is acknowledged; a
   `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
   a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
   no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,

@@ -12,9 +12,10 @@ use std::time::Duration;
 use common::{at, block_on, start};
 use kvik::env::{Env, FixedBootId, ManualClock, MemFs};
 use kvik::{
-    Backend, ChangedAtKind, DefineError, Fact, Intent, IntervalLength, Kind, LogConfig, LossKind,
-    Outcome, Position, Quality, Reader, ReaderConfig, Reading, Refusal, RetentionClass, SeriesId,
-    SeriesSpec, StateValues, Store, StoreConfig, Timestamp, Value, ValueType, View, ZoneName,
+    Backend, ChangedAtKind, DefineError, Fact, Health, Intent, IntervalLength, Kind, LogConfig,
+    LossKind, Outcome, Position, Quality, Reader, ReaderConfig, Reading, Reason, Refusal,
+    RetentionClass, SeriesId, SeriesSpec, StateValues, Store, StoreConfig, Timestamp, Value,
+    ValueType, View, ZoneName,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -522,6 +523,118 @@ fn orphaned_facts_stay_out_of_views_and_are_exported() {
     assert_eq!(
         block_on(s.define_series(gauge("x/y/new"))).unwrap(),
         SeriesId(3)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Damages the bytes of the first segment that holds `text`, in place.
+fn damage(w: &World, text: &[u8]) {
+    let (path, bytes) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(text.len()).any(|x| x == text))
+        .unwrap();
+    let at_text = bytes.windows(text.len()).position(|x| x == text).unwrap();
+    w.fs.poke(&path, at_text, b"X");
+}
+
+fn note(id: SeriesId, secs: i64, text: &str) -> Reading {
+    Reading::new(id, at(secs), Value::Text(text.into()))
+}
+
+fn data_lost(
+    losses: &[kvik::LossReport],
+) -> Vec<(Position, Option<Position>, Option<Position>, bool)> {
+    losses
+        .iter()
+        .filter(|l| l.kind == LossKind::DataLost)
+        .map(|l| (l.identity, l.first, l.last, l.recorded))
+        .collect()
+}
+
+#[test]
+fn a_batch_damaged_while_the_store_is_open_is_reported_at_once_and_its_replay_recorded() {
+    let w = World::new("damaged-open");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let mut lost_at = Position::ORIGIN;
+    for (i, t) in ["NOTE-ONE", "NOTE-TWO", "NOTE-THREE"].iter().enumerate() {
+        let ack = block_on(s.emit(&[note(id, i as i64, t)])).unwrap();
+        if i == 1 {
+            lost_at = ack.first().unwrap();
+        }
+    }
+    damage(&w, b"NOTE-TWO");
+    let found = vec![(lost_at, Some(lost_at), Some(lost_at), false)];
+
+    // A reader process and the store's own process each report the loss when their reads find it.
+    let r = w.reader();
+    assert_eq!(history(&r, id).len(), 2);
+    assert_eq!(data_lost(&r.losses()), found);
+    assert!(matches!(r.health(), Health::Degraded { .. }));
+    assert_eq!(history(&s.reader(), id).len(), 2);
+    assert_eq!(data_lost(&s.losses()), found);
+    assert!(
+        matches!(&s.health(), Health::Degraded { reasons } if matches!(&reasons[..], [Reason::DataLost(l)] if l.identity == lost_at))
+    );
+
+    // The lost reading is no duplicate: its replay is recorded.
+    let ack = block_on(s.emit(&[note(id, 1, "NOTE-TWO")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
+    assert_eq!(history(&s.reader(), id).len(), 3);
+    // Latched: still reported, until acknowledged.
+    assert_eq!(data_lost(&s.losses()), found);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    // The next start records the loss under the same identity: one report, in every process.
+    let s = w.open();
+    let recorded = vec![(lost_at, Some(lost_at), Some(lost_at), true)];
+    assert_eq!(data_lost(&s.losses()), recorded);
+    assert_eq!(data_lost(&r.losses()), recorded);
+    assert_eq!(data_lost(&w.reader().losses()), recorded);
+    assert_eq!(history(&s.reader(), id).len(), 3);
+    let ack = block_on(s.emit(&[note(id, 1, "NOTE-TWO")])).unwrap();
+    assert_eq!(ack.duplicates_dropped(), 1);
+    block_on(s.acknowledge_losses(&[lost_at])).unwrap();
+    assert!(matches!(s.health(), Health::Ok));
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn damage_to_a_batch_the_store_has_read_is_found_by_other_readers_and_recorded_at_the_next_start() {
+    let w = World::new("damaged-kept");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    for (i, t) in ["KEPT-ONE", "KEPT-TWO", "KEPT-THREE"].iter().enumerate() {
+        block_on(s.emit(&[note(id, i as i64, t)])).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    damage(&w, b"KEPT-TWO");
+    // The store read the kept log at its start and does not read it again (Q-200): a reader process finds it.
+    assert_eq!(history(&s.reader(), id).len(), 3);
+    assert!(data_lost(&s.losses()).is_empty());
+    assert_eq!(data_lost(&w.reader().losses()).len(), 1);
+    assert_eq!(
+        block_on(s.emit(&[note(id, 1, "KEPT-TWO")]))
+            .unwrap()
+            .duplicates_dropped(),
+        1
+    );
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    let lost = data_lost(&s.losses());
+    assert_eq!(lost.len(), 1);
+    assert!(lost[0].3);
+    assert_eq!(history(&s.reader(), id).len(), 2);
+    assert_eq!(
+        block_on(s.emit(&[note(id, 1, "KEPT-TWO")]))
+            .unwrap()
+            .recorded(),
+        1
     );
     block_on(s.shutdown()).unwrap();
 }

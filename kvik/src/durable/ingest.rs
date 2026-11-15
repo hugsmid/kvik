@@ -7,7 +7,7 @@
 //! Decisions are made in the order calls are queued in the log, against every fact already queued, so a call
 //! sees the calls before it whether or not their sync has returned yet.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kvik_log::content::Item;
 use kvik_log::entries::{
@@ -17,11 +17,21 @@ use kvik_log::facts::{
     FactFlags as LogFlags, FactRow, MAX_TEXT_LEN, Quality as LogQuality, Value as LogValue,
     ValueType as LogType,
 };
+use kvik_log::writer::Position as LogPos;
 
 use super::index::{Index, quality_in};
 use super::registry::Registry;
 use crate::error::Refusal;
 use crate::types::{Intent, Reading, TimeSource, Value};
+
+/// Where a recorded fact is in the log.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum At {
+    /// A fact of the kept log read at the start, at its position.
+    Kept(LogPos),
+    /// The fact with this index among its call's items.
+    Item(u64),
+}
 
 /// A recorded fact as the duplicate rule compares it: value, adapter-supplied quality and `changed_at`.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,15 +41,20 @@ struct Known {
     changed_at: Option<u64>,
     /// The call that queued it in this process; 0 for a fact of the kept log read at the start.
     call: u64,
+    at: At,
+    /// Flagged neither `future` nor `unsynced_clock`: it counts for the lateness reference (spec §2.2).
+    reference: bool,
 }
 
 impl Known {
-    fn of(r: &FactRow, call: u64) -> Self {
+    fn of(r: &FactRow, call: u64, at: At) -> Self {
         Known {
             value: r.value.clone(),
             supplied: r.quality,
             changed_at: r.changed_at,
             call,
+            at,
+            reference: !r.flags.future && !r.flags.unsynced_clock,
         }
     }
 
@@ -95,13 +110,16 @@ pub(crate) struct Plan {
 }
 
 /// The state decisions are made against: the registry and the history of every key, including calls queued but
-/// not yet acknowledged.
+/// not yet acknowledged, less the facts of ranges found lost while the store is open (Q-200).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Decider {
     pub(crate) registry: Registry,
     history: HashMap<(u32, i64), Vec<Known>>,
     versions: HashMap<(u32, i64), u64>,
     reference: HashMap<u32, i64>,
+    /// The first and last positions of each acknowledged call of this process.
+    placed: BTreeMap<u64, (LogPos, LogPos)>,
+    lost: Vec<(LogPos, LogPos)>,
 }
 
 fn reach(observed: bool, interval: Option<&LogInterval>, t: i64) -> i64 {
@@ -129,18 +147,18 @@ impl Decider {
         };
         for id in index.fact_series() {
             for f in index.series_facts(id) {
-                d.note(&f.row, 0);
+                d.note(&f.row, 0, At::Kept(f.position));
             }
         }
         d
     }
 
-    fn note(&mut self, r: &FactRow, call: u64) {
+    fn note(&mut self, r: &FactRow, call: u64, at: At) {
         let key = (r.series_id, r.t);
         self.history
             .entry(key)
             .or_default()
-            .push(Known::of(r, call));
+            .push(Known::of(r, call, at));
         if let Some(c) = r.changed_at {
             let v = self.versions.entry(key).or_insert(c);
             *v = (*v).max(c);
@@ -153,9 +171,72 @@ impl Decider {
 
     /// Takes a planned call's facts into the state, once it is queued.
     pub(crate) fn apply(&mut self, plan: &Plan) {
-        for item in &plan.items {
+        for (i, item) in plan.items.iter().enumerate() {
             if let Item::Fact(r) = item {
-                self.note(r, plan.call);
+                self.note(r, plan.call, At::Item(i as u64));
+            }
+        }
+    }
+
+    /// Notes the positions the log gave an acknowledged call.
+    pub(crate) fn placed(&mut self, call: u64, first: LogPos, last: LogPos) {
+        self.placed.insert(call, (first, last));
+        if self.lost.iter().any(|&(a, b)| first <= b && a <= last) {
+            self.forget_lost();
+        }
+    }
+
+    /// Takes in a range found lost while the store is open: its facts leave every key's history, so a replay of
+    /// one is recorded again (spec §3 Recovery rule 2, Q-200).
+    pub(crate) fn lose(&mut self, first: LogPos, last: LogPos) {
+        self.lost.push((first, last));
+        self.forget_lost();
+    }
+
+    fn position(&self, k: &Known) -> Option<LogPos> {
+        match k.at {
+            At::Kept(p) => Some(p),
+            At::Item(i) => self.placed.get(&k.call).map(|(f, _)| LogPos {
+                generation: f.generation,
+                sequence: f.sequence + i,
+            }),
+        }
+    }
+
+    fn forget_lost(&mut self) {
+        let mut history = std::mem::take(&mut self.history);
+        let mut changed = Vec::new();
+        for (key, ks) in &mut history {
+            let n = ks.len();
+            ks.retain(|k| {
+                !self
+                    .position(k)
+                    .is_some_and(|p| self.lost.iter().any(|&(a, b)| a <= p && p <= b))
+            });
+            if ks.len() != n {
+                changed.push(*key);
+            }
+        }
+        history.retain(|_, ks| !ks.is_empty());
+        self.history = history;
+        let series: BTreeSet<u32> = changed.iter().map(|(id, _)| *id).collect();
+        for key in changed {
+            match self
+                .history
+                .get(&key)
+                .and_then(|ks| ks.iter().filter_map(|k| k.changed_at).max())
+            {
+                Some(c) => self.versions.insert(key, c),
+                None => self.versions.remove(&key),
+            };
+        }
+        for id in &series {
+            self.reference.remove(id);
+        }
+        for ((id, t), ks) in &self.history {
+            if series.contains(id) && ks.iter().any(|k| k.reference) {
+                let v = self.reference.entry(*id).or_insert(*t);
+                *v = (*v).max(*t);
             }
         }
     }
@@ -315,10 +396,11 @@ impl Decider {
                 changed_at: r.changed_at,
             };
             let outranked = r.changed_at.is_some_and(|c| top.is_some_and(|top| c < top));
-            batch_history
-                .entry(key)
-                .or_default()
-                .push(Known::of(&row, call));
+            batch_history.entry(key).or_default().push(Known::of(
+                &row,
+                call,
+                At::Item(plan.items.len() as u64),
+            ));
             if let Some(c) = r.changed_at {
                 let v = batch_versions.entry(key).or_insert(c);
                 *v = (*v).max(c);
