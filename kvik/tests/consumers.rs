@@ -566,6 +566,40 @@ fn a_cursor_file_never_names_a_position_above_the_synced_mark() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Q-132: a latch change confirmed less than a second after the last cursor file write is written at once, so a
+/// crash straight after it repeats no transition.
+#[test]
+fn a_latch_change_within_a_second_of_the_last_cursor_write_survives_a_crash() {
+    let mut w = World::new("latch-at-once");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let mut c = new_consumer(&s, "alarm", Select::None);
+    let id = block_on(c.route(condition(g))).unwrap();
+    let triggers = |ds: &[Delivery]| {
+        ds.iter()
+            .filter(|d| matches!(&d.kind, DeliveryKind::Trigger(t) if t.funnel == id))
+            .count()
+    };
+    w.clock.advance(Duration::from_secs(10));
+    block_on(s.emit(&[num(g, 0, 20.0)])).unwrap();
+    assert_eq!(triggers(&drain(&mut c)), 1);
+    w.clock.advance(Duration::from_millis(500));
+    block_on(s.emit(&[num(g, 1, 5.0)])).unwrap();
+    assert_eq!(triggers(&drain(&mut c)), 1);
+    w.crash(s, vec![c], false);
+    let s = w.open();
+    let mut c = block_on(s.consumer("alarm", Start::Now, Select::None)).unwrap();
+    let ds = ready(&mut c);
+    assert_eq!(triggers(&ds), 0, "{ds:?}");
+    let r = resync(ds.last().unwrap()).unwrap();
+    let f = r.funnels.iter().find(|f| f.funnel == id).unwrap();
+    assert_eq!(
+        (f.condition.clone(), f.transition),
+        (Some(ConditionState::False), false)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
 /// Q-130: the registry file holds a routing change when the routing call returns, so a consumer whose routing
 /// entries are no longer in the log is still known at a start; with its cursor file lost it is named in the
 /// recovery entry and sent the `NoCursor` resync.
