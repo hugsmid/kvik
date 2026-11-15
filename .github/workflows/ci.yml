@@ -102,6 +102,25 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test -p commit --locked
 
+  export:
+    # The Parquet export (roadmap 6.4) is outside the default members, so the core jobs never build parquet or
+    # zstd-sys; its checks run here, on one OS.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: export
+      - run: cargo clippy -p kvik-export --all-targets --locked
+      - run: cargo doc -p kvik-export --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test -p kvik-export --locked
+        env:
+          PROPTEST_CASES: "1024"
+
   deep-shards:
     # The deep job's matrix, generated from the table in .github/deep-shards.sh.
     runs-on: ubuntu-latest
@@ -119,8 +138,9 @@ jobs:
     # Many more random cases, in release mode, one job per shard: the
     # invariants file is split by invariant number into 8 shards, each other
     # property-test file of the model, and the property, fuzz-input, batch,
-    # model-differential, model-histories, writer, recovery and reader tests of kvik-log, and the windows differential of kvik, is one shard (.github/deep-shards.sh). Each job first
-    # checks that the shards of its file select every test exactly once.
+    # model-differential, model-histories, writer, recovery and reader tests of kvik-log, the property and
+    # fuzz-input tests of kvik-chunk, and the windows differential of kvik, is one shard (.github/deep-shards.sh).
+    # Each job first checks that the shards of its file select every test exactly once.
     #
     # Durations. Measured on the runner: invariants as one job at 10,000
     # cases took 18 minutes (build included, 4 test threads). The same tests

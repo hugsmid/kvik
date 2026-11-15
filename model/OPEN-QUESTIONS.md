@@ -35,7 +35,20 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
 | Q-141 | §2.2 `received_at`, `format.md` A.7 `commit_time` | A fact's `received_at` after the wall clock steps back |
 | Q-142 | §5.5, §2.1 counter rules; `format.md` A.6 field 11 | A reset ceiling off the parts-per-million grid |
+| Q-160 | §8 Deep, Encryption, Hashes, Generations; `format.md` A.12, A.14 | Objects in the deep tier: keys, claim marker and envelope |
+| Q-161 | §8 Generations; `api.md` Backup and restore | Telling a restore's own claim marker from another restore's |
+| Q-162 | §8 Hashes, Bucket, Generations; §13 | Buckets without conditional writes or checksum checks |
+| Q-163 | §8 Generations, Restore step 1 | Reading the claims again on a bucket whose listings lag |
+| Q-164 | §8 Retention class, Restore; `api.md` Reading, Backup and restore | Interface points deferred to 8.2 that need tiers or restore |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
+| Q-190 | §11; `docs/export.md` | The Parquet export schema as a user contract: columns, types, version |
+| Q-191 | §2.3, §8 Re-ingest; `docs/export.md`; `api.md` Backup and restore | The default view of an export, and Parquet for orphaned and set-aside facts |
+| Q-192 | §2.1 `decimal scale`; `docs/export.md` | Decimal values in the export, and the scale in force on `SeriesInfo` |
+| Q-193 | §2.2 fact flags; `docs/export.md` | Fact flags as boolean columns or a bitfield |
+| Q-194 | §2.1 `kind`, §2.2 `quality`; `docs/export.md` | Quality and named states in the export |
+| Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
+| Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
+| Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -665,6 +678,96 @@ decimal places is kept exactly (`kvik/tests/api.rs`, `a_reset_ceiling_off_the_pa
 **Needed.** Whether the refusal stands in `spec.md` §5.5 and `api.md` Series, or the field holds the ratio exactly
 (the `f64` bits or a rational, a `format.md` change).
 
+## Q-160 — Objects in the deep tier: keys, claim marker and envelope
+Recorded at roadmap 8.2, which built the sink with opaque keys. To be settled before roadmap 8.1 uploads anything.
+**Scenario.** Roadmap 8.1 uploads a sealed segment, then its manifest record; a newer build later restores the store
+from the bucket. Nothing says under which key either object lies, what an uploaded manifest record holds (the A.14
+block alone, or with a header carrying the store id and generation), what the generation claim marker is
+(`format-check.md` FC-33 left it to 8.2), or how a file is encrypted: algorithm, nonce, key identification, and a
+layout that allows the ranged reads `BackupSink::get` offers (a chunk index fetched by range, `format.md` Part B).
+§8 also refuses backup on a bucket holding files of another store id, which needs the store id findable from keys
+or object headers. The restore that reads them (8.3) cannot be written against an unwritten layout.
+**Model.** Not modelled; the sink (`kvik-sink`) takes any key of 1 to 1,024 bytes and stores bytes as given.
+**Needed.** An object layout section in `format.md`. Suggested: keys under a configured prefix and the store id,
+mirroring local names (`<prefix>/<store_id:32 hex>/STORE`, `.../log/<generation:8 hex>-<file_id:16 hex>.kvl`,
+`.../manifest/<generation:8 hex>/<epoch:16 hex>`, `.../claims/<generation:8 hex>`), so that listing a generation's
+records returns them in epoch order; each uploaded file an envelope of fixed-size authenticated chunks with a header
+naming the algorithm, key id and nonce base, so that a range decrypts on its own.
+
+## Q-161 — Telling a restore's own claim marker from another restore's
+Recorded at roadmap 8.2. To be settled with Q-160, before roadmap 8.3.
+**Scenario.** Restores R1 and R2 of the same bucket both read generation 2 as the highest claimed and try to claim
+3 at once. R1's create-if-absent upload of the marker is stored but its reply is lost; R2's is refused. R2 moves on
+to 4. Had R2's upload landed first instead, R1's retry would meet a marker for 3 already there. The sink accepts a
+repeated `put` when the object has the same size and SHA-256 (so that a retry after a lost reply succeeds); if every
+marker has the same content (empty, say), R1 takes R2's marker for its own and both restores own generation 3.
+**Model.** Not modelled; a claim is a create-if-absent step that cannot be confused.
+**Needed.** Marker content unique to the restore attempt. Suggested: the marker holds the restore's reset stamp
+nonce (fresh random, §8 Generations), so a `put` that succeeds proves the marker is this restore's; any other
+content is `Exists` and the restore takes the next generation.
+
+## Q-162 — Buckets without conditional writes or checksum checks
+Recorded at roadmap 8.2. To be settled before roadmap 8.1 uploads anything.
+**Scenario.** (a) A bucket that ignores `If-None-Match` overwrites one restore's claim marker with another's;
+versioning keeps the first, but both restores believe they claimed the generation, and a sealed file uploaded twice
+silently replaces the first copy's current version. (b) A bucket that stores an upload without checking its SHA-256
+reports the hash it was sent: `put` and the scheduled reported-hash check pass on damaged bytes, and only a sampled
+download finds them (tested in `kvik-sink`, `a_bucket_that_does_not_check_is_caught_by_the_sampled_download`).
+§13 lists (b) as a risk with the fallback "hash in object metadata plus sampled downloads", whose metadata is not
+named; (a) is not listed. A bucket that reports no SHA-256 at all is refused by the sink (`SinkError::Failed`).
+**Model.** Not modelled.
+**Needed.** Whether the engine checks the bucket when backup is attached (a probe object, which stays, since the
+engine never deletes), or the operator does; (a) added to §13; and the metadata of the fallback, if it is kept.
+
+## Q-163 — Reading the claims again on a bucket whose listings lag
+Recorded at roadmap 8.2. To be settled with roadmap 8.3.
+**Scenario.** §8 Generations: after uploading its restore record, a restore "reads the claims again" and stops if a
+higher generation is claimed. Restore R1 claims 3; R2 claims 4 a moment later. R1 lists the claims, but the
+bucket's listing does not yet show R2's marker (some S3-compatible stores list with a delay; the fake injects it,
+`a_lagging_listing_does_not_decide_whether_a_key_is_taken`). R1 accepts ingest in generation 3 while R2 does in 4.
+**Model.** Not modelled.
+**Needed.** A way of reading claims that does not depend on listings. Suggested: read the claims by `stat` of
+the markers above one's own generation, in ascending order, until one is absent; a `stat` of a key is consistent
+after its write on buckets with read-after-write consistency, which the bucket requirements would then name.
+
+## Q-164 — Interface points deferred to 8.2 that need tiers or restore
+Recorded at roadmap 8.2, which settled the sink only. To be settled by roadmap 8.1 and 8.3.
+**Scenario.** Three interface points were deferred at gate 3.3 to roadmap 8.2: (a) whether `Reader::facts` fetches
+detail that is not local itself (`api-check.md` AC-12), which would put network calls in a `Reader`,
+whose calls are blocking file I/O and which owns no thread; (b) what happens to files sealed while no sink is
+attached (AC-25); (c) the restore life cycle (AC-24). None can be decided without tiering (8.1) or restore (8.3).
+**Model.** Not modelled.
+**Needed.** (a) and (b) settled with 8.1, (c) with 8.3. Suggested for (a): `facts` does not fetch; detail not local
+is reported as such and fetched by an asynchronous `Store` call on the maintenance thread.
+
+## Q-150 — Canonical bytes of the zstd-compressed XOR fallback
+Found while implementing the chunk column encodings (roadmap 6.1, `chunk/`).
+**Scenario.** Gate 2.3 kept a zstd-compressed XOR fallback for `f64` blocks (`format-chunk.md` C.8). The common rules
+require one byte sequence per content and golden files byte for byte, but zstd promises neither the same compressed
+bytes nor the same compressed length across library versions or builds. (a) A store written by one build and
+scrubbed by a build with another zstd finds encoding 5 payloads whose bytes differ from what it would write. (b) The
+choice between XOR and compressed XOR (C.9) compares lengths, so another zstd can flip it, and a canonical check
+then reports writer output of the older build as not canonical. (c) A golden file holding a compressed payload breaks
+on a zstd upgrade although the format did not change. (d) Compared by the stream it decompresses to, a payload may
+carry further skippable or concatenated zstd frames, extra bytes that a canonical check then does not see.
+**Implemented first.** An encoding 5 payload was canonical when its frames decompress to exactly its declared length
+and that stream is the canonical XOR stream; `Block::decode_canonical` compares it by the stream, not by its bytes,
+when both bodies use encoding 5; (b) is not covered. The golden file `xor-zstd.blk` is checked by what it decodes to
+(`chunk/tests/golden.rs`). zstd 1.5.7 at level 3, through the `zstd` crate 0.14, is pinned by `Cargo.lock`.
+**Needed.** A rule: (1) treat a zstd upgrade as a format event that regenerates the golden files and accept (a) and
+(b) for files written before it; (2) proposed: make encodings 4 and 5 one canonical class, so that a canonical check
+accepts either for the canonical XOR stream and only a writer compares lengths; (3) replace zstd by a compressor
+specified in `format-chunk.md`; or (4) drop the compressed fallback (the °F→°C shape of roadmap 2.1 grows from 0.87
+to 1.84 bytes per row).
+**Settled at the review of roadmap 6.1** by option (2). The format constrains only decoding, which RFC 8878 fixes, so
+no compression level or library version is pinned: encodings 4 and 5 form one canonical class, canonical when the
+stream they hold is the canonical XOR stream and the payload is shorter than every other candidate; only a writer
+compares the two lengths ((a)–(c)). An encoding 5 payload is exactly one zstd frame with no dictionary and no content
+checksum, ending where the payload ends ((d)), a reader check (`format-chunk.md` C.8, C.10, C.11). Gate 6.5 measures
+a pure-Rust codec on the XOR stream (`ruzstd` or `lz4_flex`): within about 10 % of zstd level 3 on the °F→°C shape,
+it replaces the C library; otherwise zstd stays and CI fails when `ZSTD_SYS_USE_PKG_CONFIG` is set, so that the
+bundled library is always the one built.
+
 ## Q-170 — Durability levels chosen per source
 
 Decided by the owner: a source may choose between the default level, where a reading is acknowledged only after the
@@ -685,6 +788,96 @@ it receive; batches mixing levels (a batch is acknowledged per reading at its ow
 change is always synced); principle 1 and invariant wording ("acknowledged at its level"); whether a per-call
 override (wait for the sync on a faster-level series) is offered.
 
+## Q-190 — The Parquet export schema as a user contract
+
+**Scenario.** A user loads monthly exports into an analytics tool by column name. If a later release renames
+`supplied_quality` or turns `generation` signed, their queries break, although no fact changed.
+**Now.** `docs/export.md` drafts the columns, their Parquet logical types and the file metadata; every file carries
+`kvik.export_version` = `0`, and the crate `kvik-export` writes and reads it back (round-trip tests in
+`export/tests/`).
+**Needed (owner decision pending).** Approval of the column list, names and types, or changes to them. Recommendation:
+approve as drafted, then write version `1`; adding a column or a metadata key is not a breaking change, while
+renaming, retyping or removing one raises the version.
+
+## Q-191 — The default view of an export, and Parquet for orphaned and set-aside facts
+
+**Scenario.** A versioned price series has three revisions of the 14:00 value. An export in the current view holds
+one row for 14:00; one in the history view holds all three, which re-ingest into an empty store (§8 Re-ingest)
+needs to reproduce the revisions and the duplicate rule's state.
+**Now.** `ExportOptions::view` defaults to `Current`, and `History`, `AsOf(P)` and `AsOfTime(T)` are options.
+Orphaned and set-aside facts are returned as facts by their own calls (`api.md`), not written to Parquet.
+**Needed (owner decision pending).** (a) The default view. Recommendation: `Current`, the table most users want, with
+the re-ingest documentation naming `History`; the alternative is `History`, so that an export always survives
+re-ingest. (b) Whether orphaned and set-aside facts get a Parquet form. Recommendation: the same schema, one file
+per call, its rows spanning several series, added with roadmap 8.3.
+
+## Q-192 — Decimal values in the export, and the scale in force on `SeriesInfo`
+
+**Scenario.** A series is defined at scale 2 and raised to scale 4 (§2.1 `decimal scale`); facts are stored at
+both. One Parquet column has one `DECIMAL(p, s)`.
+**Now.** `value` is `DECIMAL(19, s)`, `s` the series' scale, each value rescaled exactly (19 digits hold any `i64`
+units), and `stored_scale` keeps each fact's stored scale, so the units and stored scale come back unchanged; a
+fact stored above `s` is an error, never rounded. `SeriesInfo` exposes only the definition's scale, so the exporter
+uses it; decimal series are not stored by either backend yet, and the tests use synthetic rows
+(`export/tests/rows.rs` `decimals_round_trip_with_their_stored_scale`,
+`a_decimal_stored_above_the_export_scale_is_an_error_not_a_rounding`).
+**Needed (owner decision pending).** (a) The representation. Recommendation: `DECIMAL(19, scale in force)` with
+`stored_scale` (numeric in every tool, lossless). Alternatives: `units` (`INT64`) and `scale` (`INT(8, false)`)
+columns, lossless but not directly numeric; or `DECIMAL(38, 18)` for every decimal series, numeric and lossless
+without knowing the scale in force, but showing 18 places. (b) `SeriesInfo` (or the export call) gains the scale in
+force when decimal series reach the durable backend.
+
+## Q-193 — Fact flags as boolean columns or a bitfield
+
+**Scenario.** A user wants every late reading of last week: `WHERE late` against `WHERE flags & 2 <> 0`.
+**Now.** Seven `BOOLEAN` columns, named as in §2.2 and §2.5.
+**Needed (owner decision pending).** Recommendation: boolean columns; Parquet stores runs of equal booleans in a few
+bytes, and each is self-describing. Alternative: one `INT(16, false)` bitfield in `format.md` A.5 bit order, more
+compact in memory, which every query must decode with a key.
+
+## Q-194 — Quality and named states in the export
+
+**Scenario.** A dashboard filters `quality = 'good'`; a re-ingest needs a named state's index, which a reordered
+list of names would change.
+**Now.** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`), dictionary-encoded; a
+named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and the declared
+names in the metadata.
+**Needed (owner decision pending).** Recommendation: as now. Alternatives: quality as `INT(8, false)` codes 0–3 (best
+to worst), smaller but needing a key; a named state as its name only, with the index found from the metadata.
+
+## Q-195 — A `changed_at` of kind `time` beyond the timestamp range; forecast labels
+
+**Scenario.** An adapter sends `changed_at` = 2^63 on a series of `changed_at kind` `time`. §2.2 makes `changed_at` a
+`u64` and the store records it; a Parquet timestamp is a signed 64-bit integer and cannot hold it.
+**Now.** The export fails with `ChangedAtOutOfRange` (`export/tests/rows.rs`
+`changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by
+`kvik.timing` = `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
+**Needed (owner decision pending).** (a) Recommendation: a rule that a `time` `changed_at` above `i64::MAX` is refused
+at ingest, as every other time in `format.md` is an `i64`; alternatively the column becomes `INT(64, false)` for both
+kinds, with the kind in the metadata. (b) Whether forecast exports rename their columns (`valid_time`,
+`issue_time`). Recommendation: no; the metadata label suffices and the column names stay stable.
+
+## Q-196 — Export file layout, compression and store-level metadata
+
+**Scenario.** A user exports a hundred series: a hundred files, each with a typed `value` column, or one file whose
+value column cannot have one type. Later they want to know which store and which durable point an export came from.
+**Now.** One file per series per call; row groups of at most 131,072 rows; zstd level 1. The metadata names the
+series, view and range, not the store: its id, tzdata version, durable position and reset stamp are not reachable
+through the public `Reader` without a side effect (`refresh`).
+**Needed (owner decision pending).** (a) Recommendation: one file per series; the alternative, one file per export
+with a value column per value type (all but one null in each row), suits many small series. (b) The row-group
+default and the compression. (c) Store-level metadata, recommended when the export call joins the store's
+interface (8.3), and the saved point of a continued export (row 7b) after 5.3.
+
+## Q-197 — The interval end in an export, and calendar-length interval series
+
+**Scenario.** A half-hourly import series is exported for a billing tool that wants each interval's end, not its
+length.
+**Now.** An interval series has an `interval_end` column, `t + d` (F-14, F-17), and `kvik.interval_length_ns`.
+Calendar-length interval series are refused by the export, as neither backend stores them.
+**Needed (owner decision pending).** Recommendation: keep `interval_end`; for calendar lengths (7.3) take each end from
+the interval zone under the tzdata version in force at export, recorded in the metadata.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -697,7 +890,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 to Q-142.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`).
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -735,6 +928,14 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-141 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-142 | 5.6 | Gate; recorded by roadmap 5.4 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
+| Q-190 | 6.4 | Parquet export schema; recorded by roadmap 6.4a; owner decision pending |
+| Q-191 | 6.4 | Default export view; recorded by roadmap 6.4a; owner decision pending |
+| Q-192 | 6.4 | Decimal export; recorded by roadmap 6.4a; owner decision pending; the scale in force on `SeriesInfo` comes with decimal series in the durable backend |
+| Q-193 | 6.4 | Flag columns; recorded by roadmap 6.4a; owner decision pending |
+| Q-194 | 6.4 | Quality and state columns; recorded by roadmap 6.4a; owner decision pending |
+| Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
+| Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
+| Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -950,6 +1151,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
 | Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
 | Q-122 | A torn mark update could leave a mark older than the last one synced | `format.md` A.10 Update and Read, `spec.md` §3 Order of a start step 2 (settled by roadmap 4.7: every update between two mark syncs goes to the slot that does not hold the last synced mark, and a start writes the mark file again in place, as read, and syncs it before its own mark write, or, keeping the mark it read, writes that slot again and syncs it before the first update). Scenario: updates alternated between the slots whether or not the last was synced; with a timed mark sync, A held counter c, synced, and B c − 1; c + 1 went to B and c + 2 to A, neither synced, and a power loss that tore the write of c + 2 left A invalid and B at c − 1, older than the mark synced last. Rule 3 kept every complete batch, but the start took its id floor from that mark and the unsealed segments only, so an id defined after c − 1 in a batch then in a sealed segment was above the floor; the low floor was durable, in the recovery entry and in the new mark's highest series id, so ids would have been assigned again once roadmap 5.1 assigns above floors (`log/tests/recovery.rs`, `a_torn_mark_update_never_falls_back_past_the_last_synced_mark`) |
+| Q-150 | Canonical bytes of the zstd-compressed XOR fallback | `format-chunk.md` C.8 and C.10 (settled at the review of roadmap 6.1 by option (2): encodings 4 and 5 are one canonical class, compared by the XOR stream they hold; the payload is exactly one frame, no dictionary, no checksum, no skippable frame; no level or library is pinned; `chunk/src/block/tests.rs` `xor_class_is_one_canonical_class`); roadmap 6.5 measures a pure-Rust codec |
 | Q-121 | Series id 0 against an id floor of 0 | §2.1 `id`, `format.md` A.6 field 46 and A.10 `max_series_id` (settled by roadmap 5.1, which assigns ids: ids start at 1 and 0 names no series, so a highest id assigned or an id floor of 0 means none; the model's registry assigns from 1). Scenario: the model assigned ids from 0, so the mark's `max_series_id` and a recovery entry's id floor were 0 both in a store that had assigned no id and in one whose only series was id 0; read literally, "above every id floor" then forbade id 0 after a power loss in an empty store, and no reader of the floor could tell id 0 from none. Decoders do not refuse id 0, so files written before stay readable (`kvik/tests/durable.rs`, `ids_start_at_one_and_never_reuse_a_floor`) |
 
 ## Where the model differs from the specification

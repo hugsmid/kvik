@@ -39,6 +39,8 @@ log-writer      log   writer
 log-recovery    log   recovery
 log-reader      log   reader
 kvik-windows    kvik  windows
+chunk-properties chunk properties
+chunk-fuzz-inputs chunk fuzz_inputs
 '
 
 cd "$(dirname "$0")/.."
