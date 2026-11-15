@@ -162,7 +162,10 @@ bytes, on each platform, was not measured by the roadmap 2.2 spike.
 fails writes on demand), that each rewrite reaches the disk. If it does not, the proposed fallbacks are: for the
 manifest, rewrite it to a new file and rename it; for the log, copy the kept batches to a new segment and rename it;
 for a seal, the same copy before the rename to `.kvl`.
-To be settled on each platform with roadmap 4.8.
+To be settled on each platform. Roadmap 4.8 did not settle it: the check needs a device that fails writes on demand
+(on Linux, for example a device-mapper target that fails or drops writes) or power cuts, which its timing harness on
+a development machine and on cloud runners cannot give (`docs/measurements/4.8-commit-latency.md`, Pending). Moved to
+gate 4.9, with the owner's run on the target hardware.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -222,7 +225,7 @@ does not apply, and No deletion says nothing of it.
 files that hold its positions, the rest a lost range reported as `data_lost`), and how it is reported.
 
 ## Q-86 (b) — No space at a log write before any sync
-Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.8 (moved from 4.5).
+Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.8 (moved from 4.5); moved again, to gate 4.9, by 4.8 (see the end of the question).
 **Scenario.** (a) Free space is above the critical mark at the last check; another process then fills the file
 system, and creating the next preallocated segment (§3 Segments) fails with `ENOSPC`, leaving a partial `.open`
 file. Every acknowledged batch is durable and nothing has been written to the new file. (b) On a copy-on-write file
@@ -243,7 +246,10 @@ header.
 may find. (b) stays a write failure (`spec.md` §3 Segments); what remains is to confirm with the page-tracking fault
 file system of roadmap 4.5 that no acknowledged byte or dirty page is lost. **Roadmap 4.5** does not confirm it: its
 in-memory file system fails a write for lack of space only when a file grows, so a batch written into a preallocated
-segment never meets the case; it is confirmed by trials on a copy-on-write file system at roadmap 4.8.
+segment never meets the case; it is confirmed by trials on a copy-on-write file system at roadmap 4.8. **Roadmap 4.8**
+ran none: filling a copy-on-write file system needs a small volume of its own (a loop device with Btrfs, or a disk
+image with APFS), which its timing harness does not create, and filling the development machine's own disk is not
+an option. The trial moves to gate 4.9, with the owner's hardware run (`docs/measurements/4.8-commit-latency.md`).
 
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
@@ -456,8 +462,10 @@ passes. (e) The low mark uses the byte floor alone (`disk_low_bytes`); an unknow
 ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other series
 takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (g) Epoch 1. (h) A write or sync failure
 on the log: read-only; lack of space at the creation's syncs too, as a failed sync is never retried. (i) Both are the wall clock at commit, raised to the previous batch's commit time if it went
-back. (j) Not done; deferred to roadmap 4.8 with the device-cache check (A.13); nothing in the writer depends on
-it. (k) Mapping the log's waits and statistics onto the interface's is left to the item that puts the engine behind
+back. (j) Not done; deferred to roadmap 4.8 with the device-cache check (A.13). 4.8's harness times `FlushFileBuffers`
+on a cloud runner, which cannot show whether a device cache is flushed or a name survives a power loss; both need a
+Windows machine and power cuts, and move to gate 4.9 with the rest of this question
+(`docs/measurements/4.8-commit-latency.md`). Nothing in the writer depends on it. (k) Mapping the log's waits and statistics onto the interface's is left to the item that puts the engine behind
 the `kvik` interface. (l) Read whole; streaming the checksum is the change if a memory budget needs it. (m) Every
 failed rename or length change is retried every 10 seconds, for ever, with health degraded (`SealBlocked`); a failed
 write or sync of the seal is a fault.
@@ -507,14 +515,16 @@ lease file names, a void lease's included; an unreadable lease file counts as in
 the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
-(n) Measured by roadmap 4.8. (o) A start on the same boot writes the slot of the mark it read again in place and syncs it
+(n) Measured by roadmap 4.8 on macOS: 130–241 ms to open a store of 7–10 segments
+(446–639 MiB) again, after a clean shutdown with a warm page cache, against the 1 s budget; a cold cache, a crash and
+the Linux target are still to measure (`docs/measurements/4.8-commit-latency.md`). (o) A start on the same boot writes the slot of the mark it read again in place and syncs it
 before it resumes, in every mode, as `format.md` A.10 Update requires since Q-122; a reader is not held back
 meanwhile. (p) Left as it is: that later
 start writes the header again from the segment's first complete batch; a torn batch alone in the segment is deleted
 with it under (l) and not reported (`log/tests/recovery.rs`,
 `a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_start`).
 **Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (n) with
-4.8.
+the Linux target run of 4.8.
 To be settled at gate 4.9.
 
 ## Q-118 — The reader process and leases: points `spec.md` §7 and `format.md` A.2, A.10, A.13 and A.15 leave open
@@ -599,12 +609,12 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 | Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-52 (b) | 4.8 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform |
+| Q-52 (b) | 4.9 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform; moved from 4.8, as it needs a device that fails writes or power cuts |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
-| Q-86 (b) | 4.8 | Platform trials on a copy-on-write file system (moved from 4.5, see the question) |
+| Q-86 (b) | 4.9 | Platform trials on a copy-on-write file system (moved from 4.5 and then from 4.8, see the question) |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
@@ -619,8 +629,10 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
 | Q-121 | 5.1 | Series registry: ids are assigned there; recorded by roadmap 4.7 |
 
-Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
-on macOS only).
+Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
+measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
+runners. The figures on the Linux NVMe target are the owner's run, pending before gate 4.9
+(`docs/measurements/4.8-commit-latency.md`).
 
 ## For the format and interface documents
 The specification wins where the documents differ. These follow from it, for the checks of `docs/format.md` and
@@ -807,7 +819,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 | Q-86 (a) | No space when a log segment is created | §3 Segments (the partial file deleted, health critical, ingest waits, creation retried), `format.md` A.4 (open part: Q-86 (b)) |
-| Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3, Last batch written again (with the mark missing, unreadable or stale, the start writes the last complete batch, and its segment's header when it is the segment's first, again in place before the sync of step 3; kept only if that sync succeeds, else read-only; rests on the Q-52 (b) check at roadmap 4.8), Order of a start step 3, row 12a, `format.md` A.10 (No usable mark) and A.4 (a valid trailer found in an `.open` file is sealed again from step 1, the same hole after a failed seal sync), `api.md` Environment seams (the test file system reports per page whether a sync wrote it). Engine fault tests (roadmap 4.5, page-tracking file system): after a failed sync and a lost mark every position delivered after the restart is on disk at a power loss; the rewrite's sync fails; the same with an adopted recovery entry whose sync failed; a kill-loop property for invariant 2 over failed syncs, mark damage, restarts and power losses; the seal state found with a trailer after a failed `sync_all` |
+| Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3, Last batch written again (with the mark missing, unreadable or stale, the start writes the last complete batch, and its segment's header when it is the segment's first, again in place before the sync of step 3; kept only if that sync succeeds, else read-only; rests on the Q-52 (b) check, moved from roadmap 4.8 to gate 4.9), Order of a start step 3, row 12a, `format.md` A.10 (No usable mark) and A.4 (a valid trailer found in an `.open` file is sealed again from step 1, the same hole after a failed seal sync), `api.md` Environment seams (the test file system reports per page whether a sync wrote it). Engine fault tests (roadmap 4.5, page-tracking file system): after a failed sync and a lost mark every position delivered after the restart is on disk at a power loss; the rewrite's sync fails; the same with an adopted recovery entry whose sync failed; a kill-loop property for invariant 2 over failed syncs, mark damage, restarts and power losses; the seal state found with a trailer after a failed `sync_all` |
 | Q-93 (a) | A store nobody can open after the host's tzdata changes | §5.7 (readers and drills never refuse; calendar results computed with the reader's own release; a stored calendar node used only where its recorded release is the reader's; the writer checks the host release about once a minute and at each local midnight and adopts a new one without a restart, by a tzdata entry and a rebuild of the affected days), `api.md` Opening and Environment seams (open part: Q-93 (b), (c)) |
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |
 | Q-98 | Same boot identity after the page cache was lost | §3 Recovery rule 1 (a batch written only after the previous batch's sync and mark update; two or more complete batches beyond the mark on the same boot mean the mark is stale and rule 3 applies; accepted limit: one batch committed since the last mark sync can be lost unreported), invariant 10, `format.md` A.10, `api.md` `log.mark_sync` |

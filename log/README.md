@@ -37,3 +37,7 @@ smoke test on the real file system (`tests/threads.rs`), recovery and a kill loo
 variant run by `--ignored`), the reader process and leases, on threads and on both file systems, with a property test
 interleaving writer steps, crashes and refreshes (`tests/reader.rs`) and the fuzz entry point run over generated inputs (`tests/fuzz_inputs.rs`). The
 fuzz targets are in [`fuzz/`](fuzz/).
+
+Benchmark: `examples/commit_latency.rs` measures commit latency and throughput on a real file system (roadmap 4.8,
+[results](../docs/measurements/4.8-commit-latency.md)): `cargo run --release -p kvik-log --example commit_latency --
+<dir>`.

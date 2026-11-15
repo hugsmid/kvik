@@ -495,8 +495,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
 - Sync semantics are those of `spec.md` §3 Sync primitive and the roadmap 2.2 measurements. On Windows the flushed
   handle is the rule: the production `Fs` flushes the file after every create and rename, and `sync_dir` does nothing
   more. Windows is a development platform (`spec.md` §3 Sync primitive): whether a name made durable this way
-  survives a power loss, and whether `FlushFileBuffers` reaches the device cache, are checked at roadmap 4.8 (the
-  first moved from 4.4, Q-115 (j)), but neither decides whether Windows is accepted.
+  survives a power loss, and whether `FlushFileBuffers` reaches the device cache, are checked with the owner's
+  hardware run before gate 4.9 (moved from 4.4 and then 4.8, Q-115 (j)), but neither decides whether Windows is
+  accepted.
 - **Readers** use positional reads only and never map a file. All handles are opened sharing read, write and delete
   (std's default on Windows), so the writer's rename and length change succeed while readers hold a file. If a
   rename or length change still fails with a sharing error (another program), the seal is retried later, the segment

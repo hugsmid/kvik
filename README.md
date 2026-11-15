@@ -24,8 +24,10 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > - The [specification](docs/spec.md) is tagged **v0.2**.
 > - A slow, exact [reference model](model/) of its semantics exists, with property tests and edge-case tests; a few
 >   newer rules are not yet modelled ([coverage table](model/README.md#coverage)).
-> - Two measurements are recorded: [chunk encodings against Parquet](docs/measurements/2.1-chunk-encodings.md) and
->   [commit and sync latency](docs/measurements/2.2-commit-latency.md); gate 2.3 has looked at both.
+> - Three measurements are recorded: [chunk encodings against Parquet](docs/measurements/2.1-chunk-encodings.md),
+>   [commit and sync latency](docs/measurements/2.2-commit-latency.md) (gate 2.3 has looked at both) and the log
+>   writer's [commit latency and throughput](docs/measurements/4.8-commit-latency.md), on macOS only so far: the run
+>   on the Linux NVMe target that checks the delivery budget is pending.
 > - The public interface ([`kvik/`](kvik/)) is implemented on the reference model as an in-memory backend: **not
 >   durable, for development and tests**; nothing is written to disk yet.
 >
@@ -238,7 +240,9 @@ let w = reader.window(id, Window::rolling(Duration::from_secs(600)), Aggregate::
    ([results](docs/measurements/2.1-chunk-encodings.md)). Gate 2.3 kept the own format for compacted data, with
    per-value decimal exceptions and a compressed XOR fallback; gate 10.3 confirms it against Parquet at scale, and
    Parquet is for export only. Roadmap item 2.2 measured commit and sync latency, group commit, a failed sync and a
-   full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)).
+   full disk, so far on macOS only ([results](docs/measurements/2.2-commit-latency.md)); roadmap item 4.8 measured
+   the log writer itself there ([results](docs/measurements/4.8-commit-latency.md)), and its run on the Linux NVMe
+   target is pending.
 4. **The engine against the model.** Each part (log, delivery, compaction, summary tree, tiers, query) will be
    built behind injectable clock and file-system seams and tested differentially against the model, with crash points,
    failed syncs and full disks injected.

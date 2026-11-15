@@ -40,7 +40,9 @@ again; nothing after a gate starts before it is passed.
   to later items in Q-116)
 - [x] 4.6 Second-process reader and leases (in `kvik-log`; the interface `Reader`'s `facts` and series lookup moved to 5.1)
 - [x] 4.7 Differential tests: engine log against the model on generated histories
-- [ ] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/`
+- [x] 4.8 Benchmarks: commit latency and throughput, recorded in `docs/measurements/` (recorded on macOS; pending:
+  the run on the Linux NVMe target that checks the delivery budget, `scripts/bench-nvme.sh`, and the cloud-runner
+  figures of the `bench.yml` workflow; Q-52 (b), Q-86 (b) and Q-115 (j) moved to gate 4.9)
 - [ ] 4.9 **Gate** — log looked at as a whole
 
 ## 5. Delivery
