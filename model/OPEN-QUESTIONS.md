@@ -1171,11 +1171,12 @@ ordinary (`api.md` Backup and restore, Listings: absence from a listing proves n
 start (`format.md` A.14), so the gap is not visible. The plan is then made from fewer records: a file those records
 listed is missing from the restore, or the restored end is earlier, with nothing reported. A record that is listed
 but damaged fails the restore by name (`RestoreError::Envelope` or `Record`), as does a missing or damaged `STORE`.
-**Decided at the review of roadmap 8.3b, for a generation that lists no record at all.** A restore record is
-always epoch 1 of its generation, so the restore reads `record(g, 1)` by `stat`; if it is present the listing is
-incomplete and the restore fails with `RestoreError::ListingIncomplete { generation }`, to be retried, rather than
-falling back to an older generation and dropping everything in g. If it is absent, the generation counts as having
-no records (a claim whose restore stopped before its record). `backup/src/restore/driver.rs` `source_records`,
+**Decided at the review of roadmap 8.3b, for a generation that lists no record at all.** A generation's first
+record is epoch 1 (above generation 0, its restore record), so the restore reads `record(g, 1)` by `stat`, generation 0
+included; if it is present the listing is incomplete and the restore fails with
+`RestoreError::ListingIncomplete { generation }`, which `Store::restore` reports as `BackupError::Sink(Transient)`, to
+be retried, rather than falling back to an older generation and dropping everything in g. If it is absent, the
+generation counts as having no records (a claim whose restore stopped before its record). `backup/src/restore/driver.rs` `source_records`,
 `backup/tests/restore_guards.rs`.
 **Model.** Not modelled.
 **Needed.** A way to see a record missing from a listing that shows others: for example each uploaded record naming

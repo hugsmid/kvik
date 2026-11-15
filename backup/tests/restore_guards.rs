@@ -62,6 +62,19 @@ fn a_claim_rejected_after_a_marker_was_stored_takes_the_next_generation() {
 }
 
 #[test]
+fn the_three_claim_tries_count_per_generation() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let keys = Keys::new(ID);
+    sink.set(&keys.claim(1), Some(Fault::StoreThenMismatch));
+    sink.set(&keys.claim(2), Some(Fault::RejectPut(2)));
+    let fs = MemFs::new();
+    let (p, _) = restore(&mut restorer(sink.clone(), &fs, PlanMode::Full, KEY)).unwrap();
+    assert_eq!(p.record.generation, 2);
+    assert_eq!(sink.count("put", &keys.claim(2)), 3);
+}
+
+#[test]
 fn a_claim_rejected_three_times_with_nothing_stored_fails_and_skips_no_generation() {
     let mut src = source(ID, 2, false);
     let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
