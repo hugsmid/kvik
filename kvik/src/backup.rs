@@ -75,12 +75,18 @@ pub enum SinkError {
         key: String,
     },
     /// An object larger than one single-part upload allows (spec §8 Hashes).
-    #[error("object of {size} bytes is above the single-part limit of {limit}")]
+    #[error("object of {size} bytes is above the limit of {limit}")]
     TooLarge {
         /// The object's size.
         size: u64,
         /// The limit.
         limit: u64,
+    },
+    /// The sink's queue of calls is full; the call was not started.
+    #[error("the sink is busy: {queued} calls queued")]
+    Busy {
+        /// Calls queued.
+        queued: usize,
     },
     /// A fault that a later attempt may not meet: a timeout, a lost
     /// connection, a server error, throttling, or a download whose bytes do
@@ -103,7 +109,7 @@ pub enum SinkError {
 impl SinkError {
     /// Whether repeating the call may succeed.
     pub fn is_transient(&self) -> bool {
-        matches!(self, SinkError::Transient { .. })
+        matches!(self, SinkError::Transient { .. } | SinkError::Busy { .. })
     }
 }
 
@@ -111,22 +117,8 @@ impl SinkError {
 /// of any async runtime, so that `dyn BackupSink` works.
 pub type SinkFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SinkError>> + Send + 'a>>;
 
-/// The deep tier: an object store with no delete (spec §8). An S3-compatible
-/// implementation lives in the `kvik-sink` crate.
-///
-/// Keys are opaque to the sink. Every implementation keeps these rules:
-/// - **No overwrite.** `put` creates an object only where the key is absent.
-///   Where an object exists with the same size and reported SHA-256, `put`
-///   succeeds with what the bucket reports (an upload repeated after a lost
-///   reply or a restart); with other content it fails with
-///   [`SinkError::Exists`]. This is also the create-if-absent of generation
-///   claims (spec §8 Generations).
-/// - **Hashes.** `put` sends the SHA-256 with a single-part upload; the
-///   bucket must reject a mismatch ([`SinkError::HashMismatch`]). The
-///   returned [`Stored`] is what the bucket reports when asked after the
-///   upload, never the arguments echoed, and `put` fails with
-///   [`SinkError::HashMismatch`] where it differs from them.
-/// - **No delete.** The trait has none.
+/// The deep tier: an object store with no overwrite and no delete (spec §8).
+/// The rules every implementation keeps are in `docs/api.md` Backup and restore.
 pub trait BackupSink: Send + Sync {
     /// Stores an object if the key is absent (see the rules above).
     fn put<'a>(
@@ -149,6 +141,72 @@ pub trait BackupSink: Send + Sync {
         prefix: &'a str,
         start_after: Option<&'a str>,
     ) -> SinkFuture<'a, ListPage>;
+}
+
+/// Proof that the bucket reported the expected size and SHA-256 for a key
+/// when asked (spec §8 Hashes: "verified in another tier"); made only by
+/// [`Verified::check`]. It does not prove the bytes: a sampled download does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verified {
+    key: String,
+    stored: Stored,
+}
+
+impl Verified {
+    /// Asks the sink for the key's reported size and SHA-256 and returns a
+    /// proof only if they equal `expected`.
+    pub async fn check<S: BackupSink + ?Sized>(
+        sink: &S,
+        key: &str,
+        expected: &Stored,
+    ) -> Result<Verified, VerifyError> {
+        match sink.stat(key).await? {
+            Some(s) if &s == expected => Ok(Verified {
+                key: key.into(),
+                stored: s,
+            }),
+            reported => Err(VerifyError::Reported {
+                key: key.into(),
+                expected: expected.clone(),
+                reported,
+            }),
+        }
+    }
+
+    /// The key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// What the bucket reported.
+    pub fn stored(&self) -> &Stored {
+        &self.stored
+    }
+}
+
+/// Why a copy is not verified.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum VerifyError {
+    /// The sink failed.
+    #[error(transparent)]
+    Sink(#[from] SinkError),
+    /// The bucket reports something other than what was uploaded, or nothing.
+    #[error("{key}: the bucket reports {reported:?}, expected {expected:?}")]
+    Reported {
+        /// The key.
+        key: String,
+        /// What was uploaded.
+        expected: Stored,
+        /// What the bucket reports.
+        reported: Option<Stored>,
+    },
+    /// Downloaded bytes whose SHA-256 is not the expected one.
+    #[error("{key}: downloaded bytes do not have the expected SHA-256")]
+    Content {
+        /// The key.
+        key: String,
+    },
 }
 
 macro_rules! forward_sink {
@@ -256,6 +314,30 @@ mod tests {
         takes_generic(sink.clone());
         takes_generic(Box::new(Nothing) as Box<dyn BackupSink>);
         assert!(SinkError::Transient { reason: "x".into() }.is_transient());
+        assert!(SinkError::Busy { queued: 1 }.is_transient());
         assert!(!SinkError::Exists { key: "k".into() }.is_transient());
+    }
+
+    #[test]
+    fn verified_needs_the_reported_hash() {
+        let expected = Stored::new(1, [1; 32]);
+        let r = futures_ready(Verified::check(&Nothing, "k", &expected));
+        assert_eq!(
+            r,
+            Err(VerifyError::Reported {
+                key: "k".into(),
+                expected,
+                reported: None
+            })
+        );
+    }
+
+    fn futures_ready<F: Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match f.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("pending"),
+        }
     }
 }

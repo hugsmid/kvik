@@ -51,6 +51,7 @@ fn config() -> S3Config {
         FAKE_BUCKET,
         fake_credentials(),
     )
+    .with_plain_http(true)
 }
 
 #[test]

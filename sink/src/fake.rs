@@ -1,8 +1,5 @@
-//! [`FakeBucket`]: an in-memory bucket that answers the subset of the S3
-//! protocol the client uses, at the [`Transport`] seam, with faults that a
-//! test injects. It checks signatures, payload hashes and checksums, honours
-//! `If-None-Match: *`, serves ranges and pages listings, as a bucket must for
-//! the sink's rules to hold.
+//! [`FakeBucket`]: an in-memory bucket answering the client's protocol subset
+//! at the [`Transport`] seam, with injected faults; see the crate README.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -12,8 +9,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use sha2::{Digest, Sha256};
 
+use crate::config::S3Config;
 use crate::retry::{Pause, RetryPolicy, SystemWallClock};
-use crate::s3::{S3Config, S3Sink};
+use crate::s3::S3Sink;
 use crate::sigv4::{self, Credentials, ToSign};
 use crate::transport::{Method, Request, Response, Transport, TransportError};
 use crate::xml;
@@ -98,6 +96,7 @@ struct State {
     faults: VecDeque<(FakeOp, Fault)>,
     checksums: Checksums,
     corrupt_on_store: bool,
+    bucket_missing: bool,
     list_lag: u64,
     list_calls: u64,
     log: Vec<(Method, String)>,
@@ -110,8 +109,8 @@ struct State {
 #[derive(Clone, Default)]
 pub struct FakeBucket {
     state: Arc<Mutex<State>>,
-    /// While true, requests wait before reaching the bucket.
-    held: Arc<(Mutex<bool>, Condvar)>,
+    /// Whether requests are held, and how many wait.
+    held: Arc<(Mutex<(bool, usize)>, Condvar)>,
 }
 
 impl std::fmt::Debug for FakeBucket {
@@ -148,9 +147,13 @@ impl FakeBucket {
     /// A configuration for this fake: its endpoint, bucket, region and
     /// credentials, path-style, with a retry policy of six attempts.
     pub fn config(&self) -> S3Config {
-        S3Config::new(FAKE_ENDPOINT, FAKE_REGION, FAKE_BUCKET, fake_credentials()).with_retry(
-            RetryPolicy::new(6, Duration::from_millis(100), Duration::from_secs(5)),
-        )
+        S3Config::new(FAKE_ENDPOINT, FAKE_REGION, FAKE_BUCKET, fake_credentials())
+            .with_plain_http(true)
+            .with_retry(RetryPolicy::new(
+                6,
+                Duration::from_millis(100),
+                Duration::from_secs(5),
+            ))
     }
 
     /// A sink over this fake with [`config`](Self::config) whose pauses are
@@ -181,13 +184,23 @@ impl FakeBucket {
     /// that does not answer, until [`release`](Self::release). A sink's
     /// exchange timeout does not apply to the fake.
     pub fn hold(&self) {
-        *self.held.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.held.0.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
     }
 
     /// Lets held requests, and later ones, through.
     pub fn release(&self) {
-        *self.held.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.held.0.lock().unwrap_or_else(|e| e.into_inner()).0 = false;
         self.held.1.notify_all();
+    }
+
+    /// Requests waiting because of [`hold`](Self::hold).
+    pub fn waiting(&self) -> usize {
+        self.held.0.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    /// Drops the faults still queued.
+    pub fn clear_faults(&self) {
+        self.lock().faults.clear();
     }
 
     /// Faults still queued.
@@ -204,6 +217,11 @@ impl FakeBucket {
     /// hash of what it stored.
     pub fn set_corrupt_on_store(&self, on: bool) {
         self.lock().corrupt_on_store = on;
+    }
+
+    /// Answers every request as if the bucket did not exist.
+    pub fn set_bucket_missing(&self, missing: bool) {
+        self.lock().bucket_missing = missing;
     }
 
     /// Keeps each later upload out of the next `calls` listings, as a bucket
@@ -352,9 +370,11 @@ impl Transport for FakeBucket {
         {
             let (lock, cvar) = &*self.held;
             let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-            while *held {
+            held.1 += 1;
+            while held.0 {
                 held = cvar.wait(held).unwrap_or_else(|e| e.into_inner());
             }
+            held.1 -= 1;
         }
         let target = req.url();
         let fault = {
@@ -386,6 +406,13 @@ impl Transport for FakeBucket {
             _ => {}
         }
         let mut resp = self.handle(req);
+        if resp.body.len() as u64 > req.max_response {
+            return Err(TransportError::Fatal(format!(
+                "response body of {} bytes above the limit of {}",
+                resp.body.len(),
+                req.max_response
+            )));
+        }
         match fault {
             Some(Fault::TimeoutAfter) => Err(TransportError::Timeout(
                 "injected, after the request".into(),
@@ -422,7 +449,14 @@ impl FakeBucket {
         let Some(key) = percent_decode(raw_key) else {
             return error(400, "InvalidURI", "bad percent-encoding");
         };
+        if self.lock().bucket_missing {
+            return match req.method {
+                Method::Head => Response::new(404, Vec::new(), Vec::new()),
+                _ => error(404, "NoSuchBucket", "no such bucket"),
+            };
+        }
         match (req.method, key.is_empty()) {
+            (Method::Head, true) => Response::new(200, Vec::new(), Vec::new()),
             (Method::Put, false) => self.put(req, &key, body),
             (Method::Head, false) => self.head(req, &key),
             (Method::Get, false) => self.get(req, &key),

@@ -28,8 +28,12 @@ impl Method {
     }
 }
 
-/// One signed request.
-#[derive(Clone, Debug)]
+/// The largest response body read for anything but an object's bytes
+/// (errors, listings, replies to uploads).
+pub const META_BODY_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// One signed request. `Debug` hides credentials.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Request {
     /// The method.
@@ -44,6 +48,33 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     /// The body of a `PUT`.
     pub body: Option<Arc<[u8]>>,
+    /// The largest response body to read; a longer one is
+    /// [`TransportError::Fatal`].
+    pub max_response: u64,
+}
+
+const SECRET_HEADERS: [&str; 2] = ["authorization", "x-amz-security-token"];
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                let hidden = SECRET_HEADERS.iter().any(|s| k.eq_ignore_ascii_case(s));
+                (k.as_str(), if hidden { ".." } else { v.as_str() })
+            })
+            .collect();
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("origin", &self.origin)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("headers", &headers)
+            .field("body_len", &self.body.as_ref().map(|b| b.len()))
+            .field("max_response", &self.max_response)
+            .finish()
+    }
 }
 
 impl Request {
@@ -64,7 +95,14 @@ impl Request {
             query,
             headers,
             body,
+            max_response: META_BODY_LIMIT,
         }
+    }
+
+    /// Sets the largest response body to read.
+    pub fn with_max_response(mut self, limit: u64) -> Self {
+        self.max_response = limit;
+        self
     }
 
     /// The value of a header, by its lower-case name.
@@ -157,13 +195,12 @@ pub trait Transport: Send + Sync {
 /// followed: a signed request goes to its endpoint only.
 pub struct HttpTransport {
     agent: ureq::Agent,
-    max_body: u64,
 }
 
 impl HttpTransport {
     /// A transport with a connect timeout and a timeout for each whole
-    /// exchange, reading bodies of at most `max_body` bytes.
-    pub fn new(connect_timeout: Duration, exchange_timeout: Duration, max_body: u64) -> Self {
+    /// exchange.
+    pub fn new(connect_timeout: Duration, exchange_timeout: Duration) -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .proxy(None)
@@ -173,16 +210,13 @@ impl HttpTransport {
             .build();
         HttpTransport {
             agent: ureq::Agent::new_with_config(config),
-            max_body,
         }
     }
 }
 
 impl std::fmt::Debug for HttpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpTransport")
-            .field("max_body", &self.max_body)
-            .finish()
+        f.debug_struct("HttpTransport").finish_non_exhaustive()
     }
 }
 
@@ -202,7 +236,8 @@ impl Transport for HttpTransport {
         let mut builder = ureq::http::Request::builder()
             .method(request.method.as_str())
             .uri(request.url());
-        // `host` is sent as signed; the client then adds none of its own.
+        // A `host` header given here stops the client adding its own, so the
+        // signed value is the one sent.
         for (k, v) in &request.headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
@@ -238,7 +273,7 @@ impl Transport for HttpTransport {
             response
                 .body_mut()
                 .with_config()
-                .limit(self.max_body)
+                .limit(request.max_response)
                 .read_to_vec()
                 .map_err(map_error)?
         };
@@ -247,5 +282,31 @@ impl Transport for HttpTransport {
             headers,
             body,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_debug_hides_credentials() {
+        let r = Request::new(
+            Method::Get,
+            "http://objects.test",
+            "/b/k",
+            Vec::new(),
+            vec![
+                ("host".into(), "objects.test".into()),
+                ("authorization".into(), "SIGNATURE-VALUE".into()),
+                ("x-amz-security-token".into(), "TOKEN-VALUE".into()),
+            ],
+            Some(Arc::from(&b"BODY-VALUE"[..])),
+        );
+        let s = format!("{r:?}");
+        assert!(s.contains("objects.test"));
+        for secret in ["SIGNATURE-VALUE", "TOKEN-VALUE", "BODY-VALUE"] {
+            assert!(!s.contains(secret), "{s}");
+        }
     }
 }

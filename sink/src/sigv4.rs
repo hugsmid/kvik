@@ -213,9 +213,8 @@ mod tests {
         Credentials::new("TESTKEYID0000000", "test/secret+key/0000000000000000000000")
     }
 
-    // The expected values below were computed by a separate implementation
-    // of the signing algorithm written from its published description (not
-    // by this code), for placeholder credentials and a reserved host name.
+    // Expected values from a separate implementation of the algorithm, not
+    // this code; placeholder credentials, reserved host name.
 
     #[test]
     fn signs_a_conditional_put_with_a_checksum() {

@@ -2,126 +2,28 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use kvik::{BackupSink, ListPage, SinkError, SinkFuture, Stored};
 use sha2::{Digest, Sha256};
 
-use crate::retry::{Jitter, Pause, RetryPolicy, SystemWallClock, ThreadSleep, WallClock};
-use crate::sigv4::{self, Credentials, EMPTY_SHA256, ToSign};
-use crate::transport::{HttpTransport, Method, Request, Response, Transport, TransportError};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::config::{Addressing, S3Config};
+use crate::retry::{Jitter, Pause, SystemWallClock, ThreadSleep, WallClock};
+use crate::sigv4::{self, EMPTY_SHA256, ToSign};
+use crate::transport::{
+    HttpTransport, META_BODY_LIMIT, Method, Request, Response, Transport, TransportError,
+};
 use crate::worker::Pool;
 use crate::xml;
-
-/// The largest object one single-part upload may hold: 5 GiB.
-pub const SINGLE_PART_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
 /// The longest key the protocol allows, in bytes.
 const MAX_KEY_LEN: usize = 1024;
 
-/// How the bucket is named in a request.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Addressing {
-    /// `https://endpoint/bucket/key`.
-    #[default]
-    Path,
-    /// `https://bucket.endpoint/key`.
-    VirtualHost,
-}
-
-/// How to reach a bucket, and how hard to try.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct S3Config {
-    /// `https://host[:port]` (or `http://` for a local endpoint), no path.
-    pub endpoint: String,
-    /// The region the signature names.
-    pub region: String,
-    /// The bucket. It must have versioning or object lock (spec §8 Bucket).
-    pub bucket: String,
-    /// Access credentials.
-    pub credentials: Credentials,
-    /// Path-style (the default) or virtual-host addressing.
-    pub addressing: Addressing,
-    /// Connection set-up limit, TLS included. Default 10 s.
-    pub connect_timeout: Duration,
-    /// Limit on one whole exchange, body included. Default 10 minutes, enough
-    /// for a 64 MiB segment at about 110 kB/s.
-    pub exchange_timeout: Duration,
-    /// Retries of transient faults.
-    pub retry: RetryPolicy,
-    /// Worker threads, that is, calls in flight at once. Default 2.
-    pub workers: usize,
-    /// The largest object `put` accepts; at most [`SINGLE_PART_LIMIT`].
-    pub max_object_size: u64,
-    /// Keys asked for per listing page, 1 to 1,000. Default 1,000.
-    pub list_page: u32,
-}
-
-impl S3Config {
-    /// A configuration with the defaults above.
-    pub fn new(
-        endpoint: impl Into<String>,
-        region: impl Into<String>,
-        bucket: impl Into<String>,
-        credentials: Credentials,
-    ) -> Self {
-        S3Config {
-            endpoint: endpoint.into(),
-            region: region.into(),
-            bucket: bucket.into(),
-            credentials,
-            addressing: Addressing::Path,
-            connect_timeout: Duration::from_secs(10),
-            exchange_timeout: Duration::from_secs(600),
-            retry: RetryPolicy::default(),
-            workers: 2,
-            max_object_size: SINGLE_PART_LIMIT,
-            list_page: 1000,
-        }
-    }
-
-    /// Sets the addressing style.
-    pub fn with_addressing(mut self, addressing: Addressing) -> Self {
-        self.addressing = addressing;
-        self
-    }
-
-    /// Sets the connect and exchange timeouts.
-    pub fn with_timeouts(mut self, connect: Duration, exchange: Duration) -> Self {
-        self.connect_timeout = connect;
-        self.exchange_timeout = exchange;
-        self
-    }
-
-    /// Sets the retry policy.
-    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
-        self
-    }
-
-    /// Sets the number of worker threads.
-    pub fn with_workers(mut self, workers: usize) -> Self {
-        self.workers = workers;
-        self
-    }
-
-    /// Sets the largest object `put` accepts (capped at
-    /// [`SINGLE_PART_LIMIT`]).
-    pub fn with_max_object_size(mut self, size: u64) -> Self {
-        self.max_object_size = size.min(SINGLE_PART_LIMIT);
-        self
-    }
-
-    /// Sets the listing page size (1 to 1,000).
-    pub fn with_list_page(mut self, keys: u32) -> Self {
-        self.list_page = keys.clamp(1, 1000);
-        self
-    }
-}
+/// The most of a server's error code and message copied into an error.
+const MAX_ERROR_TEXT: usize = 200;
 
 fn failed(reason: impl Into<String>) -> SinkError {
     SinkError::Failed {
@@ -135,42 +37,8 @@ fn transient(reason: impl Into<String>) -> SinkError {
     }
 }
 
-/// Splits `scheme://authority` and checks it has no path or query.
-fn parse_endpoint(endpoint: &str) -> Result<(&'static str, String), SinkError> {
-    let (scheme, rest) = if let Some(r) = endpoint.strip_prefix("https://") {
-        ("https", r)
-    } else if let Some(r) = endpoint.strip_prefix("http://") {
-        ("http", r)
-    } else {
-        return Err(failed(format!(
-            "endpoint {endpoint:?} must start with https:// or http://"
-        )));
-    };
-    let authority = rest.strip_suffix('/').unwrap_or(rest);
-    if authority.is_empty()
-        || authority.contains(['/', '?', '#', '@'])
-        || authority.chars().any(char::is_whitespace)
-    {
-        return Err(failed(format!(
-            "endpoint {endpoint:?} must be scheme://host[:port] with no path"
-        )));
-    }
-    Ok((scheme, authority.to_ascii_lowercase()))
-}
-
-/// The backup sink over S3-compatible object storage.
-///
-/// Every call runs on the sink's own worker threads (named `kvik-sink-N`),
-/// which retry transient faults with backoff; the futures it returns only
-/// wait for a worker's result, so they never block when polled and need no
-/// async runtime. A call runs to the end even if its future is dropped.
-/// Dropping the sink waits for the calls already queued.
-///
-/// Uploads are single-part, conditional (`If-None-Match: *`) and carry the
-/// SHA-256 as `x-amz-checksum-sha256`, which the bucket must check; `put`
-/// then asks for the object's reported size and SHA-256 and returns those.
-/// The bucket must honour conditional writes and report whole-object
-/// SHA-256 checksums; spec §13 lists checking this as a risk to measure.
+/// The backup sink over S3-compatible object storage; calls run, with retries,
+/// on its worker threads (`kvik-sink-N`). Rules: `docs/api.md` Backup and restore.
 pub struct S3Sink {
     inner: Arc<Inner>,
     pool: Pool,
@@ -192,14 +60,14 @@ struct Inner {
     clock: Arc<dyn WallClock>,
     pause: Arc<dyn Pause>,
     jitter: Jitter,
+    /// The bucket answered a `HEAD`, so a key's 404 means the key is absent.
+    bucket_seen: AtomicBool,
 }
 
 impl S3Sink {
     /// A sink over HTTP, with the system clock and real pauses.
     pub fn new(config: S3Config) -> Result<Self, SinkError> {
-        let max_body = config.max_object_size.max(16 * 1024 * 1024);
-        let transport =
-            HttpTransport::new(config.connect_timeout, config.exchange_timeout, max_body);
+        let transport = HttpTransport::new(config.connect_timeout, config.exchange_timeout);
         Self::with_seams(
             config,
             Arc::new(transport),
@@ -230,14 +98,8 @@ impl S3Sink {
         clock: Arc<dyn WallClock>,
         pause: Arc<dyn Pause>,
     ) -> Result<Self, SinkError> {
-        let (scheme, authority) = parse_endpoint(&config.endpoint)?;
-        if config.bucket.is_empty() || config.bucket.contains(['/', '?', '#']) {
-            return Err(failed(format!("invalid bucket name {:?}", config.bucket)));
-        }
-        if config.region.is_empty() || config.region.contains('/') {
-            return Err(failed(format!("invalid region {:?}", config.region)));
-        }
-        let pool = Pool::new(config.workers, "kvik-sink")?;
+        let (scheme, authority) = config.validate()?;
+        let pool = Pool::new(config.workers, config.queue, "kvik-sink")?;
         let inner = Arc::new(Inner {
             jitter: Jitter::new(crate::retry::random_seed()),
             cfg: config,
@@ -246,6 +108,7 @@ impl S3Sink {
             transport,
             clock,
             pause,
+            bucket_seen: AtomicBool::new(false),
         });
         Ok(S3Sink { inner, pool })
     }
@@ -283,10 +146,7 @@ impl BackupSink for S3Sink {
         }
         let inner = Arc::clone(&self.inner);
         let key = key.to_owned();
-        Box::pin(
-            self.pool
-                .run(move || inner.retry(|| inner.put_attempt(&key, &bytes, sha256))),
-        )
+        Box::pin(self.pool.run(move || inner.put(&key, &bytes, sha256)))
     }
 
     fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>> {
@@ -350,6 +210,20 @@ impl Inner {
         }
     }
 
+    /// The first attempt uploads; a later one asks first, so that a lost
+    /// reply or a failed read-back does not send the body again.
+    fn put(&self, key: &str, bytes: &Arc<[u8]>, sha256: [u8; 32]) -> Result<Stored, SinkError> {
+        let mut first = true;
+        self.retry(|| {
+            if !std::mem::take(&mut first)
+                && let Some(s) = self.head(key)?
+            {
+                return same_or_exists(key, s, bytes.len() as u64, sha256);
+            }
+            self.put_attempt(key, bytes, sha256)
+        })
+    }
+
     fn request(
         &self,
         method: Method,
@@ -407,6 +281,7 @@ impl Inner {
             query,
             headers,
             body,
+            max_response: META_BODY_LIMIT,
         }
     }
 
@@ -428,7 +303,12 @@ impl Inner {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let what = format!("status {} {code} {message}", resp.status);
+        let what = format!(
+            "status {} {} {}",
+            resp.status,
+            clip(&code, MAX_ERROR_TEXT),
+            clip(&message, MAX_ERROR_TEXT)
+        );
         let what = what.trim_end();
         match (resp.status, code.as_str()) {
             (400, "BadDigest" | "XAmzContentSHA256Mismatch" | "InvalidDigest")
@@ -467,15 +347,39 @@ impl Inner {
             412 => true,
             _ => return Err(self.status_error(key, &resp, Op::Put)),
         };
-        // Ask the bucket what it holds now, rather than trust the reply.
         let size = bytes.len() as u64;
         match self.head(key)? {
+            Some(s) if existed => same_or_exists(key, s, size, sha256),
             Some(s) if s.size == size && s.sha256 == sha256 => Ok(s),
-            Some(_) if existed => Err(SinkError::Exists { key: key.into() }),
             Some(_) => Err(SinkError::HashMismatch { key: key.into() }),
             None => Err(transient(format!(
                 "{key} not found just after its upload was accepted"
             ))),
+        }
+    }
+
+    /// Whether the bucket exists, asked once per sink; a missing bucket is
+    /// `Failed`, never an absent key.
+    fn check_bucket(&self) -> Result<(), SinkError> {
+        if self.bucket_seen.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let request = self.request(
+            Method::Head,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            EMPTY_SHA256,
+        );
+        let resp = self.send(&request)?;
+        match resp.status {
+            200 => {
+                self.bucket_seen.store(true, Ordering::Release);
+                Ok(())
+            }
+            404 => Err(failed(format!("bucket {} not found", self.cfg.bucket))),
+            _ => Err(self.status_error(&self.cfg.bucket, &resp, Op::Head)),
         }
     }
 
@@ -502,7 +406,10 @@ impl Inner {
                 })?;
                 Ok(Some(Stored::new(size, sha256)))
             }
-            404 => Ok(None),
+            404 => {
+                self.check_bucket()?;
+                Ok(None)
+            }
             _ => Err(self.status_error(key, &resp, Op::Head)),
         }
     }
@@ -516,7 +423,6 @@ impl Inner {
                 return Err(invalid());
             }
             if r.start == r.end {
-                // No bytes to ask for: only whether the range is within.
                 return match self.head(key)? {
                     None => Err(not_found()),
                     Some(s) if r.start <= s.size => Ok(Vec::new()),
@@ -528,14 +434,20 @@ impl Inner {
                 format!("bytes={}-{}", r.start, r.end - 1),
             )];
         }
-        let request = self.request(
-            Method::Get,
-            Some(key),
-            Vec::new(),
-            extra,
-            None,
-            EMPTY_SHA256,
-        );
+        let limit = match &range {
+            Some(r) => r.end - r.start,
+            None => self.cfg.max_object_size,
+        };
+        let request = self
+            .request(
+                Method::Get,
+                Some(key),
+                Vec::new(),
+                extra,
+                None,
+                EMPTY_SHA256,
+            )
+            .with_max_response(limit.max(META_BODY_LIMIT));
         let resp = self.send(&request)?;
         let declared = resp
             .header("content-length")
@@ -550,9 +462,12 @@ impl Inner {
         }
         match (resp.status, range) {
             (200, None) => {
-                if let Some(reported) = reported_sha256(&resp)
-                    && <[u8; 32]>::from(Sha256::digest(&resp.body)) != reported
-                {
+                let reported = reported_sha256(&resp).ok_or_else(|| {
+                    failed(format!(
+                        "the bucket reported no whole-object SHA-256 for {key}"
+                    ))
+                })?;
+                if <[u8; 32]>::from(Sha256::digest(&resp.body)) != reported {
                     return Err(transient(format!(
                         "{key}: downloaded bytes do not match the reported SHA-256"
                     )));
@@ -583,7 +498,6 @@ impl Inner {
                 body.truncate((r.end - r.start) as usize);
                 Ok(body)
             }
-            // A server that ignores `Range` sends the whole object.
             (200, Some(r)) => {
                 if r.end > resp.body.len() as u64 {
                     return Err(invalid());
@@ -591,7 +505,7 @@ impl Inner {
                 Ok(resp.body[r.start as usize..r.end as usize].to_vec())
             }
             (416, _) => Err(invalid()),
-            (404, _) => Err(not_found()),
+            (404, _) if error_code(&resp).as_deref() == Some("NoSuchKey") => Err(not_found()),
             _ => Err(self.status_error(key, &resp, Op::Get)),
         }
     }
@@ -612,10 +526,21 @@ impl Inner {
         }
         let body =
             std::str::from_utf8(&resp.body).map_err(|_| failed("a listing that is not UTF-8"))?;
+        let rooted = (body.contains("<ListBucketResult>") || body.contains("<ListBucketResult "))
+            && body.contains("</ListBucketResult>");
+        if !rooted {
+            return Err(failed("the reply to a listing is not a listing"));
+        }
         let keys = xml::elements(body, "Key").map_err(|e| failed(format!("listing: {e}")))?;
-        let more = xml::element(body, "IsTruncated")
+        let more = match xml::element(body, "IsTruncated")
             .map_err(|e| failed(format!("listing: {e}")))?
-            .is_some_and(|v| v.trim() == "true");
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(failed("listing: no IsTruncated")),
+        };
         let mut previous = start_after;
         for k in &keys {
             if !k.starts_with(prefix) || previous.is_some_and(|p| k.as_str() <= p) {
@@ -629,6 +554,28 @@ impl Inner {
             return Err(failed("listing: truncated page with no keys"));
         }
         Ok(ListPage::new(keys, more))
+    }
+}
+
+fn same_or_exists(key: &str, s: Stored, size: u64, sha256: [u8; 32]) -> Result<Stored, SinkError> {
+    if s.size == size && s.sha256 == sha256 {
+        Ok(s)
+    } else {
+        Err(SinkError::Exists { key: key.into() })
+    }
+}
+
+fn error_code(resp: &Response) -> Option<String> {
+    xml::element(&String::from_utf8_lossy(&resp.body), "Code")
+        .ok()
+        .flatten()
+}
+
+/// At most `n` characters of `s`.
+fn clip(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
     }
 }
 
@@ -661,24 +608,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoints_are_checked() {
-        assert_eq!(
-            parse_endpoint("https://Objects.test:9000/").unwrap(),
-            ("https", "objects.test:9000".to_owned())
-        );
-        assert_eq!(parse_endpoint("http://objects.test").unwrap().0, "http");
-        for bad in [
-            "objects.test",
-            "https://",
-            "https://a/b",
-            "ftp://a",
-            "https://u@a",
-        ] {
-            assert!(parse_endpoint(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn content_range_is_parsed() {
         assert_eq!(
             parse_content_range("bytes 0-9/100"),
@@ -686,5 +615,11 @@ mod tests {
         );
         assert_eq!(parse_content_range("bytes 5-6/*"), Some((5, 6, None)));
         assert_eq!(parse_content_range("items 0-9/100"), None);
+    }
+
+    #[test]
+    fn error_text_is_clipped_on_a_character_boundary() {
+        assert_eq!(clip("ab", 5), "ab");
+        assert_eq!(clip("åbc", 2), "åb");
     }
 }

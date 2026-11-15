@@ -88,7 +88,6 @@ impl Jitter {
 
     pub(crate) fn apply(&self, d: Duration) -> Duration {
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        // xorshift64
         *s ^= *s << 13;
         *s ^= *s >> 7;
         *s ^= *s << 17;

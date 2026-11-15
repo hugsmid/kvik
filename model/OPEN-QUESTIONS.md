@@ -672,6 +672,7 @@ attached (AC-25); (c) the restore life cycle (AC-24). None can be decided withou
 **Model.** Not modelled.
 **Needed.** (a) and (b) settled with 8.1, (c) with 8.3. Suggested for (a): `facts` does not fetch; detail not local
 is reported as such and fetched by an asynchronous `Store` call on the maintenance thread.
+
 ## Q-170 — Durability levels chosen per source
 
 Decided by the owner: a source may choose between the default level, where a reading is acknowledged only after the

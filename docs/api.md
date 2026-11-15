@@ -410,7 +410,8 @@ pub trait BackupSink: Send + Sync {                                 // object-sa
 pub struct Stored { pub size: u64, pub sha256: [u8; 32] }           // as the bucket reports it
 pub struct ListPage { pub keys: Vec<String>, pub more: bool }       // ascending; ask again after the last key
 pub enum SinkError { Exists { key }, NotFound { key }, HashMismatch { key }, InvalidRange { key },
-                     TooLarge { size, limit }, Transient { reason }, Failed { reason } }
+                     TooLarge { size, limit }, Busy { queued }, Transient { reason }, Failed { reason } }
+pub struct Verified { .. }       // Verified::check(sink, key, &expected).await: the bucket reported `expected`
 store.attach_backup(sink, Encryption::Key(key)).await?;
 let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode::SummariesFirst).await?;
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
@@ -427,9 +428,12 @@ only, boxed `Send` futures):
 - **Ranges** are half-open; an empty range within the object returns no bytes; one past its end is `InvalidRange`.
 - **Listings** are paged and may lag behind writes on some buckets: absence from a listing proves nothing, and `put`
   alone decides whether a key is taken.
-- `Transient` faults (timeouts, lost connections, server errors, throttling, damaged downloads) may be retried; a
-  `put` that failed this way may have stored the object, and repeating it is safe. `BackupError::Sink` carries a
-  `SinkError`.
+- `Transient` faults (timeouts, lost connections, server errors, throttling, damaged downloads) and `Busy` (the
+  sink's queue is full) may be retried; a `put` that failed this way may have stored the object, and repeating it
+  is safe. `BackupError::Sink` carries a `SinkError`.
+- **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
+  SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
+  which the sampled download checks. Eviction (roadmap 8.1) requires one.
 
 The S3-compatible implementation, its retries and timeouts, and an in-memory fake bucket with injected faults are in
 the `kvik-sink` crate. The object keys, the uploaded form of a manifest record, the claim marker and the encryption

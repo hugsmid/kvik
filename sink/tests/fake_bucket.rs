@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kvik::{BackupSink, ListPage, SinkError, Stored};
 use kvik_sink::fake::{Checksums, FakeBucket, FakeOp, Fault};
+use kvik_sink::transport::{Request, Response, Transport, TransportError};
 use kvik_sink::verify::{self, VerifyError, sha256};
 use kvik_sink::{Addressing, RetryPolicy, S3Sink, block_on};
 
@@ -60,16 +61,13 @@ fn put_never_overwrites_and_a_repeat_is_idempotent() {
     let bucket = FakeBucket::new();
     let sink = bucket.sink();
     let first = put(&sink, "claims/00000001", b"restore A").unwrap();
-    // The same content again (a repeat after a restart): accepted.
     assert_eq!(put(&sink, "claims/00000001", b"restore A").unwrap(), first);
-    // Other content: refused, and the object is unchanged.
     assert_eq!(
         put(&sink, "claims/00000001", b"restore B"),
         Err(SinkError::Exists {
             key: "claims/00000001".into()
         })
     );
-    // Same size, other bytes: still refused.
     assert!(matches!(
         put(&sink, "claims/00000001", b"restore C"),
         Err(SinkError::Exists { .. })
@@ -90,7 +88,6 @@ fn a_wrong_hash_is_rejected_and_nothing_is_stored() {
         })
     );
     assert_eq!(bucket.object("data/x"), None);
-    // Not retried: a mismatch is not transient.
     assert_eq!(bucket.count(FakeOp::Put), 1);
 }
 
@@ -114,26 +111,19 @@ fn a_bucket_that_stores_other_bytes_fails_the_upload() {
 
 #[test]
 fn a_bucket_that_does_not_check_is_caught_by_the_sampled_download() {
-    // A bucket that trusts the sent hash reports it without checking. The
-    // bytes arrive damaged; the upload looks verified by reported hash, and
-    // only the download check (spec §8 Hashes) finds the damage.
+    // spec §8 Hashes: only the sampled download finds damage a bucket that trusts the sent hash hides.
     let bucket = FakeBucket::new();
     bucket.set_checksums(Checksums::Trusted);
     let sink = bucket.sink();
     let good = b"the real ciphertext";
     let copy = block_on(verify::upload(&sink, "data/t", bytes(good))).unwrap();
     assert!(bucket.damage("data/t"));
-    // The reported hash still matches: the scheduled check alone passes.
     assert!(block_on(verify::check(&sink, "data/t", copy.stored())).is_ok());
-    // A whole download is checked against the reported hash by the client
-    // and fails transiently after every attempt; the sampled check reports it.
     let r = block_on(verify::download(&sink, "data/t", sha256(good)));
     assert!(matches!(
         r,
         Err(VerifyError::Sink(SinkError::Transient { .. }))
     ));
-    // A ranged read carries no whole-object hash; the engine's plaintext
-    // check is what catches damage there.
     assert_eq!(
         block_on(sink.get("data/t", Some(1..4))).unwrap(),
         good[1..4].to_vec()
@@ -143,8 +133,13 @@ fn a_bucket_that_does_not_check_is_caught_by_the_sampled_download() {
 #[test]
 fn a_bucket_that_reports_no_checksum_is_refused() {
     let bucket = FakeBucket::new();
-    bucket.set_checksums(Checksums::NotReported);
     let sink = bucket.sink();
+    put(&sink, "data/old", b"x").unwrap();
+    bucket.set_checksums(Checksums::NotReported);
+    assert!(matches!(
+        block_on(sink.get("data/old", None)),
+        Err(SinkError::Failed { .. })
+    ));
     assert!(matches!(
         put(&sink, "data/n", b"x"),
         Err(SinkError::Failed { .. })
@@ -166,7 +161,6 @@ fn server_errors_are_retried_with_growing_pauses() {
     assert_eq!(bucket.count(FakeOp::Put), 4);
     let p = bucket.pauses();
     assert_eq!(p.len(), 3);
-    // Equal jitter around 100, 200 and 400 ms.
     for (d, base) in p.iter().zip([100u64, 200, 400]) {
         let base = Duration::from_millis(base);
         assert!(*d >= base / 2 && *d <= base, "{d:?} for {base:?}");
@@ -228,9 +222,129 @@ fn a_lost_reply_after_the_upload_is_repeated_safely() {
     bucket.inject(FakeOp::Put, Fault::TimeoutAfter);
     let stored = put(&sink, "data/l", b"once").unwrap();
     assert_eq!(stored, Stored::new(4, sha256(b"once")));
-    // The retry met the object the first attempt stored (412) and accepted it.
-    assert_eq!(bucket.count(FakeOp::Put), 2);
+    assert_eq!(bucket.count(FakeOp::Put), 1);
     assert_eq!(bucket.keys(), vec!["data/l"]);
+}
+
+#[test]
+fn a_failed_read_back_is_retried_without_sending_the_body_again() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink();
+    bucket.inject(FakeOp::Head, Fault::Status(503));
+    put(&sink, "data/rb", b"body").unwrap();
+    assert_eq!(bucket.count(FakeOp::Put), 1);
+}
+
+#[test]
+fn a_repeat_after_a_restart_is_accepted_by_the_conditional_upload() {
+    let bucket = FakeBucket::new();
+    put(&bucket.sink(), "data/again", b"same").unwrap();
+    let sink = bucket.sink();
+    put(&sink, "data/again", b"same").unwrap();
+    assert_eq!(bucket.count(FakeOp::Put), 2);
+}
+
+#[test]
+fn an_absent_key_is_none_only_when_the_bucket_exists() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink();
+    assert_eq!(block_on(sink.stat("data/none")).unwrap(), None);
+    assert_eq!(block_on(sink.stat("data/none")).unwrap(), None);
+    assert_eq!(bucket.count(FakeOp::Head), 3);
+
+    let bucket = FakeBucket::new();
+    bucket.set_bucket_missing(true);
+    let sink = bucket.sink();
+    assert!(matches!(
+        block_on(sink.stat("data/none")),
+        Err(SinkError::Failed { .. })
+    ));
+    assert!(matches!(
+        block_on(sink.get("data/none", None)),
+        Err(SinkError::Failed { .. })
+    ));
+    assert!(matches!(
+        block_on(sink.list("data/", None)),
+        Err(SinkError::Failed { .. })
+    ));
+    assert!(matches!(
+        put(&sink, "data/none", b"x"),
+        Err(SinkError::Failed { .. })
+    ));
+}
+
+#[test]
+fn a_404_without_no_such_key_is_not_an_absent_object() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink();
+    put(&sink, "data/k", b"x").unwrap();
+    bucket.inject(FakeOp::Get, Fault::Coded(404, "NoSuchBucket"));
+    assert!(matches!(
+        block_on(sink.get("data/k", None)),
+        Err(SinkError::Failed { .. })
+    ));
+    bucket.inject(FakeOp::Get, Fault::Status(404));
+    assert!(matches!(
+        block_on(sink.get("data/k", None)),
+        Err(SinkError::Failed { .. })
+    ));
+}
+
+#[test]
+fn a_full_queue_is_busy() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink_with(bucket.config().with_workers(1, 1));
+    bucket.hold();
+    let first = sink.put("q/1", bytes(b"1"), sha256(b"1"));
+    while bucket.waiting() == 0 {
+        std::thread::yield_now();
+    }
+    let second = sink.put("q/2", bytes(b"2"), sha256(b"2"));
+    let third = block_on(sink.put("q/3", bytes(b"3"), sha256(b"3")));
+    assert_eq!(third, Err(SinkError::Busy { queued: 1 }));
+    bucket.release();
+    block_on(first).unwrap();
+    block_on(second).unwrap();
+    assert_eq!(bucket.keys(), vec!["q/1", "q/2"]);
+}
+
+#[test]
+fn a_reply_that_is_not_a_listing_fails() {
+    struct Portal(FakeBucket);
+    impl Transport for Portal {
+        fn send(&self, r: &Request) -> Result<Response, TransportError> {
+            if r.query.iter().any(|(k, _)| k == "list-type") {
+                return Ok(Response::new(
+                    200,
+                    Vec::new(),
+                    b"<html>sign in</html>".to_vec(),
+                ));
+            }
+            self.0.send(r)
+        }
+    }
+    struct NoFlag(FakeBucket);
+    impl Transport for NoFlag {
+        fn send(&self, r: &Request) -> Result<Response, TransportError> {
+            let mut resp = self.0.send(r)?;
+            let body = String::from_utf8(resp.body).unwrap();
+            resp.body = body
+                .replace("<IsTruncated>false</IsTruncated>", "")
+                .into_bytes();
+            Ok(resp)
+        }
+    }
+    let bucket = FakeBucket::new();
+    for transport in [
+        Arc::new(Portal(bucket.clone())) as Arc<dyn Transport>,
+        Arc::new(NoFlag(bucket.clone())),
+    ] {
+        let sink = S3Sink::with_transport(bucket.config(), transport).unwrap();
+        assert!(matches!(
+            block_on(sink.list("", None)),
+            Err(SinkError::Failed { .. })
+        ));
+    }
 }
 
 #[test]
@@ -268,7 +382,6 @@ fn a_cut_upload_leaves_no_object() {
     ));
     assert_eq!(bucket.object("data/cut"), None);
     assert_eq!(block_on(sink.stat("data/cut")).unwrap(), None);
-    // And with retries, the next attempt stores it whole.
     let sink = bucket.sink();
     bucket.inject(FakeOp::Put, Fault::CutUpload);
     put(&sink, "data/cut", b"partial").unwrap();
@@ -294,7 +407,6 @@ fn a_truncated_download_is_an_error_never_short_bytes() {
         block_on(sink.get("data/tr", Some(2..8))),
         Err(SinkError::Transient { .. })
     ));
-    // Retried, the download succeeds whole.
     let sink = bucket.sink();
     bucket.inject(FakeOp::Get, Fault::TruncatedBody);
     assert_eq!(block_on(sink.get("data/tr", None)).unwrap(), b"0123456789");
@@ -310,7 +422,6 @@ fn ranges_are_half_open() {
     assert_eq!(get(0..1).unwrap(), b"0");
     assert_eq!(get(9..10).unwrap(), b"9");
     assert_eq!(get(0..10).unwrap(), b"0123456789");
-    // Empty ranges within the object, the end included.
     assert_eq!(get(4..4).unwrap(), b"");
     assert_eq!(get(10..10).unwrap(), b"");
     let invalid = Err(SinkError::InvalidRange {
@@ -380,8 +491,6 @@ fn awkward_keys_survive_encoding() {
 
 #[test]
 fn a_lagging_listing_does_not_decide_whether_a_key_is_taken() {
-    // A claim marker just written by another restore may be missing from a
-    // listing; the create-if-absent upload still refuses to take it.
     let bucket = FakeBucket::new();
     bucket.set_list_lag(2);
     let sink = bucket.sink();
@@ -449,7 +558,6 @@ fn polling_never_blocks_on_the_network() {
     bucket.hold();
     let mut fut = sink.put("data/held", bytes(b"g"), sha256(b"g"));
     let mut cx = Context::from_waker(Waker::noop());
-    // The exchange waits in the transport, yet each poll returns at once.
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert_eq!(bucket.object("data/held"), None);
@@ -461,7 +569,6 @@ fn polling_never_blocks_on_the_network() {
 fn coded_errors_are_classified() {
     let bucket = FakeBucket::new();
     let sink = bucket.sink();
-    // The bucket's own checksum check: a mismatch, never retried.
     bucket.inject(FakeOp::Put, Fault::Coded(400, "BadDigest"));
     assert_eq!(
         put(&sink, "data/d", b"x"),
@@ -471,12 +578,10 @@ fn coded_errors_are_classified() {
     );
     assert_eq!(bucket.count(FakeOp::Put), 1);
     assert_eq!(bucket.object("data/d"), None);
-    // A slow upload and a concurrent conditional write: retried.
     bucket.inject(FakeOp::Put, Fault::Coded(400, "RequestTimeout"));
     bucket.inject(FakeOp::Put, Fault::Coded(409, "ConditionalRequestConflict"));
     put(&sink, "data/d", b"x").unwrap();
     assert_eq!(bucket.count(FakeOp::Put), 4);
-    // A clock too far off: refused for good.
     bucket.inject(FakeOp::Head, Fault::Coded(403, "RequestTimeTooSkewed"));
     assert!(matches!(
         block_on(sink.stat("data/d")),

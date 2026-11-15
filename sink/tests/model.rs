@@ -51,11 +51,7 @@ proptest! {
                     model.insert(key, content);
                 }
             }
-            // Faults not consumed by this call (a Head fault after a refused
-            // put, say) would leak into the next: drain them by a stat.
-            while bucket.pending_faults() > 0 {
-                let _ = block_on(sink.stat(key));
-            }
+            bucket.clear_faults();
         }
         for (key, content) in &model {
             prop_assert_eq!(bucket.object(key), Some(content.to_vec()));

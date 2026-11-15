@@ -16,8 +16,6 @@ fn main() {
     let bucket = FakeBucket::new();
     let sink = bucket.sink();
 
-    // The first reply is lost after the bucket stored the object; the retry
-    // finds it already there with the same hash and accepts it.
     bucket.inject(FakeOp::Put, Fault::TimeoutAfter);
     let bytes: Arc<[u8]> = Arc::from(&b"ciphertext of a sealed segment"[..]);
     let copy =

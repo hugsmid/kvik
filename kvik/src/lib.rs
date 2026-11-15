@@ -108,6 +108,7 @@ pub mod env;
 
 pub use backup::{
     BackupSink, Encryption, ListPage, Rebuild, RestoreMode, SinkError, SinkFuture, Stored,
+    Verified, VerifyError,
 };
 pub use config::{
     Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,

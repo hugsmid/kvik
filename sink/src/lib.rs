@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+mod config;
 pub mod fake;
 mod retry;
 mod s3;
@@ -38,8 +39,9 @@ pub mod verify;
 mod worker;
 mod xml;
 
+pub use config::{Addressing, DEFAULT_MAX_OBJECT_SIZE, S3Config, SINGLE_PART_LIMIT};
 pub use retry::{Pause, RetryPolicy, SystemWallClock, ThreadSleep, WallClock};
-pub use s3::{Addressing, S3Config, S3Sink, SINGLE_PART_LIMIT};
+pub use s3::S3Sink;
 pub use sigv4::Credentials;
 
 use std::future::Future;

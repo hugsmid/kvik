@@ -13,16 +13,17 @@ use kvik::SinkError;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// Named worker threads, joined when the pool is dropped (after the jobs
-/// already queued have run).
+/// Named worker threads behind a bounded queue, joined when the pool is
+/// dropped, after the queued jobs have run.
 pub(crate) struct Pool {
-    tx: Option<mpsc::Sender<Job>>,
+    tx: Option<mpsc::SyncSender<Job>>,
+    queue: usize,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl Pool {
-    pub(crate) fn new(workers: usize, name: &str) -> Result<Self, SinkError> {
-        let (tx, rx) = mpsc::channel::<Job>();
+    pub(crate) fn new(workers: usize, queue: usize, name: &str) -> Result<Self, SinkError> {
+        let (tx, rx) = mpsc::sync_channel::<Job>(queue);
         let rx = Arc::new(Mutex::new(rx));
         let mut threads = Vec::new();
         for i in 0..workers.max(1) {
@@ -48,12 +49,14 @@ impl Pool {
         }
         Ok(Pool {
             tx: Some(tx),
+            queue,
             threads,
         })
     }
 
-    /// Queues `f` and returns a future of its result. The job runs to the end
-    /// even if the future is dropped.
+    /// Queues `f` and returns a future of its result, or of `Busy` when the
+    /// queue is full. A queued job runs to the end even if the future is
+    /// dropped.
     pub(crate) fn run<T, F>(&self, f: F) -> Pending<T>
     where
         T: Send + 'static,
@@ -74,14 +77,15 @@ impl Pool {
             });
             complete(&slot, value);
         });
-        let sent = self.tx.as_ref().map(|tx| tx.send(job));
-        if !matches!(sent, Some(Ok(()))) {
-            complete(
-                &pending.slot,
-                Err(SinkError::Failed {
-                    reason: "the sink's workers have stopped".into(),
-                }),
-            );
+        let refused = match self.tx.as_ref().map(|tx| tx.try_send(job)) {
+            Some(Ok(())) => None,
+            Some(Err(mpsc::TrySendError::Full(_))) => Some(SinkError::Busy { queued: self.queue }),
+            _ => Some(SinkError::Failed {
+                reason: "the sink's workers have stopped".into(),
+            }),
+        };
+        if let Some(e) = refused {
+            complete(&pending.slot, Err(e));
         }
         pending
     }
@@ -91,7 +95,7 @@ impl Drop for Pool {
     fn drop(&mut self) {
         self.tx = None;
         for t in self.threads.drain(..) {
-            // A worker never drops the pool, so this never joins itself.
+            // Workers hold no pool, so this never joins its own thread.
             let _ = t.join();
         }
     }

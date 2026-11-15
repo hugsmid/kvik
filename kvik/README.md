@@ -153,7 +153,8 @@ Different from `docs/api.md`:
 - **`Consumer::next`** ends with `None` on any error, not only after a shutdown; `try_next` returns the error.
 - `BackupSink` takes `Arc<[u8]>` and returns `Vec<u8>` where `docs/api.md` showed `Bytes` (std types only, by the
   stable-shapes principle); its futures are boxed (`SinkFuture`) so that `dyn BackupSink` works, it fails with
-  `SinkError`, and `list` returns one page (`ListPage`) at a time.
+  `SinkError`, and `list` returns one page (`ListPage`) at a time. `Verified` (made only by `Verified::check`) is
+  the proof of a copy in the deep tier.
 - **Added**: `Store::tick` (temporary), `Store::now`, `Store::is_durable`, `Store::consumer_stats`,
   `Consumer::try_next`, `Consumer::unroute`, `Consumer::routes`, `Reader::series`, `Ack::recorded`, `Start::Time`,
   `Trigger.cause`, `DeliveryFlags.outranked`, `WindowResult.count` and `coverage_fraction`,
