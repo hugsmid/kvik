@@ -172,10 +172,16 @@ sync fails while the file system stays writable; a control arm syncs again witho
 the same bytes again and syncs, and the device is read directly in both. The engine is then checked the same way
 for the last batch, the mark slot and the manifest record: the writer stops at the fault, the start writes the bytes
 again, and every acknowledged position reads back after a remount (mark synced at every commit, a new boot id per
-remount). It has not run yet. If the treatment arm passes on both file systems, (b) is settled for Linux as written;
-if it fails on either, the fallbacks above are adopted. The result goes in `docs/measurements/4.9-fault-trials.md`.
-Owner decision pending: the deferral wording for macOS and Windows, where no device fails writes on demand without
-kernel code.
+remount). If the treatment arm passes on both file systems, (b) is settled for Linux as written; if it fails on
+either, the fallbacks above are adopted.
+**Settled on Linux at gate 4.9** by the third run of that workflow (`docs/measurements/4.9-fault-trials.md`): on ext4
+and on XFS every arm passed. The control arm showed the behaviour the rewrite rules exist for (Q-87, Q-117): after a
+failed write-back a sync alone left the device without the new bytes, as the page was clean; the treatment arm,
+writing the same bytes again, made the next sync write them. The engine's start wrote the last batch, the mark slot
+and the manifest record again, the device then held each, and every acknowledged position (and the recorded lost
+range) read back after a remount. The rewrite rules stand as written; the fallbacks are not needed on Linux. Still
+open: owner decision pending on the deferral wording for macOS and Windows, where no device fails writes on demand
+without kernel code.
 
 ## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
 **Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
@@ -554,7 +560,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux; Q-52 (b) waits for a passing run of its rewrite job.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS).
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -562,7 +568,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux; Q-52 (b) waits for a pass
 | Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-52 (b) | 4.9 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform; moved from 4.8, as it needs a device that fails writes or power cuts. Linux: the `fault-trials` workflow (ext4, XFS); its first run stopped on a harness error before a verdict, the rerun is pending (`docs/measurements/4.9-fault-trials.md`); owner decision pending on the macOS and Windows wording |
+| Q-52 (b) | 4.9 | Settled on Linux (ext4 and XFS) by the rewrite job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decision on the macOS and Windows wording |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
@@ -780,6 +786,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 | Q-86 (a) | No space when a log segment is created | §3 Segments (the partial file deleted, health critical, ingest waits, creation retried), `format.md` A.4 (open part: Q-86 (b)) |
+| Q-52 (b), on Linux | Whether writing the last manifest record, the last log batch or a seal again in place makes the next sync write it | §7 Manifest, §3 Recovery rule 3 and Order of a start, `format.md` A.4 and A.10 unchanged; checked on ext4 and XFS at gate 4.9 with a device that fails one file's sectors (`docs/measurements/4.9-fault-trials.md`; open part: the owner's decision on the macOS and Windows wording) |
 | Q-86 (b), on Linux | No space at a log write before any sync, on a copy-on-write file system | §3 Segments and `format.md` A.4 Creation unchanged (a write failure on the log), checked on Btrfs at gate 4.9 (`docs/measurements/4.9-fault-trials.md`; open part: the owner's decisions on the `chattr +C` sentence and the macOS and Windows wording) |
 | Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3, Last batch written again (with the mark missing, unreadable or stale, the start writes the last complete batch, and its segment's header when it is the segment's first, again in place before the sync of step 3; kept only if that sync succeeds, else read-only; rests on the Q-52 (b) check, moved from roadmap 4.8 to gate 4.9), Order of a start step 3, row 12a, `format.md` A.10 (No usable mark) and A.4 (a valid trailer found in an `.open` file is sealed again from step 1, the same hole after a failed seal sync), `api.md` Environment seams (the test file system reports per page whether a sync wrote it). Engine fault tests (roadmap 4.5, page-tracking file system): after a failed sync and a lost mark every position delivered after the restart is on disk at a power loss; the rewrite's sync fails; the same with an adopted recovery entry whose sync failed; a kill-loop property for invariant 2 over failed syncs, mark damage, restarts and power losses; the seal state found with a trailer after a failed `sync_all` |
 | Q-93 (a) | A store nobody can open after the host's tzdata changes | §5.7 (readers and drills never refuse; calendar results computed with the reader's own release; a stored calendar node used only where its recorded release is the reader's; the writer checks the host release about once a minute and at each local midnight and adopts a new one without a restart, by a tzdata entry and a rebuild of the affected days), `api.md` Opening and Environment seams (open part: Q-93 (b), (c)) |

@@ -268,8 +268,8 @@ A.10) is treated as a different boot. The rules apply in this order:
    written again with it, so a recovery entry adopted from a start whose own sync failed is covered too. If that sync succeeds the batch is on disk and is kept
    (keeping a batch never acknowledged is allowed, row 12); if it fails the engine stays read-only (step 3) and
    nothing is delivered. This rests on the platform fact that the manifest's rewrite of its last record rests on
-   (§7 Manifest): that writing identical bytes makes the next sync write them, checked on each platform by gate
-   4.9 (Q-52 (b), moved from roadmap 4.8). The first start of a new store (no mark file and an empty log) writes no
+   (§7 Manifest): that writing identical bytes makes the next sync write them, checked on Linux, on ext4
+   and XFS, at gate 4.9 (Q-52 (b); macOS and Windows still open). The first start of a new store (no mark file and an empty log) writes no
    entry and creates the mark. A mark with no valid slot beside a log with no segment in use and a manifest naming
    no position is a first start too (a first start cut short while it wrote the mark): the mark is written again in
    place.
