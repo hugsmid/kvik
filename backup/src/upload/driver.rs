@@ -530,9 +530,11 @@ fn take(c: &mut Cursor, records: Vec<Record>, snap: &Catalogue) {
         if r.epoch <= c.scanned || r.epoch > snap.last_epoch() {
             continue;
         }
-        // Defensive, with the field-100 test in `fresh_copy`: a carried copy never reaches `backed_up_through`
-        // anyway, since a file's publishing record goes up only once it is verified, and its fresh `0x27`, appended
-        // first, replaces the entry (Q-280). Both keep that true if the publishing rule ever loosens.
+        // With the field-100 test in `fresh_copy`: while the bucket lists no record epoch above the local manifest's,
+        // a carried copy cannot reach `backed_up_through`, since a file's publishing record goes up only once it is
+        // verified and its fresh `0x27`, appended first, replaces the entry (Q-280). These guards matter when it
+        // does, a reused epoch or a directory put back from an older copy, where they keep the figure behind the
+        // files not yet verified again.
         if matches!(r.body, Body::Rebuild(_)) {
             c.copied_at.clear();
         }
