@@ -596,7 +596,7 @@ impl LogWriter {
         if r.fault.is_none() {
             let _ = leases.scan(&*store.fs().clone(), &leases_dir, &store_id, now);
         }
-        let mut w = Self {
+        Ok(Self {
             leases,
             stats: LogStats {
                 durable: at(r.last_sequence),
@@ -644,16 +644,7 @@ impl LogWriter {
             disk: Disk::default(),
             waiting: None,
             report: r.report,
-        };
-        // A mark read from the page cache on this boot may not be on stable storage, and which slot holds the last
-        // synced mark is unknown, so the first update could overwrite it (`format.md` A.10 Update, Q-122). With the
-        // mark synced at every commit, nothing may rest on such a mark either: a batch it covers would be read and
-        // delivered, then lost by a remount within the boot (`spec.md` §3 Recovery rule 1). It is synced now; a
-        // failed sync leaves the writer read-only.
-        if w.mark_dirty {
-            w.sync_mark(now);
-        }
-        Ok(w)
+        })
     }
 
     /// What the start found and did (`spec.md` §3 Recovery).

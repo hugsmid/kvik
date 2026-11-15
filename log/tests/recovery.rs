@@ -2102,3 +2102,106 @@ fn a_header_put_in_use_by_a_failed_sync_is_not_written_again_by_a_same_boot_star
     assert_eq!(rep.entry.unwrap().entry.tail_bytes, 0);
     r.check_started();
 }
+
+/// The mark on stable storage.
+fn durable_mark(r: &Rig) -> MarkSlot {
+    read_mark(&r.fs.read_durable(&log_path("MARK")).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1
+}
+
+/// A power loss that tears the latest mark update in the page cache: half of its slot reaches the disk.
+fn tear_last_mark_update(r: &mut Rig) {
+    let path = log_path("MARK");
+    let current = r.fs.read(&path).unwrap();
+    let (slot, _) = read_mark(&current, &STORE_ID).unwrap().unwrap();
+    let at = SLOT_OFFSETS[slot];
+    r.w = None;
+    r.fs.set_sync_hook(None);
+    r.fs.power_loss();
+    r.fs.poke(&path, at, &current[at..at + SLOT_LEN / 2]);
+    r.fs.restart();
+    r.boot += 1;
+}
+
+/// Q-122, a start's own mark write: a fact batch's update is in the page cache only, the next batch is synced and the
+/// process stops before its mark update, and the start on the same boot (rule 1, a reset point) writes its mark. The
+/// mark file as read is made durable first, so tearing that write leaves the update before it, not an older mark.
+#[test]
+fn a_starts_torn_mark_write_never_falls_back_past_the_last_synced_mark() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![definition(1)]);
+    r.drain();
+    r.submit(vec![definition(2)]);
+    r.drain();
+    let synced = durable_mark(&r);
+    assert_eq!(synced.max_series_id, 2);
+    r.submit(vec![fact(1, 1)]);
+    r.drain();
+    // The next batch: its write and sync, then the process stops before the mark's update.
+    r.submit(vec![fact(1, 2)]);
+    r.fs.crash_after(2);
+    r.step();
+    r.kill();
+    // The start stops right after its own mark write, before that write's sync.
+    let fs = r.fs.clone();
+    r.fs.set_sync_hook(Some(Arc::new(move |p: &std::path::Path| {
+        let last = fs.ops().last().cloned();
+        if p.ends_with("MARK")
+            && last.is_some_and(|o| o.op == FaultOp::Write && o.len == SLOT_LEN as u64)
+        {
+            fs.crash_after(0);
+        }
+    })));
+    assert!(r.open().is_none(), "the start stops at its mark's sync");
+    tear_last_mark_update(&mut r);
+    let found = read_mark(&r.fs.read(&log_path("MARK")).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1;
+    assert!(found.counter > synced.counter, "found {found:?}");
+    assert_eq!(found.max_series_id, 2);
+    let rep = r.open().unwrap();
+    assert!(rep.entry.unwrap().entry.id_floor >= 2);
+    r.check_started();
+}
+
+/// Q-122 with a failed mark sync: the update whose sync failed is no longer dirty, so a start on the same boot writes
+/// its slot again before syncing it; the next update then goes to the other slot, and tearing it leaves that mark.
+#[test]
+fn a_mark_whose_sync_failed_is_written_again_by_a_same_boot_start() {
+    let mut r = Rig::new(cfg());
+    r.submit(vec![definition(1)]);
+    r.drain();
+    r.submit(vec![definition(2)]);
+    r.drain();
+    let synced = durable_mark(&r);
+    r.submit(vec![fact(1, 1)]);
+    r.drain();
+    // The timed mark sync fails: the store is read-only.
+    r.fs.fail_nth(FaultOp::Sync, "MARK", 0, io::ErrorKind::Other);
+    r.advance(Duration::from_secs(2));
+    r.step();
+    assert!(r.w().fault().is_some());
+    r.kill();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    assert!(rep.entry.is_none());
+    let kept = durable_mark(&r);
+    assert_eq!(
+        kept.counter,
+        synced.counter + 1,
+        "the update is on stable storage"
+    );
+    r.submit(vec![fact(1, 2)]);
+    r.drain();
+    tear_last_mark_update(&mut r);
+    let found = read_mark(&r.fs.read(&log_path("MARK")).unwrap(), &STORE_ID)
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(found, kept, "the mark synced last");
+    r.open().unwrap();
+    r.check_started();
+}

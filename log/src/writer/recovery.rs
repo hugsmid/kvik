@@ -1124,7 +1124,7 @@ pub(super) fn start(
     let mark_slot;
     let mark_next_slot;
     let mark_file: Option<Box<dyn FsFile>>;
-    let mut mark_dirty = false;
+    let mark_dirty = false;
     let entry_state = match p.rule {
         StartRule::Reboot(state) => Some(state),
         StartRule::SameBoot if p.reset => Some(MarkState::Readable),
@@ -1332,7 +1332,7 @@ pub(super) fn start(
             max_series_id: id_floor,
             stamp,
         };
-        let r = match mark_bytes {
+        let r = match &mark_bytes {
             None => fs.open(&mark_path, OpenMode::CreateNew).and_then(|f| {
                 let mut img = vec![0u8; MARK_LEN];
                 img[..crate::mark::SLOT_LEN].copy_from_slice(&mark_slot.encode());
@@ -1340,7 +1340,11 @@ pub(super) fn start(
                 f.sync_all()?;
                 Ok(f)
             }),
-            Some(_) => fs.open(&mark_path, OpenMode::ReadWrite).and_then(|f| {
+            // The file as read is written again in place and synced first: either slot may hold an update whose
+            // sync failed or never ran, and the slot written next must not be the last durable mark (A.10 Update).
+            Some(read) => fs.open(&mark_path, OpenMode::ReadWrite).and_then(|f| {
+                f.write_at(read, 0)?;
+                f.sync_data()?;
                 f.write_at(&mark_slot.encode(), SLOT_OFFSETS[slot_index] as u64)?;
                 f.sync_data()?;
                 Ok(f)
@@ -1382,12 +1386,22 @@ pub(super) fn start(
         };
         mark_slot = *slot;
         mark_next_slot = 1 - index;
-        mark_file = match fs.open(&mark_path, OpenMode::ReadWrite) {
-            Ok(f) => Some(f),
+        // The mark read on this boot may not be on stable storage: its slot is written again in place, as read, and
+        // synced, since bytes whose earlier sync failed may no longer be dirty (compare Q-87). The slot it is in then
+        // holds the last synced mark, and updates go to the other (A.10 Update).
+        let at = SLOT_OFFSETS[*index];
+        let read = mark_bytes.as_deref().expect("a readable mark was read");
+        let f = match fs.open(&mark_path, OpenMode::ReadWrite) {
+            Ok(f) => f,
             Err(e) => return ro(fault(FaultOp::MarkWrite, &mark_path, &e), report),
         };
-        // The mark read on this boot may not be on stable storage yet: the writer syncs it before it resumes (A.10).
-        mark_dirty = true;
+        if let Err(e) = f.write_at(&read[at..at + crate::mark::SLOT_LEN], at as u64) {
+            return ro(fault(FaultOp::MarkWrite, &mark_path, &e), report);
+        }
+        if let Err(e) = f.sync_data() {
+            return ro(fault(FaultOp::MarkSync, &mark_path, &e), report);
+        }
+        mark_file = Some(f);
         id_floor = id_floor.max(slot.max_series_id);
     }
 

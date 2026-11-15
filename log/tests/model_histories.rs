@@ -28,8 +28,9 @@
 //! - Wall-clock steps backwards: the batch's `received_at` is then open (Q-115 (i)); the wall clock only moves on.
 //! - Defaults of a definition: resolving them is the registry's (roadmap 5.1); every definition here sets them.
 //! - Corruption below the mark and tzdata entries: covered by `recovery.rs` and `model_differential.rs`.
-//! - Failed mark syncs, write errors, a full disk and clean shutdowns: covered by `recovery.rs` (the kill loop) and
-//!   `writer.rs`; the model has no counterpart for a failed mark sync or a full disk at the log's level.
+//! - Write errors, a full disk and clean shutdowns: covered by `recovery.rs` (the kill loop) and `writer.rs`; the
+//!   model has no counterpart for a full disk at the log's level. A failed mark sync, which the model has no
+//!   counterpart for either, is followed at once by a crash on the same boot.
 //! - A batch whose sync failed surviving a remount: a remount runs only with the mark synced at every commit, and a
 //!   failed sync's bytes never reach the disk in the in-memory file system unless written again.
 //! - A reader voiding what it read: it reads only up to the mark, which a start on the same boot never moves back
@@ -140,11 +141,16 @@ enum Op {
     PowerLoss,
     Remount,
     Refresh,
-    /// A crash (or a power loss), then a start that stops after `n` file operations, then a start on the same boot.
+    /// A crash (or a power loss), then a start that stops after `n` file operations, then a start on the same boot,
+    /// or with `then`, a power loss that keeps a part of the unsynced writes chosen by it and a start.
     CutStart {
         n: usize,
         power: bool,
+        then: Option<u64>,
     },
+    /// The timed mark sync fails, the process stops and starts again on the same boot; with a seed, a power loss that
+    /// keeps a part of the unsynced writes follows. Under a mark synced at every commit, or a clean mark, a crash.
+    MarkSyncFails(Option<u64>),
 }
 
 fn series_spec() -> impl Strategy<Value = SeriesSpec> {
@@ -244,7 +250,9 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Crash),
         1 => Just(Op::PowerLoss),
         1 => Just(Op::Remount),
-        1 => (0..40usize, any::<bool>()).prop_map(|(n, power)| Op::CutStart { n, power }),
+        1 => (0..40usize, any::<bool>(), prop::option::of(any::<u64>()))
+            .prop_map(|(n, power, then)| Op::CutStart { n, power, then }),
+        1 => prop::option::of(any::<u64>()).prop_map(Op::MarkSyncFails),
         2 => Just(Op::Refresh),
     ]
 }
@@ -274,12 +282,14 @@ enum Count {
     TornReported,
     TornDeleted,
     CutStarts,
+    TornAfterCutStarts,
+    MarkSyncFailures,
     Adoptions,
     Voids,
     SealedSegments,
 }
 
-const COUNTS: usize = 10;
+const COUNTS: usize = 12;
 static REACHED: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
 fn count(c: Count) {
@@ -1294,7 +1304,7 @@ impl World {
         self.restart(Expect::Reboot(tail));
     }
 
-    fn cut_start(&mut self, n: usize, power: bool) {
+    fn cut_start(&mut self, n: usize, power: bool, then: Option<u64>) {
         if power {
             self.m.power_loss();
             let fate = self.log.pending.take();
@@ -1307,8 +1317,44 @@ impl World {
         let (now, wall) = self.clocks();
         self.log.open_cut(n, now, wall);
         count(Count::CutStarts);
+        if let Some(seed) = then {
+            // Whatever the cut start wrote of the mark, a power loss leaves no mark older than the last synced one.
+            count(Count::TornAfterCutStarts);
+            self.m.power_loss();
+            self.m.restart();
+            self.log.power_loss_partial(seed);
+        }
         let report = self.log.open(now, wall);
         self.started(&report, Expect::Any);
+    }
+
+    fn mark_sync_fails(&mut self, seed: Option<u64>) {
+        let dirty = self
+            .log
+            .w
+            .as_ref()
+            .is_some_and(|w| w.fault().is_none() && w.stats().mark_synced < w.stats().durable);
+        if self.log.every || !dirty {
+            self.crash();
+            return;
+        }
+        self.log
+            .fs
+            .fail_nth(FaultOp::Sync, "MARK", 0, io::ErrorKind::Other);
+        self.m.advance(40_000_000);
+        let (now, wall) = self.clocks();
+        self.log.idle(now, wall);
+        assert!(self.log.read_only(), "the timed mark sync failed");
+        count(Count::MarkSyncFailures);
+        // The model has no failed mark sync: the process stops at once, on the same boot.
+        self.m.crash();
+        self.log.kill();
+        self.restart(Expect::SameBoot(Some(false)));
+        if let Some(seed) = seed {
+            self.m.power_loss();
+            self.log.power_loss_partial(seed);
+            self.restart(Expect::Reboot(Tail::Either));
+        }
     }
 
     fn remount(&mut self) {
@@ -1450,7 +1496,8 @@ impl World {
             Op::Crash => self.crash(),
             Op::PowerLoss => self.power_loss(),
             Op::Remount => self.remount(),
-            Op::CutStart { n, power } => self.cut_start(*n, *power),
+            Op::CutStart { n, power, then } => self.cut_start(*n, *power, *then),
+            Op::MarkSyncFails(seed) => self.mark_sync_fails(*seed),
             Op::Refresh => self.refresh(),
         }
         let (now, wall) = self.clocks();
@@ -1517,6 +1564,8 @@ fn the_log_keeps_what_the_model_commits_long() {
         (Count::StopsLost, 20),
         (Count::TornReported, 20),
         (Count::CutStarts, 100),
+        (Count::TornAfterCutStarts, 50),
+        (Count::MarkSyncFailures, 50),
         (Count::Adoptions, 1),
         (Count::SealedSegments, 100),
     ];
