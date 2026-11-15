@@ -10,8 +10,8 @@ use kvik_files::catalogue::Tier;
 use kvik_files::desc::{FileClass, kind};
 use kvik_files::image::read;
 use kvik_files::record::{
-    AckedLoss, Acknowledgement, Body, Publish, Rebuild, Record, RecordError, is_canonical,
-    record_type,
+    AckedLoss, Acknowledgement, Body, EncodeError, Publish, Rebuild, Record, RecordError,
+    is_canonical, record_type,
 };
 use kvik_files::tier::{CopyVerified, DeepCopy};
 use kvik_log::Element;
@@ -511,4 +511,41 @@ fn a_block_of_type_0x27_is_decoded_and_encoded_strictly() {
         },
     );
     assert!(r.encode().is_err());
+}
+
+#[test]
+fn a_restore_record_is_checked_when_read_and_when_written() {
+    let b = raw(record_type::RESTORE, 0, &[(1, vec![0; 12])]);
+    assert!(matches!(decode_block(&b), Err(RecordError::Invalid(_))));
+    let b = raw(record_type::RESTORE, 0, &[(40, vec![])]);
+    assert_eq!(
+        decode_block(&b),
+        Err(RecordError::Unsupported(Element::Field {
+            entry_type: record_type::RESTORE,
+            field: 40
+        }))
+    );
+    let bad = Record::new(
+        2,
+        1,
+        T0,
+        Body::Other {
+            record_type: record_type::RESTORE,
+            skippable: false,
+            fields: vec![(1, vec![0; 12])],
+        },
+    );
+    assert!(matches!(bad.encode(), Err(EncodeError::Invalid(_))));
+}
+
+proptest! {
+    #[test]
+    fn a_restore_record_round_trips_through_a_manifest_block(r in restore_record(), old in proptest::option::of(any::<u64>())) {
+        let rec = Record { old_epoch: old, ..Record::new(9, r.generation, T0, r.to_body()) };
+        let b = rec.encode().unwrap();
+        let back = decode_block(&b).unwrap();
+        prop_assert_eq!(&back, &rec);
+        prop_assert!(is_canonical(&b));
+        prop_assert_eq!(kvik_files::restore::RestoreRecord::from_body(&back.body), Some(Ok(r)));
+    }
 }

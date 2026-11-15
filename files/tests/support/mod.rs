@@ -8,13 +8,17 @@ pub mod rebuild;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use kvik_files::catalogue::Tier;
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
 use kvik_files::rebuild::{FoundLoss, LocalFile, Place, Verifier};
 use kvik_files::record::{AckedLoss, Acknowledgement, Body, Publish, Rebuild, Record};
+use kvik_files::restore::{RestoreRecord, RestoredFile};
 use kvik_files::tier::{CopyVerified, DeepCopy, tier_of};
 use kvik_log::fs::{Fs, MemFs, OpenMode};
 use kvik_log::header::{FileHeader, kind as file_kind};
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
+use kvik_log::mark::ResetStamp;
+use kvik_log::setaside::RestoredEnd;
 use proptest::prelude::*;
 
 pub const STORE_ID: [u8; 16] = [3; 16];
@@ -220,6 +224,94 @@ fn unique(mut v: Vec<FileDescription>) -> Vec<FileDescription> {
     v
 }
 
+/// A restore record that follows every rule of `format.md` A.14.
+pub fn restore_record() -> impl Strategy<Value = RestoreRecord> {
+    let file = (
+        prop_oneof![description(kind::LOG_SEGMENT), description(kind::COMPACTED)],
+        prop_oneof![Just(Tier::Hot), Just(Tier::Cold), Just(Tier::Deep)],
+        any::<u64>(),
+        any::<[u8; 32]>(),
+    )
+        .prop_map(|(description, tier, size, sha256)| RestoredFile {
+            description,
+            tier,
+            copy: DeepCopy { size, sha256 },
+        });
+    (
+        (2u32..u32::MAX, any::<prop::sample::Index>(), 1u64..),
+        (
+            any::<u64>(),
+            proptest::collection::vec(any::<prop::sample::Index>(), 0..4),
+        ),
+        proptest::collection::vec(lost_range(), 0..3),
+        proptest::collection::vec((position(), ordered_pair()), 0..3),
+        proptest::collection::vec(lost_range(), 0..2),
+        proptest::collection::vec(file, 0..4),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(
+                (generation, src, nonce),
+                (end_seq, ends),
+                losses,
+                acks,
+                entry_losses,
+                files,
+                drill,
+            )| {
+                let source_generation = src.index(generation as usize) as u32;
+                let mut carried: Vec<u32> = ends
+                    .iter()
+                    .map(|i| i.index(source_generation as usize + 1) as u32)
+                    .filter(|g| *g > 0)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                carried.reverse();
+                let mut losses = losses;
+                losses.sort_by_key(|l| l.identity);
+                losses.dedup_by_key(|l| l.identity);
+                let mut acknowledgements: Vec<AckedLoss> = acks
+                    .into_iter()
+                    .map(|(identity, (first, last))| AckedLoss {
+                        identity,
+                        first,
+                        last,
+                    })
+                    .collect();
+                acknowledgements.sort();
+                acknowledgements.dedup();
+                let mut files = files;
+                files.sort_by_key(|f| {
+                    (
+                        f.description.kind,
+                        f.description.generation,
+                        f.description.file_id,
+                    )
+                });
+                files.dedup_by_key(|f| f.description.file_ref());
+                RestoreRecord {
+                    generation,
+                    stamp: ResetStamp { sequence: 1, nonce },
+                    source_generation,
+                    restored_end: (source_generation, end_seq),
+                    carried_ends: carried
+                        .into_iter()
+                        .map(|g| RestoredEnd {
+                            generation: g,
+                            end: (g - 1, end_seq),
+                        })
+                        .collect(),
+                    losses,
+                    acknowledgements,
+                    entry_losses,
+                    files,
+                    drill,
+                }
+            },
+        )
+}
+
 pub fn lost_range() -> impl Strategy<Value = LostRange> {
     (
         position(),
@@ -323,7 +415,7 @@ pub fn body() -> impl Strategy<Value = Body> {
                     .collect(),
             })),
         (
-            prop_oneof![Just(0x25u8), Just(0x26), 0x29u8..0x7F],
+            prop_oneof![Just(0x26u8), 0x29u8..0x7F],
             proptest::collection::vec(
                 (1u16..0x9000, proptest::collection::vec(any::<u8>(), 0..20)),
                 0..4
@@ -352,6 +444,7 @@ pub fn body() -> impl Strategy<Value = Body> {
                 }
                 .to_body()
             }),
+        restore_record().prop_map(|r| r.to_body()),
     ]
 }
 

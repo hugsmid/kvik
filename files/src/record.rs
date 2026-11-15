@@ -24,7 +24,7 @@ pub mod record_type {
     pub const LOST_RANGE: u8 = 0x23;
     /// An acknowledgement.
     pub const ACKNOWLEDGEMENT: u8 = 0x24;
-    /// A restore record (laid out by roadmap 8.3).
+    /// A restore record, carried as a field list and checked by its typed view (`crate::restore`).
     pub const RESTORE: u8 = 0x25;
     /// A quarantine (laid out by roadmap 8.1).
     pub const QUARANTINE: u8 = 0x26;
@@ -33,8 +33,7 @@ pub mod record_type {
     /// A rebuild record.
     pub const REBUILD: u8 = 0x28;
 
-    /// Whether `t` is reserved for a record whose layout a later roadmap item gives: such a record is carried as a
-    /// field list.
+    /// Whether `t` is carried as a field list: a restore record, or a record whose layout a later roadmap item gives.
     pub fn is_reserved(t: u8) -> bool {
         matches!(t, RESTORE | QUARANTINE | TIER_MOVE)
     }
@@ -275,6 +274,14 @@ impl Record {
                 crate::tier::CopyVerified::from_body(&self.body)
                     .transpose()
                     .map_err(|_| EncodeError::Invalid("an invalid copy-verified record"))?;
+                if let Some(Err(e)) = crate::restore::RestoreRecord::from_body(&self.body) {
+                    return Err(EncodeError::Invalid(match e {
+                        RecordError::Invalid(why) => why,
+                        RecordError::Unsupported(_) => {
+                            "a restore record field this version does not define"
+                        }
+                    }));
+                }
                 if fields.iter().any(|(id, _)| *id == FIELD_OLD_EPOCH) {
                     return Err(EncodeError::Invalid(
                         "field 100 held among a record's fields",
@@ -442,6 +449,7 @@ impl Record {
             },
         };
         crate::tier::CopyVerified::from_body(&body).transpose()?;
+        crate::restore::RestoreRecord::from_body(&body).transpose()?;
         Ok(Self {
             epoch,
             generation,
