@@ -243,14 +243,16 @@ A.10) is treated as a different boot. The rules apply in this order:
    the kept bytes or after the lost region at the tail; in a new segment when the open one is full): `after` = K, a
    new **reset stamp** (the sequence F and a random nonce, never zero; the mark carries it from then on), the
    boot id, the tail's length in bytes up to the last non-zero byte, the readable commit blocks in it (the tail reported
-   is that of the last segment in use, with the bytes after the header of any unused segment beyond it and the mark), the mark's state, an id floor (§2.1) and the consumers whose cursor file was
+   is that of the last segment in use, with the bytes after the header of any unused segment beyond the mark's segment,
+   or of any unused segment with no readable mark, Q-320), the mark's state, an id floor (§2.1) and the consumers whose cursor file was
    missing or unreadable.
    Positions between K and F, if any, are a lost range whose cause is a truncated tail. Positions above K may have
    been acknowledged and delivered and are assigned again (F to the entry, then from F + 1), so a recovery entry is
    a reset point for every consumer (§4 Resync). A consumer whose cursor file was missing or unreadable is treated
    as having no cursor. **Adoption:** if the last kept batch is a recovery entry, a readable mark does not cover it,
-   and the bytes after it show no later write (none lies beyond the end of the tail it reported, and no readable
-   commit block among them has a commit time at or after the entry's), no recovery since has resumed: that entry is
+   and the bytes after it show no later write (none lies beyond the end of the tail it reported, no readable
+   commit block among them has a commit time at or after the entry's, and, with no readable mark, no unused segment
+   after its own holds bytes after its header, Q-320), no recovery since has resumed: that entry is
    adopted, whether or not the mark is readable, no second entry is written, and the invalid bytes after it are the
    rest of the tail it reported (a mark update torn by a crash in step 6 is no new loss). Otherwise a new entry
    is written, and the bytes after the old one are a newly truncated tail that the new entry reports as
@@ -275,7 +277,8 @@ A.10) is treated as a different boot. The rules apply in this order:
    (§7 Manifest): that writing identical bytes makes the next sync write them, checked on Linux, on ext4
    and XFS, at gate 4.9 (Q-52 (b); macOS and Windows still open). The first start of a new store (no mark file and an empty log) writes no
    entry and creates the mark. A mark with no valid slot beside a log with no segment in use and a manifest naming
-   no position is a first start too (a first start cut short while it wrote the mark): the mark is written again in
+   no position is a first start too, unless an unused segment holds bytes after its header (then rule 3 applies and
+   its entry reports them, Q-320) (a first start cut short while it wrote the mark): the mark is written again in
    place.
 
 **Order of a start.** Every start runs these steps; none depends on state left by an earlier attempt.

@@ -317,8 +317,8 @@ struct Plan {
     /// Batches superseded by a recovery entry in a later segment whose `after` is below them: a reset that wrote its
     /// entry in a new segment and stopped before zeroing them. They are zeroed once the entry is on disk.
     superseded: Vec<(usize, usize)>,
-    /// Unused segments beyond the mark and the last in use with non-zero bytes after their header: part of the
-    /// entry's tail, deleted once the entry is on disk (Q-125, Q-320).
+    /// Unused segments beyond the mark's segment (any, with no readable mark) with non-zero bytes after their header:
+    /// part of the entry's tail, deleted once an entry that reports them is on disk (Q-125, Q-320).
     unused_dirty: Vec<usize>,
     /// Their bytes after the header, and the commit blocks still readable in them.
     unused_tail: (u64, u32),
