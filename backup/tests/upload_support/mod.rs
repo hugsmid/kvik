@@ -290,6 +290,10 @@ impl ManifestPort for Port {
             .read(&self.dir.join(MANIFEST))
             .ok_or_else(|| PortError::Io(std::io::ErrorKind::NotFound.into()))?;
         let img = image::read(&bytes, &ID).map_err(std::io::Error::other)?;
+        // A record that cannot be read stops the upload of those after it (spec §8 Generations).
+        if img.is_corrupt() {
+            return Err(PortError::Io(std::io::Error::other("a corrupt record")));
+        }
         let mut v: Vec<Record> = img.records().filter(|r| r.epoch > after).cloned().collect();
         v.extend(self.phantom.clone().filter(|r| r.epoch > after));
         Ok(v)
@@ -515,7 +519,7 @@ impl Harness {
         );
         let snap = lock(&self.app()).catalogue().clone();
         for (d, content) in &self.segments {
-            let Some(e) = snap.file(d.file_ref()) else {
+            let Some(e) = snap.file(d.file_ref()).filter(|e| e.is_live()) else {
                 continue;
             };
             let key = keys.file(d);
@@ -550,7 +554,9 @@ impl Harness {
                 );
             }
         }
-        check_order(&log.events, &records);
+        check_order(&log.events, &records, &|f| {
+            snap.file(f).is_some_and(|e| e.is_live())
+        });
     }
 }
 
@@ -563,9 +569,9 @@ pub fn fresh_copies(records: &[Record], f: FileRef) -> usize {
         .count()
 }
 
-/// Per file: its upload, then its copy-verified record, then the upload of each record naming it; record uploads
-/// first reach the bucket in epoch order.
-pub fn check_order(events: &[Event], records: &[Record]) {
+/// Per live file: its upload, then its copy-verified record, then the upload of each record naming it; record
+/// uploads first reach the bucket in epoch order.
+pub fn check_order(events: &[Event], records: &[Record], live: &dyn Fn(FileRef) -> bool) {
     let keys = Keys::new(ID);
     let first_put = |key: &str| {
         events
@@ -590,7 +596,7 @@ pub fn check_order(events: &[Event], records: &[Record]) {
         let Some(rec_put) = first_put(&keys.record(r.generation, r.epoch)) else {
             continue;
         };
-        for d in s {
+        for d in s.iter().filter(|d| live(d.file_ref())) {
             let file_put = first_put(&keys.file(d));
             let copy = events.iter().rposition(|e| {
                 matches!(e, Event::Append(_, b)

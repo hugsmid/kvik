@@ -388,6 +388,7 @@ fn q284_an_object_not_reported_after_its_put_is_looked_up_until_lost_then_upload
     assert!(reput_at - put_at >= 10 * MIN);
     assert!(lookups >= 3);
     assert_eq!(h.puts_of(&key), 2);
+    assert_eq!(d.progress().uploaded_files, 1);
     h.check_done();
 }
 
@@ -657,4 +658,51 @@ fn backed_up_through_waits_for_the_copy_verified_record_to_go_up() {
     assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
     assert_eq!(h.puts_of(&keys.record(0, 3)), 1);
     assert_eq!(d.progress().backed_up_through, Some((0, 10)));
+}
+
+#[test]
+fn q282_a_record_naming_a_file_retired_before_its_upload_does_not_wait_for_it() {
+    let mut h = Harness::new();
+    let old = h.seal(10);
+    let new = h.write_segment(10);
+    upload_support::lock(&h.app())
+        .append(
+            Body::Publish(kvik_files::record::Publish {
+                published: vec![new.clone()],
+                retired: vec![old.clone()],
+            }),
+            T0,
+        )
+        .unwrap();
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let keys = Keys::new(ID);
+    assert_eq!(h.puts_of(&keys.file(&old)), 0);
+    assert_eq!(h.puts_of(&keys.file(&new)), 1);
+    h.check_done();
+}
+
+#[test]
+fn a_record_that_cannot_be_read_stops_the_upload_of_those_after_it() {
+    let mut h = Harness::new();
+    h.seal(10);
+    let mut d = h.driver();
+    run_idle(&mut d, &mut Duration::default());
+    h.seal(10);
+    h.seal(10);
+    let records = h.records();
+    let n = records.len();
+    let at = 64
+        + records[..n - 2]
+            .iter()
+            .map(|r| r.encode().unwrap().len())
+            .sum::<usize>();
+    let path = h.dir.join("MANIFEST");
+    let byte = h.fs.read(&path).unwrap()[at + 8] ^ 1;
+    h.fs.poke(&path, at + 8, &[byte]);
+    let s = run(&mut d, &mut Duration::default(), 100);
+    assert!(matches!(s, Step::Failed(UploadError::Port(_))), "{s:?}");
+    let keys = Keys::new(ID);
+    for r in &records[n - 3..] {
+        assert_eq!(h.puts_of(&keys.record(0, r.epoch)), 0, "record {}", r.epoch);
+    }
 }

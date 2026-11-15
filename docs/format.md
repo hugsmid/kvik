@@ -760,7 +760,7 @@ to every stored file.
 - **Local restore record (`kind = 12`).** A copy of the restore record, written by every restore beside the
   manifest's, from which a corrupt restore record is read again (`spec.md` §7 Manifest, §8 Generations).
 - **Manifest (`kind = 3`).** Framing, the empty, publish-and-retire, sealed-segment, lost-range, acknowledgement and
-  rebuild records are in A.14. Still to be laid out: the quarantine and tier-move records, and the restore record, which also carries the lost
+  rebuild records are in A.14, and the copy-verified record (provisional, Q-281). Still to be laid out: the quarantine record and the restore record, which also carries the lost
   ranges, acknowledgements and recovery-entry loss reports of the generations it restores from. Every record that
   names a file repeats its kind, position range and plaintext hash, and every record that names a loss repeats its
   identity, so that no such fact is held by one record alone once a second names it (`spec.md` §7 Manifest).

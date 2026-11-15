@@ -1055,6 +1055,12 @@ field list. It names the file by reference only: a rebuild never reconstructs it
 in the records that publish it. The fold sets the deep copy and the verified mark (Q-280 for a carried one); for a
 file the catalogue does not know it changes nothing. The strict decoding lands in `record.rs` with the last commit
 of 8.1c, as the interfaces commit staged it.
+**Open.** §7 Manifest and `format.md` Part B say every record that names a file repeats its kind, position range and
+plaintext hash. `CopyVerified` (Q-198's interfaces) holds a `FileRef`, so field 1 cannot carry them. Nothing is lost
+while no file leaves the local tiers (the rebuild reads each live file's own header), but once eviction lands a
+corrupt publishing record would leave a file in deep known by reference only. Proposed: field 1 a whole file
+description (A.14), which changes `CopyVerified::file` to a `FileDescription`; a contract change for the lead, to
+make before anything is uploaded.
 **Model.** Not modelled.
 
 ## Q-282 — The upload queue, the record cursor and which records wait
@@ -1095,8 +1101,9 @@ it passes; that is the check the hash rule needs. A sink failure is `Refused::Si
 
 ## Q-284 — Upload failures: retries, other content, an object not reported after its `put`
 
-Recorded and decided by roadmap 8.1c, applying the owner's ruling on Q-82 (an object is lost after 3 failed lookups
-over at least 10 minutes while other calls answer).
+Recorded and decided by roadmap 8.1c. Part (c) extends the owner's ruling on Q-82, given for restore (an object is
+lost after 3 failed lookups over at least 10 minutes while other calls answer), to the lookup after an upload; that
+extension awaits the owner.
 **Scenario.** (a) Transient faults, a busy sink, and a `put` refused with `HashMismatch` (damaged in transit, or after a
 lost reply). (b) Another object already under a file's key. (c) The bucket accepts a `put` and then reports no
 object for the key.
@@ -1105,7 +1112,8 @@ object for the key.
 bucket is never overwritten; how the engine recovers is Q-85's). Other content reported after a `put` likewise fails.
 (c) The driver asks again, by `stat` alone, without a new `put`; a lookup counts only when another call to the bucket
 answers in the same step. After 3 counted lookups over at least 10 minutes the object is taken as lost and uploaded
-again. Upload never records a loss: the local file is the source.
+again. Upload never records a loss: the local file is the source. The S3 sink already reads an object back before
+its `put` returns, so (c) arises only when an object vanishes between two lookups.
 **Model.** Not modelled.
 
 ## Q-285 — Uploading files with no local layout yet, and the hash a file is checked by
@@ -1246,10 +1254,10 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-270 | 8.1 | Envelope damage mapped onto the existing error variants; recorded by roadmap 8.1b; a `Damaged` variant is the lead's call |
 | Q-271 | 8.1 | A.17 against the interfaces: other kinds' keys, the claim marker, the checksum probe key; recorded by roadmap 8.1b; ruled at the merge of 8.1a and 8.1b |
 | Q-280 | 8.1 | Rebuilt manifest and the upload queue; decided by roadmap 8.1c, for review at the 8.1 gate |
-| Q-281 | 8.1 | Copy-verified record layout; decided by roadmap 8.1c, provisional until the 8.1 gate |
+| Q-281 | 8.1 | Copy-verified record layout; decided by roadmap 8.1c, provisional until the 8.1 gate; field 1 as a whole file description needs a contract change (see the question) |
 | Q-282 | 8.1 | Upload queue and record cursor; decided by roadmap 8.1c, for review at the 8.1 gate |
 | Q-283 | 8.1 | Attach probe; decided by roadmap 8.1c under the owner's Q-162 ruling, for review at the 8.1 gate |
-| Q-284 | 8.1 | Upload failures; decided by roadmap 8.1c under the owner's Q-82 ruling, for review at the 8.1 gate |
+| Q-284 | 8.1 | Upload failures; decided by roadmap 8.1c; (c) extends the owner's Q-82 ruling and awaits the owner |
 | Q-285 | 6.2 | Local layout of kinds other than log segments; the upload driver fails on them until then |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 

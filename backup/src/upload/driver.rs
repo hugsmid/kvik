@@ -324,7 +324,9 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         let file = d.file_ref();
         let key = self.keys.file(d);
         if let Some(v) = self.looked_up(&key, now).await? {
-            return self.append_copy(file, v.stored());
+            self.append_copy(file, v.stored())?;
+            self.count_upload(v.stored().size);
+            return Ok(());
         }
         // A copy recorded before a rebuild is verified again by its reported hash, without a new upload (Q-280).
         if let Some(c) = &e.deep
@@ -343,9 +345,13 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         let sealed = self.seal(&key, &plain)?;
         let v = self.put_verified(&key, sealed, now).await?;
         self.append_copy(file, v.stored())?;
-        self.progress.uploaded_files = self.progress.uploaded_files.saturating_add(1);
-        self.progress.uploaded_bytes = self.progress.uploaded_bytes.saturating_add(v.stored().size);
+        self.count_upload(v.stored().size);
         Ok(())
+    }
+
+    fn count_upload(&mut self, size: u64) {
+        self.progress.uploaded_files = self.progress.uploaded_files.saturating_add(1);
+        self.progress.uploaded_bytes = self.progress.uploaded_bytes.saturating_add(size);
     }
 
     fn append_copy(&mut self, file: FileRef, s: &Stored) -> Out<()> {
