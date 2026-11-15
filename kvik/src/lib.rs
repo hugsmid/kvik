@@ -97,6 +97,7 @@ mod config;
 mod consume;
 mod durable;
 mod error;
+mod fold;
 mod health;
 mod read;
 mod series;

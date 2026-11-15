@@ -1,5 +1,5 @@
 //! The public interface end to end, on both backends where the durable backend supports the feature; where it
-//! does not yet, the test checks that it says so (`NotSupportedYet`, `QueryError::NotAvailable`).
+//! does not yet, the test checks that it says so (`NotSupportedYet`).
 
 mod common;
 
@@ -49,10 +49,6 @@ fn num(id: SeriesId, secs: i64, v: f64) -> Reading {
 }
 
 /// Whether a read is one the durable backend does not answer yet.
-fn not_available<T: std::fmt::Debug>(r: Result<T, QueryError>) -> bool {
-    matches!(r, Err(QueryError::NotAvailable { .. }))
-}
-
 fn refused(ack: &Ack) -> Vec<(usize, Refusal)> {
     ack.refused().collect()
 }
@@ -168,17 +164,8 @@ fn define_emit_and_read_on(b: Backend) {
 
     clock.advance(Duration::from_secs(10));
     let r = s.reader();
-    if b == Backend::Durable {
-        assert!(not_available(r.window(
-            g,
-            Window::rolling(Duration::from_secs(10)),
-            Aggregate::Avg
-        )));
-        assert!(not_available(r.live(g)));
-        assert_eq!(facts(&r, g, at(0)..at(10), View::Current).len(), 2);
-    } else {
-        windows_and_live(&r, g, c);
-    }
+    assert_eq!(facts(&r, g, at(0)..at(10), View::Current).len(), 2);
+    windows_and_live(&r, g, c);
 
     let info = s.series("plant/line-1/power").unwrap();
     assert_eq!(info.id, g);
@@ -442,11 +429,7 @@ fn forecast_series_carry_values_into_windows_on(b: Backend) {
     block_on(s.emit(&[num(f, 3_600, 12.0).changed_at(issue1 + 1)])).unwrap();
     let r = s.reader();
     // A forecast series has no live state.
-    if b == Backend::Durable {
-        assert!(not_available(r.live(f)));
-    } else {
-        assert!(matches!(r.live(f).unwrap(), Live::None));
-    }
+    assert!(matches!(r.live(f).unwrap(), Live::None));
     // The fact at a time: the version the view selects, with changed_at.
     let now = r.at(f, at(5_000), View::Current).unwrap().unwrap();
     assert_eq!(
@@ -455,9 +438,6 @@ fn forecast_series_carry_values_into_windows_on(b: Backend) {
     );
     let then = r.at(f, at(5_000), View::AsOf(first)).unwrap().unwrap();
     assert_eq!((then.number(), then.changed_at), (Some(10.0), Some(issue1)));
-    if b == Backend::Durable {
-        return;
-    }
     // Buckets of 15 minutes from 01:00 to 02:00 after now: only the first
     // holds a reading; the others carry its value in. Min and max are over
     // readings only; the mean comes from the carried-in value.
@@ -887,15 +867,11 @@ fn interval_series_and_calendar_results_on(b: Backend) {
         r.interval(energy, at(-6_300)).unwrap(),
         (at(-7_200), at(-5_400))
     );
-    if b == Backend::Durable {
-        let kept: Vec<_> = facts(&r, energy, at(-7_200)..at(0), View::Current)
-            .iter()
-            .map(|f| (f.t, f.number()))
-            .collect();
-        assert_eq!(kept, vec![(at(-7_200), Some(1.5)), (at(-5_400), Some(2.5))]);
-        assert!(not_available(r.calendar(energy, jan5, Aggregate::Sum)));
-        return;
-    }
+    let kept: Vec<_> = facts(&r, energy, at(-7_200)..at(0), View::Current)
+        .iter()
+        .map(|f| (f.t, f.number()))
+        .collect();
+    assert_eq!(kept, vec![(at(-7_200), Some(1.5)), (at(-5_400), Some(2.5))]);
     let day = r.calendar(energy, jan5, Aggregate::Sum).unwrap();
     assert_eq!(day.number(), Some(4.0));
     assert!(!day.flags.apportioned);
@@ -1000,25 +976,21 @@ fn state_and_text_series_on(b: Backend) {
     assert_eq!(refused(&ack), vec![(2, Refusal::StateOutOfRange)]);
     clock.advance(Duration::from_secs(30));
     let r = s.reader();
-    if b == Backend::Model {
-        let heat = r
-            .window(
-                mode,
-                Window::absolute(at(0)..at(30)),
-                Aggregate::TimeInState(Value::State(1)),
-            )
-            .unwrap();
-        assert_eq!(heat.number(), Some(10.0));
-        match r.live(mode).unwrap() {
-            Live::Value(v) => assert_eq!(v.fact.value, Value::State(0)),
-            other => panic!("{other:?}"),
-        }
-    } else {
-        assert!(not_available(r.live(mode)));
-        let modes = facts(&r, mode, at(0)..at(30), View::Current);
-        let values: Vec<_> = modes.iter().map(|f| f.value.clone()).collect();
-        assert_eq!(values, vec![Value::State(1), Value::State(0)]);
+    let heat = r
+        .window(
+            mode,
+            Window::absolute(at(0)..at(30)),
+            Aggregate::TimeInState(Value::State(1)),
+        )
+        .unwrap();
+    assert_eq!(heat.number(), Some(10.0));
+    match r.live(mode).unwrap() {
+        Live::Value(v) => assert_eq!(v.fact.value, Value::State(0)),
+        other => panic!("{other:?}"),
     }
+    let modes = facts(&r, mode, at(0)..at(30), View::Current);
+    let values: Vec<_> = modes.iter().map(|f| f.value.clone()).collect();
+    assert_eq!(values, vec![Value::State(1), Value::State(0)]);
     let notes = facts(&r, note, at(0)..at(1), View::Current);
     assert_eq!(notes[0].value, Value::Text("filter changed".into()));
     assert_eq!(notes[0].quality, Quality::Estimated);
@@ -1093,29 +1065,27 @@ fn unsupported_items_say_so_on(b: Backend) {
         block_on(s.rebuild(kvik::Rebuild::Derived)),
         Err(BackupError::NotSupportedYet { .. })
     ));
+    // Live state, windows, chart buckets and calendar results are answered on both backends.
+    let r = s.reader();
+    assert!(matches!(r.live(g), Ok(Live::None)));
+    let w = r
+        .window(g, Window::rolling(Duration::from_secs(60)), Aggregate::Avg)
+        .unwrap();
+    assert_eq!((w.value, w.count), (None, 0));
+    assert!(matches!(
+        r.buckets(g, at(0)..at(60), Resolution::Auto { max_points: 10 }),
+        Ok(ChartData::Facts(f)) if f.is_empty()
+    ));
+    let day = r
+        .calendar(g, LocalDate::new(2026, 1, 5), Aggregate::Avg)
+        .unwrap();
+    assert_eq!(day.value, None);
     if b == Backend::Durable {
-        // Consumers, live state, windows and chart buckets come with later roadmap items.
+        // Consumers come with a later roadmap item.
         assert!(matches!(
             block_on(s.consumer("ops", Start::Now, Select::None)),
             Err(ConsumerError::NotSupportedYet { .. })
         ));
-        let r = s.reader();
-        assert!(not_available(r.live(g)));
-        assert!(not_available(r.window(
-            g,
-            Window::rolling(Duration::from_secs(60)),
-            Aggregate::Avg
-        )));
-        assert!(not_available(r.buckets(
-            g,
-            at(0)..at(60),
-            Resolution::Auto { max_points: 10 }
-        )));
-        assert!(not_available(r.calendar(
-            g,
-            LocalDate::new(2026, 1, 5),
-            Aggregate::Avg
-        )));
         assert_eq!(
             s.export_orphaned(Position::ORIGIN..=Position::ORIGIN)
                 .unwrap(),
@@ -1198,9 +1168,9 @@ fn opening_rules_on(b: Backend) {
     block_on(s.shutdown()).unwrap();
     // Readers are independent of the writer (`docs/api.md` Handles and life
     // cycle): they keep reading what was committed after it shuts down.
-    let readable = |r: &Reader| match b {
-        Backend::Model => matches!(r.live(g), Ok(Live::Value(_))),
-        _ => facts(r, g, at(0)..at(1), View::Current).len() == 1,
+    let readable = |r: &Reader| {
+        matches!(r.live(g), Ok(Live::Value(_)))
+            && facts(r, g, at(0)..at(1), View::Current).len() == 1
     };
     assert!(readable(&reader));
     let mut other = config_on(b, "zones", &clock);
@@ -1345,7 +1315,13 @@ fn consumer_before_any_series() {
 
 #[test]
 fn auto_resolution_counts_from_the_aligned_floor() {
-    let (s, _clock) = store("auto-aligned");
+    for b in BACKENDS {
+        auto_resolution_counts_from_the_aligned_floor_on(b);
+    }
+}
+
+fn auto_resolution_counts_from_the_aligned_floor_on(b: Backend) {
+    let (s, _clock) = store_on(b, "auto-aligned");
     let g = block_on(s.define_series(gauge("a/b/c", 60))).unwrap();
     let minutes: Vec<_> = (0..=60).map(|m| num(g, -3_600 + 60 * m, 1.0)).collect();
     block_on(s.emit(&minutes)).unwrap();
@@ -1492,6 +1468,8 @@ fn future_facts_are_flagged_on(b: Backend) {
         assert_eq!(fs[0].quality, Quality::Suspect);
         assert_eq!(fs[0].supplied_quality, Quality::Good);
         assert_eq!(s.series_stats(g).unwrap().future, 1);
+        // Ignored by live state until its time comes.
+        assert!(matches!(s.reader().live(g).unwrap(), Live::None));
         return;
     }
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();

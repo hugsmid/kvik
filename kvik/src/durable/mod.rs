@@ -12,15 +12,17 @@
 //! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore
 //! (8.x).
 
+mod clock;
 mod index;
 mod ingest;
 pub(crate) mod reader;
 mod registry;
+mod windows;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -50,6 +52,7 @@ use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, Time
 use index::{Index, fact_out, pos};
 use ingest::{Decider, Decision};
 pub(crate) use reader::DurableReader;
+pub(crate) use windows::{buckets, live, window};
 
 /// The most readings in one call, whatever the ingest queue (`docs/api.md` Writing).
 const CALL_READINGS: usize = 65_536;
@@ -175,7 +178,8 @@ pub(crate) struct Writer {
     inflight: Mutex<BTreeMap<u64, Arc<Completion>>>,
     next_call: AtomicU64,
     closed: AtomicBool,
-    now: AtomicI64,
+    /// The window clock and the refresh instants of live staleness, shared with the reader of this process.
+    clocks: Arc<clock::Clocks>,
 }
 
 /// How a queued call's acknowledgement becomes its [`Ack`].
@@ -407,7 +411,7 @@ impl Writer {
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),
-            now: AtomicI64::new(wall),
+            clocks: Arc::new(clock::Clocks::new(env.clock.clone())),
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
@@ -449,10 +453,9 @@ impl Writer {
         Ok(())
     }
 
-    /// The store's `now`, which never runs backwards.
+    /// The store's `now`, which never runs backwards (spec §6 `now`).
     pub(crate) fn now(&self) -> Timestamp {
-        let w = self.env.clock.wall().0;
-        Timestamp(self.now.fetch_max(w, Ordering::SeqCst).max(w))
+        Timestamp(self.clocks.now())
     }
 
     /// The reader this process uses for its own reads, opened on first use.
@@ -462,11 +465,15 @@ impl Writer {
             return Ok(r.clone());
         }
         let opened = Arc::new(
-            DurableReader::open(&self.dir, &self.env, Duration::from_secs(30 * 60)).map_err(
-                |e| QueryError::NotAvailable {
-                    reason: e.to_string(),
-                },
-            )?,
+            DurableReader::open_with(
+                &self.dir,
+                &self.env,
+                Duration::from_secs(30 * 60),
+                self.clocks.clone(),
+            )
+            .map_err(|e| QueryError::NotAvailable {
+                reason: e.to_string(),
+            })?,
         );
         *r = Some(opened.clone());
         Ok(opened)
@@ -794,6 +801,7 @@ impl Writer {
         #[cfg(test)]
         tests::after_decision(&self.dir);
         self.count(readings, &plan);
+        self.refresh_live(&plan);
         let decisions = plan.decisions;
         let Some((completion, own)) = tracked else {
             return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None))));
@@ -874,6 +882,25 @@ impl Writer {
                         st.future += u64::from(row.flags.future);
                     }
                 }
+            }
+        }
+    }
+
+    /// Notes the facts of a call that refresh live staleness (spec §5.4): recorded, not outranked, not bad quality
+    /// and not future. The instant is taken when the call is decided, just before its commit.
+    fn refresh_live(&self, plan: &ingest::Plan) {
+        for d in &plan.decisions {
+            if let Decision::Record {
+                item,
+                outranked: false,
+                ..
+            } = d
+                && let Some(Item::Fact(row)) = plan.items.get(*item)
+                && row.quality != kvik_log::facts::Quality::Bad
+                && !matches!(row.value, kvik_log::facts::Value::Absent { .. })
+                && !row.flags.future
+            {
+                self.clocks.refresh(row.series_id);
             }
         }
     }
@@ -1154,16 +1181,6 @@ pub(crate) fn interval(
             _ => Err(Error::InvalidQuery("not an interval series".into())),
         }
     })
-}
-
-/// What a durable reader does not answer yet.
-pub(crate) fn not_available(what: &str) -> QueryError {
-    QueryError::NotAvailable {
-        reason: format!(
-            "not supported yet by the durable backend: {what} (needs live state, windows or calendar results, \
-             roadmap 5.4 and 7.x)"
-        ),
-    }
 }
 
 /// The reader state of a durable reader.

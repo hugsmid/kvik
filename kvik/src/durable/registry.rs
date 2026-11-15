@@ -148,6 +148,11 @@ impl Registry {
             .map_or(created, String::as_str)
     }
 
+    /// The site-zone entries by effective time (spec §5.7); of two at one time the later in the log.
+    pub(crate) fn site_zones(&self) -> &BTreeMap<i64, String> {
+        &self.site_zones
+    }
+
     /// The tzdata version in force: the latest tzdata entry, else `created`.
     pub(crate) fn tzdata<'a>(&'a self, created: &'a str) -> &'a str {
         self.tzdata.as_deref().unwrap_or(created)

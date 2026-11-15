@@ -582,17 +582,15 @@ impl Reader {
         )
     }
 
-    /// Live state: the latest valid value, with staleness (spec §2.3). Not
-    /// available yet with the durable backend (roadmap 5.4).
+    /// Live state: the latest valid value, with staleness (spec §2.3).
     pub fn live(&self, id: SeriesId) -> Result<Live, QueryError> {
         self.on(
             |s| s.with(|s| s.live(id)).map_err(|e| e.query()),
-            |_| Err(durable::not_available("live state")),
+            |r| durable::live(r, id),
         )
     }
 
-    /// A window result (spec §6). Not available yet with the durable backend
-    /// (roadmap 5.4).
+    /// A window result (spec §6).
     pub fn window(
         &self,
         id: SeriesId,
@@ -604,12 +602,12 @@ impl Reader {
                 s.with(|s| s.window(id, &window, &aggregate))
                     .map_err(|e| e.query())
             },
-            |_| Err(durable::not_available("windows")),
+            |r| durable::window(r, id, &window, &aggregate),
         )
     }
 
     /// A chart query: raw facts or buckets with count, min, max, mean and
-    /// coverage. Not available yet with the durable backend (roadmap 7.1).
+    /// coverage.
     pub fn buckets(
         &self,
         id: SeriesId,
@@ -622,7 +620,7 @@ impl Reader {
                 s.with(|s| s.buckets(id, range, resolution))
                     .map_err(|e| e.query())
             },
-            |_| Err(durable::not_available("chart buckets")),
+            |r| durable::buckets(r, id, range, resolution),
         )
     }
 

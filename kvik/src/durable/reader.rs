@@ -9,6 +9,7 @@ use std::time::Duration;
 use kvik_log::reader::{LogReader, ReaderConfig as LogReaderConfig, ReaderError};
 
 use super::LogClock;
+use super::clock::Clocks;
 use super::index::{Index, pos};
 use crate::backend::Error;
 use crate::env::Env;
@@ -38,6 +39,10 @@ impl Drop for State {
 pub(crate) struct DurableReader {
     dir: PathBuf,
     state: Mutex<State>,
+    /// The window clock and refresh instants of this process: the writer's, for the reader of its own process.
+    clocks: Arc<Clocks>,
+    /// The site zone at creation, from the store descriptor: in force before the first site-zone entry (spec §5.7).
+    created_zone: String,
 }
 
 pub(crate) fn open_error(dir: &Path, e: ReaderError) -> OpenError {
@@ -76,6 +81,21 @@ fn query_error(dir: &Path, e: ReaderError) -> QueryError {
 impl DurableReader {
     /// Opens a reader on the store in `dir`; reads nothing until the first call.
     pub(crate) fn open(dir: &Path, env: &Env, lease_refresh: Duration) -> Result<Self, OpenError> {
+        Self::open_with(
+            dir,
+            env,
+            lease_refresh,
+            Arc::new(Clocks::new(env.clock.clone())),
+        )
+    }
+
+    /// [`DurableReader::open`] with the window clock and refresh instants of the process.
+    pub(crate) fn open_with(
+        dir: &Path,
+        env: &Env,
+        lease_refresh: Duration,
+        clocks: Arc<Clocks>,
+    ) -> Result<Self, OpenError> {
         let mut id = [0u8; 16];
         env.entropy.fill(&mut id);
         let mut cfg = LogReaderConfig::new(
@@ -87,13 +107,33 @@ impl DurableReader {
         );
         cfg.lease_refresh = lease_refresh;
         let log = LogReader::open(cfg).map_err(|e| open_error(dir, e))?;
+        let created_zone = kvik_log::store::read_descriptor(&*env.fs, dir)
+            .map_err(|e| super::store_error(dir, e))?
+            .site_zone;
         Ok(DurableReader {
             dir: dir.to_path_buf(),
             state: Mutex::new(State {
                 log: Some(log),
                 index: Index::default(),
             }),
+            clocks,
+            created_zone,
         })
+    }
+
+    /// The window clock now (spec §6 `now`).
+    pub(crate) fn now(&self) -> i64 {
+        self.clocks.now()
+    }
+
+    /// The window clock and refresh instants of this process.
+    pub(crate) fn clocks(&self) -> &Clocks {
+        &self.clocks
+    }
+
+    /// The site zone at creation.
+    pub(crate) fn created_zone(&self) -> &str {
+        &self.created_zone
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
