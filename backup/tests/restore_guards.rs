@@ -8,7 +8,8 @@ use std::sync::Arc;
 use kvik_backup::fake::block_on;
 use kvik_backup::keys::{ClaimMarker, Keys};
 use kvik_backup::plan::PlanMode;
-use kvik_backup::restore::{RestoreDriver, RestoreError};
+use kvik_backup::restore::{Prepared, RestoreDriver, RestoreError};
+use kvik_backup::upload::Refused;
 use kvik_log::fs::MemFs;
 use kvik_sink::fake::FakeBucket;
 use kvik_sink_api::SinkError;
@@ -80,9 +81,7 @@ fn a_claim_rejected_three_times_with_nothing_stored_fails_and_skips_no_generatio
 fn a_generation_whose_records_list_empty_while_its_restore_record_is_stored_is_refused_not_skipped()
 {
     let mut src = source(ID, 2, false);
-    let bucket = FakeBucket::new();
-    upload(&bucket.sink(), &mut src);
-    use_copies(&src);
+    let bucket = fake_bucket(&mut src);
     bucket.set_list_lag(1_000);
     let first = MemFs::new();
     let (p, _) = restore(&mut restorer(bucket.sink(), &first, PlanMode::Full, KEY)).unwrap();
@@ -97,5 +96,105 @@ fn a_generation_whose_records_list_empty_while_its_restore_record_is_stored_is_r
             "{mode:?}: {r:?}"
         );
         assert!(fs.paths().is_empty(), "{mode:?}");
+    }
+}
+
+fn fake_bucket(src: &mut Source) -> FakeBucket {
+    let bucket = FakeBucket::new();
+    upload(&bucket.sink(), src);
+    use_copies(src);
+    bucket
+}
+
+fn refused(r: Result<Prepared, RestoreError>) -> Option<Refused> {
+    match r {
+        Err(RestoreError::Refused(x)) => Some(x),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_bucket_without_conditional_writes_is_refused_before_the_claim() {
+    let mut src = source(ID, 2, false);
+    let objects = bucket(&mut src);
+    let keys = Keys::new(ID);
+    for earlier in [false, true] {
+        for fault in [Fault::Overwrite, Fault::OverwriteQuietly, Fault::Pretend] {
+            let sink = Arc::new(FaultSink::new(mem_with(&objects)));
+            if earlier {
+                sink.inner.set(&keys.probe(), b"an earlier probe");
+            }
+            sink.set(&keys.probe(), Some(fault));
+            let fs = MemFs::new();
+            let r = block_on(restorer(sink.clone(), &fs, PlanMode::Full, KEY).prepare(1));
+            let ctx = format!("earlier {earlier}, {fault:?}: {r:?}");
+            assert_eq!(refused(r), Some(Refused::NoConditionalWrites), "{ctx}");
+            assert!(claims(&sink.inner.objects(), ID).is_empty(), "{ctx}");
+            assert!(fs.paths().is_empty(), "{ctx}");
+        }
+    }
+}
+
+#[test]
+fn a_bucket_without_checksum_checks_is_refused_before_the_claim_and_a_drill_does_not_probe() {
+    let mut src = source(ID, 2, false);
+    let objects = bucket(&mut src);
+    for hashes in [Hashes::Trusted, Hashes::StoreRejected, Hashes::Swallowed] {
+        let sink = Arc::new(FaultSink::new(mem_with(&objects)));
+        sink.set_hashes(hashes);
+        let fs = MemFs::new();
+        let r = block_on(restorer(sink.clone(), &fs, PlanMode::Full, KEY).prepare(1));
+        assert_eq!(refused(r), Some(Refused::NoChecksums), "{hashes:?}");
+        assert!(claims(&sink.inner.objects(), ID).is_empty());
+        assert!(fs.paths().is_empty());
+        let before = sink.log().len();
+        restore(&mut restorer(
+            sink.clone(),
+            &MemFs::new(),
+            PlanMode::Drill,
+            KEY,
+        ))
+        .unwrap();
+        assert!(sink.log()[before..].iter().all(|(op, _)| *op != "put"));
+    }
+}
+
+#[test]
+fn a_bucket_that_passed_keeps_its_probe_unchanged_and_passes_again() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(mem_with(&bucket(&mut src)));
+    let keys = Keys::new(ID);
+    restore(&mut restorer(
+        sink.clone(),
+        &MemFs::new(),
+        PlanMode::Full,
+        KEY,
+    ))
+    .unwrap();
+    let kept = sink.objects()[&keys.probe()].clone();
+    sink.remove(&keys.claim(1));
+    sink.remove(&keys.record(1, 1));
+    let (p, _) = restore(&mut restorer(
+        sink.clone(),
+        &MemFs::new(),
+        PlanMode::Full,
+        KEY,
+    ))
+    .unwrap();
+    assert_eq!(p.record.generation, 1);
+    assert_eq!(sink.objects()[&keys.probe()], kept);
+    let prefix = format!("{}/", keys.probe());
+    assert!(!sink.objects().keys().any(|k| k.starts_with(&prefix)));
+}
+
+#[test]
+fn a_sink_fault_during_the_probe_is_a_sink_error_not_a_refusal() {
+    let mut src = source(ID, 2, false);
+    let objects = bucket(&mut src);
+    for fault in [Fault::Delay(1), Fault::RejectPut(1)] {
+        let sink = Arc::new(FaultSink::new(mem_with(&objects)));
+        sink.set(&Keys::new(ID).probe(), Some(fault));
+        let r = block_on(restorer(sink.clone(), &MemFs::new(), PlanMode::Full, KEY).prepare(1));
+        assert!(matches!(r, Err(RestoreError::Sink(_))), "{fault:?}: {r:?}");
     }
 }

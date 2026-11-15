@@ -48,8 +48,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
 | Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
 | Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
-| Q-213 | §8 Bucket; `format.md` A.17 Probe; `backup/src/keys.rs` | The checksum probe's key, which the key contract cannot build |
-| Q-214 | §8 Bucket, Restore; `api.md` Backup and restore; `backup/src/restore.rs` | A restore that meets a bucket it must refuse |
 | Q-270 | §8 Encryption; `format.md` A.17 Reading | Envelope damage that `EnvelopeError` has no variant for |
 | Q-271 | §8 Deep, Generations; `format.md` A.17 Keys, Claim marker, Probe | Where `format.md` A.17 and the backup interfaces disagree |
 | Q-280 | §7 Manifest (rebuild), §8 Continuous backup, Hashes | How a rebuilt manifest queues files for upload again |
@@ -894,7 +892,7 @@ earlier A.17 draft (`data/` and `tree/` prefixes, a 40-byte marker with magic, v
 had been uploaded. A.17 was aligned to the contract's types in the same commit: a key that starts with no store id
 is ignored, since `Refused::OtherStore` and `RestoreError::SeveralStores` carry store ids; an uploaded record is the
 canonical encoding (`Record::encode`, as the manifest port hands out decoded records); the attach probe checks the
-key against `<sid>/STORE` (`Refused::WrongKey`). Two mismatches remain: Q-213 and Q-214.
+key against `<sid>/STORE` (`Refused::WrongKey`). Two mismatches remained, Q-213 and Q-214; roadmap 8.3b settled both.
 **Model.** Not modelled.
 
 ## Q-210 — Telling a bucket that reports no checksum from another sink failure
@@ -931,28 +929,6 @@ can never be used for the file (no overwrite, no delete), and the restore derive
 **Needed.** What the driver does. Suggested: no alternate key in format v1; the file stays local, is never evicted,
 and health asks for attention (`BackupStalled` naming the key); the queue continues with other files, but no
 manifest record that names the file is uploaded while it is not backed up.
-
-## Q-213 — The checksum probe's key, which the key contract cannot build
-Recorded at roadmap 8.1a. To be settled by roadmap 8.1c.
-**Scenario.** The contract (`backup/src/keys.rs`, Q-198) names one probe key, `<sid>/probe`. A.17's checksum probe
-puts under a fresh `<sid>/probe/<nonce>`, which `Keys` cannot build and `parse` ignores. Folding the checksum probe
-onto `<sid>/probe` would weaken the owner's refusal (Q-162): a bucket that does not check stores the wrong-hash
-probe there and is refused; at the next attach the key is present, a wrong-hash `put` cannot be told from
-`Exists`, the other checks pass, and the refused bucket is accepted.
-**Model.** Not modelled.
-**Needed.** Suggested: keep A.17's key and add `Keys::checksum_probe(nonce)` with `ObjectName::ChecksumProbe` (the
-enum is non-exhaustive) in `backup/src/keys.rs` before 8.1c's probe uses it. Until then nothing builds that key.
-
-## Q-214 — A restore that meets a bucket it must refuse
-Recorded at roadmap 8.1a. To be settled by roadmap 8.3b.
-**Scenario.** A.17 and §8 Bucket: a restore probes the bucket before it claims and refuses one that fails
-(`BackupRefused`). `RestoreDriver::prepare` names no probe step, and `RestoreError` has no refusal variant, so the
-executor can report such a bucket only as `Sink` or not at all, and `Store::restore` cannot return
-`BackupError::Refused`. Likewise `RestoreError::SeveralStores` (A.17) has no `BackupError` counterpart in `api.md`.
-**Model.** Not modelled.
-**Needed.** Suggested: an additive `RestoreError::Refused(Refused)` (the enum is non-exhaustive), the probe as the
-step of `prepare` before the claim (`Full` only; a drill does not probe), and `Store::restore` mapping it to
-`BackupError::Refused`; `SeveralStores` mapped to an additive `BackupError` variant named in `api.md`.
 
 ## Q-270 — Envelope damage that `EnvelopeError` has no variant for
 
@@ -1275,7 +1251,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82 and Q-305.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1320,12 +1296,10 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
-| Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; remaining mismatches in Q-213 and Q-214 |
+| Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; the remaining mismatches, Q-213 and Q-214, settled by 8.3b |
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
 | Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
 | Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
-| Q-213 | 8.1c | The checksum probe's key; recorded by roadmap 8.1a; needs a change to `backup/src/keys.rs`, roadmap 8.1b's file |
-| Q-214 | 8.3b | A restore's refusal of a bucket; recorded by roadmap 8.1a; needs a change to `backup/src/restore.rs`, roadmap 8.3b's file |
 | Q-270 | 8.1 | Envelope damage mapped onto the existing error variants; recorded by roadmap 8.1b; a `Damaged` variant is the lead's call |
 | Q-271 | 8.1 | A.17 against the interfaces: other kinds' keys, the claim marker, the checksum probe key; recorded by roadmap 8.1b; ruled at the merge of 8.1a and 8.1b |
 | Q-280 | 8.1 | Rebuilt manifest and the upload queue; decided by roadmap 8.1c, accepted by the owner |
@@ -1581,6 +1555,8 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-295 | A restore from a rebuilt manifest whose files are not yet verified again | §8 Generations, §7 Manifest (the owner's ruling at the review of roadmap 8.3a): a restore plan uses a file's recorded copy in deep (`FileEntry::deep`), not the verified mark. A copy recorded but gone from the bucket since is found when it is fetched, by the hash checks and the lost-object rule (Q-82), and reported as `data_lost`: loud. Leaving it out of a claimed generation would be silent and permanent, since later restores read that generation's records only. "Verified in deep" (Q-280) keeps its meaning for the upload queue only: what roadmap 8.1c must check again or upload again after a rebuild. A carried restore record, like a carried copy-verified record, gives its files' copies and no verified mark. Scenario: segments 1 to 3 (`0:1` to `0:30`) are uploaded and verified; the manifest is rebuilt and its records upload whole; the rebuild clears every mark and the carried records set none; a disaster then strikes before the files are checked again. Read as "verified only", a full restore claims generation 1 with restored end `0:0` and lists no file, and the segments are in no record a later restore reads; with the copy, it restores to `0:30`, as from the old records a moment earlier, so the plan is monotone in the records uploaded across a rebuild. Tests: `backup/tests/restore_plan.rs` `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark`, `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `the_plan_is_monotone_in_the_records_uploaded`; `kvik/tests/restore_plan_model.rs` (rebuilt manifests); `files/src/catalogue.rs` `a_carried_restore_record_gives_copies_but_no_verified_mark` |
 | Q-39 (f) | A crash while the restore record is written | §8 Restore, Failures and end (settled by roadmap 8.3b: the restore record reaches `MANIFEST` whole: the manifest's header and the record as its first record are written as `MANIFEST.new`, synced and renamed, and the directory synced; a directory holding only `MANIFEST.new` is a restore that did not reach its record, which is removed, and the restore starts again with the next generation, its claim kept. A torn record therefore never reaches `MANIFEST`. `backup/tests/restore.rs`, `a_restore_killed_at_every_file_operation_completes_after_a_restart`, `a_leftover_manifest_before_the_record_is_removed_and_the_next_generation_claimed`) |
 | Q-82 | How a restore tells that the bucket has lost or corrupted a listed file | §8 Restore, Failures and end (settled by roadmap 8.3b with the owner's thresholds: a wrong key is told by the key check value in `STORE`'s envelope header before any file is judged, `RestoreError::WrongKey`, and records nothing; a listed file is lost when `stat` reports it absent on 3 tries spanning at least 10 minutes while `STORE` is reported present in the same step; it is corrupt at once when the reported size or ciphertext SHA-256 differs from its copy, and after 3 downloads with the right key whose bytes are not the copy, whose chunks fail authentication or whose plaintext hash is not its description's (a sink's `HashMismatch` on a download counts as one); any other fault, a `Transient` download included, is retried with backoff and never counts. The thresholds are `RestoreConfig::lost_tries` and `lost_over`; tries are counted per run, so a restart starts them again. A lost or corrupt file becomes a lost range, cause 3 (Q-302). `backup/src/restore/judge.rs`, `backup/tests/restore.rs`, `backup/tests/restore_properties.rs`) |
+| Q-213 | The checksum probe's key, which the key contract cannot build | `backup/src/keys.rs` (settled by roadmap 8.3b at its review, by Q-213's suggestion: the checksum probe keeps its own key `<sid>/probe/<nonce:32 hex>`, built by `Keys::checksum_probe` and parsed as `ObjectName::ChecksumProbe`, so a refused bucket's wrong-hash probe never lands on `<sid>/probe` and a later probe cannot mistake it for an earlier one) |
+| Q-214 | A restore that meets a bucket it must refuse | `api.md` Backup and restore, Restore (settled by roadmap 8.3b at its review, by Q-214's suggestion: `RestoreDriver::prepare` probes the bucket in a full restore after the key check and `STORE` and before reading the claims, as `attach_backup` does (`<sid>/probe` for conditional writes, then a wrong-hash `put` to a fresh `<sid>/probe/<nonce>` that must fail and leave nothing); a failure is the additive `RestoreError::Refused(Refused)` (`NoConditionalWrites`, `NoChecksums`), which `Store::restore` maps to `BackupError::Refused`; a sink fault during the probe stays `RestoreError::Sink`; a drill and a resumed restore do not probe; the probe's bytes come from the restorer's nonce source. `RestoreError::SeveralStores` maps to the additive `BackupError::SeveralStores { store_ids }`. A `stat` that reports no SHA-256 reaches the probe as the sink's `Failed` (the S3 sink refuses such a reply), so it fails the restore as `Sink`, not as `Refused(NoChecksums)`. `backup/src/restore/probe.rs`, `backup/tests/restore_guards.rs`) |
 | Q-305 | A claim refused with `HashMismatch` while nothing is stored | §8 Generations; `api.md` Backup and restore, No overwrite (settled by roadmap 8.3b at its review. Scenario: a restore's claim `put` for generation g fails with `HashMismatch` and stores nothing; taking g + 1 leaves g unclaimed, and a later drill, which runs one above the highest claimed generation read by `stat` in ascending order (Q-163), stops at the gap, plans from an older generation and passes while ignoring the live one. Ruling: after a `HashMismatch` the restore reads the marker by `stat`; present, it takes the next generation (Q-161: the marker may be another restore's); absent, it tries g again, at most 3 tries of g, then fails with the sink's `HashMismatch` without taking another generation, since a sink that rejects every upload must not walk the generations. `backup/src/restore/driver.rs` `claim`, `backup/tests/restore_guards.rs`) |
 
 ## Where the model differs from the specification

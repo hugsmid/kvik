@@ -442,7 +442,7 @@ let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode:
 pub enum RestoreMode { Full /* default */, Drill, Partial(RestoreScope) }   // not Copy; Partial: NotSupportedYet until 8.3f
 pub struct RestoreScope { pub time: Option<Range<Timestamp>> }            // non-exhaustive; a series selection arrives with 8.3f
 pub enum BackupError { NotSupportedYet { what }, Sink(SinkError), Refused(BackupRefusal), WrongKey, NotEmpty, NoStore,
-    Superseded { generation: u32 }, AlreadyAttached, RestoreFailed { file_id: u64, reason: String }, Drill,
+    SeveralStores { store_ids: Vec<[u8; 16]> }, Superseded { generation: u32 }, AlreadyAttached, RestoreFailed { file_id: u64, reason: String }, Drill,
     Io { op, path, kind } }
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
@@ -471,7 +471,9 @@ only, boxed `Send` futures):
   sink's queue is full) may be retried; a `put` that failed this way may have stored the object, and repeating it
   is safe. `BackupError::Sink` carries a `SinkError`.
 - **Restore.** A restore finds the store id by listing the bucket (keys start at the store id; there is no key
-  prefix) and fails with `NoStore` on none. An unfinished restore is resumed by calling `Store::restore` again
+  prefix) and fails with `NoStore` on none and `SeveralStores` on more than one. A full restore probes the bucket
+  before it claims and refuses one without conditional writes or checksum checks as `Refused` (`NoConditionalWrites`,
+  `NoChecksums`; Q-214); a drill does not probe. An unfinished restore is resumed by calling `Store::restore` again
   (Q-164 (c)). `WrongKey` comes before any file is fetched. `NotEmpty`: the directory holds files and no restore
   record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
   store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a

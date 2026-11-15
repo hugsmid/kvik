@@ -14,18 +14,20 @@ use kvik_sink_api::SinkError;
 use crate::DriverFuture;
 use crate::envelope::EnvelopeError;
 use crate::plan::{PlanError, PlanMode};
+use crate::upload::Refused;
 
 mod codec;
 mod driver;
 mod judge;
 mod local;
+mod probe;
 
 pub use driver::Restorer;
 
 /// Drives a restore one file at a time.
 pub trait RestoreDriver: Send {
-    /// Finds the store id, checks the key (`WrongKey` before any file is judged), fetches `STORE`, reads the claims
-    /// by `stat` (Q-163), claims (Full), reads the source records, plans, syncs the record in `MANIFEST`, uploads it
+    /// Finds the store id, checks the key (`WrongKey` before any file is judged), fetches `STORE`, probes the bucket
+    /// (Full; format A.17 Probe, Q-214), reads the claims by `stat` (Q-163), claims (Full), reads the source records, plans, syncs the record in `MANIFEST`, uploads it
     /// and reads the claims again (Full). A directory with a restore record resumes; files and no record:
     /// [`RestoreError::NotEmpty`].
     fn prepare<'a>(&'a mut self, wall: i64) -> DriverFuture<'a, Result<Prepared, RestoreError>>;
@@ -103,6 +105,9 @@ pub enum RestoreError {
     /// The bucket holds no store.
     #[error("the bucket holds no store")]
     NoStore,
+    /// The bucket fails the probe a full restore makes before it claims (format A.17 Probe; Q-214).
+    #[error("the bucket is refused: {0}")]
+    Refused(Refused),
     /// The bucket holds several stores.
     #[error("the bucket holds {} stores", .0.len())]
     SeveralStores(Vec<[u8; 16]>),

@@ -74,7 +74,13 @@ fn a_full_restore_claims_generation_one_uploads_its_record_and_installs_every_fi
         pr.bytes_total,
         src.copies.values().map(|c| c.size).sum::<u64>()
     );
-    assert_eq!(after.len(), objects.len() + 2);
+    assert!(after.contains_key(&keys.probe()));
+    assert!(
+        !after
+            .keys()
+            .any(|k| k.starts_with(&format!("{}/", keys.probe())))
+    );
+    assert_eq!(after.len(), objects.len() + 3);
 }
 
 #[test]

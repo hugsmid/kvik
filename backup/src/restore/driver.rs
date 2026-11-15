@@ -17,6 +17,7 @@ use super::judge::{FileState, Verdict};
 use super::local::{self, Found, invalid};
 use super::{
     Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress, RestoreStep, codec,
+    probe,
 };
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
@@ -372,7 +373,8 @@ async fn fetch<S: BackupSink, E: Envelope>(
 }
 
 impl<S: BackupSink, E: Envelope> Restorer<S, E> {
-    /// `envelope` makes the cipher once the store id is known; `nonce` supplies the reset stamp's.
+    /// `envelope` makes the cipher once the store id is known; `nonce` supplies fresh random values: the reset
+    /// stamp's nonce and the probe's bytes.
     pub fn new(
         sink: S,
         envelope: Box<dyn Fn([u8; 16]) -> E + Send>,
@@ -433,6 +435,9 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         let env = (self.envelope)(store_id);
         check_key(&self.sink, &env, &keys).await?;
         let store = fetch_store(&self.sink, &env, &keys).await?;
+        if !self.drill() {
+            probe::probe(&self.sink, &env, &keys, &mut *self.nonce).await?;
+        }
         let highest = highest_claimed(&self.sink, &keys, 0).await?;
         let nonce = (self.nonce)();
         let generation = if self.drill() {

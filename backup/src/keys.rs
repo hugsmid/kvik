@@ -4,6 +4,7 @@
 //! ```text
 //! <store_id:32 hex>/STORE
 //! <store_id>/probe
+//! <store_id>/probe/<nonce:32 hex>                                 a checksum probe (Q-213)
 //! <store_id>/log/<generation:8 hex>-<file_id:16 hex>.kvl        a log segment
 //! <store_id>/files/<kind:2 hex>/<generation:8 hex>-<file_id:16 hex>   any other kind
 //! <store_id>/manifest/<generation:8 hex>/<epoch:16 hex>
@@ -38,6 +39,8 @@ pub enum ObjectName {
     Claim(u32),
     /// The attach probe.
     Probe,
+    /// A checksum probe, with its nonce (Q-213).
+    ChecksumProbe([u8; 16]),
 }
 
 /// The keys of one store's objects.
@@ -51,9 +54,7 @@ impl Keys {
     /// The keys of store `store_id`.
     pub fn new(store_id: [u8; 16]) -> Self {
         let mut root = String::with_capacity(33);
-        for b in store_id {
-            let _ = write!(root, "{b:02x}");
-        }
+        push_hex(&mut root, &store_id);
         root.push('/');
         Self { store_id, root }
     }
@@ -71,6 +72,13 @@ impl Keys {
     /// The attach probe's key.
     pub fn probe(&self) -> String {
         format!("{}probe", self.root)
+    }
+
+    /// A checksum probe's key under a fresh `nonce` (format A.17 Probe; Q-213).
+    pub fn checksum_probe(&self, nonce: [u8; 16]) -> String {
+        let mut k = format!("{}probe/", self.root);
+        push_hex(&mut k, &nonce);
+        k
     }
 
     /// A file's key.
@@ -137,22 +145,33 @@ impl Keys {
                 })
             }
             "claims" => Some(ObjectName::Claim(hex(rest, 8)? as u32)),
+            "probe" => Some(ObjectName::ChecksumProbe(bytes16(rest)?)),
             _ => None,
         }
     }
 
     /// The store id a key starts with; a restore lists `""` and reads the store ids from the keys.
     pub fn store_id_of(key: &str) -> Option<[u8; 16]> {
-        let (id, _) = key.split_once('/')?;
-        if id.len() != 32 {
-            return None;
-        }
-        let mut out = [0u8; 16];
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = hex(id.get(2 * i..2 * i + 2)?, 2)? as u8;
-        }
-        Some(out)
+        bytes16(key.split_once('/')?.0)
     }
+}
+
+fn push_hex(s: &mut String, bytes: &[u8]) {
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+}
+
+/// 16 bytes from exactly 32 lower-case hex digits.
+fn bytes16(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = hex(s.get(2 * i..2 * i + 2)?, 2)? as u8;
+    }
+    Some(out)
 }
 
 fn file_stem(s: &str) -> Option<(u32, u64)> {
@@ -225,6 +244,10 @@ mod tests {
         assert_eq!(k.store(), format!("{ROOT}STORE"));
         assert_eq!(k.probe(), format!("{ROOT}probe"));
         assert_eq!(
+            k.checksum_probe(ID),
+            format!("{ROOT}probe/0123456789abcdef00010203040506ff")
+        );
+        assert_eq!(
             k.file(&desc(kind::LOG_SEGMENT, 2, 0xab)),
             format!("{ROOT}log/00000002-00000000000000ab.kvl")
         );
@@ -270,6 +293,10 @@ mod tests {
             (k.store(), ObjectName::Store),
             (k.probe(), ObjectName::Probe),
             (
+                k.checksum_probe([0xa5; 16]),
+                ObjectName::ChecksumProbe([0xa5; 16]),
+            ),
+            (
                 k.file(&desc(kind::LOG_SEGMENT, u32::MAX, u64::MAX)),
                 file(kind::LOG_SEGMENT, u32::MAX, u64::MAX),
             ),
@@ -306,6 +333,9 @@ mod tests {
             format!("{ROOT}claims/0000000g"),
             format!("{ROOT}claims/+0000003"),
             format!("{ROOT}other/x"),
+            format!("{ROOT}probe/0123456789ABCDEF00010203040506ff"),
+            format!("{ROOT}probe/0123456789abcdef00010203040506f"),
+            format!("{ROOT}probe/"),
             "STORE".to_owned(),
         ] {
             assert_eq!(k.parse(&bad), None, "{bad}");

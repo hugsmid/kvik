@@ -338,6 +338,12 @@ pub enum Fault {
     RejectPut(u32),
     /// Every upload to it is stored, then fails as `HashMismatch`.
     StoreThenMismatch,
+    /// An upload replaces an existing object and succeeds: no conditional writes.
+    Overwrite,
+    /// An upload replaces an existing object, then fails as `Exists`.
+    OverwriteQuietly,
+    /// An upload to an existing object succeeds and changes nothing.
+    Pretend,
 }
 
 /// A sink over a [`MemSink`] that applies per-key faults and logs every call as (operation, key).
@@ -346,6 +352,21 @@ pub struct FaultSink {
     pub inner: MemSink,
     faults: Mutex<BTreeMap<String, Fault>>,
     log: Mutex<Vec<(&'static str, String)>>,
+    hashes: Mutex<Hashes>,
+}
+
+/// How a [`FaultSink`] treats an upload whose hash is not its bytes'.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Hashes {
+    /// Rejected as `HashMismatch`, nothing stored.
+    #[default]
+    Checked,
+    /// Stored, then rejected as `HashMismatch`.
+    StoreRejected,
+    /// Stored, and it succeeds reporting the hash sent.
+    Trusted,
+    /// Not stored, yet it succeeds.
+    Swallowed,
 }
 
 impl FaultSink {
@@ -362,6 +383,10 @@ impl FaultSink {
             Some(f) => m.insert(key.into(), f),
             None => m.remove(key),
         };
+    }
+
+    pub fn set_hashes(&self, h: Hashes) {
+        *self.hashes.lock().unwrap() = h;
     }
 
     pub fn log(&self) -> Vec<(&'static str, String)> {
@@ -396,7 +421,13 @@ impl FaultSink {
                 *n -= 1;
                 Some(Fault::RejectPut(*n + 1))
             }
-            Some(Fault::RejectPut(_) | Fault::StoreThenMismatch) if op != "put" => None,
+            Some(
+                Fault::RejectPut(_)
+                | Fault::StoreThenMismatch
+                | Fault::Overwrite
+                | Fault::OverwriteQuietly
+                | Fault::Pretend,
+            ) if op != "put" => None,
             other => other.copied(),
         }
     }
@@ -416,6 +447,34 @@ impl BackupSink for FaultSink {
             Some(Fault::RejectPut(_)) => Box::pin(async move { Err(mismatch()) }),
             Some(Fault::StoreThenMismatch) => {
                 let r = block_on(self.inner.put(key, bytes, sha)).and(Err(mismatch()));
+                Box::pin(async move { r })
+            }
+            Some(f @ (Fault::Overwrite | Fault::OverwriteQuietly | Fault::Pretend))
+                if self.inner.objects().contains_key(key) && sha256(&bytes) == sha =>
+            {
+                if f != Fault::Pretend {
+                    self.inner.set(key, &bytes);
+                }
+                let r = match f {
+                    Fault::OverwriteQuietly => Err(SinkError::Exists { key: key.into() }),
+                    _ => Ok(Stored::new(bytes.len() as u64, sha)),
+                };
+                Box::pin(async move { r })
+            }
+            _ if sha256(&bytes) != sha && !self.inner.objects().contains_key(key) => {
+                let ok = Ok(Stored::new(bytes.len() as u64, sha));
+                let r = match *self.hashes.lock().unwrap() {
+                    Hashes::Checked => Err(mismatch()),
+                    Hashes::StoreRejected => {
+                        self.inner.set(key, &bytes);
+                        Err(mismatch())
+                    }
+                    Hashes::Trusted => {
+                        self.inner.set(key, &bytes);
+                        ok
+                    }
+                    Hashes::Swallowed => ok,
+                };
                 Box::pin(async move { r })
             }
             _ => self.inner.put(key, bytes, sha),
@@ -446,9 +505,15 @@ impl BackupSink for FaultSink {
                         .ok_or(SinkError::InvalidRange { key: key.into() }),
                 }
             }),
-            None | Some(Fault::SlowGet(_) | Fault::RejectPut(_) | Fault::StoreThenMismatch) => {
-                block_on(self.inner.get(key, range))
-            }
+            None
+            | Some(
+                Fault::SlowGet(_)
+                | Fault::RejectPut(_)
+                | Fault::StoreThenMismatch
+                | Fault::Overwrite
+                | Fault::OverwriteQuietly
+                | Fault::Pretend,
+            ) => block_on(self.inner.get(key, range)),
         };
         Box::pin(async move { r })
     }
