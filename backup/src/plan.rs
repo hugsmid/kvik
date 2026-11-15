@@ -82,7 +82,7 @@ pub type PlanFn = fn(&PlanInput<'_>) -> Result<RestorePlan, PlanError>;
 /// The restored log is scanned in the source generation only, from sequence 1, over the copied log segments' ranges:
 /// a gap that a recorded loss covers, or that a recovery entry named in `recovery_after` follows directly, does not
 /// end it (Q-290). Positions of earlier generations at or below a carried end must be held by copied segments or
-/// recorded losses. Every live file with a copy is listed, set-aside ones included; no other file is.
+/// recorded losses. Every live file with a copy verified in deep is listed, set-aside ones included; no other file is.
 pub fn plan(input: &PlanInput<'_>) -> Result<RestorePlan, PlanError> {
     let src = input.source;
     let s = input.source_generation;
@@ -160,7 +160,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<RestorePlan, PlanError> {
             Some(RestoredFile {
                 description: e.description.clone(),
                 tier: e.tier,
-                copy: e.deep.clone()?,
+                copy: backed_up(e)?.clone(),
             })
         })
         .collect();
@@ -225,7 +225,7 @@ impl Scope<'_> {
         let (mut held, mut uncopied) = (Vec::new(), Vec::new());
         for e in self.segments.iter() {
             if let Some(r) = clip(e, g)? {
-                if e.deep.is_some() {
+                if backed_up(e).is_some() {
                     &mut held
                 } else {
                     &mut uncopied
@@ -274,9 +274,15 @@ impl Scope<'_> {
     fn uncopied_holding(&self, p: RecordPosition) -> Option<FileRef> {
         self.segments
             .iter()
-            .find(|e| e.deep.is_none() && e.description.holds(p))
+            .find(|e| backed_up(e).is_none() && e.description.holds(p))
             .map(|e| e.description.file_ref())
     }
+}
+
+/// A file's copy in deep, if it is verified there (Q-280): a copy-verified record carried into a rebuilt manifest
+/// gives the copy without the mark.
+fn backed_up(e: &FileEntry) -> Option<&kvik_files::tier::DeepCopy> {
+    e.deep.as_ref().filter(|_| e.verified.contains(&Tier::Deep))
 }
 
 /// The sequences of generation `g` a segment holds.
