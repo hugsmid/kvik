@@ -1159,8 +1159,8 @@ after its record resumes and must fetch "the files its restore record lists that
 yet local", so that list must follow from the record alone.
 **Provisional.** The executor refuses a plan whose files to fetch are not exactly the files its record lists
 (`PlanError::Invalid`), and fetches, fresh or resumed, every listed file that is not installed and has no lost
-range recorded in the new manifest, ascending by first position. This is exact for a log-only restore (M1: every
-listed file is a sealed log segment).
+range recorded in the new manifest, ascending by first position. This is exact for a log-only restore, in which every
+listed file is a sealed log segment.
 **Needed.** With tree checkpoints, chunk indexes and tiers, a rule from the record (its tiers, the checkpoint) to the
 files steps 1 and 3 bring back, used by both the plan and a resume.
 
