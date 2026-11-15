@@ -135,7 +135,7 @@ thread_local! {
     static COPIES: RefCell<BTreeMap<FileRef, DeepCopy>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-/// Gives [`hand_plan`] the copies of `src` (no `0x27` fold exists yet).
+/// Gives [`hand_plan`] the copies of `src`, which `upload` writes no copy-verified records for.
 pub fn use_copies(src: &Source) {
     COPIES.with(|c| *c.borrow_mut() = src.copies.clone());
 }
