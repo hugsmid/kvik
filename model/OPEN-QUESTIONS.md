@@ -1037,7 +1037,8 @@ hash; if they equal the copy, it appends a fresh `0x27` with no upload, and othe
 no copy (the envelope is deterministic, so the same key takes the same bytes; other content under the key fails,
 Q-284). A copy of a corrupt record appended later (`rebuild::resolve`) carries field 100 too, so it is checked the
 same way. Reason: the copy is a fact about the bucket that the rebuild does not change, so a restore reading the
-rebuilt records still finds it, while eviction and removal wait for the fresh check §7 asks for. Pinned by
+rebuilt records still finds it, while eviction and removal wait for the fresh check §7 asks for. The restore plan uses a file's recorded copy (`deep`); "verified in deep" governs the upload queue only (owner's
+ruling, see Q-295). Pinned by
 `files/src/catalogue.rs` `q280_a_carried_copy_verified_record_sets_the_copy_but_no_verified_mark` and
 `backup/tests/upload.rs` `q280_a_rebuilt_manifest_verifies_each_copy_again_without_a_new_upload`,
 `q280_a_rebuilt_copy_the_bucket_no_longer_reports_is_uploaded_again`.
@@ -1068,7 +1069,9 @@ Recorded and decided by roadmap 8.1c.
 would be a new durable structure. (b) A compacted file is published at epoch 5 and retired by a merge at epoch 9
 before it was uploaded; if record 5 waits for its file, it waits for ever. (c) Settling the last record appends an
 empty record, which is then the last; settling that one too never ends. (d) Files sealed while no sink is attached
-(Q-164 (b)).
+(Q-164 (b)). (e) Record 5 of 8 is damaged on disk while the store runs, after records 1 to 4 went up; epochs are
+not dense, so the driver cannot see the gap itself, and a port that passes over the damaged record lets 6 to 8 go up
+with 5 missing from the bucket for good.
 **Decided.** (a) No queue file: the file queue is recomputed at each step from the manifest's snapshot (live files not
 verified in deep, ascending position), and the record cursor is the highest epoch a listing of the generation's
 records shows, read at the driver's first step. A listing that lags only makes the driver `put` records it had
@@ -1078,7 +1081,11 @@ So the files records wait for are exactly the queue. (c) The last record is uplo
 last record is never settled, so a drained queue appends at most one empty record and the driver is then `Idle`,
 also after a restart, since the rule reads only the manifest. (d) They are in the snapshot, so they are queued at the
 first step after attach, oldest first (input to Q-164 (b), which roadmap 8.1d settles). Only records at or below the
-snapshot's last epoch are uploaded, so a record whose sync failed never goes up.
+snapshot's last epoch are uploaded, so a record whose sync failed never goes up. (e) By the owner's authorisation
+to change the frozen port: `ManifestPort::records_after` returns an error for a record after `after` that cannot be
+read, never skipping it, and `DirectPort` does so; the driver then fails and uploads no later record (§8
+Generations). This is the contract the store's own port (roadmap 6.3c) keeps. Pinned through `DirectPort` by
+`backup/tests/upload.rs` `a_damaged_record_stops_the_upload_of_those_after_it_through_the_direct_port`.
 **Model.** Not modelled.
 
 ## Q-283 — The attach probe

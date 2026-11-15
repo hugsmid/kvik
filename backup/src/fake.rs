@@ -396,6 +396,12 @@ impl ManifestPort for DirectPort {
     fn records_after(&self, after: u64) -> Result<Vec<Record>, PortError> {
         let bytes = self.read_manifest()?;
         let img = image::read(&bytes, &self.store_id).map_err(io::Error::other)?;
+        if let Some(c) = img.corrupt.iter().find(|c| c.before_epoch > after) {
+            return Err(PortError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a record after epoch {} cannot be read", c.after_epoch),
+            )));
+        }
         Ok(img.records().filter(|r| r.epoch > after).cloned().collect())
     }
 }

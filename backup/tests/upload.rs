@@ -706,3 +706,54 @@ fn a_record_that_cannot_be_read_stops_the_upload_of_those_after_it() {
         assert_eq!(h.puts_of(&keys.record(0, r.epoch)), 0, "record {}", r.epoch);
     }
 }
+
+#[test]
+fn a_damaged_record_stops_the_upload_of_those_after_it_through_the_direct_port() {
+    use kvik_backup::fake::DirectPort;
+    use kvik_files::appender::{Appender, Opened};
+    let mut h = Harness::new();
+    h.seal(10);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    h.seal(10);
+    h.seal(10);
+    let records = h.records();
+    let n = records.len();
+    let damaged = records[n - 2].epoch;
+    assert_eq!(damaged, 5);
+    let at = 64
+        + records[..n - 2]
+            .iter()
+            .map(|r| r.encode().unwrap().len())
+            .sum::<usize>();
+    let path = h.dir.join("MANIFEST");
+    let byte = h.fs.read(&path).unwrap()[at + 8] ^ 1;
+    h.close();
+    let Opened::Ready(a) = Appender::open(&h.fs, &h.dir, ID, 0).unwrap() else {
+        panic!()
+    };
+    h.fs.poke(&path, at + 8, &[byte]);
+    let port = DirectPort::new(*a, h.local(), ID, T0);
+    let mem = h.sink.mem.clone();
+    let mut d = Uploader::new(
+        mem.clone(),
+        TestEnvelope::new(KEY),
+        Keys::new(ID),
+        h.local(),
+        port,
+        cfg(),
+    );
+    let s = run(&mut d, &mut Duration::default(), 200);
+    assert!(matches!(s, Step::Failed(UploadError::Port(_))), "{s:?}");
+    let keys = Keys::new(ID);
+    for e in damaged..=damaged + 3 {
+        assert!(
+            !mem.objects().contains_key(&keys.record(0, e)),
+            "record {e} went up"
+        );
+    }
+    assert!(
+        d.progress().backed_up_through.is_none_or(|p| p <= (0, 10)),
+        "{:?}",
+        d.progress().backed_up_through
+    );
+}

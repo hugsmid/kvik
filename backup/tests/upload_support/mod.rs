@@ -291,7 +291,7 @@ impl ManifestPort for Port {
             .ok_or_else(|| PortError::Io(std::io::ErrorKind::NotFound.into()))?;
         let img = image::read(&bytes, &ID).map_err(std::io::Error::other)?;
         // A record that cannot be read stops the upload of those after it (spec §8 Generations).
-        if img.is_corrupt() {
+        if img.corrupt.iter().any(|c| c.before_epoch > after) {
             return Err(PortError::Io(std::io::Error::other("a corrupt record")));
         }
         let mut v: Vec<Record> = img.records().filter(|r| r.epoch > after).cloned().collect();
@@ -636,7 +636,7 @@ pub fn check_order(events: &[Event], records: &[Record], live: &dyn Fn(FileRef) 
 }
 
 /// Steps until idle, held or failed, moving `now` on at each retry. Panics if it does not settle in `max` steps.
-pub fn run(d: &mut Driver, now: &mut Duration, max: usize) -> Step {
+pub fn run<D: BackupDriver>(d: &mut D, now: &mut Duration, max: usize) -> Step {
     for _ in 0..max {
         match block_on(d.step(*now)) {
             Step::Progress => {}

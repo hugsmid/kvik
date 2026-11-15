@@ -19,7 +19,8 @@ pub trait ManifestPort: Send {
     fn holds(&self) -> bool;
     /// The fold as of the last synced record.
     fn snapshot(&self) -> Arc<Catalogue>;
-    /// The records after epoch `after`, in epoch order, as written.
+    /// The records after epoch `after`, in epoch order, as written. A record after `after` that cannot be read is
+    /// an error, never skipped: the driver uploads no record after it (`spec.md` §8 Generations; Q-282 (e)).
     fn records_after(&self, after: u64) -> Result<Vec<Record>, PortError>;
 }
 
