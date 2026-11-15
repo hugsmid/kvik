@@ -6,7 +6,7 @@
 //! Decisions are made from what was read before anything is written (`plan`); `start` then performs them in the
 //! order of a start. A failed sync at any step leaves the writer read-only and writes nothing more.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -920,14 +920,39 @@ pub(super) fn start(
         });
     }
 
+    // The other sources of F (`sources`): the registry file, cursor files. The consumers named by routing changes
+    // tell a missing cursor file from one that never existed.
+    let mut consumers = BTreeSet::new();
+    let routing = registry
+        .iter()
+        .flat_map(|f| f.entries.iter().map(|(_, _, e)| e))
+        .chain(segs.iter().flat_map(|s| {
+            s.batches.iter().flat_map(|b| {
+                b.content.items.iter().filter_map(|i| match i {
+                    Item::Entry(e) => Some(e),
+                    Item::Fact(_) => None,
+                })
+            })
+        }));
+    for e in routing {
+        if let Entry::Routing(r) = e {
+            consumers.insert(r.consumer.clone());
+        }
+    }
+    let sourced = super::sources::read_all(&super::sources::SourceContext {
+        fs: &*fs,
+        store_dir: store.dir(),
+        store_id,
+        generation: 0,
+        consumers: &consumers,
+    })
+    .map_err(StoreError::Unsupported)?;
     let p = plan(
         &segs,
         &mark,
         boot,
         sealed_last,
-        manifest
-            .highest_sequence(0)
-            .max(registry.as_ref().map_or(0, |f| f.through)),
+        manifest.highest_sequence(0).max(sourced.highest),
     );
     report.rule = p.rule;
     // What was found is reported even if the start cannot record it.
@@ -1285,7 +1310,7 @@ pub(super) fn start(
                 readable_commits: readable,
                 mark_state: state,
                 id_floor,
-                consumers: Vec::new(),
+                consumers: sourced.named.clone(),
             };
             let commit_time = wall.max(last_commit_time);
             let content = BatchContent {

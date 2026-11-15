@@ -102,7 +102,7 @@ impl Registry {
             Entry::Tzdata { version } => self.tzdata = Some(version.clone()),
             Entry::Recovery(r) => self.highest = self.highest.max(r.id_floor),
             // Decimal series are not supported yet, so no scale raise is written; an ignored entry changes nothing.
-            Entry::ScaleRaise { .. } | Entry::Ignored { .. } => {}
+            Entry::ScaleRaise { .. } | Entry::Routing(_) | Entry::Ignored { .. } => {}
         }
     }
 

@@ -8,7 +8,8 @@ use kvik_log::block::{FLAG_SKIPPABLE, block_type};
 use kvik_log::content::{BatchContent, Item};
 use kvik_log::entries::{
     CounterRules, DAY, Definition, EntriesBlock, Entry, ExcessPrecision, IntervalLength, Kind,
-    MarkState, ParameterChange, Recovery, Retention, Timing, Versioning,
+    MarkState, ParameterChange, Recovery, Retention, RouteCondition, RouteOp, RouteOperator,
+    Routing, Selection, StateArg, Timing, Versioning,
 };
 use kvik_log::facts::{FactFlags, FactRow, FactsBlock, Quality, Value, ValueType};
 use kvik_log::scan::{LossCause, ScanLimit, scan};
@@ -285,9 +286,75 @@ fn recovery() -> impl Strategy<Value = Recovery> {
         )
 }
 
+fn selection(resolved: bool) -> impl Strategy<Value = Selection> {
+    let ids = prop::collection::vec(any::<u32>(), 0..4);
+    prop_oneof![
+        Just(Selection::None),
+        ids.clone().prop_map(Selection::Ids),
+        (name(), ids).prop_map(move |(pattern, r)| Selection::Pattern {
+            pattern,
+            resolved: if resolved { r } else { Vec::new() },
+        }),
+        Just(Selection::All),
+    ]
+}
+
+fn level() -> impl Strategy<Value = f64> {
+    -1e12f64..1e12
+}
+
+fn route_condition() -> impl Strategy<Value = RouteCondition> {
+    prop_oneof![
+        (level(), 0f64..1e6).prop_map(|(on, d)| RouteCondition::Threshold { on, clear: on - d }),
+        (0f64..1e6).prop_map(|deadband| RouteCondition::OnChange { deadband }),
+        (level(), 0..i64::MAX).prop_map(|(above, n)| RouteCondition::HeldFor { above, n }),
+        (0..i64::MAX).prop_map(|n| RouteCondition::StaleFor { n }),
+    ]
+}
+
+fn route_operator() -> impl Strategy<Value = RouteOperator> {
+    (1u8..=10, positive(), any::<bool>(), any::<u32>()).prop_map(|(aggregate, width, b, i)| {
+        RouteOperator {
+            aggregate,
+            width,
+            state: (aggregate == 10).then_some(if i % 2 == 0 {
+                StateArg::Bool(b)
+            } else {
+                StateArg::State(i)
+            }),
+        }
+    })
+}
+
+fn routing() -> impl Strategy<Value = Routing> {
+    (
+        "[a-z0-9][a-z0-9._-]{0,63}",
+        0u8..3,
+        any::<u32>(),
+        selection(true),
+        prop::option::of(route_operator()),
+        selection(false),
+        prop::option::of(route_condition()),
+    )
+        .prop_map(|(consumer, op, funnel, sel, operator, emits, condition)| {
+            let op = [RouteOp::Add, RouteOp::Remove, RouteOp::Emits][usize::from(op)];
+            let add = op == RouteOp::Add;
+            Routing {
+                consumer,
+                op,
+                funnel: (op != RouteOp::Emits).then_some(funnel),
+                selection: add.then_some(sel),
+                operator: operator.filter(|_| add),
+                emits,
+                condition: condition.filter(|_| add),
+            }
+        })
+}
+
 /// Every entry type except the recovery entry, which is alone in its batch.
 fn entry() -> impl Strategy<Value = Entry> {
     prop_oneof![
+        routing().prop_map(|r| Entry::Routing(Box::new(r))),
         definition().prop_map(|d| Entry::Definition(Box::new(d))),
         parameter_change().prop_map(Entry::ParameterChange),
         (any::<u32>(), name()).prop_map(|(id, name)| Entry::Alias { id, name }),
@@ -1112,15 +1179,13 @@ fn field_framing_order_and_unknown_elements() {
         EntriesBlock::decode_canonical(&entries_body(1, T0, &[(1, ignorable)])),
         Err(BodyError::NonCanonical)
     );
-    // Unknown entry types; the routing change is not laid out yet.
+    // Unknown entry types. The routing change (type 5) is laid out since roadmap 5.2, superseding Q-106 (f): an
+    // empty one is invalid content, not a version refusal.
     assert_eq!(
         decode_one(0x10, vec![]),
         Err(BodyError::Unsupported(Element::EntryType(0x10)))
     );
-    assert_eq!(
-        decode_one(5, vec![]),
-        Err(BodyError::Unsupported(Element::EntryType(5)))
-    );
+    assert_eq!(decode_one(5, vec![]), presence(50));
     assert_eq!(
         decode_one(0, vec![]),
         Err(BodyError::Unsupported(Element::EntryType(0)))
@@ -1303,6 +1368,155 @@ fn other_entry_types() {
         field_err(47)
     );
     assert_eq!(decode_one(8, remove(rec, 46)), presence(46));
+}
+
+fn routing_fields() -> Fields {
+    vec![
+        (50, b"alarms".to_vec()),
+        (51, vec![1]),
+        (52, 3u32.to_le_bytes().to_vec()),
+        (53, vec![2]),
+        (54, 7u32.to_le_bytes().to_vec()),
+        (55, b"plant/*/power".to_vec()),
+        (60, vec![1]),
+        (61, 9u32.to_le_bytes().to_vec()),
+        (61, 10u32.to_le_bytes().to_vec()),
+        (63, vec![1]),
+        (64, 3000f64.to_bits().to_le_bytes().to_vec()),
+        (65, 2500f64.to_bits().to_le_bytes().to_vec()),
+    ]
+}
+
+#[test]
+fn routing_change_layout() {
+    // A funnel added with a condition over a pattern resolved once, and `emits` of two ids.
+    let b = decode_one(5, routing_fields()).unwrap();
+    let expected = Routing {
+        consumer: "alarms".into(),
+        op: RouteOp::Add,
+        funnel: Some(3),
+        selection: Some(Selection::Pattern {
+            pattern: "plant/*/power".into(),
+            resolved: vec![7],
+        }),
+        operator: None,
+        emits: Selection::Ids(vec![9, 10]),
+        condition: Some(RouteCondition::Threshold {
+            on: 3000.0,
+            clear: 2500.0,
+        }),
+    };
+    assert_eq!(b.entries, vec![Entry::Routing(Box::new(expected.clone()))]);
+    let body = EntriesBlock {
+        first_sequence: 1,
+        received_at: T0,
+        entries: b.entries.clone(),
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(body, entries_body(1, T0, &[(5, routing_fields())]));
+    // Checks: the consumer name, the change kind, field presence per kind, ranges.
+    assert_eq!(
+        decode_one(5, replace(routing_fields(), 50, b"Alarms".to_vec())),
+        field_err(50)
+    );
+    assert_eq!(
+        decode_one(5, replace(routing_fields(), 51, vec![4])),
+        field_err(51)
+    );
+    assert_eq!(decode_one(5, remove(routing_fields(), 52)), presence(52));
+    assert_eq!(decode_one(5, remove(routing_fields(), 53)), presence(53));
+    assert_eq!(decode_one(5, remove(routing_fields(), 60)), presence(60));
+    assert_eq!(
+        decode_one(
+            5,
+            replace(
+                routing_fields(),
+                65,
+                3001f64.to_bits().to_le_bytes().to_vec()
+            )
+        ),
+        field_err(65)
+    );
+    assert_eq!(
+        decode_one(
+            5,
+            replace(
+                routing_fields(),
+                64,
+                f64::NAN.to_bits().to_le_bytes().to_vec()
+            )
+        ),
+        field_err(64)
+    );
+    assert_eq!(decode_one(5, remove(routing_fields(), 65)), presence(65));
+    assert_eq!(
+        decode_one(5, replace(routing_fields(), 66, i64b(1))),
+        presence(66)
+    );
+    // `emits` never carries resolved ids with a pattern.
+    let mut f = remove(routing_fields(), 61);
+    f = replace(f, 60, vec![2]);
+    f = replace(f, 61, 1u32.to_le_bytes().to_vec());
+    f = replace(f, 62, b"a/*/b".to_vec());
+    assert_eq!(decode_one(5, f), presence(61));
+    // A removal carries the funnel id and `emits` only.
+    let removal = vec![
+        (50, b"alarms".to_vec()),
+        (51, vec![2]),
+        (52, 3u32.to_le_bytes().to_vec()),
+        (60, vec![0]),
+    ];
+    assert!(decode_one(5, removal.clone()).is_ok());
+    assert_eq!(
+        decode_one(5, replace(removal.clone(), 53, vec![3])),
+        presence(53)
+    );
+    // An `emits` declaration carries no funnel id.
+    let emits = replace(remove(removal, 52), 51, vec![3]);
+    assert!(decode_one(5, emits.clone()).is_ok());
+    assert_eq!(
+        decode_one(5, replace(emits, 52, 1u32.to_le_bytes().to_vec())),
+        presence(52)
+    );
+    // An operator: width positive, the state argument only for time in state.
+    let op = |f: Fields| replace(replace(f, 56, vec![1]), 57, i64b(60_000_000_000));
+    assert!(decode_one(5, op(routing_fields())).is_ok());
+    assert_eq!(
+        decode_one(5, replace(op(routing_fields()), 57, i64b(0))),
+        field_err(57)
+    );
+    assert_eq!(
+        decode_one(5, replace(op(routing_fields()), 58, vec![0, 1, 0, 0, 0])),
+        presence(58)
+    );
+    assert_eq!(
+        decode_one(5, replace(op(routing_fields()), 56, vec![10])),
+        presence(58)
+    );
+    assert!(
+        decode_one(
+            5,
+            replace(
+                replace(op(routing_fields()), 56, vec![10]),
+                58,
+                vec![1, 4, 0, 0, 0]
+            )
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        decode_one(5, remove(op(routing_fields()), 57)),
+        presence(57)
+    );
+    // Unknown critical fields of the type are refused.
+    assert_eq!(
+        decode_one(5, replace(routing_fields(), 59, vec![])),
+        Err(BodyError::Unsupported(Element::Field {
+            entry_type: 5,
+            field: 59
+        }))
+    );
 }
 
 #[test]

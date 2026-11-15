@@ -63,6 +63,7 @@ mod bytes;
 pub mod content;
 mod content_error;
 pub mod crc;
+pub mod cursor;
 pub mod entries;
 mod error;
 pub mod facts;

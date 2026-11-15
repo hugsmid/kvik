@@ -468,3 +468,24 @@ fn smoke_on_the_real_file_system() {
     drop(w);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_mark_sync_on_request_and_progress_for_watchers() {
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    // A long mark-sync interval: only a request syncs the mark before shutdown.
+    let mut c = cfg();
+    c.mark_sync = kvik_log::writer::MarkSync::Interval(Duration::from_secs(3600));
+    let log = start(fs, Path::new("store"), c);
+    let seen = log.wait_progress(0, Duration::ZERO);
+    let ack = log.submit(vec![fact(1, 0)]).unwrap().wait().unwrap();
+    // The watcher sees a turn after the acknowledgement, and the stats show it durable.
+    assert!(log.wait_progress(seen, Duration::from_secs(5)) > seen);
+    assert_eq!(log.stats().durable, ack.last);
+    assert!(
+        log.stats().mark_synced < ack.last,
+        "the timer is an hour away"
+    );
+    assert_eq!(log.sync_mark().unwrap(), ack.last);
+    assert_eq!(log.stats().mark_synced, ack.last);
+    log.shutdown().unwrap();
+}

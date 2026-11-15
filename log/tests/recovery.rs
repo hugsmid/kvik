@@ -694,6 +694,57 @@ fn a_registry_file_raises_f_and_the_id_floor_and_gives_the_segment_index_its_rea
 }
 
 #[test]
+fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
+    use kvik_log::cursor::{CursorState, append, path};
+    use kvik_log::entries::{RouteOp, Routing, Selection};
+    use kvik_log::writer::Position;
+    let mut r = Rig::new(cfg());
+    // Routing changes name three consumers; one of them never writes a cursor file.
+    for c in ["alarms", "broken", "silent"] {
+        r.submit(vec![Item::Entry(Entry::Routing(Box::new(Routing {
+            consumer: c.into(),
+            op: RouteOp::Emits,
+            funnel: None,
+            selection: None,
+            operator: None,
+            emits: Selection::None,
+            condition: None,
+        })))]);
+        r.drain();
+    }
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.shutdown().unwrap();
+    r.w = None;
+    // A cursor file naming position 12 (above the kept log's 4), and one that is unreadable.
+    let state = |consumer: &str, sequence| CursorState {
+        consumer: consumer.into(),
+        position: Position {
+            generation: 0,
+            sequence,
+        },
+        latches: Vec::new(),
+        reset: None,
+    };
+    append(&r.fs, &dir(), STORE_ID, 0, T0, &state("alarms", 12), None).unwrap();
+    append(&r.fs, &dir(), STORE_ID, 0, T0, &state("broken", 2), None).unwrap();
+    r.fs.poke(&path(&dir(), "broken"), 64 + 20, &[0xff]);
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    let e = rep.entry.unwrap();
+    assert_eq!(
+        (e.entry.after, e.sequence),
+        (4, 13),
+        "F above every position a cursor file names"
+    );
+    assert_eq!(
+        e.entry.consumers,
+        vec!["broken".to_string(), "silent".to_string()]
+    );
+    r.check_started();
+}
+
+#[test]
 fn a_crash_between_the_entry_and_the_mark_adopts_the_entry() {
     let mut adopted = 0;
     for n in 0..40 {

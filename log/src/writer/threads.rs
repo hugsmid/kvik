@@ -144,6 +144,8 @@ struct Front {
     shutdown: bool,
     read_only: bool,
     waiting: Option<Wait>,
+    /// A caller asked for the mark to be synced now ([`Log::sync_mark`]).
+    mark_sync: bool,
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +162,10 @@ struct Info {
     stats: LogStats,
     reasons: Vec<Reason>,
     fault: Option<Fault>,
+    /// Raised at every turn that published something, with `progress_cv` notified.
+    progress: u64,
+    /// The writer thread has ended.
+    stopped: bool,
 }
 
 #[derive(Debug)]
@@ -170,6 +176,7 @@ struct Shared {
     maint: Mutex<Maint>,
     maint_cv: Condvar,
     info: Mutex<Info>,
+    progress_cv: Condvar,
     halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
@@ -219,6 +226,7 @@ impl Log {
                 shutdown: false,
                 read_only: false,
                 waiting: None,
+                mark_sync: false,
             }),
             writer_cv: Condvar::new(),
             room_cv: Condvar::new(),
@@ -228,7 +236,10 @@ impl Log {
                 stats: writer.stats().clone(),
                 reasons: Vec::new(),
                 fault: None,
+                progress: 0,
+                stopped: false,
             }),
+            progress_cv: Condvar::new(),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
             clock,
@@ -318,6 +329,45 @@ impl Log {
     /// The fault that made the store read-only, if any.
     pub fn fault(&self) -> Option<Fault> {
         lock(&self.shared.info).fault.clone()
+    }
+
+    /// Waits until the writer has published a turn after `seen` (a value this returned before; 0 at first), at most
+    /// `timeout`, and returns the latest value. A caller that watches for acknowledged batches, and must not run on
+    /// the writer thread, waits here and then looks at [`Log::stats`]. Returns at once once the writer has stopped.
+    pub fn wait_progress(&self, seen: u64, timeout: Duration) -> u64 {
+        let i = lock(&self.shared.info);
+        let (i, _) = self
+            .shared
+            .progress_cv
+            .wait_timeout_while(i, timeout, |i| i.progress == seen && !i.stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        i.progress
+    }
+
+    /// Asks the writer to sync the mark now rather than at its timer, and waits until the mark on stable storage
+    /// names at least the durable position at the call (`spec.md` §3 Durable mark: a file that would name a
+    /// position above the last synced mark waits for the next mark sync or forces one). Returns the last synced
+    /// position, or the fault if the store is or becomes read-only; after a shutdown, the last synced position.
+    pub fn sync_mark(&self) -> Result<super::Position, Fault> {
+        let target = self.stats().durable;
+        {
+            let mut f = lock(&self.shared.front);
+            f.mark_sync = true;
+            f.wake = true;
+        }
+        self.shared.writer_cv.notify_one();
+        let i = lock(&self.shared.info);
+        let i = self
+            .shared
+            .progress_cv
+            .wait_while(i, |i| {
+                i.fault.is_none() && !i.stopped && i.stats.mark_synced < target
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        match &i.fault {
+            Some(f) => Err(f.clone()),
+            None => Ok(i.stats.mark_synced),
+        }
     }
 
     /// Entries queued.
@@ -410,7 +460,9 @@ fn publish(s: &Shared, w: &LogWriter) {
         i.stats = w.stats().clone();
         i.reasons = w.reasons();
         i.fault = w.fault().cloned();
+        i.progress += 1;
     }
+    s.progress_cv.notify_all();
     let mut f = lock(&s.front);
     f.read_only = w.fault().is_some();
     f.waiting = w.waiting();
@@ -433,7 +485,12 @@ impl Drop for PanicGuard<'_> {
             message: "the writer thread panicked".into(),
         };
         s.halt.set(fault.clone());
-        lock(&s.info).fault = s.halt.fault();
+        {
+            let mut i = lock(&s.info);
+            i.fault = s.halt.fault();
+            i.stopped = true;
+        }
+        s.progress_cv.notify_all();
         let slots: Vec<_> = {
             let mut f = lock(&s.front);
             f.read_only = true;
@@ -452,7 +509,14 @@ impl Drop for PanicGuard<'_> {
 fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
     let _guard = PanicGuard(s);
     loop {
-        lock(&s.front).wake = false;
+        let sync_now = {
+            let mut f = lock(&s.front);
+            f.wake = false;
+            std::mem::take(&mut f.mark_sync)
+        };
+        if sync_now {
+            w.sync_mark_now(s.clock.monotonic());
+        }
         exchange(s, &mut w);
         let step = w.step(s.clock.monotonic(), s.clock.wall(), &mut SharedSource(s));
         // A roll or a seal in this step asks for maintenance work at once. Statistics and the read-only state are
@@ -511,6 +575,8 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
     }
     let r = w.shutdown(s.clock.monotonic());
     publish(s, &w);
+    lock(&s.info).stopped = true;
+    s.progress_cv.notify_all();
     r
 }
 

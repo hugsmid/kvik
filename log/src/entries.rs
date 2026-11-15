@@ -25,7 +25,7 @@ pub mod entry_type {
     pub const ALIAS: u8 = 3;
     /// Retirement.
     pub const RETIREMENT: u8 = 4;
-    /// Routing change: reserved, laid out by roadmap 5.2; refused until then (Q-106 (f)).
+    /// Routing change (laid out by roadmap 5.2).
     pub const ROUTING: u8 = 5;
     /// Site zone.
     pub const SITE_ZONE: u8 = 6;
@@ -241,6 +241,120 @@ pub struct Recovery {
     pub consumers: Vec<String>,
 }
 
+/// A series selection in a routing change: a funnel's (fields 53 to 55) or a consumer's `emits` (fields 60 to 62).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Selection {
+    /// Kind 0: no series.
+    None,
+    /// Kind 1: the listed ids (the id field repeated, possibly none).
+    Ids(Vec<u32>),
+    /// Kind 2: a name pattern as declared, 1 to 255 bytes. For a condition funnel, `resolved` holds the ids the
+    /// pattern was resolved to when it was routed (the id field repeated); empty otherwise, and always for `emits`.
+    Pattern {
+        /// The pattern.
+        pattern: String,
+        /// Ids resolved once, for a condition funnel.
+        resolved: Vec<u32>,
+    },
+    /// Kind 3: every series.
+    All,
+}
+
+/// What a routing change does (field 51).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RouteOp {
+    /// 1: adds a funnel.
+    Add = 1,
+    /// 2: removes a funnel.
+    Remove = 2,
+    /// 3: declares the consumer's `emits` only.
+    Emits = 3,
+}
+
+/// The argument of a time-in-state operator (field 58).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StateArg {
+    /// A boolean state.
+    Bool(bool),
+    /// A named state's index.
+    State(u32),
+}
+
+/// A funnel's rolling-window operator (fields 56 to 58).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RouteOperator {
+    /// 56: 1 avg, 2 sum, 3 integral, 4 min, 5 max, 6 count, 7 increase, 8 rate, 9 last, 10 time in state.
+    pub aggregate: u8,
+    /// 57: window width, nanoseconds, > 0.
+    pub width: i64,
+    /// 58: the state counted, for aggregate 10 only.
+    pub state: Option<StateArg>,
+}
+
+/// A funnel's condition (fields 63 to 66). Levels are finite `f64`s, durations nanoseconds ≥ 0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RouteCondition {
+    /// Kind 1: 64 activation level, 65 clear level (at most the activation level).
+    Threshold {
+        /// Activation level.
+        on: f64,
+        /// Clear level.
+        clear: f64,
+    },
+    /// Kind 2: 64 dead-band (≥ 0).
+    OnChange {
+        /// Dead-band.
+        deadband: f64,
+    },
+    /// Kind 3: 64 level, 66 duration.
+    HeldFor {
+        /// Level.
+        above: f64,
+        /// Duration.
+        n: i64,
+    },
+    /// Kind 4: 66 duration beyond the series' staleness limit in force at the entry's position.
+    StaleFor {
+        /// Duration.
+        n: i64,
+    },
+}
+
+impl Eq for RouteCondition {}
+
+impl std::hash::Hash for RouteCondition {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match *self {
+            RouteCondition::Threshold { on, clear } => {
+                (1u8, on.to_bits(), clear.to_bits(), 0i64).hash(h)
+            }
+            RouteCondition::OnChange { deadband } => (2u8, deadband.to_bits(), 0u64, 0i64).hash(h),
+            RouteCondition::HeldFor { above, n } => (3u8, above.to_bits(), 0u64, n).hash(h),
+            RouteCondition::StaleFor { n } => (4u8, 0u64, 0u64, n).hash(h),
+        }
+    }
+}
+
+/// A routing change (entry type 5, `spec.md` §4 Routing): a funnel added to or removed from a consumer, or the
+/// consumer's `emits` declared; every change carries the consumer's `emits` in force from its position.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Routing {
+    /// 50: the consumer's name (A.12).
+    pub consumer: String,
+    /// 51.
+    pub op: RouteOp,
+    /// 52: the funnel id, for [`RouteOp::Add`] and [`RouteOp::Remove`].
+    pub funnel: Option<u32>,
+    /// 53 to 55: the funnel's selection, for [`RouteOp::Add`].
+    pub selection: Option<Selection>,
+    /// 56 to 58: the funnel's operator, for [`RouteOp::Add`].
+    pub operator: Option<RouteOperator>,
+    /// 60 to 62: the consumer's `emits`.
+    pub emits: Selection,
+    /// 63 to 66: the funnel's condition, for [`RouteOp::Add`].
+    pub condition: Option<RouteCondition>,
+}
+
 /// One entry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Entry {
@@ -262,6 +376,8 @@ pub enum Entry {
         /// 21: `t_r`.
         t_r: i64,
     },
+    /// 5.
+    Routing(Box<Routing>),
     /// 6.
     SiteZone {
         /// 30: IANA name, 1 to 63 bytes.
@@ -339,6 +455,26 @@ impl Fields {
     }
     fn str(&mut self, id: u16, v: &str) {
         self.raw(id, v.as_bytes());
+    }
+    /// A selection at `kind` (53 or 60): the kind, the ids at `kind + 1`, the pattern at `kind + 2`.
+    fn selection(&mut self, kind: u16, s: &Selection) {
+        match s {
+            Selection::None => self.u8(kind, 0),
+            Selection::Ids(ids) => {
+                self.u8(kind, 1);
+                for id in ids {
+                    self.u32(kind + 1, *id);
+                }
+            }
+            Selection::Pattern { pattern, resolved } => {
+                self.u8(kind, 2);
+                for id in resolved {
+                    self.u32(kind + 1, *id);
+                }
+                self.str(kind + 2, pattern);
+            }
+            Selection::All => self.u8(kind, 3),
+        }
     }
 }
 
@@ -456,6 +592,52 @@ fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
             f.i64(21, *t_r);
             entry_type::RETIREMENT
         }
+        Entry::Routing(r) => {
+            f.str(50, &r.consumer);
+            f.u8(51, r.op as u8);
+            if let Some(id) = r.funnel {
+                f.u32(52, id);
+            }
+            if let Some(sel) = &r.selection {
+                f.selection(53, sel);
+            }
+            if let Some(op) = &r.operator {
+                f.u8(56, op.aggregate);
+                f.i64(57, op.width);
+                match op.state {
+                    None => {}
+                    Some(StateArg::Bool(b)) => f.raw(58, &[0, u8::from(b), 0, 0, 0]),
+                    Some(StateArg::State(i)) => {
+                        let mut v = vec![1];
+                        v.extend_from_slice(&i.to_le_bytes());
+                        f.raw(58, &v);
+                    }
+                }
+            }
+            f.selection(60, &r.emits);
+            match r.condition {
+                None => {}
+                Some(RouteCondition::Threshold { on, clear }) => {
+                    f.u8(63, 1);
+                    f.u64(64, on.to_bits());
+                    f.u64(65, clear.to_bits());
+                }
+                Some(RouteCondition::OnChange { deadband }) => {
+                    f.u8(63, 2);
+                    f.u64(64, deadband.to_bits());
+                }
+                Some(RouteCondition::HeldFor { above, n }) => {
+                    f.u8(63, 3);
+                    f.u64(64, above.to_bits());
+                    f.i64(66, n);
+                }
+                Some(RouteCondition::StaleFor { n }) => {
+                    f.u8(63, 4);
+                    f.i64(66, n);
+                }
+            }
+            entry_type::ROUTING
+        }
         Entry::SiteZone { zone, effective } => {
             f.i64(20, *effective);
             f.str(30, zone);
@@ -559,6 +741,7 @@ fn allowed(t: u8, id: u16) -> Allowed {
         }
         entry_type::ALIAS => matches!(id, 1 | 2),
         entry_type::RETIREMENT => matches!(id, 1 | 21),
+        entry_type::ROUTING => matches!(id, 50..=58 | 60..=66),
         entry_type::SITE_ZONE => matches!(id, 20 | 30),
         entry_type::TZDATA => id == 31,
         entry_type::RECOVERY => matches!(id, 40..=47),
@@ -582,7 +765,10 @@ enum Allowed {
 fn repeated(t: u8, id: u16) -> bool {
     matches!(
         (t, id),
-        (entry_type::DEFINITION, 13) | (entry_type::RECOVERY, 47)
+        (entry_type::DEFINITION, 13)
+            | (entry_type::RECOVERY, 47)
+            | (entry_type::ROUTING, 54)
+            | (entry_type::ROUTING, 61)
     )
 }
 
@@ -711,7 +897,7 @@ fn walk(body: &[u8], mut sink: impl FnMut(Entry)) -> Result<DataPrefix, BodyErro
             .and_then(|end| body.get(fields_at..end))
             .ok_or(overrun)?;
         at = (fields_at + len).div_ceil(8) * 8;
-        let known = matches!(t, 1..=4 | 6..=9);
+        let known = matches!(t, 1..=9);
         if !known {
             if t >= 0x80 {
                 fields(raw, i, t, false)?;
@@ -785,6 +971,7 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
             id: p.u32(1)?,
             t_r: p.i64(21)?,
         },
+        entry_type::ROUTING => Entry::Routing(Box::new(routing(p)?)),
         entry_type::SITE_ZONE => Entry::SiteZone {
             zone: p.need_text(30, 1, 63)?,
             effective: p.i64(20)?,
@@ -834,6 +1021,169 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
             id: p.u32(1)?,
             scale: p.u8_in(5, MAX_SCALE)?,
         },
+    })
+}
+
+/// A selection whose kind is field `kind` (53 or 60); ids for a pattern only when `resolved_ok`.
+fn read_selection(p: &Parsed<'_>, kind: u16, resolved_ok: bool) -> Result<Selection, BodyError> {
+    let ids = p
+        .all(kind + 1)
+        .map(|v| {
+            if v.len() == 4 {
+                Ok(u32_at(v, 0))
+            } else {
+                Err(p.bad(kind + 1))
+            }
+        })
+        .collect::<Result<Vec<u32>, _>>()?;
+    Ok(match p.u8_in(kind, 3)? {
+        0 | 3 => {
+            if !ids.is_empty() {
+                return Err(p.presence(kind + 1));
+            }
+            p.none(kind + 2)?;
+            if p.u8_in(kind, 3)? == 0 {
+                Selection::None
+            } else {
+                Selection::All
+            }
+        }
+        1 => {
+            p.none(kind + 2)?;
+            Selection::Ids(ids)
+        }
+        _ => {
+            if !resolved_ok && !ids.is_empty() {
+                return Err(p.presence(kind + 1));
+            }
+            Selection::Pattern {
+                pattern: p.need_text(kind + 2, 1, 255)?,
+                resolved: ids,
+            }
+        }
+    })
+}
+
+fn finite(p: &Parsed<'_>, id: u16) -> Result<f64, BodyError> {
+    let v = f64::from_bits(p.u64(id)?);
+    if v.is_finite() { Ok(v) } else { Err(p.bad(id)) }
+}
+
+fn non_negative(p: &Parsed<'_>, id: u16) -> Result<i64, BodyError> {
+    let v = p.i64(id)?;
+    if v >= 0 { Ok(v) } else { Err(p.bad(id)) }
+}
+
+fn routing(p: &Parsed<'_>) -> Result<Routing, BodyError> {
+    let v = p.need(50)?;
+    let consumer = match std::str::from_utf8(v) {
+        Ok(s) if consumer_name_ok(s) => s.to_owned(),
+        _ => return Err(p.bad(50)),
+    };
+    let op = match p.u8_in(51, 3)? {
+        1 => RouteOp::Add,
+        2 => RouteOp::Remove,
+        3 => RouteOp::Emits,
+        _ => return Err(p.bad(51)),
+    };
+    let funnel_fields = [53, 54, 55, 56, 57, 58, 63, 64, 65, 66];
+    let funnel = match op {
+        RouteOp::Emits => p.none(52).map(|()| None)?,
+        _ => Some(p.u32(52)?),
+    };
+    let (selection, operator, condition) = if op == RouteOp::Add {
+        let selection = read_selection(p, 53, true)?;
+        let operator = match p.get(56) {
+            None => {
+                p.none(57)?;
+                p.none(58)?;
+                None
+            }
+            Some(_) => {
+                let aggregate = p.u8_in(56, 10)?;
+                if aggregate == 0 {
+                    return Err(p.bad(56));
+                }
+                let width = p.i64(57)?;
+                if width <= 0 {
+                    return Err(p.bad(57));
+                }
+                let state = if aggregate == 10 {
+                    let v = p.need(58)?;
+                    match (v.len(), v.first()) {
+                        (5, Some(0)) if v[1] <= 1 && v[2..].iter().all(|b| *b == 0) => {
+                            Some(StateArg::Bool(v[1] == 1))
+                        }
+                        (5, Some(1)) => Some(StateArg::State(u32_at(v, 1))),
+                        _ => return Err(p.bad(58)),
+                    }
+                } else {
+                    p.none(58).map(|()| None)?
+                };
+                Some(RouteOperator {
+                    aggregate,
+                    width,
+                    state,
+                })
+            }
+        };
+        let condition = match p.get(63) {
+            None => {
+                for id in [64, 65, 66] {
+                    p.none(id)?;
+                }
+                None
+            }
+            Some(_) => Some(match p.u8_in(63, 4)? {
+                1 => {
+                    p.none(66)?;
+                    let (on, clear) = (finite(p, 64)?, finite(p, 65)?);
+                    if clear > on {
+                        return Err(p.bad(65));
+                    }
+                    RouteCondition::Threshold { on, clear }
+                }
+                2 => {
+                    p.none(65)?;
+                    p.none(66)?;
+                    let deadband = finite(p, 64)?;
+                    if deadband < 0.0 {
+                        return Err(p.bad(64));
+                    }
+                    RouteCondition::OnChange { deadband }
+                }
+                3 => {
+                    p.none(65)?;
+                    RouteCondition::HeldFor {
+                        above: finite(p, 64)?,
+                        n: non_negative(p, 66)?,
+                    }
+                }
+                4 => {
+                    p.none(64)?;
+                    p.none(65)?;
+                    RouteCondition::StaleFor {
+                        n: non_negative(p, 66)?,
+                    }
+                }
+                _ => return Err(p.bad(63)),
+            }),
+        };
+        (Some(selection), operator, condition)
+    } else {
+        for id in funnel_fields {
+            p.none(id)?;
+        }
+        (None, None, None)
+    };
+    Ok(Routing {
+        consumer,
+        op,
+        funnel,
+        selection,
+        operator,
+        emits: read_selection(p, 60, false)?,
+        condition,
     })
 }
 

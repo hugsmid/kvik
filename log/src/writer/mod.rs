@@ -41,6 +41,7 @@
 mod maint;
 mod queue;
 pub mod recovery;
+pub mod sources;
 mod threads;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -961,6 +962,14 @@ impl LogWriter {
     /// The reader leases as last seen (`spec.md` §7 Leases).
     pub fn leases(&self) -> &LeaseTable {
         &self.leases
+    }
+
+    /// Syncs the mark now if an update since its last sync is not on stable storage, whatever its timer: for a
+    /// caller about to write a file that names a recent position (`spec.md` §3 Durable mark).
+    pub fn sync_mark_now(&mut self, now: Duration) {
+        if self.mark_dirty && self.fault.is_none() {
+            self.sync_mark(now);
+        }
     }
 
     fn timed_mark_sync(&mut self, now: Duration) {

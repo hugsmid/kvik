@@ -272,7 +272,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 to 26 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20 (26 only with 25 = 2, at least the scale in force). No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
-| 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
+| 5 routing change | 50 consumer name (A.12); 51 change `u8` (1 adds a funnel, 2 removes one, 3 declares `emits` only); 52 funnel id `u32` (changes 1 and 2); for change 1: 53 selection kind `u8` (0 none, 1 ids, 2 name pattern, 3 every series), 54 series id `u32` (repeated: the ids of kind 1; for kind 2, the ids a condition funnel's pattern was resolved to when routed, else none), 55 pattern (UTF-8, 1–255 bytes, kind 2 only), 56 aggregate `u8` (1 avg, 2 sum, 3 integral, 4 min, 5 max, 6 count, 7 increase, 8 rate, 9 last, 10 time in state) with 57 window width `i64` ns > 0, 58 state counted (5 bytes: tag 0 then a boolean byte and 3 zero bytes, or tag 1 then a named state's index `u32`; aggregate 10 only), 63 condition `u8` (1 threshold: 64 activation and 65 clear level, clear ≤ activation; 2 on change: 64 dead-band ≥ 0; 3 held for: 64 level, 66 duration; 4 stale for: 66 duration beyond the series' staleness limit in force at the entry's position), levels finite `f64` and durations `i64` ns ≥ 0; always: 60 the consumer's `emits` kind, 61 its ids (repeated), 62 its pattern, as 53 to 55 but never with resolved ids. Fields 53 to 58 and 63 to 66 appear only in change 1 (`spec.md` §4 Routing) |
 | 6 site zone | 30 zone name (UTF-8 IANA name, at most 63 bytes); 20 effective time |
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
 | 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
@@ -310,11 +310,12 @@ Series definition fields, all critical:
 **Checks** (a failure makes the block invalid, A.2; the presence and recovery checks are invalid content): `length`
 or a field overrunning its container; a critical field out of order or repeated when not marked repeated; a value
 outside its range above; a field missing where the tables say it is present (the "Present" column, field 27 with
-field 8, field 20 in a parameter change, the recovery entry's fields), or present where it does not apply; a
-named-state series with no state name; a recovery entry that is not the only entry of its batch. Kind and value type
-are not compared beyond the tables. Fields without a stated range take any value, and a parameter change carrying
-only field 1 is valid. Entry type 5 is refused as an unknown critical type until roadmap 5.2 lays it out; field 41
-of a recovery entry is 16 bytes with a non-zero nonce. **Splitting:** consecutive entries share one
+field 8, field 20 in a parameter change, the recovery entry's fields, a routing change's fields per change and kind),
+or present where it does not apply; a named-state series with no state name; a recovery entry that is not the only
+entry of its batch. Kind and value type are not compared beyond the tables. Fields without a stated range take any
+value, and a parameter change carrying only field 1 is valid. Entry type 5 is laid out since roadmap 5.2 (until then
+it was refused as an unknown critical type, Q-106 (f)); field 41 of a recovery entry is 16 bytes with a non-zero
+nonce. **Splitting:** consecutive entries share one
 entries block until the next would take its body past 16 MiB.
 
 ### A.7 Commit block body (48 bytes)
@@ -594,8 +595,15 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
 
 ## A.15 Cursor file and lease file
 - **Cursor**, `cursors/<name>.cur`, kind 4: an A.1 header then blocks of type `0x30`, **appended**, one per cursor
-  sync. Body: `position` (12 bytes), reserved `u32`, then fields (A.6 framing): 1 consumer name; fields for latches,
-  the confirmed reset point and timer sequences are added by roadmap 5.2 and 5.3. The state is the last valid block;
+  sync. Body: `position` (12 bytes, the last confirmed position), reserved `u32`, then fields (A.6 framing): 1
+  consumer name; 2 latch (repeated, in funnel order, 40 bytes: funnel id `u32`, the funnel's incarnation, the
+  position of the routing change that added it, 12 bytes, the position the delivery carrying the state was emitted
+  at, 12 bytes, state `u8` (0 false, 1 true, 2 on change with no value, 3 on change with a value), 3 reserved bytes,
+  the value `f64`, finite, for state 3, else zero); 3 the id of the last reset point the consumer confirmed (12
+  bytes, absent before any). An unknown critical field (`< 0x8000`) is a version refusal; fields for timer sequences
+  are added by roadmap 5.3. Every position a cursor file names is a source of F (`spec.md` §3 Recovery rule 3), and
+  the file is never written naming one above the last synced mark. The header has `file_id` 0 and the generation at
+  creation. The state is the last valid block;
   a torn last block leaves the previous, older state, never ahead of a confirmation. No valid header or no valid
   block is "unreadable" and is named in the recovery entry (field 47). Only the writer opens cursor files; when a
   file passes 16 MiB the writer writes `<name>.cur.new` with the current state, syncs it, renames it over the old one
