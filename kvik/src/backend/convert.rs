@@ -243,6 +243,19 @@ pub(crate) fn definition(spec: &SeriesSpec) -> Result<ModelDefinition, Error> {
         }
     };
     let opt = |d: Option<Duration>| d.map(dur_nanos).transpose();
+    // The log keeps a reset ceiling in whole parts per million (`format.md` A.6 field 11): one that does not
+    // survive that is refused on both backends, so both apply the same rule (Q-142). One outside 0 to 1 is left to
+    // the definition rules.
+    if let Some(c) = spec.counter
+        && (0.0..=1.0).contains(&c.reset_ceiling)
+        && f64::from((c.reset_ceiling * 1_000_000.0).round() as u32) / 1_000_000.0
+            != c.reset_ceiling
+    {
+        return Err(Error::Invalid {
+            field: "counter",
+            reason: "reset_ceiling must be a whole number of parts per million".into(),
+        });
+    }
     let counter = spec
         .counter
         .map_or(km::summary::CounterRules::default(), |c| {

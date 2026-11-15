@@ -18,10 +18,11 @@ use kvik_model as km;
 use super::index::{Index, Stored, fact_out};
 use super::reader::DurableReader;
 use super::registry::Series;
-use crate::backend::{self, Error, convert};
+use crate::backend::{Error, convert};
 use crate::error::QueryError;
 use crate::fold::{self, Reading};
 use crate::read::{Aggregate, ChartData, Live, LiveValue, Resolution, Window, WindowResult};
+use crate::rules;
 use crate::time::TimeRange;
 use crate::types::{Fact, SeriesId};
 
@@ -44,6 +45,7 @@ pub(crate) fn params(d: &Definition) -> Params {
             LogKind::Interval => K::Interval,
         },
         staleness: d.staleness,
+        // Exact: a ceiling off the parts-per-million grid is refused at definition (Q-142).
         counter: d.counter.map_or(CounterRules::default(), |c| CounterRules {
             wrap_at: c.wrap_at.map(f64::from_bits),
             reset_ceiling: f64::from(c.reset_ceiling_ppm) / 1_000_000.0,
@@ -130,6 +132,8 @@ impl<'a> Of<'a> {
     }
 
     /// The last summarised reading before `t`: the current fact of the greatest such `t` that is not bad quality.
+    /// The backward scan reads through a run of bad-quality current facts before `t`, so its cost is that run's
+    /// length; nothing bounds it until the summary tree carries each node's last reading (roadmap 7.1).
     fn prior(&self, t: i64) -> Option<Reading> {
         if self.params.interval.is_some() {
             return None;
@@ -164,6 +168,8 @@ pub(crate) fn live(r: &DurableReader, id: SeriesId) -> Result<Live, QueryError> 
         if p.timing == km::registry::Timing::Forecast {
             return Ok(Live::None);
         }
+        // As for `prior`, the scan reads through bad-quality facts, and here also through readings of an observed
+        // interval series not yet ready (at most d of event time).
         let Some(s) = of
             .current(Bound::Unbounded, Bound::Included(now), true)
             .find(|s| of.reading(s).is_some() && p.ready_at(s.row.t) <= now)
@@ -198,9 +204,9 @@ pub(crate) fn window(
     let now = r.now();
     r.with(|i, _| {
         let of = Of::new(i, id)?;
-        let a = backend::aggregate_for(&of.series.spec, of.params.kind, agg)?;
+        let a = rules::aggregate_for(&of.series.spec, of.params.kind, agg)?;
         let spec = Some(&of.series.spec);
-        let (from, to) = match backend::plain_span(window, now)? {
+        let (from, to) = match rules::plain_span(window, now)? {
             Some(span) => span,
             None => {
                 let Window::Calendar { window, zone } = window else {
@@ -216,7 +222,7 @@ pub(crate) fn window(
                 let (from, to, _) = km::calendar::window_span(
                     &zoning,
                     tzdb(),
-                    backend::calendar_window(window)?,
+                    rules::calendar_window(window)?,
                     now,
                 )
                 .map_err(|e| convert::error(km::engine::Error::Tree(e)))?;
@@ -224,7 +230,7 @@ pub(crate) fn window(
             }
         };
         let node = of.window(from, to, now);
-        Ok(backend::window_result(
+        Ok(rules::window_result(
             spec,
             &node,
             &a,
@@ -246,28 +252,29 @@ pub(crate) fn buckets(
     let now = r.now();
     r.with(|i, _| {
         let of = Of::new(i, id)?;
-        let (a, b) = backend::chart_range(range)?;
+        let (a, b) = rules::chart_range(range)?;
         let step = match resolution {
             Resolution::Auto { max_points } => {
-                let raw: Vec<Fact> = of
-                    .current(Bound::Included(a), Bound::Excluded(b), false)
-                    .map(fact_out)
-                    .collect();
-                if raw.len() <= max_points.max(1) {
-                    return Ok(ChartData::Facts(raw));
+                let max = max_points.max(1);
+                let range = || of.current(Bound::Included(a), Bound::Excluded(b), false);
+                // Counted before any is converted: a long range gives buckets.
+                if range().take(max.saturating_add(1)).count() <= max {
+                    return Ok(ChartData::Facts(
+                        range().map(fact_out).collect::<Vec<Fact>>(),
+                    ));
                 }
-                backend::auto_step(a, b, max_points)
+                rules::auto_step(a, b, max_points)
             }
-            Resolution::Step(d) => backend::fixed_step(d, a, b)?,
+            Resolution::Step(d) => rules::fixed_step(d, a, b)?,
         };
         let p = &of.params;
         let readings = of.readings(fold::reach(p, a), b);
         let prior = of.prior(a);
-        let buckets = backend::bucket_spans(a, b, step)
+        let buckets = rules::bucket_spans(a, b, step)
             .map(|(lo, hi)| {
                 let before = fold::before(&readings, lo).or(prior.as_ref());
                 let node = fold::window(p, before, &readings, lo, hi, now);
-                backend::bucket(&of.series.spec, &node, lo, hi, false)
+                rules::bucket(&of.series.spec, &node, lo, hi, false)
             })
             .collect();
         Ok(ChartData::Buckets {

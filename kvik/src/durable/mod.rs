@@ -801,7 +801,7 @@ impl Writer {
         #[cfg(test)]
         tests::after_decision(&self.dir);
         self.count(readings, &plan);
-        self.refresh_live(&plan);
+        let refreshing = refreshing(&plan);
         let decisions = plan.decisions;
         let Some((completion, own)) = tracked else {
             return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None))));
@@ -814,7 +814,12 @@ impl Writer {
                     me.note_latency(started.elapsed());
                 }
                 match r {
-                    Ok(ack) if own => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),
+                    Ok(ack) if own => {
+                        for id in &refreshing {
+                            me.clocks.refresh(*id);
+                        }
+                        Ok(Ack::new(outcomes(&decisions, Some(ack.first))))
+                    }
                     Ok(_) => Ok(Ack::new(outcomes(&decisions, None))),
                     Err(CommitError::ShutDown) => Err(EmitError::Closed),
                     Err(CommitError::ReadOnly) => Err(EmitError::ReadOnly(me.fault_now())),
@@ -882,25 +887,6 @@ impl Writer {
                         st.future += u64::from(row.flags.future);
                     }
                 }
-            }
-        }
-    }
-
-    /// Notes the facts of a call that refresh live staleness (spec §5.4): recorded, not outranked, not bad quality
-    /// and not future. The instant is taken when the call is decided, just before its commit.
-    fn refresh_live(&self, plan: &ingest::Plan) {
-        for d in &plan.decisions {
-            if let Decision::Record {
-                item,
-                outranked: false,
-                ..
-            } = d
-                && let Some(Item::Fact(row)) = plan.items.get(*item)
-                && row.quality != kvik_log::facts::Quality::Bad
-                && !matches!(row.value, kvik_log::facts::Value::Absent { .. })
-                && !row.flags.future
-            {
-                self.clocks.refresh(row.series_id);
             }
         }
     }
@@ -1116,6 +1102,32 @@ fn orphaned(i: &Index, range: &std::ops::RangeInclusive<Position>) -> Vec<Fact> 
         .collect();
     out.sort_by_key(|f| f.position);
     out
+}
+
+/// The series whose live staleness a call refreshes once it is acknowledged (spec §5.4): those of its facts that
+/// are recorded, not outranked, not bad quality and not future. A call whose acknowledgement is never taken (a
+/// dropped [`Queued`]) refreshes nothing.
+fn refreshing(plan: &ingest::Plan) -> Vec<u32> {
+    plan.decisions
+        .iter()
+        .filter_map(|d| match d {
+            Decision::Record {
+                item,
+                outranked: false,
+                ..
+            } => match plan.items.get(*item) {
+                Some(Item::Fact(row))
+                    if row.quality != kvik_log::facts::Quality::Bad
+                        && !matches!(row.value, kvik_log::facts::Value::Absent { .. })
+                        && !row.flags.future =>
+                {
+                    Some(row.series_id)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// Reads of a durable store: the queries a log reader can answer.

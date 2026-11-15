@@ -1,17 +1,11 @@
-//! Window evaluation as a fold over readings and partial summaries (spec §5.2, §5.3, §6), with no knowledge of
-//! where the readings come from.
-//!
-//! The per-node fold (count, sum, min, max, integral, first and last, the boundary pair, counter steps, state time,
-//! coverage) and its associative merge are `kvik_model::summary`'s, in exact arithmetic: one implementation for the
-//! reference model and the engine, so that results agree to the bit. This module composes them into window
-//! results the way `docs/spec.md` §6 Evaluation describes: a **core** over the window up to its credit limit,
-//! assembled from parts (nodes folded from raw readings here; stored nodes of the summary tree, roadmap 7.x, take
-//! the place of the parts they cover), then the **edge stretches** from the reading before the window. An interval
-//! series is credited pro rata at the edges instead (spec §5.4, §6). Callers pass readings that are summarised
-//! (current, not bad quality), in strictly increasing `t`.
+//! Window evaluation over summarised readings (spec §5.2, §6), independent of where the readings come from. The
+//! node fold and merge are `kvik_model::summary`'s, in exact arithmetic, so results equal the model's. A window is a
+//! core up to its credit limit, folded from the readings inside (stored nodes take the place of the readings they
+//! cover from roadmap 7.x), then the edge stretches; an interval series is credited pro rata instead. Readings are
+//! current, not bad quality, in strictly increasing `t`.
 
 use kvik_model::registry::Timing;
-use kvik_model::summary::{Node, Params, credit_intervals, direct, merge_all, with_stretches};
+use kvik_model::summary::{Node, Params, credit_intervals, direct, with_stretches};
 use kvik_model::types::{Nanos, Value};
 
 /// A summarised reading: its event time and value.
@@ -24,35 +18,6 @@ pub(crate) fn reach(p: &Params, start: Nanos) -> Nanos {
         Some(iv) => start.saturating_sub(iv.length - 1),
         None => start,
     }
-}
-
-/// The node of the readings of `[start, end)`, without stretches: a part of a window's core. `readings` are the
-/// readings with `t` in the span.
-pub(crate) fn part(p: &Params, start: Nanos, end: Nanos, readings: &[Reading]) -> Node {
-    direct(p, start, end, readings)
-}
-
-/// The core of a window `[start, until)` from adjacent parts in order, `until` being its credit limit.
-pub(crate) fn core(p: &Params, start: Nanos, until: Nanos, parts: &[Node]) -> Node {
-    let mut core = merge_all(p, start, parts.iter());
-    core.start = start;
-    core.end = until;
-    core
-}
-
-/// A window `[start, end)` from its core and the last reading before `start`: the leading stretch credits that
-/// reading within its staleness limit, the trailing stretch runs from the last reading to the credit limit (spec §6
-/// Edge stretches).
-pub(crate) fn finish(
-    p: &Params,
-    core: Node,
-    prior: Option<&Reading>,
-    until: Nanos,
-    end: Nanos,
-) -> Node {
-    let mut n = with_stretches(p, core, prior, until);
-    n.end = end;
-    n
 }
 
 /// A window `[start, end)` evaluated at `now` from raw readings: `prior` is the last reading before `start`, and
@@ -74,9 +39,10 @@ pub(crate) fn window(
         return Node::empty(p.kind, start, end);
     }
     let until = p.credit_limit(end, now).max(start);
-    let inside = within(readings, start, until);
-    let core = core(p, start, until, &[part(p, start, until, inside)]);
-    finish(p, core, prior, until, end)
+    let core = direct(p, start, until, within(readings, start, until));
+    let mut n = with_stretches(p, core, prior, until);
+    n.end = end;
+    n
 }
 
 /// A window `[start, end)` over an interval series, evaluated at `now`: every ready reading's amount pro rata to

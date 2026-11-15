@@ -99,6 +99,7 @@ mod error;
 mod fold;
 mod health;
 mod read;
+mod rules;
 mod series;
 mod store;
 mod time;
