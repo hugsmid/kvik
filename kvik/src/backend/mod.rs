@@ -135,6 +135,9 @@ struct ConsumerSlot {
     /// has been re-routed).
     to_api: BTreeMap<u32, FunnelId>,
     next_funnel: u32,
+    /// The next model funnel id for a re-routed pattern funnel, from a range of its own so that the interface's
+    /// funnel ids run 1, 2, 3, … as the durable backend's do.
+    next_model: u32,
     /// Parts of a resync not yet handed out.
     parts: VecDeque<Delivery>,
     /// The last part of a resync was handed out and not yet confirmed:
@@ -628,8 +631,8 @@ impl Slot {
         for (name, fid, set) in work {
             let c = self.consumers.get_mut(&name).expect("listed above");
             let e = c.funnels.get_mut(&fid).expect("listed above");
-            let fresh = c.next_funnel;
-            c.next_funnel += 1;
+            let fresh = c.next_model;
+            c.next_model += 1;
             self.model
                 .remove_route(c.id, km::engine::FunnelId(e.model))
                 .map_err(convert::error)?;
@@ -912,6 +915,9 @@ impl Slot {
             // already.
             if c.attached == Some(self.epoch) {
                 self.model.reconnect(c.id).map_err(convert::error)?;
+                // What was handed out is dropped with the old handle, a resync awaiting confirmation included.
+                c.parts.clear();
+                c.awaiting_resync = None;
             }
             c.attached = Some(self.epoch);
             c.handle = true;
@@ -955,6 +961,7 @@ impl Slot {
                 funnels: BTreeMap::new(),
                 to_api: BTreeMap::new(),
                 next_funnel: 1,
+                next_model: 1 << 31,
                 parts: VecDeque::new(),
                 awaiting_resync: None,
             },
@@ -1256,7 +1263,7 @@ impl Slot {
                     ResyncCause::Resume
                 };
                 let forget_above = r.forget_above.map(pos);
-                let states: Vec<FunnelState> = r
+                let mut states: Vec<FunnelState> = r
                     .funnels
                     .iter()
                     .filter(|f| f.funnel != km::engine::FunnelId::CONFIGURED)
@@ -1276,6 +1283,8 @@ impl Slot {
                         })
                     })
                     .collect();
+                // In the interface's funnel order: a re-routed pattern funnel has a later model id.
+                states.sort_by_key(|f| f.funnel);
                 let chunks: Vec<Vec<FunnelState>> = if states.is_empty() {
                     vec![Vec::new()]
                 } else {

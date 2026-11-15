@@ -38,6 +38,7 @@ impl Writer {
     /// files that are due.
     pub(crate) fn tick(&self) {
         if let Some(h) = &self.hub {
+            h.ticked();
             let r = h.run(|d, c| {
                 d.pump(c);
                 d.tick(c);
@@ -180,7 +181,9 @@ impl Writer {
         name: &str,
         waker: Option<&Waker>,
     ) -> Result<Option<Delivery>, Error> {
-        let r = self.hub()?.run(|dl, c| {
+        let hub = self.hub()?;
+        hub.ticked();
+        let r = hub.run(|dl, c| {
             dl.pump(c);
             let r = dl.poll(name, c);
             if let (Ok(None), Some(w)) = (&r, waker) {

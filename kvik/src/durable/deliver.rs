@@ -1379,6 +1379,9 @@ pub(crate) struct Hub {
     /// A cursor file write or sync failed: the store is read-only (`spec.md` §3 Write or sync failure).
     pub(crate) fault: std::sync::Mutex<Option<kvik_log::writer::Fault>>,
     pub(crate) closed: std::sync::atomic::AtomicBool,
+    /// When the timers last ran, on the process's clock: the `kvik-deliver` thread runs them only when no call has
+    /// for a second, so calls that run them (emits, polls, `tick`) keep the order the model backend gives.
+    last_tick: std::sync::Mutex<std::time::Instant>,
 }
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1400,6 +1403,7 @@ impl Hub {
             now,
             fault: std::sync::Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
+            last_tick: std::sync::Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -1431,6 +1435,11 @@ impl Hub {
         r
     }
 
+    /// Notes that the timers ran.
+    pub(crate) fn ticked(&self) {
+        *lock(&self.last_tick) = std::time::Instant::now();
+    }
+
     /// Records a cursor file fault.
     pub(crate) fn failed(&self, e: &io::Error) {
         let mut f = lock(&self.fault);
@@ -1457,9 +1466,15 @@ impl Hub {
                     if watch.stopped() || hub.closed.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
+                    let due = lock(&hub.last_tick).elapsed() >= Duration::from_secs(1);
+                    if due {
+                        hub.ticked();
+                    }
                     let r = hub.run(|d, c| {
                         d.pump(c);
-                        d.tick(c);
+                        if due {
+                            d.tick(c);
+                        }
                         d.flush_due(c)
                     });
                     if let Err(e) = r {
