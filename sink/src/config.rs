@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use kvik::SinkError;
+use kvik_sink_api::SinkError;
 
 use crate::retry::RetryPolicy;
 use crate::sigv4::Credentials;

@@ -5,11 +5,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kvik::BackupSink;
 use kvik_sink::fake::{FAKE_BUCKET, FAKE_REGION, fake_credentials};
 use kvik_sink::transport::{Method, Request, Response, Transport, TransportError};
 use kvik_sink::verify::sha256;
 use kvik_sink::{Addressing, RetryPolicy, S3Config, S3Sink, ThreadSleep, WallClock, block_on};
+use kvik_sink_api::BackupSink;
 
 /// 2026-11-15 12:00:00 UTC.
 struct Fixed;

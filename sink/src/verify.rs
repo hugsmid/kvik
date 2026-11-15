@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use kvik::{BackupSink, SinkError};
-pub use kvik::{Stored, Verified, VerifyError};
+use kvik_sink_api::{BackupSink, SinkError};
+pub use kvik_sink_api::{Stored, Verified, VerifyError};
 use sha2::{Digest, Sha256};
 
 /// The SHA-256 of some bytes.

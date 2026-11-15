@@ -632,6 +632,7 @@ dependencies = [
  "jiff",
  "kvik-log",
  "kvik-model",
+ "kvik-sink-api",
  "kvik-tree",
  "proptest",
  "thiserror",
@@ -697,11 +698,18 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hmac",
- "kvik",
+ "kvik-sink-api",
  "proptest",
  "sha2",
  "thiserror",
  "ureq",
+]
+
+[[package]]
+name = "kvik-sink-api"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

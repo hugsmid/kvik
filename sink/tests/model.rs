@@ -4,10 +4,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kvik::{BackupSink, SinkError};
 use kvik_sink::block_on;
 use kvik_sink::fake::{FakeBucket, FakeOp, Fault};
 use kvik_sink::verify::sha256;
+use kvik_sink_api::{BackupSink, SinkError};
 use proptest::prelude::*;
 
 const KEYS: [&str; 4] = ["claims/00000001", "claims/00000002", "log/a", "log/b"];

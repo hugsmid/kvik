@@ -1,7 +1,8 @@
 # kvik-sink
 
-Backup sinks for the kvik time-series store (roadmap 8.2): an implementation of `kvik::BackupSink` over
-S3-compatible object storage, and an in-memory fake bucket for tests.
+Backup sinks for the kvik time-series store (roadmap 8.2): an implementation of the `BackupSink` trait of
+`kvik-sink-api` (re-exported as `kvik::BackupSink`) over S3-compatible object storage, and an in-memory fake bucket
+for tests.
 
 - **`S3Sink`**: Signature Version 4 in the `Authorization` header; path-style or virtual-host addressing. Uploads are
   single-part and conditional (`If-None-Match: *`), carry the SHA-256 as `x-amz-checksum-sha256` and the payload hash,
@@ -22,7 +23,7 @@ S3-compatible object storage, and an in-memory fake bucket for tests.
   (also with a given error code), timeouts before and after a request is applied, requests held unanswered, cut uploads,
   truncated downloads, a bucket that stores other bytes, one that trusts the sent hash, one that reports none, damage in
   the bucket and lagging listings.
-- **`verify`**: `upload` and `check` give a `kvik::Verified` only after the bucket reports the expected hash;
+- **`verify`**: `upload` and `check` give a `Verified` only after the bucket reports the expected hash;
   `download` checks the bytes.
 
 The bucket must honour conditional writes, check and report whole-object SHA-256 checksums, and have versioning or

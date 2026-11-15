@@ -275,6 +275,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`chunk/`](chunk/) | `kvik-chunk`: the column encodings and block bodies of compacted chunks (delta bit-packing, scaled decimals with exceptions, XOR with a compressed fallback, run-length), with golden files, property tests and a fuzz target |
 | [`files/`](files/) | `kvik-files`: the manifest's records, the catalogue of files replayed from them, and the rebuild of a manifest with a corrupt record from the local files, with golden files, property tests and a fuzz target |
 | [`export/`](export/) | `kvik-export`: Parquet export of a series' facts; the schema is provisional ([`docs/export.md`](docs/export.md)) |
+| [`sinkapi/`](sinkapi/) | `kvik-sink-api`: the backup sink trait and its types, a leaf crate shared by the store, the sinks and the backup driver; `kvik` re-exports it |
 | [`sink/`](sink/) | `kvik-sink`: the backup sink over S3-compatible object storage (signing, conditional single-part uploads with their SHA-256, retries and timeouts) and an in-memory fake bucket with injected faults |
 | [`model/OPEN-QUESTIONS.md`](model/OPEN-QUESTIONS.md) | Open questions in the specification, and where the model still differs from it |
 | [`spikes/encodings/`](spikes/encodings/) | The encoding spike behind roadmap item 2.1; not part of the engine |

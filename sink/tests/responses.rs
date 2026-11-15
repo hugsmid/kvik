@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use kvik::{BackupSink, SinkError};
 use kvik_sink::fake::{Checksums, FakeBucket, FakeOp};
 use kvik_sink::transport::{Request, Response, Transport, TransportError};
 use kvik_sink::verify::sha256;
 use kvik_sink::{RetryPolicy, S3Sink, block_on};
+use kvik_sink_api::{BackupSink, SinkError};
 
 fn put(sink: &S3Sink, key: &str, b: &[u8]) {
     block_on(sink.put(key, Arc::from(b), sha256(b))).unwrap();

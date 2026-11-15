@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use kvik::{BackupSink, ListPage, SinkError, SinkFuture, Stored};
+use kvik_sink_api::{BackupSink, ListPage, SinkError, SinkFuture, Stored};
 use sha2::{Digest, Sha256};
 
 use crate::config::{Addressing, S3Config};
