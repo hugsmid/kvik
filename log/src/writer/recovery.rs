@@ -22,7 +22,9 @@ use crate::manifest::{
     LossCause, LostRange, ManifestError, ManifestRead, RECORD_LOST_RANGE, encode_record,
     read_manifest,
 };
-use crate::mark::{MARK_LEN, MarkSlot, SLOT_OFFSETS, encode_mark_file, read_mark, read_slots};
+use crate::mark::{
+    MARK_LEN, MarkSlot, ResetStamp, SLOT_OFFSETS, encode_mark_file, read_mark, read_slots,
+};
 use crate::name::SegmentName;
 use crate::scan::{HeaderState, ScanLimit, Tail, scan};
 use crate::segment::SealSummary;
@@ -280,6 +282,9 @@ struct Plan {
     /// Where writing resumes in `resume_in`.
     write_offset: u64,
     last_sequence: u64,
+    /// Rule 1 truncates a complete batch: a recovery entry is written as under rule 3, a reset point
+    /// (`spec.md` §3 Recovery rule 1).
+    reset: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -327,6 +332,7 @@ fn plan(
     let last_in_use = in_use.last().copied();
     let mut kept: Vec<usize> = segs.iter().map(|s| s.batches.len()).collect();
     let mut zero = Vec::new();
+    let mut reset = false;
     // Rule selection.
     let (rule, mark_slot) = match mark {
         MarkRead::Readable { slot, .. } => {
@@ -351,6 +357,9 @@ fn plan(
                 StartRule::Reboot(MarkState::Stale)
             };
             if rule == StartRule::SameBoot {
+                // A complete batch beyond the mark may have been acknowledged (a mark sync lost with the page cache
+                // within the boot): its truncation is a reset point (`spec.md` §3 Recovery rule 1).
+                reset = n == 1;
                 // Truncate everything after the mark: in the mark's segment from its offset, in every later segment
                 // in use from the header's end.
                 // A segment that is not the last in use holds no batch beyond a current mark, and may hold seal
@@ -498,6 +507,7 @@ fn plan(
         rewrite_last: None,
         write_offset,
         last_sequence: k,
+        reset,
     };
     if let StartRule::Reboot(state) = rule {
         // The torn tail of the last segment in use: from the write offset to the last non-zero byte.
@@ -545,6 +555,13 @@ fn plan(
         if state != MarkState::Readable || uncovered_entry {
             p.rewrite_last = last_kept;
         }
+    } else if p.reset {
+        // The entry follows the mark; the bytes rule 1 zero-fills are the tail it reports.
+        let zeroed: u64 = p.zero.iter().map(|z| z.2 - z.1).sum();
+        if let Some(r) = resume_in {
+            p.tail = Some((r, p.write_offset, p.write_offset + zeroed, 1));
+        }
+        p.last_sequence = 1 + k.max(manifest_highest);
     } else {
         p.last_sequence = k.max(mark_slot.map_or(0, |m| m.last_sequence));
     }
@@ -708,6 +725,7 @@ pub(super) fn start(
             offset: 0,
             last_sequence: 0,
             max_series_id: 0,
+            stamp: ResetStamp::default(),
         };
         let (file, created) = match mark_bytes {
             None => (fs.open(&mark_path, OpenMode::CreateNew)?, true),
@@ -887,6 +905,20 @@ pub(super) fn start(
             id_floor = s.tail_ids.iter().copied().fold(id_floor, u32::max);
         }
     }
+    // A complete batch truncated by rule 1 may have been acknowledged: its ids stay assigned.
+    if p.reset {
+        for &i in &in_use_idx {
+            for b in segs[i].batches.iter().skip(p.kept[i]) {
+                for item in &b.content.items {
+                    match item {
+                        Item::Fact(r) => id_floor = id_floor.max(r.series_id),
+                        Item::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
     for &i in &in_use_idx {
         for b in segs[i].batches.iter().take(p.kept[i]) {
             for item in &b.content.items {
@@ -947,13 +979,22 @@ pub(super) fn start(
     let mark_next_slot;
     let mark_file: Option<Box<dyn FsFile>>;
     let mut mark_dirty = false;
-    if let StartRule::Reboot(state) = p.rule {
+    let entry_state = match p.rule {
+        StartRule::Reboot(state) => Some(state),
+        StartRule::SameBoot if p.reset => Some(MarkState::Readable),
+        _ => None,
+    };
+    let stamp;
+    if let Some(state) = entry_state {
         let f_seq = p.last_sequence;
         if let Some((i, j)) = p.adopt {
             let b = &segs[i].batches[j];
+            let rec = b.recovery().cloned().expect("an adopted recovery entry");
+            // An entry written before the stamp existed gets a fresh one in the mark (`spec.md` §7 Readers).
+            stamp = rec.stamp.unwrap_or_else(|| ResetStamp::new_at(b.first));
             report.entry = Some(EntryReport {
                 sequence: b.first,
-                entry: b.recovery().cloned().expect("an adopted recovery entry"),
+                entry: rec,
                 adopted: true,
             });
             write_offset = b.end;
@@ -969,8 +1010,10 @@ pub(super) fn start(
             }
         } else {
             let (tail_bytes, readable) = p.tail.map_or((0, 0), |(_, s, e, c)| (e - s, c));
+            stamp = ResetStamp::new_at(f_seq);
             let entry = Recovery {
                 after: p.k,
+                stamp: Some(stamp),
                 boot_id: boot,
                 tail_bytes,
                 readable_commits: readable,
@@ -1054,8 +1097,8 @@ pub(super) fn start(
             if let Err(e) = file.write_at(&bytes, at).and_then(|()| file.sync_data()) {
                 return ro(fault(FaultOp::Sync, &path, &e), report);
             }
-            // The rest of the torn tail is zeroed after the entry is on disk.
-            if let Some((ti, ts, te, _)) = p.tail {
+            // The rest of the torn tail is zeroed after the entry is on disk (rule 1 zeroed its tail in step 2).
+            if let Some((ti, ts, te, _)) = p.tail.filter(|_| !p.reset) {
                 let from = if fits { at + bytes.len() as u64 } else { ts };
                 if te > from {
                     let r = zero_fill(&*files[&ti], from, te).and_then(|()| files[&ti].sync_data());
@@ -1119,6 +1162,7 @@ pub(super) fn start(
             offset: entry_end,
             last_sequence: f_seq,
             max_series_id: id_floor,
+            stamp,
         };
         let r = match mark_bytes {
             None => fs.open(&mark_path, OpenMode::CreateNew).and_then(|f| {
@@ -1422,6 +1466,7 @@ fn read_only(f: Fault, report: StartReport, halt: &Halt) -> Resume {
             offset: 0,
             last_sequence: 0,
             max_series_id: 0,
+            stamp: ResetStamp::default(),
         },
         mark_next_slot: 0,
         mark_dirty: false,

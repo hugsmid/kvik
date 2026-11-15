@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::read::{Aggregate, Live};
 use crate::time::Timestamp;
-use crate::types::{Fact, Position, SeriesId};
+use crate::types::{Fact, Position, SavedPoint, SeriesId};
 
 /// Where a new consumer starts (spec §4 New consumer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,8 +13,9 @@ pub enum Start {
     /// After the last committed position.
     #[default]
     Now,
-    /// After a position. Not supported by the model backend yet.
-    Position(Position),
+    /// After a saved point: a position and the reset stamp it was read under, checked against the resets since
+    /// (spec §4 New consumer, §7 Readers). Not supported by the model backend yet.
+    Position(SavedPoint),
     /// After the last position committed at or before a time. Not supported
     /// by the model backend yet.
     Time(Timestamp),

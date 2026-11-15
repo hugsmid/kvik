@@ -1868,6 +1868,7 @@ impl Slot {
             durable: self.head(),
             epoch: self.model.disk.latest_epoch(),
             generation: self.model.disk.generation,
+            stamp: crate::types::ResetStamp::default(),
             lease_renewed_at: ts(self.model.now),
         })
     }

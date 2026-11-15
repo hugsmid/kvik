@@ -19,6 +19,49 @@ pub const MARK_MAGIC: [u8; 8] = *b"KVIKMARK";
 /// The mark version this crate reads and writes.
 pub const MARK_VERSION: u32 = 3;
 
+/// A reset stamp (`spec.md` §3 Recovery, §7 Readers): the position of the store's last reset point written by a
+/// start (a recovery entry), or of a restore, and a random nonce, never zero, that tells two resets at one position
+/// apart. Zero, the default, means no reset since the store was created. The mark carries the current one; each
+/// recovery entry carries its own (`format.md` A.6 field 41, A.10).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ResetStamp {
+    /// The reset's sequence: the recovery entry's position F, or the first position of a restored generation.
+    pub sequence: u64,
+    /// Random, never zero once a reset has happened.
+    pub nonce: u64,
+}
+
+impl ResetStamp {
+    /// The 16 bytes: `sequence` then `nonce`.
+    pub fn encode(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&self.sequence.to_le_bytes());
+        b[8..].copy_from_slice(&self.nonce.to_le_bytes());
+        b
+    }
+
+    /// The stamp in 16 bytes; `None` for another length.
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        (b.len() == 16).then(|| Self {
+            sequence: u64_at(b, 0),
+            nonce: u64_at(b, 8),
+        })
+    }
+
+    /// A new stamp for a reset at `sequence`, with a nonce from the operating system's randomness (std's hash
+    /// keys); never zero.
+    pub fn new_at(sequence: u64) -> Self {
+        use std::hash::BuildHasher;
+        let mut n = 0u64;
+        let mut salt = 0u64;
+        while n == 0 {
+            n = std::collections::hash_map::RandomState::new().hash_one((sequence, salt));
+            salt += 1;
+        }
+        Self { sequence, nonce: n }
+    }
+}
+
 /// One mark slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MarkSlot {
@@ -38,6 +81,8 @@ pub struct MarkSlot {
     pub last_sequence: u64,
     /// The highest series id assigned.
     pub max_series_id: u32,
+    /// The current reset stamp, in bytes 84..100 (formerly reserved, so the version is unchanged).
+    pub stamp: ResetStamp,
 }
 
 /// One slot as read.
@@ -65,6 +110,7 @@ impl MarkSlot {
         put(&mut b, 64, &self.offset.to_le_bytes());
         put(&mut b, 72, &self.last_sequence.to_le_bytes());
         put(&mut b, 80, &self.max_series_id.to_le_bytes());
+        put(&mut b, 84, &self.stamp.encode());
         let crc = crc32c(&b[..124]);
         put(&mut b, 124, &crc.to_le_bytes());
         b
@@ -96,6 +142,7 @@ impl MarkSlot {
             offset: u64_at(b, 64),
             last_sequence: u64_at(b, 72),
             max_series_id: u32_at(b, 80),
+            stamp: ResetStamp::decode(&b[84..100]).unwrap_or_default(),
         })
     }
 }
@@ -167,6 +214,10 @@ mod tests {
             offset: 640,
             last_sequence: 12,
             max_series_id: 2,
+            stamp: ResetStamp {
+                sequence: 11,
+                nonce: 0x0102,
+            },
         }
     }
 
@@ -177,7 +228,9 @@ mod tests {
         assert_eq!(&b[8..12], &3u32.to_le_bytes());
         assert_eq!(&b[48..56], &7u64.to_le_bytes());
         assert_eq!(&b[64..72], &640u64.to_le_bytes());
-        assert_eq!(&b[84..124], &[0; 40]);
+        assert_eq!(&b[84..92], &11u64.to_le_bytes());
+        assert_eq!(&b[92..100], &0x0102u64.to_le_bytes());
+        assert_eq!(&b[100..124], &[0; 24]);
         assert_eq!(&b[124..], &crc32c(&b[..124]).to_le_bytes());
     }
 

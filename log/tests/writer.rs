@@ -944,6 +944,7 @@ fn commit_time_never_decreases_when_the_wall_clock_steps_back() {
 fn recovery() -> Item {
     Item::Entry(Entry::Recovery(Recovery {
         after: 0,
+        stamp: None,
         boot_id: BOOT,
         tail_bytes: 0,
         readable_commits: 0,

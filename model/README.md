@@ -87,7 +87,7 @@ names the clauses the model cannot show, why, and the roadmap item that tests th
 | 6 | `row_06_two_readings_in_one_second` | `edge_cases.rs` |  |  |
 | 7 | `row_07_process_crash_after_write_before_sync`; `s3_missing_mark_counts_as_different_boot`, `s3_recovery_writes_mark_after_reboot` | `edge_cases.rs`; `rules.rs` |  | `possible_loss`, the recovery entry and the timed mark sync: the model's mark is exact (kill loop; model support before roadmap 5.1) |
 | 7a | `row_07a_power_loss_after_write_before_sync`; `s4_resync_after_rule_3_recovery_before_later_positions` | `edge_cases.rs`; `rules.rs` |  | `possible_loss`, the recovery entry and `resync` with `forget_above` on every start until the consumer's synced cursor has passed it: the mark is exact; `s4_resync_after_rule_3_recovery_before_later_positions` now contradicts the specification (see `OPEN-QUESTIONS.md`; power-loss rig, model support before roadmap 5.1) |
-| 7b | — | — |  | The rule is open (Q-46): how a reader checks a kept position after a truncation (power-loss rig; roadmap 4.6) |
+| 7b | — | — |  | Saved points (spec §7 Readers, Q-46 settled): the check is built with roadmap 5.3 (power-loss rig) |
 | 7c | — | — |  | Recovery entries (Q-48): not yet modelled (kill loop; model support before roadmap 5.1) |
 | 8 | `row_08_crash_after_sync_before_delivery`, `row_08_crash_during_delivery_after_mark` | `edge_cases.rs` |  |  |
 | 9 | `row_09_crash_during_compaction`, `row_09_failed_recovery_sync_discards_nothing` | `edge_cases.rs` |  | Crash points in real files (kill loop, roadmap 6.2) |

@@ -313,6 +313,9 @@ pub struct ReaderState {
     pub epoch: u64,
     /// The generation.
     pub generation: u32,
+    /// The mark's reset stamp: with `durable`, the saved point to keep (always zero with the model backend,
+    /// which has no resets).
+    pub stamp: crate::types::ResetStamp,
     /// When the lease was last renewed.
     pub lease_renewed_at: Timestamp,
 }

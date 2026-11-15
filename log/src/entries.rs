@@ -6,6 +6,7 @@ use crate::bytes::{i64_at, u16_at, u32_at, u64_at};
 use crate::content_error::{BodyError, ContentError};
 use crate::error::{Element, EncodeError};
 use crate::facts::{MAX_SCALE, ValueType};
+use crate::mark::ResetStamp;
 
 /// The largest entry, header excluded: 8 MiB.
 pub const MAX_ENTRY_LEN: usize = 8 << 20;
@@ -223,6 +224,9 @@ pub enum MarkState {
 pub struct Recovery {
     /// 40: K, the last kept position's sequence.
     pub after: u64,
+    /// 41: the reset stamp this entry starts, its sequence the entry's position; every writer writes it, and an
+    /// entry without it is read as having none (`format.md` A.6).
+    pub stamp: Option<crate::mark::ResetStamp>,
     /// 42: boot id; zero where the platform has none.
     pub boot_id: [u8; 16],
     /// 43: the tail's length in bytes.
@@ -463,6 +467,9 @@ fn encode_entry(e: &Entry) -> (u8, Vec<u8>) {
         }
         Entry::Recovery(r) => {
             f.u64(40, r.after);
+            if let Some(st) = r.stamp {
+                f.raw(41, &st.encode());
+            }
             f.raw(42, &r.boot_id);
             f.u64(43, r.tail_bytes);
             f.u32(44, r.readable_commits);
@@ -798,6 +805,13 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
                 2 => MarkState::Unreadable,
                 _ => MarkState::Stale,
             };
+            let stamp = match p.get(41) {
+                None => None,
+                Some(v) => match ResetStamp::decode(v) {
+                    Some(st) if st.nonce != 0 => Some(st),
+                    _ => return Err(p.bad(41)),
+                },
+            };
             let consumers = p
                 .all(47)
                 .map(|v| match std::str::from_utf8(v) {
@@ -807,6 +821,7 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
                 .collect::<Result<_, _>>()?;
             Entry::Recovery(Recovery {
                 after: p.u64(40)?,
+                stamp,
                 boot_id,
                 tail_bytes: p.u64(43)?,
                 readable_commits: p.u32(44)?,

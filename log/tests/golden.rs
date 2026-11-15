@@ -195,6 +195,7 @@ fn generate() -> Vec<(&'static str, Vec<u8>)> {
         offset,
         last_sequence,
         max_series_id: 1,
+        stamp: kvik_log::mark::ResetStamp::default(),
     };
     let mut mark = encode_mark_file([Some(slot(7, e[1], 3)), Some(slot(8, e[2], 5))]);
     mark[4_096 + 64] ^= 0x01;

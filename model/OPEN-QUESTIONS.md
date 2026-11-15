@@ -11,7 +11,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-33 | §2.1, §3 Recovery, invariants 5 and 8 | The Derived check: derived files after a lost range |
 | Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
 | Q-44 (b) and (c) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series |
-| Q-46 | §7 Readers, §4 Resync (`start: position`), §8 Restore, row 7b | Checking a kept position against a later truncation or restore |
 | Q-52 (b) | §7 Manifest, §3 Recovery rule 3, Order of a start steps 3 and 4 | Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it |
 | Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
 | Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
@@ -149,40 +148,6 @@ during §8 Restore step 2 `duplicates_unchecked`, and keeps the latest-`t` stati
 observed series: since Q-74 the lateness reference leaves out a `future` fact, but the latest recorded `t` still
 includes it, so a device glitch to 2099 disables the fast path for good and makes Restore step 2 count every fact of
 the series `duplicates_unchecked`.
-
-## Q-46 — Checking a kept position against a later truncation or restore
-**Scenario.** Recovery entries, reset points and `forget_above` are settled for consumers (§3 Recovery rule 3, §4
-Resync; see Q-47 and Q-48 under Settled), and a reader that reads a recovery entry voids what it took above its
-`after` (§7 Readers). A reader process that keeps a position for later use (an export continued by position, row
-7b), and a consumer registering with `start: position`, need a check against truncations and restores that happened
-after the position was read. A proposed check kept with each position the mark's reset stamp (`reset_sequence`,
-`reset_nonce`) and judged it against the recovery entries of its generation in four branches: (a) above a restored
-end, void above it; (b) the stamp's entry found, void above the `after` of the first entry above it, else kept; (c)
-the stamp in a lost range, void above the position before it; (d) otherwise unknown. Review found it unsound:
-1. A restore of a store with recovery entries: point (g, 140, stamp zero), an entry at 101 (`after` 100) and
-   restored end 110. Branch (a) gives void above 110, though 101–110 now name different facts from those read; (a)
-   and (b) must combine to the lower bound, void above 100. A consumer registering with `start: position` 140 would
-   start after 110 with stale de-duplication memory for 101–110.
-2. "Same stamp: kept" is tested before (a), and a restore resets the stamp to zero, so a point (g, 140, zero) from a
-   store that never lost power, restored with end 95, is kept although 96–140 are set aside. The stamp carries no
-   generation (the interface's point did).
-3. An entry later swallowed by a corrupt range [95, 105]: a point (130, zero) finds no entry above its stamp and is
-   kept, while §4 treats that range as a reset point; a mark whose reset sequence is above the stamp with no entry
-   found should give void or unknown.
-**Model.** Not modelled; the mark is always exact and there are no recovery entries.
-**Needed.** A check that combines the restored ends, the recovery entries and the lost ranges of a generation into
-one lower bound; that is not defeated by a stamp reset at restore; and that answers void or unknown when an entry
-named by the mark has been lost. Then the reader call, `start: position` (with what it forgets) and row 7b's rule,
-and whether the mark and the recovery entry carry a reset stamp and nonce. Only `format.md` A.6 field 41 is reserved
-for the entry; the mark (A.10, version 3) has 40 reserved bytes, so a stamp fits there without a new version.
-**Roadmap 4.6 so far.** The log's reader process (`kvik-log` `reader`) voids only what one handle took itself: above a
-recovery entry's `after`, and above the last returned batch that still reads the same after a start truncated others
-(Q-118 (e)). No position outlives the handle, so none of the branches above is needed there. The check of a kept
-position, `start: position` and row 7b's rule are not built; they need the stamp fields and a rule from the owner.
-**Decided by the owner (after roadmap 4.6).** A reset stamp, a reset sequence and a random nonce, is added to the
-mark's reserved bytes, to recovery entries and to restore records; a saved point becomes (position, stamp), judged by
-a conservative void rule. The wording and the format change come in their own pull request; until then this stays
-open.
 
 ## Q-52 (b) — Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it
 **Scenario.** Parts (a) and (c) are settled at gate 3.3 (see Settled). §7 Manifest writes the last valid record's
@@ -577,11 +542,17 @@ deletes only segments that hold no batch. (l) The mark is read again after the s
 generation, a lower last position or an earlier place) the pass is discarded and returns nothing, and the next
 refresh checks what the reader holds. Left: a start that truncates and then writes enough that the mark is past its
 old place before the second read; the next refresh's check of the last batch still finds the rewrite, but corruption
-events from that pass may be wrong. The reset stamp closes it: a changed stamp discards the pass.
-**Decided by the owner (after roadmap 4.6), for (e).** Rule 1 changes the reset stamp (Q-46) whenever it truncates a
-complete batch, so the accepted limit becomes a loss reported as a reset point; the reader then voids by the stamp
-rather than by its own checksums. Recorded here until the format pull request.
-**Needed.** A rule for each part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
+events from that pass may be wrong.
+**Settled by the owner's ruling, for (e) and (l).** (e) Rule 1 writes a recovery entry with a new reset stamp whenever
+it truncates a complete batch (`spec.md` §3 Recovery rule 1): the accepted limit becomes a loss reported as
+`possible_loss` and delivered as a reset point. A recovery entry was chosen over a stamp change in the mark alone
+because it is already the reset point consumers and readers act on (§4 Resync, §7 Readers) and the place a saved
+point's check finds a reset; nothing new is delivered. The reader keeps its whole-batch checksums as a second check
+(`log/tests/recovery.rs`, `a_kill_on_the_same_boot_truncates_the_batch_beyond_the_mark`). (l) Every start that
+removes a complete batch now writes a new stamp, so the reader compares the stamps of its two reads of the mark and
+discards the pass when they differ (`log/tests/reader.rs`,
+`a_mark_with_a_new_reset_stamp_during_a_refresh_discards_the_pass`).
+**Needed.** A rule for each other part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
 
 ## Open at v0.2
 
@@ -591,7 +562,8 @@ one named in the question. Settling Q-33, Q-46 or Q-88 may add fields to `docs/f
 after gate 3.3; such a change is made by the item that settles the question, in its own pull request, and noted in
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
-Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119 was settled after it by the owner's ruling.
+Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119, Q-46 and parts (e) and (l) of Q-118 were settled after it by
+the owner's rulings.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -599,7 +571,6 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 | Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-46 | 4.6 | Second-process reader (moved from 4.5): the check of a kept position, `start: position` and row 7b |
 | Q-52 (b) | 4.8 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
@@ -822,6 +793,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
 | Q-117 | A recovery entry adopted after its own sync failed | §3 Recovery rule 3, Last batch written again, and Order of a start step 3 (an adopted entry is written again in place before the sync of step 3, whatever the mark; extends the Q-87 ruling). Scenario: a readable mark of the old boot; the start's sync of its recovery entry fails, so the entry is in the page cache only; the next start on the same boot adopts it, and its sync writes nothing; the mark then names F, a batch is acknowledged at F + 1, and a power loss removes the entry, which the following start reports as `data_lost` with nothing damaged (`log/tests/recovery.rs`, `an_adopted_entry_whose_own_sync_failed_is_written_again`) |
 | Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
+| Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

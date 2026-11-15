@@ -14,8 +14,8 @@ use kvik::{
     DeliveryKind, EmitError, ExcessPrecision, Fact, Funnel, Health, Intent, IntervalLength, Kind,
     Live, LocalDate, LocalTime, OpenError, Operator, Outcome, ParameterChange, Position, Quality,
     QueryError, Reader, ReaderConfig, Reading, Reason, Refusal, Resolution, ResyncCause,
-    ResyncPart, RetentionClass, Select, SeriesId, SeriesSpec, Span, Start, StateValues, Store,
-    TimeRange, Timing, TriggerCause, Value, ValueType, View, Wait, Window, ZoneName,
+    ResyncPart, RetentionClass, SavedPoint, Select, SeriesId, SeriesSpec, Span, Start, StateValues,
+    Store, TimeRange, Timing, TriggerCause, Value, ValueType, View, Wait, Window, ZoneName,
 };
 
 fn gauge(name: &str, expected: u64) -> SeriesSpec {
@@ -895,7 +895,7 @@ fn unsupported_items_say_so() {
     });
     block_on(s.set_parameters(g, at(0), retention)).unwrap();
     assert!(matches!(
-        block_on(s.consumer("late", Start::Position(Position::ORIGIN), Select::None)),
+        block_on(s.consumer("late", Start::Position(SavedPoint::default()), Select::None)),
         Err(ConsumerError::NotSupportedYet { .. })
     ));
     let c = block_on(s.consumer("ops", Start::Now, Select::None)).unwrap();

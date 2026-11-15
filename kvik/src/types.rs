@@ -46,6 +46,27 @@ impl Position {
     }
 }
 
+/// A reset stamp (spec §3 Recovery, §7 Readers): the sequence of the store's last reset point written by a start
+/// or a restore, and a random nonce that tells two resets at one sequence apart. Zero means no reset since the store
+/// was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ResetStamp {
+    /// The reset's sequence.
+    pub sequence: u64,
+    /// Random, never zero once a reset has happened.
+    pub nonce: u64,
+}
+
+/// A position kept for later use, with the reset stamp it was read under (spec §7 Readers): what a reader's state
+/// gives and what [`Start::Position`](crate::Start::Position) takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SavedPoint {
+    /// The position.
+    pub position: Position,
+    /// The stamp of the mark it was read under.
+    pub stamp: ResetStamp,
+}
+
 impl fmt::Display for Position {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.generation, self.sequence)

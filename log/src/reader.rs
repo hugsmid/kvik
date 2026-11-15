@@ -13,16 +13,16 @@
 //! - **The last batch it returned, checked again before every refresh.** A writer's restart never changes a
 //!   complete batch below the mark it acts on, but that mark can be older than the one the reader read: a start
 //!   after a page-cache loss on the same boot truncates the batch beyond the mark on disk (`spec.md` §3 Recovery
-//!   rule 1, accepted limit), and a damaged tail is truncated under rule 3. The reader keeps a checksum over all
-//!   the bytes of each of its recent batches (the commit block's `batch_crc32c` reaches the bodies since Q-119;
-//!   the whole-batch sum stays until the reset stamp decides, Q-118 (e)); when
-//!   the last one no longer reads the same, it voids what it took above the last that does
-//!   ([`VoidCause::Rewritten`], Q-118 (e)).
-//! - **The mark again after the scan.** If it moved backwards meanwhile, a start may have rewritten what was just
-//!   read: the pass is discarded and returns nothing (Q-118 (l)).
+//!   rule 1, then a reset point), and a damaged tail is truncated under rule 3. Both write a recovery entry, which
+//!   may lie below where the reader had reached; so the reader keeps a checksum over all the bytes of each of its
+//!   recent batches, and when the last one no longer reads the same, it voids what it took above the last that
+//!   does ([`VoidCause::Rewritten`]) and reads on from there, where the entry is.
+//! - **The mark again after the scan.** If its reset stamp changed meanwhile, or it moved backwards, a start may have
+//!   rewritten what was just read: the pass is discarded and returns nothing. Every start that removes a complete
+//!   batch writes a recovery entry with a new stamp (`spec.md` §3 Recovery), so a changed stamp is the sign.
 //! - **Recovery entries.** A reader that reads a recovery entry voids what it took above the entry's `after`
-//!   (`spec.md` §7 Readers). How a position kept beyond the life of a reader is checked against a later truncation
-//!   or restore is open (Q-46): this reader voids only what it took itself.
+//!   (`spec.md` §7 Readers). [`ReaderState::stamp`] with `durable` is the saved point a later holder keeps; its
+//!   check against the resets since is built with roadmap 5.3.
 //!
 //! The reader names in its lease (`format.md` A.15) the manifest epoch it took: it writes the lease at open,
 //! renews it at every [`LogReader::refresh`], which takes the manifest's current epoch, and through
@@ -79,7 +79,7 @@ use crate::fs::{Fs, FsFile, OpenMode};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::lease::{LEASE_EXPIRY, LEASE_REFRESH, LeaseSlot, SLOT_OFFSET, lease_name};
 use crate::manifest::{LostRange, ManifestError, read_manifest};
-use crate::mark::{MARK_LEN, MarkSlot, read_mark};
+use crate::mark::{MARK_LEN, MarkSlot, ResetStamp, read_mark};
 use crate::name::SegmentName;
 use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner};
 use crate::store::{LEASES_DIR, LOG_DIR, MANIFEST, MARK, StoreError, read_all, read_descriptor};
@@ -202,6 +202,8 @@ pub struct ReaderState {
     pub epoch: u64,
     /// The mark's generation.
     pub generation: u32,
+    /// The mark's reset stamp: with `durable`, the saved point a later handle can check (`spec.md` §7 Readers).
+    pub stamp: ResetStamp,
     /// When the lease was last written, wall clock.
     pub lease_renewed_at: i64,
 }
@@ -241,7 +243,7 @@ pub enum VoidCause {
         /// The entry's position.
         entry: Position,
     },
-    /// A batch the reader returned no longer reads the same: a start truncated it (Q-118 (e)).
+    /// A batch the reader returned no longer reads the same: a start truncated it (`spec.md` §3 Recovery).
     Rewritten,
     /// The mark's generation changed (Q-118 (c)).
     Generation {
@@ -352,6 +354,7 @@ impl LogReader {
                 durable: Position::default(),
                 epoch: 0,
                 generation: 0,
+                stamp: ResetStamp::default(),
                 lease_renewed_at: wall,
             },
             view: View::default(),
@@ -368,6 +371,7 @@ impl LogReader {
             sequence: mark.last_sequence,
         };
         r.state.generation = mark.generation;
+        r.state.stamp = mark.stamp;
         Ok(r)
     }
 
@@ -401,8 +405,9 @@ impl LogReader {
         // The lease was written whatever the log held: keep its state.
         self.commit_lease(renewed);
         read?;
-        // A mark that moved backwards while the files were read: a start may have rewritten what was read under the
-        // first one. Discard the pass; the next refresh checks what it holds and reads again (Q-118 (l)).
+        // A mark with another reset stamp, or one that moved backwards, while the files were read: a start may have
+        // rewritten what was read under the first one. Discard the pass; the next refresh checks what it holds and
+        // reads again.
         if let Ok(again) = self.read_mark()
             && behind(&again, &mark)
         {
@@ -418,6 +423,7 @@ impl LogReader {
             sequence: mark.last_sequence,
         };
         self.state.generation = mark.generation;
+        self.state.stamp = mark.stamp;
         Ok(Update {
             state: self.state,
             events,
@@ -743,7 +749,7 @@ impl LogReader {
     /// remembered batch that does, and reads again from there; with none left, from the start of the oldest
     /// remembered batch's segment, where every recovery entry is applied again: the one the truncating start wrote
     /// voids the rest, and an earlier one may void batches that are intact, which are then returned again
-    /// (Q-118 (e)).
+    /// (`spec.md` §3 Recovery).
     fn check_recent(
         &self,
         view: &mut View,
@@ -803,9 +809,11 @@ impl Drop for LogReader {
     }
 }
 
-/// Whether mark `b` is behind mark `a`: another generation, a lower last position, or an earlier place.
+/// Whether mark `b` is not a later state of mark `a`: another generation or reset stamp, a lower last position, or
+/// an earlier place.
 fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
     b.generation != a.generation
+        || b.stamp != a.stamp
         || b.last_sequence < a.last_sequence
         || (b.file_id, b.offset) < (a.file_id, a.offset)
 }

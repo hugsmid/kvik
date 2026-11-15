@@ -261,7 +261,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
 | 6 site zone | 30 zone name (UTF-8 IANA name, at most 63 bytes); 20 effective time |
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
-| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reserved; 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32`; 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
+| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32`; 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
 | 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
 
 Series definition fields, all critical:
@@ -300,7 +300,7 @@ field 8, field 20 in a parameter change, the recovery entry's fields), or presen
 named-state series with no state name; a recovery entry that is not the only entry of its batch. Kind and value type
 are not compared beyond the tables. Fields without a stated range take any value, and a parameter change carrying
 only field 1 is valid. Entry type 5 is refused as an unknown critical type until roadmap 5.2 lays it out; field 41
-of a recovery entry is reserved, never written and skipped by a reader. **Splitting:** consecutive entries share one
+of a recovery entry is 16 bytes with a non-zero nonce. **Splitting:** consecutive entries share one
 entries block until the next would take its body past 16 MiB.
 
 ### A.7 Commit block body (48 bytes)
@@ -380,12 +380,17 @@ exists; a new file is created only when none exists.
 | 64 | 8 | `offset` | just past the last durable commit block, including padding |
 | 72 | 8 | `last_sequence` | |
 | 80 | 4 | `max_series_id` | the highest series id assigned |
-| 84 | 40 | reserved | |
+| 84 | 8 | `reset_sequence` | the current reset stamp (`spec.md` §7 Readers): the position of the last recovery entry a start wrote, or the first position of a restored generation; 0 before any reset |
+| 92 | 8 | `reset_nonce` | its random nonce, never zero once a reset has happened; 0 before any reset |
+| 100 | 24 | reserved | |
 | 124 | 4 | `crc32c` | over bytes 0..124 of the slot |
 
 - **Update.** After the batch's sync has returned, the writer writes the whole slot, with one positional write, to
   the slot that does not hold the highest valid `counter`. The writer writes the next batch only after that update
   (`spec.md` §3 Recovery rule 1).
+- **Reset stamp.** Bytes 84..100 were reserved in version 3 and are read as zero in a slot that predates them, so
+  the version is unchanged. A start that writes a recovery entry writes the entry's stamp into the mark; a restore
+  writes its restore record's; every other update carries the stamp unchanged.
 - **Read.** Read both slots; the mark is the valid slot (magic, known version, checksum, store id) with the higher
   `counter`; a checksum-valid slot of unknown version is refused as above, never treated as invalid. One slot is always stable, so a torn or concurrent write costs at most one update of staleness. If
   neither slot is valid, a reader retries (8 times, then `MarkUnreadable`); for recovery the mark is unreadable. After
@@ -504,7 +509,7 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
   record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
-  `0x25` restore (8.3), `0x26` quarantine and `0x27` tier move (8.1). A rebuild never reconstructs these two: a
+  `0x25` restore (8.3; it carries the restore's reset stamp, `spec.md` §8 Generations), `0x26` quarantine and `0x27` tier move (8.1). A rebuild never reconstructs these two: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
   another tier" is verified again, so their layouts may hold no fact that only they hold.
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset

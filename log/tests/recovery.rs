@@ -322,15 +322,33 @@ fn a_kill_on_the_same_boot_truncates_the_batch_beyond_the_mark() {
     let rep = r.open().unwrap();
     assert_eq!(rep.rule, StartRule::SameBoot);
     assert!(rep.truncated_bytes > 0);
-    assert!(rep.entry.is_none());
-    assert_eq!(r.w().stats().durable.sequence, mark.last_sequence);
-    assert_eq!(r.positions().len(), 1);
+    // The truncated batch was complete, so it may have been acknowledged on a mark lost with the page cache: the
+    // truncation is a reset point, a recovery entry after the mark's position with a new stamp (Q-118 (e)).
+    let e = rep.entry.as_ref().expect("a recovery entry");
+    assert!(!e.adopted);
+    assert_eq!(e.entry.after, mark.last_sequence);
+    assert_eq!(e.sequence, mark.last_sequence + 1);
+    assert_eq!(e.entry.readable_commits, 1);
+    assert_eq!(e.entry.mark_state, MarkState::Readable);
+    let stamp = e.entry.stamp.expect("a stamp");
+    assert_eq!(stamp.sequence, e.sequence);
+    assert_ne!(stamp.nonce, 0);
+    assert_eq!(r.mark().unwrap().stamp, stamp);
+    assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+    assert_eq!(r.w().stats().durable.sequence, mark.last_sequence + 1);
+    assert_eq!(r.positions().len(), 2);
     r.check_started();
     // The writer resumes at the next position.
     r.submit(vec![fact(2, 0)]);
     r.drain();
     r.check_acked();
-    assert_eq!(r.positions().len(), 2);
+    assert_eq!(r.positions().len(), 3);
+    // A kill with nothing complete beyond the mark: no entry, and the stamp stays.
+    r.kill();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    assert!(rep.entry.is_none());
+    assert_eq!(r.mark().unwrap().stamp, stamp);
 }
 
 #[test]
@@ -404,9 +422,13 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
         if every {
             r.check_started();
         } else {
-            // Accepted limit (spec §3 Recovery rule 1): the one batch since the mark's last sync is truncated.
+            // Rule 1 truncates the one batch since the mark's last sync; it may have been acknowledged, so the
+            // truncation is reported and is a reset point: a recovery entry after the mark's position (Q-118 (e)).
             assert_eq!(rep.rule, StartRule::SameBoot);
-            assert!(r.positions().is_empty());
+            let e = rep.entry.as_ref().expect("a recovery entry");
+            assert_eq!(e.entry.after, 0);
+            assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+            assert_eq!(r.positions().len(), 1);
         }
     }
 }
@@ -1024,7 +1046,14 @@ fn kill_loop(cycles: &[Cycle], every: bool) {
                     .iter()
                     .filter(|b| b.last_sequence() <= m.last_sequence)
                     .collect();
-                assert_eq!(after.iter().collect::<Vec<_>>(), expect);
+                // A complete batch truncated beyond the mark is followed by a recovery entry (Q-118 (e)).
+                let extra = usize::from(rep.entry.is_some());
+                assert_eq!(after.len(), expect.len() + extra);
+                assert_eq!(after[..expect.len()].iter().collect::<Vec<_>>(), expect);
+                if let Some(e) = &rep.entry {
+                    assert_eq!(e.entry.after, m.last_sequence);
+                    assert_eq!(r.mark().unwrap().stamp, e.entry.stamp.unwrap());
+                }
             }
             StartRule::Reboot(_) => {
                 let extra = usize::from(rep.entry.as_ref().is_some_and(|e| !e.adopted));

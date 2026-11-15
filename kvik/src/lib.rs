@@ -131,6 +131,6 @@ pub use series::{
 pub use store::{Consumer, Reader, Store};
 pub use time::{LocalDate, LocalTime, ParseError, Span, TimeRange, Timestamp, ZoneName};
 pub use types::{
-    Ack, Fact, FactFlags, FactRow, Intent, Outcome, Pending, Position, Quality, Reading, SeriesId,
-    TimeSource, Value,
+    Ack, Fact, FactFlags, FactRow, Intent, Outcome, Pending, Position, Quality, Reading,
+    ResetStamp, SavedPoint, SeriesId, TimeSource, Value,
 };

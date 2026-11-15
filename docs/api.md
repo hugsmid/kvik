@@ -254,8 +254,10 @@ enum Live { Value(Fact), None, Unknown }
 - A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
   or on the timer, valid until the next resync), `flags` (`replayed`,
   `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
-- `Start::Position(p)` begins with a resync whose `forget_above` is `p`; how `p` is checked against a truncation or
-  restore after it was read is open (Q-46 in `model/OPEN-QUESTIONS.md`).
+- `Start::Position(point)` takes a `SavedPoint { position, stamp }` (spec §7 Readers, Reset stamp and saved points)
+  and begins with a resync whose `forget_above` is the position, or the lower position it is void above; an unknown
+  point refuses the registration with an error that says so (consumer errors are settled with roadmap 5.2). The
+  check is built with roadmap 5.3.
 - `confirm` is cheap and batched; the cursor is written at most once a second, on shutdown and when a resync
   carrying `forget_above` is confirmed.
 - A resync may carry `forget_above` = X: the consumer must drop every position above X from its de-duplication
@@ -276,7 +278,11 @@ enum Live { Value(Fact), None, Unknown }
 ```rust
 pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min }; blocking
 pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease
-pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub lease_renewed_at: Timestamp }
+pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
+pub struct ResetStamp { pub sequence: u64, pub nonce: u64 }      // zero before any reset (spec §7 Readers)
+pub struct SavedPoint { pub position: Position, pub stamp: ResetStamp }
+pub fn check(&self, point: SavedPoint) -> Result<PointCheck, QueryError>;   // roadmap 5.3
+pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 ```
 - Every read call first reads the mark and the entries appended since the reader's last call, so it sees data up to
   the mark at call time. The lease is written at open and renewed by any call once half of `lease_refresh` has
@@ -328,8 +334,9 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
   Whether `facts` fetches detail that is not local itself is decided with roadmap 8.2; in section 4 all detail is
   local.
 - All reads see only durable data. A reader in another process sees data up to the durable mark.
-- A reader that reads a recovery entry drops what it took above the entry's `after` (spec §7 Readers). A call that
-  checks a position kept for later use against a later truncation or restore is open (Q-46 in `model/OPEN-QUESTIONS.md`).
+- A reader that reads a recovery entry drops what it took above the entry's `after` (spec §7 Readers). A position
+  kept for later use is kept with `ReaderState.stamp` as a `SavedPoint`; `reader.check(point)` judges it against the
+  resets since (spec §7 Readers): kept, void above a position, or unknown (start again). Built with roadmap 5.3.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 
 ## Health and statistics (types accepted at gate 3.3)

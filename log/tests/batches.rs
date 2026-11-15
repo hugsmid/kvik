@@ -257,22 +257,29 @@ fn recovery() -> impl Strategy<Value = Recovery> {
         any::<u32>(),
         0u8..=3,
         any::<u32>(),
-        prop::collection::vec("[a-z0-9][a-z0-9._-]{0,63}", 0..4),
+        (
+            prop::collection::vec("[a-z0-9][a-z0-9._-]{0,63}", 0..4),
+            prop::option::of((any::<u64>(), 1..=u64::MAX)),
+        ),
     )
         .prop_map(
-            |(after, boot_id, tail_bytes, readable_commits, m, id_floor, consumers)| Recovery {
-                after,
-                boot_id,
-                tail_bytes,
-                readable_commits,
-                mark_state: [
-                    MarkState::Readable,
-                    MarkState::Missing,
-                    MarkState::Unreadable,
-                    MarkState::Stale,
-                ][usize::from(m)],
-                id_floor,
-                consumers,
+            |(after, boot_id, tail_bytes, readable_commits, m, id_floor, (consumers, stamp))| {
+                Recovery {
+                    after,
+                    stamp: stamp
+                        .map(|(sequence, nonce)| kvik_log::mark::ResetStamp { sequence, nonce }),
+                    boot_id,
+                    tail_bytes,
+                    readable_commits,
+                    mark_state: [
+                        MarkState::Readable,
+                        MarkState::Missing,
+                        MarkState::Unreadable,
+                        MarkState::Stale,
+                    ][usize::from(m)],
+                    id_floor,
+                    consumers,
+                }
             },
         )
 }
@@ -1259,7 +1266,22 @@ fn other_entry_types() {
     assert!(
         matches!(&b.entries[0], Entry::Recovery(r) if r.mark_state == MarkState::Stale && r.consumers.len() == 2)
     );
-    assert!(decode_one(8, replace(rec.clone(), 41, vec![1, 2])).is_ok());
+    // Field 41, the reset stamp: 16 bytes with a non-zero nonce, or absent.
+    assert!(matches!(&b.entries[0], Entry::Recovery(r) if r.stamp.is_none()));
+    assert_eq!(
+        decode_one(8, replace(rec.clone(), 41, vec![1, 2])),
+        field_err(41)
+    );
+    let mut st = 7u64.to_le_bytes().to_vec();
+    st.extend_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        decode_one(8, replace(rec.clone(), 41, st.clone())),
+        field_err(41)
+    );
+    st[8] = 5;
+    let b = decode_one(8, replace(rec.clone(), 41, st)).unwrap();
+    assert!(matches!(&b.entries[0], Entry::Recovery(r)
+        if r.stamp == Some(kvik_log::mark::ResetStamp { sequence: 7, nonce: 5 })));
     assert_eq!(
         decode_one(8, replace(rec.clone(), 45, vec![4])),
         field_err(45)
@@ -1314,6 +1336,7 @@ fn entries_encode_refuses_what_it_cannot_write() {
     // An entry above 8 MiB.
     let big = Recovery {
         after: 0,
+        stamp: None,
         boot_id: [0; 16],
         tail_bytes: 0,
         readable_commits: 0,
@@ -1388,6 +1411,10 @@ fn blocks_split_canonically() {
 fn rec() -> Entry {
     Entry::Recovery(Recovery {
         after: 3,
+        stamp: Some(kvik_log::mark::ResetStamp {
+            sequence: 4,
+            nonce: 9,
+        }),
         boot_id: [1; 16],
         tail_bytes: 40,
         readable_commits: 0,

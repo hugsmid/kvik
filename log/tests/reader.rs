@@ -505,6 +505,12 @@ fn a_returned_batch_truncated_after_a_page_cache_loss_on_the_same_boot_is_voided
             cause: VoidCause::Rewritten
         } if above.sequence == 1
     ));
+    // The truncation was a reset point: a recovery entry at position 2 and the stamp the reader now holds.
+    let stamp = r.mark().unwrap().stamp;
+    assert_eq!(stamp.sequence, 2);
+    assert_ne!(stamp.nonce, 0);
+    assert_eq!(u.state.stamp, stamp);
+    assert!(matches!(r.held.items[&2], Item::Entry(Entry::Recovery(_))));
     r.check_held();
     r.check_caught_up();
 }
@@ -1278,6 +1284,43 @@ fn a_mark_that_moves_backwards_during_a_refresh_discards_the_pass() {
     r.fs.poke(&log_path("MARK"), 0, &encode_mark_file([Some(ahead), None]));
     r.refresh().unwrap();
     assert_eq!(r.held.items.len(), 5);
+}
+
+/// The race a backward check alone leaves: a start truncates and writes on, so the mark is past its old place before
+/// the second read; its new reset stamp still discards the pass.
+#[test]
+fn a_mark_with_a_new_reset_stamp_during_a_refresh_discards_the_pass() {
+    let (mut r, fs) = hooked_rig();
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    r.submit(items(3, 100));
+    r.drain();
+    let newer = r.mark().unwrap();
+    let before = r.reader.as_ref().unwrap().state();
+    let mut opens = 0;
+    *fs.hook.lock().unwrap() = Some(Box::new(move |m: &MemFs, p: &Path| {
+        if !p.ends_with("MARK") {
+            return true;
+        }
+        opens += 1;
+        if opens == 2 {
+            let reset = MarkSlot {
+                counter: newer.counter + 1,
+                offset: newer.offset + 64,
+                last_sequence: newer.last_sequence + 1,
+                stamp: kvik_log::mark::ResetStamp::new_at(newer.last_sequence + 1),
+                ..newer
+            };
+            m.poke(&log_path("MARK"), 0, &encode_mark_file([Some(reset), None]));
+        }
+        true
+    }));
+    let u = r.refresh().unwrap();
+    assert!(u.events.is_empty());
+    assert_eq!(u.state.durable, before.durable);
+    assert_eq!(u.state.stamp, before.stamp);
+    assert_eq!(r.held.items.len(), 2);
 }
 
 #[test]
