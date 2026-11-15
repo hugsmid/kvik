@@ -15,6 +15,13 @@ use crate::DriverFuture;
 use crate::envelope::EnvelopeError;
 use crate::plan::{PlanError, PlanMode};
 
+mod codec;
+mod driver;
+mod judge;
+mod local;
+
+pub use driver::Restorer;
+
 /// Drives a restore one file at a time.
 pub trait RestoreDriver: Send {
     /// Finds the store id, checks the key (`WrongKey` before any file is judged), fetches `STORE`, reads the claims

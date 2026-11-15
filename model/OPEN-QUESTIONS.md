@@ -9,10 +9,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 |---|---|---|
 | Q-16 | §5.4, §2.3, §4 | Which commits refresh live staleness, when a fact falls due, and across a restart |
 | Q-33 | §2.1, §3 Recovery, invariants 5 and 8 | The Derived check: derived files after a lost range |
-| Q-39 (f) | §8 Restore (Failures and end, the paragraph after step 4) | A crash while the restore record is written |
 | Q-44 (b) and (c) | §2.1 timing, §2.2, §2.3 Views, §2.4, §8 Restore step 2, §11 | Withdrawn values on scheduled and forecast series, far-future values on any series |
 | Q-52 (b) | §7 Manifest, §3 Recovery rule 3, Order of a start steps 3 and 4 | Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it |
-| Q-82 | §8 Restore (Failures and end), §8 Hashes | How a restore tells that the bucket has lost or corrupted a listed file |
 | Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
 | Q-85 | §8 Corrupt block, No deletion, Fill pressure, §7 | A loss in the bucket found outside a restore |
@@ -63,6 +61,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-291 | §8 Acknowledging a loss, Generations, Restore step 1 | Recovery-entry loss reports of the generation a restore reads |
 | Q-292 | §8 Generations; `format.md` A.2 sizes, A.14 `0x25` | A restore record larger than one block |
 | Q-294 | §8 Restore step 1, Generations; model `Model::restore_from` | Where the model's restore differs from the plan |
+| Q-300 | §8 Generations, Restore; `format.md` A.14 | The restore record's bytes ahead of its layout |
+| Q-301 | §8 Restore (the paragraph after step 4) | The files a resumed restore fetches |
+| Q-302 | §8 Restore (Failures and end), §8 Corrupt block | The lost range of a listed file the bucket has lost, and files other than log segments |
+| Q-303 | §8 Generations, §7 Readers; `format.md` A.1 kind 12 | The local restore record file |
+| Q-304 | §8 Generations, Restore step 1 | A manifest record object the bucket has lost |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 
 ## Q-16 — Which commits refresh live staleness
@@ -169,16 +172,6 @@ is checked, never trusted over the log. The rest of this question (requirements 
 invariants 5 and 8 across a lost range) moved to 6.2 at the 5.1 review (no derived file other than the registry
 exists before 6.2). Recovery entries, reset points, rows 7b and 7c and invariants 25–27 are modelled since roadmap 5.1a.
 
-## Q-39 (f) — A crash while the restore record is written
-**Scenario.** A restore claims generation g and crashes while writing its restore record locally, leaving a torn
-record file. §8 Restore (Failures and end) says `restore` refuses a directory that holds files and no restore record,
-and the paragraph after step 4 says a crash before the record starts the restore again with the next generation. It
-is not said whether a torn record counts as no record (the directory then holds a file, so `restore` refuses it, and
-a restart has no record to resume from) or as a record (which cannot be read).
-**Model.** Not modelled; writing the record is atomic.
-**Needed.** How a torn local restore record is recognised, and whether the restore then starts again with the next
-generation or the directory is refused.
-
 ## Q-44 (b) and (c) — Withdrawn and far-future values
 **Scenario.** (b) A newer issue that no longer covers a valid time cannot withdraw the older issue's value there, so
 the current view can mix issues. (c) A wrong value far in the future on a scheduled or forecast series is never
@@ -238,19 +231,6 @@ and the manifest record again, the device then held each, and every acknowledged
 range) read back after a remount. The rewrite rules stand as written; the fallbacks are not needed on Linux. Still
 open: owner decision pending on the deferral wording for macOS and Windows, where no device fails writes on demand
 without kernel code.
-
-## Q-82 — How a restore tells that the bucket has lost or corrupted a listed file
-**Scenario.** Since Q-39 (e), a listed file that the bucket no longer holds, or has corrupted, is handled as §8
-Corrupt block with deep as the failed tier, and the positions no other listed file holds become a lost range, while a
-file that cannot be fetched, or whose plaintext hash fails, is retried. A download whose plaintext hash fails can
-come from an object corrupted in the bucket, a download damaged in transit, or a wrong encryption key (which fails
-every file); a bucket can also report an object missing for a while. Treating the first failure as a loss records a
-permanent lost range, and with a wrong key would record every position lost; retrying for ever leaves the restore
-with no exit, which Q-39 (e) settled against.
-**Model.** Not modelled; downloads do not fail.
-**Needed.** What shows that the bucket has lost or corrupted a file (for example the bucket's reported ciphertext
-hash against the manifest's, §8 Hashes, or a number of failed downloads), and how a wrong key is told apart and
-refused rather than recorded as loss.
 
 ## Q-83 — Node contents after a past-effective change of the staleness limit
 **Scenario.** A gauge with an expected interval of 30 s (S = 90 s) stores the 15-minute level and calendar nodes; it
@@ -1161,6 +1141,62 @@ bucket with no manifest records, and the plan restores an empty log, restored en
 **Needed.** (a) The model's restored end to skip recorded lost ranges, as the plan does. (b) Whether a restore whose
 records list no copied file is refused (the model's rule, stated in the text) or restores an empty generation (the
 text as written). Suggested for (b): refuse, with a named error, since nothing would be restored.
+## Q-300 — The restore record's bytes ahead of its layout
+Recorded by roadmap 8.3b, which writes the restore record before roadmap 8.3a lays it out.
+**Scenario.** The restore executor syncs its `0x25` record in `MANIFEST`, uploads it, and reads it back to resume
+after a crash; `format.md` A.14 reserves `0x25` and `RestoreRecord::to_body` and `from_body` are roadmap 8.3a's.
+**Provisional.** A private codec in `backup/src/restore/codec.rs` with the same two signatures (fields 1 generation,
+2 reset stamp, 3 source generation, 4 restored end, 5 carried end, 6 loss, 7 acknowledgement, 8 entry loss, 9 file:
+tier, copy size and SHA-256, then the description, 10 drill). No real data is restored before 8.3a, so nothing
+written with it has to stay readable.
+**Needed.** 8.3a's layout in A.14; the executor then calls `RestoreRecord::to_body` and `from_body` and the
+provisional codec goes.
+
+## Q-301 — The files a resumed restore fetches
+Recorded by roadmap 8.3b.
+**Scenario.** A plan returns the restore record and the files to fetch; only the record is durable. A restore killed
+after its record resumes and must fetch "the files its restore record lists that steps 1 and 3 bring back and are not
+yet local", so that list must follow from the record alone.
+**Provisional.** The executor refuses a plan whose files to fetch are not exactly the files its record lists
+(`PlanError::Invalid`), and fetches, fresh or resumed, every listed file that is not installed and has no lost
+range recorded in the new manifest, ascending by first position. This is exact for a log-only restore (M1: every
+listed file is a sealed log segment).
+**Needed.** With tree checkpoints, chunk indexes and tiers, a rule from the record (its tiers, the checkpoint) to the
+files steps 1 and 3 bring back, used by both the plan and a resume.
+
+## Q-302 — The lost range of a listed file the bucket has lost, and files other than log segments
+Recorded by roadmap 8.3b.
+**Scenario.** §8 Restore, Failures and end: what a lost listed file held is compacted again from the other listed
+files, and the positions no other listed file holds become a lost range. A lost-range record also carries a byte
+offset and length, a boot id, an id floor and the commit times around the loss, which a restore record does not
+give.
+**Provisional.** The executor installs only log segments holding positions (a plan listing anything else is
+refused: compacted files have no local layout yet, `format.md` A.12 `data/`). A lost segment's lost range is its whole
+position range: identity and first its first position, last its last, its `file_id`, offset 0 and length 0, a zero
+boot id, id floor 0, no commit times, cause 3 lost in the bucket. It is appended to the new manifest, in a drill too.
+**Needed.** The fields for a loss found by a restore, and the split into several ranges once compacted files can hold
+part of a lost segment's positions.
+
+## Q-303 — The local restore record file
+Recorded by roadmap 8.3b.
+**Scenario.** §8 Generations syncs the restore record "in the manifest and in the local restore record file
+(`format.md` A.1 kind 12)", and §7 Readers reads restored ends from that file or from deep. Kind 12 is reserved with
+no layout, and the committed interface (`RestoreDriver::prepare`) names `MANIFEST` only.
+**Provisional.** The executor syncs the record in `MANIFEST` only; a reader process can read it there through
+`kvik-files`.
+**Needed.** A layout for kind 12 and who writes it, or the spec text without it.
+
+## Q-304 — A manifest record object the bucket has lost
+Recorded by roadmap 8.3b.
+**Scenario.** A restore lists the records of the generation it reads and fetches each. An object the bucket has lost
+is simply not listed; epochs may jump after a start (`format.md` A.14), so the gap is not visible. The plan is then
+made from fewer records: a file those records listed is missing from the restore, or the restored end is earlier,
+with nothing reported. A record that is listed but damaged fails the restore by name (`RestoreError::Envelope` or
+`Record`), as does a missing or damaged `STORE`.
+**Model.** Not modelled.
+**Needed.** A way to see a missing record: for example each uploaded record naming the previous record's epoch
+(`format.md` A.17), so that a restore checks the chain, and what a broken chain does (refuse, or restore to the record
+before the gap with a reported loss).
 
 ## Q-310 — The delivery budget's p50 at exactly 100 calls a second with the default bound
 Found by the roadmap 4.8 run on the Linux NVMe target (`docs/measurements/4.8-commit-latency.md`, Linux NVMe target).
@@ -1230,16 +1266,14 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-304 and settled Q-39 (f) and Q-82.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
 | Q-16 | 5.4 | Live state and staleness are built there; built by roadmap 5.4 as the model backend has them (see the question), not settled: needs the owner's ruling on the proposal and its objections |
 | Q-33 | 6.2 | Moved from 4.5, which has no derived file to check, to 5.1, which did the registry file's check and requirement 5, then to 6.2 at the review of 5.1 (indexes at 6.2, trees at 7.1): the rest of the Derived check (requirements 1–4) and invariants 5 and 8 across a lost range. Recovery entries, reset points, rows 7b and 7c and invariants 25–27 are modelled since roadmap 5.1a |
-| Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing; not settled by roadmap 5.1, which needs the owner's ruling on the proposal and its objections (see the question) |
 | Q-52 (b) | 4.9 | Settled on Linux (ext4 and XFS) by the rewrite job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decision on the macOS and Windows wording |
-| Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
@@ -1294,6 +1328,11 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-291 | 8.3d | Recovery-entry loss reports at a restore; recorded by roadmap 8.3a |
 | Q-292 | 8.3 | Restore record size; recorded by roadmap 8.3a |
 | Q-294 | 8.3b | Model restore against the plan; recorded by roadmap 8.3a |
+| Q-300 | 8.3 | The restore record's bytes; recorded by roadmap 8.3b; settled by 8.3a's layout |
+| Q-301 | 8.3 | The files a resumed restore fetches; recorded by roadmap 8.3b; exact for a log-only restore |
+| Q-302 | 8.3 | A restore's lost range and files other than log segments; recorded by roadmap 8.3b |
+| Q-303 | 8.3 | The local restore record file (kind 12); recorded by roadmap 8.3b |
+| Q-304 | 8.3 | A lost manifest record object; recorded by roadmap 8.3b; with `format.md` A.17 (8.1b) |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
@@ -1442,10 +1481,10 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-26 | The first sequence of a generation, and "no position yet" | §2.2, §8 Restore step 1 |
 | Q-27 | Where consumer cursors come from after a restore | §8 Continuous backup, §8 Restore step 2, §4 Resync |
 | Q-28 | Two restores from one bucket; a restore from an empty bucket | §8 Generations, §8 Restore drill, row 28b |
-| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (open part: Q-39 (f)) |
+| Q-29 | The restored end, and what a continuing cursor receives | §8 Restore steps 1–2, §8 Continuous backup, invariants 4 and 9, row 28 (Q-39 (f) settled since) |
 | Q-30 | `duplicates_unchecked` during a restore compared a time with a position | §8 Restore step 2; versioned series (§2.1–§2.4, §4, §5.6, §6 Cadence, §7, §11, invariants 4, 15 and 19, rows 1, 2c and 2d), so that a replay never reverts a correction |
 | Q-31 | Accepting ingest before the registry is back | §8 Continuous backup, §8 Restore step 1 |
-| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (open part: Q-39 (f)) |
+| Q-32 | A crash or reboot during a restore | §8 Restore, row 28a (Q-39 (f) settled since) |
 | Q-33 | Registry entries after a lost range, in part: the kept log, orphaned facts and id floors | §2.1 (only the kept log applies; a lost registry entry is issued again through the normal calls, a definition issued again being a new series; orphaned facts kept, outside views, trees, indexes, routing and delivery, counted and exported; id floors; the residual on a disk that loses synced data), §2.1 `id`, §3 Commit (a batch holding an entry that is not a fact is acknowledged only after a mark sync), §3 Durable mark (highest series id assigned), §11 Health, invariants 2 and 4, `format.md` A.6 and A.10, `api.md` `export_orphaned` and `orphaned_facts`, as the owner decided (open part: Q-33, the Derived check, with invariants 5 and 8 across a lost range) |
 | Q-34 | What `data_lost` and `possible_loss` mean beyond the report, parts (a) and (b) | §8 Corrupt block (only the damaged region is lost; the valid batches of a sealed segment are copied to a new segment by one manifest record, which ends the error), §11 Health (each report carries what is known of its range; no flag on query results), row 11 (Q-34 (c) since settled; open part: Q-52, rebuilding a corrupt manifest record never uploaded) |
 | Q-34 (c) | Whether loss reports survive a restart, and whether they are latched | §11 Health (one report per loss, read from the manifest and the recovery entries at every start, never cleared, each counted once; `data_lost` holds health degraded until acknowledged, while `possible_loss` is listed and counted and does not), §8 Acknowledging a loss (an acknowledgement record; the list of losses kept for ever; a range that grows needs a new acknowledgement; carried by a restore record), §3 Order of a start step 4 (a loss keeps one identity, the first position of its range when first reported, extended upward or downward, not repeated; recovery-entry loss reports carried by a restore record), invariant 27, `format.md` Part B, `api.md` `losses` and `acknowledge_losses`, as the owner decided (open part: Q-90, the set-aside report) |
@@ -1453,7 +1492,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-36 | Calendar nodes for a series without a stored 15-minute level | §5.1 (calendar row and density rule), §5.4, §5.7: no calendar node without a stored 15-minute level, the result being a window over facts; row 20a, §13 (the levels fixed by the definition since Q-60) |
 | Q-37 | Which manifest records a restore reads, and how generations begin | §8 Generations (generation 0 counts as claimed; each generation above 0 begins with a self-contained restore record listing the files it restores from and carrying the earlier restored ends, uploaded before any other file of its generation, after which the claims are read again; a restore reads the highest generation below its own that has records, and keeps the store id), §8 Restore step 1 (a position set aside once stays so) and the paragraph after step 4, invariant 9, row 28b |
 | Q-38 | Segments beyond the restored end | §8 Restore step 1 (positions set aside, a term distinct from Corrupt block's quarantine: excluded by position everywhere, also in reader processes, with no query error; a set-aside definition keeps its id reserved; the set-aside range reported in health from the record at every start; re-ingested only by the operator, through export and Re-ingest), §2.1 `id`, §11 Health, invariants 4 and 9, row 28, `api.md` Backup and restore (open part: Q-90, whether the report holds health degraded) |
-| Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart, and later failures are retried with degraded health, except a listed file the bucket has lost or corrupted, part (e); the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed, or since (e) replaced or recorded lost), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (open part: Q-39 (f)) |
+| Q-39 | Failures during a restore, and when it ends, parts (a)–(d) | §8 Restore, Failures and end (any failure before step 1 is complete is fatal and resumed at restart, and later failures are retried with degraded health, except a listed file the bucket has lost or corrupted, part (e); the record precedes every download; `restoring` is derived and ends when every file step 3 brings back is installed, or since (e) replaced or recorded lost), §8 Restore steps 1–4, §8 Continuous backup and Deep (each tree checkpoint carries the revised-key index), §2.4, §11 Health, §13, `api.md` (part (f) settled since) |
 | Q-39 (e) | What ends a restore when the bucket has lost or corrupted a listed object | §8 Restore, Failures and end (a listed file that the bucket no longer holds, or has corrupted, in step 1 or later, is treated as Corrupt block with deep as the failed tier: compacted again from the other listed files, the positions no other listed file holds becoming a lost range reported as `data_lost`, and the restore completes; facts of a lost log segment held by other listed files fetched in step 1; a lost tree checkpoint replaced by an earlier one or the whole sealed log; `restoring` ends when every file step 3 brings back is installed, replaced or recorded lost), §8 Corrupt block and No deletion (the exception for a restore), invariants 2, 9 and 10, §11 Health and the set-aside report (open parts: Q-85, a loss in the bucket found outside a restore; Q-33, the Derived check after a definition entry lost this way; Q-82, how a loss in the bucket is told from a transient fault, a damaged download or a wrong key; a content conflict between two listed files still waits for an operator) |
 | Q-40 | Ranking facts of versioned series during a restore | §2.4 Version index, §8 Continuous backup and Deep, §8 Restore steps 1–2 (each tree checkpoint carries the version index, and step 1's replay brings it to the restored end before ingest opens), §13 |
 | Q-41 | Forecasts: values issued now about future times | §2.1 `timing`, §2.2 flags, §2.3 Live state, §4 Future facts and Timers, §5.4, §6 Windows, Evaluation and Edge stretches (credit limit), invariants 18, 20 and 21, rows 4 and 36–39, §13 (open part: Q-44 (b) and (c)) |
@@ -1531,6 +1570,8 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, the general case of the rule). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`); a gap that holds a position of a listed segment with no copy is never bridged, since the entry is then not the next restored position. The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The loss side is guaranteed by the log's start, which goes read-only rather than seal without the record. The listing side rests on the sealed-segment record being appended after the start that recorded the gaps, which is roadmap 6.3b's and not yet built (`format.md` A.14): 6.3b must state it as an invariant with a test (no sealed-segment record has an epoch below a lost-range record of the start that preceded its seal), and roadmap 8.4a needs a kill-loop case with a truncated tail, a seal and a restore. Should it fail, the plan ends the log at the gap and sets later data aside: conservative. The hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing`, `the_restored_end_is_the_one_the_spec_walks_to` |
 | Q-293 | What a restore plan lists, places and fetches | §8 Restore steps 1 and 3, Generations; `format.md` A.14 `0x25` (decided by roadmap 8.3a). Every live file with a recorded copy in deep is listed, set-aside files included, and no other file; the copy counts whether or not a fresh check has marked it verified since a rebuild (Q-295). A listed file's tier is the one the source records give it, which is where the restore places it (step 3). The files fetched are every listed log segment (with no tree checkpoint, step 1 downloads the whole sealed log) and every other listed file placed on hot or cold, in ascending position. The restored log is scanned over log segments only: a compacted file holds only some positions of its range, and log segments are never retired by compaction (§7). When the source generation's sequence 1 is not held, the restored end is that of the restore record read, or `0:0` in generation 0. Positions of an earlier generation at or below a carried end that no copied segment or recorded loss holds fail the plan: `NotCopied` when a listed segment without a copy holds them, else `MissingBelowEnd`. Scenario: a store compacted some segments into a current file in deep and lost no segment; the plan fetches the segments, lists the compacted file and leaves it in deep. Tests: `backup/tests/restore_plan.rs` `a_listed_segment_with_no_copy_ends_the_restored_log_and_is_not_named`, `a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap`, `a_compacted_file_left_in_deep_is_listed_but_not_fetched`, `a_file_missing_at_or_below_a_carried_end_fails_the_plan`, `the_plan_names_every_copied_file_and_never_one_without_a_copy`, `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark` |
 | Q-295 | A restore from a rebuilt manifest whose files are not yet verified again | §8 Generations, §7 Manifest (the owner's ruling at the review of roadmap 8.3a): a restore plan uses a file's recorded copy in deep (`FileEntry::deep`), not the verified mark. A copy recorded but gone from the bucket since is found when it is fetched, by the hash checks and the lost-object rule (Q-82), and reported as `data_lost`: loud. Leaving it out of a claimed generation would be silent and permanent, since later restores read that generation's records only. "Verified in deep" (Q-280) keeps its meaning for the upload queue only: what roadmap 8.1c must check again or upload again after a rebuild. A carried restore record, like a carried copy-verified record, gives its files' copies and no verified mark. Scenario: segments 1 to 3 (`0:1` to `0:30`) are uploaded and verified; the manifest is rebuilt and its records upload whole; the rebuild clears every mark and the carried records set none; a disaster then strikes before the files are checked again. Read as "verified only", a full restore claims generation 1 with restored end `0:0` and lists no file, and the segments are in no record a later restore reads; with the copy, it restores to `0:30`, as from the old records a moment earlier, so the plan is monotone in the records uploaded across a rebuild. Tests: `backup/tests/restore_plan.rs` `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark`, `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `the_plan_is_monotone_in_the_records_uploaded`; `kvik/tests/restore_plan_model.rs` (rebuilt manifests); `files/src/catalogue.rs` `a_carried_restore_record_gives_copies_but_no_verified_mark` |
+| Q-39 (f) | A crash while the restore record is written | §8 Restore, Failures and end (settled by roadmap 8.3b: the restore record reaches `MANIFEST` whole: the manifest's header and the record as its first record are written as `MANIFEST.new`, synced and renamed, and the directory synced; a directory holding only `MANIFEST.new` is a restore that did not reach its record, which is removed, and the restore starts again with the next generation, its claim kept. A torn record therefore never reaches `MANIFEST`. `backup/tests/restore.rs`, `a_restore_killed_at_every_file_operation_completes_after_a_restart`, `a_leftover_manifest_before_the_record_is_removed_and_the_next_generation_claimed`) |
+| Q-82 | How a restore tells that the bucket has lost or corrupted a listed file | §8 Restore, Failures and end (settled by roadmap 8.3b with the owner's thresholds: a wrong key is told by the key check value in `STORE`'s envelope header before any file is judged, `RestoreError::WrongKey`, and records nothing; a listed file is lost when `stat` reports it absent on 3 tries spanning at least 10 minutes while `STORE` is reported present in the same step; it is corrupt at once when the reported size or ciphertext SHA-256 differs from its copy, and after 3 downloads with the right key whose bytes are not the copy, whose chunks fail authentication or whose plaintext hash is not its description's (a sink's `HashMismatch` on a download counts as one); any other fault, a `Transient` download included, is retried with backoff and never counts. The thresholds are `RestoreConfig::lost_tries` and `lost_over`; tries are counted per run, so a restart starts them again. A lost or corrupt file becomes a lost range, cause 3 (Q-302). `backup/src/restore/judge.rs`, `backup/tests/restore.rs`, `backup/tests/restore_properties.rs`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

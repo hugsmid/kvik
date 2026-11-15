@@ -764,7 +764,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 A restart after the restore record is written resumes the restore in its generation, uploading its restore record if
 that had not finished (a drill uploads nothing and reads no claims), reading the claims again before ingest is accepted if step 1 had not completed (Generations
 above), and fetching the files its restore record lists that steps 1 and 3 bring back and are not yet local.
-A crash before the record starts the restore again with the next generation.
+A crash before the record starts the restore again with the next generation. The record reaches the manifest whole (written to a
+temporary name, synced, renamed), so a directory holding only that temporary file is a restore that did not reach
+its record: it is removed and the restore starts again (Q-39 (f)).
 
 **Failures and end.** The restore record is written before any file is downloaded, so a restore that stops before it
 leaves nothing local; `restore` refuses a directory that holds files and no restore record. Until step 1 is complete
@@ -778,8 +780,11 @@ Recovery rule 2); the restore then completes without them. Facts of a log segmen
 (such as compacted chunks) are fetched in step 1, before ingest is accepted, so that the version index, each
 series' latest recorded `t` and each decimal series' largest magnitude stay exact at the restored end (§2.4, step 2). A lost or corrupted tree checkpoint is
 replaced by the latest earlier checkpoint the records list, or, with none, by the whole sealed log, as step 1 allows.
-How the engine tells that the bucket has lost or corrupted a file, rather than a transient fault, a damaged download
-or a wrong key, is open (Q-82). A definition entry lost this way is lost as §2.1 says (only the kept log applies; its facts are orphaned); how the registry file, trees and indexes are brought back after it is open (Q-33). A file
+A wrong key is told by the key check value of the bucket's store descriptor before any file is judged: the restore
+fails, recording nothing. A listed file is lost when the bucket reports it absent on 3 tries spanning at least 10
+minutes while it reports the store descriptor present, and corrupted when its reported ciphertext hash differs from
+its copy's, or when 3 downloads with the right key fail its ciphertext or plaintext hash or authentication; any other
+fault is retried and never counts (Q-82). A definition entry lost this way is lost as §2.1 says (only the kept log applies; its facts are orphaned); how the registry file, trees and indexes are brought back after it is open (Q-33). A file
 holding a position whose content differs from a local copy is not installed; health names both files and the restore
 stays in progress until an operator acts. The store is `restoring` from the restore record until every file step 3
 brings back is installed, or replaced or recorded lost as above; this follows from the record and the local files and
