@@ -205,6 +205,11 @@ store.emit_with(&readings, Intent::Revise).await?;
   resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
   the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
   a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
+- **An acknowledgement means durable**, for every outcome. A call none of whose readings is recorded writes no
+  batch; if one of them is a duplicate of a reading queued by an earlier call that is not yet acknowledged, the call
+  resolves only when that earlier call does, with its result: its outcomes if that call is acknowledged, its error
+  (`OutcomeUnknown`, `ReadOnly` or `Closed`) if not. A call with readings to record resolves with its own batch,
+  which is acknowledged after every batch before it (Q-123 (b)).
 - Individual readings may be refused (`Refusal`, reported per index); a non-finite value is recorded, not refused,
   and so is a decimal value out of range, whose outcome says so (`out_of_range`, spec §2.5).
   A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`.

@@ -29,14 +29,17 @@ struct Known {
     value: LogValue,
     supplied: LogQuality,
     changed_at: Option<u64>,
+    /// The call that queued it in this process; 0 for a fact of the kept log read at the start.
+    call: u64,
 }
 
 impl Known {
-    fn of(r: &FactRow) -> Self {
+    fn of(r: &FactRow, call: u64) -> Self {
         Known {
             value: r.value.clone(),
             supplied: r.quality,
             changed_at: r.changed_at,
+            call,
         }
     }
 
@@ -84,6 +87,11 @@ pub(crate) enum Decision {
 pub(crate) struct Plan {
     pub(crate) decisions: Vec<Decision>,
     pub(crate) items: Vec<Item>,
+    /// The latest earlier call holding a fact a duplicate matched, if any: the duplicate is final only once that
+    /// call is acknowledged (Q-123 (b)).
+    pub(crate) depends: Option<u64>,
+    /// The call this plan is for.
+    call: u64,
 }
 
 /// The state decisions are made against: the registry and the history of every key, including calls queued but
@@ -121,15 +129,18 @@ impl Decider {
         };
         for id in index.fact_series() {
             for f in index.series_facts(id) {
-                d.note(&f.row);
+                d.note(&f.row, 0);
             }
         }
         d
     }
 
-    fn note(&mut self, r: &FactRow) {
+    fn note(&mut self, r: &FactRow, call: u64) {
         let key = (r.series_id, r.t);
-        self.history.entry(key).or_default().push(Known::of(r));
+        self.history
+            .entry(key)
+            .or_default()
+            .push(Known::of(r, call));
         if let Some(c) = r.changed_at {
             let v = self.versions.entry(key).or_insert(c);
             *v = (*v).max(c);
@@ -144,7 +155,7 @@ impl Decider {
     pub(crate) fn apply(&mut self, plan: &Plan) {
         for item in &plan.items {
             if let Item::Fact(r) = item {
-                self.note(r);
+                self.note(r, plan.call);
             }
         }
     }
@@ -192,9 +203,18 @@ impl Decider {
     }
 
     /// Decides a call. Nothing changes until [`Decider::apply`].
-    pub(crate) fn plan(&self, readings: &[Reading], intent: Intent, clock: Clock) -> Plan {
+    pub(crate) fn plan(
+        &self,
+        readings: &[Reading],
+        intent: Intent,
+        clock: Clock,
+        call: u64,
+    ) -> Plan {
         let revise = intent == Intent::Revise;
-        let mut plan = Plan::default();
+        let mut plan = Plan {
+            call,
+            ..Plan::default()
+        };
         let mut batch_history: HashMap<(u32, i64), Vec<Known>> = HashMap::new();
         let mut batch_versions: HashMap<(u32, i64), u64> = HashMap::new();
         let mut batch_reference: HashMap<u32, i64> = HashMap::new();
@@ -241,17 +261,25 @@ impl Decider {
                 .get(&key)
                 .copied()
                 .max(batch_versions.get(&key).copied());
-            let seen = match r.changed_at {
-                None => recorded.into_iter().any(|k| k.identical(&value, supplied)),
-                // A `changed_at` above every one of its key's is never a duplicate (§2.4).
-                Some(c) => {
-                    top.is_some_and(|top| c <= top)
-                        && recorded
-                            .into_iter()
-                            .any(|k| k.changed_at == Some(c) && k.identical(&value, supplied))
-                }
+            // The facts this reading duplicates (§2.4); a `changed_at` above every one of its key's is never a
+            // duplicate.
+            let matched: Vec<&Known> = match r.changed_at {
+                None => recorded
+                    .into_iter()
+                    .filter(|k| k.identical(&value, supplied))
+                    .collect(),
+                Some(c) if top.is_some_and(|top| c <= top) => recorded
+                    .into_iter()
+                    .filter(|k| k.changed_at == Some(c) && k.identical(&value, supplied))
+                    .collect(),
+                Some(_) => Vec::new(),
             };
-            if seen && !revise {
+            if !matched.is_empty() && !revise {
+                // The earliest call holding a match suffices: once it is acknowledged the reading is durable.
+                let earliest = matched.iter().map(|k| k.call).min().unwrap_or(0);
+                if earliest != 0 && earliest != call {
+                    plan.depends = plan.depends.max(Some(earliest));
+                }
                 plan.decisions.push(Decision::Duplicate);
                 continue;
             }
@@ -287,7 +315,10 @@ impl Decider {
                 changed_at: r.changed_at,
             };
             let outranked = r.changed_at.is_some_and(|c| top.is_some_and(|top| c < top));
-            batch_history.entry(key).or_default().push(Known::of(&row));
+            batch_history
+                .entry(key)
+                .or_default()
+                .push(Known::of(&row, call));
             if let Some(c) = r.changed_at {
                 let v = batch_versions.entry(key).or_insert(c);
                 *v = (*v).max(c);

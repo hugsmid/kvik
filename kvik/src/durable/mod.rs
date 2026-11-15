@@ -20,8 +20,9 @@ mod registry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use kvik_log::content::Item;
@@ -170,6 +171,9 @@ pub(crate) struct Writer {
     counters: Mutex<Counters>,
     reader: Mutex<Option<Arc<DurableReader>>>,
     acknowledged: Mutex<BTreeSet<Position>>,
+    /// Calls queued and not yet known to be acknowledged, by call number (Q-123 (b)).
+    inflight: Mutex<BTreeMap<u64, Arc<Completion>>>,
+    next_call: AtomicU64,
     closed: AtomicBool,
     now: AtomicI64,
 }
@@ -177,16 +181,90 @@ pub(crate) struct Writer {
 /// How a queued call's acknowledgement becomes its [`Ack`].
 type Finish = Box<dyn FnOnce(Result<LogAck, CommitError>) -> Result<Ack, EmitError> + Send + Sync>;
 
-/// A call queued in the log, and how its acknowledgement becomes the call's [`Ack`].
+/// Wakes every waker registered with a [`Completion`].
+#[derive(Debug, Default)]
+struct FanOut(Mutex<Vec<Waker>>);
+
+impl Wake for FanOut {
+    fn wake(self: Arc<Self>) {
+        let wakers = std::mem::take(&mut *lock(&self.0));
+        for w in wakers {
+            w.wake();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletionState {
+    pending: Option<LogPending>,
+    result: Option<Result<LogAck, CommitError>>,
+}
+
+/// The log's acknowledgement of one queued call, shared by the call's own future and by every later call whose
+/// outcome depends on it (a duplicate of one of its readings, Q-123 (b)), each of which may wait on it.
+#[derive(Debug)]
+pub(crate) struct Completion {
+    state: Mutex<CompletionState>,
+    wakers: Arc<FanOut>,
+}
+
+impl Completion {
+    fn new(pending: LogPending) -> Self {
+        Completion {
+            state: Mutex::new(CompletionState {
+                pending: Some(pending),
+                result: None,
+            }),
+            wakers: Arc::new(FanOut::default()),
+        }
+    }
+
+    /// The call's result once the log has given it; registers `cx`'s waker otherwise.
+    pub(crate) fn poll(&self, cx: Option<&Context<'_>>) -> Poll<Result<LogAck, CommitError>> {
+        let mut st = lock(&self.state);
+        if let Some(r) = &st.result {
+            return Poll::Ready(r.clone());
+        }
+        if let Some(cx) = cx {
+            let mut w = lock(&self.wakers.0);
+            if !w.iter().any(|x| x.will_wake(cx.waker())) {
+                w.push(cx.waker().clone());
+            }
+        }
+        let fan = Waker::from(self.wakers.clone());
+        let mut fan_cx = Context::from_waker(&fan);
+        let Some(pending) = st.pending.as_mut() else {
+            return Poll::Pending;
+        };
+        match std::pin::Pin::new(pending).poll(&mut fan_cx) {
+            Poll::Ready(r) => {
+                st.result = Some(r.clone());
+                st.pending = None;
+                drop(st);
+                fan.wake_by_ref();
+                Poll::Ready(r)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Whether the call is acknowledged.
+    fn acknowledged(&self) -> bool {
+        matches!(self.poll(None), Poll::Ready(Ok(_)))
+    }
+}
+
+/// A call waiting for the log: its own queued batch, or the queued call an outcome of it depends on; and how that
+/// call's acknowledgement becomes this call's [`Ack`].
 pub(crate) struct Queued {
-    pending: LogPending,
+    completion: Arc<Completion>,
     finish: Finish,
 }
 
 impl std::fmt::Debug for Queued {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Queued")
-            .field("pending", &self.pending)
+            .field("completion", &self.completion)
             .finish()
     }
 }
@@ -196,7 +274,7 @@ impl Queued {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<LogAck, CommitError>> {
-        std::pin::Pin::new(&mut self.pending).poll(cx)
+        self.completion.poll(Some(cx))
     }
 
     pub(crate) fn finish(self, r: Result<LogAck, CommitError>) -> Result<Ack, EmitError> {
@@ -326,6 +404,8 @@ impl Writer {
             counters: Mutex::new(counters),
             reader: Mutex::new(None),
             acknowledged: Mutex::new(BTreeSet::new()),
+            inflight: Mutex::new(BTreeMap::new()),
+            next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             now: AtomicI64::new(wall),
             env,
@@ -654,7 +734,8 @@ impl Writer {
             return self.busy(Wait::UnsyncedClock);
         }
         let mut d = lock(&self.decider);
-        let plan = d.plan(readings, intent, clock);
+        let call = self.next_call.fetch_add(1, Ordering::SeqCst);
+        let plan = d.plan(readings, intent, clock, call);
         let started = Instant::now();
         let queued = if plan.items.is_empty() {
             None
@@ -694,16 +775,33 @@ impl Writer {
         drop(d);
         self.count(readings, &plan);
         let decisions = plan.decisions;
-        let Some(pending) = queued else {
-            return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None))));
+        let mut inflight = lock(&self.inflight);
+        // Calls known to be acknowledged need no tracking: a later outcome resting on them is final.
+        inflight.retain(|_, c| !c.acknowledged());
+        let (completion, own) = match queued {
+            Some(pending) => {
+                let c = Arc::new(Completion::new(pending));
+                inflight.insert(call, c.clone());
+                (c, true)
+            }
+            // Nothing to record. A duplicate of a reading queued by an earlier call that is not yet acknowledged
+            // resolves when that call does, with its result (Q-123 (b)): an acknowledgement means durable.
+            None => match plan.depends.and_then(|c| inflight.get(&c).cloned()) {
+                Some(c) => (c, false),
+                None => return Ok(Emitted::Ready(Ack::new(outcomes(&decisions, None)))),
+            },
         };
+        drop(inflight);
         let me = self.clone();
         Ok(Emitted::Queued(Queued {
-            pending,
+            completion,
             finish: Box::new(move |r| {
-                me.note_latency(started.elapsed());
+                if own {
+                    me.note_latency(started.elapsed());
+                }
                 match r {
-                    Ok(ack) => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),
+                    Ok(ack) if own => Ok(Ack::new(outcomes(&decisions, Some(ack.first)))),
+                    Ok(_) => Ok(Ack::new(outcomes(&decisions, None))),
                     Err(CommitError::ShutDown) => Err(EmitError::Closed),
                     Err(CommitError::ReadOnly) => Err(EmitError::ReadOnly(me.fault_now())),
                     Err(CommitError::OutcomeUnknown) => {

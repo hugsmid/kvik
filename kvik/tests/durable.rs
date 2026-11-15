@@ -161,6 +161,67 @@ fn acknowledged_readings_survive_a_power_loss() {
 }
 
 #[test]
+fn a_duplicate_of_a_queued_reading_waits_for_the_original() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    let mut w = World::new("queued-duplicate");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
+    // Hold the next sync of the segment in use, then fail it: the original call's outcome is unknown, and it is not
+    // stored.
+    let armed = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let fs = w.fs.clone();
+    let hook_armed = armed.clone();
+    w.fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        // The segment in use (file id 1), not the one created ahead.
+        let in_use = p
+            .to_str()
+            .is_some_and(|p| p.ends_with("-0000000000000001.open"));
+        if in_use && hook_armed.swap(false, Ordering::SeqCst) {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            fs.fail_syncs(true);
+        }
+    })));
+    armed.store(true, Ordering::SeqCst);
+    let original = s.try_emit(&[num(g, 5, 1.0)]).unwrap();
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the original's sync started");
+    // The same reading again while the original is queued but not synced: a duplicate, not yet final.
+    let mut duplicate = std::pin::pin!(s.try_emit(&[num(g, 5, 1.0)]).unwrap());
+    let woken = Arc::new(common::Flag::default());
+    assert!(common::poll_once(duplicate.as_mut(), &woken).is_pending());
+    release.send(()).unwrap();
+    // The original's sync failed: the duplicate is not acknowledged either.
+    let r = block_on(duplicate.as_mut());
+    assert!(
+        matches!(r, Err(kvik::EmitError::OutcomeUnknown(_))),
+        "{r:?}"
+    );
+    assert!(matches!(
+        block_on(original),
+        Err(kvik::EmitError::OutcomeUnknown(_))
+    ));
+    w.fs.set_sync_hook(None);
+    w.fs.fail_syncs(false);
+    w.power_loss(s);
+    let s = w.open();
+    assert!(
+        history(&s.reader(), g).is_empty(),
+        "the reading was never stored"
+    );
+    // Acknowledged duplicates of acknowledged readings resolve at once.
+    block_on(s.emit(&[num(g, 5, 1.0)])).unwrap();
+    let ack = block_on(s.emit(&[num(g, 5, 1.0)])).unwrap();
+    assert_eq!(ack.outcomes, vec![Outcome::Duplicate]);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
 fn a_reader_process_sees_committed_facts() {
     let w = World::new("reader-process");
     let s = w.open();
