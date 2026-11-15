@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-115 | §3 Commit, Group commit, Segments, Disk space; `format.md` A.4, A.8, A.10, A.12, A.13 | The commit path: points left open |
 | Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
 | Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
+| Q-121 | §2.1 `id`, id floors; `format.md` A.6, A.10 | Series id 0 against an id floor of 0 |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -556,6 +557,18 @@ Not a question: the reset nonce comes from std's OS-seeded hash keys for now; it
 (`api.md` Environment seams) when the interface wires the log in.
 **Needed.** A rule for each other part; (c) with roadmap 8.3, (f) and (k) with 6.3. To be settled at gate 4.9.
 
+## Q-121 — Series id 0 against an id floor of 0
+Found while building the differential test of the log against the model (roadmap 4.7).
+**Scenario.** §2.1 makes an id a `u32`; the model's registry assigns ids from 0. The mark's `max_series_id` (A.10,
+"the highest series id assigned") and a recovery entry's id floor (A.6, field 46) are then 0 both in a store that has
+assigned no id and in one whose only series is id 0. §2.1 assigns new ids "above every id floor": read literally,
+after a power loss in a store that has defined nothing, the recovery entry's floor of 0 forbids id 0, which the model
+assigns next; and in a store whose only series is id 0, no reader of the floor can tell it from none.
+**Implemented.** The log writes 0 in both cases. `log/tests/model_histories.rs` expects the floor to be the highest
+id defined, 0 with none, and takes the model's ids from 0.
+**Needed.** Either ids start at 1 (0 meaning none in the mark and the floor, and the model changed to match), or the
+floor tells none from id 0 another way (the next free id, or a flag). To be settled by roadmap 5.1, which assigns ids.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -565,7 +578,7 @@ after gate 3.3; such a change is made by the item that settles the question, in 
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
 Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119, Q-46 and parts (e) and (l) of Q-118 were settled after it by
-the owner's rulings.
+the owner's rulings. Q-121 was recorded by roadmap 4.7.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -591,6 +604,7 @@ the owner's rulings.
 | Q-109 | 4.9 | Gate; left open by 4.5 (see the question); recorded at the review of roadmap 4.2 |
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2 |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
+| Q-121 | 5.1 | Series registry: ids are assigned there; recorded by roadmap 4.7 |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).
