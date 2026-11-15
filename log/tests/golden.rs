@@ -1,4 +1,4 @@
-//! Golden files: v1 log segments and a mark file, committed under `tests/golden/` (see its README).
+//! Golden files: v1 log segments, a mark file and a registry file, committed under `tests/golden/` (see its README).
 //!
 //! The files are produced by `generate` below. The tests check that the committed bytes equal what the generator
 //! produces now, that each file decodes to what it is meant to show, and that decoding a file without damage and
@@ -11,9 +11,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use kvik_log::batch::BatchBuilder;
-use kvik_log::block::{FLAG_SKIPPABLE, block_type};
+use kvik_log::block::{FLAG_SKIPPABLE, block_type, encode_block};
 use kvik_log::body::{INDEX_HAS_ENTRIES, IndexRecord};
+use kvik_log::header::{FileHeader, kind};
 use kvik_log::mark::{MarkSlot, encode_mark_file, read_mark};
+use kvik_log::registry::{self, RegistryFile};
 use kvik_log::scan::{HeaderState, LossCause, ScanLimit, SealState, Tail, scan};
 use kvik_log::segment::SegmentImage;
 use kvik_log::{Element, FormatError};
@@ -200,6 +202,35 @@ fn generate() -> Vec<(&'static str, Vec<u8>)> {
     let mut mark = encode_mark_file([Some(slot(7, e[1], 3)), Some(slot(8, e[2], 5))]);
     mark[4_096 + 64] ^= 0x01;
     files.push(("torn-slot.mark", mark));
+
+    // A registry file (A.16): the definition of `in-use.open`'s first batch and its alias from the third, each in
+    // an entries block of its own (they are not consecutive), then the summary: through 5, id floor 1, 2 entries in
+    // 2 blocks.
+    let mut reg = FileHeader::new(kind::REGISTRY, 0, 1, T0, STORE)
+        .encode()
+        .to_vec();
+    let r0 = T0 + SECOND;
+    encode_block(
+        block_type::ENTRIES,
+        0,
+        &entries_body(1, r0, &[definition(1, "room/temperature", "degC")]),
+        &mut reg,
+    )
+    .unwrap();
+    encode_block(
+        block_type::ENTRIES,
+        0,
+        &entries_body(4, r0 + 20 * SECOND, &[alias(1, "room/temp")]),
+        &mut reg,
+    )
+    .unwrap();
+    let mut summary = vec![0u8; 24];
+    summary[..8].copy_from_slice(&5u64.to_le_bytes());
+    summary[8..12].copy_from_slice(&1u32.to_le_bytes());
+    summary[12..16].copy_from_slice(&2u32.to_le_bytes());
+    summary[16..20].copy_from_slice(&2u32.to_le_bytes());
+    encode_block(registry::SUMMARY, 0, &summary, &mut reg).unwrap();
+    files.push(("registry.reg", reg));
     files
 }
 
@@ -392,6 +423,20 @@ fn reencode(bytes: &[u8]) -> Vec<u8> {
         s.set_len(bytes.len() as u64);
     }
     s.into_bytes()
+}
+
+#[test]
+fn the_registry_file_decodes_and_encodes_again() {
+    let b = read("registry.reg");
+    let f: RegistryFile = registry::decode(&b, &STORE).unwrap();
+    assert_eq!((f.generation, f.through, f.max_series_id), (0, 5, 1));
+    let seqs: Vec<_> = f.entries.iter().map(|(s, t, _)| (*s, *t)).collect();
+    assert_eq!(seqs, [(1, T0 + SECOND), (4, T0 + 21 * SECOND)]);
+    assert!(matches!(&f.entries[0].2, kvik_log::entries::Entry::Definition(d) if d.id == 1));
+    assert!(
+        matches!(&f.entries[1].2, kvik_log::entries::Entry::Alias { id: 1, name } if name == "room/temp")
+    );
+    assert_eq!(registry::encode(&f, STORE, 1, T0).unwrap(), b);
 }
 
 #[test]

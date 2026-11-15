@@ -134,6 +134,11 @@ impl Registry {
         self.highest.max(floor).checked_add(1)
     }
 
+    /// The highest id this registry knows.
+    pub(crate) fn highest(&self) -> u32 {
+        self.highest
+    }
+
     /// The site zone in force: that of the site-zone entry with the latest effective time, else `created`, the
     /// zone at creation (the store's zone, which an open must be configured with, `docs/api.md` Opening).
     pub(crate) fn site_zone<'a>(&'a self, created: &'a str) -> &'a str {

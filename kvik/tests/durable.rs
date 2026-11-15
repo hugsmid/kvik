@@ -317,6 +317,97 @@ fn ids_start_at_one_and_never_reuse_a_floor() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// The store's registry file, read as a start reads it.
+fn registry_file(w: &World) -> kvik_log::registry::RegistryFile {
+    let store_id = kvik_log::store::read_descriptor(&*w.fs, Path::new(&w.dir))
+        .unwrap()
+        .store_id;
+    kvik_log::registry::read_latest(&*w.fs, Path::new(&w.dir), &store_id)
+        .unwrap()
+        .expect("a registry file")
+        .1
+}
+
+#[test]
+fn the_registry_file_follows_the_kept_log() {
+    let w = World::new("registry-file");
+    let s = w.open();
+    // Written by the first start, empty.
+    assert!(registry_file(&w).entries.is_empty());
+    let a = block_on(s.define_series(gauge("x/y/a"))).unwrap();
+    block_on(s.alias(a, "x/y/b")).unwrap();
+    block_on(s.emit(&[num(a, 0, 1.0)])).unwrap();
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    // Rewritten at the clean shutdown, up to the mark it synced: the definition and the alias with their positions.
+    let f = registry_file(&w);
+    assert_eq!(f.entries.len(), 2);
+    assert_eq!(f.max_series_id, 1);
+    assert!(f.through >= 3);
+
+    // A file that is not a function of the kept log (here it claims a definition at a position that holds a fact,
+    // as one from a lost range would) is replaced at the next start; the ids it names stay assigned.
+    let mut planted = f.clone();
+    let mut def = match &f.entries[0].2 {
+        kvik_log::entries::Entry::Definition(d) => (**d).clone(),
+        other => panic!("{other:?}"),
+    };
+    def.id = 50;
+    def.name = "x/y/ghost".into();
+    planted.entries.push((
+        f.through,
+        0,
+        kvik_log::entries::Entry::Definition(Box::new(def)),
+    ));
+    planted.max_series_id = 50;
+    let store_id = kvik_log::store::read_descriptor(&*w.fs, Path::new(&w.dir))
+        .unwrap()
+        .store_id;
+    kvik_log::registry::write(&*w.fs, Path::new(&w.dir), store_id, 0, &planted).unwrap();
+    let s = w.open();
+    let rebuilt = registry_file(&w);
+    assert_eq!(rebuilt.entries, f.entries, "rebuilt from the kept log");
+    assert_eq!(rebuilt.max_series_id, 50, "the floor never goes down");
+    assert!(matches!(
+        s.series("x/y/ghost"),
+        Err(kvik::QueryError::UnknownSeries)
+    ));
+    assert_eq!(
+        block_on(s.define_series(gauge("x/y/c"))).unwrap(),
+        SeriesId(51)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn the_registry_file_carries_the_id_floor_when_the_mark_is_lost() {
+    let w = World::new("registry-floor");
+    let s = w.open();
+    let a = block_on(s.define_series(gauge("x/y/a"))).unwrap();
+    block_on(s.define_series(gauge("x/y/lost"))).unwrap();
+    for i in 0..3 {
+        block_on(s.emit(&[num(a, i, 1.0)])).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    // The definition of id 2 is damaged and the mark is gone: only the registry file still knows id 2.
+    let (path, bytes) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(8).any(|x| x == b"x/y/lost"))
+        .unwrap();
+    let at_name = bytes.windows(8).position(|x| x == b"x/y/lost").unwrap();
+    w.fs.poke(&path, at_name, b"X");
+    kvik::env::Fs::remove_file(&*w.fs, &Path::new(&w.dir).join("log").join("MARK")).unwrap();
+    let s = w.open();
+    assert_eq!(
+        block_on(s.define_series(gauge("x/y/lost"))).unwrap(),
+        SeriesId(3),
+        "the id floor of the registry file"
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
 #[test]
 fn writers_on_several_threads() {
     let w = World::new("threads");

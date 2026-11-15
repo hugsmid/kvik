@@ -10,6 +10,7 @@ use kvik_log::entries::{Entry, MarkState as LogMarkState, Recovery};
 use kvik_log::facts::{FactRow, Quality as LogQuality, Value as LogValue};
 use kvik_log::manifest::{LossCause as LogCause, LostRange};
 use kvik_log::reader::{ReadBatch, ReadEvent};
+use kvik_log::registry::RegistryFile;
 use kvik_log::writer::Position as LogPos;
 
 use super::registry::{Registry, Series};
@@ -37,7 +38,8 @@ impl Stored {
 /// See the module documentation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index {
-    entries: BTreeMap<LogPos, Entry>,
+    /// Registry entries with the receive time of their batch.
+    entries: BTreeMap<LogPos, (i64, Entry)>,
     registry: Registry,
     facts: BTreeMap<u32, BTreeMap<(i64, LogPos), Stored>>,
     /// Each batch's last position and commit time, in log order.
@@ -157,7 +159,7 @@ impl Index {
                     if let Entry::Recovery(r) = e {
                         self.recoveries.insert(p, r.clone());
                     }
-                    self.entries.insert(p, e.clone());
+                    self.entries.insert(p, (b.content.received_at, e.clone()));
                 }
             }
             sequence += item.sequences();
@@ -176,7 +178,7 @@ impl Index {
         }
         self.facts.retain(|_, f| !f.is_empty());
         self.registry = Registry::default();
-        for e in self.entries.values() {
+        for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
         for id in self.facts.keys() {
@@ -187,6 +189,22 @@ impl Index {
     /// The registry of the kept log.
     pub(crate) fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// The registry file's content for the kept log up to `through` (`format.md` A.16), with the id floor `floor`
+    /// or the highest id the kept log names, whichever is higher.
+    pub(crate) fn registry_file(&self, through: LogPos, floor: u32) -> RegistryFile {
+        RegistryFile {
+            generation: through.generation,
+            through: through.sequence,
+            max_series_id: floor.max(self.registry.highest()),
+            entries: self
+                .entries
+                .range(..=through)
+                .filter(|(p, _)| p.generation == through.generation)
+                .map(|(p, (t, e))| (p.sequence, *t, e.clone()))
+                .collect(),
+        }
     }
 
     /// The facts of a series in `(t, position)` order.

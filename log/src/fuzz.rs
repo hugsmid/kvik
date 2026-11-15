@@ -12,7 +12,8 @@ use crate::lease::LeaseSlot;
 use crate::mark::read_mark;
 use crate::scan::{ScanLimit, ScanReport, Tail, scan};
 
-/// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file and each body type, and
+/// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file, a registry file and each
+/// body type, and
 /// checks what a scan reports. Panics only if a check fails (a bug); never for any input.
 ///
 /// The segment identity is taken from the bytes where the header would be, so mutated valid segments reach the
@@ -107,6 +108,17 @@ pub fn decode_all(data: &[u8]) {
         let _ = FactsBlock::decode_canonical(d);
         let _ = EntriesBlock::decode(d);
         let _ = EntriesBlock::decode_canonical(d);
+    }
+    // As a registry file (A.16), judged for the store its header names: what decodes encodes again to a file that
+    // decodes to the same content.
+    if let Ok(f) = crate::registry::decode(data, &id.store_id)
+        && let Ok(again) = crate::registry::encode(&f, id.store_id, id.file_id, 0)
+    {
+        assert_eq!(
+            crate::registry::decode(&again, &id.store_id).ok(),
+            Some(f),
+            "a registry file does not survive encoding again"
+        );
     }
 }
 

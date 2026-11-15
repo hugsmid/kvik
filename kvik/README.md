@@ -13,7 +13,8 @@ the same process or another, reads up to the durable mark. It supports series de
 retirement, a change of retention class, site-zone and tzdata entries), writing (`emit`, `emit_with`, `try_emit`
 with every outcome the model backend gives) and reading facts in every view, the fact at a time, the interval of a
 fixed-length interval series and series lookup, with `refresh`, health, statistics and losses. It decides outcomes
-as the model backend does, checked by a differential property test. **Not supported yet**, each until its roadmap
+as the model backend does, checked by a differential property test. Every start rebuilds the registry from the kept
+log and writes the registry file (`format.md` A.16) again where it does not match; clean shutdown writes it too. **Not supported yet**, each until its roadmap
 item: consumers and routing (5.2; `ConsumerError::NotSupportedYet`), live state, windows, chart buckets and calendar
 results (5.4, 7.x; `QueryError::NotAvailable`), and what the model backend lacks too (below).
 

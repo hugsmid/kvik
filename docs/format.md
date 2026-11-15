@@ -2,7 +2,7 @@
 
 Byte-level rules for the files kvik writes. The semantics are in [`spec.md`](spec.md); where the two differ,
 `spec.md` wins and this document is wrong. Part A (common rules, log segments, the durable mark, the store layout,
-the platform operations, the manifest framing, cursor and lease files) is complete enough to implement. Part B
+the platform operations, the manifest framing, cursor and lease files, the registry file) is complete enough to implement. Part B
 (compacted segments and the remaining files) is an outline; each file is specified here before the roadmap item that
 writes it.
 
@@ -444,9 +444,9 @@ exists; a new file is created only when none exists.
   a gap before a recovery entry, and with an adopted recovery entry followed by the rest of a torn tail; corruption
   inside a segment with a kept batch after it; each seal state of A.4; a mark with one torn slot; a stale mark below
   acknowledged batches after a power loss; a block with an unknown ignorable and an unknown critical element; the
-  store descriptor; a manifest with a torn tail and one with a corrupt middle record.
-- A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor and lease decoders
-  included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
+  store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file.
+- A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor, lease and registry
+  file decoders included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
   length before it is checked against the body, and decoded output is bounded by the row and entry limits.
 - Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
   batches before it.
@@ -461,7 +461,8 @@ exists; a new file is created only when none exists.
 <dir>/log/<generation:8 hex>-<file_id:16 hex>.open | .kvl
 <dir>/cursors/<consumer name>.cur            kind 4 (A.15)
 <dir>/leases/<reader_id:32 hex>.lease        kind 8 (A.15)
-<dir>/registry/, tree/, data/, quarantine/   reserved for kinds 2, 5, 6 and 9–14; laid out by roadmap 5.1, 6.1, 7.1 and 8.1
+<dir>/registry/<generation:8 hex>-<file_id:16 hex>.reg   kind 5 (A.16)
+<dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.1, 7.1 and 8.1
 ```
 - Hex is lower-case and zero-padded to the stated width; extensions are lower-case. Readers match names exactly and
   ignore any other name. A consumer name is `[a-z0-9][a-z0-9._-]{0,63}`, so it is its own file name.
@@ -574,6 +575,43 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `boot_id` is honoured until expiry. The reader deletes its lease on close; the writer deletes void and expired
   ones.
 
+## A.16 Registry file (`kind = 5`)
+The registry entries of the kept log (`spec.md` §2.1: definitions, parameter changes, aliases, retirements, scale
+raises, site-zone, tzdata, routing and recovery entries), each with its position, and an id floor, in one file on the
+hot tier: `registry/<generation>-<file_id>.reg`.
+
+- **Layout.** An A.1 header (kind 5; `generation` the generation its positions belong to; `base_sequence` 0), then
+  zero or more entries blocks (type `0x02`, the A.6 body: `first_sequence`, the `received_at` of the batch the entries
+  came from, the entries), then one **summary** block (type `0x40`, 24 bytes): 0 `through: u64`, the file holds
+  every registry entry of the kept log with a sequence up to it; 8 `max_series_id: u32`, the highest series id its
+  writer knew (the mark's, the kept log's, every recovery entry's id floor and the registry file read at the start;
+  0 for none); 12 `entry_count: u32`; 16 `block_count: u32`, the entries blocks before it; 20 reserved. Entries come
+  in position order, ignored entries (A.6) are not written, and positions rise strictly through the file.
+- **Canonical writing.** Consecutive entries share a block when their sequences are consecutive and they came from
+  one batch (one `received_at`), until the next would take the body past 16 MiB; a recovery entry is alone in its
+  block, as in its batch.
+- **Checks.** The header valid, of this store and kind 5; every block valid (A.2) and of type `0x02` or `0x40`, or of
+  an unknown type with `skippable`; each entries body passing A.6; the summary the last block, ending the file, its
+  counts matching, and no entry above `through`. A file that fails a check is **invalid**: it is passed over, never
+  repaired, and removed by the next write. A newer `format_major`, an unknown critical block type, entry type or
+  field is a version refusal (common rules): the writer refuses to open and never removes the file.
+- **Writing.** The whole file is written under the next `file_id` of kind 5 (A.12), synced, and the directory
+  synced (on the first write the `registry/` directory is created and the store directory synced); only then are the
+  older registry files removed and the directory synced again. A crash at any point leaves the previous file, the new
+  one, or both. The file never names a position above the last synced mark (`spec.md` §3 Durable mark): `through`
+  is at most the mark's last position as synced. Until roadmap 6.3 lays out the publish record, a registry file is
+  not named by the manifest; it is found by its name.
+- **Reading.** The valid file with the highest `file_id`; with none, the registry comes from the log alone.
+- **At a start** (`spec.md` §3 Order of a start), the file is a derived file: its `through` is a source of F (Recovery
+  rule 3), and `max_series_id` and every id it defines count toward the id floor (`spec.md` §2.1), as do its
+  definitions' interval lengths toward the segment index's reach (A.8). Once the log is recovered, the writer
+  rebuilds the registry from the kept log and checks the file against it (the Derived check, Q-33): the file must
+  hold exactly the kept log's registry entries up to the last synced mark, with an id floor at least the writer's;
+  if it does not, it is written again from the kept log, with the writer's id floor, so the id of a lost definition
+  stays assigned. The writer writes it again at clean shutdown, after the last mark sync. Until log segments can leave
+  the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry, so the file is checked,
+  never trusted over the log.
+
 ## B. Outline of the remaining files (not yet normative)
 
 Every file below has an A.1 header and is self-describing (A.14). Parquet is the export format only, so A.1 applies
@@ -600,8 +638,8 @@ to every stored file.
   names a file repeats its kind, position range and plaintext hash, and every record that names a loss repeats its
   identity, so that no such fact is held by one record alone once a second names it (`spec.md` §7 Manifest).
 - **Cursor (`kind = 4`).** A.15; latches and sequences are added by roadmap 5.2.
-- **Registry (`kind = 5`).** The compacted registry: series entries, site-zone and tzdata entries, routing
-  changes and recovery entries, each with its position.
+- **Registry (`kind = 5`).** Laid out in A.16 by roadmap 5.1; routing changes join it with roadmap 5.2, and its
+  copy in tree checkpoints is laid out with roadmap 7.1.
 - **Tree (`kind = 6`).** Per-series stored summary levels with the position up to which they are complete; each node
   of a decimal series carries its `u8` scale (`spec.md` §5.6).
 

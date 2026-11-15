@@ -163,7 +163,9 @@ pub(crate) struct Writer {
     env: Env,
     limits: Limits,
     log: RwLock<Option<Log>>,
-    start_fault: Option<LogFault>,
+    /// A fault of the start, or of a registry file write (`spec.md` §3 Write or sync failure).
+    own_fault: Mutex<Option<LogFault>>,
+    store_id: [u8; 16],
     decider: Mutex<Decider>,
     counters: Mutex<Counters>,
     reader: Mutex<Option<Arc<DurableReader>>>,
@@ -292,6 +294,24 @@ impl Writer {
                 st.future += u64::from(f.row.flags.future);
             }
         }
+        // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
+        // the kept log at every start, and the file, which must equal what the kept log gives up to the last synced
+        // mark, is written again whenever it does not. Its id floor is the writer's, which recovery folded in from
+        // the mark, the kept log, its recovery entries and the file read, so a lost definition's id stays assigned.
+        let mut start_fault = start_fault;
+        if start_fault.is_none() {
+            let stats = writer.stats();
+            let expected = index.registry_file(stats.mark_synced, stats.max_series_id);
+            let current = kvik_log::registry::read_latest(&*env.fs, &dir, &descriptor.store_id)
+                .ok()
+                .flatten();
+            if current.is_none_or(|(_, f)| f != expected)
+                && let Err(e) =
+                    kvik_log::registry::write(&*env.fs, &dir, descriptor.store_id, wall, &expected)
+            {
+                start_fault = Some(registry_fault(&dir, &e));
+            }
+        }
         let log = Log::start(writer, clock).map_err(|source| OpenError::Io {
             path: dir.clone(),
             source,
@@ -300,7 +320,8 @@ impl Writer {
             dir,
             limits: config.limits.clone(),
             log: RwLock::new(Some(log)),
-            start_fault,
+            own_fault: Mutex::new(start_fault),
+            store_id: descriptor.store_id,
             decider: Mutex::new(Decider::from_index(&index)),
             counters: Mutex::new(counters),
             reader: Mutex::new(None),
@@ -332,7 +353,7 @@ impl Writer {
     }
 
     fn fault(&self) -> Option<LogFault> {
-        self.start_fault
+        lock(&self.own_fault)
             .clone()
             .or_else(|| self.log().as_ref().and_then(Log::fault))
     }
@@ -379,10 +400,32 @@ impl Writer {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        match log.map(Log::shutdown) {
-            Some(Err(f)) => Err(WriteError::ReadOnly(fault_out(&f))),
-            _ => Ok(()),
+        let Some(log) = log else {
+            return Ok(());
+        };
+        let floor = log.stats().max_series_id;
+        if let Err(f) = log.shutdown() {
+            return Err(WriteError::ReadOnly(fault_out(&f)));
         }
+        if let Some(f) = lock(&self.own_fault).clone() {
+            return Err(WriteError::ReadOnly(fault_out(&f)));
+        }
+        // The registry file again, up to the mark the clean shutdown synced.
+        let file = self.reader().ok().and_then(|r| {
+            r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
+                .ok()
+        });
+        if let Some(file) = file {
+            let wall = self.env.clock.wall().0;
+            if let Err(e) =
+                kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file)
+            {
+                let f = registry_fault(&self.dir, &e);
+                *lock(&self.own_fault) = Some(f.clone());
+                return Err(WriteError::ReadOnly(fault_out(&f)));
+            }
+        }
+        Ok(())
     }
 
     /// Queues one entry and waits for its acknowledgement, holding the decision lock throughout, so no later
@@ -862,6 +905,16 @@ impl Writer {
         range: std::ops::RangeInclusive<Position>,
     ) -> Result<Vec<Fact>, QueryError> {
         self.reader()?.with(|i, _| Ok(orphaned(i, &range)))
+    }
+}
+
+/// The fault of a failed registry file write.
+fn registry_fault(dir: &Path, e: &io::Error) -> LogFault {
+    LogFault {
+        op: FaultOp::Write,
+        path: dir.join(kvik_log::registry::REGISTRY_DIR),
+        kind: e.kind(),
+        message: e.to_string(),
     }
 }
 

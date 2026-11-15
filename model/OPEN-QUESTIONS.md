@@ -116,6 +116,18 @@ range (the Derived check). Whatever is designed must hold these:
    file still holds a definition from a lost position).
 Until then invariants 5 and 8 hold "lost ranges excepted" (§10), as the model has it (damage only to batches of
 facts).
+**Roadmap 5.1, for the registry file** (`format.md` A.16, `kvik/src/durable/`). Every start rebuilds the registry from
+the kept log and checks the file against it: the file must hold exactly the kept log's registry entries up to the last
+synced mark; otherwise it is written again from the kept log, carrying the writer's id floor, so the id of a lost
+definition stays assigned (`kvik/tests/durable.rs`, `the_registry_file_follows_the_kept_log`,
+`the_registry_file_carries_the_id_floor_when_the_mark_is_lost`). This meets requirement 5 (recomputed at every start,
+no stored label). Requirements 1 and 4 hold for now because no lost range is recorded at run time: only a start finds
+one, and the registry is rebuilt after it. Requirements 2 and 3 cannot arise yet: until log segments leave the hot tier
+(roadmap 8.1) or are compacted (6.x) and checkpoints exist (7.1), the kept log holds every registry entry, and the file
+is checked, never trusted over the log. **Proposed:** the rest of this question (requirements 1 to 4, the indexes and
+trees, invariants 5 and 8 across a lost range) moves to roadmap 6.2, the next item with derived files. Owner decision
+pending. The model support due before 5.1 (recovery entries, reset points, rows 7b and 7c, invariants 25–27) is not
+done.
 
 ## Q-39 (f) — A crash while the restore record is written
 **Scenario.** A restore claims generation g and crashes while writing its restore record locally, leaving a torn
@@ -469,8 +481,10 @@ one-entry calls of up to 8 MiB each are accepted (facts are small, so this needs
 Blocked seals have no bound: each holds a file handle, is read again every 10 seconds, and adds a segment to every
 later start's scan.
 **Implemented.** (e) The low mark uses the byte floor alone (`disk_low_bytes`); an unknown free space applies neither
-mark, so ingest never waits for the disk there. (f) Definitions committed by this writer give the reach; any other
-series takes `t`. Recovery (roadmap 4.5) has the same gap when it reopens a segment. (j) Not done: a cloud runner can
+mark, so ingest never waits for the disk there. (f) Since roadmap 5.1 a start takes the interval of every series the
+registry file defines (`format.md` A.16), and then of every definition in the unsealed segments; definitions this
+writer commits add theirs. The registry file is written at every start and at clean shutdown, so a series lacks its
+reach only when the file is missing or invalid, until the next start writes it (`log/src/writer/recovery.rs`). (j) Not done: a cloud runner can
 time `FlushFileBuffers` but cannot show whether a device cache is flushed or a name survives a power loss
 (`docs/measurements/4.8-commit-latency.md`). Nothing in the writer depends on it. (k) Done by roadmap 5.1: the
 interface reports the log's `QueueFull` and `NoSegment` as `Wait::QueueFull` (a roll waiting for its segment holds the
@@ -503,8 +517,8 @@ A creation that fails for lack of space waits (§3 Segments); at a start that ne
 nothing can be written until it exists. (m) *Consumers.* The entry's field 47 names consumers whose cursor file was
 missing or unreadable; cursor files are roadmap 5.2. (n) *Restart time.* A start reads every unsealed segment whole,
 and the last sealed one for its trailer, against the restart budget of `design.md`.
-**Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
-manifest count. (c) A start reports what it found and what the manifest holds. Since roadmap 5.1 the interface reads
+**Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Lost-range records of the
+manifest count, and since roadmap 5.1 the registry file's `through` (`format.md` A.16). (c) A start reports what it found and what the manifest holds. Since roadmap 5.1 the interface reads
 every recovery entry of the kept log at every start and every reader refresh, as it reads the whole kept log to
 rebuild the registry anyway: `losses()` lists the manifest's lost-range records and, for each recovery entry that
 reports a torn tail, a `PossibleLoss` (`kvik/src/durable/index.rs`). The cost is that of reading the log, which
@@ -589,7 +603,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Question | Settle by roadmap item | Note |
 |---|---|---|
 | Q-16 | 5.4 | Live state and staleness are built there |
-| Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
+| Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below). Roadmap 5.1 did the registry file's check and requirement 5; the rest is proposed for 6.2, owner decision pending (see the question) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
 | Q-52 (b) | 4.9 | Settled on Linux (ext4 and XFS) by the rewrite job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decision on the macOS and Windows wording |
@@ -610,10 +624,10 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2; owner decision pending on the trust-boundary wording |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3; owner decision pending on the call-limit wording in `api.md` |
 | Q-115 (e), (j), (n) | 4.9 | Gate; owner decisions pending: the `space()` seam, the Windows wording, and bounds on the ingest queue's bytes and on blocked seals |
-| Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9 |
+| Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9; both implemented by roadmap 5.1 (see the question) |
 | Q-116 (a) | 6.3 | Deep fetch or manifest rebuild for a corrupt record; deferred by gate 4.9 |
-| Q-116 (b), (m) | 5.2 | Durable cursors as a source of F and in the recovery entry (derived files as sources of F at 6.2 and 7.1); deferred by gate 4.9 |
-| Q-116 (c) | 5.1 | The interface reads loss history; deferred by gate 4.9 |
+| Q-116 (b), (m) | 5.2 | Durable cursors as a source of F and in the recovery entry (derived files as sources of F at 6.2 and 7.1; the registry file is one since roadmap 5.1); deferred by gate 4.9 |
+| Q-116 (c) | 5.1 | The interface reads loss history; deferred by gate 4.9; implemented by roadmap 5.1 (see the question) |
 | Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |

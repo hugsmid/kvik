@@ -29,6 +29,7 @@ format change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-log --test golden`.
 | `unknown-critical-entry.open` | An entry of unknown critical type `0x10`: a version refusal |
 | `unknown-critical-field.open` | An alias with an unknown critical field `0x0100`: a version refusal |
 | `torn-slot.mark` | A mark whose slot 1 (counter 8) is torn; slot 0 (counter 7) names the end of the second batch of `in-use.open` |
+| `registry.reg` | A registry file (A.16): the definition of `in-use.open`'s first batch (sequence 1) and its alias (sequence 4), each in an entries block of its own, then the summary (through 5, id floor 1) |
 
 Still to be added by their roadmap items (A.11): recovery entries, a gap before a recovery entry and an adopted
 recovery entry (4.5); a stale mark below

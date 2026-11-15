@@ -28,8 +28,9 @@ sources must be acted on quickly, kept for years and restored to a known, record
 >   [commit and sync latency](docs/measurements/2.2-commit-latency.md) (gate 2.3 has looked at both) and the log
 >   writer's [commit latency and throughput](docs/measurements/4.8-commit-latency.md), on macOS only so far: the run
 >   on the Linux NVMe target that checks the delivery budget is pending.
-> - The public interface ([`kvik/`](kvik/)) is implemented on the reference model as an in-memory backend: **not
->   durable, for development and tests**; nothing is written to disk yet.
+> - The public interface ([`kvik/`](kvik/)) has two backends: the durable log (the default), which so far defines
+>   series, writes and reads facts and series in this or another process, and the reference model in memory (**not
+>   durable, for development and tests**), which covers the whole interface.
 >
 > | [Roadmap](docs/roadmap.md) section | Progress |
 > |---|---|
@@ -37,7 +38,8 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, with the Linux NVMe target run pending) |
-> | 5–10. Delivery, compaction, summary tree, tiers and backup, query, scale | not started |
+> | 5. Delivery | 0 of 6 done (5.1, the series registry and the interface on the durable log, is built and waits for the questions due with it) |
+> | 6–10. Compaction, summary tree, tiers and backup, query, scale | not started |
 >
 > 22 of 47 roadmap items are done, including 3 of 9 gates.
 
@@ -206,8 +208,9 @@ demand for fact reads, never for windows or consumer catch-up. The engine never 
 
 ### Planned interface
 *Subject to change: an outline from [`docs/api.md`](docs/api.md). The [`kvik`](kvik/) crate implements it on the
-in-memory reference model, which is not durable; decimal value types, calendar-length intervals, backup and restore
-are among what it does not support yet ([coverage](kvik/README.md#coverage)).*
+durable log (series, writing, facts; consumers, live state and windows to come) and on the in-memory reference model,
+which is not durable; decimal value types, calendar-length intervals, backup and restore are among what neither
+supports yet ([coverage](kvik/README.md#coverage)).*
 
 ```rust
 let store = Store::open(config).await?;   // StoreConfig: directory, time zone, limits, tiers, ...

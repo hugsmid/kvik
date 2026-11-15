@@ -714,6 +714,16 @@ pub(super) fn start(
     }
     let manifest_bytes = store.read_file(&store.dir().join(MANIFEST))?;
     let manifest = read_manifest(&manifest_bytes, &store_id).map_err(manifest_error)?;
+    // The registry file (A.16) is a derived file: its `through` is a source of F, and every id it names counts toward
+    // the id floor (`spec.md` §2.1, §3 Recovery rule 3).
+    let registry = crate::registry::read_latest(&*fs, store.dir(), &store_id)
+        .map_err(|e| match e {
+            crate::registry::RegistryError::Io(e) => StoreError::Io(e),
+            crate::registry::RegistryError::Unsupported(e) => StoreError::Unsupported(e),
+            crate::registry::RegistryError::Invalid(_) => StoreError::Corrupt("registry"),
+        })?
+        .map(|(_, f)| f)
+        .filter(|f| f.generation == 0);
     let mark_path = log_dir.join(MARK);
     let mark_bytes = match store.read_file(&mark_path) {
         Ok(b) => Some(b),
@@ -892,7 +902,9 @@ pub(super) fn start(
         &mark,
         boot,
         sealed_last,
-        manifest.highest_sequence(0),
+        manifest
+            .highest_sequence(0)
+            .max(registry.as_ref().map_or(0, |f| f.through)),
     );
     report.rule = p.rule;
     // What was found is reported even if the start cannot record it.
@@ -1088,6 +1100,18 @@ pub(super) fn start(
         _ => 0,
     };
     let mut intervals = HashMap::new();
+    // The registry file holds definitions from sealed segments too: the segment index's reach for every series
+    // (Q-115 (f)); the kept log's own definitions follow and override.
+    if let Some(f) = &registry {
+        id_floor = id_floor.max(f.floor());
+        for (_, _, e) in &f.entries {
+            if let Entry::Definition(d) = e
+                && let Some(iv) = &d.interval
+            {
+                intervals.insert(d.id, iv.clone());
+            }
+        }
+    }
     if matches!(p.rule, StartRule::Reboot(_)) {
         for s in &segs {
             id_floor = s.tail_ids.iter().copied().fold(id_floor, u32::max);

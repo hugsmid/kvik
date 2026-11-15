@@ -15,6 +15,8 @@
 //! - [`mark`]: the durable mark's slots (A.10).
 //! - [`manifest`]: the manifest's records as far as the log's start needs them (A.14).
 //! - [`name`]: segment file names (A.12).
+//! - [`registry`]: the registry file (A.16): the registry entries of the kept log with their positions, and an id
+//!   floor.
 //! - [`store`]: the store directory, its descriptor and lock (A.12).
 //! - [`reader`]: a reader process: the log up to the durable mark, tailed as the mark moves, without the lock
 //!   (`spec.md` §7 Readers).
@@ -73,6 +75,7 @@ pub mod manifest;
 pub mod mark;
 pub mod name;
 pub mod reader;
+pub mod registry;
 mod rle;
 pub mod scan;
 pub mod segment;

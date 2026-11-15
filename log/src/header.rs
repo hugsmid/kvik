@@ -14,6 +14,8 @@ pub mod kind {
     pub const LOG_SEGMENT: u8 = 1;
     /// The manifest (A.14).
     pub const MANIFEST: u8 = 3;
+    /// Registry file (A.16).
+    pub const REGISTRY: u8 = 5;
     /// The store descriptor (A.12).
     pub const STORE: u8 = 7;
     /// A reader's lease file (A.15).

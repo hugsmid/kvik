@@ -43,7 +43,9 @@ Series definitions, parameter changes (with an effective event time, except a ch
 excess-precision policy, which take effect at their position), aliases, retirements, scale raises, site-zone entries and tzdata entries (§5.7) are log entries. A parameter other than the retention class and the
 excess-precision policy applies to readings with `t` at or after its effective time. A definition entry always has a lower
 position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
-registry file that stays on the hot tier (tree checkpoints carry a copy, §8). Site-zone entries and tzdata entries
+registry file that stays on the hot tier (tree checkpoints carry a copy, §8; `format.md` A.16). The registry file is a
+derived file: every start rebuilds the registry from the kept log and writes the file again where it does not match,
+carrying the id floor (Q-33). Site-zone entries and tzdata entries
 (§5.7) and routing changes (§4) are registry entries in this sense: the registry file holds each with its position,
 so they are in force wherever the registry is, whether or not the log segment that holds them is local. Recovery
 entries (§3) are compacted into it too, each with its position.

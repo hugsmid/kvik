@@ -25,6 +25,9 @@ durable mark's slots and segment file names.
   refresh, takes batches below the mark's offset only, follows segment rolls, seals, writer restarts and recovery
   entries, and voids what it took when a start truncated it. `lease` is the lease file it renews and the writer's
   view of the lease files: first observation, expiry, void leases, and epochs above every lease at a start (A.15).
+- `registry` is the registry file (A.16): the registry entries of the kept log with their positions and an id floor,
+  written whole under a new name; a start counts its ids toward the id floor, its `through` toward F and its
+  definitions' intervals toward the segment index's reach.
 - `fs` is the file-system seam every file operation goes through (A.13), with an in-memory implementation for tests
   that injects faults, logs operations and keeps a durable image of each file.
 
