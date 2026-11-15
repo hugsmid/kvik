@@ -486,7 +486,8 @@ the `kvik-sink` crate. The object keys, the uploaded forms, the claim marker and
   claims. A bucket that does not honour conditional writes, does not check or report SHA-256 checksums, holds keys
   of another store, or whose objects fail the key check, is refused: `BackupError::Refused(BackupRefusal)`, with
   `BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }`, and health `Reason::BackupRefused`
-  while backup stays unattached. Added with the driver's wiring (roadmap 8.1d); there is no weaker mode.
+  while backup stays unattached; the types are above, the probe's wiring is roadmap 8.1d. There is no weaker mode.
+  How a restore reports a refused bucket is Q-214.
 
 A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
 `export_series(&reader, id, &ExportOptions, writer)`. Its schema is provisional ([`export.md`](export.md), Q-190 to

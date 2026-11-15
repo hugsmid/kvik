@@ -667,22 +667,24 @@ its own prefix, which the engine never sees.
 <sid>/manifest/<generation:8 hex>/<epoch:16 hex>     one manifest record
 <sid>/claims/<generation:8 hex>                      a generation claim marker
 <sid>/probe                                          the conditional-write probe
-<sid>/probe/<nonce:32 hex>                           a checksum probe; stored only by a bucket that is refused
-<sid>/data/, <sid>/tree/                             reserved for kinds 2, 6 and 9–14, named by roadmap 6.2 and 7.1
+<sid>/files/<kind:2 hex>/<generation:8 hex>-<file_id:16 hex>   a file of any other kind (A.1)
+<sid>/probe/<nonce:32 hex>                           a checksum probe; stored only by a bucket that is refused (Q-213)
 ```
-  A listing of `<sid>/manifest/<generation>/` returns a generation's records in epoch order. Generation 0 has no
-  claim marker; it counts as claimed (`spec.md` §8 Generations). A reader ignores a key under `<sid>/` that this
-  table does not name. A restore finds the store id by listing from the first key and refuses a bucket whose keys
-  start with more than one store id; `attach_backup` refuses one with any key outside `<sid>/` (`OtherStore`).
+  A log segment (kind 1) is only under `log/`; `files/01/` names nothing. A listing of
+  `<sid>/manifest/<generation>/` returns a generation's records in epoch order. Generation 0 has no claim marker; it
+  counts as claimed (`spec.md` §8 Generations). A reader ignores a key under `<sid>/` that this table does not name,
+  and a key that does not start with a store id (32 lower-case hex digits and `/`). A restore finds the store id by
+  listing from the first key: none is `NoStore`, more than one `SeveralStores`; `attach_backup` refuses a bucket
+  holding a key under another store id (`OtherStore`).
 - **Uploaded forms (the plaintext).** `STORE` and a sealed log segment: the local file, byte for byte, so its
   plaintext SHA-256 is the one the manifest records. A manifest record: the record's A.2 block (header, body and
-  padding) exactly as `MANIFEST` holds it, and nothing else; checks: one valid record block, its `generation` and
-  `epoch` those of its key. A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
+  padding) in its canonical encoding, which for a record this build wrote is the bytes `MANIFEST` holds, and
+  nothing else; checks: one valid record block, its `generation` and `epoch` those of its key. A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
   The store id is bound by the envelope (key derivation and associated data), not repeated in the plaintext.
-- **Claim marker** (40 bytes): 0 magic ASCII `KVCL`; 4 version `u8` (1); 5 reserved (3); 8 generation `u32`, that
-  of its key; 12 reserved `u32`; 16 reset nonce `u64`, the claiming restore's fresh nonce (`spec.md` §8
-  Generations), never zero; 24 store id (16 bytes). The nonce makes each attempt's marker unique (Q-161). A marker
-  is written once; a restore that restarts before its restore record claims the next generation and never puts a
+- **Claim marker** (12 bytes, exactly): 0 generation `u32`, that of its key; 4 reset nonce `u64`, the claiming
+  restore's fresh nonce (`spec.md` §8 Generations), never zero. The store id is in the key and bound by the
+  envelope, and the envelope header carries the format version, so the marker repeats neither. The nonce makes
+  each attempt's marker unique (Q-161). A marker is written once; a restore that restarts before its restore record claims the next generation and never puts a
   marker again.
 - **Probe** (Q-162). The plaintext of a probe is 16 random bytes, never read. `attach_backup`, and a restore before
   it claims, refuse a bucket (`BackupRefused`) when: a put of a fresh probe to `<sid>/probe`, where that key was
@@ -690,9 +692,10 @@ its own prefix, which the engine never sees.
   object (`NoConditionalWrites`; where the key was present, the first put must fail and `stat` must report the
   earlier object unchanged); or a put of a fresh probe to `<sid>/probe/<nonce>` with a SHA-256 that is not its own
   (its own with every bit of byte 0 inverted) succeeds, or leaves an object under the key (`NoChecksums`); or a
-  `stat` reports no SHA-256 (`NoChecksums`). A bucket that passes keeps one probe object for ever; the engine never
+  `stat` reports no SHA-256 (`NoChecksums`); or `<sid>/STORE` is present and its envelope's key check value is not
+  the key's (`WrongKey`). A bucket that passes keeps one probe object for ever; the engine never
   deletes. Versioning or object lock cannot be probed through the sink and is the operator's to confirm. A drill
-  writes nothing and does not probe.
+  writes nothing and does not probe. How a restore reports a refusal: Q-214.
 
 **Envelope.** XChaCha20-Poly1305 from the audited `chacha20poly1305` crate; HMAC-SHA-256 as the key-derivation and
 nonce function. `K` is the application's 256-bit key (`api.md` `Encryption::Key`), `sid` the 16 store id bytes,
