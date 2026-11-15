@@ -598,11 +598,20 @@ fn writers_on_several_threads() {
 /// One step of a generated history.
 #[derive(Clone, Debug)]
 enum Step {
-    /// A call of readings, each (series index, seconds, value code, quality code, `changed_at`), with revise
-    /// intent or not.
-    Emit(Vec<(usize, i64, u8, u8, Option<u64>)>, bool),
+    /// A call of readings, each (series index, seconds, value code, quality code, `changed_at`, host-stamped), with
+    /// revise intent or not.
+    Emit(Vec<(usize, i64, u8, u8, Option<u64>, bool)>, bool),
     Retire(usize, i64),
-    Alias(usize),
+    /// An alias: a name from a small set shared by every series, so that names collide.
+    Alias(usize, usize),
+    /// The series defined again (a new series once it is retired).
+    Define(usize),
+    Retention(usize, bool),
+    SiteZone(usize, i64),
+    /// The clock moves on by this many seconds.
+    Advance(u64),
+    /// The clock is reported synchronised or not (spec §2.5).
+    Synced(bool),
 }
 
 fn specs() -> Vec<SeriesSpec> {
@@ -645,6 +654,9 @@ fn specs() -> Vec<SeriesSpec> {
     ]
 }
 
+const ALIASES: [&str; 3] = ["h/g/power", "h/x/shared", "h/y/other"];
+const ZONES: [&str; 3] = ["Europe/London", "Europe/Oslo", "Not/AZone"];
+
 fn value(code: u8) -> Value {
     match code % 12 {
         0 => Value::F64(1.0),
@@ -674,36 +686,58 @@ fn quality(code: u8) -> Quality {
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     let reading = (
         0usize..8,
-        -400i64..20,
+        -400i64..200,
         any::<u8>(),
         any::<u8>(),
         prop_oneof![Just(None), (0u64..3).prop_map(Some)],
+        prop::bool::weighted(0.15),
     );
     let step = prop_oneof![
-        6 => (prop::collection::vec(reading, 1..6), any::<bool>()).prop_map(|(r, rev)| Step::Emit(r, rev)),
+        10 => (prop::collection::vec(reading, 1..6), any::<bool>())
+            .prop_map(|(r, rev)| Step::Emit(r, rev)),
         1 => (0usize..7, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
-        1 => (0usize..7).prop_map(Step::Alias),
+        1 => (0usize..7, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
+        1 => (0usize..7).prop_map(Step::Define),
+        1 => (0usize..7, any::<bool>()).prop_map(|(i, d)| Step::Retention(i, d)),
+        1 => (0usize..ZONES.len(), -100i64..100).prop_map(|(z, t)| Step::SiteZone(z, t)),
+        2 => (0u64..400).prop_map(Step::Advance),
+        1 => prop::bool::weighted(0.7).prop_map(Step::Synced),
     ];
-    prop::collection::vec(step, 1..12)
+    prop::collection::vec(step, 1..16)
 }
 
-/// Runs a history on a store; returns every result in a comparable form, and the facts of each series.
-fn run(s: &Store, history: &[Step]) -> (Vec<String>, Vec<Vec<Fact>>) {
+/// What a history gives on one backend: every result in a comparable form, and per series its facts in each view.
+struct Run {
+    out: Vec<String>,
+    facts: Vec<Vec<Vec<Fact>>>,
+    infos: Vec<String>,
+}
+
+/// Runs a history on a store. Positions differ between the backends only by entries that are not facts (the model
+/// writes no recovery or tzdata entry); facts are compared without them, and the as-of views at the positions each
+/// backend gave the same readings.
+fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
     let mut out = Vec::new();
-    let ids: Vec<SeriesId> = specs()
+    let mut ids: Vec<SeriesId> = specs()
         .into_iter()
         .map(|spec| block_on(s.define_series(spec)).unwrap())
         .collect();
-    let id = |i: usize| ids.get(i).copied().unwrap_or(SeriesId(999));
-    for (n, step) in history.iter().enumerate() {
+    let mut all = ids.clone();
+    let mut recorded: Vec<Position> = Vec::new();
+    let mut times = Vec::new();
+    let id = |ids: &[SeriesId], i: usize| ids.get(i).copied().unwrap_or(SeriesId(999));
+    for step in history {
         match step {
             Step::Emit(rs, revise) => {
                 let readings: Vec<_> = rs
                     .iter()
-                    .map(|(i, t, v, q, c)| {
+                    .map(|(i, t, v, q, c, host)| {
                         let mut r =
-                            Reading::new(id(*i), at(*t), value(*v)).with_quality(quality(*q));
+                            Reading::new(id(&ids, *i), at(*t), value(*v)).with_quality(quality(*q));
                         r.changed_at = *c;
+                        if *host {
+                            r = r.host_stamped();
+                        }
                         r
                     })
                     .collect();
@@ -712,12 +746,30 @@ fn run(s: &Store, history: &[Step]) -> (Vec<String>, Vec<Vec<Fact>>) {
                 } else {
                     Intent::Normal
                 };
-                let ack = block_on(s.emit_with(&readings, intent)).unwrap();
+                // Host-stamped readings wait for a synchronised clock: asked without waiting.
+                let waits = rs.iter().any(|r| r.5);
+                let ack = if waits {
+                    match s.try_emit(&readings) {
+                        Ok(p) => block_on(p),
+                        Err(e) => {
+                            out.push(format!("emit {e:?}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    block_on(s.emit_with(&readings, intent))
+                }
+                .unwrap();
                 let outcomes: Vec<String> = ack
                     .outcomes
                     .iter()
                     .map(|o| match o {
-                        Outcome::Recorded { outranked, .. } => {
+                        Outcome::Recorded {
+                            outranked,
+                            position,
+                            ..
+                        } => {
+                            recorded.push(*position);
                             format!("recorded outranked={outranked}")
                         }
                         other => format!("{other:?}"),
@@ -727,44 +779,149 @@ fn run(s: &Store, history: &[Step]) -> (Vec<String>, Vec<Vec<Fact>>) {
             }
             Step::Retire(i, t) => out.push(format!(
                 "retire {:?}",
-                block_on(s.retire(id(*i), at(*t))).map_err(|e| e.to_string())
+                block_on(s.retire(id(&ids, *i), at(*t))).map_err(|e| e.to_string())
             )),
-            Step::Alias(i) => out.push(format!(
+            Step::Alias(i, n) => out.push(format!(
                 "alias {:?}",
-                block_on(s.alias(id(*i), &format!("h/alias/{n}"))).map_err(|e| e.to_string())
+                block_on(s.alias(id(&ids, *i), ALIASES[*n])).map_err(|e| e.to_string())
             )),
+            Step::Define(i) => {
+                let r = block_on(s.define_series(specs()[*i].clone()));
+                if let Ok(new) = &r {
+                    if !all.contains(new) {
+                        all.push(*new);
+                    }
+                    ids[*i] = *new;
+                }
+                out.push(format!(
+                    "define {:?}",
+                    r.map(|_| ()).map_err(|e| e.to_string())
+                ));
+            }
+            Step::Retention(i, diagnostic) => {
+                let class = if *diagnostic {
+                    RetentionClass::Diagnostic {
+                        period: Duration::from_secs(3_600),
+                    }
+                } else {
+                    RetentionClass::LongTerm
+                };
+                let change = kvik::ParameterChange::default().retention(class);
+                out.push(format!(
+                    "retention {:?}",
+                    block_on(s.set_parameters(id(&ids, *i), at(0), change))
+                        .map_err(|e| e.to_string())
+                ));
+            }
+            Step::SiteZone(z, t) => out.push(format!(
+                "zone {:?}",
+                block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)))
+                    .map_err(|e| e.to_string())
+            )),
+            Step::Advance(secs) => {
+                clock.advance(Duration::from_secs(*secs));
+                times.push(clock.wall());
+            }
+            Step::Synced(on) => clock.set_synchronised(*on),
         }
     }
+    clock.set_synchronised(true);
     let r = s.reader();
-    let facts = ids
+    let range = at(-1_000_000)..at(1_000_000);
+    let mut views = vec![View::History, View::Current];
+    views.extend(
+        [recorded.len() / 3, recorded.len() / 2]
+            .iter()
+            .filter_map(|k| recorded.get(*k))
+            .map(|p| View::AsOf(*p)),
+    );
+    views.extend(times.iter().take(2).map(|t| View::AsOfTime(*t)));
+    let facts = all
         .iter()
         .map(|id| {
-            history_facts(&r, *id)
-                .into_iter()
-                .map(|mut f| {
-                    // Positions differ only by what each backend counts besides facts; compare everything else.
-                    f.position = Position::ORIGIN;
-                    f
+            views
+                .iter()
+                .map(|v| {
+                    r.facts(*id, range.clone(), *v)
+                        .unwrap()
+                        .map(|f| {
+                            let mut f = f.unwrap();
+                            f.position = Position::ORIGIN;
+                            f
+                        })
+                        .collect()
                 })
                 .collect()
         })
         .collect();
-    (out, facts)
+    let infos = all
+        .iter()
+        .map(|id| {
+            let i = s.series(*id).unwrap();
+            format!(
+                "{} {:?} {:?} {:?} {:?} {:?}",
+                i.name, i.names, i.retired_at, i.latest_t, i.lateness_reference, i.spec.retention
+            )
+        })
+        .collect();
+    Run { out, facts, infos }
 }
 
-fn history_facts(r: &Reader, id: SeriesId) -> Vec<Fact> {
-    let mut fs = history(r, id);
-    for f in &mut fs {
-        // NaN is never stored, so facts compare with `==`.
-        assert!(!matches!(f.value, Value::F64(x) if x.is_nan()));
+/// `late` as spec §2.2 defines it, for the facts of one series in position order: the first clause against the
+/// lateness reference, which leaves out facts flagged `future` or `unsynced_clock`. The model still uses the latest
+/// recorded `t` there (Q-74, invariant 24, not yet modelled), so the two backends are compared without the flag and
+/// the durable backend's flag against this.
+fn check_late(info: &kvik::SeriesInfo, facts: &[Fact]) {
+    let s = info.staleness.map(|d| d.as_nanos() as i64);
+    let bound = info.spec.lateness_bound.unwrap().as_nanos() as i64;
+    let observed = info.spec.timing == kvik::Timing::Observed;
+    let d = match &info.spec.kind {
+        Kind::Interval {
+            length: IntervalLength::Fixed { d, .. },
+            ..
+        } if observed => d.as_nanos() as i64,
+        _ => 0,
+    };
+    let mut reference: Option<i64> = None;
+    for f in facts {
+        let synced = !f.flags.unsynced_clock;
+        let reach = f.t.0 + d;
+        let out_of_order = match (reference, s) {
+            (Some(r), Some(s)) => observed && !f.flags.future && f.t.0 < r - 2 * s,
+            _ => false,
+        };
+        let late = synced && (out_of_order || f.received_at.0 - reach > bound);
+        assert_eq!(f.flags.late, late, "{f:?}");
+        if !f.flags.future && !f.flags.unsynced_clock {
+            reference = reference.max(Some(f.t.0));
+        }
     }
-    fs
+}
+
+fn without_late(facts: &[Vec<Vec<Fact>>]) -> Vec<Vec<Vec<Fact>>> {
+    facts
+        .iter()
+        .map(|views| {
+            views
+                .iter()
+                .map(|fs| {
+                    fs.iter()
+                        .map(|f| {
+                            let mut f = f.clone();
+                            f.flags.late = false;
+                            f
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[test]
 fn the_durable_backend_decides_as_the_model_does() {
-    // Each case opens a durable store; a sixteenth of the configured cases keeps the deep run in bounds.
-    let cases = (ProptestConfig::default().cases / 16).max(16);
+    // Each case opens a durable store; a quarter of the configured cases keeps the deep run in bounds.
+    let cases = (ProptestConfig::default().cases / 4).max(16);
     let mut runner = TestRunner::new(ProptestConfig {
         cases,
         failure_persistence: None,
@@ -772,7 +929,7 @@ fn the_durable_backend_decides_as_the_model_does() {
     });
     runner
         .run(&steps(), |history| {
-            let clock = ManualClock::new(start());
+            let m_clock = ManualClock::new(start());
             let model = block_on(Store::open(
                 StoreConfig::new(
                     format!("kvik-test/differential/{}", next()),
@@ -780,20 +937,30 @@ fn the_durable_backend_decides_as_the_model_does() {
                 )
                 .create_if_missing(true)
                 .backend(Backend::Model)
-                .env(Env::test(clock.clone())),
+                .env(Env::test(m_clock.clone())),
             ))
             .unwrap();
-            let w = World {
-                clock,
-                ..World::new("differential")
-            };
+            let w = World::new("differential");
             let mut config = w.config();
             config.log.min_sync_interval = Duration::ZERO;
             let durable = block_on(Store::open(config)).unwrap();
-            let (m_out, m_facts) = run(&model, &history);
-            let (d_out, d_facts) = run(&durable, &history);
-            prop_assert_eq!(m_out, d_out);
-            prop_assert_eq!(m_facts, d_facts);
+            let m = run(&model, &m_clock, &history);
+            let d = run(&durable, &w.clock, &history);
+            prop_assert_eq!(&m.out, &d.out);
+            prop_assert_eq!(&m.infos, &d.infos);
+            prop_assert_eq!(without_late(&m.facts), without_late(&d.facts));
+            let r = durable.reader();
+            for id in (1..=d.facts.len() as u32).map(SeriesId) {
+                let info = durable.series(id).unwrap();
+                let fs: Vec<Fact> = r
+                    .facts(id, at(-1_000_000)..at(1_000_000), View::History)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                let mut by_position = fs.clone();
+                by_position.sort_by_key(|f| f.position);
+                check_late(&info, &by_position);
+            }
             block_on(durable.shutdown()).unwrap();
             block_on(model.shutdown()).unwrap();
             Ok(())

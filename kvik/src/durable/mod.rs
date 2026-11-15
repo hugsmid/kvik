@@ -589,10 +589,9 @@ impl Writer {
                 reason: "1 to 255 bytes".into(),
             });
         }
-        match d.registry.resolve(name) {
-            Some(s) if s.def.id != id.0 => return Err(Error::NameInUse(name.into())),
-            Some(_) => return Ok(()),
-            None => {}
+        // A name the series already carries is given again: it becomes the display name, as in the model.
+        if d.registry.resolve(name).is_some_and(|s| s.def.id != id.0) {
+            return Err(Error::NameInUse(name.into()));
         }
         self.commit_entry(
             &mut d,
