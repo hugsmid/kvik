@@ -149,7 +149,7 @@ pub struct LogConfig {
     pub segment_size: u64,
     /// A segment is sealed after this long at the latest (default 5 minutes).
     pub seal_interval: Duration,
-    /// Log syncs are due at least this far apart (default 10 ms; 0 disables; spec §3 Group commit).
+    /// Batch syncs are due at least this far apart (default 10 ms; 0 disables; spec §3 Group commit).
     pub min_sync_interval: Duration,
     /// Largest batch (default 1 MiB; 64 KiB to 8 MiB).
     pub max_batch_bytes: u64,

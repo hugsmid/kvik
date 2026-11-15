@@ -914,19 +914,26 @@ interval apart, so spec §3 Group commit's "at least `min_sync_interval` apart" 
 A lower default interval moves the edge to a higher rate, at the cost of the host-write cap roadmap 2.2 measured.
 **Settled** by an engineering fix, pending the next run on the Linux NVMe target. The writer thread confirms the
 cause: it sleeps until `sync_ready_at` with a timed wait and stamps the sync's start when it wakes, so any lateness
-moved the next deadline. A late start can also come from a turn entered late with the bound already passed (a call
-arriving during the timed mark sync), which a rule correcting only syncs that waited on the bound would turn into a
-permanent offset. The rule now: a batch sync is due when the bound let it start, but no more than half the interval
-before it starts; the next may start `min_sync_interval` after that. So a late wake or a stall of up to half the
-interval delays no later sync; under saturation syncs keep to a grid one interval apart, so any n + 1 consecutive
-syncs start at least n intervals less a half apart and none less than half an interval apart; a call during a sync
-still waits for the next batch. The cost: after a quiet period, which credits the full half, a burst's first batch
-follows the lone first reading after half the interval rather than a whole one. The sync that takes a segment into
-use at a timed seal stays due when it starts. Option (a) would have kept a known miss at the named load; option (c)
-only moves the edge and spends host writes. Anchoring to the oldest call's arrival would avoid the burst cost but
-needs a monotonic stamp on every call and a change to the call source; not worth it for one batch after a quiet
-period. Pinned by `log/tests/cadence.rs` (late wakes, a stall, saturation with stalls, a burst after a quiet period).
-macOS before and after: `docs/measurements/4.8-commit-latency.md`, macOS, the Q-310 fix.
+moved the next deadline. Two more ways to start late give the same lasting delay at one call per interval, with no
+spare slot to recover in: a turn entered late with the bound already passed (a call arriving during the timed mark
+sync), and the sync that takes a segment into use at a timed seal, which took a slot of the bound at whatever phase
+it fell. A rule correcting only syncs that waited on the bound misses the first; capping the correction at half an
+interval leaves a stall over half an interval, and a seal late in the interval, as a lasting delay.
+**Rule.** Two clocks. A batch sync is due when the previous one's due time let it start, but at most one interval
+before it starts; the next may start once `min_sync_interval` has passed since that due time and half of it since
+the previous log sync started, a timed seal's included. The seal's sync spaces the next batch but takes no slot.
+So late wakes and stalls delay no later sync (a stall is caught up at half-interval spacing), under saturation batch
+syncs keep to a grid one interval apart, any n + 1 consecutive batch syncs span at least n − 1 intervals, no two log
+syncs start under half an interval apart, and a call during a sync still waits for the next batch. Costs: after a
+quiet period a burst's first batch follows the lone first reading after half the interval rather than a whole one;
+a seal adds one sync per seal interval beyond the bound and delays at most one call, by under half an interval;
+spec §3 Sealing's "counts as the previous log sync for the next batch" now holds for the spacing only.
+**Rejected.** (a) would have kept a known miss at the named load; (c) only moves the edge and spends host writes.
+Anchoring to the oldest call's arrival avoids the burst cost but needs a monotonic stamp on every call and a change
+to the call source, for one batch after a quiet period.
+**Tests.** `log/tests/cadence.rs`: late wakes, stalls of 3, 8 and 30 ms, a seal early and late in the interval,
+saturation with late wakes and stalls, a burst after a quiet period. macOS before and after:
+`docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
 ## Q-198 — The backup and restore interfaces ahead of their implementations
 
 Recorded at the interfaces commit of roadmap 8.1 and 8.3, which defines the types, traits and fakes the parallel
@@ -1466,7 +1473,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Cursor file synced at most every 1 s | §4 Consumer state (and at once when a confirmation changes a latch, Q-132) | The cursor and the latches are durable at once on confirmation; the mark file is synced first when the cursor would name a position above the last synced mark (§3 Durable mark) | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Group commit and `min_sync_interval` | §3 Group commit: log syncs are due at least the interval apart (Q-310); a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
+| Group commit and `min_sync_interval` | §3 Group commit: batch syncs are due at least the interval apart and start at least half of it after any log sync (Q-310); a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
 | Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
 | Unknown condition and live state during a restore | §6 Conditions, §2.3 Live state, §4 Resync, §8 Restore step 2, invariant 16 (Q-49 (b)): an evaluation with no local detail is skipped and counted (`evaluations_unknown`), the condition keeps its latched state, `resync` reports "unknown", and the first evaluation with detail is a transition if it differs from the latch or there is none; live state of a series whose latest recorded `t` no local fact or stored node holds is unknown, not none | Not modelled: a series that stores no level answers windows and live state during a restore from its local facts, without a flag; nothing is reported unknown or counted | — |

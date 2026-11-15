@@ -20,6 +20,8 @@ const INTERVAL: Duration = Duration::from_millis(10);
 const SYNC: Duration = Duration::from_millis(2);
 /// Loads start well after the writer opens, so no bound applies to their first call.
 const START: Duration = Duration::from_secs(1);
+/// A seal interval no test reaches.
+const NO_SEAL: Duration = Duration::from_secs(300);
 
 fn fact(t: i64) -> Item {
     Item::Fact(FactRow {
@@ -44,7 +46,7 @@ struct Sim {
 }
 
 impl Sim {
-    fn new() -> Self {
+    fn new(seal_interval: Duration) -> Self {
         let fs = MemFs::new();
         let new = NewStore {
             store_id: [7; 16],
@@ -60,6 +62,7 @@ impl Sim {
             disk_critical: 0,
             disk_low_bytes: 0,
             relaxed_limits: true,
+            seal_interval,
             ..WriterConfig::default()
         };
         assert_eq!(cfg.min_sync_interval, INTERVAL);
@@ -89,20 +92,19 @@ impl Sim {
         self.q.push(call).unwrap()
     }
 
-    /// One turn of the writer at `now`: its next deadline, and whether it synced a batch.
+    /// One turn of the writer at `now`: its next deadline, and whether it synced.
     fn turn(&mut self, now: Duration) -> (Option<Duration>, bool) {
-        let before = self.w.stats().batches;
+        let (batches, syncs) = (self.w.stats().batches, self.w.stats().syncs);
         let step = self.w.step(now, T0 + now.as_nanos() as i64, &mut self.q);
         for (id, r) in step.done {
             r.unwrap();
             self.covered.insert(id, now);
         }
         self.create();
-        let synced = self.w.stats().batches > before;
-        if synced {
+        if self.w.stats().batches > batches {
             self.starts.push(now);
         }
-        (step.next, synced)
+        (step.next, self.w.stats().syncs > syncs)
     }
 }
 
@@ -117,8 +119,9 @@ fn one_call_per_interval(
     n: usize,
     wake: impl Fn(usize) -> Duration,
     late: Duration,
+    seal_interval: Duration,
 ) -> Vec<Duration> {
-    let mut s = Sim::new();
+    let mut s = Sim::new(seal_interval);
     let arrivals: Vec<Duration> = (0..n).map(|k| START + INTERVAL * k as u32).collect();
     let mut ids = Vec::new();
     let (mut k, mut free, mut next) = (0, Duration::ZERO, None);
@@ -155,22 +158,48 @@ fn late_wakes_do_not_add_up_at_one_call_per_interval() {
         300,
         |k| if k % 50 == 1 { 300 * US } else { 20 * US },
         100 * US,
+        NO_SEAL,
     );
     let worst = waits.iter().max().unwrap();
     assert!(*worst <= 300 * US, "a call waited {worst:?}");
 }
 
 #[test]
-fn a_stalled_turn_does_not_delay_later_calls() {
-    let waits = one_call_per_interval(300, |k| if k == 20 { 3 * MS } else { 20 * US }, 100 * US);
-    let worst = waits[21..].iter().max().unwrap();
-    assert!(*worst <= 20 * US, "a call after the stall waited {worst:?}");
+fn a_stalled_turn_delays_no_call_after_the_stall_is_caught_up() {
+    for stall in [3, 8, 30] {
+        let waits = one_call_per_interval(
+            300,
+            |k| if k == 20 { stall * MS } else { 20 * US },
+            100 * US,
+            NO_SEAL,
+        );
+        let worst = waits[25..].iter().max().unwrap();
+        assert!(
+            *worst <= 20 * US,
+            "after a {stall} ms stall a call waited {worst:?}"
+        );
+    }
+}
+
+#[test]
+fn a_timed_seal_delays_at_most_one_call_by_under_half_an_interval() {
+    for (phase, delayed) in [(3, 0), (7, 1)] {
+        let seal = Duration::from_secs(2) + MS * phase;
+        let waits = one_call_per_interval(300, |_| 20 * US, 100 * US, seal);
+        let late: Vec<_> = waits.iter().filter(|w| **w > 20 * US).collect();
+        assert_eq!(
+            late.len(),
+            delayed,
+            "a seal {phase} ms into the interval: {late:?}"
+        );
+        assert!(late.iter().all(|w| **w < INTERVAL / 2), "{late:?}");
+    }
 }
 
 #[test]
 fn syncs_under_saturation_keep_the_rate_bound_through_late_wakes_and_stalls() {
-    let mut s = Sim::new();
-    let mut at = START;
+    let mut s = Sim::new(NO_SEAL);
+    let mut at = Duration::ZERO;
     for n in 0..800u32 {
         if s.q.is_empty() {
             s.push();
@@ -192,17 +221,9 @@ fn syncs_under_saturation_keep_the_rate_bound_through_late_wakes_and_stalls() {
     }
     let st = &s.starts;
     assert!(st.len() > 300);
-    for (i, w) in st.windows(2).enumerate() {
-        assert!(
-            w[1] - w[0] >= INTERVAL / 2,
-            "syncs {i} and {} start {:?} apart",
-            i + 1,
-            w[1] - w[0]
-        );
-    }
     for i in 0..st.len() {
         for j in i + 1..st.len() {
-            let floor = (INTERVAL * (j - i) as u32).saturating_sub(INTERVAL / 2);
+            let floor = (INTERVAL * (j - i - 1) as u32).max(INTERVAL / 2);
             assert!(
                 st[j] - st[i] >= floor,
                 "syncs {i} to {j} span {:?}",
@@ -214,7 +235,7 @@ fn syncs_under_saturation_keep_the_rate_bound_through_late_wakes_and_stalls() {
 
 #[test]
 fn after_a_quiet_period_a_burst_waits_half_an_interval_and_forms_one_batch() {
-    let mut s = Sim::new();
+    let mut s = Sim::new(NO_SEAL);
     let a = s.push();
     s.turn(START);
     assert_eq!(
@@ -234,7 +255,7 @@ fn after_a_quiet_period_a_burst_waits_half_an_interval_and_forms_one_batch() {
     let (next, _) = s.turn(START + INTERVAL / 2 + SYNC);
     assert_eq!(
         next,
-        Some(START + INTERVAL + INTERVAL / 2),
-        "the burst's sync was due on time"
+        Some(START + INTERVAL),
+        "the burst's sync was due at the first reading"
     );
 }
