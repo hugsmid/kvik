@@ -202,11 +202,9 @@ impl Transport for HttpTransport {
         let mut builder = ureq::http::Request::builder()
             .method(request.method.as_str())
             .uri(request.url());
+        // `host` is sent as signed; the client then adds none of its own.
         for (k, v) in &request.headers {
-            // The client sets `host` from the URL, which carries the same value.
-            if k != "host" {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
+            builder = builder.header(k.as_str(), v.as_str());
         }
         let result = match &request.body {
             Some(body) => {

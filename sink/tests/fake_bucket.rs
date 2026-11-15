@@ -2,15 +2,13 @@
 //! (spec §8 Hashes, Bucket, Generations), retries and faults.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
 use kvik::{BackupSink, ListPage, SinkError, Stored};
 use kvik_sink::fake::{Checksums, FakeBucket, FakeOp, Fault};
-use kvik_sink::transport::{Request, Response, Transport, TransportError};
 use kvik_sink::verify::{self, VerifyError, sha256};
-use kvik_sink::{Addressing, RetryPolicy, S3Sink, SystemWallClock, ThreadSleep, block_on};
+use kvik_sink::{Addressing, RetryPolicy, S3Sink, block_on};
 
 fn bytes(s: &[u8]) -> Arc<[u8]> {
     Arc::from(s)
@@ -444,42 +442,46 @@ fn the_sink_works_as_a_trait_object() {
     assert_eq!(block_on(boxed.get("data/dyn", None)).unwrap(), b"dyn");
 }
 
-/// A transport that holds every request until released.
-struct Gate {
-    open: AtomicBool,
-    inner: FakeBucket,
-}
-
-impl Transport for Gate {
-    fn send(&self, r: &Request) -> Result<Response, TransportError> {
-        while !self.open.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        self.inner.send(r)
-    }
-}
-
 #[test]
 fn polling_never_blocks_on_the_network() {
     let bucket = FakeBucket::new();
-    let gate = Arc::new(Gate {
-        open: AtomicBool::new(false),
-        inner: bucket.clone(),
-    });
-    let sink = S3Sink::with_seams(
-        bucket.config(),
-        gate.clone(),
-        Arc::new(SystemWallClock),
-        Arc::new(ThreadSleep),
-    )
-    .unwrap();
-    let mut fut = sink.put("data/gate", bytes(b"g"), sha256(b"g"));
+    let sink = bucket.sink();
+    bucket.hold();
+    let mut fut = sink.put("data/held", bytes(b"g"), sha256(b"g"));
     let mut cx = Context::from_waker(Waker::noop());
-    // The exchange is stuck in the transport, yet the poll returns at once.
+    // The exchange waits in the transport, yet each poll returns at once.
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(fut.as_mut().poll(&mut cx).is_pending());
-    gate.open.store(true, Ordering::Release);
+    assert_eq!(bucket.object("data/held"), None);
+    bucket.release();
     assert_eq!(block_on(fut).unwrap().size, 1);
+}
+
+#[test]
+fn coded_errors_are_classified() {
+    let bucket = FakeBucket::new();
+    let sink = bucket.sink();
+    // The bucket's own checksum check: a mismatch, never retried.
+    bucket.inject(FakeOp::Put, Fault::Coded(400, "BadDigest"));
+    assert_eq!(
+        put(&sink, "data/d", b"x"),
+        Err(SinkError::HashMismatch {
+            key: "data/d".into()
+        })
+    );
+    assert_eq!(bucket.count(FakeOp::Put), 1);
+    assert_eq!(bucket.object("data/d"), None);
+    // A slow upload and a concurrent conditional write: retried.
+    bucket.inject(FakeOp::Put, Fault::Coded(400, "RequestTimeout"));
+    bucket.inject(FakeOp::Put, Fault::Coded(409, "ConditionalRequestConflict"));
+    put(&sink, "data/d", b"x").unwrap();
+    assert_eq!(bucket.count(FakeOp::Put), 4);
+    // A clock too far off: refused for good.
+    bucket.inject(FakeOp::Head, Fault::Coded(403, "RequestTimeTooSkewed"));
+    assert!(matches!(
+        block_on(sink.stat("data/d")),
+        Err(SinkError::Failed { .. })
+    ));
 }
 
 #[test]

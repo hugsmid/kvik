@@ -12,7 +12,7 @@ S3-compatible object storage, and an in-memory fake bucket for tests.
   retries with exponential backoff and jitter; the returned futures never block and need no runtime.
 - **`fake::FakeBucket`**: the same protocol subset in memory, at the transport seam. It checks signatures, payload
   hashes and checksums, honours conditional writes, serves ranges and pages listings, and injects faults: server
-  errors, timeouts before and after a request is applied, cut uploads, truncated downloads, a bucket that stores
+  errors (also with a given error code), timeouts before and after a request is applied, requests held unanswered, cut uploads, truncated downloads, a bucket that stores
   other bytes, one that trusts the sent hash, one that reports none, damage in the bucket and lagging listings.
 - **`verify`**: `upload`, `check` and `download` give a `Verified` copy only after the bucket's reported hash (or
   the downloaded bytes) match.

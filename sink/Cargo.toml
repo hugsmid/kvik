@@ -20,7 +20,7 @@ sha2 = "0.11"
 thiserror = "2"
 # A blocking HTTP/1.1 client over rustls, run on the sink's own worker threads
 # so that the futures the sink returns never block when polled.
-ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 proptest = "1"

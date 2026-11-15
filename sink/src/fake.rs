@@ -5,7 +5,7 @@
 //! the sink's rules to hold.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -55,6 +55,9 @@ pub enum FakeOp {
 pub enum Fault {
     /// Answer with this status and an error body; nothing is applied.
     Status(u16),
+    /// Answer with this status and error code (`BadDigest`, say); nothing
+    /// is applied.
+    Coded(u16, &'static str),
     /// Time out before the request reaches the bucket; nothing is applied.
     TimeoutBefore,
     /// Apply the request, then lose the reply (a timeout).
@@ -107,6 +110,8 @@ struct State {
 #[derive(Clone, Default)]
 pub struct FakeBucket {
     state: Arc<Mutex<State>>,
+    /// While true, requests wait before reaching the bucket.
+    held: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl std::fmt::Debug for FakeBucket {
@@ -170,6 +175,19 @@ impl FakeBucket {
     /// order queued, each once.
     pub fn inject(&self, op: FakeOp, fault: Fault) {
         self.lock().faults.push_back((op, fault));
+    }
+
+    /// Holds every later request before it reaches the bucket, as a bucket
+    /// that does not answer, until [`release`](Self::release). A sink's
+    /// exchange timeout does not apply to the fake.
+    pub fn hold(&self) {
+        *self.held.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Lets held requests, and later ones, through.
+    pub fn release(&self) {
+        *self.held.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.held.1.notify_all();
     }
 
     /// Faults still queued.
@@ -331,6 +349,13 @@ fn signature_ok(req: &Request, body_sha: &str) -> Result<(), Response> {
 
 impl Transport for FakeBucket {
     fn send(&self, req: &Request) -> Result<Response, TransportError> {
+        {
+            let (lock, cvar) = &*self.held;
+            let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while *held {
+                held = cvar.wait(held).unwrap_or_else(|e| e.into_inner());
+            }
+        }
         let target = req.url();
         let fault = {
             let mut s = self.lock();
@@ -344,6 +369,9 @@ impl Transport for FakeBucket {
         match fault {
             Some(Fault::Status(code)) => {
                 return Ok(error(code, "InjectedFault", "fault injected by the test"));
+            }
+            Some(Fault::Coded(status, code)) => {
+                return Ok(error(status, code, "fault injected by the test"));
             }
             Some(Fault::TimeoutBefore) => {
                 return Err(TransportError::Timeout(
