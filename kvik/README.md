@@ -151,7 +151,9 @@ Different from `docs/api.md`:
   yet (roadmap 5.3).
 - **`Reader::interval`** returns the interval that contains `t`, whether or not `t` is its start.
 - **`Consumer::next`** ends with `None` on any error, not only after a shutdown; `try_next` returns the error.
-- `BackupSink` takes and returns `Vec<u8>` until roadmap 8.2 settles its signatures.
+- `BackupSink` takes `Arc<[u8]>` and returns `Vec<u8>` where `docs/api.md` showed `Bytes` (std types only, by the
+  stable-shapes principle); its futures are boxed (`SinkFuture`) so that `dyn BackupSink` works, it fails with
+  `SinkError`, and `list` returns one page (`ListPage`) at a time.
 - **Added**: `Store::tick` (temporary), `Store::now`, `Store::is_durable`, `Store::consumer_stats`,
   `Consumer::try_next`, `Consumer::unroute`, `Consumer::routes`, `Reader::series`, `Ack::recorded`, `Start::Time`,
   `Trigger.cause`, `DeliveryFlags.outranked`, `WindowResult.count` and `coverage_fraction`,

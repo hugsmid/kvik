@@ -106,7 +106,9 @@ mod types;
 
 pub mod env;
 
-pub use backup::{BackupSink, Encryption, Rebuild, RestoreMode, Stored};
+pub use backup::{
+    BackupSink, Encryption, ListPage, Rebuild, RestoreMode, SinkError, SinkFuture, Stored,
+};
 pub use config::{
     Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,
 };

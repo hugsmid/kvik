@@ -400,19 +400,41 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 
 ## Backup and restore
 ```rust
-trait BackupSink {
-    async fn put(&self, key: &str, bytes: Bytes, sha256: [u8; 32]) -> Result<Stored>;
-    async fn stat(&self, key: &str) -> Result<Option<Stored>>;   // reported hash and size
-    async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Bytes>;
-    async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+pub type SinkFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SinkError>> + Send + 'a>>;
+pub trait BackupSink: Send + Sync {                                 // object-safe: `dyn BackupSink` works
+    fn put<'a>(&'a self, key: &'a str, bytes: Arc<[u8]>, sha256: [u8; 32]) -> SinkFuture<'a, Stored>;
+    fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>>;    // reported size and hash
+    fn get<'a>(&'a self, key: &'a str, range: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>>;
+    fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>) -> SinkFuture<'a, ListPage>;
 }
+pub struct Stored { pub size: u64, pub sha256: [u8; 32] }           // as the bucket reports it
+pub struct ListPage { pub keys: Vec<String>, pub more: bool }       // ascending; ask again after the last key
+pub enum SinkError { Exists { key }, NotFound { key }, HashMismatch { key }, InvalidRange { key },
+                     TooLarge { size, limit }, Transient { reason }, Failed { reason } }
 store.attach_backup(sink, Encryption::Key(key)).await?;
 let end: Position = Store::restore(dir, sink, Encryption::Key(key), RestoreMode::SummariesFirst).await?;
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
 ```
-The sink has no delete. An S3-compatible implementation lives in a separate crate. The sink's signatures are
-settled with roadmap 8.2, under the stable-shapes and runtime-neutral principles.
+The sink has no delete. Settled with roadmap 8.2, under the stable-shapes and runtime-neutral principles (std types
+only, boxed `Send` futures):
+- **No overwrite.** `put` creates an object only where the key is absent. An existing object with the same size and
+  reported SHA-256 makes it succeed (an upload repeated after a lost reply or a restart); other content is
+  `SinkError::Exists`. This is the create-if-absent of generation claims (spec §8 Generations).
+- **Hashes.** `put` sends the SHA-256 with a single-part upload, and the bucket must reject a mismatch
+  (`HashMismatch`); the returned `Stored` is what the bucket reports when asked after the upload, and `put` fails
+  with `HashMismatch` where it differs (spec §8 Hashes). An object above the single-part limit is `TooLarge`.
+- **Ranges** are half-open; an empty range within the object returns no bytes; one past its end is `InvalidRange`.
+- **Listings** are paged and may lag behind writes on some buckets: absence from a listing proves nothing, and `put`
+  alone decides whether a key is taken.
+- `Transient` faults (timeouts, lost connections, server errors, throttling, damaged downloads) may be retried; a
+  `put` that failed this way may have stored the object, and repeating it is safe. `BackupError::Sink` carries a
+  `SinkError`.
+
+The S3-compatible implementation, its retries and timeouts, and an in-memory fake bucket with injected faults are in
+the `kvik-sink` crate. The object keys, the uploaded form of a manifest record, the claim marker and the encryption
+envelope are not settled (`format-check.md` FC-33;
+[Q-160](../model/OPEN-QUESTIONS.md#q-160--objects-in-the-deep-tier-keys-claim-marker-and-envelope)).
 
 ## Environment seams (accepted at gate 3.3)
 ```rust

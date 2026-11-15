@@ -368,6 +368,9 @@ and the key type of `Encryption::Key` are not defined, nor key rotation.
 `Vec`, and a restore holds them all in memory.
 **Needed:** the trait's final shape.
 **Deferred at gate 3.3** to roadmap 8.2 (needs the sink); the stable-shapes and runtime-neutral principles apply.
+**Resolved at roadmap 8.2:** `api.md` Backup and restore (boxed `Send` futures, so `dyn BackupSink` works; std types
+and `SinkError`; create-if-absent `put` that accepts its own repeat; paged `list`). Still open: the seekable envelope
+and the key (FC-33, Q-160), and key rotation.
 
 ### AC-24 — Restore, rebuild and export calls
 **Where:** Backup and restore · **Severity:** can wait (8.3) · **Relates to:** §8 Restore, Re-ingest, §11 Ingest
