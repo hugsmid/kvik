@@ -33,6 +33,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 | §3 Recovery, Order of a start; `format.md` A.4, A.10, A.14 | Recovery at a start: points left open |
 | Q-118 | §7 Readers, Leases; `format.md` A.2, A.10, A.13, A.15 | The reader process and leases: points left open |
 | Q-121 | §2.1 `id`, id floors; `format.md` A.6, A.10 | Series id 0 against an id floor of 0 |
+| Q-122 | §3 Durable mark, §2.1 id floors; `format.md` A.10 Update | A torn mark update can leave a mark older than the last one synced |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -488,7 +489,13 @@ new segment for its entry, nothing can be written until it exists. (l) *Unused s
 header.* A.4 keeps an unused segment as the one created ahead by its header and length alone. (m) *Consumers.* The
 entry's field 47 names consumers whose cursor file was missing or unreadable; cursor files are roadmap 5.2. (n)
 *Restart time.* A start reads every unsealed segment whole, and the last sealed one for its trailer, against the
-restart budget of `design.md`.
+restart budget of `design.md`. (o) *A mark from the page cache under `EveryCommit`.* The order of a start syncs the
+mark only under rule 3. Under rule 1 a mark read on the same boot may not be on stable storage, yet a batch it covers
+is read and delivered at once; with the mark synced at every commit, a remount within the boot then truncates that
+batch, which syncing at every commit is said to prevent (Recovery rule 1). Found by roadmap 4.7. (p) *A header put in
+use by a failed sync.* When the sync of a batch that takes a segment into use fails, the new header is in the page
+cache only; a start on the same boot keeps the segment in use from that header without writing it again, so after a
+later power loss the segment reads as unused unless a batch in it was synced since. Found by roadmap 4.7.
 **Implemented.** (a) The start refuses to open (`StoreError::ManifestCorrupt`). (b) Only lost-range records of the
 manifest count. (c) A start reports what it found and what the manifest holds; earlier recovery entries are read by
 the item that puts the engine behind the interface. (d) Treated as a first start, if the manifest names no position either: the mark is written again in place.
@@ -499,7 +506,10 @@ lease file names, a void lease's included; an unreadable lease file counts as in
 the start stays read-only (`log/tests/reader.rs`). (h) Only unsealed segments are checked. (i)
 Left as it is. (j) Any sealed segment holding positions above the mark makes the mark stale (rule 3). (k) The start
 stays read-only; the next start retries. (l) Deleted unless every byte after the header is zero. (m) Always empty.
-(n) Measured by roadmap 4.8.
+(n) Measured by roadmap 4.8. (o) With `mark_sync = EveryCommit`, or no boot identity, a start on the same boot syncs
+the mark it read before it resumes. (p) Left as it is: that later start writes the header again from the segment's
+first complete batch; a torn batch alone in the segment is deleted with it under (l) and not reported
+(`log/tests/model_histories.rs`).
 **Needed.** A rule for each part; (a) with roadmap 6.3, (b) and (m) with 5.2, (c) with the interface wiring, (n) with
 4.8.
 To be settled at gate 4.9.
@@ -569,6 +579,21 @@ id defined, 0 with none, and takes the model's ids from 0.
 **Needed.** Either ids start at 1 (0 meaning none in the mark and the floor, and the model changed to match), or the
 floor tells none from id 0 another way (the next free id, or a flag). To be settled by roadmap 5.1, which assigns ids.
 
+## Q-122 — A torn mark update can leave a mark older than the last one synced
+Found by the differential test of the log against the model (roadmap 4.7).
+**Scenario.** A.10 writes each update to "the slot that does not hold the highest valid `counter`", so updates
+alternate between the slots whether or not the last one was synced. With a timed mark sync, slot A holds counter c,
+synced, and slot B holds c − 1; update c + 1 goes to B and c + 2 to A, neither synced. A power loss that keeps part of
+the write of c + 2 leaves A invalid and B at c − 1: the mark is older than the one synced last, against A.10's "one
+slot is always stable, so a torn or concurrent write costs at most one update of staleness". Rule 3 keeps every
+complete batch, so no position is lost, but the start's id floor comes from that mark and the unsealed segments only:
+an id defined after c − 1 in a batch that is now in a sealed segment is above the floor (the test saw a floor of 18
+with id 19 defined and acknowledged). Rule 2 judges an invalid region against the older mark too.
+**Implemented.** As A.10 says. `log/tests/model_histories.rs` accepts a lower floor only after a power loss that left a
+mark older than the last one synced.
+**Needed.** Either every update between two mark syncs goes to the slot that does not hold the last synced mark (A.10
+changed), or the id floor also takes the highest id defined in the sealed segments. To be settled at gate 4.9.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -578,7 +603,7 @@ after gate 3.3; such a change is made by the item that settles the question, in 
 the question. Q-34 (c), Q-47, Q-48 and Q-79, and parts of Q-33 and Q-52, were settled before gate 3.3, with their
 changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 and Q-93, were settled at gate 3.3;
 Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119, Q-46 and parts (e) and (l) of Q-118 were settled after it by
-the owner's rulings. Q-121 was recorded by roadmap 4.7.
+the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -605,6 +630,7 @@ the owner's rulings. Q-121 was recorded by roadmap 4.7.
 | Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2 |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3 |
 | Q-121 | 5.1 | Series registry: ids are assigned there; recorded by roadmap 4.7 |
+| Q-122 | 4.9 | Gate; recorded by roadmap 4.7 |
 
 Not a question: the figures behind §3 Sync primitive are measured by roadmap 4.8 (the 2.2 spike measured sync costs
 on macOS only).

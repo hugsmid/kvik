@@ -16,6 +16,9 @@
 //! - **Unacknowledged batches.** A batch whose commit was cut short may be kept or not (`spec.md` §3 Write or sync
 //!   failure, §9 rows 7 and 7a). For faults the model names, the log is made to stop at the same point; for stops at
 //!   arbitrary operations the log decides, and the model is given the fault that has the same outcome.
+//! - **Open questions.** A torn batch alone in a segment whose header never reached the disk is deleted unreported
+//!   (Q-116 (f), (l) and (p)); a power loss that leaves a mark older than the last one synced may lower the id floor
+//!   (Q-122). Each is accepted only where it applies.
 //!
 //! Left out, with the reason:
 //! - Routing changes: the log has no entry for them yet (`format.md` A.6, type 5 is reserved for roadmap 5.2).
@@ -276,8 +279,36 @@ type Write = (PathBuf, u64, Vec<u8>);
 enum Expect {
     /// Rule 1: nothing reported.
     SameBoot,
-    /// Rule 3: a recovery entry written; a torn tail reported as a possible loss, `None` when either may be.
-    Reboot { torn: Option<bool> },
+    /// Rule 3: a recovery entry written, and the tail it reports.
+    Reboot(Tail),
+}
+
+/// The tail a start under rule 3 finds.
+#[derive(Clone, Copy, Debug)]
+enum Tail {
+    /// Torn or not: the file system chose.
+    Either,
+    /// Nothing torn: no loss is reported.
+    Clean,
+    /// A batch torn in this segment: reported as a possible loss, unless the segment reads as unused, its header
+    /// being put in use by no write that reached the disk, and is deleted with the torn bytes (Q-116 (f), (l) and
+    /// (p)).
+    Torn { file_id: u64 },
+}
+
+/// The tail a power loss leaves of a batch with this outcome and these writes.
+fn tail_of(outcome: WriteOutcome, writes: &[Write]) -> Tail {
+    match (outcome, writes.last()) {
+        (WriteOutcome::Torn, Some((path, _, _))) => Tail::Torn {
+            file_id: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(SegmentName::parse)
+                .expect("a batch is written to a segment")
+                .file_id,
+        },
+        _ => Tail::Clean,
+    }
 }
 
 /// The log: a writer driven by hand on an in-memory file system, and a reader in another handle.
@@ -296,6 +327,8 @@ struct Log {
     acked: BTreeMap<u64, Item>,
     /// A batch whose sync failed: its outcome at the next power loss and its writes.
     pending: Option<(WriteOutcome, Vec<Write>)>,
+    /// The last power loss left a mark older than the last one synced (Q-122).
+    mark_rolled_back: bool,
     armed: Arc<Mutex<Option<Arm>>>,
 }
 
@@ -370,6 +403,7 @@ impl Log {
             view: BTreeMap::new(),
             acked: BTreeMap::new(),
             pending: None,
+            mark_rolled_back: false,
             armed,
         }
     }
@@ -519,7 +553,13 @@ impl Log {
         self.w = None;
         self.reader = None;
         self.view.clear();
+        let counter = |b: Option<Vec<u8>>| {
+            b.and_then(|b| read_mark(&b, &STORE_ID).ok().flatten())
+                .map_or(0, |m| m.1.counter)
+        };
+        let synced = counter(self.fs.read_durable(&mark_path()));
         self.fs.power_loss_partial(seed);
+        self.mark_rolled_back = counter(self.fs.read(&mark_path())) < synced;
         self.fs.restart();
         self.boot += 1;
         self.pending = None;
@@ -936,10 +976,9 @@ impl World {
                     self.log
                         .commit_stopped(items, arm(Arm::Stop(0)), None, now, wall);
                 assert!(!matches!(r, Some(Ok(_))), "acknowledged before its sync");
+                let tail = tail_of(outcome, &writes);
                 self.log.power_loss(Some((outcome, writes)));
-                Expect::Reboot {
-                    torn: Some(outcome == WriteOutcome::Torn),
-                }
+                Expect::Reboot(tail)
             }
             Fault::SyncError(outcome) => {
                 let (r, writes) =
@@ -1009,7 +1048,7 @@ impl World {
         assert!(self.m.commit(Some(fault)).is_err());
         self.m.restart();
         let expect = if power {
-            Expect::Reboot { torn: None }
+            Expect::Reboot(Tail::Either)
         } else {
             Expect::SameBoot
         };
@@ -1038,7 +1077,7 @@ impl World {
                 assert!(report.losses.is_empty(), "{report:?}");
                 assert!(report.entry.is_none());
             }
-            Expect::Reboot { torn } => {
+            Expect::Reboot(tail) => {
                 assert!(matches!(report.rule, StartRule::Reboot(_)), "{report:?}");
                 let entry = report.entry.as_ref().expect("a recovery entry");
                 assert!(!entry.adopted, "nothing to adopt: every start finished");
@@ -1060,13 +1099,23 @@ impl World {
                     })
                     .max()
                     .unwrap_or(0);
-                assert_eq!(entry.entry.id_floor, floor);
-                let reported = !report.losses.is_empty();
-                if let Some(torn) = torn {
-                    assert_eq!(
-                        reported, torn,
-                        "a torn tail is reported, and only one: {report:?}"
+                // A torn mark update may leave a mark older than the last one synced, and the start reads
+                // definitions only from unsealed segments: the floor may then be lower (Q-122).
+                if entry.entry.id_floor != floor {
+                    assert!(
+                        entry.entry.id_floor < floor && self.log.mark_rolled_back,
+                        "the id floor: {report:?}"
                     );
+                }
+                self.log.mark_rolled_back = false;
+                let reported = !report.losses.is_empty();
+                match tail {
+                    Tail::Either => {}
+                    Tail::Clean => assert!(!reported, "nothing torn: {report:?}"),
+                    Tail::Torn { file_id } => assert!(
+                        reported || report.deleted.contains(&file_id),
+                        "a torn tail is reported: {report:?}"
+                    ),
                 }
                 assert!(report.losses.len() <= 1);
                 for l in &report.losses {
@@ -1086,15 +1135,15 @@ impl World {
     }
 
     fn power_loss(&mut self) {
-        let torn = self
+        let tail = self
             .log
             .pending
             .as_ref()
-            .is_some_and(|p| p.0 == WriteOutcome::Torn);
+            .map_or(Tail::Clean, |(outcome, writes)| tail_of(*outcome, writes));
         self.m.power_loss();
         let fate = self.log.pending.take();
         self.log.power_loss(fate);
-        self.restart(Expect::Reboot { torn: Some(torn) });
+        self.restart(Expect::Reboot(tail));
     }
 
     fn remount(&mut self) {
