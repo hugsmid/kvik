@@ -8,7 +8,7 @@
 //! - [`plan`]: the rebuilt manifest as records, from the old manifest's valid records, the valid local files (each
 //!   self-describing) and the losses the scan of the log finds. It carries every valid record with its old epoch
 //!   (field 100) and restates only what no valid record states.
-//! - [`write`] and [`rebuild_manifest`]: `MANIFEST.new`, synced, renamed over `MANIFEST` while no handle holds it,
+//! - [`write()`] and [`rebuild_manifest`]: `MANIFEST.new`, synced, renamed over `MANIFEST` while no handle holds it,
 //!   and the directory synced; then the manifest is opened again.
 //! - [`resolve`]: deep answers after a provisional rebuild. A copy of the corrupt record is appended, carried with its
 //!   old epoch, over what was reconstructed; an answer that it holds none makes the rebuild final.
@@ -200,7 +200,7 @@ fn fold<'a>(records: impl IntoIterator<Item = &'a Record>) -> Result<Catalogue, 
 /// How far above the highest id seen each `file_id` floor is (`format.md` A.14, rebuild record field 5).
 pub const FLOOR_MARGIN: u64 = 1 << 32;
 
-/// The rebuilt manifest (`spec.md` §7 Manifest, steps 1 to 3; step 4 is [`write`]).
+/// The rebuilt manifest (`spec.md` §7 Manifest, steps 1 to 3; step 4 is [`write()`]).
 pub fn plan(
     input: &RebuildInput<'_>,
     verifier: &dyn Verifier,

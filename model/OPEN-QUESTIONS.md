@@ -32,6 +32,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-171 | §7 Manifest (Deep unreachable), §8 Generations, `format.md` A.14 | A provisional manifest rebuild across a restart |
+| Q-172 | §7 Manifest (rebuild step 2) | A rebuilt output whose live inputs are not local |
+| Q-173 | §7 Manifest, `api.md` | The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records |
+| Q-174 | §7 Manifest (rebuild step 3), invariant 27, `format.md` A.14 field 6 | Adjacent corrupt records read as one |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -539,7 +543,13 @@ a full disk after a power loss needs space freed and a restart. Owner decision p
 (n) Open until the owner's run on the Linux NVMe target: if a cold start there is over 1 s, a start scans segments
 awaiting a seal only up to their last complete batch; independently, a start should fold each batch's content into
 the segment's summary while scanning rather than hold it all at once.
-**Needed.** (a) with roadmap 6.3, (b) and (m) with 5.2 (derived files with 6.2 and 7.1), (c) with 5.1; (k) the
+**Roadmap 6.3a.** (a) The crate `kvik-files` reads a manifest past its corrupt records (`image::read`), writes a
+verified copy back in place or by a rewritten manifest (`rebuild::repair_with_copy`), decides between copy, rebuild
+and wait from the answers of the mirror path and deep (`rebuild::CorruptStart`), and rebuilds the manifest from the
+local files, final or provisional (`rebuild::rebuild_manifest`); the log reads cause 5 and passes the publish and
+sealed-segment records over. The start still refuses (`StoreError::ManifestCorrupt`) until roadmap 6.3b calls these
+from step 4 and supplies the local files, the scan's losses and the sink. Open points found: Q-171 to Q-174.
+**Needed.** (a) with roadmap 6.3 (6.3b), (b) and (m) with 5.2 (derived files with 6.2 and 7.1), (c) with 5.1; (k) the
 owner's decision and (n) the Linux target run, at gate 4.9.
 
 ## Q-118 (c), (f), (k) — The reader process and leases: points `spec.md` §7 and §8 leave open
@@ -598,12 +608,73 @@ Recorded, late and future facts are counted from the log at every open; the othe
 calling thread; readings are decided against acknowledged definitions only. An `emit` that waits for the clock to be
 synchronised looks again every millisecond with `std::thread::sleep` on the polling thread, as there is no event to
 wait for. (g) Accepted for now as the §2.1 residual; nothing further is done.
+Roadmap 6.3a builds the run-time manifest appender (`kvik-files`, `appender::Appender`) that (d) needs; the
+interface's use of it is roadmap 6.3b.
 **Needed.** A rule for each other part: (a) whether a batch's receive time may be taken before it is queued, or flags
 decided at write time on the writer thread; (c)
 whether the seam gains a monotonic clock for the engine's timers or tests take `min_sync_interval` 0; (d) the run-time
 manifest append (with roadmap 6.3 at the latest); (e) whether these counts must survive a restart, which would need
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
+
+## Q-171 — A provisional manifest rebuild across a restart
+Found while building the manifest rebuild (roadmap 6.3a, crate `kvik-files`: `rebuild`, `appender`).
+**Scenario.** A start finds a corrupt manifest record, deep cannot be reached, and after `manifest.rebuild_wait` the
+writer rebuilds provisionally (§7 Deep unreachable): uploads, evictions, removals and retirements are held and
+`acknowledge_manifest_rebuild` is refused with `NotFinal`. The process restarts before deep answers. `MANIFEST` is now
+a valid rebuilt manifest (rebuild record, carried records, restated records, empty record), and nothing in it says
+that the rebuild is provisional: the next start finds no corrupt record, asks deep nothing, and the holds lapse. The
+reconstructed records would then be uploaded (§8 Generations uploads a rebuilt manifest "once the rebuild is final"),
+retired files removed on the strength of the reconstruction, and the acknowledgement accepted, although deep might
+still hold the corrupt record with something the reconstruction lacks (a loss whose file has left the local tiers,
+invariant 27).
+**Implemented.** The state is held in memory only (`appender::RebuildState`): provisional for the rest of the run, final
+when deep answers in that run (`rebuild::resolve`). After a restart the rebuild counts as final. When deep answers with
+a copy, the copy is appended as a carried record (new epoch, field 100 its epoch) and the rebuild is final; the
+catalogue takes a loss's cause from the latest record naming it, so the copy's cause replaces `Unknown`.
+**Needed.** How a later start knows a rebuild is still provisional. Proposed: a rebuild record field 7, present when the
+rebuild is provisional (the corrupt record's generation and presumed epoch are fields 1 and 2 already), and a record
+that makes it final (an empty record with a field naming the rebuild record's epoch, appended when deep answers
+that it holds none or after the copy is appended); a start that finds a provisional rebuild record with no such
+record asks deep again and holds as before. With roadmap 6.3b.
+
+## Q-172 — A rebuilt output whose live inputs are not local
+Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `rebuild::plan`).
+**Scenario.** The corrupt record merged compacted files A and B into C and retired them. C is on hot; no valid record
+names it. A and B are live by the valid records, but A is on no local path (it was evicted, the record that moved it
+being the corrupt one, or the local copy was lost). §7 step 2 makes C live and its inputs retired if C "verifies
+against them", and discards C if it does not verify; it does not say what happens when C cannot be verified because an
+input is not at hand.
+**Implemented.** C is reported as undecided (`RebuildPlan::undecided`): it is kept on disk and published by nothing; A
+and B stay live (A unlocated). No fact is lost and no epoch lists two files holding one position, but C's space is
+held and queries over A's range return an error until A is found.
+**Needed.** A rule. Proposed: verify C against A's copy in cold or deep when it is found there (A is then located), and
+until then keep C unpublished as implemented. With roadmap 6.3b.
+
+## Q-173 — The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records
+Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `rebuild::rebuild_manifest`).
+**Scenario.** (a) §7 names `rebuild_manifest` as the way out for a process that restarts more often than the wait, but
+not whether the rebuild it makes is final (the operator vouching that no copy exists) or provisional (deep has still
+not answered). (b) Whether the call may rebuild a manifest with no corrupt record, and what the rebuild record's
+fields 1 and 2 then hold. (c) With two corrupt records, fields 1 and 2 name one corrupt record.
+**Implemented.** (a) The caller passes the finality; the crate decides nothing. (b) A readable manifest is rebuilt like
+any other; fields 1 and 2 are 0. (c) Fields 1 and 2 name the first corrupt record.
+**Needed.** (a) and (b) with the call's signature in `api.md` (roadmap 6.3b); proposed: provisional unless deep has
+answered, and allowed on a readable manifest. (c) a sentence in A.14 if the first is not what is meant.
+
+## Q-174 — Adjacent corrupt records read as one
+Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `image`, `rebuild::plan`).
+**Scenario.** Two consecutive records are corrupt (one damaged region covering both). The reader searches forward
+from the first invalid record to the next valid one and finds one corrupt span; it cannot tell how many records it
+held, as epochs may jump legitimately after a start above a lease. If the two records were a loss's own record and
+its extension downward, the rebuild lists the loss under its first missing position, which is not its identity
+(invariant 27), and does not count it in field 6, which §7 step 3 counts only "where two corrupt records leave an
+identity unknown".
+**Implemented.** Field 6 counts the restated losses that no valid record names only when the old manifest has two or
+more corrupt spans.
+**Needed.** A rule. Proposed: also count when a corrupt span's epochs leave room for more than one record (the next
+valid epoch more than 2 above the last valid one before it), accepting a count that may include a loss whose identity
+is right.
 
 ## Open at v0.2
 
@@ -636,7 +707,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
 | Q-92 | 6.2 | Revised-key index; recorded after the tag, from the review of the Q-72 ruling |
 | Q-93 (b) and (c) | 7.3 | Calendar; (a) settled at gate 3.3 by the owner |
-| Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling |
+| Q-94 | 6.3 | Compaction order; recorded after the tag, from the review of the Q-71 ruling; with 6.3b, which publishes compaction outputs (6.3a lays out the records only) |
 | Q-95 | 5.2 | Durable cursors; recorded after the tag |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
 | Q-108 | 8.3 | Restore; recorded at the review of the Q-103 ruling |
@@ -644,12 +715,12 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3; owner decision pending on the call-limit wording in `api.md` |
 | Q-115 (e), (j), (n) | 4.9 | Gate; owner decisions pending: the `space()` seam, the Windows wording, and bounds on the ingest queue's bytes and on blocked seals |
 | Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9; both implemented by roadmap 5.1 (see the question) |
-| Q-116 (a) | 6.3 | Deep fetch or manifest rebuild for a corrupt record; deferred by gate 4.9 |
+| Q-116 (a) | 6.3 | Deep fetch or manifest rebuild for a corrupt record; deferred by gate 4.9; roadmap 6.3a builds both in `kvik-files` (see the question), the start's call into them is 6.3b |
 | Q-116 (b), (m) | 5.2 | Durable cursors as a source of F and in the recovery entry (derived files as sources of F at 6.2 and 7.1; the registry file is one since roadmap 5.1); deferred by gate 4.9 |
 | Q-116 (c) | 5.1 | The interface reads loss history; deferred by gate 4.9; implemented by roadmap 5.1 (see the question) |
 | Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
-| Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
+| Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9; with 6.3b, which retires files (6.3a gives `Catalogue::at_epoch` and the settled and provisional holds) |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

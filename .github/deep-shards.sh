@@ -38,6 +38,10 @@ log-histories   log   model_histories
 log-writer      log   writer
 log-recovery    log   recovery
 log-reader      log   reader
+files-records   files records
+files-manifest  files manifest
+files-rebuild   files rebuild
+files-fuzz      files fuzz_inputs
 '
 
 cd "$(dirname "$0")/.."

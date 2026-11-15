@@ -538,10 +538,32 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   missing position because no valid record names their identity, `u32`), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
-  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. Reserved for their roadmap items: `0x21` publish and retire (6.3), `0x22` sealed log segment (6.3),
+  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire and `0x22` sealed log segment are laid out below. Reserved for their roadmap items:
   `0x25` restore (8.3; it carries the restore's reset stamp, `spec.md` §8 Generations), `0x26` quarantine and `0x27` tier move (8.1). A rebuild never reconstructs these two: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
-  another tier" is verified again, so their layouts may hold no fact that only they hold.
+  another tier" is verified again, so their layouts may hold no fact that only they hold. Until their items lay them
+  out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
+  with field 100 added; the catalogue of files does not apply one.
+- **Canonical writing.** A record's own fields in ascending id order, a repeated field's values in the order stated
+  for it; then field 100; then any ignorable fields it was read with, in their order. A record of a reserved or
+  unknown skippable type keeps its fields in their order, field 100 placed before the first field with a higher id.
+- **File description** (the value of a field that names a file, at most 65,535 bytes): 0 kind `u8` (1 log segment,
+  2 compacted segment); 1 class `u8` (0 none, for a log segment; 1 current; 2 revision); 2 flags `u8` (bit 0: the
+  file holds positions, given by `first` and `last`; the other bits reserved); 3 reserved; 4 generation `u32`; 8
+  `file_id` `u64`; 16 first position; 28 last position; 40 plaintext SHA-256 (32 bytes); 72 input count `u32`; 76
+  reserved `u32`; 80 the inputs, 12 bytes each: kind `u8`, 3 reserved, `file_id` `u64`, in strictly ascending order
+  of kind and id. Checks: the length is 80 + 12 × the input count; a log segment has class 0 and no inputs; a
+  compacted segment has class 1 or 2, positions and at least one input; an input is a log segment or compacted
+  segment other than the file itself; first is at or below last. This is everything a self-describing file's header
+  and trailer say about it (below), so a record that names a file repeats its kind, position range and hash.
+- Publish and retire (`0x21`): repeated field 1, a file published; repeated field 2, a file retired; each a file
+  description, each list in strictly ascending order of kind and id, at least one file in all, no file in both.
+  One record publishes and retires atomically: a compaction of log segments publishes its outputs and retires
+  nothing (log segments are never retired by compaction, `spec.md` §7), a compaction of compacted files publishes its
+  outputs and retires its compacted inputs. No epoch lists a compacted file live together with a compacted file it
+  names as an input (invariant 14 as the records show it).
+- Sealed log segment (`0x22`): repeated field 1, a sealed log segment's description (kind 1), in strictly ascending
+  order of id, at least one. When it is appended relative to the seal is roadmap 6.3b's.
 - Lost range (`0x23`): 1 identity (position); 2 first (position); 3 last (position); 4 `file_id` `u64`; 5 byte offset
   `u64`; 6 byte length `u64`; 7 cause `u8` (1 corruption, 2 truncated tail, 3 lost in the bucket, 4 invalid
   content, 5 unknown: found again by a manifest rebuild with no cause given, `spec.md` §7 Manifest); 8 boot id
@@ -632,9 +654,8 @@ to every stored file.
   file that is not local (`spec.md` §7 Manifest).
 - **Local restore record (`kind = 12`).** A copy of the restore record, written by every restore beside the
   manifest's, from which a corrupt restore record is read again (`spec.md` §7 Manifest, §8 Generations).
-- **Manifest (`kind = 3`).** Framing, the empty, lost-range and acknowledgement records are in A.14. Still to be laid
-  out: the publish and retire record (one record publishes a set of files and retires another set atomically, with an
-  epoch), the sealed-segment, quarantine and tier-move records, and the restore record, which also carries the lost
+- **Manifest (`kind = 3`).** Framing, the empty, publish-and-retire, sealed-segment, lost-range, acknowledgement and
+  rebuild records are in A.14. Still to be laid out: the quarantine and tier-move records, and the restore record, which also carries the lost
   ranges, acknowledgements and recovery-entry loss reports of the generations it restores from. Every record that
   names a file repeats its kind, position range and plaintext hash, and every record that names a loss repeats its
   identity, so that no such fact is held by one record alone once a second names it (`spec.md` §7 Manifest).
