@@ -294,9 +294,10 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
   epoch on its next call. There is no background task.
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
-  (roadmap 4.6). `live` and windows in a reader process (they need a tree checkpoint plus the log since it) are
-  specified with roadmap 5.4 and 7.1; until then they return
-  `QueryError::NotAvailable { reason }` rather than a stale value.
+  (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
+  reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
+  own window clock, `now`, from its open. It has no instant of the writer's last commit, so it measures the live
+  staleness of an observed series in event time, `now − t` of the live-state fact (open: Q-140).
 - `reader.health()` reports what the files hold (loss reports), not the writer's counters.
 
 ## Reading

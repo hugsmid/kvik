@@ -58,7 +58,7 @@ again; nothing after a gate starts before it is passed.
   moved from before 5.1)
 - [ ] 5.2 Routing table, conditions, consumer queues, durable cursors
 - [ ] 5.3 Catch-up, resync and replay flags; the saved-point check (`Reader::check`, `Start::Position`, row 7b)
-- [ ] 5.4 Live state and windowed operators over recent facts
+- [x] 5.4 Live state and windowed operators over recent facts
 - [ ] 5.5 Differential tests against the model; routing and delivery benchmarks
 - [ ] 5.5a Durability levels chosen per source: acknowledged once written or after the sync (Q-170)
 - [ ] 5.6 **Gate** — delivery looked at as a whole

@@ -254,11 +254,11 @@ fn a_reader_process_sees_committed_facts() {
     // The reader keeps reading after the writer has gone.
     block_on(s.shutdown()).unwrap();
     assert_eq!(history(&r, g).len(), 3);
-    // Not answered by a reader yet.
-    assert!(matches!(
-        r.live(g),
-        Err(kvik::QueryError::NotAvailable { .. })
-    ));
+    // Live state from the facts the reader holds: the current fact with the greatest `t` not after `now`.
+    match r.live(g).unwrap() {
+        kvik::Live::Value(v) => assert_eq!((v.fact.number(), v.stale), (Some(20.0), false)),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

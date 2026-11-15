@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-140 | §5.4, §2.3, §7 Readers; `api.md` Reader processes | Live staleness of an observed series in a reader process |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 
 ## Q-16 — Which commits refresh live staleness
@@ -78,6 +79,29 @@ old its `t`" makes a week-old value fresh, against "a reading is valid for at mo
 before the live-state `t` changes staleness without changing `t`, against the proposed invariant, and whether the S
 in force at `t` or at `now` applies is not stated. (5) Already so in the current text: a reader process (§7) has no
 refresh instant, since the writer's monotonic clock is not in the log.
+**Roadmap 5.4.** The durable backend gives live state and staleness as the model backend does (`kvik/src/durable/`
+`windows.rs` and `clock.rs`): an observed series is stale when more than S has passed on the monotonic clock since its
+last commit, in the writer's process, of a fact that is recorded, not outranked, not bad quality and not `future`
+(the instant is taken when the call is decided, just before its commit); with no such commit since the store was
+opened, in event time, `now − t` of the live-state fact; a scheduled series in event time, a forecast series never.
+So (a) and (b) still refresh it, as in the model, and (d) falls back to event time. A reader process has no refresh
+instant at all (objection 5, Q-140). Not settled: the owner's ruling on the proposal and its objections is pending
+(`kvik/tests/windows.rs`, `a_reader_process_answers_after_shutdown_and_power_loss`).
+
+## Q-140 — Live staleness of an observed series in a reader process
+**Scenario.** S = 3 s. The writer commits a reading for `t` = −2 s at 0 s; at 2 s a reader in another process asks
+`live()`. The writer's own reader answers fresh (2 s since the commit, §5.4 monotonic rule); the reader process
+cannot, since the commit instant on the writer's monotonic clock is in no file (Q-16 objection 5). The same holds for
+the writer's own process after a restart, before its next refreshing commit (Q-16 (d)).
+**Implemented (roadmap 5.4).** A reader process, and a writer before its first refreshing commit since it was opened,
+measure live staleness in event time, `now − t` of the live-state fact against S: stale at 2 s in the scenario
+(4 s since `t`). This is the model backend's fallback after a restart. A reader process keeps its own window clock
+`now` from its open (max(wall clock, previous value), advanced by the monotonic clock), so it can also differ from
+the writer's after the wall clock stepped back before the reader opened. Every other result (windows, buckets,
+calendar results) is a function of the facts and `now`, and agrees (`kvik/tests/windows.rs`).
+**Needed.** Whether `live().stale` in a reader process may differ from the writer's, or the refresh instant must be
+made a function of the log (with Q-16), or the reader must say it cannot tell (an `Unknown` staleness, an `api.md`
+change).
 
 ## Q-33 — The Derived check: derived files after a lost range
 **Scenario.** The kept-log principle, orphaned facts and id floors are settled (§2.1; see Settled). A lost range
@@ -638,11 +662,11 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 5.4 recorded Q-140.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
-| Q-16 | 5.4 | Live state and staleness are built there |
+| Q-16 | 5.4 | Live state and staleness are built there; built by roadmap 5.4 as the model backend has them (see the question), not settled: needs the owner's ruling on the proposal and its objections |
 | Q-33 | 6.2 | Moved from 4.5, which has no derived file to check, to 5.1, which did the registry file's check and requirement 5, then to 6.2 at the review of 5.1 (indexes at 6.2, trees at 7.1): the rest of the Derived check (requirements 1–4) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is roadmap 5.1a (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing; not settled by roadmap 5.1, which needs the owner's ruling on the proposal and its objections (see the question) |
@@ -672,6 +696,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
+| Q-140 | 5.6 | Gate, with the ruling on Q-16; recorded by roadmap 5.4 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

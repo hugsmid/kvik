@@ -5,12 +5,12 @@
 //! starts the writer's threads. Every call that appends an entry is decided against that state and queued in the
 //! log; it resolves when the log acknowledges it (after the sync and the mark update, and for an entry that is
 //! not a fact after the mark sync). Reads go through a log reader, in this process or another, and so see only
-//! what is durable.
+//! what is durable. Live state, windows, chart buckets and calendar results are evaluated from the reader's facts
+//! (roadmap 5.4, [`windows`]).
 //!
 //! Not supported yet, with the roadmap item that brings each: consumers and routing (5.2), catch-up and saved
-//! points (5.3), live state and windows (5.4, 7.x), calendar results (7.3), decimal series, calendar-length
-//! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore
-//! (8.x).
+//! points (5.3), stored summaries (7.x), decimal series, calendar-length interval series and parameter changes
+//! other than the retention class, compaction (6.x), backup and restore (8.x).
 
 mod clock;
 mod index;
