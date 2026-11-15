@@ -92,7 +92,10 @@ fn every_request_fault_of_the_fake_bucket_in_turn_ends_backed_up() {
             let mut d = driver_over(&h, bucket.sink());
             // Run k requests, then fault the next.
             let mut now = Duration::ZERO;
-            while bucket.count(FakeOp::Any) < k {
+            for _ in 0..1_000 {
+                if bucket.count(FakeOp::Any) >= k {
+                    break;
+                }
                 match block_on(d.step(now)) {
                     Step::Idle => break,
                     Step::Retry { after, .. } => now += after,

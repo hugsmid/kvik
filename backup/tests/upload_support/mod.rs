@@ -249,6 +249,8 @@ impl BackupSink for RecSink {
 /// A manifest port straight over the store's `Appender`, logging appends.
 #[derive(Debug)]
 pub struct Port {
+    /// A record `records_after` shows above the synced ones, as one whose sync failed.
+    pub phantom: Option<Record>,
     app: Arc<Mutex<Appender>>,
     fs: MemFs,
     dir: PathBuf,
@@ -288,7 +290,9 @@ impl ManifestPort for Port {
             .read(&self.dir.join(MANIFEST))
             .ok_or_else(|| PortError::Io(std::io::ErrorKind::NotFound.into()))?;
         let img = image::read(&bytes, &ID).map_err(std::io::Error::other)?;
-        Ok(img.records().filter(|r| r.epoch > after).cloned().collect())
+        let mut v: Vec<Record> = img.records().filter(|r| r.epoch > after).cloned().collect();
+        v.extend(self.phantom.clone().filter(|r| r.epoch > after));
+        Ok(v)
     }
 }
 
@@ -436,6 +440,7 @@ impl Harness {
 
     pub fn port(&self) -> Port {
         Port {
+            phantom: None,
             app: self.app(),
             fs: self.fs.clone(),
             dir: self.dir.clone(),
@@ -634,12 +639,13 @@ pub fn run(d: &mut Driver, now: &mut Duration, max: usize) -> Step {
 
 /// Steps until the first retry, failure, hold or idle step.
 pub fn run_to_fault(d: &mut Driver, now: Duration) -> Step {
-    loop {
+    for _ in 0..10_000 {
         match block_on(d.step(now)) {
             Step::Progress => {}
             s => return s,
         }
     }
+    panic!("no fault, hold or idle step");
 }
 
 /// Steps until idle with a healthy bucket.

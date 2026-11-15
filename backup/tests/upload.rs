@@ -222,6 +222,14 @@ fn a_restart_mid_queue_repeats_at_most_one_put_per_file() {
         .map(|(desc, _)| h.puts_of(&keys.file(desc)) - 1)
         .sum();
     assert_eq!(repeated, 0);
+    // The cursor comes from the bucket's listing, so no record goes up twice.
+    for r in h.records() {
+        assert!(
+            h.puts_of(&keys.record(r.generation, r.epoch)) <= 1,
+            "record {}",
+            r.epoch
+        );
+    }
 }
 
 #[test]
@@ -242,7 +250,8 @@ fn a_bucket_failing_each_call_in_turn_is_retried_with_backoff() {
             let mut d = h.driver();
             let mut now = Duration::ZERO;
             let mut retries = 0;
-            loop {
+            for i in 0.. {
+                assert!(i < 1_000, "{k}: no idle step");
                 match block_on(d.step(now)) {
                     Step::Progress => {}
                     Step::Idle => break,
@@ -354,7 +363,8 @@ fn q284_an_object_not_reported_after_its_put_is_looked_up_until_lost_then_upload
     h.stat_fault(&key, Some(StatFault::Absent(1_000)));
     let mut d = h.driver();
     let (mut now, mut put_at, mut reput_at, mut lookups) = (Duration::ZERO, None, None, 0);
-    loop {
+    for i in 0.. {
+        assert!(i < 1_000, "no idle step");
         let before = h.puts_of(&key);
         let s = block_on(d.step(now));
         let after = h.puts_of(&key);
@@ -389,7 +399,10 @@ fn q284_lookups_while_the_bucket_answers_nothing_else_never_count_an_object_lost
     h.stat_fault(&key, Some(StatFault::Absent(1_000)));
     let mut d = h.driver();
     let mut now = Duration::ZERO;
-    while h.puts_of(&key) == 0 {
+    for _ in 0..100 {
+        if h.puts_of(&key) > 0 {
+            break;
+        }
         if let Step::Retry { after, .. } = block_on(d.step(now)) {
             now += after;
         }
@@ -431,7 +444,10 @@ fn the_progress_counts_follow_the_queue() {
     h.seal(200);
     let mut d = h.driver();
     let now = Duration::ZERO;
-    while d.progress().uploaded_files == 0 {
+    for _ in 0..10 {
+        if d.progress().uploaded_files > 0 {
+            break;
+        }
         assert!(matches!(block_on(d.step(now)), Step::Progress));
     }
     let p = d.progress();
@@ -601,4 +617,44 @@ fn the_driver_reads_local_files_through_the_store_directory() {
     let key = Keys::new(ID).file(&f);
     let obj = h.sink.mem.objects()[&key].clone();
     assert_eq!(env.open(&key, &obj).unwrap(), h.segments[0].1);
+}
+
+#[test]
+fn a_record_above_the_synced_ones_is_never_uploaded() {
+    let mut h = Harness::new();
+    h.seal(10);
+    let next = 1_000;
+    let phantom = kvik_files::record::Record::new(next, 0, T0, Body::Empty);
+    let mut port = h.port();
+    port.phantom = Some(phantom);
+    let mut d = Uploader::new(
+        h.sink.clone(),
+        TestEnvelope::new(KEY),
+        Keys::new(ID),
+        h.local(),
+        port,
+        cfg(),
+    );
+    let s = run(&mut d, &mut Duration::default(), 1_000);
+    assert!(matches!(s, Step::Idle), "{s:?}");
+    assert_eq!(h.puts_of(&Keys::new(ID).record(0, next)), 0);
+}
+
+#[test]
+fn backed_up_through_waits_for_the_copy_verified_record_to_go_up() {
+    let mut h = Harness::new();
+    h.seal(10);
+    let keys = Keys::new(ID);
+    let mut d = h.driver();
+    for _ in 0..20 {
+        assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
+        if h.puts_of(&keys.record(0, 2)) == 1 {
+            break;
+        }
+    }
+    assert_eq!(h.puts_of(&keys.record(0, 3)), 0);
+    assert_eq!(d.progress().backed_up_through, None);
+    assert!(matches!(block_on(d.step(Duration::ZERO)), Step::Progress));
+    assert_eq!(h.puts_of(&keys.record(0, 3)), 1);
+    assert_eq!(d.progress().backed_up_through, Some((0, 10)));
 }
