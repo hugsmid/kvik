@@ -120,6 +120,7 @@ pub fn lost(identity: u64, first: u64, last: u64, cause: LossCause, extends: boo
         time_before: Some(T0),
         time_after: None,
         extends,
+        stamp: None,
     }
 }
 
@@ -229,9 +230,10 @@ pub fn lost_range() -> impl Strategy<Value = LostRange> {
         proptest::option::of(any::<i64>()),
         proptest::option::of(any::<i64>()),
         any::<bool>(),
+        proptest::option::of(any::<(u64, u64)>()),
     )
         .prop_map(
-            |(identity, (first, last), (f, o, l), c, boot, floor, tb, ta, ext)| LostRange {
+            |(identity, (first, last), (f, o, l), c, boot, floor, tb, ta, ext, st)| LostRange {
                 identity,
                 first,
                 last,
@@ -250,6 +252,7 @@ pub fn lost_range() -> impl Strategy<Value = LostRange> {
                 time_before: tb,
                 time_after: ta,
                 extends: ext,
+                stamp: st.map(|(sequence, nonce)| kvik_log::mark::ResetStamp { sequence, nonce }),
             },
         )
 }

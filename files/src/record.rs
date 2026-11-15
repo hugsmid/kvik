@@ -7,6 +7,7 @@
 use kvik_log::Element;
 use kvik_log::block::{FLAG_SKIPPABLE, MAX_BODY_LEN, encode_block};
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
+use kvik_log::mark::ResetStamp;
 
 use crate::desc::{FileDescription, kind};
 use crate::fields::{self, position_bytes, position_of, u32_of, u64_of};
@@ -396,7 +397,7 @@ impl Record {
                 Body::Sealed(s)
             }
             record_type::LOST_RANGE => {
-                only(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])?;
+                only(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])?;
                 let l = decode_lost(&own)?;
                 check_lost(&l).map_err(RecordError::Invalid)?;
                 Body::LostRange(l)
@@ -493,6 +494,9 @@ fn decode_lost(own: &[(u16, &[u8])]) -> Result<LostRange, RecordError> {
         Some([]) => true,
         Some(_) => return Err(bad("field 12 holds a value")),
     };
+    let stamp = optional(own, 13)?
+        .map(|v| ResetStamp::decode(v).ok_or(bad("a reset stamp not 16 bytes")))
+        .transpose()?;
     Ok(LostRange {
         identity: pos(1)?,
         first: pos(2)?,
@@ -508,6 +512,7 @@ fn decode_lost(own: &[(u16, &[u8])]) -> Result<LostRange, RecordError> {
         time_before: time(10)?,
         time_after: time(11)?,
         extends,
+        stamp,
     })
 }
 
@@ -531,6 +536,9 @@ fn lost_fields(l: &LostRange) -> Vec<(u16, Vec<u8>)> {
     }
     if l.extends {
         v.push((12, Vec::new()));
+    }
+    if let Some(s) = l.stamp {
+        v.push((13, s.encode().to_vec()));
     }
     v
 }

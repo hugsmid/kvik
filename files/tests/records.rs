@@ -14,7 +14,8 @@ use kvik_files::record::{
 };
 use kvik_log::Element;
 use kvik_log::block::{FLAG_SKIPPABLE, encode_block};
-use kvik_log::manifest::{LossCause, read_manifest};
+use kvik_log::manifest::{LossCause, LostRange, RECORD_LOST_RANGE, encode_record, read_manifest};
+use kvik_log::mark::ResetStamp;
 use proptest::prelude::*;
 use support::*;
 
@@ -257,6 +258,36 @@ fn a_rebuilt_lost_range_with_cause_unknown_is_read_by_the_log() {
         m.records[1].lost.as_ref().unwrap().cause,
         LossCause::Unknown
     );
+}
+
+/// A lost-range record carrying the reset stamp in force (field 13, `format.md` A.14) reads the same in this crate and
+/// in the log, whichever wrote it.
+#[test]
+fn a_lost_range_with_a_reset_stamp_reads_the_same_in_both_crates() {
+    let l = LostRange {
+        stamp: Some(ResetStamp {
+            sequence: 9,
+            nonce: 7,
+        }),
+        ..lost(3, 3, 4, LossCause::TruncatedTail, false)
+    };
+    let ours = manifest_bytes(&[Record::new(1, 0, T0, Body::LostRange(l.clone()))]);
+    let mut theirs = manifest_bytes(&[]);
+    theirs.extend(encode_record(RECORD_LOST_RANGE, 1, 0, T0, Some(&l)));
+    for bytes in [&ours, &theirs] {
+        assert_eq!(
+            read(bytes, &STORE_ID).unwrap().records[0].record.body,
+            Body::LostRange(l.clone())
+        );
+        assert_eq!(
+            read_manifest(bytes, &STORE_ID)
+                .unwrap()
+                .lost_ranges()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![l.clone()]
+        );
+    }
 }
 
 // ---- Golden files ----

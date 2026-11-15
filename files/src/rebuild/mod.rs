@@ -414,6 +414,8 @@ pub fn plan(
             time_before: l.time_before,
             time_after: l.time_after,
             extends,
+            // Restated with no stamp known: later than every reset (`spec.md` §7 Readers).
+            stamp: None,
         });
     }
 
