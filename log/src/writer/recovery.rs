@@ -376,7 +376,8 @@ fn plan(
     let mut adopt_beyond: Option<(usize, usize)> = None;
     // Beyond a readable mark every unused segment with non-zero bytes after its header is reported, wherever segments
     // in use lie (a start cut after taking a new segment into use for its entry leaves one above it); with no
-    // readable mark, every such segment (Q-125, Q-320). At or below the mark's segment it is rule 2's.
+    // readable mark, every such segment (Q-125, Q-320). In the mark's segment the mark's position makes it a rule 2
+    // loss; below it, Q-321.
     let mark_file = match mark {
         MarkRead::Readable { slot, .. } => Some(slot.file_id),
         _ => None,

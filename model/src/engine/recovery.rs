@@ -118,7 +118,8 @@ impl Model {
         let generation = self.disk.generation;
         let mark = self.disk.mark;
         // The first start of a store, or of a restored generation: no mark
-        // and nothing of the current generation in the log.
+        // and nothing of the current generation in the log, not even a torn
+        // tail, which rule 3's entry reports (Q-320).
         let in_use = self
             .disk
             .files
@@ -126,7 +127,11 @@ impl Model {
             .filter(|f| f.class == FileClass::Segment)
             .flat_map(StoredFile::entries)
             .any(|e| e.position.generation == generation);
-        if mark.is_none() && !in_use && self.disk.damaged.is_empty() {
+        if mark.is_none()
+            && !in_use
+            && self.disk.damaged.is_empty()
+            && self.disk.invalid_tail.is_empty()
+        {
             self.disk.mark_damage = None;
             self.disk.tail_fate = None;
             self.disk.invalid_tail = Tail::default();

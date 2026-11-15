@@ -75,6 +75,14 @@ fn alias(id: u32) -> Item {
     })
 }
 
+fn segment_id(n: &SegmentName) -> SegmentIdentity {
+    SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: n.file_id,
+        generation: n.generation,
+    }
+}
+
 /// A writer, its file system and boot, and every acknowledged entry by position.
 struct Rig {
     fs: MemFs,
@@ -230,26 +238,37 @@ impl Rig {
 
     fn batches_where(&self, keep: impl Fn(&SegmentName) -> bool) -> Vec<BatchContent> {
         let mut out = Vec::new();
-        let mut segs: Vec<(SegmentName, PathBuf)> = self
-            .fs
-            .paths()
-            .into_iter()
-            .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
-            .collect();
-        segs.sort_by_key(|s| s.0.file_id);
-        for (n, p) in segs.into_iter().filter(|s| keep(&s.0)) {
-            let bytes = self.fs.read(&p).unwrap();
-            let id = SegmentIdentity {
-                store_id: STORE_ID,
-                file_id: n.file_id,
-                generation: n.generation,
-            };
-            let r = scan(&bytes, &id, ScanLimit::End).unwrap();
+        for (n, bytes) in self.segment_images().into_iter().filter(|s| keep(&s.0)) {
+            let r = scan(&bytes, &segment_id(&n), ScanLimit::End).unwrap();
             for b in &r.batches {
                 out.push(BatchContent::decode(b).unwrap());
             }
         }
         out
+    }
+
+    /// Every segment's bytes in `file_id` order, as recovery reads them: in the last unsealed segment in use a seal
+    /// is never expected, so its end marker is cleared and its seal blocks read as tail bytes (`format.md` A.4).
+    fn segment_images(&self) -> Vec<(SegmentName, Vec<u8>)> {
+        let mut segs: Vec<(SegmentName, Vec<u8>)> = self
+            .fs
+            .paths()
+            .into_iter()
+            .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
+            .map(|(n, p)| (n, self.fs.read(&p).unwrap()))
+            .collect();
+        segs.sort_by_key(|s| s.0.file_id);
+        let last = segs.iter().rposition(|(n, b)| {
+            !n.sealed && scan(b, &segment_id(n), ScanLimit::End).unwrap().in_use()
+        });
+        if let Some(i) = last {
+            let (n, bytes) = &mut segs[i];
+            let seal = scan(bytes, &segment_id(n), ScanLimit::End).unwrap().seal;
+            if let Some(end) = seal.map(|s| s.end as usize) {
+                bytes[end - 16..end].fill(0);
+            }
+        }
+        segs
     }
 
     /// Whether an unsealed segment holds a non-zero byte beyond the mark: past its offset in the mark's segment, past
@@ -330,17 +349,11 @@ impl Rig {
     /// Every complete batch with its length up to its last non-zero byte.
     fn batch_lengths(&self) -> Vec<(BatchContent, u64)> {
         let mut out = Vec::new();
-        for p in self.fs.paths() {
-            let Some(n) = p.file_name().and_then(|f| SegmentName::parse(f.to_str()?)) else {
-                continue;
-            };
-            let bytes = self.fs.read(&p).unwrap();
-            let id = SegmentIdentity {
-                store_id: STORE_ID,
-                file_id: n.file_id,
-                generation: n.generation,
-            };
-            for b in &scan(&bytes, &id, ScanLimit::End).unwrap().batches {
+        for (n, bytes) in self.segment_images() {
+            for b in &scan(&bytes, &segment_id(&n), ScanLimit::End)
+                .unwrap()
+                .batches
+            {
                 let span = &bytes[b.offset as usize..b.end() as usize];
                 let len = span
                     .iter()
@@ -2603,6 +2616,109 @@ fn kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it() {
         ),
     ];
     kill_loop(&cycles, false, true);
+}
+
+/// Found by the kill loop: a start puts its entry after the last batch of a segment whose seal blocks were written
+/// but which is again the last in use; recovery reads the seal blocks as tail bytes and adopts the entry, so the
+/// image is read the same way (`format.md` A.4 Sealing).
+#[test]
+fn kill_loop_an_entry_over_seal_blocks_in_the_last_segment_in_use_is_adopted() {
+    let cycles = [
+        kill_cycle(
+            &[(1, false), (1, false), (2, false), (5, false)],
+            Fault::None,
+            Crash::Power(0),
+            None,
+            Fault::None,
+        ),
+        kill_cycle(
+            &[
+                (8, false),
+                (4, false),
+                (11, false),
+                (11, false),
+                (5, false),
+                (10, false),
+                (1, false),
+                (11, false),
+                (6, false),
+                (9, false),
+                (6, false),
+            ],
+            Fault::None,
+            Crash::Power(0),
+            Some(14),
+            Fault::None,
+        ),
+        kill_cycle(
+            &[(10, false)],
+            Fault::Sync(".open", 0),
+            Crash::Kill,
+            Some(13),
+            Fault::None,
+        ),
+        kill_cycle(
+            &[],
+            Fault::None,
+            Crash::Power(8_162_037_303_095_170_423),
+            Some(8),
+            Fault::None,
+        ),
+    ];
+    kill_loop(&cycles, false, true);
+}
+
+/// The second shape of a start cut after taking a new segment into use for its entry: the entry does not fit in the
+/// mark's segment, so it goes to a new one; a remount keeps that segment's header but not the entry. The unused
+/// segment below it is still reported (Q-320).
+#[test]
+fn an_unused_segment_below_a_header_only_segment_left_by_a_cut_start_is_reported() {
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::EveryCommit,
+        segment_size: 4096,
+        max_batch_bytes: 1024,
+        ..cfg()
+    });
+    for k in 0..21 {
+        r.submit(vec![fact(1, k)]);
+        r.drain();
+    }
+    let m = r.mark().unwrap();
+    assert_eq!(m.file_id, 1);
+    r.fs.crash_after(2);
+    r.submit((0..11).map(|k| fact(2, k)).collect());
+    r.step();
+    r.w = None;
+    r.fs.power_loss_partial(0);
+    r.fs.restart();
+    let unused = r.unused_bytes_beyond(Some(m));
+    assert!(unused > 0);
+    r.fs.crash_after(11);
+    assert!(r.open().is_none());
+    r.w = None;
+    r.fs.power_loss_partial(5);
+    r.fs.restart();
+    assert_eq!(r.unused_bytes_beyond(Some(m)), unused);
+    let header_only = |r: &Rig| {
+        r.fs.paths().iter().any(|p| {
+            p.file_name()
+                .and_then(|f| SegmentName::parse(f.to_str()?))
+                .is_some_and(|n| !n.sealed && n.file_id > 2)
+                && kvik_log::header::FileHeader::decode(&r.fs.read(p).unwrap())
+                    .is_some_and(|h| h.base_sequence > 0)
+        })
+    };
+    assert!(
+        header_only(&r),
+        "a segment above it is in use by its header alone"
+    );
+    assert!(recovery_entries(&r).is_empty());
+    r.open().expect("the next start finishes");
+    let entries = recovery_entries(&r);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].after, m.last_sequence);
+    assert!(entries[0].tail_bytes >= unused, "{:?}", entries[0]);
+    r.check_started();
 }
 
 /// The kill loop's torn batch in a segment never taken into use: the process stops after the segment's first batch

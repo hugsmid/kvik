@@ -65,6 +65,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
+| Q-321 | §3 Recovery rule 2; `format.md` A.4 | A damaged header and every batch damaged in an unsealed segment below the mark's |
+| Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1277,12 +1279,39 @@ follow it; with zeros after it nothing was written and the file is only deleted
 (`a_damaged_header_beyond_the_mark_is_a_reset_point_only_with_bytes_after_it`). (b) Valid seal blocks are not lost
 data and are sealed again, as step 2 says. (c) The one dropped batch is the adopted entry's reported tail: the kill
 loop checks that at most one batch is dropped, that the entry's tail is at least that batch's bytes, and that it
-counts a readable commit block. A damaged header and damaged batches in the mark's segment, or below it, are rule 2
-corruption: the positions up to the mark's are a recorded `data_lost`, with no reset point, before the file is
-deleted (`a_damaged_header_and_batch_in_the_marks_segment_are_a_recorded_loss_at_every_cut`). The kill loop also
+counts a readable commit block. A damaged header and damaged batches in the mark's segment are rule 2 corruption: the
+positions up to the mark's are a recorded `data_lost`, with no reset point, before the file is deleted
+(`a_damaged_header_and_batch_in_the_marks_segment_are_a_recorded_loss_at_every_cut`); below the mark's segment, see
+Q-321. The kill loop also
 remounts after a start cut short, with the mark synced at every commit. `spec.md` §3 Recovery rules 1 and 3,
 Adoption and the first start, and `format.md` A.4, say so. The reference model has no headers or seal blocks; its
-torn tail is a reset under rule 1 already.
+torn tail is a reset under rule 1 already, and its first start now also requires an empty invalid tail, a state its
+interface cannot reach (a definition is committed before any reading), so no test pins it.
+
+## Q-321 — A damaged header and every batch damaged in an unsealed segment below the mark's
+
+**Scenario.** Segment 1 holds one acknowledged batch and awaits its seal; segment 2 is in use and the mark names it.
+Media damage hits segment 1's header and its batch. The start finds segment 1 not in use (header invalid, no complete
+batch) and deletes it under `format.md` A.4; the chain starts at segment 2's base, so no gap is seen, and position 1
+is gone with no `data_lost` and no record.
+**Now.** Found by probe at the review of Q-320; not changed (the fix round was for Q-320 only).
+**Needed.** Proposed: a segment below the mark's that is not in use but holds non-zero bytes after its header is
+corruption of a segment that held batches; its positions, from the last sealed segment's end (or 1) to the base of
+the next segment in use, are recorded as a lost range before the file is deleted.
+
+## Q-322 — A torn mark update that makes a damaged older slot valid again
+
+**Scenario.** Found by the kill loop's sweep (`kill_loop_keeps_every_acknowledged_entry`, "a complete batch above
+position 3"; about once in 9,000 runs of 5,000 cases). Slot 1 of the mark holds counter 4 of boot 2; both slots lose
+their first 8 bytes (the magic). After a reboot the start finds no valid slot and writes counter 1 into slot 0. The
+writer's next update goes to slot 1, and a remount within the boot keeps only its first 8 bytes, which equal the old
+magic: slot 1 is valid again, with counter 4, and wins. The next start reads a mark of the previous boot, takes
+rule 3, and keeps the unacknowledged batch beyond the real mark with no reset owed for it.
+**Now.** Not changed (it needs a change to how a start numbers the slots when none is valid). No acknowledged entry
+is lost in the case found. Not yet checked: whether a slot of the same boot brought back this way can make rule 1
+truncate after an older position.
+**Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
+slot, valid or not, or writes both slots.
 
 ## Open at v0.2
 
@@ -1362,6 +1391,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
+| Q-321 | 5.6 | Gate; recorded at the review of Q-320; a silent `data_lost` under media damage below the mark |
+| Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
