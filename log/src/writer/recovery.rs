@@ -374,16 +374,17 @@ fn plan(
     // Complete batches beyond a readable mark of the current boot.
     // Rule 1: a recovery entry beyond the mark written by an earlier start that stopped before its mark (Q-117).
     let mut adopt_beyond: Option<(usize, usize)> = None;
-    let floor = last_in_use
-        .map_or(0, |i| segs[i].id.file_id)
-        .max(match mark {
-            MarkRead::Readable { slot, .. } => slot.file_id,
-            _ => 0,
-        });
+    // Beyond a readable mark every unused segment with non-zero bytes after its header is reported, wherever segments
+    // in use lie (a start cut after taking a new segment into use for its entry leaves one above it); with no
+    // readable mark, every such segment (Q-125, Q-320). At or below the mark's segment it is rule 2's.
+    let mark_file = match mark {
+        MarkRead::Readable { slot, .. } => Some(slot.file_id),
+        _ => None,
+    };
     let unused_dirty: Vec<usize> = (0..segs.len())
         .filter(|&i| {
             !segs[i].in_use()
-                && segs[i].id.file_id > floor
+                && mark_file.is_none_or(|f| segs[i].id.file_id > f)
                 && segs[i].last_nonzero > HEADER_LEN as u64
         })
         .collect();
@@ -667,7 +668,13 @@ fn plan(
             {
                 let b = &s.batches[j];
                 let covered = mark_slot.is_some_and(|m| m.last_sequence >= b.first);
-                if let (Some(rec), false) = (b.recovery(), covered) {
+                // With the mark lost, an unused segment with bytes above the entry's may have been written after it
+                // by the writer: not adopted, so that a new entry reports those bytes (Q-320).
+                let written_after = mark_slot.is_none()
+                    && p.unused_dirty
+                        .iter()
+                        .any(|&u| segs[u].id.file_id > segs[i].id.file_id);
+                if let (Some(rec), false, false) = (b.recovery(), covered, written_after) {
                     // The tail it reported began where it was written; as the first batch of its segment it may have
                     // gone to a new segment, so then only its own length counts.
                     let reported = if j == 0 { 0 } else { rec.tail_bytes };
@@ -886,7 +893,14 @@ pub(super) fn start(
     let in_use_idx: Vec<usize> = (0..segs.len()).filter(|&i| segs[i].in_use()).collect();
 
     // The first start of a new store, or a first start that stopped before its mark was readable.
-    if empty_log && !matches!(mark, MarkRead::Readable { .. }) && manifest.highest_sequence(0) == 0
+    // Bytes in an unused segment are reported by the recovery entry of rule 3 first (Q-320).
+    let unused_written = unused
+        .iter()
+        .any(|&i| segs[i].last_nonzero > HEADER_LEN as u64);
+    if empty_log
+        && !unused_written
+        && !matches!(mark, MarkRead::Readable { .. })
+        && manifest.highest_sequence(0) == 0
     {
         for &i in &to_delete {
             if let Err(e) = fs.remove_file(&segs[i].path) {

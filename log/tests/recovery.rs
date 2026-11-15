@@ -301,6 +301,57 @@ impl Rig {
         })
     }
 
+    /// The bytes after the header of every unsealed segment not in use beyond the mark's segment (any, without a
+    /// mark), up to its last non-zero byte.
+    fn unused_bytes_beyond(&self, m: Option<MarkSlot>) -> u64 {
+        self.fs
+            .paths()
+            .into_iter()
+            .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
+            .filter(|(n, _)| !n.sealed && m.is_none_or(|m| n.file_id > m.file_id))
+            .map(|(n, p)| {
+                let bytes = self.fs.read(&p).unwrap();
+                let id = SegmentIdentity {
+                    store_id: STORE_ID,
+                    file_id: n.file_id,
+                    generation: n.generation,
+                };
+                if scan(&bytes, &id, ScanLimit::End).unwrap().in_use() {
+                    return 0;
+                }
+                bytes
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map_or(0, |i| (i as u64 + 1).saturating_sub(HEADER_LEN as u64))
+            })
+            .sum()
+    }
+
+    /// Every complete batch with its length up to its last non-zero byte.
+    fn batch_lengths(&self) -> Vec<(BatchContent, u64)> {
+        let mut out = Vec::new();
+        for p in self.fs.paths() {
+            let Some(n) = p.file_name().and_then(|f| SegmentName::parse(f.to_str()?)) else {
+                continue;
+            };
+            let bytes = self.fs.read(&p).unwrap();
+            let id = SegmentIdentity {
+                store_id: STORE_ID,
+                file_id: n.file_id,
+                generation: n.generation,
+            };
+            for b in &scan(&bytes, &id, ScanLimit::End).unwrap().batches {
+                let span = &bytes[b.offset as usize..b.end() as usize];
+                let len = span
+                    .iter()
+                    .rposition(|&x| x != 0)
+                    .map_or(0, |i| i as u64 + 1);
+                out.push((BatchContent::decode(b).unwrap(), len));
+            }
+        }
+        out
+    }
+
     /// Entries by position.
     fn positions(&self) -> BTreeMap<u64, Item> {
         let mut m = BTreeMap::new();
@@ -1295,6 +1346,9 @@ struct Cycle {
     fault: Fault,
     crash: Crash,
     crash_start: Option<usize>,
+    /// After a start cut short, a remount within the boot with this seed instead of a kill; only with the mark synced
+    /// at every commit, as for `Crash::Remount`.
+    start_remount: Option<u64>,
     /// A fault inside the start that follows the crash, and how the process then stops: a kill on the same boot,
     /// or a power loss.
     start_fault: Fault,
@@ -1323,6 +1377,7 @@ fn cycle() -> impl Strategy<Value = Cycle> {
         fault,
         crash,
         prop::option::weighted(0.3, 0..40usize),
+        prop::option::of(any::<u64>()),
         prop_oneof![
             3 => Just(Fault::None),
             2 => (0..4usize).prop_map(|k| Fault::Sync(".open", k)),
@@ -1334,14 +1389,17 @@ fn cycle() -> impl Strategy<Value = Cycle> {
         prop::bool::weighted(0.2),
     )
         .prop_map(
-            |(calls, fault, crash, crash_start, start_fault, after_fault, clean)| Cycle {
-                calls,
-                fault,
-                crash,
-                crash_start,
-                start_fault,
-                after_fault,
-                clean,
+            |(calls, fault, crash, crash_start, start_remount, start_fault, after_fault, clean)| {
+                Cycle {
+                    calls,
+                    fault,
+                    crash,
+                    crash_start,
+                    start_remount,
+                    start_fault,
+                    after_fault,
+                    clean,
+                }
             },
         )
 }
@@ -1500,7 +1558,18 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                 paid(&r, &owed);
                 continue;
             }
-            r.kill();
+            match c.start_remount.filter(|_| every) {
+                Some(seed) => {
+                    r.w = None;
+                    r.fs.power_loss_partial(seed);
+                    r.fs.restart();
+                    // A batch beyond the mark that the remount lost was never acknowledged, the mark being synced
+                    // at every commit; nothing is owed for it.
+                    let now = r.batches();
+                    owed = owed.filter(|(_, b, _)| now.contains(b));
+                }
+                None => r.kill(),
+            }
             // The start that stopped may have written a mark; the next one reads it.
             if mark_before.is_some() || r.mark().is_some_and(|m| m.boot_id == r.boot_id()) {
                 mark_before = r.mark();
@@ -1542,6 +1611,8 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
             }
         }
         let before = r.batches();
+        let lengths = r.batch_lengths();
+        let unused = r.unused_bytes_beyond(r.mark());
         let dirty = mark_before
             .or_else(|| r.mark())
             .is_some_and(|m| r.nonzero_beyond(&m));
@@ -1582,6 +1653,10 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                 if let Some(e) = &rep.entry {
                     assert_eq!(e.entry.after, m.last_sequence);
                     assert_eq!(r.mark().unwrap().stamp, e.entry.stamp.unwrap());
+                    // An unused segment's bytes are in the entry's tail (Q-320).
+                    if !e.adopted {
+                        assert!(e.entry.tail_bytes >= unused, "{:?} {unused}", e.entry);
+                    }
                 }
             }
             StartRule::Reboot(_) => {
@@ -1607,15 +1682,17 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                 let extra = usize::from(rep.entry.as_ref().is_some_and(|e| !e.adopted));
                 assert_eq!(after.len(), kept.len() + extra);
                 assert_eq!(after[..kept.len()].iter().collect::<Vec<_>>(), kept);
-                // The dropped batches are the adopted entry's reported tail.
-                let dropped = before.len() - kept.len();
-                if let Some(e) = rep.entry.as_ref().filter(|_| dropped > 0) {
-                    assert!(e.entry.tail_bytes > 0, "{:?}", e.entry);
-                    assert!(
-                        e.entry.readable_commits as usize >= dropped,
-                        "{:?}",
-                        e.entry
-                    );
+                // At most one batch is dropped, and it is the adopted entry's reported tail.
+                let dropped: Vec<_> = before.iter().filter(|b| !kept.contains(b)).collect();
+                assert!(dropped.len() <= 1, "{dropped:?}");
+                if let (Some(e), Some(d)) = (&rep.entry, dropped.first()) {
+                    let len = lengths.iter().find(|(b, _)| b == *d).unwrap().1;
+                    assert!(e.entry.tail_bytes >= len, "{:?}, {len}", e.entry);
+                    assert!(e.entry.readable_commits >= 1, "{:?}", e.entry);
+                }
+                // An unused segment's bytes are in a new entry's tail (Q-320).
+                if let Some(e) = rep.entry.as_ref().filter(|e| !e.adopted) {
+                    assert!(e.entry.tail_bytes >= unused, "{:?} {unused}", e.entry);
                 }
             }
             StartRule::FirstStart => assert!(before.is_empty()),
@@ -2380,6 +2457,7 @@ fn kill_loop_a_stale_start_that_fails_after_its_entry() {
             fault: Fault::None,
             crash: Crash::Kill,
             crash_start: None,
+            start_remount: None,
             start_fault: Fault::None,
             after_fault: None,
             clean: false,
@@ -2389,6 +2467,7 @@ fn kill_loop_a_stale_start_that_fails_after_its_entry() {
             fault: Fault::None,
             crash: Crash::Power(0),
             crash_start: None,
+            start_remount: None,
             start_fault: Fault::Sync("MARK", 1),
             after_fault: None,
             clean: false,
@@ -2398,6 +2477,7 @@ fn kill_loop_a_stale_start_that_fails_after_its_entry() {
             fault: Fault::None,
             crash: Crash::Kill,
             crash_start: Some(5),
+            start_remount: None,
             start_fault: Fault::None,
             after_fault: None,
             clean: false,
@@ -2407,6 +2487,7 @@ fn kill_loop_a_stale_start_that_fails_after_its_entry() {
             fault: Fault::None,
             crash: Crash::Remount(1_678_373_410_284_916_357),
             crash_start: None,
+            start_remount: None,
             start_fault: Fault::Sync("MARK", 0),
             after_fault: None,
             clean: false,
@@ -2429,6 +2510,7 @@ fn kill_cycle(
         fault,
         crash,
         crash_start,
+        start_remount: None,
         start_fault,
         after_fault: None,
         clean: false,
@@ -2523,49 +2605,209 @@ fn kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it() {
     kill_loop(&cycles, false, true);
 }
 
-/// The kill loop's torn batch in a segment never taken into use, the next start cut at every operation: the bytes
-/// are reported by a recovery entry before the segment is deleted (Q-125, Q-320).
+/// The kill loop's torn batch in a segment never taken into use: the process stops after the segment's first batch
+/// write, and a remount keeps that write, torn, but not the header rewrite.
+fn torn_batch_in_an_unused_segment() -> Rig {
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::EveryCommit,
+        ..cfg()
+    });
+    r.fs.crash_after(2);
+    r.submit(vec![fact(0, 0)]);
+    r.step();
+    assert!(r.acked.is_empty());
+    r.w = None;
+    r.fs.power_loss_partial(10_536_856_019_055_052_379);
+    r.fs.restart();
+    let bytes =
+        r.fs.read(&log_path("00000000-0000000000000001.open"))
+            .unwrap();
+    assert_eq!(
+        kvik_log::header::FileHeader::decode(&bytes).map(|h| h.base_sequence),
+        Some(0)
+    );
+    r
+}
+
+/// The recovery entries in the log.
+fn recovery_entries(r: &Rig) -> Vec<kvik_log::entries::Recovery> {
+    r.batches()
+        .into_iter()
+        .filter_map(|b| match b.items.as_slice() {
+            [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The torn batch in a segment never taken into use, the next start cut at every operation and then killed or
+/// remounted: the bytes are in a durable recovery entry's tail before the segment is deleted (Q-125, Q-320).
 #[test]
 fn a_torn_batch_in_a_segment_never_taken_into_use_is_reported_before_it_is_deleted() {
     let seg = log_path("00000000-0000000000000001.open");
+    let unused = torn_batch_in_an_unused_segment().unused_bytes_beyond(None);
+    assert!(unused > 0);
     for n in 0..40 {
-        let mut r = Rig::new(WriterConfig {
-            mark_sync: MarkSync::EveryCommit,
-            ..cfg()
-        });
-        r.fs.crash_after(2);
-        r.submit(vec![fact(0, 0)]);
-        r.step();
-        assert!(r.acked.is_empty());
-        r.w = None;
-        r.fs.power_loss_partial(10_536_856_019_055_052_379);
-        r.fs.restart();
-        let bytes = r.fs.read(&seg).unwrap();
-        assert_eq!(
-            kvik_log::header::FileHeader::decode(&bytes).map(|h| h.base_sequence),
-            Some(0)
-        );
-        assert!(bytes[HEADER_LEN..].iter().any(|&b| b != 0));
-        r.fs.crash_after(n);
-        let cut = r.open();
-        if cut.is_none() {
-            r.kill();
-            r.open().expect("the next start finishes");
+        for remount in std::iter::once(None).chain((0..24).map(Some)) {
+            let mut r = torn_batch_in_an_unused_segment();
+            r.fs.crash_after(n);
+            let finished = r.open().is_some();
+            if !finished {
+                r.w = None;
+                if let Some(seed) = remount {
+                    r.fs.power_loss_partial(seed);
+                }
+                r.fs.restart();
+                r.open().expect("the next start finishes");
+            }
+            r.check_started();
+            assert!(
+                r.fs.read(&seg).is_none(),
+                "cut after {n}, {remount:?}: deleted"
+            );
+            let entries = recovery_entries(&r);
+            assert_eq!(entries.len(), 1, "cut after {n}, {remount:?}");
+            assert_eq!(entries[0].after, 0);
+            if finished {
+                assert_eq!(entries[0].tail_bytes, unused, "{:?}", entries[0]);
+            } else {
+                assert!(
+                    entries[0].tail_bytes >= unused,
+                    "cut after {n}, {remount:?}: {:?}",
+                    entries[0]
+                );
+            }
         }
-        r.check_started();
-        assert!(r.fs.read(&seg).is_none(), "cut after {n}: deleted");
-        let entries: Vec<_> = r
-            .batches()
-            .into_iter()
-            .filter_map(|b| match b.items.as_slice() {
-                [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(entries.len(), 1, "cut after {n}");
-        assert_eq!(entries[0].after, 0);
-        assert!(entries[0].tail_bytes > 0, "cut after {n}: {:?}", entries[0]);
     }
+}
+
+/// After a reboot the torn batch in a segment never taken into use is counted in the rule 3 entry's tail and reported
+/// before the segment is deleted (Q-320).
+#[test]
+fn a_torn_batch_in_a_segment_never_taken_into_use_is_in_a_reboots_entry() {
+    let mut r = torn_batch_in_an_unused_segment();
+    let unused = r.unused_bytes_beyond(r.mark());
+    r.boot += 1;
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::Reboot(MarkState::Readable));
+    let e = rep.entry.as_ref().unwrap();
+    assert!(!e.adopted);
+    assert_eq!(e.entry.tail_bytes, unused);
+    assert!(
+        rep.losses
+            .iter()
+            .any(|l| l.kind == LossKind::PossibleLoss && l.bytes == unused)
+    );
+    assert_eq!(rep.deleted, vec![1]);
+    r.check_started();
+}
+
+/// With the mark deleted or unreadable, the torn batch in a segment never taken into use is reported by a rule 3
+/// entry, not deleted by a first start (Q-125, Q-320).
+#[test]
+fn a_torn_batch_in_a_segment_never_taken_into_use_is_reported_with_the_mark_lost() {
+    for delete in [true, false] {
+        let mut r = torn_batch_in_an_unused_segment();
+        let unused = r.unused_bytes_beyond(None);
+        let m = log_path("MARK");
+        if delete {
+            r.fs.remove_file(&m).unwrap();
+        } else {
+            r.fs.poke(&m, 0, &[0xee; 8]);
+            r.fs.poke(&m, 4096, &[0xee; 8]);
+        }
+        let rep = r.open().unwrap();
+        let state = if delete {
+            MarkState::Missing
+        } else {
+            MarkState::Unreadable
+        };
+        assert_eq!(rep.rule, StartRule::Reboot(state));
+        assert_eq!(rep.entry.as_ref().unwrap().entry.tail_bytes, unused);
+        assert!(
+            rep.losses
+                .iter()
+                .any(|l| l.kind == LossKind::PossibleLoss && l.bytes == unused)
+        );
+        assert_eq!(rep.deleted, vec![1]);
+        r.check_started();
+    }
+}
+
+/// With the mark lost, a recovery entry followed by an unused segment holding a torn batch the writer wrote after it
+/// is not adopted: a new entry reports those bytes before the segment is deleted (Q-320).
+#[test]
+fn an_entry_with_the_mark_lost_is_not_adopted_over_bytes_in_an_unused_segment_after_it() {
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::EveryCommit,
+        segment_size: 4096,
+        max_batch_bytes: 1024,
+        ..cfg()
+    });
+    for k in 0..19 {
+        r.submit(vec![fact(1, k)]);
+        r.drain();
+    }
+    r.power_loss(None);
+    r.open().unwrap().entry.expect("a reboot's entry");
+    let m = r.mark().unwrap();
+    r.fs.crash_after(2);
+    r.submit((0..11).map(|k| fact(2, k)).collect());
+    r.step();
+    r.w = None;
+    r.fs.power_loss_partial(5);
+    r.fs.restart();
+    let next = log_path(
+        &SegmentName {
+            generation: 0,
+            file_id: m.file_id + 1,
+            sealed: false,
+        }
+        .to_string(),
+    );
+    let unused = r.unused_bytes_beyond(Some(m));
+    assert!(unused > 0);
+    assert_eq!(
+        r.batches().last().unwrap().first_sequence,
+        m.last_sequence,
+        "the old entry is the last batch"
+    );
+    r.fs.remove_file(&log_path("MARK")).unwrap();
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::Reboot(MarkState::Missing));
+    let e = rep.entry.as_ref().unwrap();
+    assert!(!e.adopted);
+    assert!(e.entry.tail_bytes >= unused, "{:?}", e.entry);
+    assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+    assert!(r.fs.read(&next).is_none());
+    assert_eq!(recovery_entries(&r).len(), 2);
+    r.check_started();
+}
+
+/// The readable commit blocks of an unused segment beyond the mark count in the entry, with its bytes (Q-320).
+#[test]
+fn an_unused_segments_readable_commit_blocks_count_in_the_entry() {
+    let mut r = Rig::new(cfg());
+    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+    r.submit(vec![fact(1, 0)]);
+    r.step();
+    assert!(r.acked.is_empty());
+    let m = r.mark().unwrap();
+    assert_eq!(m.file_id, 0);
+    r.kill();
+    let seg = log_path("00000000-0000000000000001.open");
+    let mut h = kvik_log::header::FileHeader::decode(&r.fs.read(&seg).unwrap()).unwrap();
+    h.base_sequence = 0;
+    r.fs.poke(&seg, 0, &h.encode());
+    r.fs.poke(&seg, 64 + 40, &[0xff; 8]);
+    let unused = r.unused_bytes_beyond(Some(m));
+    let rep = r.open().unwrap();
+    assert_eq!(rep.rule, StartRule::SameBoot);
+    let e = rep.entry.as_ref().unwrap();
+    assert_eq!(e.entry.tail_bytes, unused);
+    assert_eq!(e.entry.readable_commits, 1);
+    assert_eq!(rep.deleted, vec![1]);
+    r.check_started();
 }
 
 /// A damaged header in an unused segment beyond the mark: a reset point when bytes follow it, as any non-zero byte
@@ -2608,31 +2850,42 @@ fn a_damaged_header_beyond_the_mark_is_a_reset_point_only_with_bytes_after_it() 
     }
 }
 
-/// A damaged header and a damaged only batch in the mark's segment, the start cut at every operation: the positions
-/// up to the mark's are a recorded `data_lost` before and after the segment is deleted (`spec.md` §3 Recovery rule 2).
+/// A damaged header and a damaged only batch in the mark's segment, the start cut at every operation and then killed
+/// or remounted: the positions up to the mark's are a recorded `data_lost`, with no reset point, before and after the
+/// segment is deleted (`spec.md` §3 Recovery rule 2).
 #[test]
 fn a_damaged_header_and_batch_in_the_marks_segment_are_a_recorded_loss_at_every_cut() {
     let seg = log_path("00000000-0000000000000001.open");
     for n in 0..40 {
-        let mut r = Rig::new(WriterConfig {
-            mark_sync: MarkSync::EveryCommit,
-            ..cfg()
-        });
-        r.submit(vec![fact(1, 0)]);
-        r.drain();
-        assert_eq!(r.mark().unwrap().file_id, 1);
-        r.w = None;
-        r.fs.poke(&seg, 8, &[0xff; 8]);
-        r.fs.poke(&seg, 64 + 40, &[0xff; 8]);
-        r.kill();
-        r.fs.crash_after(n);
-        if r.open().is_none() {
+        for remount in [None, Some(n as u64)] {
+            let mut r = Rig::new(WriterConfig {
+                mark_sync: MarkSync::EveryCommit,
+                ..cfg()
+            });
+            r.submit(vec![fact(1, 0)]);
+            r.drain();
+            assert_eq!(r.mark().unwrap().file_id, 1);
+            r.w = None;
+            r.fs.poke(&seg, 8, &[0xff; 8]);
+            r.fs.poke(&seg, 64 + 40, &[0xff; 8]);
             r.kill();
-            r.open().expect("the next start finishes");
+            r.fs.crash_after(n);
+            if r.open().is_none() {
+                r.w = None;
+                if let Some(seed) = remount {
+                    r.fs.power_loss_partial(seed);
+                }
+                r.fs.restart();
+                r.open().expect("the next start finishes");
+            }
+            let m = read_manifest(&r.fs.read(&dir().join("MANIFEST")).unwrap(), &STORE_ID).unwrap();
+            let lost: Vec<_> = m.lost_ranges().map(|l| (l.first, l.last)).collect();
+            assert_eq!(lost, vec![((0, 1), (0, 1))], "cut after {n}, {remount:?}");
+            assert!(
+                recovery_entries(&r).is_empty(),
+                "cut after {n}, {remount:?}"
+            );
         }
-        let m = read_manifest(&r.fs.read(&dir().join("MANIFEST")).unwrap(), &STORE_ID).unwrap();
-        let lost: Vec<_> = m.lost_ranges().map(|l| (l.first, l.last)).collect();
-        assert_eq!(lost, vec![((0, 1), (0, 1))], "cut after {n}");
     }
 }
 
