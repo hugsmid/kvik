@@ -17,8 +17,8 @@ use kvik_chunk::{Block, DecodeError, encoding};
 use proptest::prelude::*;
 use support::*;
 
-/// Every value column a writer could consider for `b`, each in a copy of `body`.
-fn value_alternatives(b: &Block, body: &[u8]) -> Vec<Vec<u8>> {
+/// Every value column a writer could consider for `b`: encoding and payload.
+fn value_alternatives(b: &Block) -> Vec<(u8, Vec<u8>)> {
     let words = value_words(b);
     let ints: Vec<i64> = words.iter().map(|&w| w as i64).collect();
     let mut payloads = vec![
@@ -35,9 +35,37 @@ fn value_alternatives(b: &Block, body: &[u8]) -> Vec<Vec<u8>> {
     }
     payloads.push((encoding::XOR, xor));
     payloads
-        .iter()
-        .map(|(enc, p)| with_value(body, *enc, p))
-        .collect()
+}
+
+/// Whether C.10 makes the value column `(enc, payload)` canonical for `b`, from uncompressed lengths only (C.9).
+/// `payload` in encoding 5 is a frame of the canonical XOR stream.
+fn canonical_value(b: &Block, enc: u8, payload: &[u8]) -> bool {
+    let words = value_words(b);
+    let all_f64 = !words.is_empty()
+        && (0..b.len())
+            .filter(|&i| b.flags[i] & kvik_chunk::flag::NO_VALUE == 0)
+            .all(|i| b.value_type[i] == kvik_chunk::value_type::F64);
+    let ints: Vec<i64> = words.iter().map(|&w| w as i64).collect();
+    let mut best = (encoding::PLAIN, encode_plain(&words));
+    let mut offer = |e: u8, p: Vec<u8>| {
+        if p.len() < best.1.len() {
+            best = (e, p);
+        }
+    };
+    offer(encoding::RUN_LENGTH, encode_run_length(&words));
+    offer(encoding::DELTA, encode_delta(&ints));
+    let decimal = all_f64.then(|| best_decimal(&words)).flatten();
+    if let Some((e, _, _)) = decimal {
+        offer(encoding::DECIMAL, encode_decimal(&words, e));
+    }
+    let class = all_f64 && decimal.is_none_or(|(_, k, _)| k * 8 > words.len());
+    let xor = encode_xor(&words);
+    if class && xor.len() < best.1.len() {
+        (enc == encoding::XOR && payload == xor.as_slice())
+            || (enc == encoding::XOR_ZSTD && payload.len() < xor.len())
+    } else {
+        (enc, payload) == (best.0, best.1.as_slice())
+    }
 }
 
 /// Checks what any body that decodes must satisfy.
@@ -62,10 +90,13 @@ proptest! {
     }
 
     #[test]
-    fn a_body_accepted_as_canonical_is_encoder_output(b in prop_oneof![any_block(), xor_block()]) {
+    fn exactly_the_canonical_value_columns_are_accepted(b in prop_oneof![any_block(), xor_block()]) {
         let body = b.encode().unwrap();
-        for alt in value_alternatives(&b, &body) {
-            if let Ok(d) = Block::decode_canonical(&alt) {
+        for (enc, payload) in value_alternatives(&b) {
+            let alt = with_value(&body, enc, &payload);
+            let got = Block::decode_canonical(&alt);
+            prop_assert_eq!(got.is_ok(), canonical_value(&b, enc, &payload), "encoding {}", enc);
+            if let Ok(d) = got {
                 prop_assert_eq!(&d, &b);
                 prop_assert!(equivalent_canonical(&alt, &body));
             }

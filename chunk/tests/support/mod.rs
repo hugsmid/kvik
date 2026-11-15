@@ -218,23 +218,33 @@ pub fn temperature(n: usize) -> Block {
     )
 }
 
-/// A block of `f64` values drawn in runs from a few readings that share their high bits and do not fit a decimal
-/// exponent, so that the XOR class is usually the canonical choice, in either encoding.
+/// A block of `f64` values from a few readings that share their high bits and do not fit a decimal exponent: in
+/// random runs, or cycling with a fixed run length. Both XOR encodings and other encodings win, and cycles of
+/// length-1 runs give blocks where only compressed XOR would beat the best other candidate.
 pub fn xor_block() -> impl Strategy<Value = Block> {
     (
         prop::collection::vec(any::<u64>(), 1..=6),
         prop::collection::vec((any::<prop::sample::Index>(), 1usize..=4), 1..=1_000),
+        prop_oneof![Just(None), (1usize..=3, 2usize..=2_000).prop_map(Some)],
     )
-        .prop_map(|(pool, runs)| {
+        .prop_map(|(pool, runs, cycle)| {
             let readings: Vec<u64> = pool
                 .iter()
                 .map(|m| (1.0 + (m >> 12) as f64 / (1u64 << 52) as f64).to_bits() | 1)
                 .collect();
-            let mut values = Vec::new();
-            for (at, len) in runs {
-                values.extend(std::iter::repeat_n(readings[at.index(readings.len())], len));
-            }
-            values.truncate(kvik_chunk::MAX_ROWS);
+            let values: Vec<u64> = match cycle {
+                Some((run, n)) => (0..n)
+                    .map(|i| readings[(i / run) % readings.len()])
+                    .collect(),
+                None => {
+                    let mut v = Vec::new();
+                    for (at, len) in runs {
+                        v.extend(std::iter::repeat_n(readings[at.index(readings.len())], len));
+                    }
+                    v.truncate(kvik_chunk::MAX_ROWS);
+                    v
+                }
+            };
             let mut b = temperature(values.len());
             b.value = values;
             b
