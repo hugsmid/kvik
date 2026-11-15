@@ -21,7 +21,7 @@ each is deferred to, are listed there under "Open at v0.2".
 ### 2.1 Series
 | Field | Rule |
 |---|---|
-| `id` | u32, assigned once by the registry, never reused among the entries the store holds (after a restore, §8 Restore step 1), nor at or below an id floor (below) |
+| `id` | u32, assigned once by the registry, from 1 (0 names no series, so a highest id assigned or an id floor of 0 means none), never reused among the entries the store holds (after a restore, §8 Restore step 1), nor at or below an id floor (below) |
 | `name` | `<instance>/<device>/<metric>`; a rename adds an alias, the id is unchanged; a name maps to its active series |
 | `kind` | `gauge`, `counter` (cumulative), `state` (named or boolean), `text` (UTF-8, ≤ 255 bytes), `interval` (an amount over an interval of fixed or calendar length) |
 | `value type` | gauge/counter/interval: `f64`, or `i64` with a declared `decimal scale` (exact); state: u16 index into declared names or bool |

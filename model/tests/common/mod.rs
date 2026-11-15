@@ -383,7 +383,7 @@ pub fn consumers() -> Vec<ConsumerDecl> {
         },
         ConsumerDecl {
             id: ConsumerId(1),
-            selection: Selection::Series([SeriesId(0)].into_iter().collect()),
+            selection: Selection::Series([SeriesId(1)].into_iter().collect()),
             capacity: 2,
         },
     ]

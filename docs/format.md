@@ -274,7 +274,7 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | 5 routing change | reserved; defined by roadmap 5.2; carries the consumer's `emits` selection |
 | 6 site zone | 30 zone name (UTF-8 IANA name, at most 63 bytes); 20 effective time |
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
-| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32`; 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
+| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
 | 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
 
 Series definition fields, all critical:
@@ -392,7 +392,7 @@ exists; a new file is created only when none exists.
 | 56 | 8 | `file_id` | the segment the mark points into |
 | 64 | 8 | `offset` | just past the last durable commit block, including padding |
 | 72 | 8 | `last_sequence` | |
-| 80 | 4 | `max_series_id` | the highest series id assigned |
+| 80 | 4 | `max_series_id` | the highest series id assigned; 0 when none is (ids start at 1, `spec.md` §2.1) |
 | 84 | 8 | `reset_sequence` | the current reset stamp (`spec.md` §7 Readers): the position of the last recovery entry a start wrote, or the first position of a restored generation; 0 before any reset |
 | 92 | 8 | `reset_nonce` | its random nonce, never zero once a reset has happened; 0 before any reset |
 | 100 | 24 | reserved | |

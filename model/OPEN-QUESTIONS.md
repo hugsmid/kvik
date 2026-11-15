@@ -31,7 +31,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-115 (e), (f), (j), (k), (n) | §3 Commit, Segments, Disk space, Back-pressure; `format.md` A.8, A.13 | The commit path: the points still open |
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
-| Q-121 | §2.1 `id`, id floors; `format.md` A.6, A.10 | Series id 0 against an id floor of 0 |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -536,18 +535,6 @@ Not a question: the reset nonce comes from std's OS-seeded hash keys for now; it
 (`api.md` Environment seams) when the interface wires the log in.
 **Needed.** (c) with roadmap 8.3; (f) and (k) with 6.3 (deferred there at gate 4.9).
 
-## Q-121 — Series id 0 against an id floor of 0
-Found while building the differential test of the log against the model (roadmap 4.7).
-**Scenario.** §2.1 makes an id a `u32`; the model's registry assigns ids from 0. The mark's `max_series_id` (A.10,
-"the highest series id assigned") and a recovery entry's id floor (A.6, field 46) are then 0 both in a store that has
-assigned no id and in one whose only series is id 0. §2.1 assigns new ids "above every id floor": read literally,
-after a power loss in a store that has defined nothing, the recovery entry's floor of 0 forbids id 0, which the model
-assigns next; and in a store whose only series is id 0, no reader of the floor can tell it from none.
-**Implemented.** The log writes 0 in both cases. `log/tests/model_histories.rs` expects the floor to be the highest
-id defined, 0 with none, and takes the model's ids from 0.
-**Needed.** Either ids start at 1 (0 meaning none in the mark and the floor, and the model changed to match), or the
-floor tells none from id 0 another way (the next free id, or a flag). To be settled by roadmap 5.1, which assigns ids.
-
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -560,7 +547,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS).
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -593,7 +580,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-116 (k), (n) | 4.9 | Gate; (k) owner decision pending on the availability wording; (n) the owner's run on the Linux NVMe target |
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
-| Q-121 | 5.1 | Series registry: ids are assigned there; recorded by roadmap 4.7 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -809,6 +795,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-119 | `batch_crc32c` did not depend on the blocks it was said to cover | `format.md` A.7 and A.2 (owner's ruling after roadmap 4.6: the sum covers bytes 0..12 of each block header, without `header_crc32c`, so every body is reached through its `body_crc32c`; the candidate check stays O(blocks)). Scenario: each 16-byte header ends with the CRC32C of its first 12 bytes, and a CRC fed a message and then that message's own CRC returns to a fixed state, so every set of valid headers gave the same sum for one store, file, offset and block count; a batch assigned again at the same offset after a remount had a byte-identical commit block (`log/tests/segment.rs`, `batch_crc_tells_apart_blocks_that_differ_only_in_a_header`; golden files regenerated) |
 | Q-46 | Checking a kept position against a later truncation or restore | §7 Readers, Reset stamp and saved points; §3 Recovery rules 1 and 3; §4 Resync (`start: position`); §8 Generations; row 7b; `format.md` A.6 field 41, A.10 bytes 84..100, A.14 `0x25`; `api.md` `ReaderState.stamp`, `SavedPoint`, `Start::Position`, `check` (owner's ruling after roadmap 4.6: a reset stamp, a reset sequence and a random nonce, in the mark, every recovery entry and every restore record; a saved point is (position, stamp); kept when the generation and stamp are the same, else void above the lowest of the later entries' `after`, restored ends and the positions before later lost ranges, and unknown when the reset the mark names cannot be found). This answers the review's three objections: the lower bound combines entries, restored ends and lost ranges; a restore takes a fresh nonce, so a reset stamp is never reused; a lost entry gives unknown. The writer writes the stamp and the reader reports it (`log/tests/recovery.rs`, `log/tests/reader.rs`); the check itself, `start: position` and row 7b's export are built with roadmap 5.3 |
 | Q-122 | A torn mark update could leave a mark older than the last one synced | `format.md` A.10 Update and Read, `spec.md` §3 Order of a start step 2 (settled by roadmap 4.7: every update between two mark syncs goes to the slot that does not hold the last synced mark, and a start writes the mark file again in place, as read, and syncs it before its own mark write, or, keeping the mark it read, writes that slot again and syncs it before the first update). Scenario: updates alternated between the slots whether or not the last was synced; with a timed mark sync, A held counter c, synced, and B c − 1; c + 1 went to B and c + 2 to A, neither synced, and a power loss that tore the write of c + 2 left A invalid and B at c − 1, older than the mark synced last. Rule 3 kept every complete batch, but the start took its id floor from that mark and the unsealed segments only, so an id defined after c − 1 in a batch then in a sealed segment was above the floor; the low floor was durable, in the recovery entry and in the new mark's highest series id, so ids would have been assigned again once roadmap 5.1 assigns above floors (`log/tests/recovery.rs`, `a_torn_mark_update_never_falls_back_past_the_last_synced_mark`) |
+| Q-121 | Series id 0 against an id floor of 0 | §2.1 `id`, `format.md` A.6 field 46 and A.10 `max_series_id` (settled by roadmap 5.1, which assigns ids: ids start at 1 and 0 names no series, so a highest id assigned or an id floor of 0 means none; the model's registry assigns from 1). Scenario: the model assigned ids from 0, so the mark's `max_series_id` and a recovery entry's id floor were 0 both in a store that had assigned no id and in one whose only series was id 0; read literally, "above every id floor" then forbade id 0 after a power loss in an empty store, and no reader of the floor could tell id 0 from none. Decoders do not refuse id 0, so files written before stay readable (`kvik/tests/durable.rs`, `ids_start_at_one_and_never_reuse_a_floor`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

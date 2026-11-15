@@ -337,10 +337,12 @@ impl Registry {
         self.tzdata.as_deref()
     }
 
-    /// The next unused identifier. Identifiers are never reused because
-    /// retired series stay in the registry.
+    /// The next unused identifier. Identifiers start at 1, 0 naming no
+    /// series (the mark's highest series id and an id floor of 0 mean none
+    /// assigned, Q-121), and are never reused because retired series stay in
+    /// the registry.
     pub fn next_id(&self) -> SeriesId {
-        SeriesId(self.series.keys().next_back().map_or(0, |s| s.0 + 1))
+        SeriesId(self.series.keys().next_back().map_or(1, |s| s.0 + 1))
     }
 
     /// Looks up a series by id.
