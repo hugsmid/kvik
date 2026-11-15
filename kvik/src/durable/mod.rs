@@ -414,7 +414,11 @@ impl Writer {
         }
         let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
         let mut counters = Counters::default();
-        for id in index.fact_series() {
+        // Orphaned facts belong to no series (spec §2.1).
+        for id in index
+            .fact_series()
+            .filter(|id| index.registry().get(*id).is_some())
+        {
             let st = counters.series.entry(id).or_default();
             for f in index.series_facts(id) {
                 st.recorded += 1;
@@ -572,8 +576,29 @@ impl Writer {
         let Some(log) = log else {
             return Ok(());
         };
-        let floor = log.stats().max_series_id;
-        let shut = log.shutdown();
+        let hub_fault = || self.hub.as_ref().and_then(|h| lock(&h.fault).clone());
+        // The registry file again, up to the mark the clean shutdown synced, while the store's lock is held.
+        let shut = log.shutdown_then(|w| {
+            if lock(&self.own_fault).is_some() || hub_fault().is_some() {
+                return Ok(());
+            }
+            let floor = w.stats().max_series_id;
+            let file = self.reader().ok().and_then(|r| {
+                r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
+                    .ok()
+            });
+            match file {
+                Some(file) => kvik_log::registry::write(
+                    &*self.env.fs,
+                    &self.dir,
+                    self.store_id,
+                    self.env.clock.wall().0,
+                    &file,
+                )
+                .map(|_| ()),
+                None => Ok(()),
+            }
+        });
         // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
         if let Some(h) = &self.hub {
             h.closed.store(true, Ordering::SeqCst);
@@ -588,31 +613,17 @@ impl Writer {
             }
             h.run(|_, _| ());
         }
-        if let Err(f) = shut {
+        let written = shut.map_err(|f| WriteError::ReadOnly(fault_out(&f)))?;
+        if let Some(f) = hub_fault() {
             return Err(WriteError::ReadOnly(fault_out(&f)));
         }
-        if let Some(f) = self.hub.as_ref().and_then(|h| lock(&h.fault).clone()) {
-            return Err(WriteError::ReadOnly(fault_out(&f)));
+        if let Err(e) = written {
+            *lock(&self.own_fault) = Some(registry_fault(&self.dir, &e));
         }
-        if let Some(f) = lock(&self.own_fault).clone() {
-            return Err(WriteError::ReadOnly(fault_out(&f)));
+        match lock(&self.own_fault).as_ref() {
+            Some(f) => Err(WriteError::ReadOnly(fault_out(f))),
+            None => Ok(()),
         }
-        // The registry file again, up to the mark the clean shutdown synced.
-        let file = self.reader().ok().and_then(|r| {
-            r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
-                .ok()
-        });
-        if let Some(file) = file {
-            let wall = self.env.clock.wall().0;
-            if let Err(e) =
-                kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file)
-            {
-                let f = registry_fault(&self.dir, &e);
-                *lock(&self.own_fault) = Some(f.clone());
-                return Err(WriteError::ReadOnly(fault_out(&f)));
-            }
-        }
-        Ok(())
     }
 
     /// Decides one entry under the decision lock, queues it and waits for its acknowledgement with the lock held,

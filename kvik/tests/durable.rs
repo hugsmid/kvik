@@ -481,6 +481,30 @@ fn the_registry_file_carries_the_id_floor_when_the_mark_is_lost() {
 }
 
 #[test]
+fn a_clean_shutdown_writes_the_registry_file_under_the_stores_lock() {
+    use kvik::env::{Fs, OpenMode};
+    use std::sync::Mutex;
+    let w = World::new("shutdown-lock");
+    let s = w.open();
+    block_on(s.define_series(gauge("a/b/c"))).unwrap();
+    let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let (fs, lock_path, seen2) = (w.fs.clone(), Path::new(&w.dir).join("LOCK"), seen.clone());
+    w.fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        if p.components().any(|c| c.as_os_str() == "registry") {
+            let f = fs.open(&lock_path, OpenMode::ReadWrite).unwrap();
+            seen2.lock().unwrap().push(!f.try_lock_exclusive().unwrap());
+        }
+    })));
+    block_on(s.shutdown()).unwrap();
+    w.fs.set_sync_hook(None);
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|held| *held),
+        "{seen:?}"
+    );
+}
+
+#[test]
 fn orphaned_facts_stay_out_of_views_and_are_exported() {
     let w = World::new("orphaned");
     let s = w.open();
