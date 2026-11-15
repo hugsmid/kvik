@@ -11,7 +11,8 @@ A stored node is the fold of its readings in `t` order (a 1-minute node) or the 
 node, a rebuilt one and a chunk summary over the same readings (roadmap 6.2) compare byte for byte (invariants 5
 and 8). The node version and `summary_stale` are not functions of the readings, so they belong to the record that
 holds a node, not to its bytes. A window evaluation (`spec.md` §6: edge stretches, a held value with no reading
-inside, an apportioned amount) has no stored form; an encoder refuses it.
+inside, an apportioned amount) has no stored form; an encoder refuses every one the checks of T.6 can tell from a
+fold (a stretched window whose stretches keep within its first and last readings cannot be told apart).
 
 Decimal series (`spec.md` §5.6: `i128` sums at the node's `u8` scale) take form ids of their own, laid out with
 decimal series in the durable backend; they are additions under the critical rule, not a new major version.

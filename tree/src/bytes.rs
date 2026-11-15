@@ -61,8 +61,9 @@ pub enum DecodeError {
 /// The canonical bytes of a stored node (`format-tree.md` T.2–T.5).
 ///
 /// # Errors
-/// [`NotStorable`] for a node no fold and merge of readings gives (a held `last`, edge stretches, an apportioned
-/// amount, a value of another kind, an exact field that is not dyadic or out of range) or that fails a check of T.6.
+/// [`NotStorable`] for a node that fails a check of T.6, or that a fold and merge of readings cannot give and
+/// the bytes would not show (a held `last`, a stretch step, an apportioned amount, a value of another kind, an exact
+/// field that is not dyadic or out of range). A stretched window that keeps within its readings is not told apart (T.1).
 pub fn encode(n: &Node) -> Result<Vec<u8>, NotStorable> {
     let kind = n.body.kind();
     let mut w = Vec::with_capacity(64);

@@ -815,8 +815,7 @@ carries its inputs, is kept until every file naming 3 is retired. With roadmap 6
 and computes its edges from facts (§6 Evaluation). With `f64` node fields, the window's sum depends on how the parts
 are bracketed: the same day computed from facts alone, or from 1-minute nodes, differs in the last bits, and the
 reference model, which is exact, differs again. §5.6 asks for bitwise reproducible stored nodes and compares other
-orders within a relative 1e-9, but does not say whether the stored fields of a series without a decimal scale are
-`f64` or exact.
+orders within a relative 1e-9; `format-check.md` FC-34 assumed `f64` fields for a series without a decimal scale.
 **Now (roadmap 7.1a).** `kvik-tree` keeps sums, integrals and increases as exact rationals, as the model does, and a
 stored node holds them as dyadic numbers (`format-tree.md` T.3): every field a fold or merge gives is a sum of `f64`
 values or their products with whole nanoseconds, so ± an odd mantissa × 2^e with e ≥ −1074 and a magnitude below
@@ -830,9 +829,9 @@ scale sums in exact `i128`", and invariant 6 drops its tolerance for series with
 
 ## Q-181 — Which zero is the minimum of +0.0 and −0.0
 
-**Scenario.** A gauge reads 0.0 and then −0.0 in one minute. IEEE `minNum`, and Rust's `f64::min`, may return either
-zero, so two builds, or two orders of merging, can store different bytes for the same readings, and rebuild-equals-live
-(invariant 8) compares bytes. Results do not differ: both zeros give the result 0.
+**Scenario.** A gauge reads 0.0 and then −0.0 in one minute. IEEE `minNum` does not specify which zero it returns, nor
+does Rust's `f64::min`, so two builds, or two orders of merging, can store different bytes for the same readings,
+and rebuild-equals-live (invariant 8) compares bytes. Results do not differ: both zeros give the result 0.
 **Now (roadmap 7.1a).** Min and max are taken in IEEE total order, where −0.0 is below +0.0 (`format-tree.md` T.5),
 so the stored bytes do not depend on the order of folding or the platform. The model's `f64::min` may pick the other
 zero; the two are equal under `==`, so the differential tests compare them as equal, and the byte tests pin the rule.
