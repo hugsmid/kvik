@@ -1,0 +1,22 @@
+[package]
+name = "kvik-export"
+version = "0.1.0"
+description = "Parquet export of kvik facts (roadmap 6.4; provisional schema, docs/export.md)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+arrow-array = "60.1"
+arrow-schema = "60.1"
+kvik = { path = "../kvik" }
+parquet = { version = "60.1", default-features = false, features = ["arrow", "zstd"] }
+thiserror = "2"
+
+[dev-dependencies]
+bytes = "1"
+proptest = "1"
+
+[lints]
+workspace = true

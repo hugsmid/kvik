@@ -545,6 +545,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvik-export"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "bytes",
+ "kvik",
+ "parquet",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "kvik-log"
 version = "0.1.0"
 dependencies = [

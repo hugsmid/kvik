@@ -413,6 +413,9 @@ store.rebuild(Rebuild::Derived).await?;       // recompute every derived structu
 ```
 The sink has no delete. An S3-compatible implementation lives in a separate crate. The sink's signatures are
 settled with roadmap 8.2, under the stable-shapes and runtime-neutral principles.
+A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
+`export_series(&reader, id, &ExportOptions, writer)`. Its schema is provisional ([`export.md`](export.md), Q-190 to
+Q-197).
 
 ## Environment seams (accepted at gate 3.3)
 ```rust

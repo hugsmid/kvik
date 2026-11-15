@@ -33,6 +33,14 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
+| Q-190 | §11; `docs/export.md` | The Parquet export schema as a user contract: columns, types, version |
+| Q-191 | §2.3, §8 Re-ingest; `docs/export.md`; `api.md` Backup and restore | The default view of an export, and Parquet for orphaned and set-aside facts |
+| Q-192 | §2.1 `decimal scale`; `docs/export.md` | Decimal values in the export, and the scale in force on `SeriesInfo` |
+| Q-193 | §2.2 fact flags; `docs/export.md` | Fact flags as boolean columns or a bitfield |
+| Q-194 | §2.1 `kind`, §2.2 `quality`; `docs/export.md` | Quality and named states in the export |
+| Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
+| Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
+| Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -626,6 +634,96 @@ it receive; batches mixing levels (a batch is acknowledged per reading at its ow
 change is always synced); principle 1 and invariant wording ("acknowledged at its level"); whether a per-call
 override (wait for the sync on a faster-level series) is offered.
 
+## Q-190 — The Parquet export schema as a user contract
+
+**Scenario.** A user loads monthly exports into an analytics tool by column name. If a later release renames
+`supplied_quality` or turns `generation` signed, their queries break, although no fact changed.
+**Now.** `docs/export.md` drafts the columns, their Parquet logical types and the file metadata; every file carries
+`kvik.export_version` = `0`, and the crate `kvik-export` writes and reads it back (round-trip tests in
+`export/tests/`).
+**Needed (owner decision pending).** Approval of the column list, names and types, or changes to them. Recommendation:
+approve as drafted, then write version `1`; adding a column or a metadata key is not a breaking change, while
+renaming, retyping or removing one raises the version.
+
+## Q-191 — The default view of an export, and Parquet for orphaned and set-aside facts
+
+**Scenario.** A versioned price series has three revisions of the 14:00 value. An export in the current view holds
+one row for 14:00; one in the history view holds all three, which re-ingest into an empty store (§8 Re-ingest)
+needs to reproduce the revisions and the duplicate rule's state.
+**Now.** `ExportOptions::view` defaults to `Current`, and `History`, `AsOf(P)` and `AsOfTime(T)` are options.
+Orphaned and set-aside facts are returned as facts by their own calls (`api.md`), not written to Parquet.
+**Needed (owner decision pending).** (a) The default view. Recommendation: `Current`, the table most users want, with
+the re-ingest documentation naming `History`; the alternative is `History`, so that an export always survives
+re-ingest. (b) Whether orphaned and set-aside facts get a Parquet form. Recommendation: the same schema, one file
+per call, its rows spanning several series, added with roadmap 8.3.
+
+## Q-192 — Decimal values in the export, and the scale in force on `SeriesInfo`
+
+**Scenario.** A series is defined at scale 2 and raised to scale 4 (§2.1 `decimal scale`); facts are stored at
+both. One Parquet column has one `DECIMAL(p, s)`.
+**Now.** `value` is `DECIMAL(19, s)`, `s` the series' scale, each value rescaled exactly (19 digits hold any `i64`
+units), and `stored_scale` keeps each fact's stored scale, so the units and stored scale come back unchanged; a
+fact stored above `s` is an error, never rounded. `SeriesInfo` exposes only the definition's scale, so the exporter
+uses it; decimal series are not stored by either backend yet, and the tests use synthetic rows
+(`export/tests/rows.rs` `decimals_round_trip_with_their_stored_scale`,
+`a_decimal_stored_above_the_export_scale_is_an_error_not_a_rounding`).
+**Needed (owner decision pending).** (a) The representation. Recommendation: `DECIMAL(19, scale in force)` with
+`stored_scale` (numeric in every tool, lossless). Alternatives: `units` (`INT64`) and `scale` (`INT(8, false)`)
+columns, lossless but not directly numeric; or `DECIMAL(38, 18)` for every decimal series, numeric and lossless
+without knowing the scale in force, but showing 18 places. (b) `SeriesInfo` (or the export call) gains the scale in
+force when decimal series reach the durable backend.
+
+## Q-193 — Fact flags as boolean columns or a bitfield
+
+**Scenario.** A user wants every late reading of last week: `WHERE late` against `WHERE flags & 2 <> 0`.
+**Now.** Seven `BOOLEAN` columns, named as in §2.2 and §2.5.
+**Needed (owner decision pending).** Recommendation: boolean columns; Parquet stores runs of equal booleans in a few
+bytes, and each is self-describing. Alternative: one `INT(16, false)` bitfield in `format.md` A.5 bit order, more
+compact in memory, which every query must decode with a key.
+
+## Q-194 — Quality and named states in the export
+
+**Scenario.** A dashboard filters `quality = 'good'`; a re-ingest needs a named state's index, which a reordered
+list of names would change.
+**Now.** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`), dictionary-encoded; a
+named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and the declared
+names in the metadata.
+**Needed (owner decision pending).** Recommendation: as now. Alternatives: quality as `INT(8, false)` codes 0–3 (best
+to worst), smaller but needing a key; a named state as its name only, with the index found from the metadata.
+
+## Q-195 — A `changed_at` of kind `time` beyond the timestamp range; forecast labels
+
+**Scenario.** An adapter sends `changed_at` = 2^63 on a series of `changed_at kind` `time`. §2.2 makes `changed_at` a
+`u64` and the store records it; a Parquet timestamp is a signed 64-bit integer and cannot hold it.
+**Now.** The export fails with `ChangedAtOutOfRange` (`export/tests/rows.rs`
+`changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by
+`kvik.timing` = `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
+**Needed (owner decision pending).** (a) Recommendation: a rule that a `time` `changed_at` above `i64::MAX` is refused
+at ingest, as every other time in `format.md` is an `i64`; alternatively the column becomes `INT(64, false)` for both
+kinds, with the kind in the metadata. (b) Whether forecast exports rename their columns (`valid_time`,
+`issue_time`). Recommendation: no; the metadata label suffices and the column names stay stable.
+
+## Q-196 — Export file layout, compression and store-level metadata
+
+**Scenario.** A user exports a hundred series: a hundred files, each with a typed `value` column, or one file whose
+value column cannot have one type. Later they want to know which store and which durable point an export came from.
+**Now.** One file per series per call; row groups of at most 131,072 rows; zstd level 1. The metadata names the
+series, view and range, not the store: its id, tzdata version, durable position and reset stamp are not reachable
+through the public `Reader` without a side effect (`refresh`).
+**Needed (owner decision pending).** (a) Recommendation: one file per series; the alternative, one file per export
+with a value column per value type (all but one null in each row), suits many small series. (b) The row-group
+default and the compression. (c) Store-level metadata, recommended when the export call joins the store's
+interface (8.3), and the saved point of a continued export (row 7b) after 5.3.
+
+## Q-197 — The interval end in an export, and calendar-length interval series
+
+**Scenario.** A half-hourly import series is exported for a billing tool that wants each interval's end, not its
+length.
+**Now.** An interval series has an `interval_end` column, `t + d` (F-14, F-17), and `kvik.interval_length_ns`.
+Calendar-length interval series are refused by the export, as neither backend stores them.
+**Needed (owner decision pending).** Recommendation: keep `interval_end`; for calendar lengths (7.3) take each end from
+the interval zone under the tzdata version in force at export, recorded in the metadata.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -638,7 +736,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`).
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -673,6 +771,14 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
+| Q-190 | 6.4 | Parquet export schema; recorded by roadmap 6.4a; owner decision pending |
+| Q-191 | 6.4 | Default export view; recorded by roadmap 6.4a; owner decision pending |
+| Q-192 | 6.4 | Decimal export; recorded by roadmap 6.4a; owner decision pending; the scale in force on `SeriesInfo` comes with decimal series in the durable backend |
+| Q-193 | 6.4 | Flag columns; recorded by roadmap 6.4a; owner decision pending |
+| Q-194 | 6.4 | Quality and state columns; recorded by roadmap 6.4a; owner decision pending |
+| Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
+| Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
+| Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
