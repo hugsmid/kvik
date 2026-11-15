@@ -48,7 +48,15 @@ pub fn min_exponent(bits: u64) -> Option<u8> {
 
 /// Encoding 3 at exponent `e`: `e` (one byte), the exception count (`u16`), each exception's index (`u16`,
 /// strictly ascending) and bits (`u64`), then the scaled integers of the other values in encoding 2.
+///
+/// # Panics
+/// If `values` holds more than 65,535 values (indexes are `u16`; a block holds at most 4,096) or `e` is above 18.
 pub fn encode_decimal(values: &[u64], e: u8) -> Vec<u8> {
+    assert!(
+        values.len() <= usize::from(u16::MAX),
+        "too many values for encoding 3"
+    );
+    assert!(e <= MAX_EXPONENT, "decimal exponent above 18");
     let (ns, exceptions) = split(values, e);
     let mut out = Vec::with_capacity(3 + exceptions.len() * 10 + delta_len(&ns));
     out.push(e);

@@ -615,7 +615,8 @@ bytes nor the same compressed length across library versions or builds. (a) A st
 scrubbed by a build with another zstd finds encoding 5 payloads whose bytes differ from what it would write. (b) The
 choice between XOR and compressed XOR (C.9) compares lengths, so another zstd can flip it, and a canonical check
 then reports writer output of the older build as not canonical. (c) A golden file holding a compressed payload breaks
-on a zstd upgrade although the format did not change.
+on a zstd upgrade although the format did not change. (d) Compared by the stream it decompresses to, a payload may
+carry further skippable or concatenated zstd frames, extra bytes that a canonical check then does not see.
 **Implemented for now.** An encoding 5 payload is canonical when its frames decompress to exactly its declared length
 and that stream is the canonical XOR stream; `Block::decode_canonical` compares it by the stream, not by its bytes,
 when both bodies use encoding 5; (b) is not covered. The golden file `xor-zstd.blk` is checked by what it decodes to
