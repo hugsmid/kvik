@@ -252,14 +252,41 @@ impl Rig {
         out
     }
 
-    /// Whether an unsealed segment holds a non-zero byte beyond the mark: past its offset in the mark's segment,
-    /// past the header in a later one.
+    /// Whether an unsealed segment in use holds a non-zero byte beyond the mark: past its offset in the mark's
+    /// segment, past the header in a later one. An unused segment is deleted, and seal blocks that hold in a segment
+    /// not the last in use are sealed again, neither a reset point (`format.md` A.4 States recovery may find, Q-320).
     fn nonzero_beyond(&self, m: &MarkSlot) -> bool {
-        self.fs.paths().into_iter().any(|p| {
-            let Some(n) = p.file_name().and_then(|f| SegmentName::parse(f.to_str()?)) else {
-                return false;
+        let segs: Vec<(SegmentName, Vec<u8>)> = self
+            .fs
+            .paths()
+            .into_iter()
+            .filter_map(|p| Some((SegmentName::parse(p.file_name()?.to_str()?)?, p.clone())))
+            .filter(|(n, _)| !n.sealed)
+            .map(|(n, p)| (n, self.fs.read(&p).unwrap()))
+            .collect();
+        let report = |n: &SegmentName, bytes: &[u8]| {
+            let id = SegmentIdentity {
+                store_id: STORE_ID,
+                file_id: n.file_id,
+                generation: n.generation,
             };
-            if n.sealed || n.file_id < m.file_id {
+            let r = scan(bytes, &id, ScanLimit::End).unwrap();
+            let end = r.batches.last().map_or(HEADER_LEN as u64, |b| b.end());
+            let seal_holds = r.seal.as_ref().is_some_and(|s| {
+                s.start == end
+                    && s.trailer.batch_count == r.batches.len() as u64
+                    && Some(s.trailer.last_sequence) == r.last_sequence()
+            });
+            (r.in_use(), seal_holds)
+        };
+        let last_in_use = segs
+            .iter()
+            .filter(|(n, b)| report(n, b).0)
+            .map(|(n, _)| n.file_id)
+            .max();
+        segs.iter().any(|(n, bytes)| {
+            let (in_use, seal_holds) = report(n, bytes);
+            if n.file_id < m.file_id || !in_use || (seal_holds && Some(n.file_id) != last_in_use) {
                 return false;
             }
             let from = if n.file_id == m.file_id {
@@ -267,7 +294,6 @@ impl Rig {
             } else {
                 HEADER_LEN
             };
-            let bytes = self.fs.read(&p).unwrap();
             bytes
                 .iter()
                 .rposition(|&b| b != 0)
@@ -1559,9 +1585,28 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                 }
             }
             StartRule::Reboot(_) => {
+                // An adopted entry first in a later segment drops the batches between its `after` and itself
+                // (`spec.md` §3 Order of a start step 2, Q-320).
+                let kept: Vec<_> = match &rep.entry {
+                    Some(e) if e.adopted => {
+                        let is_entry = |b: &BatchContent| {
+                            b.first_sequence == e.sequence
+                                && matches!(
+                                    b.items.as_slice(),
+                                    [Item::Entry(Entry::Recovery(x))] if x.after == e.entry.after
+                                )
+                        };
+                        assert!(before.iter().any(is_entry), "the adopted entry was on disk");
+                        before
+                            .iter()
+                            .filter(|b| b.last_sequence() <= e.entry.after || is_entry(b))
+                            .collect()
+                    }
+                    _ => before.iter().collect(),
+                };
                 let extra = usize::from(rep.entry.as_ref().is_some_and(|e| !e.adopted));
-                assert_eq!(after.len(), before.len() + extra);
-                assert!(after.iter().zip(&before).all(|(a, b)| a == b));
+                assert_eq!(after.len(), kept.len() + extra);
+                assert_eq!(after[..kept.len()].iter().collect::<Vec<_>>(), kept);
             }
             StartRule::FirstStart => assert!(before.is_empty()),
         }
@@ -2360,6 +2405,112 @@ fn kill_loop_a_stale_start_that_fails_after_its_entry() {
     for small in [false, true] {
         kill_loop(&cycles, true, small);
     }
+}
+
+fn kill_cycle(
+    calls: &[(usize, bool)],
+    fault: Fault,
+    crash: Crash,
+    crash_start: Option<usize>,
+    start_fault: Fault,
+) -> Cycle {
+    Cycle {
+        calls: calls.to_vec(),
+        fault,
+        crash,
+        crash_start,
+        start_fault,
+        after_fault: None,
+        clean: false,
+    }
+}
+
+/// Found by the kill loop: the process stops after taking the segment created ahead into use, and a remount keeps a
+/// torn first batch but not the header rewrite; the segment is unused and deleted, with no reset point (Q-320).
+#[test]
+fn kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a_reset() {
+    let cycles = [kill_cycle(
+        &[(1, false)],
+        Fault::Stop(2),
+        Crash::Remount(10_536_856_019_055_052_379),
+        None,
+        Fault::None,
+    )];
+    kill_loop(&cycles, true, false);
+}
+
+/// Found by the kill loop: a timed seal leaves seal blocks after the last batch of the segment the mark still names,
+/// the next one in use by its header alone; they are sealed again, not a reset point (Q-320).
+#[test]
+fn kill_loop_seal_blocks_beyond_a_same_boot_mark_are_not_a_reset() {
+    let cycles = [
+        kill_cycle(
+            &[
+                (7, true),
+                (5, true),
+                (9, false),
+                (8, false),
+                (3, true),
+                (8, false),
+                (6, false),
+                (2, false),
+                (2, false),
+                (2, false),
+            ],
+            Fault::None,
+            Crash::Power(0),
+            None,
+            Fault::None,
+        ),
+        kill_cycle(
+            &[(1, true), (7, false), (11, false), (10, true), (9, true)],
+            Fault::Stop(8),
+            Crash::Kill,
+            Some(12),
+            Fault::None,
+        ),
+        kill_cycle(&[], Fault::None, Crash::Kill, None, Fault::None),
+    ];
+    kill_loop(&cycles, false, true);
+}
+
+/// Found by the kill loop: a rule 1 start puts its entry in a new segment and stops before zeroing the batch beyond
+/// the mark; the next start finds the mark stale, adopts the entry and drops that batch (Q-320).
+#[test]
+fn kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it() {
+    let cycles = [
+        kill_cycle(
+            &[(10, false), (5, false), (8, false), (11, true), (9, false)],
+            Fault::None,
+            Crash::Power(0),
+            None,
+            Fault::None,
+        ),
+        kill_cycle(
+            &[
+                (2, false),
+                (8, false),
+                (10, false),
+                (6, false),
+                (7, false),
+                (10, false),
+                (8, false),
+                (5, false),
+            ],
+            Fault::None,
+            Crash::Power(0),
+            None,
+            Fault::Sync(".open", 2),
+        ),
+        kill_cycle(
+            &[(1, false)],
+            Fault::None,
+            Crash::Kill,
+            Some(6),
+            Fault::None,
+        ),
+    ];
+    kill_loop(&cycles, false, true);
 }
 
 /// A remount within the boot can leave the next segment taken into use by its header alone (base F) while the batch

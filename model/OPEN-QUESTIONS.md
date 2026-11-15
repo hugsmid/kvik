@@ -65,6 +65,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
+| Q-320 | §3 Recovery rule 1, Order of a start step 2; `format.md` A.4 | Which bytes beyond a same-boot mark make a reset point |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1247,6 +1248,30 @@ evicted early.
 **Model.** Not modelled.
 **Needed.** Suggested: the cursor takes the files a fresh (uncarried) restore record lists as copied at its epoch,
 with a test of the figure after a restore; with `BackupStats` (8.1d), which reports it.
+## Q-320 — Which bytes beyond a same-boot mark make a reset point
+
+**Scenario.** Three inputs the kill loop found, rare enough that a default run fails only now and then, as each run
+takes a fresh seed (`log/tests/recovery.rs`, one test each). (a) The writer takes the segment created ahead into use
+and stops before its sync; a remount within the boot keeps part of the first batch but not the header rewrite, so the
+segment is not in use (`base_sequence` 0, no complete batch) and holds non-zero bytes after its header
+(`kill_loop_a_torn_batch_in_a_segment_never_taken_into_use_is_deleted_without_a_reset`). (b) A timed seal leaves seal
+blocks after the last batch of the segment the mark still names, the next segment in use by its header alone
+(`kill_loop_seal_blocks_beyond_a_same_boot_mark_are_not_a_reset`). (c) A rule 1 start writes its entry in a new
+segment and stops before zeroing the batch beyond the mark; the next start finds the mark stale, adopts the entry and
+drops that batch (`kill_loop_an_adopted_entry_in_a_later_segment_drops_the_batch_before_it`).
+**Now.** The engine follows `format.md` A.4: (a) deletes the unused segment with no recovery entry, (b) seals the
+segment again, (c) drops the batch as Order of a start step 2 says. The kill loop's oracle expected a recovery entry
+for any non-zero byte in any unsealed segment beyond the mark, and every batch kept after a reboot; it now counts only
+segments in use, leaves out seal blocks that hold in a segment that is not the last in use, and expects the batches
+between an adopted entry's `after` and the entry to be dropped. No acknowledged entry is lost in any of the three: in
+(a) the header rewrite is made durable by the same sync as the batch, so a batch whose header rewrite is lost was
+never acknowledged and no reader saw it; in (b) and (c) the kill loop checks every acknowledged position.
+**Needed (owner decision pending).** §3 Recovery rule 1 says "any non-zero byte beyond the mark" without the scope
+A.4 gives; step 2 leaves out seal blocks but not unused segments. Proposed wording for rule 1: "any non-zero byte beyond the mark in a segment in use, other than
+seal blocks that hold in a segment that is not the last in use". The reference model has no headers or seal blocks
+and treats a torn batch as a torn tail with a reset; the engine's deletion in (a) matches the model's outcome for a
+write that never reached the disk. Not yet checked: a header damaged after its sync, in a segment whose batches are
+damaged too, makes that segment unused under A.4; whether a start then reports the loss or only deletes the file.
 
 ## Open at v0.2
 
@@ -1326,6 +1351,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
+| Q-320 | 5.6 | Gate; recorded from a kill-loop failure; owner decision pending on the wording of rule 1 and step 2, and on a damaged header in a segment with no complete batch |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
