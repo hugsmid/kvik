@@ -9,7 +9,9 @@ use kvik_files::rebuild::{
     FLOOR_MARGIN, Finality, LocalState, Location, Place, RebuildError, plan, rebuild_manifest,
 };
 use kvik_files::record::{Body, Record, record_type};
+use kvik_files::restore::RestoreRecord;
 use kvik_log::manifest::LossCause;
+use kvik_log::mark::ResetStamp;
 use support::rebuild::*;
 use support::*;
 
@@ -143,6 +145,25 @@ fn a_rebuild_takes_epochs_above_every_lease() {
     );
 }
 
+fn restore_body() -> Body {
+    RestoreRecord {
+        generation: 1,
+        stamp: ResetStamp {
+            sequence: 1,
+            nonce: 1,
+        },
+        source_generation: 0,
+        restored_end: (0, 0),
+        carried_ends: Vec::new(),
+        losses: Vec::new(),
+        acknowledgements: Vec::new(),
+        entry_losses: Vec::new(),
+        files: Vec::new(),
+        drill: false,
+    }
+    .to_body()
+}
+
 #[test]
 fn a_rebuilt_manifest_carrying_a_restore_record_opens_again() {
     let mut h = store();
@@ -150,19 +171,7 @@ fn a_rebuilt_manifest_carrying_a_restore_record_opens_again() {
         r.epoch += 1;
         r.generation = 1;
     }
-    h.records.insert(
-        0,
-        Record::new(
-            1,
-            1,
-            T0,
-            Body::Other {
-                record_type: record_type::RESTORE,
-                skippable: false,
-                fields: vec![(1, vec![0; 12])],
-            },
-        ),
-    );
+    h.records.insert(0, Record::new(1, 1, T0, restore_body()));
     let (bytes, _) = image_with_corrupt(&h, &[3]);
     let fs = fs_with(&bytes);
     let (app, p) = rebuild_manifest(
@@ -267,26 +276,14 @@ fn q103_b_a_restore_record_is_never_rebuilt() {
         plan(&input(&img, &h), &FakeVerifier::default()),
         Err(RebuildError::RestoreRecord(1))
     ));
-    // With the generation's restore record valid (carried as a field list), another corrupt record is rebuilt.
+    // With the generation's restore record valid, another corrupt record is rebuilt.
     let mut h = store();
     let at = h.records[2].epoch;
     for r in &mut h.records[2..] {
         r.epoch += 1;
         r.generation = 1;
     }
-    h.records.insert(
-        2,
-        Record::new(
-            at,
-            1,
-            T0,
-            Body::Other {
-                record_type: record_type::RESTORE,
-                skippable: false,
-                fields: vec![(1, vec![0; 12])],
-            },
-        ),
-    );
+    h.records.insert(2, Record::new(at, 1, T0, restore_body()));
     let (_, img) = image_with_corrupt(&h, &[4]);
     let p = plan(&input(&img, &h), &FakeVerifier::default()).unwrap();
     assert!(

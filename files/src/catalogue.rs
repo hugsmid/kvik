@@ -4,18 +4,19 @@
 //!
 //! The fold is [`Catalogue::apply`]; it refuses a record that contradicts the records before it and then changes
 //! nothing. A file a record retires without any record having published it is entered as retired: every record
-//! that names a file repeats its description, so the retirement alone says what the file was. A record of a type
-//! whose layout a later roadmap item gives (restore, quarantine) or of an unknown skippable type changes nothing here
-//! until its item lays it out; so a quarantined file stays listed as live until roadmap 8.1. A copy-verified record
-//! (`0x27`) sets the file's deep copy and marks its tier verified; one carried into a rebuilt manifest sets the copy
-//! only (Q-280).
+//! that names a file repeats its description, so the retirement alone says what the file was. A restore record
+//! enters the files it lists, with their copies, and the losses and acknowledgements it carries, so a generation's
+//! records are complete without those before it (`spec.md` §8 Generations). A record of a type whose layout a later
+//! roadmap item gives (quarantine) or of an unknown skippable type changes nothing here until its item lays it out;
+//! so a quarantined file stays listed as live until roadmap 8.1. A copy-verified record (`0x27`) sets the file's deep
+//! copy and marks its tier verified; one carried into a rebuilt manifest sets the copy only (Q-280).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 
 use crate::desc::{FileDescription, FileRef, kind};
-use crate::record::{Body, Rebuild, Record};
+use crate::record::{AckedLoss, Body, Rebuild, Record, RecordError, record_type};
 use crate::restore::RestoreRecord;
 use crate::tier::{CopyVerified, DeepCopy};
 
@@ -104,6 +105,9 @@ pub enum CatalogueError {
     /// It publishes a file that is retired.
     #[error("file {0:?} is published again after its retirement")]
     Republished(FileRef),
+    /// A restore record whose fields do not decode (`format.md` A.14).
+    #[error("restore record: {0}")]
+    Restore(RecordError),
     /// A live compacted file would name a live compacted file as an input: both hold the same positions (`spec.md`
     /// §10 invariant 14).
     #[error("file {output:?} would be live with its input {input:?}")]
@@ -125,6 +129,7 @@ pub struct Catalogue {
     rebuilds: BTreeMap<u64, RebuildEntry>,
     rebuild_acks: BTreeSet<u64>,
     floors: BTreeMap<u8, u64>,
+    restores: Vec<RestoreRecord>,
     last_epoch: u64,
     generation: u32,
 }
@@ -157,6 +162,15 @@ impl Catalogue {
         match &r.body {
             Body::Publish(p) => self.check_publish(&p.published, &p.retired),
             Body::Sealed(s) => self.check_publish(s, &[]),
+            b @ Body::Other {
+                record_type: record_type::RESTORE,
+                ..
+            } => {
+                let rr = restore_of(b)?;
+                let listed: Vec<FileDescription> =
+                    rr.files.iter().map(|f| f.description.clone()).collect();
+                self.check_publish(&listed, &[])
+            }
             Body::Other { .. } => match CopyVerified::from_body(&r.body) {
                 Some(Ok(c)) => self.check_described(&c.file),
                 _ => Ok(()),
@@ -170,6 +184,13 @@ impl Catalogue {
         self.check(r)?;
         match &r.body {
             Body::Empty => {}
+            b @ Body::Other {
+                record_type: record_type::RESTORE,
+                ..
+            } => {
+                let rr = restore_of(b)?;
+                self.apply_restore(r.epoch, rr);
+            }
             Body::Other { .. } => {
                 if let Some(Ok(c)) = CopyVerified::from_body(&r.body) {
                     self.apply_copy(c, r.old_epoch.is_some());
@@ -196,28 +217,10 @@ impl Catalogue {
                         .or_insert_with(|| entry(d, Some(r.epoch)));
                 }
             }
-            Body::LostRange(l) => {
-                let loss = self.losses.entry(l.identity).or_insert_with(|| Loss {
-                    record: l.clone(),
-                    epochs: Vec::new(),
-                    acknowledged: false,
-                });
-                let (first, last) = (loss.record.first.min(l.first), loss.record.last.max(l.last));
-                loss.record = LostRange {
-                    first,
-                    last,
-                    ..l.clone()
-                };
-                loss.epochs.push(r.epoch);
-                self.refresh_ack(l.identity);
-            }
+            Body::LostRange(l) => self.record_loss(r.epoch, l),
             Body::Acknowledgement(a) => {
                 for l in &a.losses {
-                    self.acks
-                        .entry(l.identity)
-                        .or_default()
-                        .push((l.first, l.last));
-                    self.refresh_ack(l.identity);
+                    self.record_ack(l);
                 }
                 if let Some(e) = a.rebuild {
                     self.rebuild_acks.insert(e);
@@ -273,6 +276,49 @@ impl Catalogue {
             Some(e) if e.description != *d => Err(CatalogueError::Conflict(d.file_ref())),
             _ => Ok(()),
         }
+    }
+
+    fn record_loss(&mut self, epoch: u64, l: &LostRange) {
+        let loss = self.losses.entry(l.identity).or_insert_with(|| Loss {
+            record: l.clone(),
+            epochs: Vec::new(),
+            acknowledged: false,
+        });
+        let (first, last) = (loss.record.first.min(l.first), loss.record.last.max(l.last));
+        loss.record = LostRange {
+            first,
+            last,
+            ..l.clone()
+        };
+        loss.epochs.push(epoch);
+        self.refresh_ack(l.identity);
+    }
+
+    fn record_ack(&mut self, l: &AckedLoss) {
+        self.acks
+            .entry(l.identity)
+            .or_default()
+            .push((l.first, l.last));
+        self.refresh_ack(l.identity);
+    }
+
+    fn apply_restore(&mut self, epoch: u64, rr: RestoreRecord) {
+        for f in &rr.files {
+            let e = self
+                .files
+                .entry(f.description.file_ref())
+                .or_insert_with(|| entry(&f.description, Some(epoch)));
+            e.tier = f.tier;
+            e.deep = Some(f.copy.clone());
+            e.verified.insert(Tier::Deep);
+        }
+        for l in &rr.losses {
+            self.record_loss(epoch, l);
+        }
+        for a in &rr.acknowledgements {
+            self.record_ack(a);
+        }
+        self.restores.push(rr);
     }
 
     /// Checks a record that publishes `published` and retires `retired`.
@@ -449,15 +495,21 @@ impl Catalogue {
         }
     }
 
-    /// The restore records, in order; empty until their fold (roadmap 8.3a).
+    /// The restore records, in order.
     pub fn restores(&self) -> &[RestoreRecord] {
-        &[]
+        &self.restores
     }
 
     /// The cause a recorded loss gives, if a loss holds `p`.
     pub fn cause_at(&self, p: RecordPosition) -> Option<LossCause> {
         self.loss_holding(p).map(|l| l.record.cause)
     }
+}
+
+fn restore_of(b: &Body) -> Result<RestoreRecord, CatalogueError> {
+    RestoreRecord::from_body(b)
+        .unwrap_or(Err(RecordError::Invalid("not a restore record")))
+        .map_err(CatalogueError::Restore)
 }
 
 fn entry(d: &FileDescription, published: Option<u64>) -> FileEntry {
@@ -594,8 +646,92 @@ mod tests {
         assert!(c.file(segment(1).file_ref()).unwrap().deep.is_none());
     }
 
+    fn lost(identity: RecordPosition, last: RecordPosition) -> LostRange {
+        LostRange {
+            identity,
+            first: identity,
+            last,
+            file_id: 1,
+            offset: 0,
+            length: 10,
+            cause: LossCause::Corruption,
+            boot_id: [1; 16],
+            id_floor: 0,
+            time_before: None,
+            time_after: None,
+            extends: false,
+            stamp: None,
+        }
+    }
+
+    fn restore_record() -> RestoreRecord {
+        use crate::restore::RestoredFile;
+        use kvik_log::mark::ResetStamp;
+        RestoreRecord {
+            generation: 1,
+            stamp: ResetStamp {
+                sequence: 1,
+                nonce: 7,
+            },
+            source_generation: 0,
+            restored_end: (0, 9),
+            carried_ends: Vec::new(),
+            losses: vec![lost((0, 4), (0, 5))],
+            acknowledgements: vec![AckedLoss {
+                identity: (0, 4),
+                first: (0, 4),
+                last: (0, 5),
+            }],
+            entry_losses: Vec::new(),
+            files: vec![RestoredFile {
+                description: segment(1),
+                tier: Tier::Hot,
+                copy: DeepCopy {
+                    size: 50,
+                    sha256: [6; 32],
+                },
+            }],
+            drill: false,
+        }
+    }
+
     #[test]
-    fn no_restore_record_is_folded_yet() {
-        assert!(Catalogue::new().restores().is_empty());
+    fn a_restore_record_enters_its_files_copies_losses_and_acknowledgements() {
+        let rr = restore_record();
+        let c = Catalogue::replay(&[Record::new(1, 1, 0, rr.to_body())]).unwrap();
+        assert_eq!(c.restores(), std::slice::from_ref(&rr));
+        let e = c.file(segment(1).file_ref()).unwrap();
+        assert_eq!(e.published, Some(1));
+        assert_eq!(e.tier, Tier::Hot);
+        assert_eq!(e.deep, Some(rr.files[0].copy.clone()));
+        assert!(e.verified.contains(&Tier::Deep));
+        let l = c.loss((0, 4)).unwrap();
+        assert_eq!(l.record, rr.losses[0]);
+        assert!(l.acknowledged);
+        assert_eq!(c.generation(), 1);
+    }
+
+    #[test]
+    fn a_restore_record_that_does_not_decode_or_contradicts_is_refused_and_changes_nothing() {
+        let mut c = Catalogue::new();
+        let bad = Body::Other {
+            record_type: record_type::RESTORE,
+            skippable: false,
+            fields: vec![(1, vec![0; 12])],
+        };
+        assert!(matches!(
+            c.apply(&Record::new(1, 1, 0, bad)),
+            Err(CatalogueError::Restore(RecordError::Invalid(_)))
+        ));
+        let mut other = segment(1);
+        other.hash = [9; 32];
+        c.apply(&Record::new(1, 1, 0, Body::Sealed(vec![other])))
+            .unwrap();
+        let before = c.clone();
+        assert_eq!(
+            c.apply(&Record::new(2, 1, 0, restore_record().to_body())),
+            Err(CatalogueError::Conflict(segment(1).file_ref()))
+        );
+        assert_eq!(c, before);
     }
 }
