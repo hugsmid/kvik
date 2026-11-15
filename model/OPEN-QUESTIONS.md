@@ -266,9 +266,15 @@ Btrfs on a loop device; gate 4.9 will try that, with the owner's hardware run
 (write or sync) and the error kind, which must be storage-full, checks that nothing after the fault is
 acknowledged, and that every acknowledged position reads back after a remount with the disk still full and again
 after space is freed, when a new batch must commit. A second arm repeats it on a log directory with copy-on-write off
-(`chattr +C`). It has not run yet; if it passes, (b) stays a write failure as settled at gate 3.3. Owner decision
-pending: whether `format.md` A.4 advises copy-on-write off for the log directory, if the second arm shows that it
-removes the failure.
+(`chattr +C`). If it passes, (b) stays a write failure as settled at gate 3.3.
+**Settled on Linux at gate 4.9** by the first run of that job (`docs/measurements/4.9-fault-trials.md`): with
+copy-on-write on, lack of space surfaced at the batch write (storage-full, before any sync), the writer stopped and
+acknowledged nothing after it, and every acknowledged position read back after a remount with the disk still full
+(the start stays read-only) and after space was freed, when a new batch committed. (b) stays a write failure, as
+settled at gate 3.3; the text does not change. With copy-on-write off for the log directory no write failed: the
+zero-filled segment filled, and the next creation then waited for space (Q-86 (a)). Still open: owner decision
+pending on whether `format.md` A.4 advises copy-on-write off for the log directory (the second arm shows that it
+removes the failure), and on the wording for macOS and Windows, where the check is not made.
 
 ## Q-88 — The grammar of name patterns
 **Scenario.** §4 Funnel selects series by "ids or name patterns", and since Q-78 a consumer's `emits` does too;
@@ -547,8 +553,8 @@ changes to both documents (see Settled). Q-97 to Q-99, and parts of Q-52, Q-86 a
 Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by the owner's rulings; Q-108 to Q-111 were recorded then. Q-117 was settled by roadmap 4.5 as an extension of the Q-87 ruling. Q-118 and Q-119 were recorded by roadmap 4.6; Q-119, Q-46 and parts (e) and (l) of Q-118 were settled after it by
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
-and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table; Q-52 (b) and
-Q-86 (b) wait for a passing run of the `fault-trials` workflow, which has not run yet.
+and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
+the `fault-trials` workflow settled Q-86 (b) on Linux; Q-52 (b) waits for a passing run of its rewrite job.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -556,12 +562,12 @@ Q-86 (b) wait for a passing run of the `fault-trials` workflow, which has not ru
 | Q-33 | 5.1 | Moved from 4.5, which has no derived file to check: the registry file is the first, at 5.1 (indexes at 6.2, trees at 7.1). The Derived check (requirements 1–5) and invariants 5 and 8 across a lost range. Model support for recovery entries, reset points, rows 7b and 7c and invariants 25–27 is due before this item (see the table below) |
 | Q-39 (f) | 8.3 | Restore |
 | Q-44 (b) and (c) | 5.1 | Series registry and timing |
-| Q-52 (b) | 4.9 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform; moved from 4.8, as it needs a device that fails writes or power cuts. Linux: the `fault-trials` workflow (ext4, XFS), not yet run; owner decision pending on the macOS and Windows wording |
+| Q-52 (b) | 4.9 | The in-place rewrites of the manifest, the log and a seal (since Q-87), checked on each platform; moved from 4.8, as it needs a device that fails writes or power cuts. Linux: the `fault-trials` workflow (ext4, XFS); its first run stopped on a harness error before a verdict, the rerun is pending (`docs/measurements/4.9-fault-trials.md`); owner decision pending on the macOS and Windows wording |
 | Q-82 | 8.3 | Restore |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
 | Q-85 | 8.1 | Tiers and corrupt blocks |
-| Q-86 (b) | 4.9 | Platform trials on a copy-on-write file system (moved from 4.5 and then from 4.8, see the question): the Btrfs job of the `fault-trials` workflow, not yet run; owner decision pending on the `chattr +C` sentence |
+| Q-86 (b) | 4.9 | Settled on Linux by the Btrfs job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decisions on the `chattr +C` sentence and the macOS and Windows wording |
 | Q-88 | 5.2 | Routing table; recorded after the tag, from the Q-78 ruling |
 | Q-90 | 8.3 | Restore |
 | Q-91 | 5.2 | Routing table and durable cursors; recorded after the tag, from the review of the Q-61, Q-63 and Q-64 rulings |
@@ -774,6 +780,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-80 | An interval zone that the tzdata version in force does not know, or that has become a link | §2.1 `interval length` (the name is resolved by the version in force each time; a link is followed to its target; an unknown name has no interval starts, so recorded readings are displaced, new ones refused off phase and health degraded until a version that knows it is in force), row 45, `api.md` Reading and Health |
 | Q-81 | Count, min, max and last over readings whose `t` lies in the window, on a calendar-length series in another zone | §6 Aggregates (the readings whose `t` lies in the window, each with its whole amount; flagged `apportioned` where an edge lies inside an interval), invariant 22 (counts over adjacent windows add up), row 41 |
 | Q-86 (a) | No space when a log segment is created | §3 Segments (the partial file deleted, health critical, ingest waits, creation retried), `format.md` A.4 (open part: Q-86 (b)) |
+| Q-86 (b), on Linux | No space at a log write before any sync, on a copy-on-write file system | §3 Segments and `format.md` A.4 Creation unchanged (a write failure on the log), checked on Btrfs at gate 4.9 (`docs/measurements/4.9-fault-trials.md`; open part: the owner's decisions on the `chattr +C` sentence and the macOS and Windows wording) |
 | Q-87 | A mark lost on the same boot after a failed sync | §3 Recovery rule 3, Last batch written again (with the mark missing, unreadable or stale, the start writes the last complete batch, and its segment's header when it is the segment's first, again in place before the sync of step 3; kept only if that sync succeeds, else read-only; rests on the Q-52 (b) check, moved from roadmap 4.8 to gate 4.9), Order of a start step 3, row 12a, `format.md` A.10 (No usable mark) and A.4 (a valid trailer found in an `.open` file is sealed again from step 1, the same hole after a failed seal sync), `api.md` Environment seams (the test file system reports per page whether a sync wrote it). Engine fault tests (roadmap 4.5, page-tracking file system): after a failed sync and a lost mark every position delivered after the restart is on disk at a power loss; the rewrite's sync fails; the same with an adopted recovery entry whose sync failed; a kill-loop property for invariant 2 over failed syncs, mark damage, restarts and power losses; the seal state found with a trailer after a failed `sync_all` |
 | Q-93 (a) | A store nobody can open after the host's tzdata changes | §5.7 (readers and drills never refuse; calendar results computed with the reader's own release; a stored calendar node used only where its recorded release is the reader's; the writer checks the host release about once a minute and at each local midnight and adopts a new one without a restart, by a tzdata entry and a rebuild of the affected days), `api.md` Opening and Environment seams (open part: Q-93 (b), (c)) |
 | Q-97 | A memory-mapped mark in a project that forbids unsafe code | §3 Durable mark, Sync primitive, §7 Readers (the mark updated by positional writes and synced like any file; no file is mapped), `format.md` A.10, A.13, `api.md` Environment seams |

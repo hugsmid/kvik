@@ -46,8 +46,9 @@ again; nothing after a gate starts before it is passed.
   moved to gate 4.9)
 - [ ] 4.9 **Gate** — log looked at as a whole. Reviewed; its fixes and the questions due here are applied
   (`model/OPEN-QUESTIONS.md`). Remaining: (1) the owner's run on the Linux NVMe target, `scripts/bench-nvme.sh`
-  (delivery budget, the 100 × 1 Hz tail, restart time, Q-116 (n)); (2) one passing run of the `fault-trials`
-  workflow, recorded in `docs/measurements/4.9-fault-trials.md` (Q-52 (b) on ext4 and XFS, Q-86 (b) on Btrfs);
+  (delivery budget, the 100 × 1 Hz tail, restart time, Q-116 (n)); (2) a passing run of the `fault-trials`
+  rewrite job on ext4 and XFS (Q-52 (b)), recorded in `docs/measurements/4.9-fault-trials.md`, where the passing
+  Btrfs run (Q-86 (b)) is recorded;
   (3) the owner's decisions on Q-110 (trust boundary), Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam),
   (j) (Windows wording) and (n) (a byte bound on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k)
   (full disk after a power loss), the Q-52 (b) macOS and Windows wording and the Q-86 (b) `chattr +C` sentence

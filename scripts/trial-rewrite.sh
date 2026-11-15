@@ -48,7 +48,8 @@ arm_setup() {
 	xfs) mkfs.xfs -q -f "$DEV" ;;
 	esac
 	mount "$DEV" "$MNT"
-	printf 'arm %s: %s on %s (loop %s, %s sectors)\n' "$ARM" "$FS" "$DEV" "$LOOP" "$SECTORS"
+	printf 'arm %s: %s on %s (loop %s, %s sectors of 512 bytes, logical sector %s bytes)\n' \
+		"$ARM" "$FS" "$DEV" "$LOOP" "$SECTORS" "$(blockdev --getss "$LOOP")"
 }
 
 # shellcheck disable=SC2317 # run by the EXIT trap
@@ -134,24 +135,35 @@ restore_device() {
 	printf 'device restored to linear\n'
 }
 
-# dev_read FILE OFFSET LENGTH OUT: FILE's bytes at [OFFSET, OFFSET + LENGTH) read from the device with O_DIRECT.
+# dev_read FILE OFFSET LENGTH OUT: FILE's bytes at [OFFSET, OFFSET + LENGTH) read with O_DIRECT from the loop device
+# under the device-mapper device (the linear table maps sector n to sector n), so the read never meets the error
+# target whatever table is loaded. Direct reads must be whole logical sectors of the loop device, which may be
+# 4,096 bytes: the window is widened to them, read extent by extent, and cut back to the bytes asked for.
 dev_read() {
-	local file=$1 off=$2 len=$3 out=$4 s0 s1 ls ps n a b got
+	local file=$1 off=$2 len=$3 out=$4 ss w0 w1 ls ps n e0 e1 a b dev got
 	extents "$file"
-	s0=$((off / 512))
-	s1=$(((off + len + 511) / 512))
+	ss=$(blockdev --getss "$LOOP")
+	w0=$((off / ss * ss))
+	w1=$(((off + len + ss - 1) / ss * ss))
 	: >"$out.raw"
 	while read -r ls ps n; do
-		a=$((ls > s0 ? ls : s0))
-		b=$((ls + n < s1 ? ls + n : s1))
+		# The extent in file bytes, and its overlap with the window.
+		e0=$((ls * 512))
+		e1=$(((ls + n) * 512))
+		a=$((e0 > w0 ? e0 : w0))
+		b=$((e1 < w1 ? e1 : w1))
 		if ((a < b)); then
-			dd if="$DEV" of="$out.raw" iflag=direct oflag=append conv=notrunc bs=512 \
-				skip=$((ps + a - ls)) count=$((b - a)) status=none
+			dev=$((ps * 512 + a - e0))
+			if ((dev % ss != 0 || (b - a) % ss != 0)); then
+				die "extent of $file at device byte $dev, $((b - a)) bytes, is not in whole $ss-byte sectors"
+			fi
+			dd if="$LOOP" of="$out.raw" iflag=direct oflag=append conv=notrunc bs="$ss" \
+				skip=$((dev / ss)) count=$(((b - a) / ss)) status=none
 		fi
 	done <"$WORK/extents"
 	got=$(stat -c %s "$out.raw")
-	((got == (s1 - s0) * 512)) || die "direct read of $file returned $got bytes, expected $(((s1 - s0) * 512))"
-	tail -c +$((off - s0 * 512 + 1)) "$out.raw" | head -c "$len" >"$out"
+	((got == w1 - w0)) || die "direct read of $file returned $got bytes, expected $((w1 - w0))"
+	tail -c +$((off - w0 + 1)) "$out.raw" | head -c "$len" >"$out"
 }
 
 # cached_read FILE OFFSET LENGTH OUT: the same bytes through the page cache.

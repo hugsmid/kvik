@@ -421,7 +421,7 @@ that has not yet been written can make a data sync also write metadata, which ch
 for lack of space. §3 treats a write failure as fatal (read-only), although the critical mark was meant to make
 ingest wait first.
 **Needed:** the guarantee required of preallocation, and the rule when it cannot be given.
-**Resolved at gate 3.3:** `format.md` A.4 Creation (physical zeros; copy-on-write accepted; no space at creation waits, at a batch write it is a write failure); `spec.md` §3 Segments. The rest of Q-86 (b) is deferred to roadmap 4.5.
+**Resolved at gate 3.3:** `format.md` A.4 Creation (physical zeros; copy-on-write accepted; no space at creation waits, at a batch write it is a write failure); `spec.md` §3 Segments. The rest of Q-86 (b) was deferred to roadmap 4.5 and then to gate 4.9, where a trial on Btrfs confirmed the write failure on Linux (`docs/measurements/4.9-fault-trials.md`).
 
 ### FC-28 — The single-writer lock
 **Where:** A.4, layout · **Severity:** before 4.1 · **Relates to:** §3 Single writer, Q-99
