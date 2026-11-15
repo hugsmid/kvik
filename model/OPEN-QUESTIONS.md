@@ -32,6 +32,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-116 (a)–(c), (k), (m), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
 | Q-118 (c), (f), (k) | §7 Readers, Leases, Manifest; §8 Generations | The reader process and leases: the points still open |
 | Q-123 (a), (c)–(g) | §2.2, §3 Commit, §11; `api.md` Writing, Series, Health | The interface on the durable log: points left open |
+| Q-150 | `format.md` common rules (canonical writing), A.3 (golden files); `format-chunk.md` C.8–C.10 | Canonical bytes of the zstd-compressed XOR fallback |
 | Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 
 ## Q-16 — Which commits refresh live staleness
@@ -606,6 +607,25 @@ manifest append (with roadmap 6.3 at the latest); (e) whether these counts must 
 them recorded; (f) whether a definition, and an emit waiting for the clock, may wait without blocking the caller's thread; (g)
 whether the residual is accepted. To be settled at gate 5.6.
 
+## Q-150 — Canonical bytes of the zstd-compressed XOR fallback
+Found while implementing the chunk column encodings (roadmap 6.1, `chunk/`).
+**Scenario.** Gate 2.3 kept a zstd-compressed XOR fallback for `f64` blocks (`format-chunk.md` C.8). The common rules
+require one byte sequence per content and golden files byte for byte, but zstd promises neither the same compressed
+bytes nor the same compressed length across library versions or builds. (a) A store written by one build and
+scrubbed by a build with another zstd finds encoding 5 payloads whose bytes differ from what it would write. (b) The
+choice between XOR and compressed XOR (C.9) compares lengths, so another zstd can flip it, and a canonical check
+then reports writer output of the older build as not canonical. (c) A golden file holding a compressed payload breaks
+on a zstd upgrade although the format did not change.
+**Implemented for now.** An encoding 5 payload is canonical when its frames decompress to exactly its declared length
+and that stream is the canonical XOR stream; `Block::decode_canonical` compares it by the stream, not by its bytes,
+when both bodies use encoding 5; (b) is not covered. The golden file `xor-zstd.blk` is checked by what it decodes to
+(`chunk/tests/golden.rs`). zstd 1.5.7 at level 3, through the `zstd` crate 0.14, is pinned by `Cargo.lock`.
+**Needed.** A rule: (1) treat a zstd upgrade as a format event that regenerates the golden files and accept (a) and
+(b) for files written before it; (2) proposed: make encodings 4 and 5 one canonical class, so that a canonical check
+accepts either for the canonical XOR stream and only a writer compares lengths; (3) replace zstd by a compressor
+specified in `format-chunk.md`; or (4) drop the compressed fallback (the °F→°C shape of roadmap 2.1 grows from 0.87
+to 1.84 bytes per row). To be settled by gate 6.5.
+
 ## Q-170 — Durability levels chosen per source
 
 Decided by the owner: a source may choose between the default level, where a reading is acknowledged only after the
@@ -638,7 +658,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123. Roadmap 6.1 recorded Q-150.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -672,6 +692,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-118 (c) | 8.3 | Restore: a reader that sees a new generation; deferred by gate 4.9 |
 | Q-118 (f), (k) | 6.3 | Compaction and retirement: which epoch a refresh takes, and what removal honours; deferred by gate 4.9 |
 | Q-123 (a), (c)–(g) | 5.6 | Gate; recorded by roadmap 5.1; (b) settled at its review |
+| Q-150 | 6.5 | Gate; recorded by roadmap 6.1 |
 | Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8

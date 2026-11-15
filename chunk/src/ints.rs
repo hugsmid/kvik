@@ -2,7 +2,7 @@
 //! packing (encoding 2), `docs/format-chunk.md` C.3–C.5.
 //!
 //! The decoders take the value count from the caller, never from the payload, and reserve at most
-//! [`MAX_ROWS`](crate::MAX_ROWS) values up front, so a payload cannot make them allocate more than its own values.
+//! [`MAX_ROWS`] values up front, so a payload cannot make them allocate more than its own values.
 
 use crate::MAX_ROWS;
 use crate::bytes::{Reader, bit_width, pack, put_leb128, unpack, unzigzag, zigzag};

@@ -64,7 +64,8 @@ again; nothing after a gate starts before it is passed.
 - [ ] 5.6 **Gate** — delivery looked at as a whole
 
 ## 6. Compacted segments
-- [ ] 6.1 Value and timestamp encodings with property and fuzz tests
+- [x] 6.1 Value and timestamp encodings with property and fuzz tests (block bodies and column encodings in
+  `docs/format-chunk.md`; sizes in `docs/measurements/6.1-encodings.md`; the compressed fallback's canonical bytes in Q-150)
 - [ ] 6.2 Per-series chunks, index, lossless compaction with verification
 - [ ] 6.3 Manifest and atomic publish-and-retire
 - [ ] 6.4 Parquet export and a differential check against it
