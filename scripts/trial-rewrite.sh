@@ -7,7 +7,7 @@
 # file, the table becomes linear | error | linear over exactly that file's extents (`filefrag`), so the journal and
 # every other file stay writable. Arms, each on a fresh file system:
 #   probe     the bare platform fact: a write over failed sectors, a failed sync, then a sync alone (control) and the
-#             same bytes written again and synced (treatment); the device is read with O_DIRECT after each.
+#             same bytes written again and synced (treatment); what reached the device is read after each.
 #   batch     the engine: a batch whose segment sync fails; the mark removed; a start on the same boot writes the
 #             last batch again; the device must then hold the file's bytes.
 #   mark      the same with the fault on the mark: the start writes the mark slot it read again.
@@ -50,6 +50,7 @@ arm_setup() {
 	mount "$DEV" "$MNT"
 	printf 'arm %s: %s on %s (loop %s, %s sectors of 512 bytes, logical sector %s bytes)\n' \
 		"$ARM" "$FS" "$DEV" "$LOOP" "$SECTORS" "$(blockdev --getss "$LOOP")"
+	printf 'device bytes are read from the image %s (loop offset 0, linear offset 0)\n' "$IMG"
 }
 
 # shellcheck disable=SC2317 # run by the EXIT trap
@@ -135,35 +136,45 @@ restore_device() {
 	printf 'device restored to linear\n'
 }
 
-# dev_read FILE OFFSET LENGTH OUT: FILE's bytes at [OFFSET, OFFSET + LENGTH) read with O_DIRECT from the loop device
-# under the device-mapper device (the linear table maps sector n to sector n), so the read never meets the error
-# target whatever table is loaded. Direct reads must be whole logical sectors of the loop device, which may be
-# 4,096 bytes: the window is widened to them, read extent by extent, and cut back to the bytes asked for.
+# dev_read FILE OFFSET LENGTH OUT: FILE's bytes at [OFFSET, OFFSET + LENGTH) as they reached the device. The loop
+# device (offset 0) stores sector n at byte 512 n of its image, and the linear table maps device-mapper sector n to
+# loop sector n, so what reached the device is exactly what the loop driver wrote to the image: the bytes are read
+# from the image file at those offsets, by ordinary reads. Nothing is synced or flushed from outside: that could write
+# bytes the engine left dirty and hide a missing sync. Arithmetic in bytes; each piece read is printed.
 dev_read() {
-	local file=$1 off=$2 len=$3 out=$4 ss w0 w1 ls ps n e0 e1 a b dev got
+	local file=$1 off=$2 len=$3 out=$4 w1 ls ps n e0 e1 a b at
 	extents "$file"
-	ss=$(blockdev --getss "$LOOP")
-	w0=$((off / ss * ss))
-	w1=$(((off + len + ss - 1) / ss * ss))
-	: >"$out.raw"
+	w1=$((off + len))
+	: >"$out"
 	while read -r ls ps n; do
-		# The extent in file bytes, and its overlap with the window.
+		# The extent in file bytes, and its overlap with [off, w1).
 		e0=$((ls * 512))
 		e1=$(((ls + n) * 512))
-		a=$((e0 > w0 ? e0 : w0))
+		a=$((e0 > off ? e0 : off))
 		b=$((e1 < w1 ? e1 : w1))
 		if ((a < b)); then
-			dev=$((ps * 512 + a - e0))
-			if ((dev % ss != 0 || (b - a) % ss != 0)); then
-				die "extent of $file at device byte $dev, $((b - a)) bytes, is not in whole $ss-byte sectors"
-			fi
-			dd if="$LOOP" of="$out.raw" iflag=direct oflag=append conv=notrunc bs="$ss" \
-				skip=$((dev / ss)) count=$(((b - a) / ss)) status=none
+			at=$((ps * 512 + a - e0))
+			printf '  image read: file bytes %s..%s at image byte %s\n' "$a" "$b" "$at"
+			dd if="$IMG" iflag=skip_bytes,count_bytes skip="$at" count=$((b - a)) status=none >>"$out"
 		fi
 	done <"$WORK/extents"
-	got=$(stat -c %s "$out.raw")
-	((got == w1 - w0)) || die "direct read of $file returned $got bytes, expected $((w1 - w0))"
-	tail -c +$((off - w0 + 1)) "$out.raw" | head -c "$len" >"$out"
+	local got
+	got=$(stat -c %s "$out")
+	((got == len)) || die "image read of $file returned $got bytes, expected $len"
+}
+
+# check_mapping FILE EXPECTED_HEX: before any verdict that reads the image, FILE's first bytes, written and synced
+# long before the fault, must be found at the offset dev_read computes; otherwise the arm fails here with a clear
+# message instead of comparing the wrong bytes.
+check_mapping() {
+	local file=$1 want=$2 n got
+	n=$((${#want} / 2))
+	dev_read "$file" 0 "$n" "$WORK/mapping.bin"
+	got=$(od -An -v -tx1 "$WORK/mapping.bin" | tr -d ' \n')
+	if [[ $got != "$want" ]]; then
+		die "mapping check failed: $file's first $n bytes in the image are $got, expected $want (offset arithmetic)"
+	fi
+	printf 'mapping check: %s starts with %s in the image\n' "$file" "$want"
 }
 
 # cached_read FILE OFFSET LENGTH OUT: the same bytes through the page cache.
@@ -174,7 +185,10 @@ cached_read() {
 # same_on_device FILE: sets SAME to 1 if every byte of FILE in the page cache is on the device, else 0. (Never
 # called as a condition, so that errexit holds inside.)
 same_on_device() {
-	local file=$1 size
+	local file=$1 size header=$1
+	# The A.1 header's magic, "KVIK"; the mark has no header, so the store's manifest is checked instead.
+	[[ $(basename "$file") == MARK ]] && header=$(dirname "$(dirname "$file")")/MANIFEST
+	check_mapping "$header" 4b56494b
 	size=$(stat -c %s "$file")
 	dev_read "$file" 0 "$size" "$WORK/dev.bin"
 	cached_read "$file" 0 "$size" "$WORK/cache.bin"
@@ -218,6 +232,9 @@ arm_probe() {
 		return
 	fi
 	local control
+	# The file's first 16 bytes are fill (0x5a), synced before the fault; the probe's piece lies further in.
+	((off >= 16)) || die "the probe's piece starts at $off, inside the bytes the mapping check reads"
+	check_mapping "$f" 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
 	dev_read "$f" "$off" "$len" "$WORK/control.bin"
 	if cmp -s "$WORK/control.bin" "$WORK/pattern.bin"; then
 		control="the device holds the new bytes after the control sync: the kernel kept the page dirty"
@@ -409,7 +426,7 @@ main() {
 	[[ $(uname -s) == Linux ]] || die "Linux only"
 	((EUID == 0)) || die "run as root"
 	[[ -x $BIN ]] || die "$BIN is not an executable"
-	need_tools losetup dmsetup blockdev filefrag dd cmp mkfifo mountpoint "mkfs.$FS" modprobe stat awk
+	need_tools losetup dmsetup blockdev filefrag dd cmp od mkfifo mountpoint "mkfs.$FS" modprobe stat awk
 	need_module dm_mod
 	need_module "$FS"
 	dmsetup targets | grep -q '^error' || die "device-mapper has no error target"
