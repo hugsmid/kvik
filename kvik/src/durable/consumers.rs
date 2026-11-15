@@ -31,6 +31,7 @@ impl Writer {
     pub(crate) fn deliver(&self) {
         if let Some(h) = &self.hub {
             h.run(|d, c| d.pump(c));
+            h.wait_wakes();
         }
     }
 
@@ -135,6 +136,8 @@ impl Writer {
         })?;
         let id = change.funnel.unwrap_or(0);
         self.commit_entry(&mut d, Entry::Routing(Box::new(change)))?;
+        drop(d);
+        hub.run(|_, _| ());
         Ok(FunnelId(id))
     }
 
@@ -163,6 +166,7 @@ impl Writer {
             })
         })?;
         self.commit_entry(&mut d, Entry::Routing(Box::new(change)))?;
+        drop(d);
         hub.run(|dl, _| dl.forget_latch(name, funnel.0));
         Ok(())
     }

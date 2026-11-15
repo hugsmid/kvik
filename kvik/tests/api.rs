@@ -770,7 +770,7 @@ fn next_waits_until_an_emit_on(b: Backend) {
     let mut next = std::pin::pin!(c.next());
     assert!(poll_once(next.as_mut(), &woken).is_pending());
     block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
-    assert!(woken.take());
+    assert!(woken.take(), "{b:?}");
     match poll_once(next.as_mut(), &woken) {
         Poll::Ready(Some(d)) => assert!(matches!(d.kind, DeliveryKind::Fact(_))),
         other => panic!("{other:?}"),
@@ -829,7 +829,7 @@ fn back_pressure_and_call_limits_on(b: Backend) {
     ));
     clock.set_synchronised(true);
     s.tick().unwrap();
-    assert!(woken.take());
+    assert!(woken.take(), "{b:?}");
     match poll_once(emit.as_mut(), &woken) {
         Poll::Ready(Ok(ack)) => assert_eq!(ack.recorded(), 1),
         other => panic!("{other:?}"),
@@ -1469,9 +1469,15 @@ impl Drop for ReadingWaker {
 
 #[test]
 fn wakers_run_outside_the_store_lock() {
-    let (s, _clock) = store("waker-lock");
+    for b in BACKENDS {
+        wakers_run_outside_the_store_lock_on(b);
+    }
+}
+
+fn wakers_run_outside_the_store_lock_on(b: Backend) {
+    let (s, _clock) = store_on(b, "waker-lock");
     let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
-    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let mut c = new_consumer(&s, "c");
     block_on(c.route(Funnel::facts(Select::All))).unwrap();
     let woken = Arc::new(Flag::default());
     {
@@ -1493,7 +1499,7 @@ fn wakers_run_outside_the_store_lock() {
         std::mem::forget(s);
         panic!("the emit did not complete: a waker ran under the store lock");
     }
-    assert!(woken.take());
+    assert!(woken.take(), "{b:?}");
 }
 
 #[test]

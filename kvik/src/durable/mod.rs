@@ -618,7 +618,11 @@ impl Writer {
             CommitError::OutcomeUnknown => Error::SyncFailed,
         })?;
         d.registry.apply(&entry);
-        self.deliver();
+        // Routing sees the entry now, at its position; consumers waiting are woken once the decision lock is
+        // released, by the next call or the `kvik-deliver` thread.
+        if let Some(h) = &self.hub {
+            h.run_quiet(|dl, c| dl.pump(c));
+        }
         Ok(ack)
     }
 

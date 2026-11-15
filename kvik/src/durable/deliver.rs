@@ -204,6 +204,9 @@ pub(crate) struct Deliverer {
     wakers: Vec<Waker>,
     /// Something a consumer may be waiting for changed since the wakers were last woken.
     notify: bool,
+    /// A cursor file write or sync failed: no cursor file is written again and nothing further is delivered until a
+    /// restart (`spec.md` §3 Write or sync failure: a failed sync is never retried).
+    failed: bool,
     loading: bool,
 }
 
@@ -280,6 +283,7 @@ impl Deliverer {
             max_consumers,
             wakers: Vec::new(),
             notify: false,
+            failed: false,
             loading: true,
         };
         let ctx = Ctx {
@@ -290,6 +294,20 @@ impl Deliverer {
             wall: 0,
             mono: 0,
         };
+        // The kept log, read whole before anything is delivered: a read that fails stops the open.
+        let first = d
+            .reader
+            .as_mut()
+            .map(LogReader::refresh)
+            .transpose()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        for e in first.map(|u| u.events).unwrap_or_default() {
+            match e {
+                ReadEvent::Batch(b) => d.pending.push_back(b),
+                ReadEvent::Void { above, .. } => d.void(above),
+                ReadEvent::Corruption { .. } => {}
+            }
+        }
         d.pump(&ctx);
         d.loading = false;
         // Lost ranges not described by a recovery entry are reset points: `forget_above` the position before, id
@@ -354,6 +372,7 @@ impl Deliverer {
         let Some(r) = self.reader.as_mut() else {
             return;
         };
+        // A refresh that fails changes nothing the reader holds; the next one reads it again.
         if let Ok(u) = r.refresh() {
             for e in u.events {
                 match e {
@@ -997,6 +1016,13 @@ impl Deliverer {
         }
     }
 
+    fn writable(&self) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::ReadOnly("a cursor file write failed".into()));
+        }
+        Ok(())
+    }
+
     fn bound(&self, name: &str) -> Result<&Rt, Error> {
         match self.consumers.get(name) {
             Some(rt) if rt.handle => Ok(rt),
@@ -1030,6 +1056,7 @@ impl Deliverer {
     /// unless a resync awaits confirmation, the next from its queue after running timers and catch-up.
     pub(crate) fn poll(&mut self, name: &str, ctx: &Ctx<'_>) -> Result<Option<Delivery>, Error> {
         self.bound(name)?;
+        self.writable()?;
         if let Some(d) = self.hand_out(name) {
             return Ok(Some(d));
         }
@@ -1210,6 +1237,7 @@ impl Deliverer {
         ctx: &Ctx<'_>,
     ) -> Result<io::Result<()>, Error> {
         self.bound(name)?;
+        self.writable()?;
         let funnels: BTreeMap<u32, LogPos> = self
             .view
             .funnels(name)
@@ -1254,9 +1282,15 @@ impl Deliverer {
         rt.dirty = true;
         self.notify = true;
         if forced {
-            rt.paused = false;
-            rt.reset_open = false;
-            return Ok(self.write_cursor(name, true, ctx));
+            // Nothing further is delivered until the cursor file naming the resync's id is synced.
+            let r = self.write_cursor(name, true, ctx);
+            if r.is_ok()
+                && let Some(rt) = self.consumers.get_mut(name)
+            {
+                rt.paused = false;
+                rt.reset_open = false;
+            }
+            return Ok(r);
         }
         Ok(self.write_cursor(name, false, ctx))
     }
@@ -1269,6 +1303,9 @@ impl Deliverer {
             .funnels(name)
             .map(|(id, f)| (id, f.incarnation))
             .collect();
+        if self.failed {
+            return Err(io::Error::other("a cursor file write failed before"));
+        }
         let Some(rt) = self.consumers.get_mut(name) else {
             return Ok(());
         };
@@ -1296,7 +1333,7 @@ impl Deliverer {
         {
             w.sync_mark().map_err(|f| io::Error::other(f.to_string()))?;
         }
-        let end = cursor::append(
+        let end = match cursor::append(
             &*ctx.env.fs,
             ctx.dir,
             self.store_id,
@@ -1304,7 +1341,13 @@ impl Deliverer {
             ctx.wall,
             &state,
             rt.file_end,
-        )?;
+        ) {
+            Ok(end) => end,
+            Err(e) => {
+                self.failed = true;
+                return Err(e);
+            }
+        };
         rt.file_end = Some(end);
         rt.dirty = false;
         rt.last_write = Some(ctx.mono);
@@ -1382,6 +1425,15 @@ pub(crate) struct Hub {
     /// When the timers last ran, on the process's clock: the `kvik-deliver` thread runs them only when no call has
     /// for a second, so calls that run them (emits, polls, `tick`) keep the order the model backend gives.
     last_tick: std::sync::Mutex<std::time::Instant>,
+    /// Runs that took wakers, and those that have woken them: a call waits until every wake begun before it has
+    /// ended ([`Hub::wait_wakes`]).
+    wakes: std::sync::Mutex<(u64, u64)>,
+    wakes_cv: std::sync::Condvar,
+}
+
+thread_local! {
+    /// This thread is waking consumers: a waker that calls back into the store does not wait for itself.
+    static IN_WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1404,11 +1456,60 @@ impl Hub {
             fault: std::sync::Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
             last_tick: std::sync::Mutex::new(std::time::Instant::now()),
+            wakes: std::sync::Mutex::new((0, 0)),
+            wakes_cv: std::sync::Condvar::new(),
         })
     }
 
     /// Runs `f` on the deliverer with the clocks now, then wakes the consumers waiting if something changed.
     pub(crate) fn run<R>(&self, f: impl FnOnce(&mut Deliverer, &Ctx<'_>) -> R) -> R {
+        let r = self.run_quiet(f);
+        let closed = self.closed.load(std::sync::atomic::Ordering::SeqCst);
+        let wakers = {
+            let mut d = lock(&self.deliverer);
+            let w = d.take_wakers(closed);
+            if !w.is_empty() {
+                lock(&self.wakes).0 += 1;
+            }
+            w
+        };
+        if !wakers.is_empty() {
+            let was = IN_WAKE.with(|f| f.replace(true));
+            for w in wakers {
+                w.wake();
+            }
+            IN_WAKE.with(|f| f.set(was));
+            lock(&self.wakes).1 += 1;
+            self.wakes_cv.notify_all();
+        }
+        r
+    }
+
+    /// Waits until every wake of consumers begun before the call has ended, so that a call whose batch another
+    /// thread delivered returns only once the consumers waiting for it are woken. A waker that calls back does not
+    /// wait.
+    pub(crate) fn wait_wakes(&self) {
+        if IN_WAKE.with(std::cell::Cell::get) {
+            return;
+        }
+        let w = lock(&self.wakes);
+        let target = w.0;
+        drop(
+            self.wakes_cv
+                .wait_while(w, |w| w.1 < target)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
+    /// Notes that the timers ran.
+    pub(crate) fn ticked(&self) {
+        *lock(&self.last_tick) = std::time::Instant::now();
+    }
+
+    /// Runs `f` on the deliverer without waking anyone: for a caller that holds a lock a waker might take. What
+    /// changed is woken by the next run, the `kvik-deliver` thread's at the latest, which the writer's progress
+    /// wakes.
+    pub(crate) fn run_quiet<R>(&self, f: impl FnOnce(&mut Deliverer, &Ctx<'_>) -> R) -> R {
         let watch = lock(&self.watch).clone();
         let wall = self.env.clock.wall().0;
         let now = self
@@ -1424,20 +1525,7 @@ impl Hub {
             wall,
             mono,
         };
-        let mut d = lock(&self.deliverer);
-        let r = f(&mut d, &ctx);
-        let closed = self.closed.load(std::sync::atomic::Ordering::SeqCst);
-        let wakers = d.take_wakers(closed);
-        drop(d);
-        for w in wakers {
-            w.wake();
-        }
-        r
-    }
-
-    /// Notes that the timers ran.
-    pub(crate) fn ticked(&self) {
-        *lock(&self.last_tick) = std::time::Instant::now();
+        f(&mut lock(&self.deliverer), &ctx)
     }
 
     /// Records a cursor file fault.

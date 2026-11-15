@@ -57,7 +57,13 @@ fn futures_are_send() {
 
 #[test]
 fn writers_and_a_consumer_on_several_threads() {
-    let (s, clock) = store("threads");
+    for b in common::BACKENDS {
+        writers_and_a_consumer_on_several_threads_on(b);
+    }
+}
+
+fn writers_and_a_consumer_on_several_threads_on(b: kvik::Backend) {
+    let (s, clock) = common::store_on(b, "threads");
     let id = block_on(s.define_series(SeriesSpec::new(
         "a/b/c",
         Kind::Gauge {

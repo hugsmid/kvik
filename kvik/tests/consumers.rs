@@ -275,6 +275,48 @@ fn a_reset_point_in_the_replay_waits_for_its_confirmation() {
 }
 
 #[test]
+fn a_failed_cursor_sync_turns_the_store_read_only_and_is_never_retried() {
+    use kvik_log::fs::FaultOp;
+    let mut w = World::new("cursor-fault");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let c = new_consumer(&s, "log", Select::None);
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
+    w.crash(s, vec![c], true);
+    let s = w.open();
+    let mut c = block_on(s.consumer("log", Start::Now, Select::None)).unwrap();
+    let mut got = Vec::new();
+    while let Some(d) = c.try_next().unwrap() {
+        got.push(d);
+    }
+    let last = got.last().unwrap();
+    assert!(resync(last).unwrap().forget_above.is_some());
+    // The sync of the cursor file that the reset point's confirmation writes fails.
+    w.fs.fail_nth(FaultOp::Sync, "cursors", 0, std::io::ErrorKind::Other);
+    let syncs = || {
+        w.fs.ops()
+            .iter()
+            .filter(|o| o.op == FaultOp::Sync && o.path.to_string_lossy().contains("cursors"))
+            .count()
+    };
+    let before = syncs();
+    assert!(matches!(
+        block_on(c.confirm(last.id)),
+        Err(ConsumerError::Write(_))
+    ));
+    assert_eq!(syncs(), before + 1);
+    assert!(matches!(s.health(), kvik::Health::ReadOnly { .. }));
+    // Nothing further is delivered, and no cursor file is written again, by a call, the timer or the shutdown.
+    block_on(s.emit(&[num(g, 1, 2.0)])).ok();
+    assert!(c.try_next().is_err());
+    w.clock.advance(Duration::from_secs(2));
+    s.tick().unwrap();
+    assert!(block_on(s.shutdown()).is_err());
+    assert_eq!(syncs(), before + 1, "a failed sync is never retried");
+}
+
+#[test]
 fn emits_are_declared_and_routing_cycles_are_refused() {
     let w = World::new("emits");
     let s = w.open();

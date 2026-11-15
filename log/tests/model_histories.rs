@@ -28,7 +28,8 @@
 //!   (Q-116 (f), (l) and (p)); accepted only when the header on disk does read unused.
 //!
 //! Left out, with the reason:
-//! - Routing changes: the log has no entry for them yet (`format.md` A.6, type 5 is reserved for roadmap 5.2).
+//! - Routing changes: entry type 5 since roadmap 5.2; routing and delivery are tested against the model at the
+//!   interface (`kvik/tests/consumers.rs`).
 //! - The timed mark sync in the model: the model can lose acknowledged batches above its last synced mark
 //!   (`MarkSync::Timed`, `Model::remount`, `Model::power_loss_losing`), but the log syncs its mark on its own timer, so
 //!   the model runs with the mark synced at every commit; remounts run with the log's mark synced at every commit too,
