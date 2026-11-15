@@ -202,6 +202,8 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
     /// One object at most; `Ok(false)` when nothing is left to do now.
     async fn advance(&mut self, now: Duration) -> Out<bool> {
         if !self.store_done && self.upload_store(now).await? {
+            let snap = self.manifest.snapshot();
+            self.update_progress(&snap);
             return Ok(true);
         }
         let snap = self.manifest.snapshot();

@@ -122,6 +122,12 @@ impl RecSink {
         f.at.remove(&op)
     }
 
+    /// A fault for a call other than `put`: a hash mismatch is a `put`'s alone.
+    fn read_fault(&self) -> Option<Fault> {
+        self.fault()
+            .filter(|f| !matches!(f, Fault::Fail(SinkError::HashMismatch { .. })))
+    }
+
     fn check_put(&self, key: &str) {
         let Some(app) = lock(&self.slot).clone() else {
             lock(&self.log)
@@ -172,7 +178,7 @@ impl BackupSink for RecSink {
     }
 
     fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>> {
-        let fault = self.fault();
+        let fault = self.read_fault();
         let special = {
             let mut f = lock(&self.faults);
             let others_fail = f.others_fail;
@@ -208,7 +214,7 @@ impl BackupSink for RecSink {
     }
 
     fn get<'a>(&'a self, key: &'a str, range: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>> {
-        let fault = self.fault();
+        let fault = self.read_fault();
         Box::pin(async move {
             match fault {
                 Some(Fault::Fail(e)) => Err(e),
@@ -226,7 +232,7 @@ impl BackupSink for RecSink {
         prefix: &'a str,
         start_after: Option<&'a str>,
     ) -> SinkFuture<'a, ListPage> {
-        let fault = self.fault();
+        let fault = self.read_fault();
         Box::pin(async move {
             match fault {
                 Some(Fault::Fail(e)) => Err(e),

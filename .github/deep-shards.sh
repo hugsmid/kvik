@@ -53,6 +53,7 @@ tree-fuzz-inputs tree fuzz_inputs
 backup-envelope backup envelope
 backup-fuzz     backup fuzz_inputs
 backup-keys     backup keys
+backup-upload   backup upload_histories
 '
 
 cd "$(dirname "$0")/.."
