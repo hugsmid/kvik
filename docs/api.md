@@ -133,7 +133,8 @@ pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timesta
 ```
 Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence) and
 `ConsumerError::RouteCycle` (a route or a change of `emits`), and `DefineError::RouteCycle` for an alias, each naming
-the cycle (roadmap 5.2). Backup errors are added by roadmap 8.2.
+the cycle (roadmap 5.2). A `Start::Position` whose saved point is unknown is `ConsumerError::UnknownPoint`. Backup
+errors are added by roadmap 8.2.
 
 ## Handles and life cycle (accepted at gate 3.3)
 - `Store` is `Clone + Send + Sync`; clones share the one writer. `Consumer` is `Send`, not `Clone`, and owns a share
@@ -242,10 +243,10 @@ while let Some(d) = consumer.next().await {
     }
     consumer.confirm(d.id).await?;            // advances the durable cursor
 }
-pub struct ResyncPart { pub cause: ResyncCause /* Resume | ResetPoint | GenerationChanged | CursorBehindLog */,
+pub struct ResyncPart { pub cause: ResyncCause /* Resume | ResetPoint | GenerationChanged | CursorBehindLog | NoCursor */,
     pub forget_above: Option<Position>,       // Some at a reset point: drop every position above it
     pub part: u32, pub last: bool,            // a resync is 1..n deliveries
-    pub funnels: Vec<FunnelState> }           // at most 256 per part; empty unless it ends a resume
+    pub funnels: Vec<FunnelState> }           // at most 256 per part; empty unless it ends a resume or is NoCursor
 pub struct FunnelState { pub funnel: FunnelId, pub series: SeriesId, pub live: Live, pub condition: Option<ConditionState> }
 enum ConditionState { True, False, Unknown }
 enum Live { Value(Fact), None, Unknown }
@@ -261,12 +262,17 @@ enum Live { Value(Fact), None, Unknown }
 - A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
   or on the timer, valid until the next resync), `flags` (`replayed`,
   `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
-- `Start::Position(point)` takes a `SavedPoint { position, stamp }` (spec §7 Readers, Reset stamp and saved points)
-  and begins with a resync whose `forget_above` is the position, or the lower position it is void above; an unknown
-  point refuses the registration with an error that says so (consumer errors are settled with roadmap 5.2). The
-  check is built with roadmap 5.3.
-- `confirm` is cheap and batched; the cursor is written at most once a second, on shutdown and when a resync
-  carrying `forget_above` is confirmed.
+- `start` gives the position before the start (spec §4 Resync): the last position for `Start::Now`, the position
+  before the first fact at or after T for `Start::Time(T)`, and for `Start::Position(point)`, which takes a
+  `SavedPoint { position, stamp }` (spec §7 Readers, Reset stamp and saved points), the position, or the lower
+  position it is void above; an unknown point refuses the registration with `ConsumerError::UnknownPoint`. A new
+  consumer receives no resync and starts after that position. A consumer whose cursor file was lost (missing or
+  unreadable at a start) first receives a resync of cause `NoCursor` whose `forget_above` is that position, carrying
+  each funnel's state, a transition since its latches are lost (Q-131). A consumer with a cursor file resumes after
+  it, whatever `start`. The model backend supports only `Start::Now`.
+- `confirm` is cheap and batched; the cursor is written at most once a second, at once when the confirmation changes
+  a latch (it returns once the file is synced, Q-132), on shutdown and when a resync carrying `forget_above` is
+  confirmed.
 - A resync may carry `forget_above` = X: the consumer must drop every position above X from its de-duplication
   memory, its own last confirmation included, because such a position can now name a different fact (spec §3
   Recovery rule 3, §4 At-least-once). It confirms that resync only when the forgetting is durable wherever that
@@ -278,8 +284,13 @@ enum Live { Value(Fact), None, Unknown }
   counted.
 - Routes may be added and removed while running; each change is a log entry and takes effect at its position. A
   route, a change of `emits` or an alias (`store.alias`) that closes a cycle between consumers is refused with the
-  error `RouteCycle`, naming the cycle (spec §4 Routing). Whether two name patterns overlap must be decidable from
-  the two patterns alone; the pattern grammar is not yet defined (`model/OPEN-QUESTIONS.md`, Q-88).
+  error `RouteCycle`, naming the cycle (spec §4 Routing). Routes are kept across restarts: `route` with a funnel equal
+  to one in force returns that funnel's id and writes nothing, keeping its latch, so an application may route its
+  funnels at every start, as the example does (Q-91 (c)). Whether two name patterns overlap must be decidable from
+  the two patterns alone. The pattern grammar is provisional until roadmap 5.6 (`model/OPEN-QUESTIONS.md`, Q-88): a
+  name pattern has as many `/`-separated segments as the names it matches, and `*` matches any run of characters
+  within one segment; two patterns overlap when they have as many segments and, in each, some string that both
+  match.
 
 ## Reader processes (accepted at gate 3.3)
 ```rust
