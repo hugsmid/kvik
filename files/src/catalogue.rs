@@ -5,8 +5,10 @@
 //! The fold is [`Catalogue::apply`]; it refuses a record that contradicts the records before it and then changes
 //! nothing. A file a record retires without any record having published it is entered as retired: every record
 //! that names a file repeats its description, so the retirement alone says what the file was. A record of a type
-//! whose layout a later roadmap item gives (restore, quarantine, tier move) or of an unknown skippable type changes
-//! nothing here until its item lays it out; so a quarantined file stays listed as live until roadmap 8.1.
+//! whose layout a later roadmap item gives (restore, quarantine) or of an unknown skippable type changes nothing here
+//! until its item lays it out; so a quarantined file stays listed as live until roadmap 8.1. A copy-verified record
+//! (`0x27`) sets the file's deep copy and marks its tier verified; one carried into a rebuilt manifest sets the copy
+//! only (Q-280).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +17,7 @@ use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 use crate::desc::{FileDescription, FileRef, kind};
 use crate::record::{Body, Rebuild, Record};
 use crate::restore::RestoreRecord;
-use crate::tier::DeepCopy;
+use crate::tier::{CopyVerified, DeepCopy};
 
 /// A storage tier (`spec.md` §8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,7 +45,8 @@ pub struct FileEntry {
     /// The tiers other than its own where a copy is verified. A rebuild record clears every mark (`spec.md` §7: a
     /// rebuilt manifest takes no file as verified in another tier until it is verified there again).
     pub verified: BTreeSet<Tier>,
-    /// Its verified copy in the deep tier, from a copy-verified record (`0x27`).
+    /// Its copy in the deep tier, from a copy-verified record (`0x27`); kept by a rebuild record, which clears only
+    /// `verified` (Q-280).
     pub deep: Option<DeepCopy>,
 }
 
@@ -162,7 +165,12 @@ impl Catalogue {
     pub fn apply(&mut self, r: &Record) -> Result<(), CatalogueError> {
         self.check(r)?;
         match &r.body {
-            Body::Empty | Body::Other { .. } => {}
+            Body::Empty => {}
+            Body::Other { .. } => {
+                if let Some(Ok(c)) = CopyVerified::from_body(&r.body) {
+                    self.apply_copy(c, r.old_epoch.is_some());
+                }
+            }
             Body::Publish(p) => {
                 for d in &p.published {
                     self.files
@@ -237,6 +245,21 @@ impl Catalogue {
         self.last_epoch = r.epoch;
         self.generation = r.generation;
         Ok(())
+    }
+
+    /// A copy-verified record. A carried one (field 100) was verified before a rebuild, so it gives the copy but no
+    /// verified mark (`spec.md` §7 Manifest: verified there again; Q-280).
+    fn apply_copy(&mut self, c: CopyVerified, carried: bool) {
+        match (c.tier, carried) {
+            (Tier::Deep, false) => self.record_copy(c.file, c.tier, c.copy),
+            (Tier::Deep, true) => {
+                if let Some(e) = self.files.get_mut(&c.file) {
+                    e.deep = Some(c.copy);
+                }
+            }
+            (t, false) => self.mark_verified(c.file, t),
+            (_, true) => {}
+        }
     }
 
     /// Checks a record that publishes `published` and retires `retired`.
@@ -470,6 +493,65 @@ mod tests {
         let absent = segment(2).file_ref();
         c.record_copy(absent, Tier::Deep, copy);
         assert!(c.file(absent).is_none());
+    }
+
+    fn copy(file_id: u64, carried: bool, epoch: u64) -> Record {
+        let c = CopyVerified {
+            file: segment(file_id).file_ref(),
+            tier: Tier::Deep,
+            copy: DeepCopy {
+                size: 10 + file_id,
+                sha256: [file_id as u8; 32],
+            },
+        };
+        let mut r = Record::new(epoch, 0, 0, c.to_body());
+        r.old_epoch = carried.then_some(epoch - 1);
+        r
+    }
+
+    #[test]
+    fn a_copy_verified_record_sets_the_copy_and_marks_deep_verified() {
+        let c = Catalogue::replay(&[
+            Record::new(2, 0, 0, Body::Sealed(vec![segment(1)])),
+            copy(1, false, 3),
+        ])
+        .unwrap();
+        let e = c.file(segment(1).file_ref()).unwrap();
+        assert_eq!(e.deep.as_ref().map(|d| d.size), Some(11));
+        assert!(e.verified.contains(&Tier::Deep));
+    }
+
+    #[test]
+    fn q280_a_carried_copy_verified_record_sets_the_copy_but_no_verified_mark() {
+        let rebuild = Record::new(10, 0, 0, Body::Rebuild(Rebuild::default()));
+        let mut sealed = Record::new(11, 0, 0, Body::Sealed(vec![segment(1)]));
+        sealed.old_epoch = Some(2);
+        let c = Catalogue::replay(&[rebuild, sealed, copy(1, true, 12)]).unwrap();
+        let e = c.file(segment(1).file_ref()).unwrap();
+        assert_eq!(e.deep.as_ref().map(|d| d.size), Some(11));
+        assert!(e.verified.is_empty());
+        let mut c = c;
+        c.apply(&copy(1, false, 13)).unwrap();
+        assert!(
+            c.file(segment(1).file_ref())
+                .unwrap()
+                .verified
+                .contains(&Tier::Deep)
+        );
+    }
+
+    #[test]
+    fn a_rebuild_record_clears_verified_but_keeps_the_copy() {
+        let mut c = Catalogue::replay(&[
+            Record::new(2, 0, 0, Body::Sealed(vec![segment(1)])),
+            copy(1, false, 3),
+        ])
+        .unwrap();
+        c.apply(&Record::new(4, 0, 0, Body::Rebuild(Rebuild::default())))
+            .unwrap();
+        let e = c.file(segment(1).file_ref()).unwrap();
+        assert!(e.verified.is_empty());
+        assert!(e.deep.is_some());
     }
 
     #[test]

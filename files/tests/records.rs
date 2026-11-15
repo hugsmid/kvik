@@ -6,12 +6,14 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 
-use kvik_files::desc::{FileClass, kind};
+use kvik_files::catalogue::Tier;
+use kvik_files::desc::{FileClass, FileRef, kind};
 use kvik_files::image::read;
 use kvik_files::record::{
     AckedLoss, Acknowledgement, Body, Publish, Rebuild, Record, RecordError, is_canonical,
     record_type,
 };
+use kvik_files::tier::{CopyVerified, DeepCopy};
 use kvik_log::Element;
 use kvik_log::block::{FLAG_SKIPPABLE, encode_block};
 use kvik_log::manifest::{LossCause, LostRange, RECORD_LOST_RANGE, encode_record, read_manifest};
@@ -399,4 +401,93 @@ fn golden_files_are_what_the_generator_writes_and_read_as_they_show() {
     assert_eq!(img.corrupt.len(), 1);
     assert_eq!(img.corrupt[0].presumed_epoch(), 3);
     assert_eq!(img.corrupt[0].before_epoch, 4);
+}
+
+fn copy_verified() -> impl Strategy<Value = CopyVerified> {
+    (
+        1u8..15,
+        any::<u64>(),
+        prop_oneof![Just(Tier::Hot), Just(Tier::Cold), Just(Tier::Deep)],
+        any::<u64>(),
+        any::<[u8; 32]>(),
+    )
+        .prop_map(|(kind, file_id, tier, size, sha256)| CopyVerified {
+            file: FileRef { kind, file_id },
+            tier,
+            copy: DeepCopy { size, sha256 },
+        })
+}
+
+proptest! {
+    #[test]
+    fn a_copy_verified_record_round_trips_through_its_block(c in copy_verified(), old in proptest::option::of(any::<u64>())) {
+        let mut r = Record::new(5, 1, T0, c.to_body());
+        r.old_epoch = old;
+        let b = r.encode().unwrap();
+        prop_assert!(is_canonical(&b));
+        let back = decode_block(&b).unwrap();
+        prop_assert_eq!(&back, &r);
+        prop_assert_eq!(CopyVerified::from_body(&back.body), Some(Ok(c)));
+    }
+}
+
+#[test]
+fn the_checks_of_a_copy_verified_record() {
+    let good = CopyVerified {
+        file: FileRef {
+            kind: kind::LOG_SEGMENT,
+            file_id: 7,
+        },
+        tier: Tier::Deep,
+        copy: DeepCopy {
+            size: 9,
+            sha256: [4; 32],
+        },
+    };
+    let Body::Other { fields, .. } = good.to_body() else {
+        panic!()
+    };
+    let with = |f: Vec<(u16, Vec<u8>)>| Body::Other {
+        record_type: record_type::TIER_MOVE,
+        skippable: false,
+        fields: f,
+    };
+    let edit = |id: u16, v: Vec<u8>| {
+        let f = fields
+            .iter()
+            .map(|(i, x)| (*i, if *i == id { v.clone() } else { x.clone() }))
+            .collect();
+        CopyVerified::from_body(&with(f)).unwrap()
+    };
+    assert!(edit(1, vec![1; 11]).is_err());
+    assert!(edit(1, [vec![1, 0, 1, 0], vec![0; 8]].concat()).is_err());
+    assert!(edit(2, vec![0]).is_err());
+    assert!(edit(2, vec![4]).is_err());
+    assert!(edit(3, vec![0; 7]).is_err());
+    assert!(edit(4, vec![0; 31]).is_err());
+    let mut twice = fields.clone();
+    twice.push((4, vec![0; 32]));
+    assert!(CopyVerified::from_body(&with(twice)).unwrap().is_err());
+    assert!(
+        CopyVerified::from_body(&with(fields[1..].to_vec()))
+            .unwrap()
+            .is_err()
+    );
+    let mut unknown = fields.clone();
+    unknown.push((5, vec![]));
+    assert_eq!(
+        CopyVerified::from_body(&with(unknown)).unwrap(),
+        Err(RecordError::Unsupported(Element::Field {
+            entry_type: record_type::TIER_MOVE,
+            field: 5
+        }))
+    );
+    let mut ignorable = fields.clone();
+    ignorable.push((0x8001, vec![1]));
+    assert_eq!(
+        CopyVerified::from_body(&with(ignorable)),
+        Some(Ok(good.clone()))
+    );
+    assert_eq!(CopyVerified::from_body(&Body::Empty), None);
+    assert_eq!(CopyVerified::from_body(&with(fields)), Some(Ok(good)));
 }
