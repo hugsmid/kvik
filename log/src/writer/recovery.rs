@@ -939,8 +939,9 @@ pub(super) fn start(
             consumers.insert(r.consumer.clone());
         }
     }
-    // Routing changes sealed above the registry file's `through`: the file is written after each routing change
-    // (Q-130), so these are at most the changes whose segment was sealed before the file was written.
+    // Routing changes sealed above the registry file's `through` (Q-130). The file is written at a start, a clean
+    // shutdown and each routing change, so after a crash this reads every segment sealed since the last of those
+    // (possibly the whole previous run), and with no registry file every sealed segment; the cost is Q-116 (n).
     let through = registry.as_ref().map_or(0, |f| f.through);
     for (name, path) in sealed.iter().rev().filter(|(n, _)| n.generation == 0) {
         let Ok(bytes) = store.read_file(path) else {
