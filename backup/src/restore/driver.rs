@@ -468,7 +468,8 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         resumed: bool,
     ) -> Result<Prepared, RestoreError> {
         let g = record.generation;
-        if !record.drill {
+        // A drill never writes to the bucket, whatever the directory holds.
+        if !record.drill && !self.drill() {
             appender.settle(written.epoch, wall)?;
             let key = keys.record(g, written.epoch);
             let sealed = env.seal(
