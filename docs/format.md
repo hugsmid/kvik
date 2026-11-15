@@ -630,7 +630,7 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   synced (on the first write the `registry/` directory is created and the store directory synced); only then are the
   older registry files removed and the directory synced again. A crash at any point leaves the previous file, the new
   one, or both. The file never names a position above the last synced mark (`spec.md` §3 Durable mark): `through`
-  is at most the mark's last position as synced. Until roadmap 6.3 lays out the publish record, a registry file is
+  is at most the mark's last position as synced. Until roadmap 6.3b publishes registry files, a registry file is
   not named by the manifest; it is found by its name, so a `registry/` directory emptied by hand starts the file ids
   of kind 5 at 1 again, which is harmless until the manifest names registry files.
 - **Reading.** The valid file with the highest `file_id`; with none, the registry comes from the log alone.

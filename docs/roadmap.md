@@ -67,7 +67,10 @@ again; nothing after a gate starts before it is passed. Items that do not depend
 - [x] 6.1 Value and timestamp encodings with property and fuzz tests (block bodies and column encodings in
   `docs/format-chunk.md`; sizes in `docs/measurements/6.1-encodings.md`; the compressed fallback's canonical class settled in Q-150)
 - [ ] 6.2 Per-series chunks, index, lossless compaction with verification
-- [ ] 6.3 Manifest and atomic publish-and-retire
+- [x] 6.3a Manifest records, the file catalogue and the automatic rebuild (`files/`; record layouts in `docs/format.md`
+  A.14; Q-171 and Q-174 settled at its review)
+- [ ] 6.3b Atomic publish-and-retire: the store publishes compaction outputs and retires inputs through the manifest,
+  and a start calls the rebuild and the copies of a corrupt record (moved from 6.3)
 - [ ] 6.4a Parquet export: the export schema (provisional, `docs/export.md`) and the Parquet writer (unticked pending Q-190 to Q-197)
 - [ ] 6.4b Differential check of compacted data against the Parquet export (moved from 6.4)
 - [ ] 6.5 **Gate** — compaction looked at as a whole (includes: measure a pure-Rust codec, `ruzstd` or `lz4_flex`, on the XOR
