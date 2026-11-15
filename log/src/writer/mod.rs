@@ -57,7 +57,7 @@ pub use maint::{create_segment, seal_segment};
 pub use options::{GenerationStart, SealListener, StartOptions};
 pub use queue::{CallSource, IngestQueue, QueueFull};
 pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
-pub use threads::{Clock, Log, Pending, SubmitError, SystemClock, Watch};
+pub use threads::{Clock, Log, Pending, Room, SubmitError, SystemClock, Watch};
 
 use crate::batch::SegmentIdentity;
 use crate::block::{BLOCK_HEADER_LEN, block_type};

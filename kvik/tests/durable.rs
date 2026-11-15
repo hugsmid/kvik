@@ -706,6 +706,90 @@ fn writers_on_several_threads() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// Runs `f` on another thread; whether it returned within `limit`.
+fn returns_within(limit: Duration, f: impl FnOnce() + Send + 'static) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
+}
+
+#[test]
+fn with_the_queue_full_try_emit_is_busy_at_once_while_other_calls_wait_for_room() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let w = World::new("queue-full");
+    let mut limits = kvik::Limits::default();
+    limits.ingest_queue = 1024;
+    let s = block_on(Store::open(w.config().limits(limits))).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    // The next log sync is held, so nothing leaves the queue.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    let armed = Arc::new(AtomicBool::new(true));
+    let a = armed.clone();
+    w.fs.set_sync_hook(Some(Arc::new(move |_: &Path| {
+        if thread::current().name() == Some("kvik-writer") && a.swap(false, Ordering::SeqCst) {
+            gate.lock().unwrap().recv().unwrap();
+        }
+    })));
+    let batch = |n: i64| -> Vec<Reading> {
+        (0..256)
+            .map(|k| note(id, n * 1_000 + k, &format!("v{n}-{k}")))
+            .collect()
+    };
+    let mut queued = Vec::new();
+    let mut n = 0;
+    let full = loop {
+        match s.try_emit(&batch(n)) {
+            Ok(p) => queued.push(p),
+            Err(e) => break e,
+        }
+        n += 1;
+        assert!(n < 100, "the queue never filled");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        matches!(full, kvik::EmitError::Busy(kvik::Wait::QueueFull)),
+        "{full:?}"
+    );
+
+    // A waiting emit and a definition wait for room without holding up other calls.
+    let s2 = s.clone();
+    let waiting = thread::spawn(move || block_on(s2.emit(&[note(id, 900_000, "w")])).map(|_| ()));
+    let s3 = s.clone();
+    let defining =
+        thread::spawn(move || block_on(s3.define_series(gauge("a/b/later"))).map(|_| ()));
+    thread::sleep(Duration::from_millis(200));
+    let s4 = s.clone();
+    assert!(returns_within(Duration::from_secs(1), move || {
+        let r = s4.try_emit(&[note(id, 900_001, "t")]);
+        assert!(
+            matches!(r, Err(kvik::EmitError::Busy(kvik::Wait::QueueFull))),
+            "{:?}",
+            r.map(|_| ())
+        );
+    }));
+    let s5 = s.clone();
+    assert!(returns_within(Duration::from_secs(1), move || {
+        s5.series_stats(id).unwrap();
+        s5.health();
+        s5.stats();
+    }));
+    assert!(!waiting.is_finished() && !defining.is_finished());
+
+    release.send(()).unwrap();
+    waiting.join().unwrap().unwrap();
+    defining.join().unwrap().unwrap();
+    for p in queued {
+        block_on(p).unwrap();
+    }
+    w.fs.set_sync_hook(None);
+    block_on(s.shutdown()).unwrap();
+}
+
 // ----- the same outcomes as the model backend -----
 
 /// One step of a generated history.

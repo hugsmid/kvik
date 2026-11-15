@@ -85,7 +85,7 @@ impl Writer {
 
     /// Commits a routing change and writes the registry file after it.
     fn commit_routing(&self, d: &mut super::ingest::Decider, change: Routing) -> Result<(), Error> {
-        self.commit_entry(d, Entry::Routing(Box::new(change)))?;
+        self.commit_entry_held(d, Entry::Routing(Box::new(change)))?;
         self.write_registry_file()
     }
 

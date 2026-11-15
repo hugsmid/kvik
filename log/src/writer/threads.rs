@@ -260,6 +260,43 @@ impl Watch {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Wait,
+    Try,
+    Offer,
+}
+
+/// Waits for room in a log's ingest queue ([`Log::room`]).
+#[derive(Debug, Clone)]
+pub struct Room {
+    shared: Arc<Shared>,
+}
+
+impl Room {
+    /// Blocks until a call of `len` entries would be queued, or the log turns read-only or shuts down. Room found
+    /// here may be taken by another caller before this one queues.
+    pub fn wait(&self, len: usize) -> Result<(), SubmitError> {
+        let mut f = lock(&self.shared.front);
+        loop {
+            if f.read_only {
+                return Err(SubmitError::ReadOnly);
+            }
+            if f.shutdown {
+                return Err(SubmitError::ShutDown);
+            }
+            if f.queue.has_room(len) {
+                return Ok(());
+            }
+            f = self
+                .shared
+                .room_cv
+                .wait(f)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 /// The log writer on its threads. See the module documentation of [`crate::writer`].
 #[derive(Debug)]
 pub struct Log {
@@ -324,7 +361,7 @@ impl Log {
         })
     }
 
-    fn enqueue(&self, items: Vec<Item>, wait: bool) -> Result<Pending, SubmitError> {
+    fn enqueue(&self, items: Vec<Item>, mode: Mode) -> Result<Pending, SubmitError> {
         let call = Call::new(items, self.call_limit)?;
         let mut f = lock(&self.shared.front);
         loop {
@@ -334,13 +371,15 @@ impl Log {
             if f.shutdown {
                 return Err(SubmitError::ShutDown);
             }
-            if !wait && let Some(w) = f.waiting {
+            if mode == Mode::Try
+                && let Some(w) = f.waiting
+            {
                 return Err(SubmitError::Busy(w));
             }
             if f.queue.has_room(call.len()) {
                 break;
             }
-            if !wait {
+            if mode != Mode::Wait {
                 return Err(SubmitError::Busy(Wait::QueueFull));
             }
             f = self
@@ -363,12 +402,26 @@ impl Log {
 
     /// Queues a call, waiting while the queue is full (back-pressure).
     pub fn submit(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
-        self.enqueue(items, true)
+        self.enqueue(items, Mode::Wait)
     }
 
     /// Queues a call without waiting: [`SubmitError::Busy`] names the reason ingest would wait.
     pub fn try_submit(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
-        self.enqueue(items, false)
+        self.enqueue(items, Mode::Try)
+    }
+
+    /// Queues a call if the queue has room for it now, as [`Log::submit`] would without waiting, whatever else
+    /// ingest waits on; [`SubmitError::Busy`] with [`Wait::QueueFull`] otherwise. With [`Log::room`], a caller
+    /// that must not wait while it holds a lock queues as `submit` does.
+    pub fn offer(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
+        self.enqueue(items, Mode::Offer)
+    }
+
+    /// A handle that waits for room in the queue without borrowing the log.
+    pub fn room(&self) -> Room {
+        Room {
+            shared: self.shared.clone(),
+        }
     }
 
     /// The writer's statistics, as of its last turn.

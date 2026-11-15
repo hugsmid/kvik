@@ -330,6 +330,12 @@ impl Queued {
     }
 }
 
+/// What a decision under the decision lock gives a call that may append an entry: nothing to append, or the entry.
+enum Decided<T> {
+    Done(T),
+    Entry(Entry, T),
+}
+
 /// What an emit gives back: the outcomes at once, or a call queued in the log.
 pub(crate) enum Emitted {
     Ready(Ack),
@@ -488,12 +494,18 @@ impl Writer {
         // Opening). A release whose name is not a valid entry is left out.
         let release = tzdata_name(tz.version());
         if w.fault().is_none() && release != tzdata_in_force && !release.is_empty() {
-            let mut d = lock(&w.decider);
-            w.commit_entry(&mut d, Entry::Tzdata { version: release })
-                .map_err(|e| OpenError::Io {
-                    path: w.dir.clone(),
-                    source: io::Error::other(e.to_string()),
-                })?;
+            w.commit_entry(|_| {
+                Ok(Decided::Entry(
+                    Entry::Tzdata {
+                        version: release.clone(),
+                    },
+                    (),
+                ))
+            })
+            .map_err(|e| OpenError::Io {
+                path: w.dir.clone(),
+                source: io::Error::other(e.to_string()),
+            })?;
         }
         Ok(w)
     }
@@ -605,9 +617,42 @@ impl Writer {
         Ok(())
     }
 
-    /// Queues one entry and waits for its acknowledgement, holding the decision lock throughout, so no later
-    /// decision sees an entry that is not yet durable. Applies it to the registry once acknowledged.
-    fn commit_entry(&self, d: &mut Decider, entry: Entry) -> Result<LogAck, Error> {
+    /// Decides one entry under the decision lock, queues it and waits for its acknowledgement with the lock held,
+    /// so no later decision sees an entry that is not yet durable; applies it to the registry once acknowledged.
+    /// While the ingest queue is full it waits for room with no lock held and decides again.
+    fn commit_entry<T>(
+        &self,
+        mut decide: impl FnMut(&mut Decider) -> Result<Decided<T>, Error>,
+    ) -> Result<T, Error> {
+        loop {
+            self.writable()?;
+            let mut d = lock(&self.decider);
+            let (entry, out) = match decide(&mut d)? {
+                Decided::Done(out) => return Ok(out),
+                Decided::Entry(entry, out) => (entry, out),
+            };
+            let r = {
+                let log = self.log();
+                let log = log.as_ref().ok_or(Error::Closed)?;
+                log.offer(vec![Item::Entry(entry.clone())])
+            };
+            let pending = match r {
+                Ok(p) => p,
+                Err(SubmitError::Busy(LogWait::QueueFull)) => {
+                    drop(d);
+                    self.wait_room(1).map_err(|e| self.submit_error(e))?;
+                    continue;
+                }
+                Err(e) => return Err(self.submit_error(e)),
+            };
+            self.entry_acknowledged(&mut d, &entry, pending)?;
+            return Ok(out);
+        }
+    }
+
+    /// As [`Self::commit_entry`] for a caller that already holds the decision lock; a full ingest queue is waited
+    /// for with the lock held.
+    fn commit_entry_held(&self, d: &mut Decider, entry: Entry) -> Result<LogAck, Error> {
         self.writable()?;
         let pending = {
             let log = self.log();
@@ -615,18 +660,37 @@ impl Writer {
             log.submit(vec![Item::Entry(entry.clone())])
                 .map_err(|e| self.submit_error(e))?
         };
+        self.entry_acknowledged(d, &entry, pending)
+    }
+
+    fn entry_acknowledged(
+        &self,
+        d: &mut Decider,
+        entry: &Entry,
+        pending: kvik_log::writer::Pending,
+    ) -> Result<LogAck, Error> {
         let ack = pending.wait().map_err(|e| match e {
             CommitError::ShutDown => Error::Closed,
             CommitError::ReadOnly => Error::ReadOnly("the store is read-only".into()),
             CommitError::OutcomeUnknown => Error::SyncFailed,
         })?;
-        d.registry.apply(&entry);
+        d.registry.apply(entry);
         // Routing sees the entry now, at its position; consumers waiting are woken once the decision lock is
         // released, by the next call or the `kvik-deliver` thread.
         if let Some(h) = &self.hub {
             h.run_quiet(|dl, c| dl.pump(c));
         }
         Ok(ack)
+    }
+
+    /// Waits for room for `len` entries in the ingest queue, holding neither a lock nor the log.
+    fn wait_room(&self, len: usize) -> Result<(), SubmitError> {
+        let room = self
+            .log()
+            .as_ref()
+            .map(Log::room)
+            .ok_or(SubmitError::ShutDown)?;
+        room.wait(len)
     }
 
     fn submit_error(&self, e: SubmitError) -> Error {
@@ -644,30 +708,32 @@ impl Writer {
     // ----- series -----
 
     pub(crate) fn define(&self, spec: &SeriesSpec) -> Result<SeriesId, Error> {
-        self.writable()?;
         let lateness = self.limits.default_lateness_bound;
-        let mut d = lock(&self.decider);
-        if let Some(s) = d.registry.resolve(&spec.name) {
-            let new = registry::definition_of(spec, s.def.id, lateness)?;
-            return match registry::difference(&new, &s.def) {
-                None => Ok(SeriesId(s.def.id)),
-                Some(field) => Err(Error::Conflict(field)),
-            };
-        }
         // Validate before an id is taken.
         registry::definition_of(spec, 1, lateness)?;
-        let ceiling = self.limits.series_ceiling as usize;
-        if d.registry.len() >= ceiling {
-            return Err(Error::Ceiling(ceiling));
-        }
-        let floor = self.log().as_ref().map_or(0, |l| l.stats().max_series_id);
-        let id = d
-            .registry
-            .next_id(floor)
-            .ok_or(Error::Ceiling(u32::MAX as usize))?;
-        let def = registry::definition_of(spec, id, lateness)?;
-        self.commit_entry(&mut d, Entry::Definition(Box::new(def)))?;
-        Ok(SeriesId(id))
+        self.commit_entry(|d| {
+            if let Some(s) = d.registry.resolve(&spec.name) {
+                let new = registry::definition_of(spec, s.def.id, lateness)?;
+                return match registry::difference(&new, &s.def) {
+                    None => Ok(Decided::Done(SeriesId(s.def.id))),
+                    Some(field) => Err(Error::Conflict(field)),
+                };
+            }
+            let ceiling = self.limits.series_ceiling as usize;
+            if d.registry.len() >= ceiling {
+                return Err(Error::Ceiling(ceiling));
+            }
+            let floor = self.log().as_ref().map_or(0, |l| l.stats().max_series_id);
+            let id = d
+                .registry
+                .next_id(floor)
+                .ok_or(Error::Ceiling(u32::MAX as usize))?;
+            let def = registry::definition_of(spec, id, lateness)?;
+            Ok(Decided::Entry(
+                Entry::Definition(Box::new(def)),
+                SeriesId(id),
+            ))
+        })
     }
 
     fn live(&self, d: &Decider, id: SeriesId) -> Result<(), Error> {
@@ -682,57 +748,55 @@ impl Writer {
     }
 
     pub(crate) fn alias(&self, id: SeriesId, name: &str) -> Result<(), Error> {
-        self.writable()?;
-        let mut d = lock(&self.decider);
-        self.live(&d, id)?;
-        if name.is_empty() || name.len() > 255 {
-            return Err(Error::Invalid {
-                field: "name",
-                reason: "1 to 255 bytes".into(),
-            });
-        }
-        // A name the series already carries is given again: it becomes the display name, as in the model.
-        if d.registry.resolve(name).is_some_and(|s| s.def.id != id.0) {
-            return Err(Error::NameInUse(name.into()));
-        }
-        // An alias that would close a routing cycle is refused (`spec.md` §4 Routing).
-        if let Some(h) = &self.hub
-            && let Some(c) = h.run(|dl, c| {
-                dl.pump(c);
-                dl.view().cycle_with(None, Some((id.0, name)))
-            })
-        {
-            return Err(Error::RouteCycle(c.join(" -> ")));
-        }
-        self.commit_entry(
-            &mut d,
-            Entry::Alias {
-                id: id.0,
-                name: name.into(),
-            },
-        )
-        .map(|_| ())
+        self.commit_entry(|d| {
+            self.live(d, id)?;
+            if name.is_empty() || name.len() > 255 {
+                return Err(Error::Invalid {
+                    field: "name",
+                    reason: "1 to 255 bytes".into(),
+                });
+            }
+            // A name the series already carries is given again: it becomes the display name, as in the model.
+            if d.registry.resolve(name).is_some_and(|s| s.def.id != id.0) {
+                return Err(Error::NameInUse(name.into()));
+            }
+            // An alias that would close a routing cycle is refused (`spec.md` §4 Routing).
+            if let Some(h) = &self.hub
+                && let Some(c) = h.run(|dl, c| {
+                    dl.pump(c);
+                    dl.view().cycle_with(None, Some((id.0, name)))
+                })
+            {
+                return Err(Error::RouteCycle(c.join(" -> ")));
+            }
+            Ok(Decided::Entry(
+                Entry::Alias {
+                    id: id.0,
+                    name: name.into(),
+                },
+                (),
+            ))
+        })
     }
 
     pub(crate) fn retire(&self, id: SeriesId, t_r: Timestamp) -> Result<(), Error> {
-        self.writable()?;
-        let mut d = lock(&self.decider);
-        let s = d
-            .registry
-            .get(id.0)
-            .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
-        // Retiring a retired series changes nothing, as in the model.
-        if s.retired() {
-            return Ok(());
-        }
-        self.commit_entry(
-            &mut d,
-            Entry::Retirement {
-                id: id.0,
-                t_r: t_r.0,
-            },
-        )
-        .map(|_| ())
+        self.commit_entry(|d| {
+            let s = d
+                .registry
+                .get(id.0)
+                .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
+            // Retiring a retired series changes nothing, as in the model.
+            if s.retired() {
+                return Ok(Decided::Done(()));
+            }
+            Ok(Decided::Entry(
+                Entry::Retirement {
+                    id: id.0,
+                    t_r: t_r.0,
+                },
+                (),
+            ))
+        })
     }
 
     pub(crate) fn set_parameters(
@@ -740,37 +804,36 @@ impl Writer {
         id: SeriesId,
         change: &ParameterChange,
     ) -> Result<(), Error> {
-        self.writable()?;
-        let mut d = lock(&self.decider);
-        d.registry
-            .get(id.0)
-            .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
-        if change.expected_interval.is_some()
-            || change.staleness.is_some()
-            || change.lateness_bound.is_some()
-            || change.counter.is_some()
-        {
-            return Err(Error::NotSupportedYet(
-                "parameter changes other than the retention class",
-            ));
-        }
-        let Some(r) = change.retention else {
-            return Ok(());
-        };
-        let (class, period) = match convert::retention(r)? {
-            kvik_model::registry::RetentionClass::LongTerm => (0, None),
-            kvik_model::registry::RetentionClass::Diagnostic { period } => (1, Some(period)),
-        };
-        self.commit_entry(
-            &mut d,
-            Entry::ParameterChange(LogChange {
-                id: id.0,
-                retention_class: Some(class),
-                retention_period: period,
-                ..LogChange::default()
-            }),
-        )
-        .map(|_| ())
+        self.commit_entry(|d| {
+            d.registry
+                .get(id.0)
+                .ok_or_else(|| Error::UnknownSeries(id.to_string()))?;
+            if change.expected_interval.is_some()
+                || change.staleness.is_some()
+                || change.lateness_bound.is_some()
+                || change.counter.is_some()
+            {
+                return Err(Error::NotSupportedYet(
+                    "parameter changes other than the retention class",
+                ));
+            }
+            let Some(r) = change.retention else {
+                return Ok(Decided::Done(()));
+            };
+            let (class, period) = match convert::retention(r)? {
+                kvik_model::registry::RetentionClass::LongTerm => (0, None),
+                kvik_model::registry::RetentionClass::Diagnostic { period } => (1, Some(period)),
+            };
+            Ok(Decided::Entry(
+                Entry::ParameterChange(LogChange {
+                    id: id.0,
+                    retention_class: Some(class),
+                    retention_period: period,
+                    ..LogChange::default()
+                }),
+                (),
+            ))
+        })
     }
 
     /// Decimal series are not supported yet: a raise or a policy change names an existing series or fails.
@@ -792,15 +855,15 @@ impl Writer {
         if z.is_empty() || z.len() > 63 {
             return Err(Error::UnknownZone(z.into()));
         }
-        let mut d = lock(&self.decider);
-        self.commit_entry(
-            &mut d,
-            Entry::SiteZone {
-                zone: z.into(),
-                effective: effective.0,
-            },
-        )
-        .map(|_| ())
+        self.commit_entry(|_| {
+            Ok(Decided::Entry(
+                Entry::SiteZone {
+                    zone: z.into(),
+                    effective: effective.0,
+                },
+                (),
+            ))
+        })
     }
 
     pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, QueryError> {
@@ -845,48 +908,56 @@ impl Writer {
         if !clock.synced && readings.iter().any(|r| r.source == TimeSource::Host) {
             return self.busy(Wait::UnsyncedClock);
         }
-        let mut d = lock(&self.decider);
-        self.settle(&mut d);
-        let call = self.next_call.fetch_add(1, Ordering::SeqCst);
-        let plan = d.plan(readings, intent, clock, call);
         let started = Instant::now();
-        let queued = if plan.items.is_empty() {
-            None
-        } else {
+        // Decided and queued in call order under the decision lock; a full queue is waited for with no lock held,
+        // and the call decided again.
+        let (mut d, call, plan, queued) = loop {
+            let mut d = lock(&self.decider);
+            self.settle(&mut d);
+            let call = self.next_call.fetch_add(1, Ordering::SeqCst);
+            let plan = d.plan(readings, intent, clock, call);
+            if plan.items.is_empty() {
+                break (d, call, plan, None);
+            }
             // The log's read guard is dropped before an error is mapped, which reads the log's fault again.
             let r = {
                 let log = self.log();
                 let log = log.as_ref().ok_or(EmitError::Closed)?;
                 if wait {
-                    log.submit(plan.items.clone())
+                    log.offer(plan.items.clone())
                 } else {
                     log.try_submit(plan.items.clone())
                 }
             };
-            if wait {
-                self.note_waited(started.elapsed());
-            }
-            match r {
-                Ok(p) => Some(p),
-                Err(SubmitError::Busy(w)) => {
+            let e = match r {
+                Ok(p) => break (d, call, plan, Some(p)),
+                Err(SubmitError::Busy(LogWait::QueueFull)) if wait => {
                     drop(d);
-                    return self.busy(wait_out(w));
+                    match self.wait_room(plan.items.len()) {
+                        Ok(()) => continue,
+                        Err(e) => e,
+                    }
                 }
-                Err(SubmitError::ReadOnly) => {
-                    return Err(EmitError::ReadOnly(self.fault_now()));
-                }
-                Err(SubmitError::ShutDown) => return Err(EmitError::Closed),
-                Err(SubmitError::Call(_)) => {
-                    return Err(EmitError::TooLarge {
-                        readings: readings.len(),
-                        bytes,
-                    });
-                }
-            }
+                Err(e) => e,
+            };
+            return match e {
+                SubmitError::Busy(w) => self.busy(wait_out(w)),
+                SubmitError::ReadOnly => Err(EmitError::ReadOnly(self.fault_now())),
+                SubmitError::ShutDown => Err(EmitError::Closed),
+                SubmitError::Call(_) => Err(EmitError::TooLarge {
+                    readings: readings.len(),
+                    bytes,
+                }),
+            };
         };
+        if wait {
+            self.note_waited(started.elapsed());
+        }
         d.apply(&plan);
         // The call is tracked before the decision lock is released, so a later call that duplicates one of its
         // readings always finds it (lock order: decisions, then calls in flight).
+        #[cfg(test)]
+        tests::before_tracking(&self.dir);
         let mut inflight = lock(&self.inflight);
         let tracked = match queued {
             Some(pending) => {
@@ -911,8 +982,6 @@ impl Writer {
         };
         drop(inflight);
         drop(d);
-        #[cfg(test)]
-        tests::after_decision(&self.dir);
         self.count(readings, &plan);
         let decisions = plan.decisions;
         let Some((completion, own)) = tracked else {
@@ -1346,11 +1415,12 @@ mod tests {
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
 
-    /// A pause point right after a call's decision, for the store in the given directory.
-    static AFTER_DECISION: Mutex<Option<(PathBuf, Hook)>> = Mutex::new(None);
+    /// A pause point right before a call is tracked, after its facts joined the decision state and with the
+    /// decision lock held, for the store in the given directory.
+    static BEFORE_TRACKING: Mutex<Option<(PathBuf, Hook)>> = Mutex::new(None);
 
-    pub(super) fn after_decision(dir: &Path) {
-        let hook = AFTER_DECISION
+    pub(super) fn before_tracking(dir: &Path) {
+        let hook = BEFORE_TRACKING
             .lock()
             .unwrap()
             .as_ref()
@@ -1372,10 +1442,11 @@ mod tests {
         }
     }
 
-    /// A duplicate decided while the original's call has been decided but not yet returned still finds that call
-    /// and waits for it: here the original's sync fails, so neither is acknowledged (Q-123 (b)).
+    /// A duplicate that arrives while the original's facts are in the decision state but its call is not yet
+    /// tracked is decided only after the tracking, and waits for the original: here the original's sync fails, so
+    /// neither is acknowledged (Q-123 (b)).
     #[test]
-    fn a_duplicate_decided_right_after_the_original_waits_for_it() {
+    fn a_duplicate_arriving_before_the_original_is_tracked_waits_for_it() {
         let fs = MemFs::new();
         let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
         let mut env = Env::test(clock.clone());
@@ -1417,12 +1488,12 @@ mod tests {
                 failing.fail_syncs(true);
             }
         })));
-        // The original's call pauses right after its decision.
+        // The original's call pauses between joining the decision state and being tracked.
         let (paused_tx, paused) = mpsc::channel::<()>();
         let (resume, resume_rx) = mpsc::channel::<()>();
         let resume_rx = Mutex::new(resume_rx);
         let pause_armed = AtomicBool::new(true);
-        *AFTER_DECISION.lock().unwrap() = Some((
+        *BEFORE_TRACKING.lock().unwrap() = Some((
             dir.clone(),
             Arc::new(move || {
                 if pause_armed.swap(false, Ordering::SeqCst) {
@@ -1441,24 +1512,38 @@ mod tests {
         });
         paused
             .recv_timeout(Duration::from_secs(5))
-            .expect("the original paused after its decision");
-        // The duplicate, decided now, must wait for the original's call.
-        let duplicate = match w.emit(&reading, Intent::Normal, false) {
-            Ok(Emitted::Queued(q)) => q,
-            Ok(Emitted::Ready(a)) => panic!("acknowledged before the original: {:?}", a.outcomes),
-            Err(e) => panic!("{e:?}"),
-        };
+            .expect("the original paused before its tracking");
+        let (decided_tx, decided) = mpsc::channel::<()>();
+        let w3 = w.clone();
+        let dup = reading.clone();
+        let duplicate = std::thread::spawn(move || {
+            let r = w3.emit(&dup, Intent::Normal, false);
+            decided_tx.send(()).unwrap();
+            match r {
+                Ok(Emitted::Queued(q)) => Ok(wait(q)),
+                Ok(Emitted::Ready(a)) => Err(format!(
+                    "acknowledged before the original: {:?}",
+                    a.outcomes
+                )),
+                Err(e) => Err(format!("{e:?}")),
+            }
+        });
+        assert!(
+            decided.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the duplicate was decided before the original was tracked"
+        );
         resume.send(()).unwrap();
         sync_seen
             .recv_timeout(Duration::from_secs(5))
             .expect("the original's sync started");
         sync_release.send(()).unwrap();
-        assert!(matches!(wait(duplicate), Err(EmitError::OutcomeUnknown(_))));
+        let dup = duplicate.join().unwrap().unwrap();
+        assert!(matches!(dup, Err(EmitError::OutcomeUnknown(_))), "{dup:?}");
         assert!(matches!(
             original.join().unwrap(),
             Err(EmitError::OutcomeUnknown(_))
         ));
-        *AFTER_DECISION.lock().unwrap() = None;
+        *BEFORE_TRACKING.lock().unwrap() = None;
         fs.set_sync_hook(None);
     }
 }
