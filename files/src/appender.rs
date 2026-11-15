@@ -1,0 +1,348 @@
+//! The one run-time writer of `MANIFEST` (`spec.md` §7 Manifest, §3 Order of a start step 4).
+//!
+//! - **Open** is the start's repair: a `MANIFEST.new` left by a crash is removed; a torn tail is dropped and the
+//!   file truncated after the last valid record; the last valid record is written again in place and synced, so that
+//!   a record kept from the page cache after a failed sync is on disk before a successor is appended. A corrupt
+//!   record is not repaired here: [`Opened::Corrupt`] hands the image to [`crate::rebuild`].
+//! - **Append** writes a record only after the previous record's sync has returned, and syncs it. New epochs
+//!   continue above every epoch the last valid record names and above every lease (`format.md` A.14), then by one.
+//!   A failed write or sync makes the appender read-only: the record may be in the page cache only, and the next
+//!   start writes it again.
+//! - **Settled**: the last record is neither uploaded nor acted on irreversibly until a later record has been
+//!   synced. A [`Settled`] is the proof that a record has a synced successor; [`Appender::settle`] appends an empty
+//!   record when one is needed. While a rebuild is provisional nothing is acted on irreversibly at all
+//!   ([`Appender::irreversible`]).
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use kvik_log::fs::{Fs, FsFile, OpenMode};
+
+use crate::catalogue::{Catalogue, CatalogueError};
+use crate::image::{Image, ReadError, read};
+use crate::record::{Acknowledgement, Body, EncodeError, Record};
+use crate::{MANIFEST, MANIFEST_NEW};
+
+/// Proof that a record has a synced successor, so dropping a torn tail can never remove it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    epoch: u64,
+}
+
+impl Settled {
+    /// The record's epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Why an irreversible act on a record must wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Held {
+    /// The record has no synced successor yet.
+    #[error("the record has no synced successor")]
+    NotSettled,
+    /// A provisional rebuild holds every upload, eviction, removal and retirement (`spec.md` §7 Deep unreachable).
+    #[error("a provisional manifest rebuild holds it")]
+    Provisional,
+}
+
+/// Where a manifest rebuild stands in this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildState {
+    /// No rebuild in this run.
+    None,
+    /// Rebuilt while deep could not say whether it holds a copy of the corrupt record; the rebuild record's epoch.
+    Provisional {
+        /// The rebuild record's epoch.
+        epoch: u64,
+    },
+    /// Rebuilt, and deep has answered or none is configured.
+    Final {
+        /// The rebuild record's epoch.
+        epoch: u64,
+    },
+}
+
+/// The outcome of [`Appender::open`].
+#[derive(Debug)]
+pub enum Opened {
+    /// Repaired and ready.
+    Ready(Box<Appender>),
+    /// A corrupt record: fetched again or rebuilt by [`crate::rebuild`]. No handle on `MANIFEST` is held.
+    Corrupt(Box<Image>),
+}
+
+/// Why the manifest cannot be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// A file-system operation failed: the start is read-only.
+    #[error("manifest: {0}")]
+    Io(#[from] io::Error),
+    /// A header that is not a manifest of this store, or a version refusal.
+    #[error(transparent)]
+    Read(#[from] ReadError),
+    /// Valid records that contradict each other.
+    #[error(transparent)]
+    Catalogue(#[from] CatalogueError),
+    /// No epoch is left above the manifest's and the leases'.
+    #[error("no manifest epoch is left")]
+    EpochsExhausted,
+}
+
+/// Why a record was not appended.
+#[derive(Debug, thiserror::Error)]
+pub enum AppendError {
+    /// An earlier write or sync failed: the manifest is read-only until the next start.
+    #[error("the manifest is read-only after a failed write")]
+    ReadOnly,
+    /// The write or the sync failed; the record may be in the page cache only.
+    #[error("manifest write: {0}")]
+    Io(#[from] io::Error),
+    /// The record cannot be encoded.
+    #[error(transparent)]
+    Encode(#[from] EncodeError),
+    /// The record contradicts the manifest.
+    #[error(transparent)]
+    Catalogue(#[from] CatalogueError),
+    /// No epoch is left.
+    #[error("no manifest epoch is left")]
+    EpochsExhausted,
+}
+
+/// Why a rebuild acknowledgement was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum AcknowledgeError {
+    /// The rebuild is provisional (`api.md` `WriteError::NotFinal`).
+    #[error("the manifest rebuild is provisional")]
+    NotFinal,
+    /// No rebuild record has that epoch.
+    #[error("no rebuild record has epoch {0}")]
+    UnknownRebuild(u64),
+    /// The acknowledgement record was not written.
+    #[error(transparent)]
+    Append(#[from] AppendError),
+}
+
+/// The manifest's writer.
+#[derive(Debug)]
+pub struct Appender {
+    file: Box<dyn FsFile>,
+    path: PathBuf,
+    /// Where the next record goes.
+    end: u64,
+    next_epoch: u64,
+    /// The epoch of the last record known synced; every record below it is settled.
+    synced: u64,
+    generation: u32,
+    catalogue: Catalogue,
+    faulted: bool,
+    rebuild: RebuildState,
+    dropped_tail: u64,
+}
+
+pub(crate) fn read_file(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
+    let f = fs.open(path, OpenMode::Read)?;
+    let len = f.len()?;
+    let mut b = vec![0u8; usize::try_from(len).map_err(io::Error::other)?];
+    let mut at = 0;
+    while at < b.len() {
+        let n = f.read_at(&mut b[at..], at as u64)?;
+        if n == 0 {
+            b.truncate(at);
+            break;
+        }
+        at += n;
+    }
+    Ok(b)
+}
+
+/// Removes a `MANIFEST.new` left by a crash, then syncs the directory (`format.md` A.12).
+pub(crate) fn remove_leftover(fs: &dyn Fs, dir: &Path) -> io::Result<bool> {
+    let present = fs.read_dir(dir)?.iter().any(|e| e.name == MANIFEST_NEW);
+    if present {
+        fs.remove_file(&dir.join(MANIFEST_NEW))?;
+        fs.sync_dir(dir)?;
+    }
+    Ok(present)
+}
+
+impl Appender {
+    /// The start's repair of the manifest in `dir` (see the module documentation). `lease_epoch` is the highest
+    /// epoch any lease file names.
+    pub fn open(
+        fs: &dyn Fs,
+        dir: &Path,
+        store_id: [u8; 16],
+        lease_epoch: u64,
+    ) -> Result<Opened, OpenError> {
+        remove_leftover(fs, dir)?;
+        let path = dir.join(MANIFEST);
+        let bytes = read_file(fs, &path)?;
+        let image = read(&bytes, &store_id)?;
+        if image.is_corrupt() {
+            return Ok(Opened::Corrupt(Box::new(image)));
+        }
+        let catalogue = Catalogue::replay(image.records())?;
+        let file = fs.open(&path, OpenMode::ReadWrite)?;
+        let mut end = image.valid_end;
+        let dropped_tail = bytes.len() as u64 - image.valid_end;
+        if image.torn {
+            file.set_len(image.valid_end)?;
+        }
+        if let Some(last) = image.records.last() {
+            let have = (last.end as usize).min(bytes.len());
+            let mut b = bytes[last.offset as usize..have].to_vec();
+            b.resize((last.end - last.offset) as usize, 0);
+            file.write_at(&b, last.offset)?;
+            end = last.end;
+        }
+        if image.torn {
+            file.sync_all()?;
+        } else {
+            file.sync_data()?;
+        }
+        let named = image.records.last().map_or(0, |p| {
+            p.record.epochs_named().into_iter().max().unwrap_or(0)
+        });
+        let next_epoch = named
+            .max(lease_epoch)
+            .checked_add(1)
+            .ok_or(OpenError::EpochsExhausted)?;
+        Ok(Opened::Ready(Box::new(Self {
+            file,
+            path,
+            end,
+            next_epoch,
+            synced: image.last_epoch(),
+            generation: image.records.last().map_or(0, |p| p.record.generation),
+            catalogue,
+            faulted: false,
+            rebuild: RebuildState::None,
+            dropped_tail,
+        })))
+    }
+
+    /// Appends a record holding `body` and syncs it; returns its epoch.
+    pub fn append(&mut self, body: Body, written_at: i64) -> Result<u64, AppendError> {
+        let r = Record::new(self.next_epoch, self.generation, written_at, body);
+        self.append_record(r)
+    }
+
+    /// Appends `r` with the next epoch, keeping its old epoch and ignorable fields (a carried record).
+    pub(crate) fn append_record(&mut self, mut r: Record) -> Result<u64, AppendError> {
+        if self.faulted {
+            return Err(AppendError::ReadOnly);
+        }
+        r.epoch = self.next_epoch;
+        self.catalogue.check(&r)?;
+        let bytes = r.encode()?;
+        let next = self
+            .next_epoch
+            .checked_add(1)
+            .ok_or(AppendError::EpochsExhausted)?;
+        if let Err(e) = self
+            .file
+            .write_at(&bytes, self.end)
+            .and_then(|()| self.file.sync_data())
+        {
+            self.faulted = true;
+            return Err(e.into());
+        }
+        self.end += bytes.len() as u64;
+        self.catalogue.apply(&r)?;
+        self.synced = r.epoch;
+        self.next_epoch = next;
+        Ok(r.epoch)
+    }
+
+    /// A [`Settled`] for the record of `epoch` if a later record has been synced.
+    pub fn settled(&self, epoch: u64) -> Option<Settled> {
+        (epoch < self.synced && epoch <= self.catalogue.last_epoch()).then_some(Settled { epoch })
+    }
+
+    /// A [`Settled`] for the record of `epoch`, appending an empty record first if it has no synced successor.
+    pub fn settle(&mut self, epoch: u64, written_at: i64) -> Result<Settled, AppendError> {
+        if let Some(s) = self.settled(epoch) {
+            return Ok(s);
+        }
+        self.append(Body::Empty, written_at)?;
+        Ok(Settled { epoch })
+    }
+
+    /// A [`Settled`] for the record of `epoch` if it may be acted on irreversibly now: it has a synced successor and
+    /// no provisional rebuild holds it.
+    pub fn irreversible(&self, epoch: u64) -> Result<Settled, Held> {
+        if matches!(self.rebuild, RebuildState::Provisional { .. }) {
+            return Err(Held::Provisional);
+        }
+        self.settled(epoch).ok_or(Held::NotSettled)
+    }
+
+    /// Whether uploads, evictions, removals and acting on retirements are held by a provisional rebuild.
+    pub fn holds(&self) -> bool {
+        matches!(self.rebuild, RebuildState::Provisional { .. })
+    }
+
+    /// Acknowledges the rebuild record other records refer to by `epoch` (`api.md` `acknowledge_manifest_rebuild`):
+    /// refused while the rebuild is provisional; writes nothing if it is acknowledged already. Returns whether a
+    /// record was written.
+    pub fn acknowledge_rebuild(
+        &mut self,
+        epoch: u64,
+        written_at: i64,
+    ) -> Result<bool, AcknowledgeError> {
+        if self.holds() {
+            return Err(AcknowledgeError::NotFinal);
+        }
+        let entry = self
+            .catalogue
+            .rebuild(epoch)
+            .ok_or(AcknowledgeError::UnknownRebuild(epoch))?;
+        if entry.acknowledged {
+            return Ok(false);
+        }
+        self.append(
+            Body::Acknowledgement(Acknowledgement {
+                losses: Vec::new(),
+                rebuild: Some(epoch),
+            }),
+            written_at,
+        )?;
+        Ok(true)
+    }
+
+    /// The fold of every record, those appended in this run included.
+    pub fn catalogue(&self) -> &Catalogue {
+        &self.catalogue
+    }
+
+    /// The epoch the next record takes.
+    pub fn next_epoch(&self) -> u64 {
+        self.next_epoch
+    }
+
+    /// Whether a failed write has made the manifest read-only.
+    pub fn is_faulted(&self) -> bool {
+        self.faulted
+    }
+
+    /// Where a rebuild stands in this run.
+    pub fn rebuild_state(&self) -> RebuildState {
+        self.rebuild
+    }
+
+    pub(crate) fn set_rebuild_state(&mut self, s: RebuildState) {
+        self.rebuild = s;
+    }
+
+    /// Bytes of a torn tail the open dropped.
+    pub fn dropped_tail(&self) -> u64 {
+        self.dropped_tail
+    }
+
+    /// The manifest's path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}

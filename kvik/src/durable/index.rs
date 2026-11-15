@@ -332,6 +332,7 @@ impl Index {
                     LogCause::TruncatedTail => LossCause::TruncatedTail,
                     LogCause::LostInBucket => LossCause::LostInBucket,
                     LogCause::InvalidContent => LossCause::InvalidContent,
+                    LogCause::Unknown => LossCause::Unknown,
                 },
                 first: Some(first),
                 last: Some(last),

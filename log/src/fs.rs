@@ -320,6 +320,8 @@ enum NameChange {
     Renamed {
         from: PathBuf,
         to: PathBuf,
+        /// The file the rename replaced, if `to` existed: an undone rename puts it back.
+        replaced: Option<Arc<Mutex<MemData>>>,
     },
     Removed {
         path: PathBuf,
@@ -595,12 +597,27 @@ impl MemFs {
                             *lock(&self.free) += lock(&d).bytes.len() as u64;
                         }
                     }
-                    NameChange::Renamed { from, to } => {
+                    NameChange::Renamed { from, to, replaced } => {
                         if !s.files.contains_key(&from)
                             && let Some(d) = s.files.remove(&to)
                         {
                             lock(&d).path = from.clone();
                             s.files.insert(from, d);
+                            // The file the rename replaced is there again, as of its last sync.
+                            if let Some(old) = replaced {
+                                let len = {
+                                    let mut d = lock(&old);
+                                    d.path = to.clone();
+                                    d.bytes = d.durable.clone();
+                                    d.pending.clear();
+                                    d.lost.clear();
+                                    d.locked = false;
+                                    d.bytes.len() as u64
+                                };
+                                let mut f = lock(&self.free);
+                                *f = f.saturating_sub(len);
+                                s.files.insert(to, old);
+                            }
                         }
                     }
                     NameChange::Removed { path, data } => {
@@ -744,12 +761,14 @@ impl Fs for MemFs {
         let mut s = lock(&self.state);
         let d = s.files.remove(from).ok_or_else(not_found)?;
         lock(&d).path = to.to_path_buf();
-        if let Some(old) = s.files.insert(to.to_path_buf(), d) {
-            *lock(&self.free) += lock(&old).bytes.len() as u64;
+        let replaced = s.files.insert(to.to_path_buf(), d);
+        if let Some(old) = &replaced {
+            *lock(&self.free) += lock(old).bytes.len() as u64;
         }
         s.names.push(NameChange::Renamed {
             from: from.to_path_buf(),
             to: to.to_path_buf(),
+            replaced,
         });
         // A planned failure of the flush after the rename: the rename stands, the call fails. The planned faults
         // are consulted directly, so no crash point is used and no operation is recorded.
@@ -1116,5 +1135,30 @@ mod tests {
         assert!(seen.contains(&Some(vec![1; 16])));
         assert!(seen.contains(&Some(vec![2; 16])));
         assert!(seen.contains(&Some([vec![2; 8], vec![1; 8]].concat())));
+    }
+
+    #[test]
+    fn an_undone_rename_over_a_file_puts_the_replaced_file_back() {
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            let fs = MemFs::new();
+            let (old, new) = (Path::new("d/m"), Path::new("d/m.new"));
+            for (p, b) in [(old, 1u8), (new, 2u8)] {
+                let f = fs.open(p, OpenMode::CreateNew).unwrap();
+                f.write_at(&[b; 8], 0).unwrap();
+                f.sync_all().unwrap();
+            }
+            fs.sync_dir(Path::new("d")).unwrap();
+            fs.rename(new, old).unwrap();
+            fs.power_loss_partial(seed);
+            // Either the rename stands, or both files are as they were: never the new name alone.
+            let state = (fs.read(old), fs.read(new));
+            assert!(
+                state == (Some(vec![2; 8]), None) || state == (Some(vec![1; 8]), Some(vec![2; 8])),
+                "{state:?}"
+            );
+            seen.insert(state);
+        }
+        assert_eq!(seen.len(), 2);
     }
 }

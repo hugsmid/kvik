@@ -1,0 +1,21 @@
+[package]
+name = "kvik-files"
+version = "0.1.0"
+description = "The manifest of the kvik time-series store: typed records, the file catalogue, the appender and the manifest rebuild"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+repository = "https://github.com/hugsmid/kvik"
+keywords = ["time-series", "storage", "embedded", "manifest"]
+categories = ["database-implementations"]
+
+[dependencies]
+kvik-log = { path = "../log" }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

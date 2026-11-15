@@ -1,6 +1,8 @@
 //! The manifest's framing (`format.md` A.14) as far as the log's start needs it (`spec.md` §3 Order of a start,
 //! step 4; §7 Manifest): reading its records, telling a torn last record from a corrupt one, and the empty and
-//! lost-range records. Publish, restore, quarantine and rebuild records belong to later roadmap items.
+//! lost-range records. Publish, restore, quarantine and rebuild records belong to later roadmap items; their typed
+//! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire and sealed-segment records
+//! over, taking only their epochs.
 
 use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block};
 use crate::error::{Element, FormatError};
@@ -8,6 +10,10 @@ use crate::header::{FileHeader, HEADER_LEN, kind};
 
 /// An empty record.
 pub const RECORD_EMPTY: u8 = 0x20;
+/// A publish-and-retire record (laid out by roadmap 6.3).
+pub const RECORD_PUBLISH: u8 = 0x21;
+/// A sealed-log-segment record (laid out by roadmap 6.3).
+pub const RECORD_SEALED: u8 = 0x22;
 /// A lost-range record.
 pub const RECORD_LOST_RANGE: u8 = 0x23;
 /// An acknowledgement record.
@@ -31,6 +37,9 @@ pub enum LossCause {
     LostInBucket = 3,
     /// A checksum-valid block whose content fails its checks.
     InvalidContent = 4,
+    /// Found again by a manifest rebuild with no cause given by a valid record or a recovery entry (`spec.md` §7
+    /// Manifest).
+    Unknown = 5,
 }
 
 impl LossCause {
@@ -40,6 +49,7 @@ impl LossCause {
             2 => Self::TruncatedTail,
             3 => Self::LostInBucket,
             4 => Self::InvalidContent,
+            5 => Self::Unknown,
             _ => return None,
         })
     }
@@ -184,7 +194,9 @@ fn record_at(bytes: &[u8], at: u64, min_epoch: u64) -> Result<Option<Record>, Ma
             Some(l) => Some(l),
             None => return Ok(None),
         },
-        RECORD_EMPTY | RECORD_ACKNOWLEDGEMENT | RECORD_REBUILD => None,
+        RECORD_EMPTY | RECORD_PUBLISH | RECORD_SEALED | RECORD_ACKNOWLEDGEMENT | RECORD_REBUILD => {
+            None
+        }
         _ if b.header.skippable() => None,
         _ => {
             return Err(ManifestError::Unsupported(FormatError::Unsupported {

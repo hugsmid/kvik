@@ -545,6 +545,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvik-files"
+version = "0.1.0"
+dependencies = [
+ "kvik-log",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "kvik-log"
 version = "0.1.0"
 dependencies = [
