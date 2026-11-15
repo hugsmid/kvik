@@ -390,7 +390,7 @@ fn plan(
     let unused_tail = unused_dirty.iter().fold((0u64, 0u32), |(b, c), &i| {
         let n = u32::try_from(segs[i].tail_commits.len()).unwrap_or(u32::MAX);
         (
-            b + (segs[i].last_nonzero - HEADER_LEN as u64),
+            b.saturating_add(segs[i].last_nonzero - HEADER_LEN as u64),
             c.saturating_add(n),
         )
     });
@@ -1367,7 +1367,7 @@ pub(super) fn start(
         } else {
             let (tail_bytes, readable) = p.tail.map_or((0, 0), |(_, s, e, c)| (e - s, c));
             let (tail_bytes, readable) = (
-                tail_bytes + p.unused_tail.0,
+                tail_bytes.saturating_add(p.unused_tail.0),
                 readable.saturating_add(p.unused_tail.1),
             );
             stamp = ResetStamp::new_at(f_seq);
