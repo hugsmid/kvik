@@ -1265,7 +1265,9 @@ impl Slot {
             K::Trigger(t) => one(
                 DeliveryId::Condition {
                     funnel: self.api_funnel(name, t.funnel),
-                    sequence: t.sequence - self.sequence_base(name, t.funnel.0),
+                    sequence: t
+                        .sequence
+                        .saturating_sub(self.sequence_base(name, t.funnel.0)),
                 },
                 DeliveryKind::Trigger(Trigger {
                     funnel: self.api_funnel(name, t.funnel),

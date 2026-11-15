@@ -45,7 +45,8 @@ excess-precision policy applies to readings with `t` at or after its effective t
 position than the series' first reading (the same batch is allowed). Registry entries are also compacted into a
 registry file that stays on the hot tier (tree checkpoints carry a copy, §8; `format.md` A.16). The registry file is a
 derived file: every start rebuilds the registry from the kept log and writes the file again where it does not match,
-carrying the id floor (Q-33). Site-zone entries and tzdata entries
+carrying the id floor (Q-33), and the writer writes it again after each routing change, before the call that made it
+returns (Q-130). Site-zone entries and tzdata entries
 (§5.7) and routing changes (§4) are registry entries in this sense: the registry file holds each with its position,
 so they are in force wherever the registry is, whether or not the log segment that holds them is local. Recovery
 entries (§3) are compacted into it too, each with its position.

@@ -490,11 +490,13 @@ fn a_cursor_file_never_names_a_position_above_the_synced_mark() {
     let id = block_on(c.route(condition(g))).unwrap();
     block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
     let ahead = Arc::new(Mutex::new(Vec::new()));
-    let (fs, dir, seen) = (w.fs.clone(), w.dir.clone(), ahead.clone());
+    let checked = Arc::new(Mutex::new(0usize));
+    let (fs, dir, seen, count) = (w.fs.clone(), w.dir.clone(), ahead.clone(), checked.clone());
     w.fs.set_sync_hook(Some(Arc::new(move |p: &std::path::Path| {
         if !p.to_string_lossy().ends_with(".cur") {
             return;
         }
+        *count.lock().unwrap() += 1;
         let bytes = fs.read(p).unwrap();
         let id = kvik_log::header::FileHeader::decode(&bytes)
             .unwrap()
@@ -541,6 +543,10 @@ fn a_cursor_file_never_names_a_position_above_the_synced_mark() {
     s.tick().unwrap();
     assert!(syncs() > mid);
     w.fs.set_sync_hook(None);
+    assert!(
+        *checked.lock().unwrap() >= 2,
+        "every cursor file sync is checked"
+    );
     assert!(
         ahead.lock().unwrap().is_empty(),
         "{:?}",
