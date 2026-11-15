@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 
 use crate::bytes::{BitReader, BitWriter, Reader};
-use crate::error::ColumnError;
+use crate::error::{ColumnError, EncodeError};
 use crate::ints::{decode_delta, delta_len, encode_delta};
 
 /// The highest decimal exponent (the highest decimal scale, `spec.md` §2.1).
@@ -230,36 +230,61 @@ thread_local! {
     static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> = const { RefCell::new(None) };
 }
 
-fn compress(raw: &[u8]) -> Option<Vec<u8>> {
+/// The magic number of a zstd frame (RFC 8878 §3.1.1), little-endian.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+fn compress(raw: &[u8]) -> Result<Vec<u8>, EncodeError> {
     COMPRESSOR.with(|c| {
         let mut c = c.borrow_mut();
         if c.is_none() {
-            *c = zstd::bulk::Compressor::new(ZSTD_LEVEL).ok();
+            *c =
+                Some(zstd::bulk::Compressor::new(ZSTD_LEVEL).map_err(|_| EncodeError::Compressor)?);
         }
-        c.as_mut()?.compress(raw).ok()
+        let c = c.as_mut().ok_or(EncodeError::Compressor)?;
+        c.compress(raw).map_err(|_| EncodeError::Compressor)
     })
 }
 
-/// Encoding 5 for an XOR stream: its length (`u32`), then the stream compressed as a zstd frame at
-/// [`ZSTD_LEVEL`]. `None` if the compressor fails, in which case a writer does not offer this encoding.
-pub fn encode_xor_zstd(xor: &[u8]) -> Option<Vec<u8>> {
+/// Encoding 5 for an XOR stream: its length (`u32`, little-endian), then the stream as one zstd frame (RFC 8878)
+/// written at [`ZSTD_LEVEL`], with no dictionary and no content checksum. A compressor failure is an error, never a
+/// silent fall back to another encoding.
+pub fn encode_xor_zstd(xor: &[u8]) -> Result<Vec<u8>, EncodeError> {
     let frame = compress(xor)?;
+    if !frame_is_allowed(&frame) {
+        return Err(EncodeError::Compressor);
+    }
     let mut out = Vec::with_capacity(4 + frame.len());
     out.extend_from_slice(&(xor.len() as u32).to_le_bytes());
     out.extend_from_slice(&frame);
-    Some(out)
+    Ok(out)
+}
+
+/// Whether `frame` is exactly one zstd frame (not a skippable frame) with no dictionary id and no content
+/// checksum, and nothing after it (`docs/format-chunk.md` C.8).
+fn frame_is_allowed(frame: &[u8]) -> bool {
+    // The frame header descriptor follows the magic: bit 2 is the content checksum flag, bits 0–1 the dictionary
+    // id flag (RFC 8878 §3.1.1.1.1).
+    frame.len() > 4
+        && frame[..4] == ZSTD_MAGIC
+        && frame[4] & 0b0000_0111 == 0
+        && zstd::zstd_safe::find_frame_compressed_size(frame) == Ok(frame.len())
 }
 
 /// The XOR stream inside an encoding 5 payload of `n` values: its declared length must not exceed
-/// [`max_xor_len`]`(n)`, which bounds the buffer, and the frame must decompress to exactly that length.
+/// [`max_xor_len`]`(n)`, which bounds the buffer; the rest must be exactly one zstd frame with no dictionary and no
+/// content checksum, and decompress to exactly the declared length.
 pub fn decompress_xor(payload: &[u8], n: usize) -> Result<Vec<u8>, ColumnError> {
     let mut r = Reader::new(payload);
     let raw_len = r.u32()? as usize;
     if raw_len > max_xor_len(n) {
         return Err(ColumnError::RawLength);
     }
+    let frame = &payload[4..];
+    if !frame_is_allowed(frame) {
+        return Err(ColumnError::Frame);
+    }
     let mut raw = vec![0u8; raw_len];
-    match zstd::bulk::decompress_to_buffer(&payload[4..], &mut raw[..]) {
+    match zstd::bulk::decompress_to_buffer(frame, &mut raw[..]) {
         Ok(k) if k == raw_len => Ok(raw),
         _ => Err(ColumnError::Compressed),
     }
@@ -402,9 +427,23 @@ mod tests {
         let mut short = enc.clone();
         short[..4].copy_from_slice(&(raw.len() as u32 - 1).to_le_bytes());
         assert_eq!(decode_xor_zstd(&short, 4096), Err(ColumnError::Compressed));
-        assert_eq!(
-            decode_xor_zstd(&enc[..10], 4096),
-            Err(ColumnError::Compressed)
-        );
+        assert_eq!(decode_xor_zstd(&enc[..10], 4096), Err(ColumnError::Frame));
+        // A trailing skippable frame (magic 0x184D2A50, length 1), a second frame, a frame with a checksum: rejected.
+        let mut skip = enc.clone();
+        skip.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 1, 0, 0, 0, 0]);
+        assert_eq!(decode_xor_zstd(&skip, 4096), Err(ColumnError::Frame));
+        let mut two = enc.clone();
+        two.extend_from_slice(&enc[4..]);
+        assert_eq!(decode_xor_zstd(&two, 4096), Err(ColumnError::Frame));
+        let mut c = zstd::bulk::Compressor::new(3).unwrap();
+        c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))
+            .unwrap();
+        let mut sum = enc[..4].to_vec();
+        sum.extend_from_slice(&c.compress(&raw).unwrap());
+        assert_eq!(decode_xor_zstd(&sum, 4096), Err(ColumnError::Frame));
+        // Another level is another valid frame of the same stream.
+        let mut other = enc[..4].to_vec();
+        other.extend_from_slice(&zstd::bulk::compress(&raw, 19).unwrap());
+        assert_eq!(decode_xor_zstd(&other, 4096).unwrap(), vs);
     }
 }

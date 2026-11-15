@@ -67,17 +67,24 @@ pub fn decode_plain<T: Fixed>(payload: &[u8], n: usize) -> Result<Vec<T>, Column
 }
 
 /// Encoding 1: pairs of a run length (minimal unsigned LEB128, at most 3 bytes, at least 1) and one value; adjacent
-/// runs hold different values. Runs longer than 2^21 − 1 are split, which never happens within a block.
+/// runs hold different values.
+///
+/// # Panics
+/// If `values` holds more than 2^21 − 1 values: a longer run cannot be written in a form its decoder accepts (a
+/// block holds at most 4,096).
 pub fn encode_run_length<T: Fixed>(values: &[T]) -> Vec<u8> {
+    assert!(
+        values.len() as u64 <= MAX_RUN,
+        "too many values for run-length"
+    );
     let mut out = Vec::new();
     let mut i = 0;
     while i < values.len() {
         let v = values[i];
-        let n = values[i..].iter().take_while(|&&x| x == v).count();
-        let run = (n as u64).min(MAX_RUN);
-        put_leb128(&mut out, run);
+        let run = values[i..].iter().take_while(|&&x| x == v).count();
+        put_leb128(&mut out, run as u64);
         v.put(&mut out);
-        i += run as usize;
+        i += run;
     }
     out
 }

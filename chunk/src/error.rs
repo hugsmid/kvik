@@ -42,6 +42,9 @@ pub enum ColumnError {
     /// A compressed payload whose declared length exceeds the largest XOR stream for its value count.
     #[error("declared raw length too large")]
     RawLength,
+    /// A compressed payload that is not exactly one zstd frame without a dictionary or a content checksum.
+    #[error("not exactly one allowed zstd frame")]
+    Frame,
     /// A compressed payload that does not decompress to exactly its declared length.
     #[error("compressed payload does not decompress to its declared length")]
     Compressed,
@@ -149,4 +152,7 @@ pub enum EncodeError {
         /// The row, or the row count when the heap holds bytes after the last text.
         row: usize,
     },
+    /// The zstd compressor failed, or wrote a frame outside the rules of `docs/format-chunk.md` C.8.
+    #[error("the zstd compressor failed")]
+    Compressor,
 }

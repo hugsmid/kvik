@@ -185,7 +185,7 @@ pub(crate) fn unpack(
     Ok(())
 }
 
-/// Writes bit fields most significant bit first (the XOR stream, C.6).
+/// Writes bit fields most significant bit first (the XOR stream, `docs/format-chunk.md` C.7).
 #[derive(Default)]
 pub(crate) struct BitWriter {
     buf: Vec<u8>,

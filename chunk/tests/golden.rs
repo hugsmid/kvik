@@ -324,7 +324,7 @@ fn golden_files() {
         );
         let now = block.encode().unwrap();
         if value_encoding(&file) == encoding::XOR_ZSTD {
-            // Compressed bytes depend on the zstd build (Q-150): compared by what they decode to.
+            // Compressed bytes are a writer's choice (C.8): compared by what they decode to.
             assert_eq!(value_encoding(&now), encoding::XOR_ZSTD, "{name}");
         } else {
             assert_eq!(now, file, "{name} is what the encoder writes now");

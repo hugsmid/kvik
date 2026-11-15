@@ -3,7 +3,7 @@
 Small block bodies (`docs/format-chunk.md`) that guard the encodings against accidental change (`docs/format.md`
 A.3). They are hand-built, deterministically, by [`../golden.rs`](../golden.rs) from synthetic rows (no recorded
 data). The test checks that each file decodes to the rows it was built from, is canonical, and, except for the
-compressed XOR payload (Q-150), is byte for byte what the encoder writes now. Regenerate only after a deliberate
+compressed XOR payload (`docs/format-chunk.md` C.8, C.10), is byte for byte what the encoder writes now. Regenerate only after a deliberate
 format change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-chunk --test golden`.
 
 | File | Shows |

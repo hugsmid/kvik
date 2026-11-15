@@ -22,7 +22,7 @@ fn check_decoded(body: &[u8]) {
         let again = b.encode().expect("decoded content is valid");
         assert_eq!(Block::decode(&again), Ok(b.clone()));
         if Block::decode_canonical(body).is_ok() {
-            // Canonical means the encoder's own output (compressed XOR aside, Q-150).
+            // Canonical means the encoder's own output (the XOR class compared by its stream, C.10).
             assert_eq!(Block::decode_canonical(&again), Ok(b));
         }
     }
@@ -112,10 +112,15 @@ proptest! {
     }
 
     #[test]
-    fn scaled_values_are_exact(n in -9_007_199_254_740_991i64..=9_007_199_254_740_991, e in 0u8..=18) {
-        let v = (n as f64 / 10f64.powi(i32::from(e))).to_bits();
-        if let Some(m) = scaled(v, e) {
-            prop_assert_eq!((m as f64 / 10f64.powi(i32::from(e))).to_bits(), v);
+    fn integers_below_2_pow_53_fit_at_exponent_0(n in -9_007_199_254_740_991i64..=9_007_199_254_740_991) {
+        prop_assert_eq!(scaled((n as f64).to_bits(), 0), Some(n));
+    }
+
+    #[test]
+    fn scaled_values_are_exact(bits in f64_bits(), e in 0u8..=18) {
+        if let Some(m) = scaled(bits, e) {
+            prop_assert!(m.unsigned_abs() < 1 << 53);
+            prop_assert_eq!((m as f64 / 10f64.powi(i32::from(e))).to_bits(), bits);
         }
     }
 

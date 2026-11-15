@@ -66,10 +66,11 @@ fn wide(id: u8, values: &[i64]) -> Column {
     }
 }
 
-/// The value column (C.9): the shortest payload among plain, run-length and delta, and, when every value is an
-/// `f64`, decimal at its best exponent and, if that has no candidate or more than one exception per eight values,
-/// XOR and compressed XOR. A tie goes to the lower encoding id.
-fn value_column(words: &[u64], all_f64: bool) -> Column {
+/// The shortest value payload outside the XOR class (C.9): plain, run-length, delta and, when every value is an
+/// `f64`, decimal at its best exponent; a tie goes to the lower encoding id. Also whether the XOR class (encodings
+/// 4 and 5) is a candidate: every value an `f64` and no decimal candidate, or one with more than one exception per
+/// eight values.
+fn other_candidates(words: &[u64], all_f64: bool) -> ((u8, Vec<u8>), bool) {
     fn offer(best: &mut (u8, Vec<u8>), enc: u8, payload: Vec<u8>) {
         if payload.len() < best.1.len() {
             *best = (enc, payload);
@@ -81,26 +82,47 @@ fn value_column(words: &[u64], all_f64: bool) -> Column {
     if delta_len(&ints) < best.1.len() {
         offer(&mut best, encoding::DELTA, encode_delta(&ints));
     }
-    if all_f64 && !words.is_empty() {
-        let decimal = best_decimal(words);
-        if let Some((e, _, len)) = decimal
-            && len < best.1.len()
-        {
-            offer(&mut best, encoding::DECIMAL, encode_decimal(words, e));
-        }
-        if decimal.is_none_or(|(_, exceptions, _)| exceptions * 8 > words.len()) {
-            let xor = encode_xor(words);
-            let zstd = encode_xor_zstd(&xor);
-            offer(&mut best, encoding::XOR, xor);
-            if let Some(z) = zstd {
-                offer(&mut best, encoding::XOR_ZSTD, z);
-            }
+    if !(all_f64 && !words.is_empty()) {
+        return (best, false);
+    }
+    let decimal = best_decimal(words);
+    if let Some((e, _, len)) = decimal
+        && len < best.1.len()
+    {
+        offer(&mut best, encoding::DECIMAL, encode_decimal(words, e));
+    }
+    let xor = decimal.is_none_or(|(_, exceptions, _)| exceptions * 8 > words.len());
+    (best, xor)
+}
+
+/// The value column (C.9): the shortest of [`other_candidates`] and, where the XOR class is a candidate, the
+/// shorter of XOR and compressed XOR (XOR on a tie), which must be strictly shorter to win.
+fn value_column(words: &[u64], all_f64: bool) -> Result<Column, EncodeError> {
+    let (mut best, xor_class) = other_candidates(words, all_f64);
+    if xor_class {
+        let xor = encode_xor(words);
+        let zstd = encode_xor_zstd(&xor)?;
+        let class = if zstd.len() < xor.len() {
+            (encoding::XOR_ZSTD, zstd)
+        } else {
+            (encoding::XOR, xor)
+        };
+        if class.1.len() < best.1.len() {
+            best = class;
         }
     }
-    (column::VALUE, best.0, best.1)
+    Ok((column::VALUE, best.0, best.1))
 }
 
 impl Block {
+    /// The value words of the rows that have a value, in row order, and whether every one is an `f64`.
+    fn value_words(&self) -> (Vec<u64>, bool) {
+        let rows = (0..self.len()).filter(|&i| self.flags[i] & flag::NO_VALUE == 0);
+        let words = rows.clone().map(|i| self.value[i]).collect();
+        let all_f64 = rows.clone().all(|i| self.value_type[i] == value_type::F64);
+        (words, all_f64)
+    }
+
     /// The number of rows.
     pub fn len(&self) -> usize {
         self.t.len()
@@ -210,7 +232,6 @@ impl Block {
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         self.check()?;
         let n = self.len();
-        let has_value = |i: usize| self.flags[i] & flag::NO_VALUE == 0;
         let mut cols: Vec<Column> = Vec::with_capacity(10);
         cols.push(wide(column::T, &self.t));
         if self.quality.iter().any(|&q| q != 0) {
@@ -220,14 +241,8 @@ impl Block {
             cols.push(small(column::FLAGS, &self.flags));
         }
         cols.push(small(column::VALUE_TYPE, &self.value_type));
-        let words: Vec<u64> = (0..n)
-            .filter(|&i| has_value(i))
-            .map(|i| self.value[i])
-            .collect();
-        let all_f64 = (0..n)
-            .filter(|&i| has_value(i))
-            .all(|i| self.value_type[i] == value_type::F64);
-        cols.push(value_column(&words, all_f64));
+        let (words, all_f64) = self.value_words();
+        cols.push(value_column(&words, all_f64)?);
         if self.value_type.contains(&value_type::TEXT) {
             cols.push((column::TEXT_HEAP, encoding::PLAIN, self.heap.clone()));
         }
@@ -268,12 +283,13 @@ impl Block {
         decode(body)
     }
 
-    /// Decodes a body and also requires it to be what [`Block::encode`] writes for its content. A compressed XOR
-    /// payload is compared by the stream it decompresses to, not by its compressed bytes (Q-150).
+    /// Decodes a body and also requires it to be what [`Block::encode`] writes for its content (C.10). In the XOR
+    /// class (encodings 4 and 5) either representation is canonical when it holds the canonical XOR stream and is
+    /// shorter than every other candidate; compressed bytes are not compared (C.10, Q-150).
     pub fn decode_canonical(body: &[u8]) -> Result<Self, DecodeError> {
         let b = decode(body)?;
         let again = b.encode().map_err(|_| DecodeError::NonCanonical)?;
-        if again == body || same_modulo_compression(body, &again, &b) {
+        if again == body || canonical_in_xor_class(body, &again, &b) {
             Ok(b)
         } else {
             Err(DecodeError::NonCanonical)
@@ -300,30 +316,31 @@ fn directory(body: &[u8]) -> Option<Vec<(u8, u8, &[u8])>> {
     Some(cols)
 }
 
-/// Whether two bodies of the same rows differ only in the compressed bytes of an encoding 5 value column that
-/// decompresses to the same XOR stream.
-fn same_modulo_compression(a: &[u8], b: &[u8], block: &Block) -> bool {
-    let (Some(da), Some(db)) = (directory(a), directory(b)) else {
+/// Whether `body`, which differs from the writer's output `again` for the same rows, differs only in a value
+/// column of the XOR class that is canonical by the class rule of C.10.
+fn canonical_in_xor_class(body: &[u8], again: &[u8], block: &Block) -> bool {
+    let (Some(da), Some(db)) = (directory(body), directory(again)) else {
         return false;
     };
-    let n = block
-        .flags
-        .iter()
-        .filter(|&&f| f & flag::NO_VALUE == 0)
-        .count();
-    a.get(..2) == b.get(..2)
-        && da.len() == db.len()
-        && da.iter().zip(&db).all(|(x, y)| {
-            x.0 == y.0
-                && x.1 == y.1
-                && (x.2 == y.2
-                    || (x.0 == column::VALUE
-                        && x.1 == encoding::XOR_ZSTD
-                        && matches!(
-                            (decompress_xor(x.2, n), decompress_xor(y.2, n)),
-                            (Ok(p), Ok(q)) if p == q
-                        )))
-        })
+    if body.get(..2) != again.get(..2) || da.len() != db.len() {
+        return false;
+    }
+    da.iter().zip(&db).all(|(x, y)| {
+        if (x.0, x.1, x.2) == (y.0, y.1, y.2) {
+            return true;
+        }
+        if x.0 != y.0 || x.0 != column::VALUE {
+            return false;
+        }
+        let (words, all_f64) = block.value_words();
+        let (other, xor_class) = other_candidates(&words, all_f64);
+        let stream = match x.1 {
+            encoding::XOR => Some(x.2.to_vec()),
+            encoding::XOR_ZSTD => decompress_xor(x.2, words.len()).ok(),
+            _ => None,
+        };
+        xor_class && x.2.len() < other.1.len() && stream.is_some_and(|s| s == encode_xor(&words))
+    })
 }
 
 fn decode(body: &[u8]) -> Result<Block, DecodeError> {
@@ -464,6 +481,16 @@ fn decode(body: &[u8]) -> Result<Block, DecodeError> {
     }
 
     let (venc, vpayload) = cols[usize::from(column::VALUE)].unwrap_or_default();
+    // Encodings 3–5 hold `f64` values only: at least one row has a value word and every such row has value type 1.
+    let f64_only = valued > 0
+        && (0..n)
+            .filter(|&i| has_value(i))
+            .all(|i| vtypes[i] == value_type::F64);
+    if matches!(venc, encoding::DECIMAL..=encoding::XOR_ZSTD) && !f64_only {
+        return Err(E::Encoding {
+            column: column::VALUE,
+        });
+    }
     let words: Vec<u64> = match venc {
         encoding::PLAIN => decode_plain(vpayload, valued),
         encoding::RUN_LENGTH => decode_run_length(vpayload, valued),
