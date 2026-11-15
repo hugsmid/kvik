@@ -1,0 +1,98 @@
+name: Fault trials
+
+# Gate 4.9: platform facts the log's recovery rests on, checked on a hosted Linux runner with root
+# (`model/OPEN-QUESTIONS.md` Q-52 (b) and Q-86 (b)). `rewrite`: does writing identical bytes again make the next sync
+# write them, on ext4 and XFS over a device-mapper device that fails one file's sectors on demand
+# (`scripts/trial-rewrite.sh`). `no-space`: lack of space at a log write on Btrfs filled to capacity, with and
+# without copy-on-write on the log directory (`scripts/trial-no-space.sh`). Each job uploads its transcript; a
+# run's results are to be recorded in `docs/measurements/4.9-fault-trials.md`.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install shellcheck if missing
+        run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y shellcheck)
+      - run: shellcheck --version
+      - run: shellcheck -x scripts/trial-lib.sh scripts/trial-rewrite.sh scripts/trial-no-space.sh
+
+  rewrite: # Q-52 (b)
+    name: rewrite (${{ matrix.fs }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4, xfs]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fault-trials
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dmsetup xfsprogs e2fsprogs
+          # Some runner kernels ship file systems and device-mapper targets in the extra modules package; the
+          # script fails with a clear message if a module is still missing.
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra package for $(uname -r)"
+      - run: cargo build --release --locked -p kvik-log --example fault_trial
+      - name: Trial
+        run: sudo bash scripts/trial-rewrite.sh ${{ matrix.fs }} target/release/examples/fault_trial "trial-rewrite-${{ matrix.fs }}.log"
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f "trial-rewrite-${{ matrix.fs }}.log" ]; then
+            { echo '```'; grep -E '^(RESULT|kernel|# )' "trial-rewrite-${{ matrix.fs }}.log" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fault-trial-rewrite-${{ matrix.fs }}
+          path: trial-rewrite-${{ matrix.fs }}.log
+          if-no-files-found: warn
+
+  no-space: # Q-86 (b)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fault-trials
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs e2fsprogs
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra package for $(uname -r)"
+      - run: cargo build --release --locked -p kvik-log --example fault_trial
+      - name: Trial
+        run: sudo bash scripts/trial-no-space.sh target/release/examples/fault_trial trial-no-space.log
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f trial-no-space.log ]; then
+            { echo '```'; grep -E '^(RESULT|kernel|# )' trial-no-space.log || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fault-trial-no-space
+          path: trial-no-space.log
+          if-no-files-found: warn
