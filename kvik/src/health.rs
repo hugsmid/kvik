@@ -277,6 +277,18 @@ pub struct Stats {
     pub disk: DiskStats,
     /// Clock.
     pub clock: ClockStats,
+    /// Delivery (durable backend).
+    pub delivery: DeliveryStats,
+}
+
+/// What taking the committed log for delivery met (durable backend; zero on the model backend).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeliveryStats {
+    /// Reads of the log that failed and were tried again at the next one.
+    pub refresh_errors: u64,
+    /// Invalid regions below the durable mark the delivery reader passed over (`spec.md` §3 Recovery rule 2).
+    pub corruptions: u64,
 }
 
 /// Per-series statistics.

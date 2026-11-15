@@ -379,6 +379,10 @@ pub enum ConsumerError {
     /// emit nothing.
     #[error("routing cycle: {0}")]
     RouteCycle(String),
+    /// The saved point of a `start: position` is unknown (spec §4 Resync, §7
+    /// Readers): the consumer is not registered; start it now or at a time.
+    #[error("the saved point is unknown; start now or at a time")]
+    UnknownPoint,
     /// A confirmation names a delivery that was not received.
     #[error("confirmation of a delivery that was not received")]
     BadConfirm,

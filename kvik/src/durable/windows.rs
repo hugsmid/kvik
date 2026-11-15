@@ -162,41 +162,52 @@ impl<'a> Of<'a> {
     }
 }
 
-/// Live state (spec §2.3): the current fact with the greatest `t ≤ now` that is not bad quality (for an observed
-/// interval series, `t + d ≤ now`); a forecast series has none. Stale (spec §5.4): for a scheduled series when `now`
+/// The live-state fact of a series (spec §2.3) in an index at `now`: the current fact with the greatest `t ≤ now`
+/// that is not bad quality (for an observed interval series, `t + d ≤ now`); a forecast series has none.
+pub(crate) fn live_fact(index: &Index, id: SeriesId, now: i64) -> Result<Option<&Stored>, Error> {
+    let of = Of::new(index, id)?;
+    let p = &of.params;
+    if p.timing == km::registry::Timing::Forecast {
+        return Ok(None);
+    }
+    // As for `prior`, the scan reads through bad-quality facts, and here also through readings of an observed
+    // interval series not yet ready (at most d of event time).
+    Ok(of
+        .current(Bound::Unbounded, Bound::Included(now), true)
+        .find(|s| of.reading(s).is_some() && p.ready_at(s.row.t) <= now))
+}
+
+/// Live state (spec §2.3) in an index at `now`, with its staleness (spec §5.4): for a scheduled series when `now`
 /// is later than its `t` by more than S; for an observed series when more than S has passed since its last
 /// refreshing commit in this process, or else in event time ([`super::clock`]).
+pub(crate) fn live_in(
+    index: &Index,
+    clocks: &super::clock::Clocks,
+    id: SeriesId,
+    now: i64,
+) -> Result<Live, Error> {
+    let Some(s) = live_fact(index, id, now)? else {
+        return Ok(Live::None);
+    };
+    let p = params(&Of::new(index, id)?.series.def);
+    let stale = match (p.timing, p.staleness) {
+        (_, None) => false,
+        (km::registry::Timing::Observed, Some(limit)) => match clocks.since_refresh(id.0) {
+            Some(d) => d > limit,
+            None => now.saturating_sub(s.row.t) > limit,
+        },
+        (_, Some(limit)) => now.saturating_sub(s.row.t) > limit,
+    };
+    Ok(Live::Value(LiveValue {
+        fact: fact_out(s),
+        stale,
+    }))
+}
+
+/// Live state (spec §2.3, §5.4) at the reader's `now` ([`live_in`]).
 pub(crate) fn live(r: &DurableReader, id: SeriesId) -> Result<Live, QueryError> {
     let now = r.now();
-    r.with(|i, _| {
-        let of = Of::new(i, id)?;
-        let p = &of.params;
-        if p.timing == km::registry::Timing::Forecast {
-            return Ok(Live::None);
-        }
-        // As for `prior`, the scan reads through bad-quality facts, and here also through readings of an observed
-        // interval series not yet ready (at most d of event time).
-        let Some(s) = of
-            .current(Bound::Unbounded, Bound::Included(now), true)
-            .find(|s| of.reading(s).is_some() && p.ready_at(s.row.t) <= now)
-        else {
-            return Ok(Live::None);
-        };
-        let stale = match (p.timing, p.staleness) {
-            (_, None) => false,
-            (km::registry::Timing::Observed, Some(limit)) => {
-                match r.clocks().since_refresh(of.id()) {
-                    Some(d) => d > limit,
-                    None => now.saturating_sub(s.row.t) > limit,
-                }
-            }
-            (_, Some(limit)) => now.saturating_sub(s.row.t) > limit,
-        };
-        Ok(Live::Value(LiveValue {
-            fact: fact_out(s),
-            stale,
-        }))
-    })
+    r.with(|i, _| live_in(i, r.clocks(), id, now))
 }
 
 /// A window result (spec §6), a calendar result among them (spec §5.7: a window over its span, in the site zone or

@@ -418,6 +418,11 @@ pub struct Env {
     pub tz: Arc<dyn TzSource>,
     /// Entropy.
     pub entropy: Arc<dyn Entropy>,
+    /// Whether the durable backend runs consumer timers (held-for and stale-for conditions, values coming into
+    /// force) on its own thread when no call has run them for a second (default `true`). With `false` they run only
+    /// when the store is called (emits, deliveries polled, [`crate::Store::tick`]), as on the model backend, so a
+    /// test on a manual clock decides when they run.
+    pub background_timers: bool,
 }
 
 impl Env {
@@ -429,6 +434,7 @@ impl Env {
             boot: Arc::new(SystemBootId),
             tz: Arc::new(SystemTz::default()),
             entropy: Arc::new(SystemEntropy),
+            background_timers: true,
         }
     }
 
@@ -442,6 +448,7 @@ impl Env {
             boot: Arc::new(FixedBootId::new(Some([1; 16]))),
             tz: Arc::new(FixedTz::new("test")),
             entropy: Arc::new(FixedEntropy::new(1)),
+            background_timers: true,
         }
     }
 }

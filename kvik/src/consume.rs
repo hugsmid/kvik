@@ -249,11 +249,10 @@ pub enum ResyncCause {
     GenerationChanged,
     /// The cursor is older than the oldest local log segment.
     CursorBehindLog,
-    /// The consumer has no cursor (a new consumer, or one whose cursor file
-    /// was missing or unreadable at the start): sent before its first
-    /// delivery, with `forget_above` the position before its start (spec §4
-    /// Resync). An addition of the durable backend; never produced by the
-    /// model backend.
+    /// The consumer's cursor file was missing or unreadable at the start:
+    /// sent before its first delivery, with `forget_above` the position
+    /// before its start and each funnel's state (spec §4 Resync; Q-131). A
+    /// new consumer receives none. Never produced by the model backend.
     NoCursor,
 }
 

@@ -438,15 +438,16 @@ impl Writer {
             }
         }
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
-        let now = Arc::new(std::sync::atomic::AtomicI64::new(wall));
+        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let hub = match deliver::Deliverer::open(
             &dir,
             &env,
+            &clocks,
             descriptor.store_id,
             config.limits.consumer_queue,
             config.limits.max_consumers,
         ) {
-            Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, now.clone())),
+            Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
             Err(source) => {
                 return Err(OpenError::Io {
@@ -478,7 +479,7 @@ impl Writer {
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),
-            clocks: Arc::new(clock::Clocks::new(env.clock.clone())),
+            clocks,
             hub,
             env,
         });
@@ -816,7 +817,7 @@ impl Writer {
     ) -> Result<Emitted, EmitError> {
         self.writable().map_err(|e| e.emit(&self.dir))?;
         // Timers due run before a call is decided, as the model backend runs them.
-        self.tick();
+        self.run_timers();
         let bytes: usize = readings
             .iter()
             .map(|r| {
@@ -1109,6 +1110,11 @@ impl Writer {
             },
             disk: DiskStats { free },
             clock: ClockStats::default(),
+            delivery: self
+                .hub
+                .as_ref()
+                .map(|h| h.run_quiet(|d, _| d.delivery_stats()))
+                .unwrap_or_default(),
         }
     }
 

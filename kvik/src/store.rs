@@ -332,10 +332,12 @@ impl Store {
     /// [`Select::None`]; anything else is
     /// [`ConsumerError::NotSupportedYet`]. On the durable backend a change of
     /// `emits` is a routing change, refused with
-    /// [`ConsumerError::RouteCycle`] if it closes a cycle; a consumer with no
-    /// cursor (a new one) is first sent a resync of cause
-    /// [`ResyncCause::NoCursor`](crate::ResyncCause::NoCursor), and only
-    /// [`Start::Now`] is supported so far.
+    /// [`ConsumerError::RouteCycle`] if it closes a cycle. A new consumer
+    /// starts after the position before `start`, with no resync; one whose
+    /// cursor file was lost is first sent a resync of cause
+    /// [`ResyncCause::NoCursor`](crate::ResyncCause::NoCursor) (Q-131). An
+    /// unknown saved point is [`ConsumerError::UnknownPoint`]. The model
+    /// backend supports only [`Start::Now`].
     pub async fn consumer(
         &self,
         name: &str,
@@ -773,7 +775,9 @@ impl Consumer {
         &self.name
     }
 
-    /// Adds a funnel; a log entry that takes effect at its position.
+    /// Adds a funnel; a log entry that takes effect at its position. A funnel
+    /// equal to one in force is that funnel: its id is returned and nothing
+    /// is written (Q-91 (c)).
     pub async fn route(&self, funnel: Funnel) -> Result<FunnelId, ConsumerError> {
         match &self.inner {
             ConsumerInner::Model(w) => w.shared.with(|s| s.route(w.epoch, &self.name, funnel)),

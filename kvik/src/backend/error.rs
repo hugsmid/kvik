@@ -54,6 +54,8 @@ pub(crate) enum Error {
     TooManyConsumers(usize),
     #[error("bad confirmation")]
     BadConfirm,
+    #[error("the saved point is unknown")]
+    UnknownPoint,
     #[error("invalid query: {0}")]
     InvalidQuery(String),
     #[error("aggregate refused: {0}")]
@@ -173,6 +175,7 @@ impl Error {
             Error::Route(r) => ConsumerError::Route(r),
             Error::RouteCycle(c) => ConsumerError::RouteCycle(c),
             Error::BadConfirm => ConsumerError::BadConfirm,
+            Error::UnknownPoint => ConsumerError::UnknownPoint,
             Error::NotSupportedYet(what) => ConsumerError::NotSupportedYet { what },
             e @ (Error::ReadOnly(_) | Error::SyncFailed) => ConsumerError::Write(e.write(dir)),
             other => ConsumerError::Route(other.to_string()),

@@ -8,7 +8,7 @@ use std::task::Waker;
 use kvik_log::entries::{Entry, RouteOp, Routing, Selection, consumer_name_ok};
 
 use super::deliver::Hub;
-use super::routing::{add_change, emits_in};
+use super::routing::{add_change, emits_in, funnel_out};
 use super::{Emitted, Queued, Writer, lock};
 use crate::backend::Error;
 use crate::consume::{Delivery, DeliveryId, Funnel, FunnelId, Select, Start};
@@ -51,6 +51,44 @@ impl Writer {
         }
     }
 
+    /// Runs the timers that are due, before a call is decided, as the model backend runs them; the batches and the
+    /// cursor files are left to the acknowledgement and the `kvik-deliver` thread.
+    pub(crate) fn run_timers(&self) {
+        if let Some(h) = &self.hub {
+            h.ticked();
+            h.run(|d, c| d.tick(c));
+        }
+    }
+
+    /// Writes the registry file again after a routing change (Q-130), so that a start knows every consumer from the
+    /// registry file and the unsealed segments: up to the last synced mark, which the change's acknowledgement
+    /// moved past it.
+    fn write_registry_file(&self) -> Result<(), Error> {
+        let Some(st) = self.log().as_ref().map(kvik_log::writer::Log::stats) else {
+            return Err(Error::Closed);
+        };
+        let file = self
+            .reader()
+            .map_err(|e| Error::Internal(e.to_string()))?
+            .with(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let wall = self.env.clock.wall().0;
+        kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file).map_err(
+            |e| {
+                let f = super::registry_fault(&self.dir, &e);
+                *lock(&self.own_fault) = Some(f);
+                Error::ReadOnly(e.to_string())
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Commits a routing change and writes the registry file after it.
+    fn commit_routing(&self, d: &mut super::ingest::Decider, change: Routing) -> Result<(), Error> {
+        self.commit_entry(d, Entry::Routing(Box::new(change)))?;
+        self.write_registry_file()
+    }
+
     /// Writes the cursor files that are due; a failure turns the store read-only.
     fn flush(&self, r: std::io::Result<()>) -> Result<(), Error> {
         if let (Err(e), Some(h)) = (r, &self.hub) {
@@ -72,11 +110,6 @@ impl Writer {
         if !consumer_name_ok(name) {
             return Err(Error::Route(
                 "a consumer name is [a-z0-9][a-z0-9._-]{0,63} (format.md A.12)".into(),
-            ));
-        }
-        if !matches!(start, Start::Now) {
-            return Err(Error::NotSupportedYet(
-                "a new consumer starting at a position or a time (roadmap 5.3)",
             ));
         }
         let emits = emits_in(emits);
@@ -107,13 +140,14 @@ impl Writer {
         })?;
         if let Some(change) = change {
             self.writable()?;
-            self.commit_entry(&mut d, Entry::Routing(Box::new(change)))?;
+            self.commit_routing(&mut d, change)?;
         }
         drop(d);
-        hub.run(|dl, c| {
+        let r = hub.run(|dl, c| {
             dl.pump(c);
-            dl.take(name, c)
-        })
+            dl.take(name, start, c)
+        })?;
+        self.flush(r)
     }
 
     /// Adds a funnel: a routing change that takes effect at its position.
@@ -121,21 +155,33 @@ impl Writer {
         let hub = self.hub()?.clone();
         self.writable()?;
         let mut d = lock(&self.decider);
-        let change = hub.run(|dl, c| -> Result<Routing, Error> {
+        let change = hub.run(|dl, c| -> Result<Result<Routing, FunnelId>, Error> {
             dl.pump(c);
             if !dl.is_bound(name) {
                 return Err(Error::Closed);
             }
             let view = dl.view();
+            // The same definition again (a consumer that routes at every start) is the funnel in force, with its
+            // latch (Q-91 (c)).
+            if let Some((id, _)) = view
+                .funnels(name)
+                .find(|(_, f)| funnel_out(f, &view.registry) == *funnel)
+            {
+                return Ok(Err(FunnelId(id)));
+            }
             let id = view.consumers.get(name).map_or(0, |r| r.max_funnel) + 1;
             let change = add_change(&view.registry, name, id, funnel, view.emits(name))?;
             if let Some(cycle) = view.cycle_with(Some(&change), None) {
                 return Err(Error::RouteCycle(cycle.join(" -> ")));
             }
-            Ok(change)
+            Ok(Ok(change))
         })?;
+        let change = match change {
+            Ok(c) => c,
+            Err(existing) => return Ok(existing),
+        };
         let id = change.funnel.unwrap_or(0);
-        self.commit_entry(&mut d, Entry::Routing(Box::new(change)))?;
+        self.commit_routing(&mut d, change)?;
         drop(d);
         hub.run(|_, _| ());
         Ok(FunnelId(id))
@@ -165,7 +211,7 @@ impl Writer {
                 condition: None,
             })
         })?;
-        self.commit_entry(&mut d, Entry::Routing(Box::new(change)))?;
+        self.commit_routing(&mut d, change)?;
         drop(d);
         hub.run(|dl, _| dl.forget_latch(name, funnel.0));
         Ok(())

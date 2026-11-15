@@ -124,8 +124,8 @@ pub use error::{
     Wait, WriteError,
 };
 pub use health::{
-    ClockJump, ClockStats, ConsumerStats, DiskStats, Health, IngestStats, Latency, LogStats,
-    LossCause, LossKind, LossReport, MarkState, MarkSyncMode, Reason, SeriesStats, Stats,
+    ClockJump, ClockStats, ConsumerStats, DeliveryStats, DiskStats, Health, IngestStats, Latency,
+    LogStats, LossCause, LossKind, LossReport, MarkState, MarkSyncMode, Reason, SeriesStats, Stats,
 };
 pub use read::{
     Aggregate, Aggregated, Bucket, CalendarPeriod, CalendarWindow, ChartData, Facts, Live,

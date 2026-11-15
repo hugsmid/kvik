@@ -143,6 +143,9 @@ struct ConsumerSlot {
     /// The last part of a resync was handed out and not yet confirmed:
     /// nothing further is delivered until it is.
     awaiting_resync: Option<u32>,
+    /// Per model funnel, the last condition delivery sequence the model issued before this store session: the model
+    /// keeps sequences across restarts, the interface starts them at 1 at every start (spec §4 Order).
+    sequence_base: BTreeMap<u32, u64>,
 }
 
 #[derive(Debug)]
@@ -294,6 +297,16 @@ impl Slot {
         cfg.site_zone = fresh.site_zone;
         self.mark_sync = mark_sync_mode(config);
         self.sync_clock();
+        for c in self.consumers.values_mut() {
+            c.sequence_base = self
+                .model
+                .disk
+                .sequences
+                .iter()
+                .filter(|((id, _), _)| *id == c.id)
+                .map(|((_, f), n)| (f.0, *n))
+                .collect();
+        }
         self.model.restart();
         if !self.model.is_up() {
             return Err(self.model.disk.open_refused.clone().map_or_else(
@@ -962,6 +975,7 @@ impl Slot {
                 to_api: BTreeMap::new(),
                 next_funnel: 1,
                 next_model: 1 << 31,
+                sequence_base: BTreeMap::new(),
                 parts: VecDeque::new(),
                 awaiting_resync: None,
             },
@@ -1015,6 +1029,15 @@ impl Slot {
         let cid = self.bound(epoch, name)?;
         if self.model.is_read_only() {
             return Err(Error::ReadOnly("routing changes are log entries".into()));
+        }
+        // The same definition again (a consumer that routes at every start) is the funnel in force, with its latch
+        // (Q-91 (c)).
+        if let Some((id, _)) = self.consumers[name]
+            .funnels
+            .iter()
+            .find(|(_, e)| e.spec == funnel)
+        {
+            return Ok(*id);
         }
         let registry = self.model.registry().map_err(convert::error)?;
         let (selection, pattern_set) = match &funnel.series {
@@ -1196,6 +1219,13 @@ impl Slot {
         Ok(d)
     }
 
+    fn sequence_base(&self, name: &str, model: u32) -> u64 {
+        self.consumers
+            .get(name)
+            .and_then(|c| c.sequence_base.get(&model).copied())
+            .unwrap_or(0)
+    }
+
     fn api_funnel(&self, name: &str, model: km::engine::FunnelId) -> FunnelId {
         self.consumers
             .get(name)
@@ -1235,7 +1265,7 @@ impl Slot {
             K::Trigger(t) => one(
                 DeliveryId::Condition {
                     funnel: self.api_funnel(name, t.funnel),
-                    sequence: t.sequence,
+                    sequence: t.sequence - self.sequence_base(name, t.funnel.0),
                 },
                 DeliveryKind::Trigger(Trigger {
                     funnel: self.api_funnel(name, t.funnel),
@@ -1327,7 +1357,7 @@ impl Slot {
             DeliveryId::Condition { funnel, sequence } => km::engine::DeliveryId::Timer {
                 generation: self.model.disk.generation,
                 funnel: km::engine::FunnelId(funnel.0),
-                sequence,
+                sequence: sequence + self.sequence_base(name, funnel.0),
             },
             DeliveryId::GenerationChanged => km::engine::DeliveryId::GenerationChanged,
             DeliveryId::Resync { part } => {
@@ -1733,6 +1763,7 @@ impl Slot {
                 jumps: self.clock_jumps,
                 last: self.last_jump,
             },
+            delivery: crate::health::DeliveryStats::default(),
         }
     }
 
