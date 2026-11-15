@@ -1,117 +1,29 @@
 //! Consumers on the durable backend (roadmap 5.2): routing changes and cursor files survive restarts, a power loss
-//! ends in a reset point carrying `forget_above`, `emits` and routing cycles, and two property tests: deliveries match
-//! the model backend's over clean restarts, and after crashes and power losses they follow the specification's
-//! rules (at least once, never ahead of a confirmation, reset points).
+//! ends in a reset point carrying `forget_above`, `emits` and routing cycles, the start of a new consumer and of one
+//! whose cursor file was lost (Q-131), routing again at every start (Q-91 (c)), the cursor file never ahead of the
+//! synced mark (Q-132, invariant 26) and the registry file after each routing change (Q-130). The property tests are
+//! in `consumer_properties.rs`.
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{at, block_on, start};
-use kvik::env::{Env, FixedBootId, ManualClock, MemFs};
+use common::world::{World, drain, gauge, num, ready, resync};
+use common::{at, block_on};
 use kvik::{
-    Backend, Condition, ConditionState, Consumer, ConsumerError, DefineError, Delivery,
-    DeliveryKind, Funnel, LogConfig, Outcome, Position, Reading, Refusal, ResyncCause, ResyncPart,
-    Select, SeriesId, SeriesSpec, Start, Store, StoreConfig, TriggerCause, Value, ValueType,
+    Condition, ConditionState, Consumer, ConsumerError, DefineError, Delivery, DeliveryKind,
+    Funnel, MarkSync, Outcome, Position, Refusal, ResetStamp, ResyncCause, SavedPoint, Select,
+    Start, Store, TriggerCause,
 };
-use proptest::prelude::*;
-use proptest::test_runner::TestRunner;
 
-/// A durable store's world: its in-memory file system, boot identity and clock.
-struct World {
-    dir: String,
-    fs: Arc<MemFs>,
-    boot: Arc<FixedBootId>,
-    clock: ManualClock,
-    boot_count: u8,
-}
-
-impl World {
-    fn new(name: &str) -> Self {
-        World {
-            dir: format!("consumers/{name}"),
-            fs: Arc::new(MemFs::new()),
-            boot: Arc::new(FixedBootId::new(Some([1; 16]))),
-            clock: ManualClock::new(start()),
-            boot_count: 1,
-        }
-    }
-
-    fn config(&self) -> StoreConfig {
-        let mut env = Env::test(self.clock.clone());
-        env.fs = self.fs.clone();
-        env.boot = self.boot.clone();
-        let mut log = LogConfig::default();
-        log.segment_size = 16 << 20;
-        log.min_sync_interval = Duration::ZERO;
-        StoreConfig::new(&self.dir, "Europe/London")
-            .create_if_missing(true)
-            .env(env)
-            .log(log)
-    }
-
-    fn open(&self) -> Store {
-        block_on(Store::open(self.config())).unwrap()
-    }
-
-    /// The process stops (every later file operation fails) and its handles are dropped; with `power`, the power
-    /// goes too: every file returns to what was synced and the machine boots with a new boot identity.
-    fn crash(&mut self, store: Store, consumers: Vec<Consumer>, power: bool) {
-        self.fs.crash_after(0);
-        drop(consumers);
-        drop(store);
-        if power {
-            self.fs.power_loss();
-            self.boot_count += 1;
-            self.boot.set(Some([self.boot_count; 16]));
-        } else {
-            self.fs.restart();
-        }
-    }
-}
-
-fn gauge(name: &str) -> SeriesSpec {
-    SeriesSpec::new(
-        name,
-        kvik::Kind::Gauge {
-            value: ValueType::F64,
-        },
-        "W",
-    )
-    .expected_interval(Duration::from_secs(1))
-}
-
-fn num(id: SeriesId, secs: i64, v: f64) -> Reading {
-    Reading::new(id, at(secs), Value::F64(v))
-}
-
-/// Every ready delivery, each confirmed.
-fn drain(c: &mut Consumer) -> Vec<Delivery> {
-    let mut out = Vec::new();
-    while let Some(d) = c.try_next().unwrap() {
-        block_on(c.confirm(d.id)).unwrap();
-        out.push(d);
-    }
-    out
-}
-
-fn resync(d: &Delivery) -> Option<&ResyncPart> {
-    match &d.kind {
-        DeliveryKind::Resync(r) => Some(r),
-        _ => None,
-    }
-}
-
-/// A consumer taken for the first time: its resync for a consumer with no cursor, confirmed.
+/// A consumer taken for the first time: it is sent no resync (Q-131).
 fn new_consumer(s: &Store, name: &str, emits: Select) -> Consumer {
     let mut c = block_on(s.consumer(name, Start::Now, emits)).unwrap();
-    let d = c.try_next().unwrap().unwrap();
-    let r = resync(&d).unwrap();
-    assert_eq!(r.cause, ResyncCause::NoCursor);
-    assert_eq!(r.forget_above, Some(d.position));
-    block_on(c.confirm(d.id)).unwrap();
+    assert!(
+        c.try_next().unwrap().is_none(),
+        "a new consumer has nothing to forget"
+    );
     c
 }
 
@@ -371,468 +283,321 @@ fn emits_are_declared_and_routing_cycles_are_refused() {
     block_on(s.shutdown()).unwrap();
 }
 
-// ----- differential test against the model backend, and crash rules -----
-
-const NAMES: [&str; 4] = [
-    "site/a/power",
-    "site/b/power",
-    "site/a/energy",
-    "site/c/power",
-];
-
-#[derive(Clone, Debug)]
-enum FunnelKind {
-    Ids(usize),
-    All,
-    Pattern,
-    Threshold(usize),
-    OnChange(usize),
-    HeldFor(usize),
-    StaleFor(usize),
-}
-
-#[derive(Clone, Debug)]
-enum Step {
-    Emit(usize, u8),
-    Advance(u64),
-    Tick,
-    Route(usize, FunnelKind),
-    Unroute(usize, usize),
-    /// Takes every ready delivery and confirms up to the one at this index, if any.
-    Drain(usize, usize),
-    Retake(usize),
-    Restart,
-    Define,
-    Alias,
-    /// Crash steps, for the durable-only test: a process crash, or a power loss.
-    Crash(bool),
-}
-
-fn funnel_kind() -> impl Strategy<Value = FunnelKind> {
-    prop_oneof![
-        (0usize..4).prop_map(FunnelKind::Ids),
-        Just(FunnelKind::All),
-        Just(FunnelKind::Pattern),
-        (0usize..3).prop_map(FunnelKind::Threshold),
-        (0usize..3).prop_map(FunnelKind::OnChange),
-        (0usize..3).prop_map(FunnelKind::HeldFor),
-        (0usize..3).prop_map(FunnelKind::StaleFor),
-    ]
-}
-
-fn steps(crashes: bool) -> impl Strategy<Value = Vec<Step>> {
-    // A clean restart in the differential test; a crash or a power loss in the test of the crash rules.
-    let stop = any::<bool>().prop_map(move |power| {
-        if crashes {
-            Step::Crash(power)
-        } else {
-            Step::Restart
-        }
-    });
-    let step = prop_oneof![
-        10 => (0usize..4, any::<u8>()).prop_map(|(i, v)| Step::Emit(i, v)),
-        4 => (0u64..3).prop_map(Step::Advance),
-        1 => Just(Step::Tick),
-        4 => (0usize..2, funnel_kind()).prop_map(|(c, k)| Step::Route(c, k)),
-        1 => (0usize..2, 0usize..3).prop_map(|(c, n)| Step::Unroute(c, n)),
-        5 => (0usize..2, 0usize..8).prop_map(|(c, n)| Step::Drain(c, n)),
-        1 => (0usize..2).prop_map(Step::Retake),
-        2 => stop,
-        1 => Just(Step::Define),
-        1 => Just(Step::Alias),
-    ];
-    prop::collection::vec(step, 1..40)
-}
-
-const CONSUMERS: [&str; 2] = ["c0", "c1"];
-
-fn funnel(k: &FunnelKind, ids: &[SeriesId]) -> Funnel {
-    let id = |i: usize| ids.get(i).copied().unwrap_or(SeriesId(999));
-    let cond = |i: usize, c: Condition| Funnel {
-        series: Select::Ids(vec![id(i)]),
+fn condition(g: kvik::SeriesId) -> Funnel {
+    Funnel {
+        series: Select::Ids(vec![g]),
         operator: None,
-        condition: Some(c),
+        condition: Some(Condition::above(10.0)),
+    }
+}
+
+/// Facts at `t` = 0, 1, 2, 3 seconds, a second apart, with their positions.
+fn four_facts(w: &World, s: &Store, g: kvik::SeriesId, v: f64) -> Vec<Position> {
+    (0..4)
+        .map(|i| {
+            let p = block_on(s.emit(&[num(g, i, v)])).unwrap().last().unwrap();
+            w.clock.advance(Duration::from_secs(1));
+            p
+        })
+        .collect()
+}
+
+fn stamp0(position: Position) -> SavedPoint {
+    SavedPoint {
+        position,
+        stamp: ResetStamp::default(),
+    }
+}
+
+fn cursor(s: &Store, name: &str) -> Position {
+    s.consumer_stats(name).unwrap().cursor
+}
+
+/// Q-131: a new consumer is sent no resync and starts after the position before its start: the last position for
+/// `start: now`, the position before the first fact at or after T for `start: time`, and for `start: position` the
+/// saved point, kept or void above the position a later reset kept.
+#[test]
+fn a_new_consumer_starts_after_the_position_before_its_start_with_no_resync() {
+    let mut w = World::new("start-kinds");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let ps = four_facts(&w, &s, g, 1.0);
+    let mut now = new_consumer(&s, "now", Select::None);
+    assert!(cursor(&s, "now") >= ps[3]);
+    let time = block_on(s.consumer("time", Start::Time(at(2)), Select::None)).unwrap();
+    assert!(ps[1] <= cursor(&s, "time") && cursor(&s, "time") < ps[2]);
+    let kept = block_on(s.consumer("kept", Start::Position(stamp0(ps[1])), Select::None)).unwrap();
+    assert_eq!(cursor(&s, "kept"), ps[1]);
+    // Facts after the start are delivered once routed.
+    block_on(now.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    let p = block_on(s.emit(&[num(g, 9, 9.0)])).unwrap().last().unwrap();
+    let ds = drain(&mut now);
+    assert!(matches!(&ds[..], [d] if matches!(&d.kind, DeliveryKind::Fact(f) if f.position == p)));
+    // A point above what a power loss kept is void above the position the recovery entry kept.
+    let durable = s.stats().log.durable;
+    let beyond = Position {
+        generation: durable.generation,
+        sequence: durable.sequence + 3,
     };
-    match k {
-        FunnelKind::Ids(i) => Funnel::facts(Select::Ids(vec![id(*i)])),
-        FunnelKind::All => Funnel::facts(Select::All),
-        FunnelKind::Pattern => Funnel::facts(Select::Names("site/*/power".into())),
-        FunnelKind::Threshold(i) => cond(*i, Condition::above(50.0).clear_below(30.0)),
-        FunnelKind::OnChange(i) => cond(*i, Condition::on_change(40.0)),
-        FunnelKind::HeldFor(i) => cond(*i, Condition::held_for(50.0, Duration::from_secs(2))),
-        FunnelKind::StaleFor(i) => cond(*i, Condition::stale_for(Duration::from_secs(1))),
-    }
-}
-
-/// A delivery in a form both backends give alike: positions differ between them (the model backend writes routing
-/// entries when a pattern is evaluated again, the durable backend tzdata and recovery entries), and condition
-/// sequences start again at every start of the durable engine only.
-fn normal(d: &Delivery) -> String {
-    match &d.kind {
-        DeliveryKind::Fact(f) => format!(
-            "fact {} {} {:?} r={} o={} f={}",
-            f.series.0, f.t.0, f.value, d.flags.replayed, d.flags.outranked, d.flags.future
-        ),
-        DeliveryKind::Trigger(t) => format!("trigger {} {:?} {:?}", t.funnel.0, t.state, t.cause),
-        DeliveryKind::Resync(r) => {
-            let fs: Vec<String> = r
-                .funnels
-                .iter()
-                .map(|f| {
-                    // Live staleness is left out: the model backend judges it when it hands the resync out, the
-                    // durable backend when it evaluates the resync, as the specification has it.
-                    let live = match &f.live {
-                        kvik::Live::Value(v) => format!("{} {:?}", v.fact.t.0, v.fact.value),
-                        other => format!("{other:?}"),
-                    };
-                    format!(
-                        "{} {} {:?} {} {live}",
-                        f.funnel.0, f.series.0, f.condition, f.transition
-                    )
-                })
-                .collect();
-            format!(
-                "resync {:?} {} {}/{} [{}]",
-                r.cause,
-                r.forget_above.is_some(),
-                r.part,
-                r.last,
-                fs.join("; ")
-            )
-        }
-        other => format!("{other:?}"),
-    }
-}
-
-/// Takes a consumer; the durable backend's resync for a consumer with no cursor is checked, confirmed and left out
-/// of the record, the model backend sends none.
-fn take(s: &Store, name: &str, out: &mut Vec<String>) -> Option<Consumer> {
-    match block_on(s.consumer(name, Start::Now, Select::None)) {
-        Ok(mut c) => {
-            // The first delivery is taken at once on both backends.
-            if let Some(d) = c.try_next().unwrap() {
-                match resync(&d) {
-                    Some(r) if r.cause == ResyncCause::NoCursor => {
-                        block_on(c.confirm(d.id)).unwrap();
-                    }
-                    _ => {
-                        // Not a new consumer: the first delivery is part of what is compared.
-                        out.push(format!("{name}: {}", normal(&d)));
-                        pending(&mut c, d);
-                    }
-                }
-            }
-            Some(c)
-        }
-        Err(e) => {
-            out.push(format!("{name}: take {e:?}"));
-            None
-        }
-    }
-}
-
-thread_local! {
-    static HELD: std::cell::RefCell<BTreeMap<String, Vec<Delivery>>> = const { std::cell::RefCell::new(BTreeMap::new()) };
-}
-
-/// Keeps a delivery taken outside a drain, to be confirmed by the next drain.
-fn pending(c: &mut Consumer, d: Delivery) {
-    HELD.with(|h| {
-        h.borrow_mut()
-            .entry(c.name().to_string())
-            .or_default()
-            .push(d)
-    });
-}
-
-fn held(name: &str) -> Vec<Delivery> {
-    HELD.with(|h| h.borrow_mut().remove(name).unwrap_or_default())
-}
-
-/// What a history gave: per step, what each consumer received, in a comparable form.
-fn run(
-    store: Store,
-    reopen: &dyn Fn() -> Store,
-    clock: &ManualClock,
-    history: &[Step],
-) -> Vec<String> {
-    HELD.with(|h| h.borrow_mut().clear());
-    let mut s = store;
-    let mut out = Vec::new();
-    let mut ids: Vec<SeriesId> = NAMES[..3]
-        .iter()
-        .map(|n| block_on(s.define_series(gauge(n))).unwrap())
-        .collect();
-    let mut cs: Vec<Option<Consumer>> = CONSUMERS.iter().map(|n| take(&s, n, &mut out)).collect();
-    let mut t = 0i64;
-    for step in history {
-        match step {
-            Step::Emit(i, v) => {
-                let id = ids.get(*i).copied().unwrap_or(SeriesId(999));
-                t += 1;
-                let value = f64::from(*v % 8) * 15.0;
-                let r = block_on(s.emit(&[Reading::new(id, clock.wall(), Value::F64(value))]));
-                match r {
-                    Ok(a) => out.push(format!(
-                        "emit {:?}",
-                        a.outcomes
-                            .first()
-                            .map(|o| matches!(o, Outcome::Recorded { .. }))
-                    )),
-                    Err(e) => out.push(format!("emit {e:?}")),
-                }
-            }
-            Step::Advance(secs) => clock.advance(Duration::from_secs(*secs)),
-            Step::Tick => s.tick().unwrap(),
-            Step::Route(c, k) => {
-                if let Some(c) = &cs[*c] {
-                    let r = block_on(c.route(funnel(k, &ids)));
-                    out.push(format!(
-                        "route {:?}",
-                        r.map_err(|e| format!("{e:?}").split('(').next().unwrap().to_string())
-                    ));
-                }
-            }
-            Step::Unroute(c, n) => {
-                if let Some(c) = &cs[*c] {
-                    let routes = c.routes().unwrap();
-                    if let Some((id, _)) = routes.get(*n) {
-                        block_on(c.unroute(*id)).unwrap();
-                    }
-                }
-            }
-            Step::Drain(c, n) => {
-                let name = CONSUMERS[*c];
-                if let Some(cons) = cs[*c].as_mut() {
-                    let mut got = held(name);
-                    while let Some(d) = cons.try_next().unwrap() {
-                        out.push(format!("{name}: {}", normal(&d)));
-                        got.push(d);
-                    }
-                    if let Some(d) = got.get(*n).or(got.last().filter(|_| *n >= 4)) {
-                        block_on(cons.confirm(d.id)).unwrap();
-                    }
-                }
-            }
-            Step::Retake(c) => {
-                cs[*c] = None;
-                held(CONSUMERS[*c]);
-                cs[*c] = take(&s, CONSUMERS[*c], &mut out);
-            }
-            Step::Restart => {
-                block_on(s.shutdown()).unwrap();
-                cs.clear();
-                drop(s);
-                for n in CONSUMERS {
-                    held(n);
-                }
-                s = reopen();
-                cs = CONSUMERS.iter().map(|n| take(&s, n, &mut out)).collect();
-            }
-            Step::Define => {
-                if ids.len() == 3 {
-                    ids.push(block_on(s.define_series(gauge(NAMES[3]))).unwrap());
-                }
-            }
-            Step::Alias => {
-                let r = block_on(s.alias(ids[2], "site/x/power"));
-                out.push(format!("alias {}", r.is_ok()));
-            }
-            Step::Crash(_) => {}
-        }
-    }
-    let _ = t;
-    // Everything still ready.
-    for (i, c) in cs.iter_mut().enumerate() {
-        if let Some(c) = c {
-            while let Some(d) = c.try_next().unwrap() {
-                out.push(format!("{}: {}", CONSUMERS[i], normal(&d)));
-                block_on(c.confirm(d.id)).unwrap();
-            }
-        }
-    }
-    drop(cs);
+    w.crash(s, vec![now, time, kept], true);
+    let s = w.open();
+    let mut void =
+        block_on(s.consumer("void", Start::Position(stamp0(beyond)), Select::None)).unwrap();
+    assert_eq!(cursor(&s, "void"), durable);
+    // The recovery entry above it is a reset point for it, as for a cursor there (`spec.md` §4 Resync).
+    let d = void.try_next().unwrap().unwrap();
+    let r = resync(&d).unwrap();
+    assert_eq!(
+        (r.cause, r.forget_above),
+        (ResyncCause::ResetPoint, Some(durable))
+    );
+    assert!(r.funnels.is_empty());
+    let _kept2 =
+        block_on(s.consumer("kept-again", Start::Position(stamp0(ps[1])), Select::None)).unwrap();
+    assert_eq!(cursor(&s, "kept-again"), ps[1]);
     block_on(s.shutdown()).unwrap();
-    out
 }
 
-fn next_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::SeqCst)
-}
-
+/// Q-131: a consumer whose cursor file is unreadable at the start is named in the recovery entry and, when taken, is
+/// first sent a resync of cause `NoCursor` carrying each funnel's state, a transition since its latch is lost, with
+/// `forget_above` the position before its start, by start kind.
 #[test]
-fn deliveries_follow_the_model_over_restarts() {
-    let cases = (ProptestConfig::default().cases / 4).max(16);
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    });
-    runner
-        .run(&steps(false), |history| {
-            let m_clock = ManualClock::new(start());
-            let dir = format!("kvik-test/consumers-differential/{}", next_id());
-            let m_config = StoreConfig::new(&dir, "Europe/London")
-                .create_if_missing(true)
-                .backend(Backend::Model)
-                .env(Env::test(m_clock.clone()));
-            let model = block_on(Store::open(m_config.clone())).unwrap();
-            let m = run(
-                model,
-                &|| block_on(Store::open(m_config.clone())).unwrap(),
-                &m_clock,
-                &history,
-            );
-            let w = World::new(&format!("differential-{}", next_id()));
-            let d = run(w.open(), &|| w.open(), &w.clock, &history);
-            prop_assert_eq!(m, d);
-            Ok(())
-        })
-        .unwrap();
+fn a_lost_cursor_file_gives_a_resync_with_funnel_states_by_start_kind() {
+    let w = World::new("lost-cursor");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let names = ["now", "time", "pos"];
+    let mut cs: Vec<Consumer> = names
+        .iter()
+        .map(|n| new_consumer(&s, n, Select::None))
+        .collect();
+    let mut ids = Vec::new();
+    for c in &cs {
+        ids.push(block_on(c.route(condition(g))).unwrap());
+    }
+    let ps = four_facts(&w, &s, g, 20.0);
+    for c in &mut cs {
+        let ds = drain(c);
+        assert!(ds.iter().any(
+            |d| matches!(&d.kind, DeliveryKind::Trigger(t) if t.state == ConditionState::True)
+        ));
+    }
+    block_on(s.shutdown()).unwrap();
+    drop((cs, s));
+    for n in names {
+        let path = w.path_with(&format!("cursors/{n}.cur")).unwrap();
+        w.fs.poke(&path, 0, &[0; 16]);
+    }
+    // A clean start writes no recovery entry (`spec.md` §3 Recovery rule 3), but the consumers are known from their
+    // routing changes and are treated as having no cursor.
+    let s = w.open();
+    let starts = [
+        Start::Now,
+        Start::Time(at(2)),
+        Start::Position(stamp0(ps[0])),
+    ];
+    for ((n, start), id) in names.iter().zip(starts).zip(&ids) {
+        let mut c = block_on(s.consumer(n, start, Select::None)).unwrap();
+        let ds = ready(&mut c);
+        let d: &Delivery = &ds[0];
+        let r = resync(d).unwrap();
+        assert_eq!(r.cause, ResyncCause::NoCursor, "{n}");
+        assert!(r.last);
+        let forget = r.forget_above.unwrap();
+        match *n {
+            "now" => assert!(forget >= ps[3]),
+            "time" => assert!(ps[1] <= forget && forget < ps[2], "{forget:?} {ps:?}"),
+            _ => assert_eq!(forget, ps[0]),
+        }
+        let f = r.funnels.iter().find(|f| f.funnel == *id).unwrap();
+        assert_eq!(f.condition, Some(ConditionState::True));
+        assert!(f.transition, "no latch to compare");
+        assert_eq!(ds.len(), 1, "nothing before it is confirmed");
+        block_on(c.confirm(d.id)).unwrap();
+        assert_eq!(cursor(&s, n), d.position);
+    }
+    block_on(s.shutdown()).unwrap();
 }
 
-/// The crash rules, checked against what the test itself saw: after a crash or a power loss a consumer resumes at a
-/// cursor no later than its last confirmation, every fact handed to it above that cursor before the stop is
-/// replayed in position order, a power loss ends the resume with a resync whose `forget_above` is the last
-/// position acknowledged before it and whose id is above it, and nothing follows before that resync is confirmed.
+/// Q-91 (c), row 16: routing the same funnel at every start adds no funnel and keeps its latch; a condition that
+/// became true while the consumer was down is delivered once, as a transition, and not again after the next start.
 #[test]
-fn deliveries_after_crashes_follow_the_rules() {
-    let cases = (ProptestConfig::default().cases / 4).max(16);
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    });
-    runner
-        .run(&steps(true), |history| {
-            let mut w = World::new(&format!("crashes-{}", next_id()));
-            let s = w.open();
-            let mut s = Some(s);
-            let ids: Vec<SeriesId> = NAMES[..3]
-                .iter()
-                .map(|n| block_on(s.as_ref().unwrap().define_series(gauge(n))).unwrap())
-                .collect();
-            let mut ignore = Vec::new();
-            let mut cs: Vec<Option<Consumer>> = CONSUMERS
-                .iter()
-                .map(|n| take(s.as_ref().unwrap(), n, &mut ignore))
-                .collect();
-            // Per consumer: facts handed out in this run (position), and the last confirmed position.
-            let mut handed: Vec<Vec<Position>> = vec![Vec::new(), Vec::new()];
-            let mut confirmed: Vec<Position> = CONSUMERS
-                .iter()
-                .map(|n| s.as_ref().unwrap().consumer_stats(n).unwrap().cursor)
-                .collect();
-            for step in &history {
-                let st = s.as_ref().unwrap();
-                match step {
-                    Step::Emit(i, v) => {
-                        let _ = block_on(st.emit(&[Reading::new(
-                            ids[*i % 3],
-                            w.clock.wall(),
-                            Value::F64(f64::from(*v)),
-                        )]));
-                    }
-                    Step::Advance(secs) => w.clock.advance(Duration::from_secs(*secs)),
-                    Step::Tick => st.tick().unwrap(),
-                    Step::Route(c, k) => {
-                        if let Some(c) = &cs[*c] {
-                            let _ = block_on(c.route(funnel(k, &ids)));
-                        }
-                    }
-                    Step::Unroute(c, n) => {
-                        if let Some(c) = &cs[*c]
-                            && let Some((id, _)) = c.routes().unwrap().get(*n)
-                        {
-                            block_on(c.unroute(*id)).unwrap();
-                        }
-                    }
-                    Step::Drain(i, n) => {
-                        if let Some(c) = cs[*i].as_mut() {
-                            let mut got = Vec::new();
-                            while let Some(d) = c.try_next().unwrap() {
-                                if let DeliveryKind::Fact(f) = &d.kind {
-                                    handed[*i].push(f.position);
-                                }
-                                got.push(d);
-                            }
-                            if let Some(d) = got.get(*n).or(got.last()) {
-                                block_on(c.confirm(d.id)).unwrap();
-                                confirmed[*i] = st.consumer_stats(CONSUMERS[*i]).unwrap().cursor;
-                            }
-                        }
-                    }
-                    Step::Crash(power) => {
-                        let durable = st.stats().log.durable;
-                        let store = s.take().unwrap();
-                        w.crash(store, cs.drain(..).flatten().collect(), *power);
-                        let st = w.open();
-                        for (i, name) in CONSUMERS.iter().enumerate() {
-                            let mut c =
-                                block_on(st.consumer(name, Start::Now, Select::None)).unwrap();
-                            let cursor = st.consumer_stats(name).unwrap().cursor;
-                            prop_assert!(
-                                cursor <= confirmed[i],
-                                "cursor {:?} ahead of the confirmation {:?}",
-                                cursor,
-                                confirmed[i]
-                            );
-                            let mut got = Vec::new();
-                            while let Some(d) = c.try_next().unwrap() {
-                                got.push(d);
-                            }
-                            // Every fact handed out above the cursor comes again, replayed, in position order.
-                            let replayed: Vec<Position> = got
-                                .iter()
-                                .filter_map(|d| match &d.kind {
-                                    DeliveryKind::Fact(f) => Some((f.position, d.flags.replayed)),
-                                    _ => None,
-                                })
-                                .map(|(p, r)| {
-                                    assert!(r, "a replayed fact");
-                                    p
-                                })
-                                .collect();
-                            prop_assert!(replayed.windows(2).all(|w| w[0] < w[1]));
-                            for p in handed[i].iter().filter(|p| **p > cursor) {
-                                prop_assert!(
-                                    replayed.contains(p),
-                                    "fact at {p:?} not replayed after {cursor:?}"
-                                );
-                            }
-                            let last = got.last().map(resync);
-                            if let Some(Some(r)) = last {
-                                prop_assert_eq!(r.cause, ResyncCause::Resume);
-                                if *power {
-                                    prop_assert_eq!(r.forget_above, Some(durable));
-                                    prop_assert!(got.last().unwrap().position > durable);
-                                }
-                                if !*power {
-                                    prop_assert_eq!(r.forget_above, None);
-                                }
-                                // Nothing further before its confirmation.
-                                prop_assert!(c.try_next().unwrap().is_none());
-                                let id = got.last().unwrap().id;
-                                block_on(c.confirm(id)).unwrap();
-                                confirmed[i] = st.consumer_stats(name).unwrap().cursor;
-                            } else {
-                                prop_assert!(false, "a resume ends with a resync: {:?}", got);
-                            }
-                            handed[i].clear();
-                            cs.push(Some(c));
-                        }
-                        s = Some(st);
-                    }
-                    Step::Retake(_) | Step::Restart | Step::Define | Step::Alias => {}
+fn routing_again_at_every_start_keeps_the_funnel_and_delivers_a_change_once() {
+    let w = World::new("route-again");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let mut c = new_consumer(&s, "alarm", Select::None);
+    let id = block_on(c.route(condition(g))).unwrap();
+    block_on(s.emit(&[num(g, 0, 5.0)])).unwrap();
+    w.clock.advance(Duration::from_secs(1));
+    drain(&mut c);
+    block_on(s.shutdown()).unwrap();
+    drop((c, s));
+    let trues = |ds: &[Delivery]| {
+        ds.iter()
+            .map(|d| match &d.kind {
+                DeliveryKind::Trigger(t) => {
+                    usize::from(t.funnel == id && t.state == ConditionState::True)
                 }
-            }
-            drop(cs);
-            if let Some(st) = s {
-                block_on(st.shutdown()).unwrap();
-            }
-            Ok(())
-        })
+                DeliveryKind::Resync(r) => r
+                    .funnels
+                    .iter()
+                    .filter(|f| {
+                        f.funnel == id && f.transition && f.condition == Some(ConditionState::True)
+                    })
+                    .count(),
+                _ => 0,
+            })
+            .sum::<usize>()
+    };
+    let s = w.open();
+    // The condition becomes true while the consumer is down.
+    block_on(s.emit(&[num(g, 1, 20.0)])).unwrap();
+    w.clock.advance(Duration::from_secs(1));
+    let mut c = block_on(s.consumer("alarm", Start::Now, Select::None)).unwrap();
+    assert_eq!(block_on(c.route(condition(g))).unwrap(), id);
+    assert_eq!(c.routes().unwrap().len(), 1);
+    let ds = drain(&mut c);
+    assert_eq!(trues(&ds), 1, "{ds:?}");
+    block_on(s.emit(&[num(g, 2, 25.0)])).unwrap();
+    assert_eq!(trues(&drain(&mut c)), 0);
+    block_on(s.shutdown()).unwrap();
+    drop((c, s));
+    let s = w.open();
+    let mut c = block_on(s.consumer("alarm", Start::Now, Select::None)).unwrap();
+    assert_eq!(block_on(c.route(condition(g))).unwrap(), id);
+    let ds = drain(&mut c);
+    assert_eq!(trues(&ds), 0, "{ds:?}");
+    let r = resync(ds.last().unwrap()).unwrap();
+    let f = r.funnels.iter().find(|f| f.funnel == id).unwrap();
+    assert_eq!(
+        (f.condition.clone(), f.transition),
+        (Some(ConditionState::True), false)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-132, invariant 26: with the mark synced only on request, the cursor file written at once when a latch changes,
+/// and the ones written by the timer, never name a position above the last synced mark: the mark is synced first.
+#[test]
+fn a_cursor_file_never_names_a_position_above_the_synced_mark() {
+    use kvik_log::fs::FaultOp;
+    let mut w = World::new("cursor-mark");
+    w.mark_sync = MarkSync::Interval(Duration::from_secs(3_600));
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let mut c = new_consumer(&s, "alarm", Select::None);
+    let id = block_on(c.route(condition(g))).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    let ahead = Arc::new(Mutex::new(Vec::new()));
+    let (fs, dir, seen) = (w.fs.clone(), w.dir.clone(), ahead.clone());
+    w.fs.set_sync_hook(Some(Arc::new(move |p: &std::path::Path| {
+        if !p.to_string_lossy().ends_with(".cur") {
+            return;
+        }
+        let bytes = fs.read(p).unwrap();
+        let id = kvik_log::header::FileHeader::decode(&bytes)
+            .unwrap()
+            .store_id;
+        let state = kvik_log::cursor::decode(&bytes, &id).unwrap().state;
+        let mark = fs
+            .read_durable(&std::path::Path::new(&dir).join("log/MARK"))
+            .unwrap();
+        let (_, m) = kvik_log::mark::read_mark(&mark, &id).unwrap().unwrap();
+        let high = state.highest();
+        if (high.generation, high.sequence) > (m.generation, m.last_sequence) {
+            seen.lock().unwrap().push(format!(
+                "{high:?} above {}:{}",
+                m.generation, m.last_sequence
+            ));
+        }
+    })));
+    let syncs = || {
+        w.fs.ops()
+            .iter()
+            .filter(|o| o.op == FaultOp::Sync && o.path.to_string_lossy().ends_with(".cur"))
+            .count()
+    };
+    let before = syncs();
+    for (t, v) in [(0, 5.0), (1, 20.0)] {
+        block_on(s.emit(&[num(g, t, v)])).unwrap();
+        w.clock.advance(Duration::from_secs(1));
+    }
+    let ds = drain(&mut c);
+    assert!(
+        ds.iter()
+            .any(|d| matches!(&d.kind, DeliveryKind::Trigger(t) if t.funnel == id)),
+        "{ds:?}"
+    );
+    assert!(
+        syncs() > before,
+        "a latch change writes the cursor file at once"
+    );
+    // A confirmed fact alone is written by the timer, a second later.
+    block_on(s.emit(&[num(g, 2, 21.0)])).unwrap();
+    drain(&mut c);
+    let mid = syncs();
+    w.clock.advance(Duration::from_secs(2));
+    s.tick().unwrap();
+    assert!(syncs() > mid);
+    w.fs.set_sync_hook(None);
+    assert!(
+        ahead.lock().unwrap().is_empty(),
+        "{:?}",
+        ahead.lock().unwrap()
+    );
+    // The process stops: the latch confirmed is in the cursor file, so the resume reports no transition.
+    w.crash(s, vec![c], false);
+    let s = w.open();
+    let mut c = block_on(s.consumer("alarm", Start::Now, Select::None)).unwrap();
+    let ds = ready(&mut c);
+    let r = resync(ds.last().unwrap()).unwrap();
+    let f = r.funnels.iter().find(|f| f.funnel == id).unwrap();
+    assert_eq!(
+        (f.condition.clone(), f.transition),
+        (Some(ConditionState::True), false)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-130: the registry file holds a routing change when the routing call returns, so a consumer whose routing
+/// entries are no longer in the log is still known at a start; with its cursor file lost it is named in the
+/// recovery entry and sent the `NoCursor` resync.
+#[test]
+fn the_registry_file_holds_each_routing_change_when_the_call_returns() {
+    use kvik_log::entries::{Entry, RouteOp};
+    let mut w = World::new("registry");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let c = new_consumer(&s, "watch", Select::None);
+    let f = block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    let cur = w.path_with("cursors/watch.cur").unwrap();
+    let id = kvik_log::header::FileHeader::decode(&w.fs.read(&cur).unwrap())
+        .unwrap()
+        .store_id;
+    let (_, file) = kvik_log::registry::read_latest(&*w.fs, std::path::Path::new(&w.dir), &id)
+        .unwrap()
         .unwrap();
+    let at = file.entries.iter().find_map(|(p, _, e)| match e {
+        Entry::Routing(r)
+            if r.consumer == "watch" && r.op == RouteOp::Add && r.funnel == Some(f.0) =>
+        {
+            Some(*p)
+        }
+        _ => None,
+    });
+    assert!(at.is_some_and(|p| p <= file.through), "{:?}", file.entries);
+    w.crash(s, vec![c], true);
+    w.fs.poke(&cur, 0, &[0; 16]);
+    let s = w.open();
+    assert!(
+        s.losses().iter().any(|l| l.cursors_missing == ["watch"]),
+        "{:?}",
+        s.losses()
+    );
+    let mut c = block_on(s.consumer("watch", Start::Now, Select::None)).unwrap();
+    let d = c.try_next().unwrap().unwrap();
+    assert_eq!(resync(&d).unwrap().cause, ResyncCause::NoCursor);
+    assert_eq!(c.routes().unwrap().len(), 1);
+    block_on(s.shutdown()).unwrap();
 }

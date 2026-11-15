@@ -102,31 +102,9 @@ fn resyncs(ds: &[Delivery]) -> Vec<ResyncPart> {
         .collect()
 }
 
-/// A new consumer. On the durable backend a consumer with no cursor is first sent a resync of cause `NoCursor`
-/// whose `forget_above` is the last position (spec §4 Resync); it is checked and confirmed here, so that both
-/// backends go on alike.
+/// A new consumer, which is sent no resync on either backend (Q-131).
 fn new_consumer(s: &Store, name: &str) -> Consumer {
-    let mut c = block_on(s.consumer(name, Start::Now, Select::None)).unwrap();
-    if s.is_durable() {
-        let d = c
-            .try_next()
-            .unwrap()
-            .expect("the resync of a consumer with no cursor");
-        match &d.kind {
-            DeliveryKind::Resync(r) => {
-                assert_eq!(r.cause, ResyncCause::NoCursor);
-                assert_eq!(r.forget_above, Some(d.position));
-                assert!(r.last);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(
-            c.try_next().unwrap().is_none(),
-            "nothing before it is confirmed"
-        );
-        block_on(c.confirm(d.id)).unwrap();
-    }
-    c
+    block_on(s.consumer(name, Start::Now, Select::None)).unwrap()
 }
 
 #[test]
@@ -1135,10 +1113,12 @@ fn unsupported_items_say_so_on(b: Backend) {
             period: Duration::from_secs(86_400)
         }
     );
-    assert!(matches!(
-        block_on(s.consumer("late", Start::Position(SavedPoint::default()), Select::None)),
-        Err(ConsumerError::NotSupportedYet { .. })
-    ));
+    if !s.is_durable() {
+        assert!(matches!(
+            block_on(s.consumer("late", Start::Position(SavedPoint::default()), Select::None)),
+            Err(ConsumerError::NotSupportedYet { .. })
+        ));
+    }
     assert!(matches!(
         block_on(s.rebuild(kvik::Rebuild::Derived)),
         Err(BackupError::NotSupportedYet { .. })
