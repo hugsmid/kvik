@@ -310,6 +310,31 @@ fn three_downloads_failing_with_the_right_key_are_a_loss_and_two_are_not() {
 }
 
 #[test]
+fn a_plaintext_hash_other_than_the_description_is_lost_after_three_downloads() {
+    let mut src = source(ID, 2, false);
+    src.segments[1].0.hash = [0xee; 32];
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let fs = MemFs::new();
+    let (_, o) = restore(&mut restorer(sink.clone(), &fs, PlanMode::Full, KEY)).unwrap();
+    assert_eq!(o.lost.iter().map(|l| l.0).collect::<Vec<_>>(), [seg(2)]);
+    assert_eq!(sink.count("get", &file_key(&src, 1)), 3);
+    assert_eq!(fs.read(&segment_path(&src.segments[1].0)), None);
+}
+
+#[test]
+fn a_download_failing_transiently_is_retried_and_never_counted() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let key = file_key(&src, 0);
+    sink.set(&key, Some(Fault::SlowGet(10)));
+    let fs = MemFs::new();
+    let (_, o) = restore(&mut restorer(sink.clone(), &fs, PlanMode::Full, KEY)).unwrap();
+    assert!(o.lost.is_empty());
+    assert_eq!(sink.count("get", &key), 11);
+    assert_installed(&fs, &src, &[]);
+}
+
+#[test]
 fn a_delayed_object_is_retried_and_never_lost() {
     let mut src = source(ID, 2, false);
     let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));

@@ -332,6 +332,8 @@ pub enum Fault {
     Mismatch,
     /// The next `n` calls on it fail as transient.
     Delay(u32),
+    /// The next `n` downloads of it fail as transient.
+    SlowGet(u32),
 }
 
 /// A sink over a [`MemSink`] that applies per-key faults and logs every call as (operation, key).
@@ -379,6 +381,12 @@ impl FaultSink {
                 *n -= 1;
                 Some(Fault::Delay(*n + 1))
             }
+            Some(Fault::SlowGet(0)) => None,
+            Some(Fault::SlowGet(n)) if op == "get" => {
+                *n -= 1;
+                Some(Fault::Delay(*n + 1))
+            }
+            Some(Fault::SlowGet(_)) => None,
             other => other.copied(),
         }
     }
@@ -422,7 +430,7 @@ impl BackupSink for FaultSink {
                         .ok_or(SinkError::InvalidRange { key: key.into() }),
                 }
             }),
-            None => block_on(self.inner.get(key, range)),
+            None | Some(Fault::SlowGet(_)) => block_on(self.inner.get(key, range)),
         };
         Box::pin(async move { r })
     }
