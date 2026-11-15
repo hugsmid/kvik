@@ -1,15 +1,15 @@
 //! The restore plan (`spec.md` §8 Restore step 1): scenarios for each rule and error, Q-108's record selection, and
-//! properties over generated histories. A copy-verified record (`0x27`) is laid out by roadmap 8.1c; here a
-//! placeholder record of that type stands for one, and its fold is [`Catalogue::record_copy`].
+//! properties over generated histories. Copies are copy-verified records (`0x27`, `format.md` A.14), so a carried
+//! one gives the copy without the verified mark (Q-280).
 
 use std::collections::BTreeSet;
 
 use kvik_backup::plan::{PlanError, PlanInput, PlanMode, RestorePlan, plan, records_to_read};
 use kvik_files::catalogue::{Catalogue, Tier};
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
-use kvik_files::record::{AckedLoss, Acknowledgement, Body, Rebuild, Record, record_type};
+use kvik_files::record::{AckedLoss, Acknowledgement, Body, Rebuild, Record};
 use kvik_files::restore::{RestoreRecord, RestoredFile};
-use kvik_files::tier::DeepCopy;
+use kvik_files::tier::{CopyVerified, DeepCopy};
 use kvik_log::manifest::{LossCause, LostRange, RecordPosition};
 use kvik_log::mark::ResetStamp;
 use kvik_log::setaside::RestoredEnd;
@@ -81,7 +81,16 @@ impl History {
         self.push(Body::Sealed(vec![d]))
     }
     fn copy(&mut self, file_id: u64) -> &mut Self {
-        self.push(copy_body(file_id))
+        let d = self
+            .bodies
+            .iter()
+            .rev()
+            .find_map(|(b, _)| match b {
+                Body::Sealed(ds) => ds.iter().find(|d| d.file_id == file_id).cloned(),
+                _ => None,
+            })
+            .expect("a copy follows its seal");
+        self.push(copy_body(&d))
     }
     fn lose(&mut self, first: RecordPosition, last: RecordPosition) -> &mut Self {
         self.push(Body::LostRange(lost(first, last)))
@@ -98,28 +107,19 @@ impl History {
     }
 }
 
-fn copy_body(file_id: u64) -> Body {
-    Body::Other {
-        record_type: record_type::TIER_MOVE,
-        skippable: false,
-        fields: vec![(1, file_id.to_le_bytes().to_vec())],
+fn copy_body(d: &FileDescription) -> Body {
+    CopyVerified {
+        file: d.clone(),
+        tier: Tier::Deep,
+        copy: copy_of(d.file_id),
     }
+    .to_body()
 }
 
-/// The fold of `records`, the placeholder copy records folded by [`Catalogue::record_copy`].
 fn catalogue(records: &[Record]) -> Catalogue {
     let mut c = Catalogue::new();
     for r in records {
         c.apply(r).unwrap();
-        if let Body::Other {
-            record_type: record_type::TIER_MOVE,
-            fields,
-            ..
-        } = &r.body
-        {
-            let id = u64::from_le_bytes(fields[0].1[..].try_into().unwrap());
-            c.record_copy(seg_ref(id), Tier::Deep, copy_of(id));
-        }
     }
     c
 }
@@ -469,9 +469,9 @@ fn a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap() {
         .push(Body::Publish(kvik_files::record::Publish {
             published: vec![comp.clone()],
             retired: Vec::new(),
-        }));
-    let mut c = catalogue(&h.records());
-    c.record_copy(comp.file_ref(), Tier::Deep, copy_of(9));
+        }))
+        .push(copy_body(&comp));
+    let c = catalogue(&h.records());
     let p = plan(&input(&c, &[])).unwrap();
     assert_eq!(p.record.restored_end, (0, 10));
     assert_eq!(p.record.files.len(), 2);
@@ -680,9 +680,13 @@ fn history() -> impl Strategy<Value = Gen> {
                         .iter()
                         .position(|(b, _)| matches!(b, Body::Sealed(d) if d[0].file_id == *id))
                         .unwrap();
+                    let Body::Sealed(d) = &h.bodies[seal_at].0 else {
+                        unreachable!()
+                    };
+                    let body = copy_body(&d[0]);
                     let span = h.bodies.len() - seal_at;
                     let at = seal_at + 1 + places[k % places.len()].index(span);
-                    h.bodies.insert(at, (copy_body(*id), None));
+                    h.bodies.insert(at, (body, None));
                 }
             }
             if let Some(at) = rebuild {

@@ -1,8 +1,7 @@
 //! The restore plan (`kvik_backup::plan`) against the reference model's `Model::restore_from` on generated histories:
 //! ingest, seals, uploads that the bucket rejects or that cannot reach it, and crashes. The model's sealed segments
-//! become sealed-segment records, and its bucket's objects copy-verified records (a placeholder of type `0x27`
-//! folded by `Catalogue::record_copy` until roadmap 8.1c lays that record out), sometimes carried into a whole
-//! rebuilt manifest that the restore reads instead (Q-108, Q-295). Both must give the same restored end,
+//! become sealed-segment records, and its bucket's objects copy-verified records (`0x27`), sometimes carried into a
+//! whole rebuilt manifest that the restore reads instead (Q-108, Q-295). Both must give the same restored end,
 //! list the same files and set aside the same ones. Where nothing was set aside, the restored model runs on in its
 //! generation and is restored again, from the first plan's record and the new generation's records.
 //!
@@ -13,13 +12,13 @@
 //! - Recovery entries: the model writes none; the plan's rule for them is pinned in `backup/tests/restore_plan.rs`.
 //! - A bucket holding no file: the model refuses it, the plan does not (Q-294).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kvik_backup::plan::{PlanInput, PlanMode, RestorePlan, plan, records_to_read};
 use kvik_files::catalogue::{Catalogue, Tier};
-use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
-use kvik_files::record::{Body, Rebuild, Record, record_type};
-use kvik_files::tier::DeepCopy;
+use kvik_files::desc::{FileClass, FileDescription, kind};
+use kvik_files::record::{Body, Rebuild, Record};
+use kvik_files::tier::{CopyVerified, DeepCopy};
 use kvik_model::engine::{Config, FileClass as ModelClass, FileId, Model};
 use kvik_model::registry::SeriesOptions;
 use kvik_model::types::{Kind, Nanos, Position, Reading, SECOND, SeriesId, ValueType};
@@ -117,27 +116,27 @@ fn records(
     rebuild: Option<prop::sample::Index>,
 ) -> Catalogue {
     let mut bodies = head;
-    let mut sealed = BTreeSet::new();
+    let mut sealed = BTreeMap::new();
     for (id, f) in &m.disk.files {
         if f.class != ModelClass::Segment || !f.sealed || id.0 < from {
             continue;
         }
         let ps: Vec<Position> = f.entries().map(|e| e.position).collect();
-        bodies.push(Body::Sealed(vec![description(*id, &ps, g)]));
-        sealed.insert(id.0);
+        let d = description(*id, &ps, g);
+        bodies.push(Body::Sealed(vec![d.clone()]));
+        sealed.insert(id.0, d);
     }
-    for id in m
-        .disk
-        .bucket
-        .objects
-        .keys()
-        .filter(|f| sealed.contains(&f.0))
-    {
-        bodies.push(Body::Other {
-            record_type: record_type::TIER_MOVE,
-            skippable: false,
-            fields: vec![(1, id.0.to_le_bytes().to_vec())],
-        });
+    for id in m.disk.bucket.objects.keys() {
+        if let Some(d) = sealed.get(&id.0) {
+            bodies.push(
+                CopyVerified {
+                    file: d.clone(),
+                    tier: Tier::Deep,
+                    copy: copy_of(id.0),
+                }
+                .to_body(),
+            );
+        }
     }
     let mut list: Vec<(Body, Option<u64>)> = bodies.into_iter().map(|b| (b, None)).collect();
     if let Some(at) = rebuild {
@@ -164,19 +163,6 @@ fn records(
     let mut c = Catalogue::new();
     for r in records_to_read(&records) {
         c.apply(r).unwrap();
-        if let Body::Other {
-            record_type: record_type::TIER_MOVE,
-            fields,
-            ..
-        } = &r.body
-        {
-            let id = u64::from_le_bytes(fields[0].1[..].try_into().unwrap());
-            let f = FileRef {
-                kind: kind::LOG_SEGMENT,
-                file_id: id,
-            };
-            c.record_copy(f, Tier::Deep, copy_of(id));
-        }
     }
     c
 }
