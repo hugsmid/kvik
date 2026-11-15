@@ -47,8 +47,9 @@ durable backend has no consumers or windows yet, it runs on the model backend.
 What the model backend supports, each with a test in [`tests/`](tests/) or the crate's unit tests. The tests in
 [`tests/api.rs`](tests/api.rs) run on both backends wherever the durable backend supports the feature, and check
 that it says so where it does not; [`tests/durable.rs`](tests/durable.rs) covers durability (acknowledged readings
-after a power loss), a reader in another handle, the registry after crashes, ids never assigned twice, writers on
-several threads, and the differential test of the durable backend against the model.
+after a power loss), a reader in another handle, the registry and its file after crashes and damage, ids never
+assigned twice, orphaned facts, writers on several threads, a store on the system environment, and the differential
+test of the durable backend against the model.
 
 | Area | Supported |
 |---|---|
@@ -73,6 +74,12 @@ same errors):
   `rounded` fact flag are never set, and the `out_of_range` count stays 0.
 - **Calendar-length interval series** (a local day or month, with a day start): `DefineError::NotSupportedYet`.
 - **Parameter changes** other than the retention class: `DefineError::NotSupportedYet`.
+- **Backup, restore, export of set-aside facts and rebuild** (`BackupError::NotSupportedYet`).
+- `SystemTz` reports the embedded tzdata as the release `"embedded"`; `StdFs::free_space` returns `Unsupported` on
+  Windows; `SystemBootId` is `None` outside Linux (the durable backend then syncs the mark at every commit).
+
+Model backend:
+
 - **A new consumer starting at a position or a time**, and **a consumer that emits** (`emits` other than
   `Select::None`): `ConsumerError::NotSupportedYet`. `Consumer::try_emit` therefore refuses every reading
   `NotDeclared`, and `RouteCycle` is never returned.
@@ -81,19 +88,19 @@ same errors):
 - **A condition funnel over several series**: it must select exactly one, and a name pattern in it is resolved once,
   when routed, so `docs/api.md`'s `plant/*/power` condition example is refused (`ConsumerError::Route`) unless
   exactly one series matches.
-- **Backup, restore, export of set-aside facts and rebuild** (`BackupError::NotSupportedYet`), and
-  `export_orphaned` (`QueryError::NotAvailable`).
+- `export_orphaned` (`QueryError::NotAvailable`): the model has no orphaned facts.
 - Never produced: the `Unknown` live and condition states, `approximate_edges`, `displaced`, a trigger's value and
   coverage, `forget_above`, the `ResetPoint` and `GenerationChanged` resync causes, `PossibleLoss`, `ManifestRebuilt` (provisional or not), `LossCause::Unknown`, `loss_identities_rebuilt`, `WriteError::NotFinal`,
   `Outcome::Recorded.unchecked` and `duplicates_unchecked` (the model's detail is always local),
   `SealBlocked`, `Wait::QueueFull` (a call never exceeds the queue, which is empty between calls), commit latency and
   time waited, `orphaned_facts`, `scale_raises`, `interval_displaced`, and `evaluations_unknown` and
   `transitions_not_delivered`, which are not reported at all.
-- The seams other than the clock are not used by the model backend: it writes no files, takes no lock file and
-  computes calendars with the reference model's embedded tzdata rather than through `Env::tz`. `SystemTz` reports the embedded tzdata as
-  the release `"embedded"`; `StdFs::free_space` returns `Unsupported`; `SystemBootId` is `None` outside Linux.
+- The seams other than the clock are not used: it writes no files, takes no lock file and computes calendars with
+  the reference model's embedded tzdata rather than through `Env::tz`.
 - `DiskStats.free` and the disk marks (`limits.disk_low`, `limits.disk_critical`) are measured against the reference
   model's simulated disk of 1 TiB, not a real file system; `IngestStats.syncs` is 0, as nothing is synced.
+
+- **`ReaderState.stamp`** is always the zero stamp: the model has no resets. The durable backend gives the mark's.
 
 Durable backend, besides consumers, live state, windows, chart buckets and calendar results:
 
@@ -111,8 +118,10 @@ Durable backend, besides consumers, live state, windows, chart buckets and calen
   refusals, `outranked_on_arrival` and `absent_supplied` count since the store was opened. Clock jumps are not
   counted.
 - Not produced: `Wait::UnsyncedClock` in `stats().ingest.waiting` and health (the call waits, and `waits` counts
-  it), `ManifestRebuilt`, `loss_identities_rebuilt`, `WriteError::NotFinal`, `Outcome::Recorded.unchecked` (all
-  detail is local).
+  it), `ManifestRebuilt`, `loss_identities_rebuilt`, `WriteError::NotFinal`, `Outcome::Recorded.unchecked` and
+  `duplicates_unchecked` (all detail is local), `ConditionState`s and deliveries of any kind, `scale_raises`,
+  `interval_displaced`, `counter_regressions` and `SeriesStats.orphaned_facts` (orphaned facts are left out of every
+  view and returned by `export_orphaned`, but not counted yet).
 
 Different from `docs/api.md`:
 
@@ -132,7 +141,7 @@ Different from `docs/api.md`:
   `docs/api.md` shows `Vec<Bucket>` and also says raw facts. `Resolution::Auto` takes the finest of 1 minute,
   15 minutes and multiples of 15 minutes that fits `max_points` (`docs/api.md` says the coarsest), counted from the
   UTC-aligned start.
-- **`ReaderState.stamp`** is always the zero stamp: the model has no resets. `Start::Position` takes a `SavedPoint`
+- `Start::Position` takes a `SavedPoint`
   (spec §7 Readers) and is `NotSupportedYet`; `Reader::check` and `PointCheck` (`docs/api.md`) are not in the crate
   yet (roadmap 5.3).
 - **`Reader::interval`** returns the interval that contains `t`, whether or not `t` is its start.

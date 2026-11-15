@@ -659,15 +659,19 @@ impl Writer {
         let queued = if plan.items.is_empty() {
             None
         } else {
-            let log = self.log();
-            let log = log.as_ref().ok_or(EmitError::Closed)?;
-            let r = if wait {
-                let r = log.submit(plan.items.clone());
-                self.note_waited(started.elapsed());
-                r
-            } else {
-                log.try_submit(plan.items.clone())
+            // The log's read guard is dropped before an error is mapped, which reads the log's fault again.
+            let r = {
+                let log = self.log();
+                let log = log.as_ref().ok_or(EmitError::Closed)?;
+                if wait {
+                    log.submit(plan.items.clone())
+                } else {
+                    log.try_submit(plan.items.clone())
+                }
             };
+            if wait {
+                self.note_waited(started.elapsed());
+            }
             match r {
                 Ok(p) => Some(p),
                 Err(SubmitError::Busy(w)) => {

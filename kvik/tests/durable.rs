@@ -14,7 +14,7 @@ use kvik::env::{Env, FixedBootId, ManualClock, MemFs};
 use kvik::{
     Backend, ChangedAtKind, DefineError, Fact, Intent, IntervalLength, Kind, LogConfig, LossKind,
     Outcome, Position, Quality, Reader, ReaderConfig, Reading, Refusal, RetentionClass, SeriesId,
-    SeriesSpec, StateValues, Store, StoreConfig, Value, ValueType, View, ZoneName,
+    SeriesSpec, StateValues, Store, StoreConfig, Timestamp, Value, ValueType, View, ZoneName,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -137,6 +137,16 @@ fn acknowledged_readings_survive_a_power_loss() {
             "acknowledged reading at {p} lost"
         );
     }
+    // The registry file the start after the power loss writes holds the definition and the start's recovery entry,
+    // up to the mark it synced.
+    let f = registry_file(&w);
+    let kinds: Vec<_> = f
+        .entries
+        .iter()
+        .map(|(_, _, e)| matches!(e, kvik_log::entries::Entry::Recovery(_)))
+        .collect();
+    assert_eq!(kinds, vec![false, true]);
+    assert_eq!(f.max_series_id, 1);
     // The registry was recovered: the series is defined, under its name, and defining it again is idempotent.
     assert_eq!(s.series("site/meter/power").unwrap().id, g);
     assert_eq!(
@@ -406,6 +416,88 @@ fn the_registry_file_carries_the_id_floor_when_the_mark_is_lost() {
         "the id floor of the registry file"
     );
     block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn orphaned_facts_stay_out_of_views_and_are_exported() {
+    let w = World::new("orphaned");
+    let s = w.open();
+    let a = block_on(s.define_series(gauge("x/y/a"))).unwrap();
+    let b = block_on(s.define_series(gauge("x/y/orphan"))).unwrap();
+    block_on(s.emit(&[num(b, 0, 7.0), num(b, 1, 8.0)])).unwrap();
+    for i in 0..3 {
+        block_on(s.emit(&[num(a, i, 1.0)])).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let (path, bytes) = w
+        .segments()
+        .into_iter()
+        .find(|(_, x)| x.windows(10).any(|n| n == b"x/y/orphan"))
+        .unwrap();
+    let at_name = bytes.windows(10).position(|n| n == b"x/y/orphan").unwrap();
+    w.fs.poke(&path, at_name, b"X");
+
+    let s = w.open();
+    // Kept in the log, outside views (spec §2.1): the id is unknown to every call.
+    assert!(matches!(s.series(b), Err(kvik::QueryError::UnknownSeries)));
+    let r = s.reader();
+    assert!(matches!(
+        r.facts(b, at(0)..at(2), View::Current),
+        Err(kvik::QueryError::UnknownSeries)
+    ));
+    let ack = block_on(s.emit(&[num(b, 2, 9.0)])).unwrap();
+    assert_eq!(
+        ack.refused().collect::<Vec<_>>(),
+        vec![(0, Refusal::UnknownSeries)]
+    );
+    // Exported for re-ingest, in position order.
+    let orphans = s
+        .export_orphaned(Position::ORIGIN..=Position::new(0, u64::MAX))
+        .unwrap();
+    let values: Vec<_> = orphans.iter().map(|f| (f.series, f.number())).collect();
+    assert_eq!(values, vec![(b, Some(7.0)), (b, Some(8.0))]);
+    // New ids go above every series id in a kept fact.
+    assert_eq!(
+        block_on(s.define_series(gauge("x/y/new"))).unwrap(),
+        SeriesId(3)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_store_on_the_system_environment() {
+    // The default environment: the operating system's file system, clocks, boot identity and tzdata.
+    let dir = std::env::temp_dir().join(format!("kvik-durable-system-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut log = LogConfig::default();
+    log.segment_size = 16 << 20;
+    let config = || {
+        StoreConfig::new(&dir, "Europe/London")
+            .create_if_missing(true)
+            .log(log.clone())
+    };
+    let s = block_on(Store::open(config())).unwrap();
+    assert!(s.is_durable());
+    let g = block_on(s.define_series(gauge("a/b/c"))).unwrap();
+    let now = s.now();
+    let ack = block_on(s.emit(&[Reading::new(g, now, Value::F64(1.5))])).unwrap();
+    assert_eq!(ack.recorded(), 1);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = block_on(Store::open(config())).unwrap();
+    let r = Reader::open(ReaderConfig::new(&dir)).unwrap();
+    let fs: Vec<_> = r
+        .facts(g, now..Timestamp(now.0 + 1), View::Current)
+        .unwrap()
+        .map(|f| f.unwrap().number())
+        .collect();
+    assert_eq!(fs, vec![Some(1.5)]);
+    assert_eq!(r.series("a/b/c").unwrap().id, g);
+    drop(r);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

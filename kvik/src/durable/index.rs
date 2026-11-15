@@ -384,3 +384,96 @@ impl Index {
         out.into_values().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kvik_log::content::BatchContent;
+    use kvik_log::facts::FactFlags as LogFlags;
+    use kvik_log::reader::VoidCause;
+
+    use super::*;
+    use crate::series::{Kind, SeriesSpec, ValueType};
+
+    fn batch(first: u64, items: Vec<Item>) -> ReadEvent {
+        let n: u64 = items.iter().map(Item::sequences).sum();
+        let p = |sequence| LogPos {
+            generation: 0,
+            sequence,
+        };
+        ReadEvent::Batch(ReadBatch {
+            file_id: 1,
+            offset: 0,
+            first: p(first),
+            last: p(first + n - 1),
+            commit_time: first as i64,
+            content: BatchContent {
+                first_sequence: first,
+                received_at: first as i64,
+                items,
+            },
+        })
+    }
+
+    fn fact(t: i64, v: f64) -> Item {
+        Item::Fact(FactRow {
+            series_id: 1,
+            t,
+            quality: LogQuality::Good,
+            flags: LogFlags::default(),
+            value: LogValue::F64(v.to_bits()),
+            changed_at: None,
+        })
+    }
+
+    #[test]
+    fn a_void_cuts_facts_and_entries_back_and_rebuilds_the_registry() {
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let def =
+            super::super::registry::definition_of(&spec, 1, Duration::from_secs(300)).unwrap();
+        let mut i = Index::default();
+        i.apply(&[
+            batch(1, vec![Item::Entry(Entry::Definition(Box::new(def)))]),
+            batch(2, vec![fact(10, 1.0), fact(20, 2.0)]),
+            batch(
+                4,
+                vec![Item::Entry(Entry::Alias {
+                    id: 1,
+                    name: "a/b/d".into(),
+                })],
+            ),
+        ]);
+        assert!(i.registry().resolve("a/b/d").is_some());
+        assert_eq!(i.series_facts(1).count(), 2);
+        // A start truncated everything above position 2: the second fact and the alias are void.
+        i.apply(&[ReadEvent::Void {
+            above: LogPos {
+                generation: 0,
+                sequence: 2,
+            },
+            cause: VoidCause::Rewritten,
+        }]);
+        assert!(i.registry().resolve("a/b/d").is_none());
+        assert!(i.registry().resolve("a/b/c").is_some());
+        let left: Vec<_> = i.series_facts(1).map(|s| s.row.t).collect();
+        assert_eq!(left, vec![10]);
+        assert_eq!(i.latest_t(1), Some(10));
+        // Positions above the void are taken again.
+        i.apply(&[batch(3, vec![fact(30, 3.0)])]);
+        assert_eq!(i.latest_t(1), Some(30));
+        // Everything void.
+        i.apply(&[ReadEvent::Void {
+            above: LogPos::default(),
+            cause: VoidCause::Rewritten,
+        }]);
+        assert!(i.registry().get(1).is_none());
+        assert_eq!(i.series_facts(1).count(), 0);
+    }
+}

@@ -390,7 +390,13 @@ fn the_fact_at_a_time_on(b: Backend) {
 
 #[test]
 fn forecast_series_carry_values_into_windows() {
-    let (s, _clock) = store("forecast");
+    for b in BACKENDS {
+        forecast_series_carry_values_into_windows_on(b);
+    }
+}
+
+fn forecast_series_carry_values_into_windows_on(b: Backend) {
+    let (s, _clock) = store_on(b, "forecast");
     let f = block_on(
         s.define_series(
             gauge("grid/area/price-forecast", 3_600)
@@ -411,7 +417,11 @@ fn forecast_series_carry_values_into_windows() {
     block_on(s.emit(&[num(f, 3_600, 12.0).changed_at(issue1 + 1)])).unwrap();
     let r = s.reader();
     // A forecast series has no live state.
-    assert!(matches!(r.live(f).unwrap(), Live::None));
+    if b == Backend::Durable {
+        assert!(not_available(r.live(f)));
+    } else {
+        assert!(matches!(r.live(f).unwrap(), Live::None));
+    }
     // The fact at a time: the version the view selects, with changed_at.
     let now = r.at(f, at(5_000), View::Current).unwrap().unwrap();
     assert_eq!(
@@ -420,6 +430,9 @@ fn forecast_series_carry_values_into_windows() {
     );
     let then = r.at(f, at(5_000), View::AsOf(first)).unwrap().unwrap();
     assert_eq!((then.number(), then.changed_at), (Some(10.0), Some(issue1)));
+    if b == Backend::Durable {
+        return;
+    }
     // Buckets of 15 minutes from 01:00 to 02:00 after now: only the first
     // holds a reading; the others carry its value in. Min and max are over
     // readings only; the mean comes from the carried-in value.
@@ -743,6 +756,42 @@ fn back_pressure_and_call_limits_on(b: Backend) {
 }
 
 #[test]
+fn critical_disk_makes_ingest_wait_on_the_durable_backend() {
+    let clock = ManualClock::new(start());
+    let s = block_on(Store::open(config_on(
+        Backend::Durable,
+        "critical-disk",
+        &clock,
+    )))
+    .unwrap();
+    let g = block_on(s.define_series(gauge("a/b/c", 1))).unwrap();
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    // Opened again with the critical mark above the in-memory file system's free space (1 TiB).
+    let mut cfg = config_on(Backend::Durable, "critical-disk", &clock);
+    cfg.limits.disk_critical = 2 << 40;
+    let s = block_on(Store::open(cfg)).unwrap();
+    // The log names the wait once a call is queued and the writer has checked free space; until then a call may
+    // still be queued (each a new reading, so none is a duplicate of one queued before).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    for i in 0.. {
+        match s.try_emit(&[num(g, i, 1.0)]) {
+            Err(EmitError::Busy(Wait::DiskFull)) => break,
+            Ok(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "free space never checked"
+            ),
+            Err(e) => panic!("{e:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        s.health(),
+        Health::Degraded { reasons } if reasons.iter().any(|r| matches!(r, Reason::DiskCritical { .. }))
+    ));
+}
+
+#[test]
 fn critical_disk_makes_ingest_wait() {
     let clock = ManualClock::new(start());
     let mut cfg = config("critical-disk", &clock);
@@ -775,7 +824,13 @@ fn critical_disk_makes_ingest_wait() {
 
 #[test]
 fn interval_series_and_calendar_results() {
-    let (s, clock) = store("calendar");
+    for b in BACKENDS {
+        interval_series_and_calendar_results_on(b);
+    }
+}
+
+fn interval_series_and_calendar_results_on(b: Backend) {
+    let (s, clock) = store_on(b, "calendar");
     let half_hour = Duration::from_secs(1_800);
     let energy = block_on(s.define_series(SeriesSpec::new(
         "site/meter/import",
@@ -807,6 +862,15 @@ fn interval_series_and_calendar_results() {
         r.interval(energy, at(-6_300)).unwrap(),
         (at(-7_200), at(-5_400))
     );
+    if b == Backend::Durable {
+        let kept: Vec<_> = facts(&r, energy, at(-7_200)..at(0), View::Current)
+            .iter()
+            .map(|f| (f.t, f.number()))
+            .collect();
+        assert_eq!(kept, vec![(at(-7_200), Some(1.5)), (at(-5_400), Some(2.5))]);
+        assert!(not_available(r.calendar(energy, jan5, Aggregate::Sum)));
+        return;
+    }
     let day = r.calendar(energy, jan5, Aggregate::Sum).unwrap();
     assert_eq!(day.number(), Some(4.0));
     assert!(!day.flags.apportioned);

@@ -535,6 +535,95 @@ fn a_position_named_by_the_manifest_raises_the_recovery_entry_and_its_gap_is_rec
 }
 
 #[test]
+fn a_registry_file_raises_f_and_the_id_floor_and_gives_the_segment_index_its_reach() {
+    use kvik_log::entries::{Definition, IntervalLength, Kind, Retention, Timing, Versioning};
+    use kvik_log::registry::{RegistryFile, write};
+    let mut r = Rig::new(cfg());
+    r.submit(vec![fact(1, 0)]);
+    r.drain();
+    r.shutdown().unwrap();
+    r.w = None;
+    // A registry file (A.16) naming position 10, an id floor of 40 and a half-hourly interval series 7 whose
+    // definition is in no segment the start reads.
+    let half_hour = 1_800_000_000_000;
+    let def = Definition {
+        id: 7,
+        name: "a/b/energy".into(),
+        kind: Kind::Interval,
+        value_type: kvik_log::facts::ValueType::F64,
+        scale: None,
+        unit: "kWh".into(),
+        expected_interval: Some(half_hour),
+        staleness: Some(3 * half_hour),
+        record_on_change: false,
+        counter: None,
+        lateness_bound: 300_000_000_000,
+        state_names: Vec::new(),
+        versioning: Versioning::None,
+        timing: Timing::Observed,
+        interval: Some(IntervalLength::Fixed {
+            length: half_hour,
+            phase: 0,
+        }),
+        retention: Retention::LongTerm,
+        excess_precision: None,
+        staleness_set: false,
+    };
+    let file = RegistryFile {
+        generation: 0,
+        through: 10,
+        max_series_id: 40,
+        entries: vec![(9, T0, Entry::Definition(Box::new(def)))],
+    };
+    write(&r.fs, &dir(), STORE_ID, T0, &file).unwrap();
+    r.power_loss(None);
+    let rep = r.open().unwrap();
+    let e = rep.entry.unwrap();
+    assert_eq!(
+        (e.entry.after, e.sequence),
+        (1, 11),
+        "F above the file's through"
+    );
+    assert_eq!(e.entry.id_floor, 40);
+    assert_eq!(r.mark().unwrap().max_series_id, 40);
+    // A fact of series 7, then a timed seal: the index reaches the end of its interval (Q-115 (f)).
+    r.submit(vec![fact(7, 0)]);
+    r.drain();
+    r.advance(Duration::from_secs(301));
+    for _ in 0..10 {
+        r.step();
+        r.maint();
+        r.advance(10 * MS);
+    }
+    let mut reach = None;
+    for p in r.fs.paths() {
+        let Some(n) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(SegmentName::parse)
+        else {
+            continue;
+        };
+        if !n.sealed {
+            continue;
+        }
+        let id = SegmentIdentity {
+            store_id: STORE_ID,
+            file_id: n.file_id,
+            generation: n.generation,
+        };
+        let bytes = r.fs.read(&p).unwrap();
+        let rep = scan(&bytes, &id, ScanLimit::End).unwrap();
+        if let Some(index) = rep.seal.and_then(|s| s.index.flatten()) {
+            for rec in index.records.iter().filter(|r| r.series_id == 7) {
+                reach = Some(rec.max_t - rec.min_t);
+            }
+        }
+    }
+    assert_eq!(reach, Some(half_hour));
+}
+
+#[test]
 fn a_crash_between_the_entry_and_the_mark_adopts_the_entry() {
     let mut adopted = 0;
     for n in 0..40 {
