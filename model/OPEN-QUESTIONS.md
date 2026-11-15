@@ -53,6 +53,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
 | Q-213 | §8 Bucket; `format.md` A.17 Probe; `backup/src/keys.rs` | The checksum probe's key, which the key contract cannot build |
 | Q-214 | §8 Bucket, Restore; `api.md` Backup and restore; `backup/src/restore.rs` | A restore that meets a bucket it must refuse |
+| Q-270 | §8 Encryption; `format.md` A.17 Reading | Envelope damage that `EnvelopeError` has no variant for |
+| Q-271 | §8 Deep, Generations; `format.md` A.17 Keys, Claim marker, Probe | Where `format.md` A.17 and the backup interfaces disagree |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -974,6 +976,41 @@ executor can report such a bucket only as `Sink` or not at all, and `Store::rest
 step of `prepare` before the claim (`Full` only; a drill does not probe), and `Store::restore` mapping it to
 `BackupError::Refused`; `SeveralStores` mapped to an additive `BackupError` variant named in `api.md`.
 
+## Q-270 — Envelope damage that `EnvelopeError` has no variant for
+
+Recorded by roadmap 8.1b, which implements the envelope (`backup/src/envelope.rs`, `ChunkedXChaCha`). Decided
+there, provisionally.
+**Scenario.** (a) One bit of an object's header flips in the bucket: the magic or `header_crc32c` no longer
+matches. A.17 calls this a damaged object, never `WrongKey` or a version refusal, but `EnvelopeError` (fixed by
+the interfaces commit, Q-198) has no damage variant other than `Authentication { chunk }`. (b) The same with valid
+CRC but non-zero reserved bytes. (c) An object longer than its header's length gives (an extension). (d) A ranged
+read for plaintext past the length, or an inverted range.
+**Decided (provisional).** (a) and (b) are `Authentication { chunk: 0 }`: every chunk binds the header as
+associated data, so chunk 0 could not authenticate anyway; a restore treats it as damage (retry, then `Lost`,
+Q-82). The order of A.17 Reading holds: magic and checksum, then version and algorithm (`Unsupported`), then
+reserved bytes, then the key check (`WrongKey`). (c) is `Authentication { chunk: n }`, `n` the chunk count, as for
+a chunk that cannot exist; a shorter object is `Truncated`. (d) is `Truncated`, as the test envelope does. A
+header whose length needs more than 2^32 chunks is `TooLarge`, before anything is allocated. An empty range opens
+to nothing without reading any chunk, and `span` of it is empty. Pinned by `backup/tests/envelope.rs`
+(`a_damaged_header_is_damage_never_a_wrong_key_or_a_version_refusal`, `truncation_and_extension_are_rejected`,
+`a_range_past_the_plaintext_or_inverted_is_refused`). A `Damaged` variant would be clearer; adding one changes the
+seam, so it is the lead's call.
+**Model.** Not modelled.
+
+## Q-271 — Where `format.md` A.17 and the backup interfaces disagree
+
+Recorded by roadmap 8.1b, built against the A.17 draft of roadmap 8.1a. Where they differ, 8.1b follows the
+interfaces (Q-198) and leaves the choice to the merge of 8.1a and 8.1b.
+**Scenario.** (a) A.17 reserves `<sid>/data/` and `<sid>/tree/` for kinds other than log segments; Q-198 (e) and
+`Keys::file` put them under `<sid>/files/<kind:2 hex>/`. Nothing but log segments is uploaded before roadmap 6.2,
+so no object exists under either. (b) A.17's claim marker is 40 bytes (magic `KVCL`, version, generation, nonce,
+store id); `ClaimMarker` holds only the generation and the nonce, so `encode(&self)` cannot write the store id, and
+it keeps Q-198 (f)'s 12 bytes. (c) A.17 names a checksum probe at `<sid>/probe/<nonce:32 hex>`; `Keys` has no
+builder for it, and `parse` returns `None` for it, which A.17 allows (a reader ignores a key it does not name).
+**Needed.** The lead's ruling at the merge: either A.17 adopts the interfaces' forms, or `Keys` and `ClaimMarker`
+change (for (b), a store id field or argument) before anything is uploaded.
+**Model.** Not modelled.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -986,7 +1023,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1040,6 +1077,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
 | Q-213 | 8.1c | The checksum probe's key; recorded by roadmap 8.1a; needs a change to `backup/src/keys.rs`, roadmap 8.1b's file |
 | Q-214 | 8.3b | A restore's refusal of a bucket; recorded by roadmap 8.1a; needs a change to `backup/src/restore.rs`, roadmap 8.3b's file |
+| Q-270 | 8.1 | Envelope damage mapped onto the existing error variants; recorded by roadmap 8.1b; a `Damaged` variant is the lead's call |
+| Q-271 | 8.1 | A.17 against the interfaces: other kinds' keys, the claim marker, the checksum probe key; recorded by roadmap 8.1b; ruled at the merge of 8.1a and 8.1b |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
