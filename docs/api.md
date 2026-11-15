@@ -368,7 +368,8 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
-    SetAside(SetAsideReport) }     // information, not degraded (Q-90)
+    SetAside(SetAsideReport),      // information, not degraded (Q-90)
+    LossesUnknown { error: String } }
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
     pub commit_time_first: Timestamp, pub commit_time_last: Timestamp }
@@ -398,7 +399,9 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   recovery entry's position, and the gap before that entry is a `DataLost` with cause `TruncatedTail`. Reports are read from the
   manifest and the recovery entries at every start. A loss found while the store is open, by a read of that process,
   or by a start that could not write, is reported at once with `recorded` false, and is the same loss, recorded,
-  after the next start that can write (spec §3 Recovery rule 2, Q-200). A `DataLost` holds health `Degraded` until it is acknowledged; a
+  after the next start that can write (spec §3 Recovery rule 2, Q-200). When the loss reports cannot be read (the
+  mark or the manifest unreadable), `losses()` returns those the process already holds and health is at least
+  `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A `DataLost` holds health `Degraded` until it is acknowledged; a
   `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
   a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
   no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,

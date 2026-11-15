@@ -719,18 +719,29 @@ impl Reader {
         )
     }
 
-    /// What the files report: loss reports, not the writer's counters.
+    /// What the files report: loss reports, not the writer's counters; loss
+    /// reports that cannot be read are a reason too.
     pub fn health(&self) -> Health {
-        let losses: Vec<_> = self
-            .losses()
+        let (losses, error) = match &self.inner {
+            ReaderInner::Process(r) => match r.losses() {
+                Ok(v) => (v, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            },
+            ReaderInner::Store(w) => w.loss_reports(),
+            ReaderInner::Model(_) => (self.losses(), None),
+        };
+        let mut reasons: Vec<_> = losses
             .into_iter()
             .filter(|l| !l.acknowledged && l.kind == crate::health::LossKind::DataLost)
             .map(crate::health::Reason::DataLost)
             .collect();
-        if losses.is_empty() {
+        if let Some(error) = error {
+            reasons.push(crate::health::Reason::LossesUnknown { error });
+        }
+        if reasons.is_empty() {
             Health::Ok
         } else {
-            Health::Degraded { reasons: losses }
+            Health::Degraded { reasons }
         }
     }
 

@@ -55,7 +55,7 @@ use crate::read::{Facts, ReaderState, View};
 use crate::series::{IntervalLength, Kind, ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
 use crate::time::{TimeRange, Timestamp, ZoneName};
 use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
-use index::{Index, fact_out, pos};
+use index::{Index, cause_out, fact_out, mark_state_out, pos};
 use ingest::{Decider, Decision};
 use loss::Latch;
 pub(crate) use reader::DurableReader;
@@ -193,6 +193,8 @@ pub(crate) struct Writer {
     hub: Option<Arc<deliver::Hub>>,
     /// The losses the reader of this process finds (Q-200).
     latch: Arc<Latch>,
+    /// The losses the start found and could not record (`spec.md` §3 Order of a start, step 3).
+    start_losses: Vec<LossReport>,
 }
 
 /// How a queued call's acknowledgement becomes its [`Ack`].
@@ -385,23 +387,18 @@ impl Writer {
             },
         })?;
         let start_fault = writer.fault().cloned();
+        let start_losses = start_losses(&writer, env.boot.current());
         let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let latch = Arc::new(Latch::default());
         // The kept log, read once by the reader this process keeps: the registry and the history of every key.
-        let (reader, index) =
-            match DurableReader::open_with(&dir, &env, READER_LEASE, clocks.clone(), latch.clone())
-            {
-                Ok(r) => {
-                    let index = r.with(|i, _| Ok(i.clone())).map_err(|e| OpenError::Io {
-                        path: dir.clone(),
-                        source: io::Error::other(e.to_string()),
-                    })?;
-                    (Some(Arc::new(r)), index)
-                }
-                // A start that could not write may leave no readable mark: the store opens read-only.
-                Err(_) if start_fault.is_some() => (None, Index::default()),
-                Err(e) => return Err(e),
-            };
+        let reader =
+            DurableReader::open_with(&dir, &env, READER_LEASE, clocks.clone(), latch.clone())?;
+        let index = reader
+            .with(|i, _| Ok(i.clone()))
+            .map_err(|e| OpenError::Io {
+                path: dir.clone(),
+                source: io::Error::other(e.to_string()),
+            })?;
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
         let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
@@ -480,7 +477,7 @@ impl Writer {
             store_id: descriptor.store_id,
             decider: Mutex::new(Decider::from_index(&index)),
             counters: Mutex::new(counters),
-            reader: Mutex::new(reader),
+            reader: Mutex::new(Some(Arc::new(reader))),
             acknowledged: Mutex::new(BTreeSet::new()),
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
@@ -488,6 +485,7 @@ impl Writer {
             clocks,
             hub,
             latch,
+            start_losses,
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
@@ -1089,13 +1087,25 @@ impl Writer {
     // ----- health and statistics -----
 
     pub(crate) fn losses(&self) -> Vec<LossReport> {
+        self.loss_reports().0
+    }
+
+    /// Every loss report this process holds, and why the files could not be read, if they could not: the reports
+    /// the files hold, then those of the start that could not record them, then those of this process's reads.
+    pub(crate) fn loss_reports(&self) -> (Vec<LossReport>, Option<String>) {
         let acked = lock(&self.acknowledged).clone();
-        let mut out = self.reader().and_then(|r| r.losses()).unwrap_or_default();
+        let (read, error) = match self.reader().and_then(|r| r.losses()) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        };
+        let (mut out, found): (Vec<_>, Vec<_>) = read.into_iter().partition(|l| l.recorded);
+        loss::merge(&mut out, self.start_losses.iter().cloned());
+        loss::merge(&mut out, found);
         loss::merge(&mut out, self.latch.found());
         for l in &mut out {
             l.acknowledged = acked.contains(&l.identity);
         }
-        out
+        (out, error)
     }
 
     /// Acknowledges losses. Held in memory for this process: the manifest's acknowledgement record is not
@@ -1125,12 +1135,16 @@ impl Writer {
                 });
             }
         }
+        let (losses, error) = self.loss_reports();
         reasons.extend(
-            self.losses()
+            losses
                 .into_iter()
                 .filter(|l| l.kind == LossKind::DataLost && !l.acknowledged)
                 .map(Reason::DataLost),
         );
+        if let Some(error) = error {
+            reasons.push(Reason::LossesUnknown { error });
+        }
         match (self.fault(), reasons.is_empty()) {
             (Some(f), _) => Health::ReadOnly {
                 cause: fault_out(&f),
@@ -1224,6 +1238,41 @@ impl Writer {
     ) -> Result<Vec<Fact>, QueryError> {
         self.reader()?.with(|i, _| Ok(orphaned(i, &range)))
     }
+}
+
+/// The losses a start found and did not record, as reports (`spec.md` §3 Order of a start, step 3).
+fn start_losses(w: &LogWriter, boot_id: Option<[u8; 16]>) -> Vec<LossReport> {
+    let report = w.start_report();
+    let g = w.stats().durable.generation;
+    let mark_state = match report.rule {
+        kvik_log::writer::StartRule::Reboot(m) => mark_state_out(m),
+        _ => crate::health::MarkState::Readable,
+    };
+    report
+        .losses
+        .iter()
+        .filter(|l| !l.recorded)
+        .map(|l| LossReport {
+            identity: Position::new(g, l.identity),
+            kind: match l.kind {
+                kvik_log::writer::LossKind::DataLost => LossKind::DataLost,
+                kvik_log::writer::LossKind::PossibleLoss => LossKind::PossibleLoss,
+            },
+            cause: cause_out(l.cause),
+            first: l.first.map(|s| Position::new(g, s)),
+            last: l.last.map(|s| Position::new(g, s)),
+            file_id: Some(l.file_id),
+            bytes: l.bytes,
+            readable_commit_blocks: l.readable_commits,
+            mark_state,
+            boot_id,
+            commit_time_before: None,
+            commit_time_after: None,
+            cursors_missing: Vec::new(),
+            recorded: false,
+            acknowledged: false,
+        })
+        .collect()
 }
 
 /// The fault of a failed registry file write.

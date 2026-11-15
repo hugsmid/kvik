@@ -89,6 +89,12 @@ pub enum Reason {
     },
     /// A restore set positions aside; information, not degraded (Q-90).
     SetAside(SetAsideReport),
+    /// The loss reports could not be read, so a loss may go unreported
+    /// (spec §11 Health, Q-201).
+    LossesUnknown {
+        /// Why.
+        error: String,
+    },
 }
 
 impl fmt::Display for Reason {
@@ -117,6 +123,7 @@ impl fmt::Display for Reason {
                 write!(f, "restore of file {file_id} failed: {reason}")
             }
             Reason::SetAside(r) => write!(f, "positions {} to {} set aside", r.first, r.last),
+            Reason::LossesUnknown { error } => write!(f, "loss reports unreadable: {error}"),
         }
     }
 }

@@ -706,6 +706,81 @@ fn writers_on_several_threads() {
     block_on(s.shutdown()).unwrap();
 }
 
+#[test]
+fn a_start_left_read_only_reports_the_losses_it_could_not_record() {
+    let w = World::new("start-read-only");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    for (i, t) in ["RO-ONE", "RO-TWO", "RO-THREE"].iter().enumerate() {
+        block_on(s.emit(&[note(id, i as i64, t)])).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    damage(&w, b"RO-TWO");
+    // The start's sync of the segment holding the lost range fails.
+    w.fs.fail_nth(
+        kvik_log::fs::FaultOp::Sync,
+        ".open",
+        0,
+        std::io::ErrorKind::Other,
+    );
+    let s = w.open();
+    let lost = s.losses();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    // The start's own report, with its boot identity, not yet recorded.
+    assert_eq!(
+        (lost[0].kind, lost[0].recorded, lost[0].boot_id),
+        (LossKind::DataLost, false, Some([1; 16]))
+    );
+    assert!(
+        matches!(&s.health(), Health::ReadOnly { reasons, .. } if matches!(&reasons[..], [Reason::DataLost(l)] if l.identity == lost[0].identity))
+    );
+    drop(s);
+    let s = w.open();
+    let again = s.losses();
+    assert_eq!(again.len(), 1);
+    assert_eq!(
+        (again[0].identity, again[0].recorded),
+        (lost[0].identity, true)
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_start_that_could_not_write_a_readable_mark_is_an_open_error() {
+    let w = World::new("no-mark");
+    w.fs.fail_nth(
+        kvik_log::fs::FaultOp::Write,
+        "MARK",
+        0,
+        std::io::ErrorKind::Other,
+    );
+    let r = block_on(Store::open(w.config()));
+    assert!(
+        matches!(r, Err(kvik::OpenError::MarkUnreadable)),
+        "{:?}",
+        r.map(|_| ())
+    );
+}
+
+#[test]
+fn unreadable_loss_reports_degrade_health() {
+    let w = World::new("losses-unreadable");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/c"))).unwrap();
+    block_on(s.emit(&[num(id, 0, 1.0)])).unwrap();
+    let r = w.reader();
+    assert!(matches!(r.health(), Health::Ok));
+    assert!(matches!(s.health(), Health::Ok));
+    let mark = Path::new(&w.dir).join("log").join("MARK");
+    let len = w.fs.read(&mark).unwrap().len();
+    w.fs.poke(&mark, 0, &vec![0xA5; len]);
+    let unknown = |h: Health| matches!(&h, Health::Degraded { reasons } if reasons.iter().any(|x| matches!(x, Reason::LossesUnknown { .. })));
+    assert!(unknown(s.health()), "{:?}", s.health());
+    assert!(unknown(s.reader().health()));
+    assert!(unknown(r.health()));
+}
+
 /// Runs `f` on another thread; whether it returned within `limit`.
 fn returns_within(limit: Duration, f: impl FnOnce() + Send + 'static) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();

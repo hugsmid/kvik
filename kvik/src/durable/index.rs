@@ -63,6 +63,25 @@ pub(crate) fn log_pos(p: Position) -> LogPos {
     }
 }
 
+pub(crate) fn cause_out(c: LogCause) -> LossCause {
+    match c {
+        LogCause::Corruption => LossCause::Corruption,
+        LogCause::TruncatedTail => LossCause::TruncatedTail,
+        LogCause::LostInBucket => LossCause::LostInBucket,
+        LogCause::InvalidContent => LossCause::InvalidContent,
+        LogCause::Unknown => LossCause::Unknown,
+    }
+}
+
+pub(crate) fn mark_state_out(m: LogMarkState) -> MarkState {
+    match m {
+        LogMarkState::Readable => MarkState::Readable,
+        LogMarkState::Missing => MarkState::Missing,
+        LogMarkState::Unreadable => MarkState::Unreadable,
+        LogMarkState::Stale => MarkState::Stale,
+    }
+}
+
 pub(crate) fn quality_out(q: LogQuality) -> Quality {
     match q {
         LogQuality::Good => Quality::Good,
@@ -452,13 +471,7 @@ impl Index {
             let e = out.entry((identity, false)).or_insert_with(|| LossReport {
                 identity,
                 kind: LossKind::DataLost,
-                cause: match l.cause {
-                    LogCause::Corruption => LossCause::Corruption,
-                    LogCause::TruncatedTail => LossCause::TruncatedTail,
-                    LogCause::LostInBucket => LossCause::LostInBucket,
-                    LogCause::InvalidContent => LossCause::InvalidContent,
-                    LogCause::Unknown => LossCause::Unknown,
-                },
+                cause: cause_out(l.cause),
                 first: Some(first),
                 last: Some(last),
                 file_id: Some(l.file_id),
@@ -498,12 +511,7 @@ impl Index {
                     file_id: None,
                     bytes: r.tail_bytes,
                     readable_commit_blocks: r.readable_commits,
-                    mark_state: match r.mark_state {
-                        LogMarkState::Readable => MarkState::Readable,
-                        LogMarkState::Missing => MarkState::Missing,
-                        LogMarkState::Unreadable => MarkState::Unreadable,
-                        LogMarkState::Stale => MarkState::Stale,
-                    },
+                    mark_state: mark_state_out(r.mark_state),
                     boot_id: (r.boot_id != [0; 16]).then_some(r.boot_id),
                     commit_time_before: None,
                     commit_time_after: None,
