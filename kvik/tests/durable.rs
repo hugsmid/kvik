@@ -161,6 +161,113 @@ fn acknowledged_readings_survive_a_power_loss() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// A segment's file id, from its name (`format.md` A.12).
+fn file_id(p: &Path) -> u64 {
+    let name = p.file_stem().unwrap().to_string_lossy();
+    name.rsplit('-').next().unwrap().parse().unwrap()
+}
+
+/// Waits, on the real clock the log's timers use, until the store's log has `n` sealed segments.
+fn sealed(w: &World, n: usize) -> Vec<std::path::PathBuf> {
+    for _ in 0..4_000 {
+        let v: Vec<_> = w
+            .segments()
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| p.extension().is_some_and(|e| e == "kvl"))
+            .collect();
+        if v.len() >= n {
+            return v;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("fewer than {n} sealed segments");
+}
+
+#[test]
+fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_restarts_and_damage()
+{
+    let w = World::new("slow-path");
+    let mut config = w.config();
+    config.log.seal_interval = Duration::from_millis(20);
+    let open = || block_on(Store::open(config.clone())).unwrap();
+    let s = open();
+    let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
+    sealed(&w, 1);
+    block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 2.0)])).unwrap();
+    let facts = sealed(&w, 2)
+        .into_iter()
+        .max_by_key(|p| file_id(p))
+        .unwrap();
+    // An hour later: the first readings leave the recent window, and the segment holding them is sealed.
+    block_on(s.emit(&[num(g, 3_600, 3.0)])).unwrap();
+    sealed(&w, 3);
+    let ack = block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 9.0), num(g, 1, 2.0)])).unwrap();
+    assert!(matches!(ack.outcomes[0], Outcome::Duplicate));
+    assert!(matches!(
+        ack.outcomes[1],
+        Outcome::Recorded {
+            unchecked: false,
+            ..
+        }
+    ));
+    assert!(matches!(ack.outcomes[2], Outcome::Duplicate));
+    assert_eq!(s.stats().ingest.slow_path, 3);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    // After a restart the key revised outside the window is read from the log again.
+    let s = open();
+    let ack = block_on(s.emit(&[num(g, 1, 9.0), num(g, 0, 1.0), num(g, 2, 4.0)])).unwrap();
+    assert!(matches!(ack.outcomes[0], Outcome::Duplicate));
+    assert!(matches!(ack.outcomes[1], Outcome::Duplicate));
+    assert!(matches!(
+        ack.outcomes[2],
+        Outcome::Recorded {
+            unchecked: false,
+            ..
+        }
+    ));
+    assert_eq!(s.stats().ingest.slow_path, 3);
+    // Damage while the store runs, in the batch of the first readings: never read as "no such key".
+    let bytes = w.fs.read(&facts).unwrap();
+    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    let ack = block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
+    assert!(
+        matches!(
+            ack.outcomes[0],
+            Outcome::Recorded {
+                unchecked: true,
+                ..
+            }
+        ),
+        "{:?}",
+        ack.outcomes
+    );
+    assert_eq!(s.series_stats(g).unwrap().duplicates_unchecked, 1);
+    // The unchecked reading is in the log now: a repeat is a duplicate of it.
+    let ack = block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
+    assert!(matches!(ack.outcomes[0], Outcome::Duplicate));
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    // A start passes over the damaged region as lost (spec §3 Recovery rule 2): its facts are out of the log.
+    let s = open();
+    let ack = block_on(s.emit(&[num(g, 1, 2.0)])).unwrap();
+    assert!(
+        matches!(
+            ack.outcomes[0],
+            Outcome::Recorded {
+                unchecked: false,
+                ..
+            }
+        ),
+        "{:?}",
+        ack.outcomes
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
 #[test]
 fn a_duplicate_of_a_queued_reading_waits_for_the_original() {
     use std::sync::atomic::{AtomicBool, Ordering};

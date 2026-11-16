@@ -154,3 +154,82 @@ fn read_whole(mut reader: LogReader) -> Result<Kept, ReaderError> {
         local: Box::new(LogFacts::new(reader, lost)),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake};
+
+    use super::*;
+    use crate::durable::history::WINDOW_FACTS;
+    use crate::env::ManualClock;
+    use crate::series::{Kind, SeriesSpec, ValueType};
+    use crate::time::Timestamp;
+    use crate::types::{Reading, SeriesId, Value};
+    use crate::{Store, StoreConfig};
+
+    const T0: i64 = 1_767_225_600_000_000_000;
+    const S: i64 = 1_000_000_000;
+
+    fn block_on<F: Future>(f: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let mut f = std::pin::pin!(f);
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn a_start_keeps_the_recent_window_and_counters_but_no_facts() {
+        let env = Env::test(ManualClock::new(Timestamp(T0 + 7_200 * S)));
+        let dir = Path::new("start-bounded");
+        let s = block_on(Store::open(
+            StoreConfig::new(dir, "Europe/London")
+                .create_if_missing(true)
+                .env(env.clone()),
+        ))
+        .unwrap();
+        let spec = |i| {
+            SeriesSpec::new(
+                format!("a/s{i}/v"),
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+        };
+        for i in 0..4 {
+            block_on(s.define_series(spec(i))).unwrap();
+        }
+        for chunk in (0..7_200).collect::<Vec<i64>>().chunks(900) {
+            let readings: Vec<Reading> = chunk
+                .iter()
+                .flat_map(|&k| {
+                    (1..=4).map(move |id| {
+                        Reading::new(SeriesId(id), Timestamp(T0 + k * S), Value::F64(k as f64))
+                    })
+                })
+                .collect();
+            block_on(s.emit(&readings)).unwrap();
+        }
+        block_on(s.shutdown()).unwrap();
+        let kept = read_kept(log_reader(dir, &env).unwrap(), || log_reader(dir, &env)).unwrap();
+        let held = kept.decider.history.held();
+        assert!(held.window <= 4 * 901, "{held:?}");
+        assert!(held.window <= 4 * WINDOW_FACTS);
+        assert_eq!((held.revised_keys, held.overlay), (0, 0));
+        assert_eq!(kept.index.fact_series().count(), 0);
+        assert_eq!(kept.index.registry().len(), 4);
+        assert!(kept.counters.values().all(|c| c.recorded == 7_200));
+    }
+}
