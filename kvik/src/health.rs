@@ -55,6 +55,12 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
+    /// A sealed segment that no manifest record lists cannot be read whole or fails its checks, so it cannot be
+    /// listed or backed up; held while the store runs and raised again at each start until repaired (Q-221 (c)).
+    SegmentDamaged {
+        /// The segment.
+        file_id: u64,
+    },
     /// A corrupt manifest record was rebuilt from the local files, until
     /// acknowledged.
     ManifestRebuilt {
@@ -99,6 +105,7 @@ impl fmt::Display for Reason {
             Reason::DiskLow { free } => write!(f, "free space low: {free} bytes"),
             Reason::DiskCritical { free } => write!(f, "free space critical: {free} bytes"),
             Reason::SealBlocked { file_id } => write!(f, "segment {file_id} cannot be sealed"),
+            Reason::SegmentDamaged { file_id } => write!(f, "sealed segment {file_id} is damaged"),
             Reason::ManifestRebuilt { epoch, provisional } => {
                 let how = if *provisional { " provisionally" } else { "" };
                 write!(f, "manifest record of epoch {epoch} rebuilt{how}")

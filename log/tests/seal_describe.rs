@@ -14,7 +14,7 @@ use kvik_log::manifest::{
     LossCause, LostRange, RECORD_LOST_RANGE, RECORD_SEALED, encode_record, read_manifest,
 };
 use kvik_log::scan::{ScanLimit, scan};
-use kvik_log::writer::{DescribeError, describe_sealed};
+use kvik_log::writer::{DescribeError, Reason, describe_sealed};
 use proptest::prelude::*;
 use seal_rig::{Rig, STORE_ID, T0, Watch, by_id, dir, expected, sealed_files, seg_path};
 
@@ -126,7 +126,7 @@ fn a_start_describes_every_sealed_segment_no_record_names() {
 }
 
 #[test]
-fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed() {
+fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health_naming_it() {
     let mut r = Rig::open(Watch::new());
     r.fill(3);
     r.maint();
@@ -145,9 +145,11 @@ fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed() {
     assert!(r.w.fault().is_none());
     let got = by_id(&r.described);
     assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![ids[2]]);
+    assert_eq!(damaged(&r), vec![ids[0], ids[1]]);
     r.fill(1);
     r.maint();
     assert!(r.w.fault().is_none());
+    assert_eq!(damaged(&r), vec![ids[0], ids[1]]);
     r.w.shutdown(r.now).unwrap();
     drop(r);
     // The next start tries again: the readable one is described, the damaged one never.
@@ -158,6 +160,17 @@ fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed() {
     assert!(got.contains_key(&ids[0]));
     assert!(!got.contains_key(&ids[1]));
     assert_eq!(got[&ids[0]], expected(ids[0], &files[&ids[0]]));
+    assert_eq!(damaged(&r), vec![ids[1]]);
+}
+
+fn damaged(r: &Rig) -> Vec<u64> {
+    r.w.reasons()
+        .into_iter()
+        .filter_map(|x| match x {
+            Reason::SegmentDamaged { file_id } => Some(file_id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A store with two sealed, unlisted segments, rebooted, whose manifest names position 100,005: the next start writes

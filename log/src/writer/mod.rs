@@ -413,6 +413,11 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
+    /// A sealed segment no manifest record lists cannot be read whole or fails its checks (Q-221 (c)).
+    SegmentDamaged {
+        /// The segment.
+        file_id: u64,
+    },
 }
 
 /// Why the mark is synced at every commit.
@@ -557,7 +562,9 @@ pub struct LogWriter {
     sealing: usize,
     /// Sealed segments no manifest record listed at the start, described one at a time (Q-221 (b)).
     unlisted: VecDeque<SegmentIdentity>,
-    describing: bool,
+    describing: Option<u64>,
+    /// Unlisted segments that could not be described this run (Q-221 (c)).
+    damaged: BTreeSet<u64>,
     described: Vec<SealedFile>,
     disk: Disk,
     waiting: Option<Wait>,
@@ -666,7 +673,8 @@ impl LogWriter {
             seal_blocked: BTreeSet::new(),
             sealing: 0,
             unlisted: r.unlisted.into(),
-            describing: false,
+            describing: None,
+            damaged: BTreeSet::new(),
             described: Vec::new(),
             disk: Disk::default(),
             waiting: None,
@@ -733,6 +741,11 @@ impl LogWriter {
             self.seal_blocked
                 .iter()
                 .map(|&file_id| Reason::SealBlocked { file_id }),
+        );
+        r.extend(
+            self.damaged
+                .iter()
+                .map(|&file_id| Reason::SegmentDamaged { file_id }),
         );
         r
     }
@@ -848,20 +861,26 @@ impl LogWriter {
     /// writable (Q-221 (b)).
     pub fn take_unlisted(&mut self) -> Option<SegmentIdentity> {
         self.sync_halt();
-        if self.fault.is_some() || self.describing || self.seals_running() {
+        if self.fault.is_some() || self.describing.is_some() || self.seals_running() {
             return None;
         }
         let id = self.unlisted.pop_front()?;
-        self.describing = true;
+        self.describing = Some(id.file_id);
         Some(id)
     }
 
-    /// The result of describing a segment [`LogWriter::take_unlisted`] handed out; a segment that cannot be
-    /// described stays unlisted and sets no fault (Q-221 (c)).
+    /// The result of describing a segment [`LogWriter::take_unlisted`] handed out. A segment that cannot be
+    /// described stays unlisted, sets no fault and degrades health as [`Reason::SegmentDamaged`] until the writer
+    /// stops; the next start tries it again (Q-221 (c)).
     pub fn unlisted_done(&mut self, result: Result<SealedFile, DescribeError>) {
-        self.describing = false;
-        if let Ok(f) = result {
-            self.described.push(f);
+        let Some(file_id) = self.describing.take() else {
+            return;
+        };
+        match result {
+            Ok(f) => self.described.push(f),
+            Err(_) => {
+                self.damaged.insert(file_id);
+            }
         }
     }
 
