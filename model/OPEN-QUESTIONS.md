@@ -1368,7 +1368,10 @@ its trailer or end marker is not valid, or its `file_crc32c` does not match.
 **Decided (the conservative choice in each case).** (a) As before the hash: the seal fails as a write failure on the
 log (read-only, fatal health; the next start seals it again from step 1), so no segment takes its `.kvl` name
 without a hash. (b) The start does not read them; a segment is named by generation and `file_id`, so a record of
-another generation does not list it. The writer hands them out one at a time (`LogWriter::take_unlisted`, run by
+another generation does not list it. A sealed-segment, a publish-and-retire and a restore record list segments (the
+restore's field 9, set-aside segments included), so a segment a restore placed is not described and listed again in
+the new generation (scenario from the review of roadmap 6.3b: after a restore, earlier generations' segments are named
+only by the `0x25`). The writer hands them out one at a time (`LogWriter::take_unlisted`, run by
 `writer::describe_sealed` on `kvik-maint`), only while no seal is ready or running and the store is writable, outside
 `seals_running` and `sealed_segments`; a shutdown drops one not started, so neither a start nor a shutdown waits for
 them, and one not described when the writer stops is found again at the next start. (c) No description
@@ -1385,7 +1388,8 @@ acknowledgement (the owner's ruling on (c), at the review of roadmap 6.3b). `log
 `a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health_naming_it`,
 `describe_sealed_refuses_each_check_it_makes`,
 `a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
-the records `kvik-files` encodes). Not pinned by a test: that a shutdown drops a description not started.
+the records `kvik-files` encodes,
+`listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`). Not pinned by a test: that a shutdown drops a description not started.
 (d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
 outside the crate; `kvik` maps those it knows and skips any other. Scenario (the review of roadmap 6.3b): a branch
 that matched every log reason stopped compiling once `SegmentDamaged` merged, with no textual conflict to warn of it.
