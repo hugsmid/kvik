@@ -17,12 +17,12 @@ use sha2::{Digest, Sha256};
 use super::judge::{FileState, Verdict};
 use super::local::{self, Found, invalid};
 use super::{
-    Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress, RestoreStep, codec,
-    probe,
+    Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress, RestoreStep, probe,
 };
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
 use crate::plan::{PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, records_to_read};
+use crate::uploaded::UploadedRecord;
 use crate::{DriverFuture, LocalStore};
 
 fn sha256(b: &[u8]) -> [u8; 32] {
@@ -231,7 +231,7 @@ async fn source_records<S: BackupSink, E: Envelope>(
         let mut out: Vec<Record> = Vec::with_capacity(listed.len());
         for (epoch, key) in listed {
             let plain = open(env, &key, &sink.get(&key, None).await?)?;
-            let r = codec::decode_block(&plain)?;
+            let r = UploadedRecord::decode(&plain)?.record;
             if r.epoch != epoch {
                 return Err(RestoreError::Record(
                     kvik_files::record::RecordError::Invalid(
@@ -499,12 +499,14 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         if !record.drill {
             appender.settle(written.epoch, wall)?;
             let key = keys.record(g, written.epoch);
-            let sealed = env.seal(
-                &key,
-                &written
-                    .encode()
-                    .map_err(|e| RestoreError::Append(e.into()))?,
-            )?;
+            // A generation's first record names no predecessor (format A.17, Q-610).
+            let plain = UploadedRecord {
+                previous: 0,
+                record: written.clone(),
+            }
+            .encode()
+            .map_err(|e| RestoreError::Append(e.into()))?;
+            let sealed = env.seal(&key, &plain)?;
             let sha = sha256(&sealed);
             self.sink.put(&key, sealed.into(), sha).await?;
             let top = highest_claimed(&self.sink, &keys, g).await?;

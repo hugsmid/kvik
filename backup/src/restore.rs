@@ -16,7 +16,6 @@ use crate::envelope::EnvelopeError;
 use crate::plan::{PlanError, PlanMode};
 use crate::upload::Refused;
 
-mod codec;
 mod driver;
 mod judge;
 mod local;

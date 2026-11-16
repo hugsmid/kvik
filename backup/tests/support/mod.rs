@@ -125,10 +125,28 @@ pub fn upload(sink: &dyn BackupSink, src: &mut Source) {
             Body::Sealed(vec![d.clone()]),
         ));
     }
+    let mut previous = 0;
     for r in records {
-        let k = keys.record(0, r.epoch);
-        put(sink, &k, env.seal(&k, &r.encode().unwrap()).unwrap());
+        put_record(sink, src.id, previous, &r);
+        previous = r.epoch;
     }
+}
+
+/// A record's uploaded form, built from `format.md` A.17: the predecessor's epoch, then the record's block.
+pub fn uploaded(previous: u64, r: &Record) -> Vec<u8> {
+    [previous.to_le_bytes().as_slice(), &r.encode().unwrap()].concat()
+}
+
+/// Seals and puts store `id`'s record `r` naming `previous`, as the upload driver would.
+pub fn put_record(sink: &dyn BackupSink, id: [u8; 16], previous: u64, r: &Record) {
+    let k = Keys::new(id).record(r.generation, r.epoch);
+    put(
+        sink,
+        &k,
+        TestEnvelope::new(KEY)
+            .seal(&k, &uploaded(previous, r))
+            .unwrap(),
+    );
 }
 
 thread_local! {

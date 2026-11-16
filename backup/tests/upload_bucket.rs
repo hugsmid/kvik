@@ -54,11 +54,11 @@ fn assert_backed_up(h: &Harness, object: impl Fn(&str) -> Option<Vec<u8>>) {
         assert_eq!(object(&key), Some(env.seal(&key, content).unwrap()));
     }
     let records = h.records();
-    for r in &records[..records.len() - 1] {
+    for (i, r) in records[..records.len() - 1].iter().enumerate() {
         let key = keys.record(r.generation, r.epoch);
         assert_eq!(
             object(&key),
-            Some(env.seal(&key, &r.encode().unwrap()).unwrap())
+            Some(env.seal(&key, &uploaded_form(&records, i)).unwrap())
         );
     }
 }

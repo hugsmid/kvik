@@ -19,6 +19,7 @@ use super::{BackupDriver, Progress, Refused, Step, UploadConfig, UploadError};
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{Keys, ObjectName};
 use crate::port::ManifestPort;
+use crate::uploaded::{UploadedRecord, opens_manifest};
 use crate::{DriverFuture, LocalStore};
 
 /// Owner's ruling (Q-82, Q-284): an object is lost after this many failed lookups while other calls answer...
@@ -50,8 +51,8 @@ struct Cursor {
     uploaded: u64,
     /// The highest epoch read from the manifest.
     scanned: u64,
-    /// Synced records above `uploaded`, in epoch order.
-    pending: VecDeque<Record>,
+    /// Synced records above `uploaded`, in epoch order, each with its predecessor in its manifest (Q-610).
+    pending: VecDeque<UploadedRecord>,
     /// The epoch of each file's copy-verified record written since the last rebuild record.
     copied_at: BTreeMap<FileRef, u64>,
 }
@@ -221,13 +222,13 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
 
     async fn next_object(&mut self, snap: &Catalogue, now: Duration) -> Out<bool> {
         let front = self.cursor.as_ref().and_then(|c| c.pending.front());
-        if let Some(r) = front
-            && ready(r, snap)
+        if let Some(u) = front
+            && ready(&u.record, snap)
             // The last record is settled once: an empty last record waits for a successor (spec §7 Manifest).
-            && !(r.epoch == snap.last_epoch() && r.body == Body::Empty)
+            && !(u.record.epoch == snap.last_epoch() && u.record.body == Body::Empty)
         {
-            let r = r.clone();
-            self.upload_record(&r, now).await?;
+            let u = u.clone();
+            self.upload_record(&u, now).await?;
             return Ok(true);
         }
         let Some(e) = queue(snap).first().map(|e| (*e).clone()) else {
@@ -314,11 +315,12 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         Ok(())
     }
 
-    async fn upload_record(&mut self, r: &Record, now: Duration) -> Out<()> {
+    async fn upload_record(&mut self, u: &UploadedRecord, now: Duration) -> Out<()> {
+        let r = &u.record;
         self.manifest.settle(r.epoch).map_err(port)?;
         let key = self.keys.record(r.generation, r.epoch);
         if self.looked_up(&key, now).await?.is_none() {
-            let plain = r
+            let plain = u
                 .encode()
                 .map_err(|e| io_stop(io::Error::new(io::ErrorKind::InvalidData, e)))?;
             let sealed = self.seal(&key, &plain)?;
@@ -541,9 +543,15 @@ fn take(c: &mut Cursor, records: Vec<Record>, snap: &Catalogue) {
         if let Some(f) = fresh_copy(&r) {
             c.copied_at.insert(f, r.epoch);
         }
+        // The predecessor in the manifest read, which is deterministic, so a repeated `put` sends the same bytes
+        // whatever the listing showed (Q-610).
+        let previous = if opens_manifest(&r) { 0 } else { c.scanned };
         c.scanned = r.epoch;
         if r.epoch > c.uploaded {
-            c.pending.push_back(r);
+            c.pending.push_back(UploadedRecord {
+                previous,
+                record: r,
+            });
         }
     }
 }

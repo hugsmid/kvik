@@ -68,11 +68,11 @@ fn check_objects(h: &Harness) {
                 env.seal(&k, content).unwrap()
             }
             Some(ObjectName::Record { epoch, .. }) => {
-                let r = records
+                let i = records
                     .iter()
-                    .find(|r| r.epoch == epoch)
+                    .position(|r| r.epoch == epoch)
                     .expect("an object for a record not in the manifest");
-                env.seal(&k, &r.encode().unwrap()).unwrap()
+                env.seal(&k, &uploaded_form(&records, i)).unwrap()
             }
             other => panic!("unexpected object {k}: {other:?}"),
         };

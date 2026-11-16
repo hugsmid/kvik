@@ -20,6 +20,7 @@ use kvik_files::appender::{Appender, Opened, Settled};
 use kvik_files::catalogue::{Catalogue, Tier};
 use kvik_files::desc::{FileClass, FileDescription, FileRef, kind};
 use kvik_files::image;
+use kvik_files::rebuild::{Finality, LocalFile, LocalState, Place, Verifier, rebuild_manifest};
 use kvik_files::record::{Body, Record};
 use kvik_files::tier::CopyVerified;
 use kvik_log::fs::{Fs, MemFs, OpenMode};
@@ -533,14 +534,14 @@ impl Harness {
         }
         let last = records.last().map(|r| r.epoch);
         let mut in_manifest = BTreeSet::new();
-        for r in &records {
+        for (i, r) in records.iter().enumerate() {
             let key = keys.record(r.generation, r.epoch);
             in_manifest.insert(key.clone());
             if Some(r.epoch) == last {
                 assert_eq!(r.body, Body::Empty, "the last record of an idle run");
                 assert!(!objects.contains_key(&key), "the last record went up");
             } else {
-                let want = env.seal(&key, &r.encode().unwrap()).unwrap();
+                let want = env.seal(&key, &uploaded_form(&records, i)).unwrap();
                 assert_eq!(objects.get(&key), Some(&want), "record {}", r.epoch);
             }
         }
@@ -558,6 +559,18 @@ impl Harness {
             snap.file(f).is_some_and(|e| e.is_live())
         });
     }
+}
+
+/// The uploaded form of `records[i]`, built from `format.md` A.17: the epoch of the record before it in the manifest,
+/// 0 for the first and for a rebuild record that opens a rebuilt manifest, then its block.
+pub fn uploaded_form(records: &[Record], i: usize) -> Vec<u8> {
+    let r = &records[i];
+    let opens = matches!(r.body, Body::Rebuild(_)) && r.old_epoch.is_none();
+    let previous = match i.checked_sub(1) {
+        Some(j) if !opens => records[j].epoch,
+        _ => 0,
+    };
+    [previous.to_le_bytes().as_slice(), &r.encode().unwrap()].concat()
 }
 
 /// Copy-verified records of `f` written since the last rebuild record.
@@ -666,4 +679,39 @@ pub fn run_to_fault(d: &mut Driver, now: Duration) -> Step {
 pub fn run_idle(d: &mut Driver, now: &mut Duration) {
     let s = run(d, now, 10_000);
     assert!(matches!(s, Step::Idle), "{s:?}");
+}
+
+/// A verifier that takes every local file as matching its description.
+pub struct AllVerify;
+
+impl Verifier for AllVerify {
+    fn verify(&self, _: &LocalFile, _: &[&LocalFile]) -> bool {
+        true
+    }
+}
+
+/// The harness's segments as a rebuild finds them on hot.
+pub fn local_files(h: &Harness) -> Vec<LocalFile> {
+    h.segments
+        .iter()
+        .map(|(d, _)| LocalFile {
+            description: d.clone(),
+            place: Place::Hot,
+            verified: true,
+        })
+        .collect()
+}
+
+/// Rebuilds the closed manifest, final.
+pub fn rebuild_final(h: &Harness) -> Appender {
+    let files = local_files(h);
+    let state = LocalState {
+        files: &files,
+        losses: &[],
+        lease_epoch: 0,
+        mark_file_id: 0,
+    };
+    rebuild_manifest(&h.fs, &h.dir, ID, state, &AllVerify, Finality::Final, T0)
+        .unwrap()
+        .0
 }

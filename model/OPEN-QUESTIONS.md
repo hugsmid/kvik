@@ -1330,6 +1330,33 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-610 — The chain of epochs in uploaded manifest records: the field and where it starts
+Recorded and decided by roadmap 8.3g.
+**Scenario.** A restore lists the records of the generation it reads. A record the listing does not show, or the
+bucket has lost, leaves no trace (Q-304): epochs may skip, since after a start the next epoch is above every epoch a
+lease file names (`format.md` A.14), and a rebuilt manifest's epochs start above the old manifest's last, whose
+last record may never have been uploaded.
+**Decision.** The uploaded form of a manifest record (`format.md` A.17) starts with `previous: u64`, the epoch of
+the record before it in the manifest it was read from, then the record's block, which stays 8-aligned and is
+decoded as before. `previous` is 0 for a manifest's first record: a generation's first record (the store's first
+record in generation 0, the restore record above it) and a rebuild record that opens a rebuilt manifest (the one
+without field 100). A chain lives in one generation: a claim marker is no record and starts nothing, and a record
+names only epochs of its own generation. Decoding refuses `previous` at or above the record's epoch, and a
+non-zero `previous` on a rebuild record without field 100. The upload driver takes `previous` from the records it
+reads from the manifest, as it takes them into its queue; the restore driver writes 0 for the restore record.
+**Reason.** The envelope is deterministic in its plaintext and the sink takes a repeated `put` only with identical
+bytes (A.17). A predecessor read from the bucket (the last record uploaded) would change with a listing that lags
+at a restart, so a repeated `put` would meet `Exists` and stop uploads; one read from the manifest cannot change.
+The cost: a rebuild record names nothing, so the chain cannot show a restore that reads the records before a
+rebuilt manifest not yet whole that the bucket has lost the last of them; the tail check (Q-612) finds one the
+listing hides when its epoch follows directly. The format is unreleased (`format.md` title; A.3 keeps golden files
+for released versions only) and no object of the earlier form is read, so the change is not made readable both
+ways.
+**Model.** Not modelled: the model uploads no manifest records.
+**Tests.** `backup/src/uploaded.rs` (format vector, refusals both ways); `backup/tests/upload_chain.rs`
+(consecutive records, a restart, a rebuilt manifest after a restart and under a driver that outlives it); the
+uploaded bytes in `check_done` and in `upload_histories.rs`, `upload_bucket.rs`, `restore.rs`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1410,6 +1437,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-610 | 8.3 | The chain of epochs in uploaded manifest records; decided by roadmap 8.3g |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
