@@ -8,8 +8,8 @@ decision maps skip the version lookup without `changed_at` and move a call's his
 shared virtual machine with other work running, not the Linux NVMe target.
 
 ```sh
-cargo run --release -p kvik --example emit_throughput -- --dir <empty dir> --writers 1 --per-call 2000
-cargo run --release -p kvik --example emit_throughput -- --dir <empty dir> --writers 16 --per-call 2
+cargo run --release -p kvik --example emit_throughput -- --dir <scratch dir> --writers 1 --per-call 2000
+cargo run --release -p kvik --example emit_throughput -- --dir <scratch dir> --writers 16 --per-call 2
 ```
 
 ## Method
@@ -36,3 +36,24 @@ cargo run --release -p kvik --example emit_throughput -- --dir <empty dir> --wri
   and is not built (Q-706).
 - **16 writers, 2 readings per call:** 4–6× the calls per second. With one batch sync acknowledging many calls,
   only one refresh of the delivery reader now runs per sync instead of one per caller plus one on `kvik-deliver`.
+
+## Memory
+A reader now keeps the bytes of the segment it follows up to the mark between refreshes, instead of allocating and
+zeroing that prefix at every refresh: at most one segment's bytes per reader handle (64 MiB at the default
+`segment_size`) while it follows a segment. A whole-file read of an earlier segment is freed when its refresh ends,
+and the kept bytes are freed when the reader follows another segment, so after a rollover only the new segment's
+prefix is held. This applies to the store's delivery reader and to every reader process handle.
+
+## After freeing the kept bytes
+Re-measured once that change was in, the same way (three alternated runs, load under 2.0):
+
+| Shape | Build | Calls/s | Readings/s | Cores | CPU per reading |
+|---|---|---|---|---|---|
+| 1 writer × 2,000 readings per call | before | 168–257 | 335–514 k | 0.90–1.08 | 2.1–2.7 µs |
+| | after | 232–261 | 464–521 k | 0.97–1.01 | 1.9–2.1 µs |
+| 16 writers × 2 readings per call | before | 3,330–4,810 | 6.7–9.6 k | 1.29–1.32 | 137–197 µs |
+| | after | 18,260–21,300 | 36.5–42.6 k | 1.21–1.48 | 33–35 µs |
+
+The gain holds: the ranges for one writer overlap here because of one fast run of the old build, while the medians
+(436 k and 519 k) and CPU per reading keep the earlier picture; 16 writers stay at 4–6×.
+
