@@ -978,8 +978,26 @@ fn q250_a_remount_keeping_part_of_the_flagged_batches_gives_the_rest_again() {
 fn q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positions_again() {
     use kvik_model::engine::{Fault, WriteOutcome};
     let (mut m, c, s) = written_level_store();
+    let slow = m
+        .define(
+            "site/meter/energy",
+            Kind::Gauge,
+            ValueType::Number,
+            "kWh",
+            10 * SECOND,
+        )
+        .unwrap();
+    let synced = m
+        .ingest(vec![Reading::num(slow, T0, 1.0)])
+        .unwrap()
+        .positions[0];
+    assert!(
+        m.disk.synced_mark.unwrap().last < synced,
+        "the mark file lags"
+    );
     let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
-    assert_eq!(m.poll(c, 10).unwrap()[0].position, first, "delivered");
+    let got = m.poll(c, 10).unwrap();
+    assert_eq!(got.last().unwrap().position, first, "delivered");
     let _ = m.emit(Reading::num(s, T0 + 1, 2.0));
     assert!(
         m.commit(Some(Fault::SyncError(WriteOutcome::Lost)))
@@ -988,7 +1006,14 @@ fn q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positi
     m.crash();
     m.evict_failed_write_back().unwrap();
     m.restart();
-    assert!(m.recovery_entries().is_empty());
+    assert!(
+        m.disk.live_entries().contains_key(&synced),
+        "synced before the failure"
+    );
+    assert!(
+        m.recovery_entries().is_empty(),
+        "the mark's dirty page was kept"
+    );
     assert!(m.losses().is_empty());
     let again = m
         .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
