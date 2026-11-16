@@ -219,8 +219,12 @@ pub struct Rig {
 
 impl Rig {
     pub fn open(fs: Watch) -> Self {
+        Self::open_on_boot(fs, [1; 16])
+    }
+
+    pub fn open_on_boot(fs: Watch, boot: [u8; 16]) -> Self {
         let store = StoreDir::open(Arc::new(fs.clone()), &dir(), Some(&new_store())).unwrap();
-        let w = LogWriter::open(store, cfg(), Some([1; 16]), Duration::ZERO, T0).unwrap();
+        let w = LogWriter::open(store, cfg(), Some(boot), Duration::ZERO, T0).unwrap();
         let mut r = Self {
             fs,
             w,

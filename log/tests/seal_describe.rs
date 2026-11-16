@@ -10,7 +10,9 @@ use kvik_log::batch::SegmentIdentity;
 use kvik_log::block::{BLOCK_HEADER_LEN, block_type, encode_block};
 use kvik_log::body::{END_MARKER_LEN, TRAILER_LEN, Trailer};
 use kvik_log::fs::{FaultOp, Fs, MemFs, OpenMode};
-use kvik_log::manifest::{RECORD_SEALED, read_manifest};
+use kvik_log::manifest::{
+    LossCause, LostRange, RECORD_LOST_RANGE, RECORD_SEALED, encode_record, read_manifest,
+};
 use kvik_log::scan::{ScanLimit, scan};
 use kvik_log::writer::{DescribeError, describe_sealed};
 use proptest::prelude::*;
@@ -158,6 +160,67 @@ fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed() {
     assert_eq!(got[&ids[0]], expected(ids[0], &files[&ids[0]]));
 }
 
+/// A store with two sealed, unlisted segments, rebooted, whose manifest names position 100,005: the next start writes
+/// its recovery entry above it and records the gap below as a lost range (step 6, Q-290).
+fn store_with_a_gap_to_record() -> Watch {
+    let fs = sealed_store(2);
+    let path = manifest_path();
+    let bytes = fs.inner.read(&path).unwrap();
+    let epoch = read_manifest(&bytes, &STORE_ID).unwrap().last_epoch() + 1;
+    let named = LostRange {
+        identity: (0, 100_000),
+        first: (0, 100_000),
+        last: (0, 100_005),
+        file_id: 1,
+        offset: 0,
+        length: 0,
+        cause: LossCause::Corruption,
+        boot_id: [0; 16],
+        id_floor: 0,
+        time_before: None,
+        time_after: None,
+        extends: false,
+        stamp: None,
+    };
+    fs.inner.poke(
+        &path,
+        bytes.len(),
+        &encode_record(RECORD_LOST_RANGE, epoch, 0, T0, Some(&named)),
+    );
+    fs.inner.power_loss();
+    fs.inner.restart();
+    fs
+}
+
+#[test]
+fn no_description_leaves_the_writer_before_the_gap_below_a_recovery_entry_is_recorded() {
+    let fs = store_with_a_gap_to_record();
+    assert_eq!(lost_ranges(&fs.inner), 1);
+    let mut r = Rig::open_on_boot(fs, [2; 16]);
+    assert!(r.w.fault().is_none());
+    assert_eq!(r.w.start_report().entry.as_ref().unwrap().sequence, 100_006);
+    assert_eq!(lost_ranges(&r.fs.inner), 2);
+    r.maint();
+    assert_eq!(r.described.len(), 2);
+    r.fill(1);
+    r.maint();
+    assert_eq!(r.described.len(), 3);
+}
+
+#[test]
+fn a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing() {
+    let fs = store_with_a_gap_to_record();
+    // The first write repairs the last record (step 4); the second is the gap's record (step 6).
+    fs.inner
+        .fail_nth(FaultOp::Write, "MANIFEST", 1, std::io::ErrorKind::Other);
+    let mut r = Rig::open_on_boot(fs, [2; 16]);
+    assert!(r.w.fault().is_some());
+    assert_eq!(lost_ranges(&r.fs.inner), 1);
+    assert!(r.w.take_unlisted().is_none());
+    r.maint();
+    assert!(r.described.is_empty());
+}
+
 #[test]
 fn a_start_skips_every_segment_a_record_lists_by_generation_and_id() {
     let fs = sealed_store(3);
@@ -200,8 +263,9 @@ fn no_description_leaves_the_writer_before_the_starts_lost_range_records() {
 #[test]
 fn a_start_that_cannot_record_a_loss_is_read_only_and_describes_nothing() {
     let fs = store_with_a_loss_to_record();
+    // The first write repairs the last record; the second is the loss's record (step 4).
     fs.inner
-        .fail_nth(FaultOp::Write, "MANIFEST", 0, std::io::ErrorKind::Other);
+        .fail_nth(FaultOp::Write, "MANIFEST", 1, std::io::ErrorKind::Other);
     let mut r = Rig::open(fs);
     assert!(r.w.fault().is_some());
     assert_eq!(lost_ranges(&r.fs.inner), 0);
@@ -339,4 +403,39 @@ fn no_segment_is_described_after_a_fault() {
     assert!(r.w.fault().is_some());
     assert!(r.w.take_unlisted().is_none());
     assert!(r.described.is_empty());
+}
+
+#[test]
+fn a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use kvik_log::store::StoreDir;
+    use kvik_log::writer::{Log, LogWriter, SystemClock};
+
+    let fs = sealed_store(2);
+    let want = sealed_files(&fs.inner);
+    let store = StoreDir::open(Arc::new(fs.clone()), &dir(), None).unwrap();
+    let w = LogWriter::open(
+        store,
+        seal_rig::cfg(),
+        Some([1; 16]),
+        std::time::Duration::ZERO,
+        T0,
+    )
+    .unwrap();
+    let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+    let deadline = Instant::now() + seal_rig::WAIT;
+    let mut got = Vec::new();
+    while got.len() < want.len() {
+        assert!(Instant::now() < deadline, "described {got:?}");
+        got.extend(log.take_sealed());
+        std::thread::sleep(seal_rig::MS);
+    }
+    log.shutdown().unwrap();
+    let got = by_id(&got);
+    assert_eq!(got.len(), want.len());
+    for (id, bytes) in &want {
+        assert_eq!(got[id], expected(*id, bytes));
+    }
 }
