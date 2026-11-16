@@ -1,5 +1,5 @@
-//! Guards of the restore executor: a drill never writes, claim retries, lagging listings, the bucket probe and the
-//! records read past a rebuilt manifest not yet whole (`spec.md` §8 Generations, Restore, Restore drill).
+//! Guards of the restore executor: a drill never writes, a plan of the other mode, claim retries, lagging listings,
+//! the bucket probe and the records read past a rebuilt manifest not yet whole (`spec.md` §8 Generations, Restore, Restore drill).
 
 mod support;
 
@@ -8,8 +8,8 @@ use std::sync::Arc;
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::{ClaimMarker, Keys, ObjectName};
-use kvik_backup::plan::PlanMode;
-use kvik_backup::restore::{Prepared, RestoreDriver, RestoreError};
+use kvik_backup::plan::{PlanError, PlanInput, PlanMode, RestorePlan};
+use kvik_backup::restore::{Prepared, RestoreDriver, RestoreError, Restorer};
 use kvik_backup::upload::Refused;
 use kvik_files::record::{Body, Rebuild, Record};
 use kvik_log::fs::MemFs;
@@ -257,4 +257,47 @@ fn q108_a_rebuilt_manifest_not_yet_whole_in_the_bucket_is_not_read() {
     let all: Vec<_> = src.segments.iter().map(|(d, _)| d.clone()).collect();
     assert_eq!(listed, all);
     assert_eq!(o.installed.len(), 3);
+}
+
+fn other_mode_plan(input: &PlanInput<'_>) -> Result<RestorePlan, PlanError> {
+    let mut p = hand_plan(input)?;
+    p.record.drill = !p.record.drill;
+    Ok(p)
+}
+
+#[test]
+fn a_plan_whose_record_has_the_other_mode_is_refused_before_the_record_is_written() {
+    for mode in [PlanMode::Full, PlanMode::Drill] {
+        let mut src = source(ID, 2, false);
+        let sink = Arc::new(mem_with(&bucket(&mut src)));
+        let fs = MemFs::new();
+        let mut r = Restorer::new(
+            sink.clone(),
+            Box::new(|_| TestEnvelope::new(KEY)),
+            local(&fs),
+            other_mode_plan,
+            Box::new({
+                let mut n = 76;
+                move || {
+                    n += 1;
+                    n
+                }
+            }),
+            cfg(mode.clone()),
+        );
+        let got = block_on(r.prepare(1));
+        assert!(
+            matches!(got, Err(RestoreError::Plan(PlanError::Invalid(_)))),
+            "{mode:?}: {got:?}"
+        );
+        let keys = Keys::new(ID);
+        assert!(
+            !sink
+                .objects()
+                .keys()
+                .any(|k| matches!(keys.parse(k), Some(ObjectName::Record { generation, .. }) if generation > 0)),
+            "{mode:?}"
+        );
+        assert!(fs.paths().is_empty(), "{mode:?}");
+    }
 }
