@@ -312,6 +312,10 @@ pub struct IngestStats {
     pub syncs: u64,
     /// Commit latency (zero with the model backend).
     pub commit_latency: Latency,
+    /// Readings the duplicate rule decided by the slow path: at or below the series' latest recorded `t`, outside
+    /// the recent window and the revised-key index, so read from the local log (spec §2.4; zero with the model
+    /// backend).
+    pub slow_path: u64,
 }
 
 /// How the mark is synced.
@@ -400,6 +404,9 @@ pub struct DeliveryStats {
     pub refresh_errors: u64,
     /// Invalid regions below the durable mark the delivery reader passed over (`spec.md` §3 Recovery rule 2).
     pub corruptions: u64,
+    /// Reads of the local log for facts outside the deliverer's recent window: a key's earlier facts, a series'
+    /// facts before the window, or the records a consumer behind needs.
+    pub slow_path: u64,
 }
 
 /// Per-series statistics.

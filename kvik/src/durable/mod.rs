@@ -17,11 +17,14 @@
 mod clock;
 mod consumers;
 mod deliver;
+mod history;
 mod index;
 mod ingest;
+mod keys;
 pub(crate) mod reader;
 mod registry;
 mod routing;
+mod start;
 mod windows;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -161,6 +164,7 @@ struct Counters {
     series: BTreeMap<u32, SeriesStats>,
     waits: BTreeMap<Wait, u64>,
     waited: Duration,
+    slow_path: u64,
     latencies: VecDeque<Duration>,
     max_latency: Duration,
 }
@@ -176,6 +180,8 @@ pub(crate) struct Writer {
     own_fault: Mutex<Option<LogFault>>,
     store_id: [u8; 16],
     decider: Mutex<Decider>,
+    /// The slow path's reads of local data, taken after the decision lock (roadmap 11.0).
+    local: Mutex<Box<dyn keys::LocalFacts>>,
     counters: Mutex<Counters>,
     reader: Mutex<Option<Arc<DurableReader>>>,
     acknowledged: Mutex<BTreeSet<Position>>,
@@ -378,24 +384,24 @@ impl Writer {
             },
         })?;
         let start_fault = writer.fault().cloned();
-        // The kept log, read once: the registry and the history of every key.
-        let index = match DurableReader::open(&dir, &env, Duration::from_secs(30 * 60)) {
-            Ok(r) => {
-                let mut index = None;
-                r.with(|i, _| {
-                    index = Some(i.clone());
-                    Ok(())
-                })
-                .map_err(|e| OpenError::Io {
+        // The kept log, read once in parts: the registry, the decision state and the counters (roadmap 11.0).
+        let kept = match start::log_reader(&dir, &env) {
+            Ok(r) => start::read_kept(r, || start::log_reader(&dir, &env)).map_err(|e| {
+                OpenError::Io {
                     path: dir.clone(),
                     source: io::Error::other(e.to_string()),
-                })?;
-                index.unwrap_or_default()
-            }
+                }
+            })?,
             // A start that could not write may leave no readable mark: the store opens read-only.
-            Err(_) if start_fault.is_some() => Index::default(),
-            Err(e) => return Err(e),
+            Err(_) if start_fault.is_some() => start::Kept::unreadable(),
+            Err(e) => return Err(reader::open_error(&dir, e)),
         };
+        let start::Kept {
+            index,
+            decider,
+            counters: series_counters,
+            local,
+        } = kept;
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
         let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
@@ -410,15 +416,10 @@ impl Writer {
             });
         }
         let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
-        let mut counters = Counters::default();
-        for id in index.fact_series() {
-            let st = counters.series.entry(id).or_default();
-            for f in index.series_facts(id) {
-                st.recorded += 1;
-                st.late += u64::from(f.row.flags.late);
-                st.future += u64::from(f.row.flags.future);
-            }
-        }
+        let counters = Counters {
+            series: series_counters,
+            ..Counters::default()
+        };
         // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
         // the kept log at every start, and the file, which must equal what the kept log gives up to the last synced
         // mark, is written again whenever it does not. Its id floor is the writer's, which recovery folded in from
@@ -472,7 +473,8 @@ impl Writer {
             log: RwLock::new(Some(log)),
             own_fault: Mutex::new(start_fault),
             store_id: descriptor.store_id,
-            decider: Mutex::new(Decider::from_index(&index)),
+            decider: Mutex::new(decider),
+            local: Mutex::new(local),
             counters: Mutex::new(counters),
             reader: Mutex::new(None),
             acknowledged: Mutex::new(BTreeSet::new()),
@@ -845,7 +847,17 @@ impl Writer {
         }
         let mut d = lock(&self.decider);
         let call = self.next_call.fetch_add(1, Ordering::SeqCst);
-        let mut plan = d.plan(readings, intent, clock, call);
+        // Calls below the oldest one in flight are acknowledged, so the log shows their facts to the slow path.
+        let readable = {
+            let mut inflight = lock(&self.inflight);
+            inflight.retain(|_, c| !c.acknowledged());
+            inflight.keys().next().copied().unwrap_or(call)
+        };
+        d.readable_below(readable);
+        let mut plan = {
+            let mut local = lock(&self.local);
+            d.plan(readings, intent, clock, call, &mut **local)
+        };
         let started = Instant::now();
         let refreshes = refreshing(&plan);
         let queued = if plan.items.is_empty() {
@@ -977,6 +989,7 @@ impl Writer {
 
     fn count(&self, readings: &[Reading], plan: &ingest::Plan) {
         let mut c = lock(&self.counters);
+        c.slow_path += plan.slow;
         for (r, d) in readings.iter().zip(&plan.decisions) {
             let st = c.series.entry(r.series.0).or_default();
             match d {
@@ -987,9 +1000,11 @@ impl Writer {
                     absent,
                     late,
                     future,
+                    unchecked,
                     ..
                 } => {
                     st.recorded += 1;
+                    st.duplicates_unchecked += u64::from(*unchecked);
                     st.outranked_on_arrival += u64::from(*outranked);
                     st.absent_supplied += u64::from(*absent);
                     st.late += u64::from(*late);
@@ -1091,6 +1106,7 @@ impl Writer {
                     p99: pct(99),
                     max: c.max_latency,
                 },
+                slow_path: c.slow_path,
             },
             log: LogStats {
                 durable: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.durable)),
@@ -1193,13 +1209,16 @@ fn outcomes(decisions: &[Decision], first: Option<kvik_log::writer::Position>) -
             Decision::Refused(x) => Outcome::Refused(*x),
             Decision::Duplicate => Outcome::Duplicate,
             Decision::Record {
-                item, outranked, ..
+                item,
+                outranked,
+                unchecked,
+                ..
             } => {
                 let f = first.unwrap_or_default();
                 Outcome::Recorded {
                     position: Position::new(f.generation, f.sequence + *item as u64),
                     outranked: *outranked,
-                    unchecked: false,
+                    unchecked: *unchecked,
                     rounded: false,
                     out_of_range: false,
                 }

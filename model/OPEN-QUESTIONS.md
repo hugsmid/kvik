@@ -69,6 +69,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-704 | §7 Readers, Leases, Retired files | The writer's own delivery reader skips a refresh at the writer's durable position; that needs a manifest that changes only at a start |
 | Q-705 | §2.3, §4 Outranked facts; `api.md` `Outcome` | The model backend's `outranked` when a later reading of the same call outranks an earlier one |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
+| Q-750 | §2.4, §3 Recovery rule 2, §8 Corrupt block | The slow path of the duplicate rule meeting damage found during a run |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1394,6 +1395,27 @@ at the next one"; "invalid regions below the durable mark the delivery reader pa
 small change with a test that a consumer registered after many such calls receives what its start promises; if no,
 the read-back stays on the caller's thread until acknowledged batches are handed to the deliverer in memory.
 
+## Q-750 — The slow path of the duplicate rule meeting damage found during a run
+Recorded by roadmap 11.0. To be settled by roadmap 6.3b, with the quarantine of §8 Corrupt block.
+**Scenario.** A gauge records 1.0 at `t`; an hour later its recent window has moved on. A sealed segment holding
+that fact is then damaged while the store runs (a flipped byte below the mark), and the adapter replays 1.0 at `t`.
+Before roadmap 11.0 the writer held every fact in memory and dropped the replay as a duplicate. Now the key is read
+from the local log (the slow path, §2.4), and the region that may hold it cannot be read. §2.4 names
+`duplicates_unchecked` for a key whose fact is on no local tier; §8 Corrupt block says only that queries over the
+range return an error until the file is replaced.
+**Decision.** An invalid region that the store's start passed over is lost (§3 Recovery rule 2; the start's state
+never held its facts, as before roadmap 11.0), so it reads as absence. Any other damage, and a segment that cannot be
+read, is never read as absence: a reading that matches no fact the writer still knows (in the recent window, the
+revised-key index or the facts of calls not yet acknowledged) is recorded with `Outcome::Recorded { unchecked: true }`
+and counted in `duplicates_unchecked`; on a versioned series its `outranked` is judged on the facts it knows.
+The deliverer, reading a key's earlier facts or a series' facts before its recent window, takes such damage as no
+earlier fact. A segment file removed while the store runs is not listed and so is not seen, as for any reader (gaps
+between sealed segments are the scrub's, §8).
+**Open.** Whether the call should instead wait, or fail, until the file is replaced from another tier (D5's rejected
+alternative), once quarantine exists.
+**Pinned by.** `a_key_that_cannot_be_read_is_recorded_unchecked_unless_a_known_fact_matches` (unit test of the
+decision), `a_lookup_never_reads_damage_as_absence_unless_the_region_is_lost` (unit test of the log reader).
+
 ## Q-710 — The default floor of the batch-sync interval
 
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
@@ -1541,6 +1563,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-704 | 6.3b | The delivery reader's skipped refresh once the manifest changes during a run; recorded by the store-path quick wins |
 | Q-705 | 5.5 | The model backend's `outranked` within one call; recorded by the store-path quick wins |
 | Q-706 | 5.5 | An emit's read-back with no consumer registered; recorded by the store-path quick wins, not built |
+| Q-750 | 6.3b | The duplicate rule's slow path on damage found during a run: recorded unchecked; recorded by roadmap 11.0 |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |

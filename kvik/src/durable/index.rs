@@ -46,6 +46,10 @@ pub(crate) struct Index {
     /// Each batch's last position and commit time, in log order.
     commits: Vec<(LogPos, i64)>,
     recoveries: BTreeMap<LogPos, Recovery>,
+    /// Facts are not kept, only each series' first fact position (roadmap 11.0: the writer's start and the
+    /// deliverer need the registry and the commit times, not the facts).
+    no_facts: bool,
+    first_fact: BTreeMap<u32, LogPos>,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -123,6 +127,14 @@ pub(crate) fn fact_out(s: &Stored) -> Fact {
 }
 
 impl Index {
+    /// An index that keeps no facts: [`Index::series_facts`] and the calls on facts see none.
+    pub(crate) fn without_facts() -> Self {
+        Index {
+            no_facts: true,
+            ..Index::default()
+        }
+    }
+
     /// Applies what a refresh found, in order.
     pub(crate) fn apply(&mut self, events: &[ReadEvent]) {
         for e in events {
@@ -135,7 +147,8 @@ impl Index {
         }
     }
 
-    fn batch(&mut self, b: &ReadBatch) {
+    /// Applies one batch a refresh found.
+    pub(crate) fn batch(&mut self, b: &ReadBatch) {
         let mut sequence = b.first.sequence;
         for item in &b.content.items {
             let p = LogPos {
@@ -143,6 +156,10 @@ impl Index {
                 sequence,
             };
             match item {
+                Item::Fact(row) if self.no_facts => {
+                    self.registry.note_fact(row.series_id);
+                    self.first_fact.entry(row.series_id).or_insert(p);
+                }
                 Item::Fact(row) => {
                     self.registry.note_fact(row.series_id);
                     self.facts.entry(row.series_id).or_default().insert(
@@ -178,11 +195,12 @@ impl Index {
             f.retain(|(_, p), _| keep(p));
         }
         self.facts.retain(|_, f| !f.is_empty());
+        self.first_fact.retain(|_, p| keep(p));
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
-        for id in self.facts.keys() {
+        for id in self.facts.keys().chain(self.first_fact.keys()) {
             self.registry.note_fact(*id);
         }
     }

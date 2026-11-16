@@ -5,54 +5,26 @@
 //! differential test in `tests/durable.rs` holds the two backends to the same outcomes.
 //!
 //! Decisions are made in the order calls are queued in the log, against every fact already queued, so a call
-//! sees the calls before it whether or not their sync has returned yet.
+//! sees the calls before it whether or not their sync has returned yet. The facts are found as [`History`] says: in
+//! memory, or for a key outside the recent window and the revised-key index, by the slow path through
+//! [`LocalFacts`], once per call for all such keys.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry as Slot;
+use std::collections::{HashMap, HashSet};
 
 use kvik_log::content::Item;
 use kvik_log::entries::{
     IntervalLength as LogInterval, Kind as LogKind, Timing as LogTiming, Versioning,
 };
 use kvik_log::facts::{
-    FactFlags as LogFlags, FactRow, MAX_TEXT_LEN, Quality as LogQuality, Value as LogValue,
-    ValueType as LogType,
+    FactFlags as LogFlags, FactRow, MAX_TEXT_LEN, Value as LogValue, ValueType as LogType,
 };
 
+use super::history::{Facts, History, Key, Known, span_of};
 use super::index::{Index, quality_in};
+use super::keys::LocalFacts;
 use super::registry::Registry;
 use crate::error::Refusal;
 use crate::types::{Intent, Reading, TimeSource, Value};
-
-/// A recorded fact as the duplicate rule compares it: value, adapter-supplied quality and `changed_at`.
-#[derive(Clone, Debug, PartialEq)]
-struct Known {
-    value: LogValue,
-    supplied: LogQuality,
-    changed_at: Option<u64>,
-    /// The call that queued it in this process; 0 for a fact of the kept log read at the start.
-    call: u64,
-}
-
-impl Known {
-    fn of(r: &FactRow, call: u64) -> Self {
-        Known {
-            value: r.value.clone(),
-            supplied: r.quality,
-            changed_at: r.changed_at,
-            call,
-        }
-    }
-
-    /// Identity (spec §2.4): values compare bitwise, a value recorded without one as "no value".
-    fn identical(&self, value: &LogValue, supplied: LogQuality) -> bool {
-        self.supplied == supplied
-            && match (&self.value, value) {
-                (LogValue::Absent { .. }, LogValue::Absent { .. }) => true,
-                (a, b) => a == b,
-            }
-    }
-}
 
 /// The clock at decision time.
 #[derive(Clone, Copy, Debug)]
@@ -84,7 +56,18 @@ pub(crate) enum Decision {
         late: bool,
         /// Flagged `future` (spec §2.2).
         future: bool,
+        /// Recorded although the duplicate check could not run (spec §2.4 `duplicates_unchecked`, Q-750).
+        unchecked: bool,
     },
+}
+
+/// A recorded fact as [`Decider::apply`] takes it into the state.
+#[derive(Clone, Debug)]
+struct Note {
+    key: Key,
+    /// It raises the lateness reference: flagged neither `future` nor `unsynced_clock`.
+    reference: bool,
+    known: Known,
 }
 
 /// A call's decisions and the facts it commits.
@@ -95,21 +78,20 @@ pub(crate) struct Plan {
     /// The latest earlier call holding a fact a duplicate matched, if any: the duplicate is final only once that
     /// call is acknowledged (Q-123 (b)).
     pub(crate) depends: Option<u64>,
-    /// What [`Decider::apply`] takes into the state: the plan's facts as `history`, `versions` and `reference`
-    /// hold them, so that `items` can be moved into the log.
-    history: HashMap<(u32, i64), Vec<Known>>,
-    versions: HashMap<(u32, i64), u64>,
-    reference: HashMap<u32, i64>,
+    /// Readings decided by the slow path (spec §2.4; roadmap 11.0).
+    pub(crate) slow: u64,
+    /// The plan's facts as the state takes them, so that `items` can be moved into the log.
+    notes: Vec<Note>,
+    /// The complete history the slow path read of each key it read whole.
+    whole: HashMap<Key, Vec<Known>>,
 }
 
-/// The state decisions are made against: the registry and the history of every key, including calls queued but
-/// not yet acknowledged.
+/// The state decisions are made against: the registry and [`History`], including calls queued but not yet
+/// acknowledged.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Decider {
     pub(crate) registry: Registry,
-    history: HashMap<(u32, i64), Vec<Known>>,
-    versions: HashMap<(u32, i64), u64>,
-    reference: HashMap<u32, i64>,
+    pub(crate) history: History,
 }
 
 fn reach(observed: bool, interval: Option<&LogInterval>, t: i64) -> i64 {
@@ -129,56 +111,43 @@ fn on_phase(interval: Option<&LogInterval>, t: i64) -> bool {
 }
 
 impl Decider {
-    /// The state of the kept log.
+    /// The state of the kept log in a full index (a start whose read of the log was voided part-way).
     pub(crate) fn from_index(index: &Index) -> Self {
         let mut d = Decider {
             registry: index.registry().clone(),
             ..Decider::default()
         };
-        for id in index.fact_series() {
-            for f in index.series_facts(id) {
-                d.note(&f.row, 0);
-            }
+        let mut facts: Vec<_> = index
+            .fact_series()
+            .flat_map(|id| index.series_facts(id))
+            .collect();
+        facts.sort_by_key(|f| f.position);
+        for f in facts {
+            d.note_kept(&f.row, span_of(&d.registry, f.row.series_id));
         }
         d
     }
 
-    fn note(&mut self, r: &FactRow, call: u64) {
-        let key = (r.series_id, r.t);
+    /// Takes in a fact of the kept log, read in log order at the start, of a series whose window span is `span`.
+    pub(crate) fn note_kept(&mut self, r: &FactRow, span: i64) {
+        let reference = !r.flags.future && !r.flags.unsynced_clock;
         self.history
-            .entry(key)
-            .or_default()
-            .push(Known::of(r, call));
-        if let Some(c) = r.changed_at {
-            let v = self.versions.entry(key).or_insert(c);
-            *v = (*v).max(c);
-        }
-        if !r.flags.future && !r.flags.unsynced_clock {
-            let v = self.reference.entry(r.series_id).or_insert(r.t);
-            *v = (*v).max(r.t);
-        }
+            .note((r.series_id, r.t), reference, Known::of(r, 0), span, None);
+    }
+
+    /// Notes that every call below `call` is acknowledged.
+    pub(crate) fn readable_below(&mut self, call: u64) {
+        self.history.readable_below(call);
     }
 
     /// Takes a planned call's facts into the state, once it is queued; the same as noting each of its facts in
     /// order.
     pub(crate) fn apply(&mut self, plan: &mut Plan) {
-        let history = std::mem::take(&mut plan.history);
-        self.history.reserve(history.len());
-        for (key, known) in history {
-            match self.history.entry(key) {
-                Slot::Occupied(mut e) => e.get_mut().extend(known),
-                Slot::Vacant(e) => {
-                    e.insert(known);
-                }
-            }
-        }
-        for (key, c) in std::mem::take(&mut plan.versions) {
-            let v = self.versions.entry(key).or_insert(c);
-            *v = (*v).max(c);
-        }
-        for (id, t) in std::mem::take(&mut plan.reference) {
-            let v = self.reference.entry(id).or_insert(t);
-            *v = (*v).max(t);
+        let mut whole = std::mem::take(&mut plan.whole);
+        for n in std::mem::take(&mut plan.notes) {
+            let span = span_of(&self.registry, n.key.0);
+            let w = whole.remove(&n.key);
+            self.history.note(n.key, n.reference, n.known, span, w);
         }
     }
 
@@ -224,13 +193,15 @@ impl Decider {
         Ok(value)
     }
 
-    /// Decides a call. Nothing changes until [`Decider::apply`].
+    /// Decides a call, reading the keys the slow path needs through `local`. Nothing changes until
+    /// [`Decider::apply`].
     pub(crate) fn plan(
         &self,
         readings: &[Reading],
         intent: Intent,
         clock: Clock,
         call: u64,
+        local: &mut dyn LocalFacts,
     ) -> Plan {
         let revise = intent == Intent::Revise;
         let mut plan = Plan {
@@ -238,9 +209,36 @@ impl Decider {
             items: Vec::with_capacity(readings.len()),
             ..Plan::default()
         };
-        let mut batch_history: HashMap<(u32, i64), Vec<Known>> =
-            HashMap::with_capacity(readings.len());
-        let mut batch_versions: HashMap<(u32, i64), u64> = HashMap::new();
+        // A reading with revise intent bypasses the check (§2.4) and is never outranked (it is refused on a
+        // versioned series), so it needs no read.
+        let mut slow: Vec<Key> = Vec::new();
+        if !revise {
+            let mut seen = HashSet::new();
+            for r in readings {
+                let key = (r.series.0, r.t.0);
+                if matches!(self.history.facts(key), Facts::Slow(_))
+                    && seen.insert(key)
+                    && self.refusal(r, revise).is_ok()
+                {
+                    slow.push(key);
+                }
+            }
+        }
+        let found = if slow.is_empty() {
+            super::keys::Found::default()
+        } else {
+            local.at(&slow)
+        };
+        let read: HashMap<Key, Vec<Known>> = slow
+            .iter()
+            .map(|k| {
+                let facts = found.facts.get(k).map_or_else(Vec::new, |fs| {
+                    fs.iter().map(|f| Known::of(&f.row, 0)).collect()
+                });
+                (*k, facts)
+            })
+            .collect();
+        let mut batch: HashMap<Key, Vec<Known>> = HashMap::with_capacity(readings.len());
         let mut batch_reference: HashMap<u32, i64> = HashMap::new();
         for r in readings {
             let value = match self.refusal(r, revise) {
@@ -274,27 +272,32 @@ impl Decider {
                 && observed
                 && reach > clock.wall.saturating_add(clock.future_tolerance);
             let key = (r.series.0, r.t.0);
-            let recorded = self
-                .history
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .chain(batch_history.get(&key).into_iter().flatten());
-            let top = r.changed_at.and_then(|_| {
-                self.versions
-                    .get(&key)
+            let (state, unreadable): (Vec<&Known>, bool) = match self.history.facts(key) {
+                Facts::Known(v) => (v, false),
+                Facts::Slow(overlay) if !revise => {
+                    plan.slow += 1;
+                    let mut v: Vec<&Known> = read.get(&key).into_iter().flatten().collect();
+                    v.extend(overlay);
+                    (v, found.unreadable.contains(&key))
+                }
+                Facts::Slow(overlay) => (overlay, false),
+            };
+            let recorded = || {
+                state
+                    .iter()
                     .copied()
-                    .max(batch_versions.get(&key).copied())
-            });
+                    .chain(batch.get(&key).into_iter().flatten())
+            };
+            let top = r
+                .changed_at
+                .and_then(|_| recorded().filter_map(|k| k.changed_at).max());
             // The facts this reading duplicates (§2.4); a `changed_at` above every one of its key's is never a
             // duplicate.
             let matched: Vec<&Known> = match r.changed_at {
-                None => recorded
-                    .into_iter()
+                None => recorded()
                     .filter(|k| k.identical(&value, supplied))
                     .collect(),
-                Some(c) if top.is_some_and(|top| c <= top) => recorded
-                    .into_iter()
+                Some(c) if top.is_some_and(|top| c <= top) => recorded()
                     .filter(|k| k.changed_at == Some(c) && k.identical(&value, supplied))
                     .collect(),
                 Some(_) => Vec::new(),
@@ -312,9 +315,8 @@ impl Decider {
             // reference by more than 2 × S; on any series, older than the lateness bound. Neither before the clock
             // is synchronised (§2.5).
             let reference = self
-                .reference
-                .get(&r.series.0)
-                .copied()
+                .history
+                .reference(r.series.0)
                 .max(batch_reference.get(&r.series.0).copied());
             let out_of_order = match (reference, d.staleness) {
                 (Some(rf), Some(st)) => {
@@ -340,161 +342,35 @@ impl Decider {
                 changed_at: r.changed_at,
             };
             let outranked = r.changed_at.is_some_and(|c| top.is_some_and(|top| c < top));
-            batch_history
-                .entry(key)
-                .or_default()
-                .push(Known::of(&row, call));
-            if let Some(c) = r.changed_at {
-                let v = batch_versions.entry(key).or_insert(c);
-                *v = (*v).max(c);
-            }
-            if !future && clock.synced {
+            let known = Known::of(&row, call);
+            batch.entry(key).or_default().push(known.clone());
+            let raises = !future && clock.synced;
+            if raises {
                 let v = batch_reference.entry(r.series.0).or_insert(r.t.0);
                 *v = (*v).max(r.t.0);
             }
+            plan.notes.push(Note {
+                key,
+                reference: raises,
+                known,
+            });
             plan.decisions.push(Decision::Record {
                 item: plan.items.len(),
                 outranked,
                 absent,
                 late,
                 future,
+                unchecked: unreadable,
             });
             plan.items.push(Item::Fact(row));
         }
-        plan.history = batch_history;
-        plan.versions = batch_versions;
-        plan.reference = batch_reference;
+        plan.whole = read
+            .into_iter()
+            .filter(|(k, _)| !found.unreadable.contains(k))
+            .collect();
         plan
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use kvik_log::entries::Entry;
-
-    use super::*;
-    use crate::durable::registry::definition_of;
-    use crate::series::{ChangedAtKind, Kind, SeriesSpec, ValueType};
-    use crate::time::Timestamp;
-    use crate::types::{Quality, SeriesId};
-
-    const T0: i64 = 1_767_225_600_000_000_000;
-    const S: i64 = 1_000_000_000;
-
-    fn decider() -> Decider {
-        let mut d = Decider::default();
-        let gauge = SeriesSpec::new(
-            "a/b/c",
-            Kind::Gauge {
-                value: ValueType::F64,
-            },
-            "W",
-        );
-        let versioned = gauge.clone().versioned(ChangedAtKind::Version);
-        for (id, spec) in [(1, gauge), (2, versioned)] {
-            let def = definition_of(&spec, id, Duration::from_secs(300)).unwrap();
-            d.registry.apply(&Entry::Definition(Box::new(def)));
-        }
-        d
-    }
-
-    fn reading(series: u32, t: i64, v: f64, changed_at: Option<u64>) -> Reading {
-        Reading {
-            changed_at,
-            quality: if v < 0.0 { Quality::Bad } else { Quality::Good },
-            ..Reading::new(SeriesId(series), Timestamp(t), Value::F64(v))
-        }
-    }
-
-    #[test]
-    fn a_call_mixing_versioned_and_unversioned_series_decides_duplicates_and_outranked_per_key() {
-        let clock = Clock {
-            wall: T0 + 3_600 * S,
-            synced: true,
-            future_tolerance: 60 * S,
-        };
-        let mut d = decider();
-        let first = [reading(2, T0, 1.0, Some(5)), reading(1, T0, 1.0, None)];
-        let mut first = d.plan(&first, Intent::Normal, clock, 1);
-        d.apply(&mut first);
-        let readings = [
-            reading(1, T0, 1.0, None),
-            reading(2, T0, 2.0, Some(3)),
-            reading(2, T0, 1.0, Some(5)),
-            reading(1, T0 + S, 1.0, None),
-            reading(2, T0 + S, 1.0, Some(1)),
-            reading(2, T0 + S, 3.0, Some(0)),
-            reading(1, T0 + S, 1.0, None),
-        ];
-        let plan = d.plan(&readings, Intent::Normal, clock, 2);
-        let got: Vec<_> = plan
-            .decisions
-            .iter()
-            .map(|x| match x {
-                Decision::Record { outranked, .. } => Some(*outranked),
-                Decision::Duplicate => None,
-                Decision::Refused(r) => panic!("refused: {r:?}"),
-            })
-            .collect();
-        assert_eq!(
-            got,
-            [
-                None,
-                Some(true),
-                None,
-                Some(false),
-                Some(false),
-                Some(true),
-                None
-            ]
-        );
-        assert_eq!(plan.depends, Some(1));
-    }
-
-    #[test]
-    fn apply_takes_in_what_noting_each_planned_fact_in_order_would() {
-        let clock = Clock {
-            wall: T0 + 3_600 * S,
-            synced: true,
-            future_tolerance: 60 * S,
-        };
-        let mut d = decider();
-        // The state is above the plan: a later time on series 1, a higher version at series 2's key.
-        let first = [
-            reading(1, T0, 1.0, None),
-            reading(1, T0 + 3_000 * S, 1.0, None),
-            reading(2, T0, 1.0, Some(20)),
-        ];
-        let mut first = d.plan(&first, Intent::Normal, clock, 1);
-        d.apply(&mut first);
-        let readings = [
-            reading(1, T0, 2.0, None),
-            reading(1, T0 + S, 3.0, None),
-            reading(1, T0, 4.0, None),
-            reading(1, T0 - 7_200 * S, 5.0, None),
-            reading(1, T0 + 7_200 * S, 6.0, None),
-            reading(2, T0, 1.0, Some(3)),
-            reading(2, T0, 2.0, Some(9)),
-            reading(2, T0, 3.0, Some(5)),
-            reading(1, T0 + 2 * S, -1.0, None),
-        ];
-        let mut plan = d.plan(&readings, Intent::Normal, clock, 2);
-        let mut noted = d.clone();
-        for item in &plan.items {
-            if let Item::Fact(r) = item {
-                noted.note(r, 2);
-            }
-        }
-        assert_eq!(plan.items.len(), readings.len());
-        d.apply(&mut plan);
-        assert_eq!(d.history, noted.history);
-        assert_eq!(d.versions, noted.versions);
-        assert_eq!(d.reference, noted.reference);
-        assert_eq!(d.history[&(1, T0)].len(), 3);
-        assert_eq!(d.history[&(2, T0)].len(), 4);
-        assert_eq!(d.reference[&1], T0 + 3_000 * S);
-        assert_eq!(d.versions[&(2, T0)], 20);
-    }
-}
+mod tests;

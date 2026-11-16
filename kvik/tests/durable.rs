@@ -6,6 +6,7 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -612,6 +613,8 @@ enum Step {
     Advance(u64),
     /// The clock is reported synchronised or not (spec §2.5).
     Synced(bool),
+    /// The store is shut down and opened again.
+    Restart,
 }
 
 fn specs() -> Vec<SeriesSpec> {
@@ -684,9 +687,10 @@ fn quality(code: u8) -> Quality {
 }
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
+    // Times far apart as well, so that keys leave the recent window (15 minutes) and are met again (roadmap 11.0).
     let reading = (
         0usize..8,
-        -400i64..200,
+        prop_oneof![8 => -400i64..200, 2 => -4_000i64..4_000],
         any::<u8>(),
         any::<u8>(),
         prop_oneof![Just(None), (0u64..3).prop_map(Some)],
@@ -696,7 +700,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
     // within one call, interleaved. Within a call the versioned readings' `changed_at` does not rise (Q-705).
     let keyed = (
         prop::sample::select(vec![0usize, 4]),
-        0i64..4,
+        prop::sample::select(vec![0i64, 1, 2, 3, 1_500, 3_000]),
         0u8..2,
         0u8..2,
         0u64..3,
@@ -723,6 +727,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         1 => (0usize..ZONES.len(), -100i64..100).prop_map(|(z, t)| Step::SiteZone(z, t)),
         2 => (0u64..400).prop_map(Step::Advance),
         1 => prop::bool::weighted(0.7).prop_map(Step::Synced),
+        1 => Just(Step::Restart),
     ];
     prop::collection::vec(step, 1..16)
 }
@@ -737,7 +742,9 @@ struct Run {
 /// Runs a history on a store. Positions differ between the backends only by entries that are not facts (the model
 /// writes no recovery or tzdata entry); facts are compared without them, and the as-of views at the positions each
 /// backend gave the same readings.
-fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
+fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (Run, Store) {
+    let mut zone = "Europe/London";
+    let mut s = open(zone);
     let mut out = Vec::new();
     let mut ids: Vec<SeriesId> = specs()
         .into_iter()
@@ -834,16 +841,23 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
                         .map_err(|e| e.to_string())
                 ));
             }
-            Step::SiteZone(z, t) => out.push(format!(
-                "zone {:?}",
-                block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)))
-                    .map_err(|e| e.to_string())
-            )),
+            Step::SiteZone(z, t) => {
+                let r = block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)));
+                if r.is_ok() {
+                    zone = ZONES[*z];
+                }
+                out.push(format!("zone {:?}", r.map_err(|e| e.to_string())));
+            }
             Step::Advance(secs) => {
                 clock.advance(Duration::from_secs(*secs));
                 times.push(clock.wall());
             }
             Step::Synced(on) => clock.set_synchronised(*on),
+            Step::Restart => {
+                block_on(s.shutdown()).unwrap();
+                drop(s);
+                s = open(zone);
+            }
         }
     }
     clock.set_synchronised(true);
@@ -885,7 +899,7 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
             )
         })
         .collect();
-    Run { out, facts, infos }
+    (Run { out, facts, infos }, s)
 }
 
 /// `late` as spec §2.2 defines it, for the facts of one series in position order: the first clause against the
@@ -951,22 +965,25 @@ fn the_durable_backend_decides_as_the_model_does() {
     runner
         .run(&steps(), |history| {
             let m_clock = ManualClock::new(start());
-            let model = block_on(Store::open(
-                StoreConfig::new(
-                    format!("kvik-test/differential/{}", next()),
-                    "Europe/London",
-                )
-                .create_if_missing(true)
-                .backend(Backend::Model)
-                .env(Env::test(m_clock.clone())),
-            ))
-            .unwrap();
+            let m_config = StoreConfig::new(
+                format!("kvik-test/differential/{}", next()),
+                "Europe/London",
+            )
+            .create_if_missing(true)
+            .backend(Backend::Model)
+            .env(Env::test(m_clock.clone()));
             let w = World::new("differential");
             let mut config = w.config();
             config.log.min_sync_interval = Duration::ZERO;
-            let durable = block_on(Store::open(config)).unwrap();
-            let m = run(&model, &m_clock, &history);
-            let d = run(&durable, &w.clock, &history);
+            // A restart opens with the site zone in force (`docs/api.md` Opening).
+            let in_zone = |c: &StoreConfig, z: &str| {
+                let mut c = c.clone();
+                c.time_zone = z.into();
+                block_on(Store::open(c)).unwrap()
+            };
+            let (m, model) = run(&|z| in_zone(&m_config, z), &m_clock, &history);
+            let (d, durable) = run(&|z| in_zone(&config, z), &w.clock, &history);
+            SLOW.fetch_add(durable.stats().ingest.slow_path, Ordering::Relaxed);
             prop_assert_eq!(&m.out, &d.out);
             prop_assert_eq!(&m.infos, &d.infos);
             prop_assert_eq!(without_late(&m.facts), without_late(&d.facts));
@@ -987,10 +1004,16 @@ fn the_durable_backend_decides_as_the_model_does() {
             Ok(())
         })
         .unwrap();
+    assert!(
+        SLOW.load(Ordering::Relaxed) > 0,
+        "some history takes the slow path"
+    );
 }
 
+/// Readings the differential histories decided by the slow path.
+static SLOW: AtomicU64 = AtomicU64::new(0);
+
 fn next() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Ordering::SeqCst)
 }
