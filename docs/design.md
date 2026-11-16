@@ -70,6 +70,11 @@ with ALP for decimal `f64` data, about 1 % for the same series declared as scale
 dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.3
 confirms the format against Parquet.
 
+**Crafted files.** The restart budget covers files the engine wrote, damaged or not. A file crafted by a process
+with write access to the store is not held to it, but costs no more than a linear scan: what is checksummed and the
+block headers read are linear in its length, and memory is bounded (`format.md` A, common rules: scan bound; Q-110).
+The checks of checksum-valid bodies nested in one another are still bounded per block only (Q-230).
+
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).
 

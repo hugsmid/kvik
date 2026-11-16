@@ -38,6 +38,11 @@ specified here before the roadmap item that writes it.
   region, a torn tail or a lost range, and recovery never truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
+- **Scan bound.** A reader's work on a file is linear in its length whatever its bytes: at most twice the file's
+  length is checksummed, and memory is bounded by the largest block the header limits allow. Files the engine wrote,
+  damaged or not, are read exactly as before. A body checksum is derived from a table of prefix checksums by a CRC
+  shift, so a block image nested in another costs arithmetic, not bytes; the acceptance rules (A.2, A.14) are
+  unchanged (Q-110). The checks of a checksum-valid body by its type are bounded per block, not per file (Q-230).
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |
@@ -450,7 +455,8 @@ exists; a new file is created only when none exists.
   store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file.
 - A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor, lease and registry
   file decoders included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
-  length before it is checked against the body, and decoded output is bounded by the row and entry limits.
+  length before it is checked against the body, and decoded output is bounded by the row and entry limits. The
+  segment and manifest targets also check the scan bound (common rules).
 - Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
   batches before it.
 
