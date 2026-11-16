@@ -100,7 +100,6 @@ impl Writer {
             }
         }
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
-        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let hub = match deliver::Deliverer::open(
             &dir,
             &env,
