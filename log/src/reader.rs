@@ -344,6 +344,8 @@ pub struct LogReader {
     scratch: Scratch,
     /// Sealed segments' indexes read by [`LogReader::lookup`], by file id.
     seal_index: std::collections::HashMap<u64, lookup::SealIndex>,
+    /// What [`LogReader::lookup`] has read of each segment, by file id.
+    maps: std::collections::HashMap<u64, lookup::SegmentMap>,
     closed: bool,
 }
 
@@ -381,6 +383,7 @@ impl LogReader {
             lost: Vec::new(),
             scratch: Scratch::default(),
             seal_index: std::collections::HashMap::new(),
+            maps: std::collections::HashMap::new(),
             closed: false,
             cfg,
         };

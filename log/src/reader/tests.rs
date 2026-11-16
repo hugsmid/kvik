@@ -350,6 +350,17 @@ mod parts_and_lookup {
         let path = Path::new("s")
             .join(crate::store::LOG_DIR)
             .join(first.to_string());
+        let mut r = reader(&fs, 13);
+        let everything = Wanted {
+            series_id: 5,
+            from: i64::MIN,
+            to: i64::MAX,
+        };
+        // A first lookup maps every segment; the damage comes after, in a batch the map holds.
+        assert_eq!(
+            r.lookup(&[everything], &|_, _| false).unwrap().complete,
+            [true]
+        );
         let bytes = fs.read(&path).unwrap();
         // A byte inside the first batch's data: the region starts at the header's end.
         fs.poke(&path, HEADER_LEN + 40, &[bytes[HEADER_LEN + 40] ^ 0xFF]);
@@ -365,7 +376,6 @@ mod parts_and_lookup {
             from: t,
             to: t,
         };
-        let mut r = reader(&fs, 13);
         let got = r
             .lookup(&[key(damaged_t), key(later)], &|_, _| false)
             .unwrap();
@@ -375,5 +385,44 @@ mod parts_and_lookup {
         let got = r.lookup(&[key(damaged_t), key(later)], &lost).unwrap();
         assert_eq!(got.complete, vec![true, true]);
         assert_eq!(got.facts.len(), 1);
+    }
+
+    #[test]
+    fn a_lookup_after_appends_finds_what_a_first_lookup_finds() {
+        let (fs, log) = store(150);
+        let mut r = reader(&fs, 14);
+        let wanted = |t| {
+            [
+                Wanted {
+                    series_id: 3,
+                    from: 0,
+                    to: 0,
+                },
+                Wanted {
+                    series_id: 8,
+                    from: t,
+                    to: t + 3,
+                },
+            ]
+        };
+        let found = |l: Lookup| -> Vec<(Position, FactRow)> {
+            l.facts.into_iter().map(|f| (f.position, f.row)).collect()
+        };
+        for round in 0..4 {
+            let t = 40 * round;
+            let again = found(r.lookup(&wanted(t), &|_, _| false).unwrap());
+            let fresh = found(reader(&fs, 15).lookup(&wanted(t), &|_, _| false).unwrap());
+            assert_eq!(again, fresh, "round {round}");
+            assert!(!again.is_empty());
+            for k in 0..40 {
+                let items: Vec<Item> = (0..20).map(|i| fact(i, 150 + 40 * round + k, 1)).collect();
+                log.submit(items).unwrap().wait().unwrap();
+            }
+            log.submit(vec![fact(3, 0, 7_000 + round as u64)])
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        log.shutdown().unwrap();
     }
 }
