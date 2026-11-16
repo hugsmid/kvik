@@ -908,10 +908,17 @@ for that lock: `try_emit` does not wait for room in the queue, but it does wait 
 **Now.** No lock is held while a call waits for room (`kvik/tests/durable.rs`
 `with_the_queue_full_try_emit_is_busy_at_once_while_other_calls_wait_for_room`); the wait for an entry's
 acknowledgement is under the lock. A routing change (roadmap 5.2) is decided with the lock already held, so it
-waits for room in a full queue with the lock held too.
+waits for room in a full queue with the lock held too. With the disk critical and the queue full nothing leaves the
+queue, so that routing change holds the decision lock, and the read side of the log's lock, until free space
+returns: `try_emit` waits for the decision lock instead of returning `Busy(Wait::DiskFull)`, and `shutdown` does not
+return, since it needs the write side of the log's lock to stop the log. Calls waiting for room hold no lock and are
+not affected. Every entry waited so before definitions, aliases, retirements, parameters and zones moved to waiting
+for room with no lock held (`commit_entry`); routing changes still do (`commit_entry_held`). Seen by a probe, not
+pinned by a test; which lock `shutdown` waits on is by reading.
 **Needed.** A choice between taking an entry into the decision state when it is queued (a failure leaves the store
 read-only, so nothing is decided after it) and keeping the present wait as an accepted limit of `try_emit`, measured
-with the routing and delivery benchmarks of roadmap 5.5.
+with the routing and delivery benchmarks of roadmap 5.5; and for routing changes, waiting for room before taking
+the lock (`offer` with `wait_room`, as `commit_entry` does) or a wait that does not hold the log's guard.
 
 ## Q-203 — The identity of a loss found while the store is open that grows downward before a start records it
 
