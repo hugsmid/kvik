@@ -426,3 +426,25 @@ fn an_undamaged_segment_is_read_in_one_pass_of_direct_reads() {
     let bodies: usize = r.batches.iter().map(|b| b.blocks[0].block.body.len()).sum();
     assert_eq!(stats.bytes_body_checked, bodies as u64);
 }
+
+#[test]
+fn the_bound_holds_body_checks_and_failed_reads_per_window() {
+    let len = 1u64 << 20;
+    // Twice the file, the direct read that found damage, and two batches (here the file) per failed read.
+    let at_bound = ScanStats {
+        bytes_body_checked: 3 * len + 2 * FAILED_READS_PER_WINDOW * len,
+        failed_reads_peak: FAILED_READS_PER_WINDOW,
+        ..ScanStats::default()
+    };
+    assert!(at_bound.within_bound(len));
+    let more_body = ScanStats {
+        bytes_body_checked: at_bound.bytes_body_checked + 1,
+        ..at_bound
+    };
+    assert!(!more_body.within_bound(len));
+    let more_failed = ScanStats {
+        failed_reads_peak: FAILED_READS_PER_WINDOW + 1,
+        ..at_bound
+    };
+    assert!(!more_failed.within_bound(len));
+}

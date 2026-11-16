@@ -41,16 +41,23 @@ specified here before the roadmap item that writes it.
 - **Scan bound.** A reader's work on a file of L bytes is bounded whatever its bytes. At most 2L bytes are
   checksummed, plus, in a log segment, once more the bytes of the one direct read that found the first damage (at most
   a batch, 8 MiB). Block headers are read at most 16 times per 8 bytes. Working memory, beyond the file and what the
-  read reports, is about one batch in a segment and one block (16 MiB) in the manifest. A body whose checksum holds is
-  checked by its type (A.5, A.6, A.14) a bounded number of times per candidate, and a candidate's bodies span at most
-  a window w: in a segment w = 8 MiB (a batch), and resynchronisation reads a candidate in full only at the offset its
-  commit block names, so at most one candidate per commit block; in the manifest w = 16 MiB (a body), at most one
-  candidate per 8-byte step. These checks therefore cost at most about L/8 × w, linear in L for the fixed w; only a
-  writer of the file can reach that figure, as random damage stops at the checksum (Q-230). A body checksum is derived
-  from a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes
-  (Q-110). An undamaged segment is read in one pass of direct checksums; the bounded reading starts at the first
-  boundary read that finds no complete batch and holds to the end of the scan (Q-231). The acceptance rules (A.2,
-  A.14) are unchanged: files the engine wrote, damaged or not, are read with exactly the same results as before.
+  read reports, is about one batch in a segment and one block (16 MiB) in the manifest. A body checksum is derived from
+  a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes (Q-110).
+  A body whose checksum holds is checked by its type (A.5, A.6, A.14). A **failed read** is a candidate read in full,
+  with at least one body checked, that is rejected: a resynchronisation candidate or a boundary read that keeps no
+  batch (A.2), or a manifest record whose checksum holds and whose fields are rejected (A.14). The file is divided into
+  **windows** of w bytes from offset 0: w = 8 MiB (a batch) in a log segment, 16 MiB (a body) in the manifest. After
+  8 failed reads in one window, no other candidate in it is read in full: the rest of the window is passed as damaged
+  and reported with the invalid region, corrupt record or torn tail it falls in (Q-110). Files the engine wrote,
+  damaged or not, never reach 8: a failed read needs intact headers, framing and `batch_crc32c` around a body that
+  fails its checks, and damage gives a handful at most. Body checks therefore total at most 2L, the direct read that
+  found damage, and two batches per failed read (16 batches per window): about 1.1 GiB of bodies for a 64 MiB
+  segment and 300 MiB for a 16 MiB one. A facts row takes at least 20 bytes of body and decodes in about 100 ns at
+  most (a 255-byte text value, release build), so a crafted segment costs at most about 6 s at 64 MiB and 1.6 s at
+  16 MiB, against 29 to 170 ms for an undamaged one; a crafted manifest at most about 0.3 s per 16 MiB (Q-230). An
+  undamaged segment is read in one pass of direct checksums; the bounded reading starts at the first boundary read
+  that finds no complete batch and holds to the end of the scan (Q-231). Apart from the window rule, which only a
+  writer of the file can trigger, the acceptance rules (A.2, A.14) are unchanged.
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |
@@ -98,7 +105,9 @@ each data block's `body_crc32c`, every body (A.7), so a batch image at any other
 that imitate a batch without its exact blocks, are not accepted. A reader
 process applies the same rule below the mark's `offset` and never above it. A structural failure inside a
 checksum-valid block (the checks of A.5 and A.6) makes the block invalid; the region is handled as corruption
-(`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14).
+(`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14). After 8 failed reads in
+one 8 MiB window of the file (common rules: scan bound), the rest of that window is not read: it lies in the invalid
+region, or the torn tail, that holds it.
 
 ### A.3 Versioning
 - A reader refuses a file whose `format_major` is greater than it supports, with an error that names both
@@ -618,7 +627,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   Fields that settling Q-33 and Q-48 needs are added by roadmap 4.5 as new field ids.
 - A torn tail and a corrupt record are told apart as `spec.md` §7 Manifest says: a forward search at 8-byte steps
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
-  synced.
+  synced. After 8 failed reads in one 16 MiB window of the file (common rules: scan bound), the search passes the
+  rest of that window: a valid record beyond it makes the passed bytes part of the corrupt span; with none, they are
+  part of the torn tail (Q-650).
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
   with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator

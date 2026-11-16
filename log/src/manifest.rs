@@ -4,11 +4,11 @@
 //! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire, sealed-segment and reserved
 //! (restore, quarantine, tier-move) records over as field lists, taking only their epochs.
 
-use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block_with};
+use crate::block::{BLOCK_HEADER_LEN, MAX_BODY_LEN, encode_block, read_block_with};
 use crate::crc::PrefixCrc;
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
-use crate::scan::ScanStats;
+use crate::scan::{FailedReads, ScanStats};
 
 /// An empty record.
 pub const RECORD_EMPTY: u8 = 0x20;
@@ -191,6 +191,7 @@ struct Search<'a> {
     sums: PrefixCrc<'a>,
     headers: u64,
     body: u64,
+    failed: FailedReads,
 }
 
 impl<'a> Search<'a> {
@@ -200,6 +201,7 @@ impl<'a> Search<'a> {
             sums: PrefixCrc::new(bytes),
             headers: 0,
             body: 0,
+            failed: FailedReads::new(u64::from(MAX_BODY_LEN)),
         }
     }
 
@@ -208,6 +210,7 @@ impl<'a> Search<'a> {
             bytes_checksummed: self.sums.checksummed(),
             headers_visited: self.headers,
             bytes_body_checked: self.body,
+            failed_reads_peak: self.failed.peak(),
         }
     }
 
@@ -236,12 +239,16 @@ impl<'a> Search<'a> {
         let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
         self.body += body.len() as u64;
         let Some(list) = fields(&body[RECORD_PREFIX..]) else {
+            self.failed.count(at);
             return Ok(None);
         };
         let lost = match t {
             RECORD_LOST_RANGE => match decode_lost(&list) {
                 Some(l) => Some(l),
-                None => return Ok(None),
+                None => {
+                    self.failed.count(at);
+                    return Ok(None);
+                }
             },
             RECORD_EMPTY
             | RECORD_PUBLISH
@@ -315,10 +322,17 @@ fn read_all(
         }
     }
     let valid_end = at.min(bytes.len() as u64);
-    // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced.
+    // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced. Past
+    // the failed reads allowed in a window, the rest of it is passed as damaged (`format.md` A, common rules: scan
+    // bound).
     let min = records.last().map_or(0, |r| r.epoch);
     let mut probe = valid_end + 8;
     while probe + (BLOCK_HEADER_LEN as u64) <= bytes.len() as u64 {
+        let next = search.failed.next_from(probe);
+        if next != probe {
+            probe = next;
+            continue;
+        }
         if search.record_at(probe, min)?.is_some() {
             return Err(ManifestError::Corrupt(valid_end));
         }

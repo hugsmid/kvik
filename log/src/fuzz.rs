@@ -73,6 +73,9 @@ pub fn decode_all(data: &[u8]) {
     }
     let (_, stats) = crate::scan::legacy::scan_ignoring_seal(data, &id, false);
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+    // As a manifest (A.14), read by the start's reader for the store its header names.
+    let (_, stats) = crate::manifest::read_manifest_with_stats(data, &id.store_id);
+    assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
     let _ = FileHeader::decode(data);
     let _ = read_mark(data, &id.store_id);
     // As a mark file: the store id where slot 0 holds it.

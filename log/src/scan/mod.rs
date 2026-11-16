@@ -15,7 +15,7 @@ mod resync;
 mod walk;
 
 pub(crate) use reads::Reads;
-pub use reads::{HEADERS_PER_WORD, ScanStats};
+pub use reads::{FAILED_READS_PER_WINDOW, FailedReads, HEADERS_PER_WORD, ScanStats};
 use resync::{Chains, CommitSearch, readable_commits};
 use walk::Walks;
 

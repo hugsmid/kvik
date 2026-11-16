@@ -93,8 +93,25 @@ fn judge(reads: &mut Reads<'_>, p: u64, o: u64, limit: u64) -> Judged {
 }
 
 impl Walks {
-    /// `read_batch(o, Refusal::AtOnce)`, with the same result.
+    /// `read_batch(o, Refusal::AtOnce)`, with the same result; a read that checked a body and kept no batch is
+    /// counted against its window (`format.md` A, common rules: scan bound).
     pub(crate) fn read<'a>(
+        &mut self,
+        reads: &mut Reads<'a>,
+        id: &SegmentIdentity,
+        o: u64,
+        limit: u64,
+        min_first: u64,
+    ) -> BatchRead<'a> {
+        let before = reads.body_checked();
+        let r = self.walk(reads, id, o, limit, min_first);
+        if matches!(r, BatchRead::Incomplete { .. }) && reads.body_checked() > before {
+            reads.failed.count(o);
+        }
+        r
+    }
+
+    fn walk<'a>(
         &mut self,
         reads: &mut Reads<'a>,
         id: &SegmentIdentity,

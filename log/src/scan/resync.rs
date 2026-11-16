@@ -121,7 +121,8 @@ impl Chains {
     /// block too long for a batch ends the chain. A candidate `o` goes further only when that commit's
     /// `batch_bytes` is the distance from `o`, which one candidate per commit block is; then its framing and
     /// `batch_crc32c` are checked on headers ([`framing_holds`]); only a candidate that passes is read in full,
-    /// its body checksums taken from the prefix table (Q-110).
+    /// its body checksums taken from the prefix table (Q-110). Past [`super::FAILED_READS_PER_WINDOW`] failed reads
+    /// in a window, the rest of the window is not read (Q-110).
     pub(crate) fn resync<'a>(
         &mut self,
         reads: &mut Reads<'a>,
@@ -142,6 +143,13 @@ impl Chains {
                 self.pruned = o;
                 reads.forget_below(commits.as_deref().map_or(o, |c| c.next.min(o)));
             }
+            // Past the failed reads allowed in a window, the rest of it is passed as damaged (`format.md` A, common
+            // rules: scan bound).
+            let next = reads.failed.next_from(o);
+            if next != o && !self.reference {
+                o = next;
+                continue;
+            }
             // A zero word cannot start a block header (type 0 is never valid), and a header that fails its
             // checksum cannot start a batch: both are passed without reading further.
             if slice(reads.bytes, o, 8).is_none_or(|w| u64_at(w, 0) == 0)
@@ -154,9 +162,13 @@ impl Chains {
                 c.at > o && c.batch_bytes == c.at - o && c.at - o <= MAX_BATCH_DATA
             });
             if candidate && framing_holds(reads, id, o, limit) {
+                let before = reads.body_checked();
                 match read_batch(reads, id, o, limit, min_first, Refusal::IfBatchVerifies) {
                     BatchRead::Complete(b) => return Ok(Some(b)),
                     BatchRead::Refused(e) => return Err(e),
+                    BatchRead::Incomplete { .. } if reads.body_checked() > before => {
+                        reads.failed.count(o);
+                    }
                     BatchRead::Incomplete { .. } => {}
                 }
             }

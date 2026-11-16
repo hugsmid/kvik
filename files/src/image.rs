@@ -10,7 +10,7 @@ use kvik_log::FormatError;
 use kvik_log::block::{BLOCK_HEADER_LEN, BlockHeader, MAX_BODY_LEN};
 use kvik_log::crc::PrefixCrc;
 use kvik_log::header::{FileHeader, HEADER_LEN, kind};
-use kvik_log::scan::ScanStats;
+use kvik_log::scan::{FailedReads, ScanStats};
 
 use crate::record::{RECORD_PREFIX, Record, RecordError};
 
@@ -89,6 +89,7 @@ struct Search<'a> {
     sums: PrefixCrc<'a>,
     headers: u64,
     body: u64,
+    failed: FailedReads,
 }
 
 impl<'a> Search<'a> {
@@ -98,6 +99,7 @@ impl<'a> Search<'a> {
             sums: PrefixCrc::new(bytes),
             headers: 0,
             body: 0,
+            failed: FailedReads::new(u64::from(MAX_BODY_LEN)),
         }
     }
 
@@ -106,6 +108,7 @@ impl<'a> Search<'a> {
             bytes_checksummed: self.sums.checksummed(),
             headers_visited: self.headers,
             bytes_body_checked: self.body,
+            failed_reads_peak: self.failed.peak(),
         }
     }
 
@@ -149,7 +152,10 @@ impl<'a> Search<'a> {
                 end: at + h.block_len(),
                 record: r,
             })),
-            Ok(_) | Err(RecordError::Invalid(_)) => Ok(None),
+            Ok(_) | Err(RecordError::Invalid(_)) => {
+                self.failed.count(at);
+                Ok(None)
+            }
             Err(RecordError::Unsupported(element)) => Err(FormatError::Unsupported {
                 offset: at,
                 element,
@@ -198,10 +204,16 @@ fn read_all(
             records.push(p);
             continue;
         }
-        // An invalid record, or the end: search forward for a valid record of a higher epoch.
+        // An invalid record, or the end: search forward for a valid record of a higher epoch. Past the failed reads
+        // allowed in a window, the rest of it is passed as damaged (`format.md` A, common rules: scan bound).
         let mut probe = at + 8;
         let mut found = None;
         while probe + (BLOCK_HEADER_LEN as u64) <= len {
+            let next = search.failed.next_from(probe);
+            if next != probe {
+                probe = next;
+                continue;
+            }
             if let Some(p) = search
                 .record_at(probe, min)
                 .map_err(ReadError::Unsupported)?
@@ -297,5 +309,101 @@ mod tests {
             );
             assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
         }
+    }
+
+    /// A manifest whose first record is damaged, then `m` lost-range records sharing one list of `g` ignorable empty
+    /// fields: record `k` starts inside a field of every record before it. Each has a valid checksum and no field 1,
+    /// so each is read in full and rejected.
+    fn crafted(m: u64, g: u64) -> Vec<u8> {
+        use kvik_log::crc::{crc32c, crc32c_shift};
+        let put = |f: &mut Vec<u8>, at: u64, b: &[u8]| {
+            f[at as usize..at as usize + b.len()].copy_from_slice(b);
+        };
+        let field = 0x8001u16;
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+            .encode()
+            .to_vec();
+        f.extend_from_slice(&[0xFF; 8]);
+        let base = f.len() as u64;
+        let e = (base + 48 * m + 4 * g).div_ceil(8) * 8;
+        f.resize(e as usize, 0);
+        let shared = base + 48 * m - 8;
+        for i in 0..(e - shared) / 4 {
+            put(&mut f, shared + 4 * i, &field.to_le_bytes());
+        }
+        let mut inner: Option<u32> = None;
+        for k in (0..m).rev() {
+            let p = base + 48 * k;
+            let body = p + 16;
+            put(&mut f, body, &(1_000 + k).to_le_bytes());
+            if k > 0 {
+                put(&mut f, p - 8, &field.to_le_bytes());
+                put(&mut f, p - 6, &44u16.to_le_bytes());
+            }
+            let crc = match inner {
+                None => crc32c(&f[body as usize..e as usize]),
+                Some(c) => {
+                    let head = crc32c(&f[body as usize..(body + 48) as usize]);
+                    crc32c_shift(head, e - body - 48) ^ c
+                }
+            };
+            inner = Some(crc);
+            let h = BlockHeader {
+                block_type: crate::record::record_type::LOST_RANGE,
+                flags: 0,
+                body_len: (e - body) as u32,
+                body_crc32c: crc,
+            };
+            put(&mut f, p, &h.encode());
+        }
+        f
+    }
+
+    fn empty(epoch: u64) -> Vec<u8> {
+        kvik_log::manifest::encode_record(kvik_log::manifest::RECORD_EMPTY, epoch, 0, 0, None)
+    }
+
+    #[test]
+    fn a_crafted_search_passes_the_rest_of_a_window_after_the_allowed_failed_reads() {
+        let mut f = crafted(2_000, 100_000);
+        f.extend(empty(1 << 40));
+        let (img, stats) = read_with_stats(&f, &[9; 16]);
+        assert_eq!(
+            stats.failed_reads_peak,
+            kvik_log::scan::FAILED_READS_PER_WINDOW
+        );
+        assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+        // The record in the passed part of the window is not found: the file reads as a torn tail.
+        let img = img.unwrap();
+        assert!(img.records.is_empty() && img.corrupt.is_empty() && img.torn);
+        // A record in the next window is found: the damaged record and the window form one corrupt span.
+        let window = u64::from(MAX_BODY_LEN);
+        f.resize(window as usize, 0);
+        f.extend(empty(1 << 41));
+        let img = read(&f, &[9; 16]).unwrap();
+        assert_eq!(img.records.len(), 1);
+        assert_eq!(
+            img.corrupt,
+            [CorruptSpan {
+                offset: HEADER_LEN as u64,
+                end: window,
+                after_epoch: 0,
+                before_epoch: 1 << 41,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_full_crafted_manifest_is_read_within_the_restart_budget() {
+        let f = crafted(20_000, 2_300_000);
+        let len = f.len() as u64;
+        let t = std::time::Instant::now();
+        let (img, stats) = read_with_stats(&f, &[9; 16]);
+        let elapsed = t.elapsed();
+        assert!(img.unwrap().torn);
+        assert!(stats.failed_reads_peak <= kvik_log::scan::FAILED_READS_PER_WINDOW);
+        assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+        // A ceiling for a slow shared machine; the restart budget is 1 s.
+        assert!(elapsed.as_secs() < 5, "{elapsed:?} for {len} bytes");
     }
 }
