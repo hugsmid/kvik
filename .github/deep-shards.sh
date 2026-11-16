@@ -30,6 +30,7 @@ recovery        model recovery_histories
 edge_cases      model edge_cases
 rules           model rules
 open_questions  model open_questions
+self_repair     model self_repair
 model           model model
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs

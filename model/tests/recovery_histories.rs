@@ -4,7 +4,9 @@
 //! take and confirm deliveries, crash, lose power (losing acknowledged
 //! batches above the last synced mark), remount, lose the mark or a cursor
 //! file, damage a batch, fail a start's sync, acknowledge losses, compact,
-//! upload, move files off the local tiers and let time pass.
+//! upload, move files off the local tiers and let time pass, and self-repair:
+//! damage a sealed segment, lose an object in the bucket, swap copies in,
+//! close losses and name corruptions seen.
 
 mod common;
 
@@ -12,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{T0, seqs};
 use kvik_model::engine::ConsumerId;
-use kvik_model::recovery::LossKind;
+use kvik_model::recovery::{Loss, LossCause, LossKind, LossState, Outcome};
 use kvik_model::types::{DAY, Kind, Nanos, SECOND};
 use proptest::prelude::*;
 
@@ -76,6 +78,26 @@ enum ROp {
     /// The clocks move on this many days, so tier moves take log segments
     /// off the local tiers and cursors fall behind the oldest local segment.
     Advance(u16),
+    /// The clocks move on this many minutes.
+    Minutes(u16),
+    /// The hot copy of a sealed segment is damaged and a scrub runs, with
+    /// the engine up or stopped.
+    CorruptSealed(usize),
+    /// Fill pressure moves every sealed segment verified in the bucket off
+    /// the fast disk.
+    Evict,
+    /// Every quarantined file is swapped for its copy where one exists.
+    RestoreFiles,
+    /// The bucket loses the object of an uploaded segment.
+    LoseObject(usize),
+    /// The scheduled check of the bucket, this many times, 5 minutes apart.
+    CheckBucket(u8),
+    /// The self-repair step closes every loss whose re-send stage ended.
+    Repair,
+    /// The application ends the re-send stage of the first open request.
+    RepairDone,
+    /// Every corruption is named as seen.
+    AcknowledgeCorruptions,
 }
 
 fn arb_rop() -> impl Strategy<Value = ROp> {
@@ -118,10 +140,34 @@ fn arb_rop() -> impl Strategy<Value = ROp> {
         1 => Just(ROp::Checkpoint),
         1 => Just(ROp::Upload),
         1 => prop_oneof![Just(1u16), Just(100)].prop_map(ROp::Advance),
+        4 => prop_oneof![
+            1 => prop_oneof![Just(5u16), Just(30)].prop_map(ROp::Minutes),
+            2 => (0usize..4).prop_map(ROp::CorruptSealed),
+            1 => Just(ROp::Evict),
+            1 => Just(ROp::RestoreFiles),
+            1 => (0usize..4).prop_map(ROp::LoseObject),
+            2 => (1u8..4).prop_map(ROp::CheckBucket),
+            1 => Just(ROp::Repair),
+            1 => Just(ROp::RepairDone),
+            1 => Just(ROp::AcknowledgeCorruptions),
+        ],
     ]
 }
 
 const RC: [ConsumerId; 2] = [ConsumerId(1), ConsumerId(2)];
+
+/// The losses with their closing and state set aside: what invariant 27 says
+/// acknowledging and closing never change.
+fn strip(v: &[Loss]) -> Vec<Loss> {
+    v.iter()
+        .map(|l| {
+            let mut l = l.clone();
+            l.acknowledged = false;
+            l.state = None;
+            l
+        })
+        .collect()
+}
 
 /// What a recovery history saw, for the properties and their guard.
 #[derive(Default)]
@@ -139,6 +185,15 @@ struct Seen {
     acknowledged: usize,
     possible: usize,
     data_lost: usize,
+    closed_by_repair: usize,
+    restored: usize,
+    lost_in_bucket: usize,
+    judged_lost: usize,
+    corruptions_seen: usize,
+    /// Every recorded corruption reported, with whether it was seen.
+    corruptions: BTreeMap<kvik_model::engine::Corruption, bool>,
+    /// The step names corruptions as seen.
+    acknowledging: bool,
     /// Every loss listed, by identity and kind, with its range.
     losses: BTreeMap<
         (kvik_model::types::Position, bool),
@@ -209,6 +264,17 @@ impl RWorld {
         }
     }
 
+    /// A lost range recorded at run time is followed by a restart: the model
+    /// sends no reset point for it in the session (Q-33 requirement 1, "the
+    /// writer restarts recovery when it records one").
+    fn restart_after_run_time_loss(&mut self, before: usize) {
+        if self.m.disk.lost_ranges().len() > before {
+            self.m.crash();
+            self.m.restart();
+            self.last = [None, None];
+        }
+    }
+
     fn down(&mut self) {
         if self.m.is_up() {
             self.m.crash();
@@ -228,6 +294,10 @@ impl RWorld {
             ROp::SyncMark
                 | ROp::Upload
                 | ROp::Advance(_)
+                | ROp::Minutes(_)
+                | ROp::LoseObject(_)
+                | ROp::CorruptSealed(_)
+                | ROp::Evict
                 | ROp::Crash
                 | ROp::PowerLoss(_)
                 | ROp::Remount
@@ -357,22 +427,135 @@ impl RWorld {
             ROp::Acknowledge if up => {
                 let ids: Vec<_> = self.m.losses().iter().map(|l| l.identity).collect();
                 let before = self.m.losses();
+                seen.acknowledging = true;
                 if self.m.acknowledge_losses(&ids).is_ok() && self.checks.inv27 {
                     let after = self.m.losses();
-                    let strip = |v: &[kvik_model::recovery::Loss]| -> Vec<_> {
-                        v.iter()
-                            .map(|l| {
-                                let mut l = l.clone();
-                                l.acknowledged = false;
-                                l
-                            })
-                            .collect()
-                    };
-                    // 27. Acknowledging changes only the health state.
+                    // 27. Acknowledging changes only the state and health.
                     prop_assert_eq!(strip(&before), strip(&after));
                     prop_assert!(after.iter().all(|l| !l.degrades()));
                     seen.acknowledged += after.iter().filter(|l| l.acknowledged).count();
                 }
+            }
+            ROp::Repair if up => {
+                let before = self.m.losses();
+                if let Ok(n) = self.m.repair()
+                    && self.checks.inv27
+                {
+                    let after = self.m.losses();
+                    // 27. A loss closed by self-repair stays listed; closing
+                    // changes only its state and health.
+                    prop_assert_eq!(strip(&before), strip(&after));
+                    let closed = |v: &[Loss]| v.iter().filter(|l| l.acknowledged).count();
+                    prop_assert_eq!(closed(&after), closed(&before) + n);
+                    seen.closed_by_repair += n;
+                }
+            }
+            ROp::RepairDone if up => {
+                if let Some(r) = self.m.resend_requests().first()
+                    && !self.m.is_read_only()
+                {
+                    let before = self.m.losses();
+                    self.m.repair_done(r.identity).unwrap();
+                    let after = self.m.losses();
+                    prop_assert_eq!(strip(&before), strip(&after));
+                    let l = after.iter().find(|l| l.identity == r.identity).unwrap();
+                    prop_assert_eq!(l.state, Some(LossState::Closed(Outcome::ResendEnded)));
+                    seen.closed_by_repair += 1;
+                }
+            }
+            ROp::AcknowledgeCorruptions if up => {
+                let ids: Vec<_> = self.m.corruptions().iter().map(|c| c.id).collect();
+                seen.acknowledging = true;
+                let before = self.m.losses();
+                if self.m.acknowledge_corruptions(&ids).is_ok() {
+                    prop_assert_eq!(
+                        before,
+                        self.m.losses(),
+                        "naming corruptions seen closes nothing"
+                    );
+                    seen.corruptions_seen += ids.len();
+                }
+            }
+            ROp::Minutes(n) => self.m.advance(i64::from(*n) * 60 * SECOND),
+            ROp::Evict => {
+                let verified: Vec<_> = self
+                    .m
+                    .disk
+                    .hot
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        let file = &self.m.disk.files[f];
+                        file.sealed
+                            && file.class == kvik_model::engine::FileClass::Segment
+                            && self.m.disk.in_bucket(*f)
+                    })
+                    .collect();
+                for f in verified {
+                    self.m.disk.hot.remove(&f);
+                }
+            }
+            ROp::CorruptSealed(k) => {
+                let mut sealed: Vec<_> = self
+                    .m
+                    .disk
+                    .hot
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        let file = &self.m.disk.files[f];
+                        file.sealed && file.class == kvik_model::engine::FileClass::Segment
+                    })
+                    .collect();
+                // Segments with a copy in the bucket first, so that stage 1
+                // is reached often.
+                sealed.sort_by_key(|f| !self.m.disk.in_bucket(*f));
+                if let Some(f) = sealed.get(k % sealed.len().max(1)) {
+                    let lost = self.m.disk.lost_ranges().len();
+                    self.m.corrupt_hot(*f);
+                    self.m.scrub();
+                    self.restart_after_run_time_loss(lost);
+                }
+            }
+            ROp::RestoreFiles if up => {
+                let q: Vec<_> = self.m.disk.quarantined.iter().copied().collect();
+                for f in q {
+                    let before = self.m.losses();
+                    self.m.restore_file(f);
+                    let after = self.m.losses();
+                    prop_assert_eq!(strip(&before), strip(&after));
+                    seen.restored += after
+                        .iter()
+                        .filter(|l| {
+                            matches!(l.state, Some(LossState::Closed(Outcome::Restored(_))))
+                        })
+                        .count();
+                }
+            }
+            ROp::LoseObject(k) => {
+                let objects: Vec<_> = self.m.disk.bucket.objects.keys().copied().collect();
+                if let Some(f) = objects.get(k % objects.len().max(1)) {
+                    self.m.lose_object(*f);
+                }
+            }
+            ROp::CheckBucket(n) if up => {
+                let lost = self.m.disk.lost_ranges().len();
+                for i in 0..*n {
+                    if i > 0 {
+                        self.m.advance(5 * 60 * SECOND);
+                    }
+                    if let Ok(judged) = self.m.check_bucket() {
+                        seen.judged_lost += judged.len();
+                    }
+                }
+                self.restart_after_run_time_loss(lost);
+                seen.lost_in_bucket = seen.lost_in_bucket.max(
+                    self.m
+                        .losses()
+                        .iter()
+                        .filter(|l| l.cause == LossCause::LostInBucket)
+                        .count(),
+                );
             }
             ROp::Seal if up => self.m.seal_active(),
             ROp::Compact if up => {
@@ -395,6 +578,38 @@ impl RWorld {
         }
         if !matches!(op, ROp::Take { .. }) {
             self.last = self.last.map(|l| l.filter(|_| self.m.is_up()));
+        }
+        let acknowledging = std::mem::take(&mut seen.acknowledging);
+        if self.checks.inv27 && self.m.is_up() {
+            // A corruption's alert ends only when a record names it as seen
+            // (Q-240): never by a restart, time or its repair.
+            let now: BTreeMap<_, _> = self
+                .m
+                .corruptions()
+                .into_iter()
+                .map(|c| (c.id, (c.seen, c.at.is_some())))
+                .collect();
+            for (id, was_seen) in &seen.corruptions {
+                let Some((is_seen, _)) = now.get(id) else {
+                    return Err(TestCaseError::fail(format!("corruption {id:?} lost")));
+                };
+                prop_assert!(!was_seen || *is_seen, "{:?} unseen again", id);
+                prop_assert!(
+                    *was_seen || !is_seen || acknowledging,
+                    "{:?} seen by itself",
+                    id
+                );
+            }
+            let alerts = self.m.attention();
+            for (id, (is_seen, recorded)) in now {
+                prop_assert_eq!(
+                    alerts.contains(&kvik_model::engine::Alert::Corruption(id)),
+                    !is_seen
+                );
+                if recorded {
+                    seen.corruptions.insert(id, is_seen);
+                }
+            }
         }
         for (p, e) in self.m.recovery_entries().into_iter().skip(entries) {
             seen.stale += usize::from(e.mark_state == MarkState::Stale);
@@ -509,6 +724,11 @@ impl RWorld {
                 .filter(|r| matches!(r, kvik_model::engine::Reason::DataLost(..)))
                 .count();
             prop_assert_eq!(degraded, losses.iter().filter(|l| l.degrades()).count());
+            for l in &losses {
+                let closed = matches!(l.state, Some(LossState::Closed(_)));
+                prop_assert_eq!(closed, l.acknowledged);
+                prop_assert_eq!(l.state.is_none(), l.kind == LossKind::PossibleLoss);
+            }
         }
         Ok(())
     }
@@ -556,8 +776,10 @@ proptest! {
     }
 
     /// 27. The list of losses never loses a loss across restarts, each loss
-    /// keeps one identity however its range grows, and acknowledging changes
-    /// only the health state (§8 Acknowledging a loss, §11 Health).
+    /// keeps one identity however its range grows, acknowledging or closing a
+    /// loss changes only its state and the health state, and a loss closed
+    /// by self-repair stays listed (§8 Self-repair, Acknowledging a loss,
+    /// §11 Health); a corruption alerts until a record names it seen.
     #[test]
     fn inv27_losses_are_never_lost_and_acknowledging_changes_only_health(
         ops in proptest::collection::vec(arb_rop(), 1..120)
@@ -578,7 +800,7 @@ fn recovery_generator_coverage() {
     let strat = proptest::collection::vec(arb_rop(), 80..120);
     let mut seen = Seen::default();
     let (mut possible, mut data_lost) = (0, 0);
-    for _ in 0..200 {
+    for _ in 0..300 {
         let ops = strat.new_tree(&mut runner).unwrap().current();
         let mut s = Seen::default();
         run_recovery(&ops, &mut s, ALL).unwrap();
@@ -590,6 +812,11 @@ fn recovery_generator_coverage() {
         seen.gaps += s.gaps;
         seen.rule_1_resets += s.rule_1_resets;
         seen.acknowledged += s.acknowledged;
+        seen.closed_by_repair += s.closed_by_repair;
+        seen.restored += s.restored;
+        seen.lost_in_bucket += s.lost_in_bucket;
+        seen.judged_lost += s.judged_lost;
+        seen.corruptions_seen += s.corruptions_seen;
         possible += usize::from(s.possible > 0);
         data_lost += usize::from(s.data_lost > 0);
     }
@@ -604,8 +831,18 @@ fn recovery_generator_coverage() {
         seen.rule_1_resets,
         seen.acknowledged
     );
-    assert!(seen.reassigned > 5 && seen.forget_resyncs > 100 && seen.forced_syncs > 20);
-    assert!(seen.behind_resyncs > 20);
-    assert!(seen.stale > 20 && seen.gaps > 5 && seen.rule_1_resets > 20);
-    assert!(seen.acknowledged > 50 && possible > 100 && data_lost > 50);
+    assert!(seen.reassigned > 7 && seen.forget_resyncs > 150 && seen.forced_syncs > 30);
+    assert!(seen.behind_resyncs > 30);
+    assert!(seen.stale > 30 && seen.gaps > 7 && seen.rule_1_resets > 30);
+    assert!(seen.acknowledged > 75 && possible > 150 && data_lost > 75);
+    eprintln!(
+        "closed-by-repair {} restored {} judged-lost {} lost-in-bucket {} corruptions-seen {}",
+        seen.closed_by_repair,
+        seen.restored,
+        seen.judged_lost,
+        seen.lost_in_bucket,
+        seen.corruptions_seen
+    );
+    assert!(seen.closed_by_repair > 20 && seen.corruptions_seen > 20);
+    assert!(seen.restored > 0 && seen.judged_lost > 5 && seen.lost_in_bucket > 0);
 }

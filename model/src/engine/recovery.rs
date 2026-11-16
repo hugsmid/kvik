@@ -1,6 +1,6 @@
 //! The start's recovery and the store's resets (§3 Recovery rules 1–3 and
 //! Order of a start, §4 Resync reset points, §7 Readers saved points, §8
-//! Acknowledging a loss, §11 Health losses), and the fault injections that
+//! Acknowledging a loss and Self-repair, §11 Health losses), and the fault injections that
 //! make them happen: a remount, a power loss that loses acknowledged batches,
 //! a lost mark or cursor file.
 
@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 
 use super::{
     Acknowledged, ConsumerId, Entry, EntryBody, Error, FileClass, FileId, Loss, LossCause,
-    ManifestOp, ManifestRecord, Mark, MarkState, MarkSync, Model, PointCheck, RecoveryEntry, Reset,
-    ResetPoint, ResetStamp, SavedPoint, StoredFile, Tail, WriteOutcome,
+    ManifestOp, ManifestRecord, Mark, MarkState, MarkSync, Model, PointCheck, QuarantineCause,
+    RecoveryEntry, Reset, ResetPoint, ResetStamp, SavedPoint, StoredFile, Tail, WriteOutcome,
 };
-use crate::recovery::LossKind;
+use crate::recovery::{LossKind, Outcome};
 use crate::registry::RegistryEvent;
 use crate::types::Position;
 
@@ -391,6 +391,10 @@ impl Model {
     /// engine could not write. A range that overlaps a recorded loss names its
     /// identity (§3 Order of a start, step 4).
     fn record_lost_ranges(&mut self) {
+        let quarantined: Vec<FileId> = self.disk.quarantined.iter().copied().collect();
+        for f in quarantined {
+            self.record_quarantine(f, QuarantineCause::Damaged);
+        }
         let at = self.wall;
         let stamp = self.stamp_in_force();
         let found = std::mem::take(&mut self.disk.found_lost);
@@ -547,13 +551,16 @@ impl Model {
             &found,
             &recoveries,
             &self.disk.acknowledged(),
+            |l| self.loss_stage(l),
         )
     }
 
     /// Acknowledges the `data_lost` losses named by their identities (§8
-    /// Acknowledging a loss): one manifest record naming each with its range
-    /// as reported now. Acknowledging an acknowledged loss, a `possible_loss`
-    /// or none writes nothing. Refused while read-only and in a drill.
+    /// Acknowledging a loss): one closing record, by an operator, naming each
+    /// with its range as reported now and, as seen, the corruptions they came
+    /// from. Acknowledging an acknowledged loss, a `possible_loss` or none
+    /// writes nothing, except to name a corruption not yet seen. Refused
+    /// while read-only and in a drill.
     pub fn acknowledge_losses(&mut self, identities: &[Position]) -> Result<(), Error> {
         if self.vol()?.read_only {
             return Err(Error::ReadOnly);
@@ -569,18 +576,23 @@ impl Model {
                     identity: l.identity,
                     from: l.first?,
                     to: l.last?,
+                    outcome: Outcome::Operator,
                 })
             })
             .collect();
+        let seen = self.unseen_corruptions_of(identities);
+        if losses.is_empty() && seen.is_empty() {
+            return Ok(());
+        }
         if let Some(to) = losses.iter().map(|a| a.to).max() {
             self.disk.cover(to);
-            let epoch = self.disk.epoch();
-            self.disk.manifest.push(ManifestRecord {
-                epoch,
-                at: self.wall,
-                op: ManifestOp::Acknowledge { losses },
-            });
         }
+        let epoch = self.disk.epoch();
+        self.disk.manifest.push(ManifestRecord {
+            epoch,
+            at: self.wall,
+            op: ManifestOp::Acknowledge { losses, seen },
+        });
         Ok(())
     }
 
