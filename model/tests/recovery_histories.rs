@@ -486,6 +486,23 @@ impl RWorld {
 
     fn check(&self, seen: &mut Seen) -> Result<(), TestCaseError> {
         let m = &self.m;
+        // §3 Batches: a flagged batch holds only facts of a series at the
+        // `written` level (none once damaged), so no flag outlives the batch
+        // it was written for.
+        for (f, b) in &m.disk.flagged {
+            let batch = m.disk.files.get(f).and_then(|x| x.batches.get(*b));
+            let facts_of_fast = batch.is_some_and(|x| {
+                x.iter()
+                    .all(|e| e.fact().is_some_and(|ft| ft.series == self.fast))
+            });
+            prop_assert!(
+                facts_of_fast,
+                "flag on {:?} batch {} that holds {:?}",
+                f,
+                b,
+                batch
+            );
+        }
         if !m.is_up() {
             return Ok(());
         }
