@@ -25,7 +25,7 @@ fn model_store() -> Store {
     let clock = ManualClock::new(start());
     let mut env = Env::test(clock);
     env.background_timers = false;
-    let config = StoreConfig::new(format!("kvik-test/patterns/{}", next_id()), "Europe/London")
+    let config = StoreConfig::new(format!("kvik-test/patterns/{}", next_id()), "UTC")
         .create_if_missing(true)
         .backend(Backend::Model)
         .env(env);
