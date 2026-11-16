@@ -234,7 +234,9 @@ A.10) is treated as a different boot. The rules apply in this order:
    overwritten. The byte and position range, from the last valid batch (with none, from the last sealed segment's
    end or position 1) to the next valid batch or, at the tail, to the mark's last position, is reported as `data_lost` when found and recorded in the manifest as a **lost range**
    by step 4 below; neither makes the store read-only. Its positions are not reused. A lost range is a reset point
-   for consumers (§4 Resync).
+   for consumers (§4 Resync). The next valid batch is found by resynchronisation (`format.md` A.2) under the window
+   rule of the scan bound (`format.md` A, common rules), which damage does not reach: in a crafted file, the rest of
+   an 8 MiB window can be passed as damaged and lost.
 3. **Different boot id** (the machine rebooted, the page cache is gone), or the mark missing, unreadable or stale
    (rule 1): any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
    batch's last position and the end of a lost range found at the tail under rule 2. Let F = 1 + the highest
@@ -550,7 +552,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   A record is appended only after the previous record's sync has returned. At every start the writer writes the
   bytes of the last valid record again in place and syncs, so that a record kept from the page cache after a failed
   sync is on disk before a successor is appended (§3 Order of a start, step 4). On reading, an invalid record is passed by searching forward, at
-  8-byte boundaries, for a valid record with a higher epoch. An invalid record followed by a valid one was synced
+  8-byte boundaries, for a valid record with a higher epoch, under the window rule of the scan bound (`format.md` A,
+  common rules; Q-650), which damage does not reach. An invalid record followed by a valid one was synced
   and is **corrupt**. An invalid last record is a **torn tail**: the writer drops it at start and truncates the
   file after the last valid record (§3 Order of a start, step 4). So that dropping is always safe, the last record is neither uploaded nor acted
   on irreversibly (no file it retires, moves or quarantines is removed) until a later record has been synced; the

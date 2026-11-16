@@ -277,3 +277,119 @@ fn batches_of_exactly_the_limit_are_kept_and_a_word_over_it_is_not() {
         assert!(stats.within_bound(f.len() as u64), "{stats:?}");
     }
 }
+
+/// An engine-shaped segment of one window: about 7 MiB of batches, each an alias entry and a facts block of 20 rows
+/// (`two`), or three facts blocks of 200 rows; returns the bytes and the end of the data.
+fn engine_shaped(two: bool) -> &'static (Vec<u8>, usize) {
+    use kvik_log::block::block_type;
+    use std::sync::OnceLock;
+    static CELLS: [OnceLock<(Vec<u8>, usize)>; 2] = [OnceLock::new(), OnceLock::new()];
+    CELLS[usize::from(two)].get_or_init(|| {
+        let rows = if two { 20 } else { 200 };
+        let total = 7u64 << 20;
+        let mut s = SegmentImage::create_ahead(ID, T0, total + (1 << 20)).unwrap();
+        s.take_into_use(1).unwrap();
+        let mk = |seq: u64| -> Vec<(u32, i64, f64)> {
+            (0..rows)
+                .map(|i| {
+                    (
+                        1 + i % 7,
+                        T0 + i64::from(i) * SECOND + seq as i64,
+                        f64::from(i),
+                    )
+                })
+                .collect()
+        };
+        let mut seq = 1u64;
+        while s.write_offset() < total {
+            let b = if two {
+                let mut b = entries_batch(seq, T0, &[alias(1, "a")]);
+                b.push(block_type::FACTS, facts_body(seq + 1, T0, &mk(seq)))
+                    .unwrap();
+                b
+            } else {
+                let mut b = facts_batch(seq, T0, &mk(seq));
+                for k in 1..3 {
+                    b.push(
+                        block_type::FACTS,
+                        facts_body(seq + k * u64::from(rows), T0, &mk(seq)),
+                    )
+                    .unwrap();
+                }
+                b
+            };
+            seq = b.sequences().unwrap().1 + 1;
+            s.append(&b, T0).unwrap();
+        }
+        let end = s.write_offset() as usize;
+        (s.into_bytes(), end)
+    })
+}
+
+/// A damage site: a flipped bit, a zeroed 512-byte sector or a zeroed 4 KiB page.
+#[derive(Clone, Copy, Debug)]
+enum Site {
+    Flip(u8),
+    Sector,
+    Page,
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn the_bounded_scan_agrees_with_the_reference_scan_under_disjoint_damage_in_one_window(
+        two in any::<bool>(),
+        site in prop_oneof![any::<u8>().prop_map(Site::Flip), Just(Site::Sector), Just(Site::Page)],
+        at in prop::collection::vec(any::<prop::sample::Index>(), 1..=64),
+        mark in any::<prop::sample::Index>(),
+    ) {
+        let (clean, end) = engine_shaped(two);
+        let mut f = clean.clone();
+        // One site in each of `at.len()` equal slices of the data, so the sites are disjoint by construction.
+        let from = kvik_log::header::HEADER_LEN + 4_096;
+        let slice = (end - from) / at.len();
+        for (k, i) in at.iter().enumerate() {
+            let p = from + k * slice + i.index(slice - 4_096);
+            match site {
+                Site::Flip(bit) => f[p] ^= 1 << (bit % 8),
+                Site::Sector => f[p & !511..(p & !511) + 512].fill(0),
+                Site::Page => f[p & !4_095..(p & !4_095) + 4_096].fill(0),
+            }
+        }
+        agree(&f, mark)?;
+    }
+}
+
+#[test]
+fn stale_complete_batches_ahead_of_kept_data_stay_under_the_budget() {
+    use kvik_log::block::block_type;
+    // A batch, then older complete batches at their own offsets (sequences below it, as left by a write at an
+    // earlier offset over two windows), then a later batch: each stale batch fails only on its sequence.
+    let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
+    let push = |f: &mut Vec<u8>, seq: u64| {
+        let mut b = entries_batch(seq, T0, &[alias(1, "a")]);
+        let rows: Vec<_> = (0..200).map(|i| (1, T0 + i * SECOND, 0.0)).collect();
+        b.push(block_type::FACTS, facts_body(seq + 1, T0, &rows))
+            .unwrap();
+        let at = f.len() as u64;
+        f.extend_from_slice(&b.encode(&ID, at, T0).unwrap());
+    };
+    push(&mut f, 1_000_000);
+    let mut seq = 1;
+    while f.len() < 15 << 20 {
+        push(&mut f, seq);
+        seq += 201;
+    }
+    let last = f.len() as u64;
+    push(&mut f, 2_000_000);
+    let (new, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
+    let (old, _) = legacy::scan(&f, &ID, ScanLimit::End);
+    let new = new.unwrap();
+    assert_eq!(Ok(&new), old.as_ref());
+    assert_eq!(new.batches.last().map(|b| b.offset), Some(last));
+    assert!(
+        stats.failed_bytes_peak < kvik_log::scan::FAILED_READ_BUDGET,
+        "{stats:?}"
+    );
+}

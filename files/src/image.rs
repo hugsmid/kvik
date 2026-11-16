@@ -108,7 +108,7 @@ impl<'a> Search<'a> {
             bytes_checksummed: self.sums.checksummed(),
             headers_visited: self.headers,
             bytes_body_checked: self.body,
-            failed_reads_peak: self.failed.peak(),
+            failed_bytes_peak: self.failed.peak(),
         }
     }
 
@@ -153,7 +153,7 @@ impl<'a> Search<'a> {
                 record: r,
             })),
             Ok(_) | Err(RecordError::Invalid(_)) => {
-                self.failed.count(at);
+                self.failed.charge(at, body.len() as u64);
                 Ok(None)
             }
             Err(RecordError::Unsupported(element)) => Err(FormatError::Unsupported {
@@ -204,8 +204,8 @@ fn read_all(
             records.push(p);
             continue;
         }
-        // An invalid record, or the end: search forward for a valid record of a higher epoch. Past the failed reads
-        // allowed in a window, the rest of it is passed as damaged (`format.md` A, common rules: scan bound).
+        // An invalid record, or the end: search forward for a valid record of a higher epoch. Past the failed reads'
+        // budget of a window, the rest of it is passed as damaged (`format.md` A, common rules: scan bound).
         let mut probe = at + 8;
         let mut found = None;
         while probe + (BLOCK_HEADER_LEN as u64) <= len {
@@ -359,23 +359,25 @@ mod tests {
         f
     }
 
+    use kvik_log::scan::FAILED_READ_BUDGET as BUDGET;
+
+    /// The budget, plus the one failed read that reached it (at most a body).
+    fn within_budget(peak: u64) -> bool {
+        (BUDGET..=BUDGET + u64::from(MAX_BODY_LEN)).contains(&peak)
+    }
+
     fn empty(epoch: u64) -> Vec<u8> {
         kvik_log::manifest::encode_record(kvik_log::manifest::RECORD_EMPTY, epoch, 0, 0, None)
     }
 
     #[test]
-    fn a_crafted_search_passes_the_rest_of_a_window_after_the_allowed_failed_reads() {
+    fn a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget() {
         let mut f = crafted(2_000, 100_000);
         f.extend(empty(1 << 40));
         let (img, stats) = read_with_stats(&f, &[9; 16]);
-        assert_eq!(
-            stats.failed_reads_peak,
-            kvik_log::scan::FAILED_READS_PER_WINDOW
-        );
+        assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
         assert!(stats.within_bound(f.len() as u64), "{stats:?}");
-        // Each failed read checks the shared field list.
-        let failed = kvik_log::scan::FAILED_READS_PER_WINDOW * 4 * 100_000;
-        assert!(stats.bytes_body_checked >= failed, "{stats:?}");
+        assert!(stats.bytes_body_checked >= BUDGET, "{stats:?}");
         // The record in the passed part of the window is not found: the file reads as a torn tail.
         let img = img.unwrap();
         assert!(img.records.is_empty() && img.corrupt.is_empty() && img.torn);
@@ -397,16 +399,17 @@ mod tests {
     }
 
     #[test]
-    fn a_full_crafted_manifest_is_read_within_the_restart_budget() {
-        let f = crafted(20_000, 2_300_000);
+    fn a_full_crafted_window_stays_within_the_budget_and_a_smoke_ceiling() {
+        let f = crafted(20_000, 3_900_000);
         let len = f.len() as u64;
+        assert!(len <= u64::from(MAX_BODY_LEN));
         let t = std::time::Instant::now();
         let (img, stats) = read_with_stats(&f, &[9; 16]);
         let elapsed = t.elapsed();
         assert!(img.unwrap().torn);
-        assert!(stats.failed_reads_peak <= kvik_log::scan::FAILED_READS_PER_WINDOW);
+        assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
         assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
-        // A ceiling for a slow shared machine; the restart budget is 1 s.
+        // A smoke ceiling for a slow shared machine; the pin is the budget.
         assert!(elapsed.as_secs() < 5, "{elapsed:?} for {len} bytes");
     }
 

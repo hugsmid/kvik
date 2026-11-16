@@ -12,17 +12,18 @@ use crate::crc::{PrefixCrc, crc32c};
 /// Block headers a scan may visit per 8 bytes of the file: the sum of the passes over each block start (Q-110).
 pub const HEADERS_PER_WORD: u64 = 16;
 
-/// Candidates read in full and rejected after a body check, allowed in one window; past them the rest of the
-/// window is passed as damaged (`format.md` A, common rules: scan bound; Q-110).
-pub const FAILED_READS_PER_WINDOW: u64 = 8;
+/// Body bytes that failed reads starting in one window may check; once reached, the rest of the window is passed as
+/// damaged (`format.md` A, common rules: scan bound; Q-110). Twice a segment window: failed reads from damage check
+/// disjoint bodies, so those starting in one window check less than the window and one batch beyond it.
+pub const FAILED_READ_BUDGET: u64 = 16 << 20;
 
-/// Failed reads counted per window of file offsets `[k · w, (k + 1) · w)` (`format.md` A, common rules: scan
-/// bound): w is a batch's data in a log segment, a body in the manifest.
+/// Body bytes checked by failed reads, per window of file offsets `[k · w, (k + 1) · w)` (`format.md` A, common
+/// rules: scan bound): w is a batch's data in a log segment, a body in the manifest.
 #[derive(Clone, Copy, Debug)]
 pub struct FailedReads {
     window: u64,
     current: u64,
-    count: u64,
+    charged: u64,
     peak: u64,
 }
 
@@ -32,34 +33,34 @@ impl FailedReads {
         Self {
             window: window.max(1),
             current: 0,
-            count: 0,
+            charged: 0,
             peak: 0,
         }
     }
 
-    /// Counts a failed read of the candidate at `offset`; offsets come in rising order.
-    pub fn count(&mut self, offset: u64) {
+    /// Charges a failed read of the candidate at `offset` that checked `bytes` of body; offsets come in rising order.
+    pub fn charge(&mut self, offset: u64, bytes: u64) {
         let w = offset / self.window;
         if w != self.current {
             self.current = w;
-            self.count = 0;
+            self.charged = 0;
         }
-        self.count += 1;
-        self.peak = self.peak.max(self.count);
+        self.charged = self.charged.saturating_add(bytes);
+        self.peak = self.peak.max(self.charged);
     }
 
-    /// Where the search goes on from `offset`: `offset` itself, or the end of its window once that window has had
-    /// [`FAILED_READS_PER_WINDOW`] failed reads.
+    /// Where the search goes on from `offset`: `offset` itself, or the end of its window once failed reads starting
+    /// in it have checked [`FAILED_READ_BUDGET`] bytes of body.
     pub fn next_from(&self, offset: u64) -> u64 {
         let w = offset / self.window;
-        if w == self.current && self.count >= FAILED_READS_PER_WINDOW {
+        if w == self.current && self.charged >= FAILED_READ_BUDGET {
             (w + 1).saturating_mul(self.window)
         } else {
             offset
         }
     }
 
-    /// The most failed reads in one window.
+    /// The most body bytes checked by failed reads starting in one window.
     pub fn peak(&self) -> u64 {
         self.peak
     }
@@ -74,24 +75,24 @@ pub struct ScanStats {
     pub headers_visited: u64,
     /// Body bytes passed to the checks of their type (A.5, A.6; a manifest record's fields, A.14).
     pub bytes_body_checked: u64,
-    /// The most candidates read in full and rejected in one window ([`FailedReads`]).
-    pub failed_reads_peak: u64,
+    /// The most body bytes checked by failed reads starting in one window ([`FailedReads`]).
+    pub failed_bytes_peak: u64,
 }
 
 impl ScanStats {
     /// Whether the counts keep the scan bound for a file of `len` bytes (`format.md` A, common rules: scan bound):
     /// at most `2 · len` bytes checksummed, plus once more the bytes of the one direct read that found damage (at
-    /// most a batch); [`HEADERS_PER_WORD`] headers per 8 bytes; [`FAILED_READS_PER_WINDOW`] failed reads per
-    /// window; and body checks of at most `2 · len`, that direct read, and two batches per failed read.
+    /// most a batch); [`HEADERS_PER_WORD`] headers per 8 bytes; failed reads per window checking at most
+    /// [`FAILED_READ_BUDGET`] plus the read that reached it (two batches); and body checks of at most `2 · len`,
+    /// that direct read, and those failed reads.
     pub fn within_bound(&self, len: u64) -> bool {
         let first_read = len.min(MAX_BATCH_DATA + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64);
-        let failed = (2 * FAILED_READS_PER_WINDOW)
-            .saturating_mul(len.min(MAX_BATCH_DATA))
-            .saturating_mul(len.div_ceil(MAX_BATCH_DATA));
+        let per_window = FAILED_READ_BUDGET.saturating_add(2 * len.min(MAX_BATCH_DATA));
+        let failed = per_window.saturating_mul(len.div_ceil(MAX_BATCH_DATA));
         let twice = len.saturating_mul(2).saturating_add(first_read);
         self.bytes_checksummed <= twice
             && self.headers_visited <= (len / 8 + 2).saturating_mul(HEADERS_PER_WORD)
-            && self.failed_reads_peak <= FAILED_READS_PER_WINDOW
+            && self.failed_bytes_peak <= per_window
             && self.bytes_body_checked <= twice.saturating_add(failed)
     }
 }
@@ -132,7 +133,7 @@ impl<'a> Reads<'a> {
             bytes_checksummed: self.direct + self.sums.as_ref().map_or(0, PrefixCrc::checksummed),
             headers_visited: self.headers,
             bytes_body_checked: self.body,
-            failed_reads_peak: self.failed.peak(),
+            failed_bytes_peak: self.failed.peak(),
         }
     }
 

@@ -428,12 +428,13 @@ fn an_undamaged_segment_is_read_in_one_pass_of_direct_reads() {
 }
 
 #[test]
-fn the_bound_holds_body_checks_and_failed_reads_per_window() {
+fn the_bound_holds_body_checks_and_the_failed_read_budget_per_window() {
     let len = 1u64 << 20;
-    // Twice the file, the direct read that found damage, and two batches (here the file) per failed read.
+    // Twice the file, the direct read that found damage, and per window the budget and the read that reached it.
+    let per_window = FAILED_READ_BUDGET + 2 * len;
     let at_bound = ScanStats {
-        bytes_body_checked: 3 * len + 2 * FAILED_READS_PER_WINDOW * len,
-        failed_reads_peak: FAILED_READS_PER_WINDOW,
+        bytes_body_checked: 3 * len + per_window,
+        failed_bytes_peak: per_window,
         ..ScanStats::default()
     };
     assert!(at_bound.within_bound(len));
@@ -443,24 +444,24 @@ fn the_bound_holds_body_checks_and_failed_reads_per_window() {
     };
     assert!(!more_body.within_bound(len));
     let more_failed = ScanStats {
-        failed_reads_peak: FAILED_READS_PER_WINDOW + 1,
+        failed_bytes_peak: per_window + 1,
         ..at_bound
     };
     assert!(!more_failed.within_bound(len));
 }
 
 #[test]
-fn failed_reads_are_counted_per_window_and_pass_the_rest_of_a_full_one() {
-    let mut f = FailedReads::new(64);
-    for o in (0..8 * FAILED_READS_PER_WINDOW).step_by(8) {
-        assert_eq!(f.next_from(o), o);
-        f.count(o);
-    }
-    assert_eq!(f.next_from(8), 64);
-    assert_eq!(f.next_from(64), 64);
-    f.count(64);
-    assert_eq!((f.next_from(72), f.peak()), (72, FAILED_READS_PER_WINDOW));
+fn failed_reads_are_charged_per_window_and_pass_the_rest_of_one_past_its_budget() {
+    let w = 1u64 << 20;
+    let mut f = FailedReads::new(w);
+    f.charge(0, FAILED_READ_BUDGET - 1);
+    assert_eq!(f.next_from(8), 8);
+    f.charge(8, 1);
+    assert_eq!(f.next_from(16), w);
+    assert_eq!(f.next_from(w), w);
+    f.charge(w, 8);
+    assert_eq!((f.next_from(w + 8), f.peak()), (w + 8, FAILED_READ_BUDGET));
     let mut z = FailedReads::new(0);
-    z.count(8);
+    z.charge(8, FAILED_READ_BUDGET);
     assert_eq!(z.next_from(16), 16);
 }

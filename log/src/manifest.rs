@@ -210,7 +210,7 @@ impl<'a> Search<'a> {
             bytes_checksummed: self.sums.checksummed(),
             headers_visited: self.headers,
             bytes_body_checked: self.body,
-            failed_reads_peak: self.failed.peak(),
+            failed_bytes_peak: self.failed.peak(),
         }
     }
 
@@ -239,14 +239,14 @@ impl<'a> Search<'a> {
         let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
         self.body += body.len() as u64;
         let Some(list) = fields(&body[RECORD_PREFIX..]) else {
-            self.failed.count(at);
+            self.failed.charge(at, body.len() as u64);
             return Ok(None);
         };
         let lost = match t {
             RECORD_LOST_RANGE => match decode_lost(&list) {
                 Some(l) => Some(l),
                 None => {
-                    self.failed.count(at);
+                    self.failed.charge(at, body.len() as u64);
                     return Ok(None);
                 }
             },
@@ -323,7 +323,7 @@ fn read_all(
     }
     let valid_end = at.min(bytes.len() as u64);
     // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced. Past
-    // the failed reads allowed in a window, the rest of it is passed as damaged (`format.md` A, common rules: scan
+    // the failed reads' budget of a window, the rest of it is passed as damaged (`format.md` A, common rules: scan
     // bound).
     let min = records.last().map_or(0, |r| r.epoch);
     let mut probe = valid_end + 8;

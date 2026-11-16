@@ -1,5 +1,5 @@
-//! Crafted files against the cap on failed full reads (`format.md` A, common rules: scan bound; Q-110): nested facts
-//! images sharing their columns, and manifest records sharing one field list.
+//! Crafted files against the budget of failed full reads (`format.md` A, common rules: scan bound; Q-110): nested
+//! facts images sharing their columns, and manifest records sharing one field list.
 
 mod support;
 
@@ -12,7 +12,7 @@ use kvik_log::header::{FileHeader, HEADER_LEN, kind};
 use kvik_log::manifest::{
     ManifestError, RECORD_EMPTY, RECORD_LOST_RANGE, encode_record, read_manifest_with_stats,
 };
-use kvik_log::scan::{FAILED_READS_PER_WINDOW as K, ScanLimit, Tail, legacy, scan_with_stats};
+use kvik_log::scan::{FAILED_READ_BUDGET as BUDGET, ScanLimit, Tail, legacy, scan_with_stats};
 use support::*;
 
 /// 8 MiB: the window of a log segment.
@@ -21,9 +21,16 @@ const W: u64 = 8 << 20;
 const MW: u64 = 16 << 20;
 /// Header, prefix and the five-entry directory of a crafted facts image.
 const IMAGE: u64 = 104;
-/// A ceiling for one crafted file on a slow shared machine; the restart budget is 1 s, and the machine-independent
-/// pin is the count of failed reads per window.
+/// A smoke ceiling for one crafted file on a slow shared machine; the machine-independent pin is the body bytes that
+/// failed reads check per window.
 const CEILING: Duration = Duration::from_secs(5);
+/// Rows of a full crafted facts image.
+const ROWS: u64 = 65_536;
+
+/// The budget, plus the failed read that reached it (two batches in a segment, a body in the manifest).
+fn within_budget(peak: u64) -> bool {
+    (BUDGET..=BUDGET + 2 * W).contains(&peak)
+}
 
 fn rle_run(n: u64) -> Vec<u8> {
     let mut out = Vec::new();
@@ -165,16 +172,16 @@ fn facts_at(f: &mut Vec<u8>, seq: u64) -> u64 {
 }
 
 #[test]
-fn a_crafted_window_has_the_rest_passed_as_damaged_after_the_allowed_failed_reads() {
+fn a_crafted_window_has_the_rest_passed_as_damaged_once_failed_reads_use_its_budget() {
     let mut f = damaged_start();
-    crafted(&mut f, 64, 4_096, false, 1);
+    crafted(&mut f, 64, ROWS, false, 1);
     let inside = facts_at(&mut f, 50);
     f.resize(W as usize, 0);
     let after = facts_at(&mut f, 60);
     let len = f.len() as u64;
     let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
     let r = r.unwrap();
-    assert_eq!(stats.failed_reads_peak, K);
+    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
     // The batch in the passed part of the window is reported with the region; the next window is read.
     let offsets: Vec<u64> = r.batches.iter().map(|b| b.offset).collect();
@@ -185,45 +192,45 @@ fn a_crafted_window_has_the_rest_passed_as_damaged_after_the_allowed_failed_read
         (HEADER_LEN as u64, after)
     );
     assert_eq!(r.regions[0].first_sequence_after, Some(60));
-    // Without the cap every image is read in full and the batch inside the window is kept.
+    // Without the budget every image is read in full and the batch inside the window is kept.
     let (old, old_stats) = legacy::scan(&f, &ID, ScanLimit::End);
     let old: Vec<u64> = old.unwrap().batches.iter().map(|b| b.offset).collect();
     assert_eq!(old, [inside, after]);
-    assert_eq!(old_stats.failed_reads_peak, 64);
+    assert!(old_stats.failed_bytes_peak > 4 * BUDGET, "{old_stats:?}");
 }
 
 #[test]
-fn boundary_reads_that_fail_after_a_body_check_count_against_the_window() {
+fn boundary_reads_that_fail_after_a_body_check_are_charged_to_the_window() {
     let mut f = damaged_start();
-    crafted(&mut f, 64, 4_096, true, 1);
+    crafted(&mut f, 64, ROWS, true, 1);
     let len = f.len() as u64;
     let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
     let r = r.unwrap();
-    assert_eq!(stats.failed_reads_peak, K);
+    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
-    // One failed read by resynchronisation, then one boundary read after each kept alias batch.
-    assert_eq!(r.batches.len() as u64, K - 1);
+    // One failed read by resynchronisation, then a boundary read after each kept alias batch until the budget.
+    let kept = r.batches.len();
+    assert!((1..16).contains(&kept), "{kept} alias batches kept");
     assert!(matches!(r.tail, Some(Tail::Torn { .. })));
-    // Each boundary read checks the image's body twice: judged, then read as a batch.
-    let rows = 20 * 4_096;
-    assert!(stats.bytes_body_checked >= (2 * K - 1) * rows, "{stats:?}");
+    let (old, _) = legacy::scan(&f, &ID, ScanLimit::End);
+    assert_eq!(old.unwrap().batches.len(), 64);
 }
 
 #[test]
-fn full_crafted_windows_are_read_within_the_restart_budget() {
+fn full_crafted_windows_stay_within_the_budget_and_a_smoke_ceiling() {
     for between in [false, true] {
         let mut f = damaged_start();
         let m = if between { 20_000 } else { 42_000 };
-        let seq = crafted(&mut f, m, 65_536, between, 1);
+        let seq = crafted(&mut f, m, ROWS, between, 1);
         assert!(f.len() as u64 <= W);
         f.resize(W as usize, 0);
-        crafted(&mut f, m, 65_536, between, seq);
+        crafted(&mut f, m, ROWS, between, seq);
         let len = f.len() as u64;
         let t = Instant::now();
         let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
         let elapsed = t.elapsed();
         r.unwrap();
-        assert!(stats.failed_reads_peak <= K, "{stats:?}");
+        assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
         assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
         assert!(elapsed < CEILING, "{elapsed:?} for {len} bytes");
     }
@@ -275,13 +282,13 @@ fn crafted_manifest(m: u64, g: u64, t: u8, field: u16) -> Vec<u8> {
 }
 
 #[test]
-fn a_crafted_manifest_search_passes_the_rest_of_a_window_after_the_allowed_failed_reads() {
+fn a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget() {
     let mut f = crafted_manifest(2_000, 100_000, RECORD_LOST_RANGE, 0x8001);
     f.extend(encode_record(RECORD_EMPTY, 1 << 40, 0, 0, None));
     let (r, stats) = read_manifest_with_stats(&f, &[9; 16]);
-    assert_eq!(stats.failed_reads_peak, K);
+    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
     assert!(stats.within_bound(f.len() as u64), "{stats:?}");
-    // The record in the passed part of the window is not found: the file reads as a torn tail.
+    // The record in the passed part of the window is not found: the file reads as a torn tail (Q-650).
     let r = r.unwrap();
     assert!(r.records.is_empty() && r.torn);
     // A record in the next window is found, so the damaged record and the window are reported corrupt.
@@ -289,18 +296,19 @@ fn a_crafted_manifest_search_passes_the_rest_of_a_window_after_the_allowed_faile
     f.extend(encode_record(RECORD_EMPTY, 1 << 41, 0, 0, None));
     let (r, stats) = read_manifest_with_stats(&f, &[9; 16]);
     assert_eq!(r, Err(ManifestError::Corrupt(HEADER_LEN as u64)));
-    assert_eq!(stats.failed_reads_peak, K);
+    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
 }
 
 #[test]
-fn a_full_crafted_manifest_is_read_within_the_restart_budget() {
-    let f = crafted_manifest(20_000, 2_300_000, RECORD_LOST_RANGE, 201);
+fn a_full_crafted_manifest_window_stays_within_the_budget_and_a_smoke_ceiling() {
+    let f = crafted_manifest(20_000, 3_900_000, RECORD_LOST_RANGE, 201);
     let len = f.len() as u64;
+    assert!(len <= MW);
     let t = Instant::now();
     let (r, stats) = read_manifest_with_stats(&f, &[9; 16]);
     let elapsed = t.elapsed();
     assert!(r.unwrap().torn);
-    assert!(stats.failed_reads_peak <= K, "{stats:?}");
+    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
     assert!(elapsed < CEILING, "{elapsed:?} for {len} bytes");
 }

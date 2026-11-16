@@ -121,8 +121,8 @@ impl Chains {
     /// block too long for a batch ends the chain. A candidate `o` goes further only when that commit's
     /// `batch_bytes` is the distance from `o`, which one candidate per commit block is; then its framing and
     /// `batch_crc32c` are checked on headers ([`framing_holds`]); only a candidate that passes is read in full,
-    /// its body checksums taken from the prefix table (Q-110). Past [`super::FAILED_READS_PER_WINDOW`] failed reads
-    /// in a window, the rest of the window is not read (Q-110).
+    /// its body checksums taken from the prefix table (Q-110). Once failed reads in a window have checked
+    /// [`super::FAILED_READ_BUDGET`] bytes of body, the rest of the window is not read (Q-110).
     pub(crate) fn resync<'a>(
         &mut self,
         reads: &mut Reads<'a>,
@@ -143,7 +143,7 @@ impl Chains {
                 self.pruned = o;
                 reads.forget_below(commits.as_deref().map_or(o, |c| c.next.min(o)));
             }
-            // Past the failed reads allowed in a window, the rest of it is passed as damaged (`format.md` A, common
+            // Past the failed reads' budget of a window, the rest of it is passed as damaged (`format.md` A, common
             // rules: scan bound).
             let next = reads.failed.next_from(o);
             if next != o && !self.reference {
@@ -167,7 +167,7 @@ impl Chains {
                     BatchRead::Complete(b) => return Ok(Some(b)),
                     BatchRead::Refused(e) => return Err(e),
                     BatchRead::Incomplete { .. } if reads.body_checked() > before => {
-                        reads.failed.count(o);
+                        reads.failed.charge(o, reads.body_checked() - before);
                     }
                     BatchRead::Incomplete { .. } => {}
                 }
