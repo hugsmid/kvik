@@ -312,6 +312,9 @@ pub struct DeliveryFlags {
     pub approximate_edges: bool,
     /// Delivered while a restore is bringing detail back.
     pub restoring: bool,
+    /// Decided without every fact it rests on, because local data could not be read during this run: whether a fact
+    /// was outranked, or the facts a condition or live state was evaluated over (spec §2.4, Q-750).
+    pub unchecked: bool,
 }
 
 /// A delivery to a consumer.

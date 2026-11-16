@@ -104,6 +104,8 @@ pub(crate) struct Ctx<'a> {
 struct FactRec {
     stored: Stored,
     outranked: bool,
+    /// Its key's earlier facts could not all be read, so `outranked` rests on those that could (Q-750).
+    unchecked: bool,
 }
 
 /// A record of the kept log; facts are shared with the queues that hold them.
@@ -136,6 +138,7 @@ enum Pend {
         state: MState,
         cause: TriggerCause,
         position: LogPos,
+        unchecked: bool,
     },
     Resync {
         cause: ResyncCause,
@@ -144,6 +147,7 @@ enum Pend {
         funnels: Vec<FState>,
         /// It is, or ends with, a reset point: its confirmation records its id in the cursor file (field 3).
         reset: bool,
+        unchecked: bool,
     },
 }
 
@@ -212,6 +216,10 @@ pub(crate) struct Deliverer {
     damaged: crate::durable::keys::Lost,
     /// Reads of the log for facts outside the recent window.
     slow: Cell<u64>,
+    /// A read of the log for facts outside the recent window met data it could not read since this was last reset.
+    incomplete: Cell<bool>,
+    /// Deliveries decided without every fact they rest on (Q-750).
+    unchecked: u64,
     /// The kept log by position, from `items_from` up (the lowest cursor); below it, a consumer that needs older
     /// records has them read from the log again ([`Deliverer::restore_items`]).
     items: BTreeMap<LogPos, Rec>,
@@ -274,6 +282,8 @@ impl Deliverer {
             recent: recent::Recent::default(),
             damaged: crate::durable::keys::Lost::default(),
             slow: Cell::new(0),
+            incomplete: Cell::new(false),
+            unchecked: 0,
             items: BTreeMap::new(),
             items_from: LogPos::default(),
             entries: BTreeMap::new(),
@@ -389,6 +399,7 @@ impl Deliverer {
     pub(crate) fn delivery_stats(&self) -> DeliveryStats {
         DeliveryStats {
             slow_path: self.slow.get(),
+            unchecked: self.unchecked,
             ..self.stats.clone()
         }
     }
@@ -425,8 +436,10 @@ impl Deliverer {
     /// Takes the batches read that are acknowledged.
     fn take_pending(&mut self, ctx: &Ctx<'_>) {
         let stats = ctx.watch.map(Watch::stats);
-        let mut read: HashMap<crate::durable::history::Key, Vec<kvik_log::reader::FoundFact>> =
-            HashMap::new();
+        let mut read: HashMap<
+            crate::durable::history::Key,
+            (Vec<kvik_log::reader::FoundFact>, bool),
+        > = HashMap::new();
         let mut took = false;
         while let Some(b) = self.pending.front() {
             if let Some(st) = &stats {
@@ -464,22 +477,33 @@ impl Deliverer {
         self.items_from = self.items_from.max(next(floor));
     }
 
-    /// Rebuilds the records from `at` up to where they are kept, from the entries and the log's facts.
-    fn restore_items(&mut self, at: LogPos, ctx: &Ctx<'_>) {
+    /// Rebuilds the records from `at` up to where they are kept, from the entries and the log's facts. A read of the
+    /// log that fails changes nothing and is counted (`refresh_errors`): the consumer stays behind and the next
+    /// call that catches it up reads again. Returns whether the records from `at` are held.
+    fn restore_items(&mut self, at: LogPos, ctx: &Ctx<'_>) -> bool {
         if at >= self.items_from {
-            return;
+            return true;
         }
         let to = self.items_from;
+        let Some(facts) = self.facts_between(at, to, ctx) else {
+            self.stats.refresh_errors += 1;
+            return false;
+        };
         for (p, e) in self.entries.range(at..to) {
             self.items.insert(*p, Rec::Entry(e.clone()));
         }
-        for (stored, outranked) in self.facts_between(at, to, ctx) {
+        for (stored, outranked, unchecked) in facts {
             self.items.insert(
                 stored.position,
-                Rec::Fact(Arc::new(FactRec { stored, outranked })),
+                Rec::Fact(Arc::new(FactRec {
+                    stored,
+                    outranked,
+                    unchecked,
+                })),
             );
         }
         self.items_from = at;
+        true
     }
 
     fn void(&mut self, above: LogPos) {
@@ -505,7 +529,7 @@ impl Deliverer {
         &mut self,
         b: ReadBatch,
         ctx: &Ctx<'_>,
-        read: &mut HashMap<crate::durable::history::Key, Vec<kvik_log::reader::FoundFact>>,
+        read: &mut HashMap<crate::durable::history::Key, (Vec<kvik_log::reader::FoundFact>, bool)>,
     ) {
         self.index.batch(&b);
         // Versioned facts below the recent window: their keys' earlier facts are read from the log, once per pass.
@@ -524,7 +548,8 @@ impl Deliverer {
         if !keys.is_empty() {
             let found = self.read_keys(&keys);
             for k in keys {
-                read.insert(k, found.facts.get(&k).cloned().unwrap_or_default());
+                let facts = found.facts.get(&k).cloned().unwrap_or_default();
+                read.insert(k, (facts, found.unreadable.contains(&k)));
             }
         }
         let mut fed: Vec<u32> = Vec::new();
@@ -539,9 +564,11 @@ impl Deliverer {
             match item {
                 Item::Fact(row) => {
                     let key = (row.series_id, row.t);
-                    let outranked = row
-                        .changed_at
-                        .is_some_and(|c| self.outranked(key, p, c, read));
+                    let (outranked, unchecked) = match row.changed_at {
+                        Some(c) => self.outranked(key, p, c, read),
+                        None => (false, false),
+                    };
+                    self.unchecked += u64::from(unchecked);
                     let rec = Arc::new(FactRec {
                         stored: Stored {
                             position: p,
@@ -549,6 +576,7 @@ impl Deliverer {
                             row,
                         },
                         outranked,
+                        unchecked,
                     });
                     let series = rec.stored.row.series_id;
                     let registry = &self.view.registry;

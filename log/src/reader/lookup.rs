@@ -56,6 +56,8 @@ pub struct Lookup {
     pub durable: Position,
     /// Segments read for the lookup.
     pub segments_read: u64,
+    /// Whether the lease was renewed when due ([`LogReader::keep_alive`]).
+    pub lease_kept: bool,
 }
 
 /// A sealed segment's index as the lookup uses it: `None` when the segment has none that reads.
@@ -127,10 +129,12 @@ impl LogReader {
         lost: &dyn Fn(u64, u64, u64) -> bool,
     ) -> Result<Lookup, ReaderError> {
         let mark = self.read_mark()?;
-        self.keep_alive()?;
+        // The lease's renewal is apart from the read: a failure to write it makes no range incomplete.
+        let lease_kept = self.keep_alive().is_ok();
         let mut out = Lookup {
             facts: Vec::new(),
             complete: vec![true; wanted.len()],
+            lease_kept,
             durable: Position {
                 generation: mark.generation,
                 sequence: mark.last_sequence,

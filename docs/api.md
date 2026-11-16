@@ -263,7 +263,8 @@ enum Live { Value(Fact), None, Unknown }
   `Trigger` if it differs from the latched state, or there is none.
 - A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
   or on the timer, valid until the next resync), `flags` (`replayed`,
-  `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
+  `future`; on a trigger also `approximate_edges` and `restoring`; on any delivery `unchecked`, when local data it
+  rests on could not be read during this run, spec §2.4, Q-750) and the times needed to judge its age.
 - `start` gives the position before the start (spec §4 Resync): the last position for `Start::Now`, the position
   before the first fact at or after T for `Start::Time(T)`, and for `Start::Position(point)`, which takes a
   `SavedPoint { position, stamp }` (spec §7 Readers, Reset stamp and saved points), the position, or the lower
@@ -373,6 +374,7 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
+    LocalDataUnreadable { readings: u64, deliveries: u64 },   // decided without unreadable local data this run (Q-750)
     SetAside(SetAsideReport) }     // information, not degraded (Q-90)
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
@@ -387,12 +389,16 @@ pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for e
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
-pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
+pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats,
+                   pub delivery: DeliveryStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max },
 //               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */ }
 // LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
 //            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+// DeliveryStats { refresh_errors /* reads of the log that failed, tried again */, corruptions /* invalid regions the
+//               delivery reader passed over */, slow_path /* reads of the log for facts outside the deliverer's recent
+//               window */, unchecked /* deliveries flagged `unchecked` */ }   (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }

@@ -493,4 +493,29 @@ mod parts_and_lookup {
         }
         log.shutdown().unwrap();
     }
+
+    #[test]
+    fn a_failed_lease_renewal_leaves_a_lookup_complete() {
+        let (fs, log) = store(60);
+        log.shutdown().unwrap();
+        let clock = Arc::new(SystemClock::default());
+        let mut cfg = ReaderConfig::new("s", fs.clone(), clock, Some([2; 16]), [23; 16]);
+        cfg.lease_refresh = Duration::from_millis(2);
+        let mut r = LogReader::open(cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        fs.fail_nth(crate::fs::FaultOp::Write, "leases", 0, io::ErrorKind::Other);
+        let got = r
+            .lookup(
+                &[Wanted {
+                    series_id: 3,
+                    from: 0,
+                    to: 0,
+                }],
+                &|_, _, _| false,
+            )
+            .unwrap();
+        assert!(!got.lease_kept);
+        assert_eq!(got.complete, [true]);
+        assert!(!got.facts.is_empty());
+    }
 }

@@ -208,9 +208,13 @@ mod bounded {
         };
         let late: Vec<(Option<u64>, bool)> = d
             .facts_between(LogPos::default(), next(d.head), &ctx)
+            .unwrap()
             .into_iter()
-            .filter(|(s, _)| s.row.series_id == 2 && s.row.t == T0 + 10 * S)
-            .map(|(s, o)| (s.row.changed_at, o))
+            .filter(|(s, _, _)| s.row.series_id == 2 && s.row.t == T0 + 10 * S)
+            .map(|(s, o, u)| {
+                assert!(!u);
+                (s.row.changed_at, o)
+            })
             .collect();
         assert_eq!(late, [(Some(5), false), (Some(3), true), (Some(9), false)]);
         assert!(d.slow.get() > 0);
@@ -221,11 +225,34 @@ mod bounded {
         let (env, dir) = store();
         let d = open(&env, dir);
         let read = HashMap::new();
-        // Below the window, without the key read: nothing known, so not outranked.
-        assert!(!d.outranked((2, T0 + 10 * S), next(d.head), 4, &read));
+        // Below the window, without the key read: nothing known, so not outranked, and flagged.
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 4, &read),
+            (false, true)
+        );
         let found = d.read_keys(&[(2, T0 + 10 * S)]);
-        let read: HashMap<_, _> = found.facts.into_iter().collect();
-        assert!(d.outranked((2, T0 + 10 * S), next(d.head), 4, &read));
-        assert!(!d.outranked((2, T0 + 10 * S), next(d.head), 9, &read));
+        let read: HashMap<_, _> = found
+            .facts
+            .into_iter()
+            .map(|(k, f)| (k, (f, false)))
+            .collect();
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 4, &read),
+            (true, false)
+        );
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 9, &read),
+            (false, false)
+        );
+        // Read but not all of it: an outranking fact found is enough; none found is flagged.
+        let partial: HashMap<_, _> = read.into_iter().map(|(k, (f, _))| (k, (f, true))).collect();
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 4, &partial),
+            (true, false)
+        );
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 9, &partial),
+            (false, true)
+        );
     }
 }

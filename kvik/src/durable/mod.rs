@@ -1062,6 +1062,22 @@ impl Writer {
                 .filter(|l| l.kind == LossKind::DataLost && !l.acknowledged)
                 .map(Reason::DataLost),
         );
+        // Q-750: decisions made without data that could not be read hold health degraded until a restart.
+        let readings: u64 = lock(&self.counters)
+            .series
+            .values()
+            .map(|s| s.duplicates_unchecked)
+            .sum();
+        let deliveries = self
+            .hub
+            .as_ref()
+            .map_or(0, |h| h.run_quiet(|d, _| d.delivery_stats().unchecked));
+        if readings > 0 || deliveries > 0 {
+            reasons.push(Reason::LocalDataUnreadable {
+                readings,
+                deliveries,
+            });
+        }
         match (self.fault(), reasons.is_empty()) {
             (Some(f), _) => Health::ReadOnly {
                 cause: fault_out(&f),

@@ -192,19 +192,17 @@ impl Deliverer {
                 }
                 Some(true) => {}
             }
-            work.push((
-                id,
-                arrived,
-                self.value_of(s, ctx.now),
-                self.scheduled_since(c, s, ctx.now),
-            ));
+            self.incomplete.set(false);
+            let value = self.value_of(s, ctx.now);
+            let scheduled = self.scheduled_since(c, s, ctx.now);
+            work.push((id, arrived, value, scheduled, self.incomplete.get()));
         }
         let cause = if batch.is_some() {
             TriggerCause::Fact
         } else {
             TriggerCause::Timer
         };
-        for (id, arrived, value, scheduled) in work {
+        for (id, arrived, value, scheduled, unchecked) in work {
             let Some(rt) = self.consumers.get_mut(name) else {
                 continue;
             };
@@ -225,7 +223,7 @@ impl Deliverer {
                 }
             }
             for e in events {
-                self.emit_trigger(name, id, e.state(), cause);
+                self.emit_trigger(name, id, e.state(), cause, unchecked);
             }
         }
     }
@@ -238,6 +236,7 @@ impl Deliverer {
         funnel: u32,
         state: MState,
         cause: TriggerCause,
+        unchecked: bool,
     ) {
         let head = self.head;
         let incarnation = self
@@ -267,7 +266,9 @@ impl Deliverer {
             state: state.clone(),
             cause,
             position: head,
+            unchecked,
         });
+        self.unchecked += u64::from(unchecked);
         rt.emitted.insert(funnel, state);
         self.notify = true;
     }

@@ -69,7 +69,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-704 | §7 Readers, Leases, Retired files | The writer's own delivery reader skips a refresh at the writer's durable position; that needs a manifest that changes only at a start |
 | Q-705 | §2.3, §4 Outranked facts; `api.md` `Outcome` | The model backend's `outranked` when a later reading of the same call outranks an earlier one |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
-| Q-750 | §2.4, §3 Recovery rule 2, §8 Corrupt block | The slow path of the duplicate rule meeting damage found during a run |
 | Q-751 | §5.1, §11 | The recent window's span and cap as configuration keys |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
 | Q-753 | §2.3 Live state, §4 Outranked facts, §5.1, §6 Restart and resume | What the deliverer keeps in memory and reads from the log |
@@ -1399,25 +1398,29 @@ small change with a test that a consumer registered after many such calls receiv
 the read-back stays on the caller's thread until acknowledged batches are handed to the deliverer in memory.
 
 ## Q-750 — The slow path of the duplicate rule meeting damage found during a run
-Recorded by roadmap 11.0. To be settled by roadmap 6.3b, with the quarantine of §8 Corrupt block.
+Recorded by roadmap 11.0. **Settled by the owner's ruling** at its review.
 **Scenario.** A gauge records 1.0 at `t`; an hour later its recent window has moved on. A sealed segment holding
 that fact is then damaged while the store runs (a flipped byte below the mark), and the adapter replays 1.0 at `t`.
 Before roadmap 11.0 the writer held every fact in memory and dropped the replay as a duplicate. Now the key is read
-from the local log (the slow path, §2.4), and the region that may hold it cannot be read. §2.4 names
-`duplicates_unchecked` for a key whose fact is on no local tier; §8 Corrupt block says only that queries over the
-range return an error until the file is replaced.
-**Decision.** An invalid region that the store's start passed over is lost (§3 Recovery rule 2; the start's state
-never held its facts, as before roadmap 11.0), so it reads as absence. Any other damage, and a segment that cannot be
-read, is never read as absence: a reading that matches no fact the writer still knows (in the recent window, the
-revised-key index or the facts of calls not yet acknowledged) is recorded with `Outcome::Recorded { unchecked: true }`
-and counted in `duplicates_unchecked`; on a versioned series its `outranked` is judged on the facts it knows.
-The deliverer, reading a key's earlier facts or a series' facts before its recent window, takes such damage as no
-earlier fact. A segment file removed while the store runs is not listed and so is not seen, as for any reader (gaps
-between sealed segments are the scrub's, §8).
-**Open.** Whether the call should instead wait, or fail, until the file is replaced from another tier (D5's rejected
-alternative), once quarantine exists.
+from the local log (the slow path, §2.4), and the region that may hold it cannot be read.
+**Ruling.** A reading whose duplicate check cannot complete because of damage found during the run is recorded
+flagged unchecked (`Outcome::Recorded { unchecked: true }`) and counted in `duplicates_unchecked`, the existing flag
+for a fact on no local tier, with its rank judged on the facts that can be read; ingest never stops. A delivery
+decided without such data (whether a fact was outranked when committed, or the facts a condition or live state was
+evaluated over) carries the same flag (`DeliveryFlags::unchecked`) and is counted (`DeliveryStats::unchecked`).
+Either holds health degraded (`Reason::LocalDataUnreadable`) until the next start (spec §2.4, §11). A failed lease
+renewal during a read flags nothing; only data that could not be read does.
+**As built.** An invalid region the store's start passed over is lost (§3 Recovery rule 2; the start's state never
+held its facts, as before roadmap 11.0) and reads as absence; a region met later is lost only if it lies inside one
+the start passed over, so damage that lengthens it is unreadable. A segment file removed while the store runs is not
+listed and so is not seen, as for any reader (gaps between sealed segments are the scrub's, §8). On a series that is
+not versioned, a replay of an earlier value whose key sits in a damaged batch is recorded and becomes current; the
+flag and the health reason say so.
 **Pinned by.** `a_key_that_cannot_be_read_is_recorded_unchecked_unless_a_known_fact_matches` (unit test of the
-decision), `a_lookup_never_reads_damage_as_absence_unless_the_region_is_lost` (unit test of the log reader).
+decision); `a_lookup_never_reads_damage_as_absence_unless_the_region_is_lost`,
+`damage_that_lengthens_a_lost_region_is_not_read_as_absence`, `a_failed_lease_renewal_leaves_a_lookup_complete`
+(log reader); `a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_restarts_and_damage`,
+`a_fact_whose_earlier_facts_cannot_be_read_is_delivered_unchecked` (`kvik/tests/slow_path.rs`).
 
 ## Q-751 — The recent window's span and cap as configuration keys
 Recorded by roadmap 11.0. To be settled by the owner before gate 5.6.
@@ -1541,7 +1544,7 @@ of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
 
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-753.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-753; the owner settled Q-750 at its review.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1612,7 +1615,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-704 | 6.3b | The delivery reader's skipped refresh once the manifest changes during a run; recorded by the store-path quick wins |
 | Q-705 | 5.5 | The model backend's `outranked` within one call; recorded by the store-path quick wins |
 | Q-706 | 5.5 | An emit's read-back with no consumer registered; recorded by the store-path quick wins, not built |
-| Q-750 | 6.3b | The duplicate rule's slow path on damage found during a run: recorded unchecked; recorded by roadmap 11.0 |
 | Q-751 | 5.6 | The recent window as a configuration key; constants decided by the lead with roadmap 11.0, awaiting the owner |
 | Q-752 | 7.1b | A start bounded in memory but not in time until tree checkpoints carry the decision state; recorded by roadmap 11.0 |
 | Q-753 | 5.6 | The deliverer's recent window and its reads of the log; decided by the lead with roadmap 11.0 |
@@ -1867,6 +1869,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
 | Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
+| Q-750 | The duplicate rule's slow path on damage found during a run | `kvik/src/durable/ingest.rs`, `deliver/recent.rs`, `health.rs` (settled by the owner's ruling at the review of roadmap 11.0: recorded and delivered flagged unchecked, counted, health degraded until the next start; ingest never stops) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

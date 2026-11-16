@@ -210,8 +210,17 @@ impl Deliverer {
                 }
                 .between(series, lo, hi)
             });
-            let Some(found) = read else { return };
-            let mut facts: Vec<Stored> = found.into_iter().map(stored).collect();
+            let Some(found) = read else {
+                self.incomplete.set(true);
+                return;
+            };
+            // Only what has been taken: a batch read and not yet taken is not yet in force.
+            let head = self.head;
+            let mut facts: Vec<Stored> = found
+                .into_iter()
+                .filter(|f| f.position <= head)
+                .map(stored)
+                .collect();
             facts.sort_by_key(|f| std::cmp::Reverse((f.row.t, f.position)));
             if !current_newest_first(versioned, facts.iter(), visit) || lo == i64::MIN {
                 return;
@@ -222,76 +231,45 @@ impl Deliverer {
     }
 
     /// Whether a fact of a versioned series at `p` with `changed_at` `c` was outranked when committed: an earlier fact
-    /// of its key has a higher `changed_at` (`spec.md` §4). `read` holds the keys read from the log in this pass.
+    /// of its key has a higher `changed_at` (`spec.md` §4); and whether that rests on fewer than all its key's earlier
+    /// facts. `read` holds the keys read from the log in this pass, each with whether it could not all be read.
     pub(super) fn outranked(
         &self,
         key: Key,
         p: LogPos,
         c: u64,
-        read: &HashMap<Key, Vec<FoundFact>>,
-    ) -> bool {
+        read: &HashMap<Key, (Vec<FoundFact>, bool)>,
+    ) -> (bool, bool) {
         let higher = |q: LogPos, d: Option<u64>| q < p && d.is_some_and(|d| d > c);
         match self.recent.key(key) {
-            Some(facts) => facts.iter().any(|f| higher(f.position, f.row.changed_at)),
-            None => read
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .any(|f| higher(f.position, f.row.changed_at)),
+            Some(facts) => (
+                facts.iter().any(|f| higher(f.position, f.row.changed_at)),
+                false,
+            ),
+            None => match read.get(&key) {
+                Some((facts, unreadable)) => {
+                    let outranked = facts.iter().any(|f| higher(f.position, f.row.changed_at));
+                    (outranked, *unreadable && !outranked)
+                }
+                None => (false, true),
+            },
         }
     }
 
     /// The facts with positions from `at` up to `to` (not included), read from the log, each with whether it was
-    /// outranked when committed.
+    /// outranked when committed and whether that rests on fewer than all its key's earlier facts; `None` when the log
+    /// could not be read to `to`.
     pub(super) fn facts_between(
         &self,
         at: LogPos,
         to: LogPos,
         ctx: &Ctx<'_>,
-    ) -> Vec<(Stored, bool)> {
+    ) -> Option<Vec<(Stored, bool, bool)>> {
         self.slow.set(self.slow.get() + 1);
-        let Ok(mut reader) = crate::durable::start::log_reader(ctx.dir, ctx.env) else {
-            return Vec::new();
-        };
-        let mut out: Vec<Stored> = Vec::new();
-        'read: while let Ok((u, more)) = reader.refresh_some(PART) {
-            for e in u.events {
-                match e {
-                    ReadEvent::Batch(b) => {
-                        if b.first >= to {
-                            break 'read;
-                        }
-                        if b.last < at {
-                            continue;
-                        }
-                        let mut sequence = b.first.sequence;
-                        for item in b.content.items {
-                            let p = LogPos {
-                                generation: b.first.generation,
-                                sequence,
-                            };
-                            sequence += item.sequences();
-                            if let Item::Fact(row) = item
-                                && p >= at
-                                && p < to
-                            {
-                                out.push(Stored {
-                                    position: p,
-                                    received_at: b.content.received_at,
-                                    row,
-                                });
-                            }
-                        }
-                    }
-                    ReadEvent::Void { above, .. } => out.retain(|s| s.position <= above),
-                    ReadEvent::Corruption { .. } => {}
-                }
-            }
-            if !more {
-                break;
-            }
-        }
+        let mut reader = crate::durable::start::log_reader(ctx.dir, ctx.env).ok()?;
+        let read = read_positions(&mut reader, at, to);
         let _ = reader.close();
+        let out = read?;
         let mut keys: Vec<Key> = out
             .iter()
             .filter(|s| s.row.changed_at.is_some())
@@ -299,22 +277,73 @@ impl Deliverer {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        let read = if keys.is_empty() {
-            HashMap::new()
+        let found = if keys.is_empty() {
+            Found::default()
         } else {
-            self.read_keys(&keys).facts
+            self.read_keys(&keys)
         };
-        out.into_iter()
-            .map(|s| {
-                let key = (s.row.series_id, s.row.t);
-                let outranked = s.row.changed_at.is_some_and(|c| {
-                    read.get(&key)
-                        .into_iter()
-                        .flatten()
-                        .any(|f| f.position < s.position && f.row.changed_at.is_some_and(|d| d > c))
-                });
-                (s, outranked)
-            })
-            .collect()
+        Some(
+            out.into_iter()
+                .map(|s| {
+                    let key = (s.row.series_id, s.row.t);
+                    let Some(c) = s.row.changed_at else {
+                        return (s, false, false);
+                    };
+                    let outranked = found.facts.get(&key).into_iter().flatten().any(|f| {
+                        f.position < s.position && f.row.changed_at.is_some_and(|d| d > c)
+                    });
+                    let unchecked = !outranked && found.unreadable.contains(&key);
+                    (s, outranked, unchecked)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The facts with positions from `at` up to `to` (not included); `None` if a part of the log could not be read
+/// before `to` was reached.
+fn read_positions(
+    reader: &mut kvik_log::reader::LogReader,
+    at: LogPos,
+    to: LogPos,
+) -> Option<Vec<Stored>> {
+    let mut out: Vec<Stored> = Vec::new();
+    loop {
+        let (u, more) = reader.refresh_some(PART).ok()?;
+        for e in u.events {
+            match e {
+                ReadEvent::Batch(b) => {
+                    if b.first >= to {
+                        return Some(out);
+                    }
+                    if b.last < at {
+                        continue;
+                    }
+                    let mut sequence = b.first.sequence;
+                    for item in b.content.items {
+                        let p = LogPos {
+                            generation: b.first.generation,
+                            sequence,
+                        };
+                        sequence += item.sequences();
+                        if let Item::Fact(row) = item
+                            && p >= at
+                            && p < to
+                        {
+                            out.push(Stored {
+                                position: p,
+                                received_at: b.content.received_at,
+                                row,
+                            });
+                        }
+                    }
+                }
+                ReadEvent::Void { above, .. } => out.retain(|s| s.position <= above),
+                ReadEvent::Corruption { .. } => {}
+            }
+        }
+        if !more {
+            return Some(out);
+        }
     }
 }

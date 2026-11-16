@@ -455,12 +455,13 @@ impl LogReader {
             if self.scratch.whole.take().is_some() {
                 self.scratch.bytes = Vec::new();
             }
+            // Nothing was taken: more may follow, so a caller reading in parts reads again.
             return Ok((
                 Update {
                     state: self.state,
                     events: Vec::new(),
                 },
-                false,
+                true,
             ));
         }
         self.view = view;

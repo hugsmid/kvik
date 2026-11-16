@@ -89,6 +89,14 @@ pub enum Reason {
     },
     /// A restore set positions aside; information, not degraded (Q-90).
     SetAside(SetAsideReport),
+    /// Local data could not be read during this run where a decision needed it (spec §2.4, Q-750): readings recorded
+    /// with `unchecked`, and deliveries flagged `unchecked`, since the store was opened. Held until a restart.
+    LocalDataUnreadable {
+        /// Readings recorded unchecked.
+        readings: u64,
+        /// Deliveries flagged unchecked.
+        deliveries: u64,
+    },
 }
 
 impl fmt::Display for Reason {
@@ -117,6 +125,13 @@ impl fmt::Display for Reason {
                 write!(f, "restore of file {file_id} failed: {reason}")
             }
             Reason::SetAside(r) => write!(f, "positions {} to {} set aside", r.first, r.last),
+            Reason::LocalDataUnreadable {
+                readings,
+                deliveries,
+            } => write!(
+                f,
+                "local data unreadable: {readings} readings recorded unchecked, {deliveries} deliveries unchecked"
+            ),
         }
     }
 }
@@ -407,6 +422,8 @@ pub struct DeliveryStats {
     /// Reads of the local log for facts outside the deliverer's recent window: a key's earlier facts, a series'
     /// facts before the window, or the records a consumer behind needs.
     pub slow_path: u64,
+    /// Deliveries decided without every fact they rest on, flagged `unchecked` (Q-750).
+    pub unchecked: u64,
 }
 
 /// Per-series statistics.
