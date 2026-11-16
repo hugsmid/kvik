@@ -68,6 +68,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-243 | §8 Self-repair; `api.md` `repair_done` | `repair_done` under manual acknowledgement, across a restart |
 | Q-249 | §8 Self-repair stage 3, §7 Manifest | A torn closing record of a loss restored in full |
 | Q-600 | §8 Self-repair, Restore; `format.md` A.14 `0x26`, `0x27` | A lost object that answers again after its loss was closed: a new copy-verified record, and the restore plan (owner) |
+| Q-601 | §8 Self-repair, Generations; `format.md` A.14 corruption seen, `0x25` fields 12 and 13 | A corruption named by an epoch across restore generations |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1360,6 +1361,24 @@ swapped in and holds no error (`tests/self_repair.rs`
 **Needed.** Whether such an object gets a new `0x27` and returns to a restore's plan. Proposed: no, as Q-246 rules
 for the live store; the closing record stands in every generation.
 
+## Q-601 — A corruption named by an epoch across restore generations
+Recorded at the re-check of roadmap 8.5a. The lead's to settle.
+**Scenario.** A corruption seen names a file by kind, `file_id` and the epoch of its quarantine record, and a
+corrupt manifest record by its epoch (`format.md` A.14); `0x25` fields 12 and 13 carry these values into the next
+generation. An epoch is unique only within one generation's manifest (records are keyed by generation and epoch),
+the value holds no generation, a restore keeps file ids, and no text says which epoch a restore record takes (the
+model's takes 1). (a) Generation 0: segment 7 is quarantined at epoch 105, swapped and seen. A restore claims
+generation 1 and carries "seen (7, 105)". In generation 1 the restored segment 7 is found damaged and its
+quarantine record takes epoch 105: it is born seen and never alerts, against the owner's ruling that every
+corruption alerts. The same holds for a corrupt manifest record at the same epoch number. (b) Over generations 0,
+1 and 2, a seen "(7, 105)" from generation 0 and an unseen "(7, 105)" from generation 1 are the same 24 bytes, so
+fields 12 and 13 ("each named once") cannot hold both. (c) Carried values hold no time, so after a restore the
+30-day count of `repair.suspect_after` (Q-247) starts from nothing unless carried corruptions are dated.
+**Model.** Not shown: the model's restore carries no losses or corruptions (Q-294).
+**Needed.** Proposed: the value carries its generation (in the reserved bytes, or a longer value), or,
+equivalently, a generation's first epoch lies above every epoch its restore read; and a carried corruption is dated
+at the restore record for the count, as Q-244 dates one at the rebuild record.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1442,6 +1461,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-243 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
 | Q-249 | 8.5d | The fault matrix with a kill loop; recorded by roadmap 8.5a |
 | Q-600 | 8.5c | Self-repair wired; for the owner; recorded at the review of roadmap 8.5a |
+| Q-601 | 8.5b | Strict decoding of the corruption-seen values; recorded at the re-check of roadmap 8.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

@@ -562,7 +562,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   none, 1 hot, 2 cold, 3 deep, 4 the mirror path). Each field exactly once; another field below `0x8000` is
   unsupported. Appended when a file is found damaged or judged lost, before a copy is fetched; it names a
   corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. A reason 4 with no later `0x27` for the file
-  takes its copy out of a restore's plan (Q-295): its positions are already a recorded loss, or no loss at all. A
+  takes its copy out of a restore's plan (Q-295) only where recorded lost ranges cover each of its positions that
+  no other listed file holds; otherwise (the re-upload from a local copy or the lost-range record not yet written)
+  it stays listed and the restore judges it (`spec.md` §8 Restore, Failures and end). A
   re-upload from a verified local copy writes a new `0x27`, as does an object that answers again while its loss is
   open and so restores it in full; whether one that answers again after its loss was closed otherwise gets one, and
   so returns to a restore's plan, is Q-600. Decoded strictly

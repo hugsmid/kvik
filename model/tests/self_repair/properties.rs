@@ -329,11 +329,15 @@ impl World {
                     prop_assert!(all.contains_key(p) || self.pending(*p), "{:?} hidden", p);
                 }
             }
-            // Q-246: a loss closed otherwise stays closed so.
+            // Q-246: a loss closed otherwise stays closed so, and holds
+            // nothing, also after an earlier "restored in full".
             if let Some(LossState::Closed(o)) = l.state
                 && !matches!(o, Outcome::Restored(_))
             {
                 self.closed.insert(l.identity, o);
+                for p in sealed.iter().filter(|p| covers(l, **p)) {
+                    prop_assert!(!all.contains_key(p), "{:?} readable in a closed loss", p);
+                }
             }
             let was = self.states.insert(l.identity, l.state).flatten();
             cover.restored += usize::from(restored(l.state) && !restored(was));

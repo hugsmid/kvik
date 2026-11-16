@@ -673,6 +673,28 @@ fn s8_self_repair_adjacent_segments_found_while_stopped_keep_a_loss_each() {
 }
 
 #[test]
+fn s8_self_repair_a_relost_loss_closed_as_resend_ended_stays_hidden_when_its_object_answers() {
+    let (mut m, f, p) = lost_in_bucket(false);
+    assert_eq!(judge(&mut m), vec![f]);
+    m.find_object(f);
+    m.check_bucket().unwrap();
+    assert!(held(&m, &p));
+    m.advance(7 * DAY);
+    m.lose_object(f);
+    assert_eq!(judge(&mut m), vec![f]);
+    m.advance(DAY);
+    assert_eq!(m.repair(), Ok(1));
+    m.find_object(f);
+    m.check_bucket().unwrap();
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::ResendEnded))
+    );
+    assert!(m.disk.is_hidden(p[0]));
+    assert!(!held(&m, &p), "Q-246");
+}
+
+#[test]
 fn s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming() {
     let (mut m, s) = store(RepairConfig::default());
     let (f, p) = sealed_facts(&mut m, s);
