@@ -1,0 +1,142 @@
+//! The derived files of a durable store (`format.md` A.18): after seals the series directory agrees with the store's
+//! own reads as of its position, the log directory lists every sealed segment, and the status file holds the
+//! writer's counters; a reopened store continues the series directory from the one it finds.
+
+mod common;
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use common::block_on;
+use common::world::{World, gauge, num};
+use kvik::{Live, Quality, Reading, SeriesId, Store, Timestamp, View};
+use kvik_log::directory::logdir;
+use kvik_log::directory::series::SeriesDirectory;
+use kvik_log::directory::status::{StatusFile, counter, health};
+use kvik_log::directory::{Family, read_latest};
+use kvik_log::writer::writer_catalogue;
+
+fn open(w: &World) -> Store {
+    let mut c = w.config();
+    c.log.seal_interval = Duration::from_millis(300);
+    block_on(Store::open(c)).unwrap()
+}
+
+fn store_id(w: &World) -> [u8; 16] {
+    let b = w.fs.read(&Path::new(&w.dir).join("STORE")).unwrap();
+    kvik_log::header::FileHeader::decode(&b).unwrap().store_id
+}
+
+fn series_dir(w: &World) -> Option<SeriesDirectory> {
+    let id = store_id(w);
+    read_latest(&*w.fs, Path::new(&w.dir), Family::Series, |b| {
+        SeriesDirectory::decode(b, &id)
+    })
+    .unwrap()
+    .map(|(_, d)| d)
+}
+
+/// Waits (in real time: seals run on the log's own clock) until the series directory covers `seq`.
+fn wait_for(w: &World, seq: u64) -> SeriesDirectory {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(d) = series_dir(w).filter(|d| d.through.sequence >= seq) {
+            return d;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no series directory through {seq}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn emit(s: &Store, readings: &[Reading]) -> u64 {
+    block_on(s.emit(readings))
+        .unwrap()
+        .last()
+        .map_or(0, |p| p.sequence)
+}
+
+/// The store's own reads agree with an entry: every fact up to `through`, the latest `t` and the live fact.
+fn check(s: &Store, d: &SeriesDirectory, ids: &[SeriesId]) {
+    let all = Timestamp(0)..Timestamp(i64::MAX);
+    let r = s.reader();
+    for id in ids {
+        let e = d.entries.iter().find(|e| e.series_id == id.0).unwrap();
+        let facts: Vec<_> = r
+            .facts(*id, all.clone(), View::History)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|f| f.position.sequence <= d.through.sequence)
+            .collect();
+        assert_eq!(e.fact_count, facts.len() as u64, "series {id:?}");
+        assert_eq!(e.orphan_count, 0);
+        assert_eq!(
+            e.latest_t,
+            facts.iter().map(|f| f.t.0).max(),
+            "series {id:?}"
+        );
+        if !e.candidate_unsure
+            && let Live::Value(v) = r.live(*id).unwrap()
+            && v.fact.position.sequence <= d.through.sequence
+        {
+            let c = e.candidate.unwrap();
+            assert_eq!(
+                (c.t, c.position.sequence),
+                (v.fact.t.0, v.fact.position.sequence)
+            );
+        }
+    }
+}
+
+#[test]
+fn the_series_directory_agrees_with_the_store_and_continues_after_a_reopen() {
+    let w = World::new("derived-agree");
+    let s = open(&w);
+    let ids: Vec<SeriesId> = (0..3)
+        .map(|k| block_on(s.define_series(gauge(&format!("site/dev/m{k}")))).unwrap())
+        .collect();
+    for round in 0..3 {
+        for k in 0..20 {
+            let mut readings: Vec<Reading> = ids
+                .iter()
+                .map(|id| num(*id, round * 100 + k, (round * 100 + k) as f64))
+                .collect();
+            if k % 6 == 0 {
+                readings[1].quality = Quality::Bad;
+            }
+            emit(&s, &readings);
+        }
+        // A seal by time; the first is followed by the series directory, later small ones wait for the cadence
+        // (A.18): whichever file there is agrees with the store as of its position.
+        std::thread::sleep(Duration::from_millis(400));
+        let d = wait_for(&w, 1);
+        check(&s, &d, &ids);
+    }
+    block_on(s.shutdown()).unwrap();
+    let id = store_id(&w);
+    let dir = Path::new(&w.dir);
+    // The log directory lists every sealed segment the catalogue holds.
+    let cat = writer_catalogue(&*w.fs, dir, &id, 0).unwrap();
+    let ld = logdir::load(&*w.fs, dir, &id, &cat).unwrap().unwrap();
+    assert!(ld.groups.iter().all(Option::is_some));
+    assert_eq!(ld.segments().count(), cat.segments.len());
+    assert!(cat.segments.len() >= 3);
+    let (_, st) = read_latest(&*w.fs, dir, Family::Status, |b| StatusFile::decode(b, &id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(st.health, health::OK);
+    assert!(st.counter(counter::BATCHES).is_some());
+    // A reopened store continues from the file it finds and agrees again after more seals.
+    let before = series_dir(&w).unwrap();
+    let s = open(&w);
+    for k in 0..10 {
+        emit(&s, &[num(ids[2], 1_000 + k, 1.0)]);
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    // The reopened writer has not written one yet, so the next seal is due.
+    let d = wait_for(&w, before.through.sequence + 1);
+    check(&s, &d, &ids);
+    block_on(s.shutdown()).unwrap();
+}
