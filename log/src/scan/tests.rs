@@ -291,3 +291,95 @@ fn resynchronising_over_a_chain_longer_than_a_batch_remembers_at_most_a_batch_of
         chains.peak
     );
 }
+
+/// `k` regions, each a damaged word, then a skippable block header whose chain leaps to one shared chain of `n`
+/// header-only blocks at the end of the file, then a batch: every region's resynchronisation meets the shared chain.
+fn regions_sharing_a_chain(k: u64, n: u64) -> (Vec<u8>, SegmentIdentity) {
+    let (mut b, id) = chain(0);
+    b.truncate(HEADER_LEN);
+    let batch_len = alias_batch(&id, 1, 0).len() as u64;
+    let region = 8 + 16 + batch_len;
+    let shared = HEADER_LEN as u64 + k * region;
+    for j in 0..k {
+        let at = b.len() as u64;
+        b.extend_from_slice(&[0xFF; 8]);
+        let leap = crate::block::BlockHeader {
+            block_type: 0x50,
+            flags: FLAG_SKIPPABLE,
+            body_len: (shared - at - 24) as u32,
+            body_crc32c: 0,
+        };
+        b.extend_from_slice(&leap.encode());
+        b.extend_from_slice(&alias_batch(&id, j + 1, at + 24));
+    }
+    for _ in 0..n {
+        encode_block(0x50, FLAG_SKIPPABLE, &[], &mut b).unwrap();
+    }
+    b.extend_from_slice(&[0xFF; 8]);
+    b.resize(b.len() + 64, 0);
+    (b, id)
+}
+
+#[test]
+fn resynchronising_in_many_regions_walks_a_shared_chain_once() {
+    for (k, n) in [(500u64, 500u64), (1_000, 1_000), (2_000, 2_000)] {
+        let (bytes, id) = regions_sharing_a_chain(k, n);
+        let len = bytes.len() as u64;
+        let (old, old_stats) = legacy::scan(&bytes, &id, ScanLimit::End);
+        let (new, stats) = scan_with_stats(&bytes, &id, ScanLimit::End);
+        assert_eq!(new, old);
+        let r = new.unwrap();
+        assert_eq!(r.batches.len() as u64, k);
+        assert_eq!(r.regions.len() as u64, k);
+        assert!(old_stats.headers_visited >= k * n);
+        assert!(
+            !old_stats.within_bound(len),
+            "{old_stats:?} for {len} bytes"
+        );
+        assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+    }
+}
+
+/// A block header claiming a body to the end of the file, then readable commit blocks every 4 KiB in a torn tail.
+fn tail_of_commits(commits: u64) -> (Vec<u8>, SegmentIdentity) {
+    let (mut b, id) = chain(0);
+    b.truncate(HEADER_LEN);
+    let len = HEADER_LEN as u64 + 16 + 4_096 * commits;
+    let claim = crate::block::BlockHeader {
+        block_type: 0x50,
+        flags: FLAG_SKIPPABLE,
+        body_len: (len - HEADER_LEN as u64 - 16) as u32,
+        body_crc32c: 0,
+    };
+    b.extend_from_slice(&claim.encode());
+    for i in 0..commits {
+        let commit = Commit {
+            generation: id.generation,
+            block_count: 1,
+            first_sequence: i + 1,
+            last_sequence: i + 1,
+            commit_time: 0,
+            batch_bytes: 1 << 40,
+            batch_crc32c: 0,
+        };
+        b.resize(b.len() + 4_096 - 64, 0x11);
+        encode_block(block_type::COMMIT, 0, &commit.encode(), &mut b).unwrap();
+    }
+    (b, id)
+}
+
+#[test]
+fn a_torn_tail_with_readable_commits_checksums_each_byte_once() {
+    for commits in [64u64, 256, 1_024] {
+        let (bytes, id) = tail_of_commits(commits);
+        let len = bytes.len() as u64;
+        let (old, _) = legacy::scan(&bytes, &id, ScanLimit::End);
+        let (new, stats) = scan_with_stats(&bytes, &id, ScanLimit::End);
+        assert_eq!(new, old);
+        let r = new.unwrap();
+        assert!(
+            matches!(&r.tail, Some(Tail::Torn { commits: c, .. }) if c.len() as u64 == commits)
+        );
+        assert!(stats.bytes_checksummed <= len, "{stats:?} for {len} bytes");
+    }
+}
