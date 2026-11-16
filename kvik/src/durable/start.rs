@@ -245,4 +245,46 @@ mod tests {
         assert_eq!(kept.index.registry().len(), 4);
         assert!(kept.counters.values().all(|c| c.recorded == 7_200));
     }
+
+    #[test]
+    fn the_read_again_whole_gives_what_the_read_in_parts_gives() {
+        let clock = ManualClock::new(Timestamp(T0 + 7_200 * S));
+        let mut env = Env::test(clock);
+        let fs = Arc::new(kvik_log::fs::MemFs::new());
+        env.fs = fs.clone();
+        let dir = Path::new("start-whole");
+        let config = || {
+            StoreConfig::new(dir, "Etc/UTC")
+                .create_if_missing(true)
+                .env(env.clone())
+        };
+        let s = block_on(Store::open(config())).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/v",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        block_on(s.define_series(spec)).unwrap();
+        let readings: Vec<Reading> = (0..3_000)
+            .map(|k| Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64)))
+            .collect();
+        block_on(s.emit(&readings)).unwrap();
+        // A power loss: the next start writes a recovery entry.
+        fs.crash_after(0);
+        drop(s);
+        fs.power_loss();
+        let s = block_on(Store::open(config())).unwrap();
+        let last = Reading::new(SeriesId(1), Timestamp(T0 + 4_000 * S), Value::F64(1.0));
+        block_on(s.emit(&[last])).unwrap();
+        block_on(s.shutdown()).unwrap();
+        let open = || log_reader(dir, &env);
+        let parts = read_kept(open().unwrap(), open, 100, usize::MAX).unwrap();
+        let whole = read_whole(open().unwrap(), usize::MAX).unwrap();
+        assert!(whole.read_whole && !parts.read_whole);
+        assert_eq!(parts.counters, whole.counters);
+        assert_eq!(parts.decider.history.held(), whole.decider.history.held());
+        assert_eq!(parts.index.registry().len(), whole.index.registry().len());
+    }
 }

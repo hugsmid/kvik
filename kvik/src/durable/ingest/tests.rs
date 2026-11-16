@@ -57,6 +57,8 @@ struct Mem {
     facts: Vec<(u64, FactRow)>,
     readable_below: u64,
     unreadable: HashSet<Key>,
+    /// For an unreadable key, how many of its facts are read before the damage.
+    partial: usize,
     reads: usize,
 }
 
@@ -66,7 +68,10 @@ impl LocalFacts for Mem {
         let mut out = Found::default();
         for (n, (call, row)) in self.facts.iter().enumerate() {
             let key = (row.series_id, row.t);
-            if *call < self.readable_below && keys.contains(&key) && !self.unreadable.contains(&key)
+            let seen = out.facts.get(&key).map_or(0, Vec::len);
+            if *call < self.readable_below
+                && keys.contains(&key)
+                && (!self.unreadable.contains(&key) || seen < self.partial)
             {
                 out.facts.entry(key).or_default().push(FoundFact {
                     position: LogPos {
@@ -286,6 +291,53 @@ fn a_key_that_cannot_be_read_is_recorded_unchecked_unless_a_known_fact_matches()
     );
     assert!(matches!(plan.decisions[0], Decision::Duplicate));
     assert_eq!(plan.depends, Some(3));
+}
+
+#[test]
+fn a_key_read_in_part_never_enters_the_revised_key_index() {
+    let (mut d, mut mem) = left_behind();
+    mem.readable_below = 3;
+    d.readable_below(3);
+    // A second fact at the key, with revise intent: no read, so the key stays out of the index.
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 3.0, None)],
+        Intent::Revise,
+        3,
+    );
+    mem.readable_below = 4;
+    d.readable_below(4);
+    // Only the key's first fact reads; its second lies past the damage.
+    mem.unreadable.insert((1, T0));
+    mem.partial = 1;
+    let plan = commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 2.0, None)],
+        Intent::Normal,
+        4,
+    );
+    assert!(matches!(
+        plan.decisions[0],
+        Decision::Record {
+            unchecked: true,
+            ..
+        }
+    ));
+    assert_eq!(d.history.held().revised_keys, 0);
+    // Readable again: the fact the partial read missed is found, so its replay is a duplicate.
+    mem.unreadable.clear();
+    mem.readable_below = 5;
+    d.readable_below(5);
+    let plan = commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 3.0, None)],
+        Intent::Normal,
+        5,
+    );
+    assert!(matches!(plan.decisions[0], Decision::Duplicate));
 }
 
 #[test]
