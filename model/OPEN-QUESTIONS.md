@@ -68,6 +68,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-610 | §8 Generations; `format.md` A.17 Uploaded forms | The chain of epochs in uploaded manifest records: the field and where it starts |
 | Q-611 | §8 Generations, Restore step 1; `api.md` Backup and restore | What a broken chain of uploaded records is, and what a restore does with one |
 | Q-612 | §8 Generations, Restore step 1; `api.md` Backup and restore | The tail check: a record after the last listed, found, not found or unanswered |
+| Q-613 | §8 Generations, Restore step 1 | Files of the generation read that no record names |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1389,6 +1390,22 @@ before the claim). Built as described; for the owner to accept.
 **Tests.** `backup/tests/restore_chain.rs` (`q612_*`: found, not found and unanswered, after the last listed and
 after the last read; the `stat` before the first fetch).
 
+## Q-613 — Files of the generation read that no record names
+Recorded and decided by roadmap 8.3g. To be settled by roadmap 8.3d (how `Store::restore` reports them).
+**Scenario.** A file is uploaded before the records that name it (spec §8 Continuous backup), so a disaster between
+the two leaves its object in the bucket with no record naming it; so does a record lost or hidden beyond the reach
+of the chain and the tail check (Q-611, Q-612). The restore leaves such a file out, as spec §8 Generations says for
+what is uploaded after a restore read its records, and before this item nothing said so.
+**Decision.** After reading the source records, the restore lists the source generation's log segments
+(`<sid>/log/<generation>-`) and the files of other kinds (`<sid>/files/`) and returns in `Prepared::unnamed` every
+file of that generation that the fold of the records read does not know, in ascending order. It is a report, not
+an error: the restore goes on and lists none of them. A drill reports them too; a resumed restore reports none, as
+it reads no records. A listing that fails fails the restore with the sink's error.
+**Needed.** Roadmap 8.3d: surface the report through `Store::restore` (health or statistics, next to the set-aside
+report), so an operator learns that the bucket holds data the restore left out.
+**Model.** Not modelled.
+**Tests.** `backup/tests/restore_chain.rs` (`q613_*`).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1471,6 +1488,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-610 | 8.3 | The chain of epochs in uploaded manifest records; decided by roadmap 8.3g |
 | Q-611 | 8.3 | A broken chain of uploaded records; decided by roadmap 8.3g; owner: a bucket that lost a record now refuses the restore |
 | Q-612 | 8.3 | The tail check after the listing and after the records read; decided by roadmap 8.3g; owner: a store still uploading can make a restore retry |
+| Q-613 | 8.3d | Files of the generation read that no record names; reported by roadmap 8.3g in `Prepared::unnamed`; surfaced by `Store::restore` at 8.3d |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

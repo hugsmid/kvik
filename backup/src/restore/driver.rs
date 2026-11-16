@@ -297,6 +297,28 @@ async fn reported<S: BackupSink>(
     Ok(sink.stat(&keys.record(g, e)).await?.is_some())
 }
 
+/// The files of generation `g` in the bucket that no record of `source` names (Q-613).
+async fn unnamed<S: BackupSink>(
+    sink: &S,
+    keys: &Keys,
+    g: u32,
+    source: &Catalogue,
+) -> Result<Vec<FileRef>, RestoreError> {
+    let mut out = Vec::new();
+    for prefix in [keys.log_prefix(g), keys.files_prefix()] {
+        for k in list_all(sink, &prefix).await? {
+            if let Some(ObjectName::File { file, generation }) = keys.parse(&k)
+                && generation == g
+                && source.file(file).is_none()
+            {
+                out.push(file);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn by_position(files: &[RestoredFile]) -> Vec<RestoredFile> {
     let mut v = files.to_vec();
     v.sort_by_key(|f| (f.description.range.map(|r| r.0), f.description.file_ref()));
@@ -474,7 +496,16 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
                 let store = fetch_store(&self.sink, &env, &keys).await?;
                 let appender = local::open_appender(&self.local, store_id)?;
                 self.finish(
-                    keys, env, appender, *written, *record, &lost, &store, wall, true,
+                    keys,
+                    env,
+                    appender,
+                    *written,
+                    *record,
+                    &lost,
+                    &store,
+                    wall,
+                    true,
+                    Vec::new(),
                 )
                 .await
             }
@@ -503,6 +534,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             source_records(&self.sink, &env, &keys, generation).await?;
         let source = Catalogue::replay(&records)
             .map_err(|_| PlanError::Invalid("the records read contradict each other"))?;
+        let unnamed = unnamed(&self.sink, &keys, source_generation, &source).await?;
         let plan = (self.plan)(&PlanInput {
             generation,
             nonce,
@@ -525,6 +557,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             &store,
             wall,
             false,
+            unnamed,
         )
         .await
     }
@@ -543,6 +576,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         store: &[u8],
         wall: i64,
         resumed: bool,
+        unnamed: Vec<FileRef>,
     ) -> Result<Prepared, RestoreError> {
         let g = record.generation;
         // `record.drill` is the configured mode here: `prepare_inner` refuses a directory of the other mode and
@@ -590,6 +624,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             store_id: keys.store_id(),
             record,
             resumed,
+            unnamed,
         })
     }
 

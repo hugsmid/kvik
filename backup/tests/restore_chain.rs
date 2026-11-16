@@ -1,5 +1,6 @@
 //! The chain of uploaded manifest records at a restore (`format.md` A.17 Uploaded forms; Q-611, Q-612): each break
-//! of the chain, a record the listing hides, the tail checks found, not found and unanswered.
+//! of the chain, a record the listing hides, the tail checks found, not found and unanswered, and the files of the
+//! generation read that no record names (Q-613).
 
 mod support;
 
@@ -378,4 +379,51 @@ fn q612_no_record_after_the_records_read_before_a_partial_rebuilt_manifest_resto
     let sink = bucket(src, &rebuilt(&s1, &s2, false));
     both(&sink, |r| assert_eq!(r.unwrap().record.files.len(), 2));
     assert!(sink.count("stat", &key(4)) >= 2);
+}
+
+/// The key of a compacted file (kind 2) of `generation` with no description behind it.
+fn other_kind_key(generation: u32, file_id: u64) -> String {
+    let root = Keys::new(ID).store().trim_end_matches("STORE").to_owned();
+    format!("{root}files/02/{generation:08x}-{file_id:016x}")
+}
+
+fn put_object(sink: &FaultSink, key: &str) {
+    let bytes = b"an object no record names".to_vec();
+    let sha = sha256(&bytes);
+    block_on(sink.inner.put(key, bytes.into(), sha)).unwrap();
+}
+
+#[test]
+fn q613_files_of_the_source_generation_that_no_record_read_names_are_reported_and_left_out() {
+    let (src, s1, _) = segments();
+    let second = src.segments[1].0.file_ref();
+    let sink = bucket(src, &[up(0, rec(1, Body::Empty)), up(1, rec(2, s1))]);
+    put_object(&sink, &other_kind_key(0, 0xaa));
+    let other = kvik_files::desc::FileRef {
+        kind: 2,
+        file_id: 0xaa,
+    };
+    both(&sink, |r| {
+        let p = r.unwrap();
+        assert_eq!(p.unnamed, vec![second, other]);
+        assert_eq!(p.record.files.len(), 1);
+    });
+}
+
+#[test]
+fn q613_named_files_and_files_of_other_generations_are_not_reported() {
+    let (mut src, s1, s2) = segments();
+    let mut later = src.segments[0].0.clone();
+    later.generation = 1;
+    later.file_id = 9;
+    src.segments.push((later.clone(), b"generation 1".to_vec()));
+    let sink = bucket(src, &plain(&s1, &s2));
+    put_object(&sink, &other_kind_key(1, 0xbb));
+    assert!(
+        sink.inner
+            .objects()
+            .contains_key(&Keys::new(ID).file(&later))
+    );
+    let p = prepare(&sink, PlanMode::Drill).unwrap();
+    assert_eq!(p.unnamed, Vec::new());
 }

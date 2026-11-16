@@ -45,6 +45,9 @@ pub struct Prepared {
     pub record: RestoreRecord,
     /// The directory already held this record.
     pub resumed: bool,
+    /// Files of the source generation in the bucket that no record read names, which the restore leaves out (Q-613);
+    /// empty on a resume.
+    pub unnamed: Vec<FileRef>,
 }
 
 /// What one [`RestoreDriver::step`] did.
