@@ -1477,7 +1477,14 @@ impl Disk {
             ManifestOp::Seal { .. } => Vec::new(),
             ManifestOp::Restore { restored_end, .. } => vec![*restored_end],
             ManifestOp::LostRange { to, .. } => vec![*to],
-            ManifestOp::Acknowledge { losses, .. } => losses.iter().map(|a| a.to).collect(),
+            ManifestOp::Acknowledge { losses, seen } => losses
+                .iter()
+                .map(|a| a.to)
+                .chain(seen.iter().filter_map(|c| match c {
+                    Corruption::Range(p) => Some(*p),
+                    Corruption::File(_) => None,
+                }))
+                .collect(),
             ManifestOp::Quarantine { .. } => Vec::new(),
         }
     }

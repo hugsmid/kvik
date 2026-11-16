@@ -11,7 +11,7 @@ use super::{
     ManifestOp, ManifestRecord, Mark, MarkState, MarkSync, Model, PointCheck, QuarantineCause,
     RecoveryEntry, Reset, ResetPoint, ResetStamp, SavedPoint, StoredFile, Tail, WriteOutcome,
 };
-use crate::recovery::{LossKind, Outcome};
+use crate::recovery::{LossKind, LossState, Outcome};
 use crate::registry::RegistryEvent;
 use crate::types::Position;
 
@@ -568,8 +568,13 @@ impl Model {
         let losses: Vec<Acknowledged> = self
             .losses()
             .into_iter()
+            // A loss whose copy is being brought back closes as restored in
+            // full (Q-248).
             .filter(|l| {
-                l.kind == LossKind::DataLost && !l.acknowledged && identities.contains(&l.identity)
+                l.kind == LossKind::DataLost
+                    && !l.acknowledged
+                    && l.state != Some(LossState::Copying)
+                    && identities.contains(&l.identity)
             })
             .filter_map(|l| {
                 Some(Acknowledged {

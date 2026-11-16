@@ -330,6 +330,17 @@ impl Model {
             .collect()
     }
 
+    fn quarantine_records_of(&self, cause: QuarantineCause) -> Vec<FileId> {
+        self.disk
+            .manifest
+            .iter()
+            .filter_map(|r| match r.op {
+                ManifestOp::Quarantine { file, cause: c } if c == cause => Some(file),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn seen(&self) -> BTreeSet<Corruption> {
         self.disk
             .manifest
@@ -482,7 +493,8 @@ impl Model {
     /// `repair.lost_over` while the bucket answers; an unreachable bucket
     /// counts nothing. A lost file is quarantined by record and uploaded
     /// again from a verified local copy, or its positions no other file
-    /// holds become a lost range of cause lost in the bucket. Returns the
+    /// holds become a lost range of cause lost in the bucket; one that
+    /// answers again while its loss is open restores it in full. Returns the
     /// files judged lost. Refused while read-only.
     pub fn check_bucket(&mut self) -> Result<Vec<FileId>, Error> {
         if self.vol()?.read_only {
@@ -490,6 +502,16 @@ impl Model {
         }
         if !self.disk.bucket.reachable {
             return Ok(Vec::new());
+        }
+        // An object judged lost that answers again restores its open loss in
+        // full (stage 1); a closed one stays closed (Q-246).
+        let back: Vec<FileId> = self
+            .quarantine_records_of(QuarantineCause::LostInBucket)
+            .into_iter()
+            .filter(|f| self.disk.in_bucket(*f))
+            .collect();
+        for f in back {
+            self.close_restored(f);
         }
         let wall = self.wall;
         let missing: Vec<FileId> = self

@@ -403,6 +403,8 @@ pub struct CorruptionReport { pub id: CorruptionId, pub found_at: Timestamp, pub
     pub repaired: bool }
 pub fn attention(&self) -> Vec<Alert>;                      // Store and Reader; empty: nobody needs to look
 pub async fn acknowledge_corruptions(&self, ids: &[CorruptionId]) -> Result<(), WriteError>;
+// LossState, Closed, ResendRequest, repairs, repair_done, Alert, CorruptionId, CorruptionReport, attention,
+// acknowledge_corruptions, LossReport.state and the repair.* keys are built with roadmap 8.5c.
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }

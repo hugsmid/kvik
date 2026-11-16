@@ -5,10 +5,10 @@ mod common;
 
 use common::T0;
 use kvik_model::engine::{
-    Alert, Config, Corruption, Error, FileClass, FileId, Level, ManifestOp, Model, QuarantineCause,
-    Reason, RepairConfig,
+    Alert, Config, ConsumerDecl, ConsumerId, Corruption, Error, FileClass, FileId, Level,
+    ManifestOp, MarkSync, Model, QuarantineCause, Reason, RepairConfig, Selection,
 };
-use kvik_model::recovery::{LossCause, LossKind, LossState, Outcome};
+use kvik_model::recovery::{LossCause, LossKind, LossState, MarkState, Outcome};
 use kvik_model::types::{DAY, HOUR, Kind, MINUTE, Position, Reading, SECOND, SeriesId, ValueType};
 
 fn store(repair: RepairConfig) -> (Model, SeriesId) {
@@ -384,6 +384,102 @@ fn s8_self_repair_a_closed_loss_is_not_restored_from_a_copy_found_later() {
         only_loss(&m).state,
         Some(LossState::Closed(Outcome::ResendEnded))
     );
+}
+
+#[test]
+fn s8_self_repair_an_object_that_answers_again_restores_its_open_loss_in_full() {
+    let (mut m, f, p) = lost_in_bucket(false);
+    for _ in 0..2 {
+        m.check_bucket().unwrap();
+        m.advance(5 * MINUTE);
+    }
+    assert_eq!(m.check_bucket(), Ok(vec![f]));
+    assert!(!held(&m, &p));
+    m.find_object(f);
+    assert_eq!(m.check_bucket(), Ok(vec![]));
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3)))
+    );
+    assert!(held(&m, &p));
+    assert_eq!(m.health().level, Level::Ok);
+    assert_eq!(m.attention(), vec![Alert::Corruption(Corruption::File(f))]);
+}
+
+#[test]
+fn s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    m.upload();
+    m.crash();
+    m.corrupt_hot(f);
+    m.scrub();
+    m.restart();
+    assert_eq!(only_loss(&m).state, Some(LossState::Copying));
+    m.acknowledge_losses(&[p[0]]).unwrap();
+    assert_eq!(only_loss(&m).state, Some(LossState::Copying), "Q-248");
+    assert!(m.attention().is_empty(), "its corruption is named seen");
+    assert!(m.restore_file(f));
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3)))
+    );
+    assert_eq!(m.health().level, Level::Ok);
+}
+
+#[test]
+fn s8_self_repair_a_region_a_start_finds_alerts_by_its_loss_and_a_truncated_tail_does_not() {
+    let (mut m, s) = store(RepairConfig::default());
+    for i in 0..3 {
+        m.ingest(vec![Reading::num(s, m.wall + i * SECOND, 1.0)])
+            .unwrap();
+    }
+    m.crash();
+    let active = m.disk.active.unwrap();
+    let batch = m.disk.files[&active].batches.len() - 2;
+    m.corrupt_open_batch(batch).unwrap();
+    m.restart();
+    let l = only_loss(&m);
+    assert_eq!(l.cause, LossCause::Corruption);
+    let alert = Alert::Corruption(Corruption::Range(l.identity));
+    assert_eq!(m.attention(), vec![alert]);
+    m.acknowledge_losses(&[l.identity]).unwrap();
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Operator))
+    );
+    assert!(m.attention().is_empty());
+
+    let consumer = ConsumerDecl {
+        id: ConsumerId(1),
+        selection: Selection::All,
+        capacity: 16,
+    };
+    let config = Config {
+        mark_sync: MarkSync::Timed,
+        ..Config::default()
+    };
+    let mut m = Model::new(config, vec![consumer], T0 + HOUR);
+    let s = m
+        .define(
+            "plant/line-1/power",
+            Kind::Gauge,
+            ValueType::Number,
+            "kW",
+            10 * SECOND,
+        )
+        .unwrap();
+    for i in 0..3 {
+        m.ingest(vec![Reading::num(s, T0 + i, 1.0)]).unwrap();
+    }
+    m.drain().unwrap();
+    m.crash();
+    m.lose_mark(MarkState::Missing).unwrap();
+    assert_eq!(m.power_loss_losing(2), 2);
+    m.restart();
+    assert_eq!(only_loss(&m).cause, LossCause::TruncatedTail);
+    assert!(m.corruptions().is_empty());
+    assert!(m.attention().is_empty());
 }
 
 #[test]

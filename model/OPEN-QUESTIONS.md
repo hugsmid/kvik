@@ -70,6 +70,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-243 | §8 Self-repair; `api.md` `repair_done` | `repair_done` under manual acknowledgement, across a restart |
 | Q-244 | §8 Self-repair, §7 Manifest; `format.md` A.14 `0x26` | Corruptions after a manifest rebuild: alerts and the repeated-corruption count |
 | Q-247 | §8 Self-repair; `api.md` Configuration | The default of `repair.suspect_after` |
+| Q-248 | §8 Self-repair, Acknowledging a loss | `acknowledge_losses` on a loss whose copy is being brought back |
+| Q-249 | §8 Self-repair stage 3, §7 Manifest | A torn closing record of a loss restored in full |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1389,6 +1391,28 @@ until seen, the repeated-corruption alert says that the storage itself is suspec
 **Now.** 2 corruptions (not losses: a repaired corruption counts) in 30 days, counted by the records that name them.
 **Needed.** The owner's default.
 
+## Q-248 — `acknowledge_losses` on a loss whose copy is being brought back
+Recorded by roadmap 8.5a.
+**Scenario.** A sealed segment is found damaged while the store cannot write; the next start records its loss, and
+the segment's copy in deep is being fetched (stage 1, state `Copying`). An operator calls `acknowledge_losses` for
+it. Closed "by an operator", the loss is closed for good, and Q-246 keeps a closed loss from being restored, so the
+copy is never swapped in and the quarantined file holds the Corrupt block error, with fatal health, for ever.
+**Model.** `acknowledge_losses` skips a loss in stage 1: it writes no closing record for it (it still names its
+corruption seen), and the loss closes as restored in full when the copy is swapped in
+(`tests/self_repair.rs` `s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming`).
+**Needed.** Whether the operator's call waits for stage 1 as the model has it, or closes the loss and lets the swap
+proceed with the positions left out of every view (the copy then ends only the error).
+
+## Q-249 — A torn closing record of a loss restored in full
+Recorded by roadmap 8.5a.
+**Scenario.** A copy is swapped in and the closing record "restored in full" is torn by a power loss. §8 Self-repair
+says the loss is closed again with the same outcome. For "re-send ended" the next start sees the wait passed and
+closes it again; for "restored in full" the start must tell that the swap happened (the swap record survived) and
+count the positions again.
+**Now.** The model writes manifest records atomically and cannot show it.
+**Needed.** The rule a start applies: a recorded open loss all of whose positions a live file holds is closed as
+restored in full with that file's count, before any re-send request is offered.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1473,6 +1497,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-243 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
 | Q-244 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
 | Q-247 | 8.5c | The owner's default; recorded by roadmap 8.5a |
+| Q-248 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
+| Q-249 | 8.5d | The fault matrix with a kill loop; recorded by roadmap 8.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1859,6 +1885,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Compacting a corrupt file again from its kept inputs | §8 Corrupt block, row 11 | Quarantine needs a verified copy in another tier | — |
 | Corruption inside the open segment; lost ranges, `data_lost` | §3 Recovery rule 2 and Order of a start, §4 Resync, §8 Corrupt block (reported when found; for the open segment, recorded by the next start that can write), §11, row 11a, invariants 1, 2, 9 and 10 | Damage is injected while the engine is down, only to a batch of facts or a recovery entry alone in its batch below the durable mark (Q-33), found and reported by the next recovery, and recorded by the next recovery that can write (Q-79); a block found corrupt at run time is not modelled. The range recorded is the positions the batch held, which is the range the rule names when its neighbours are valid batches. A damaged batch that a remount or a lost mark leaves beyond the mark, at the end of the open segment, is a torn tail: beyond a same-boot mark it is part of a rule 1 reset (Q-125). A lost range recorded at run time (a scrub of a sealed segment) sends no plain `resync` to consumers past it | `tests/edge_cases.rs` `row_11a_…`, `tests/invariants.rs` `inv01_gap_free_except_lost_ranges` |
 | A corrupt sealed log segment with no other copy loses only its damaged region | §8 Corrupt block, row 11: valid batches copied to a new segment by one manifest record, which ends the error | The whole segment's range is lost, recorded as a lost range and reported as `data_lost`, so its positions are not issued again; the file stays quarantined, and its fatal health ends with the lost-range record (§8 Self-repair) | `tests/rules.rs` `s8_corrupt_log_segment_with_no_other_copy_loses_range` |
+| Lost ranges and copies in the model | §8 Self-repair stage 1, Q-246; §8 Hashes | A recorded lost range holds nothing in `Disk::all_entries` until it is closed as restored in full, whatever file is readable at its positions; the upload queue takes only files with a verified local copy (hot and not damaged, or cold), so a damaged file is never uploaded and an object the bucket lost is not put again by the queue | `tests/self_repair.rs` |
 | Self-repair | §8 Self-repair | Closing records are written by an explicit step (`Model::repair`, `repair_done`, `restore_file`), not as time passes; a re-send request carries positions and the wait, not series or commit times; the bucket loses objects but never corrupts one; a corrupt manifest record (a corruption of its own) is not modelled; re-sent readings are ordinary ingest. Restored positions are excluded from catch-up, since the reset point covers them | `tests/self_repair.rs`; `tests/recovery_histories.rs` |
 | Recovery: the default mark sync, torn bytes, Adoption and the last batch written again | §3 Durable mark, Recovery rules 1 and 3, Order of a start, `api.md` `log.mark_sync` (default `Interval(1 s)`) | The model's default is the mark synced at every commit, so existing histories lose no acknowledged batch; the timed sync is `MarkSync::Timed`, fired by `Model::sync_mark_file`. A tail is a count of batches and whether one was torn, not bytes. A start is never cut short, so no recovery entry is adopted, and no batch or header is written again. A reset stamp's nonce comes from a counter. A start whose own sync fails delivers nothing, timer-driven condition deliveries included, and compaction and tree checkpoints are refused while read-only | `tests/edge_cases.rs` `row_07_…`, `row_07a_…`, `row_12a_…` |
 | Orphaned facts and id floors | §2.1, §3 Commit, invariants 2 and 4 (Q-33) | A batch holding anything but facts cannot be damaged or lost from a tail (the mark file is synced at once after it, and the fault injections refuse it), so no fact is orphaned; recovery entries carry the id floor, which no definition can exceed | `tests/edge_cases.rs` `row_11a_fault_injection_limits` |
