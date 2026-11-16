@@ -883,6 +883,10 @@ impl Writer {
                 }
             }
         };
+        debug_assert!(
+            plan.items.is_empty(),
+            "the planned facts are moved into the log"
+        );
         d.apply(&mut plan);
         // The call is tracked before the decision lock is released, so a later call that duplicates one of its
         // readings always finds it (lock order: decisions, then calls in flight).
