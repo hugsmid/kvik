@@ -213,6 +213,37 @@ fn a_key_below_the_window_is_read_once_per_call_and_enters_the_revised_key_index
 }
 
 #[test]
+fn a_key_of_several_facts_leaves_the_window_whole_into_the_revised_key_index() {
+    let mut d = decider(History::default());
+    let mut mem = Mem::default();
+    let first = [
+        reading(1, T0, 1.0, None),
+        reading(1, T0, 2.0, None),
+        reading(1, T0, 3.0, None),
+    ];
+    commit(&mut d, &mut mem, &first, Intent::Normal, 1);
+    mem.readable_below = 2;
+    d.readable_below(2);
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0 + 3_600 * S, 1.0, None)],
+        Intent::Normal,
+        2,
+    );
+    assert_eq!(d.history.held().revised_facts, 3);
+    let plan = commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 3.0, None)],
+        Intent::Normal,
+        3,
+    );
+    assert!(matches!(plan.decisions[0], Decision::Duplicate));
+    assert_eq!(mem.reads, 0);
+}
+
+#[test]
 fn a_reading_above_the_latest_t_takes_the_fast_path_and_one_in_the_window_reads_nothing() {
     let (mut d, mut mem) = left_behind();
     let readings = [
