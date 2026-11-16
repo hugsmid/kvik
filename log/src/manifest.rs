@@ -4,7 +4,8 @@
 //! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire, sealed-segment and reserved
 //! (restore, quarantine, tier-move) records over as field lists, taking only their epochs.
 
-use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block};
+use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block_with};
+use crate::crc::PrefixCrc;
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 
@@ -182,9 +183,20 @@ fn decode_lost(list: &[(u16, &[u8])]) -> Option<LostRange> {
     })
 }
 
-/// The record at `at`, if it is a valid record whose epoch is above `min_epoch`.
-fn record_at(bytes: &[u8], at: u64, min_epoch: u64) -> Result<Option<Record>, ManifestError> {
-    let Ok(b) = read_block(bytes, at, bytes.len() as u64) else {
+/// The record at `at`, if it is a valid record whose epoch is above `min_epoch`. Body checksums come from `sums`,
+/// asked at rising offsets, so a read checksums at most twice the file (`format.md` A, common rules: scan bound).
+fn record_at(
+    bytes: &[u8],
+    sums: &mut PrefixCrc<'_>,
+    at: u64,
+    min_epoch: u64,
+) -> Result<Option<Record>, ManifestError> {
+    sums.forget_below(at);
+    let crc = |start, body: &[u8]| {
+        sums.range(start, body.len() as u64)
+            .unwrap_or_else(|| crate::crc::crc32c(body))
+    };
+    let Ok(b) = read_block_with(bytes, at, bytes.len() as u64, crc) else {
         return Ok(None);
     };
     let t = b.header.block_type;
@@ -245,10 +257,11 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
         return Err(ManifestError::Header);
     }
     let mut records: Vec<Record> = Vec::new();
+    let mut sums = PrefixCrc::new(bytes);
     let mut at = HEADER_LEN as u64;
     while at < bytes.len() as u64 {
         let min = records.last().map_or(0, |r| r.epoch);
-        match record_at(bytes, at, min)? {
+        match record_at(bytes, &mut sums, at, min)? {
             Some(r) => {
                 at = r.end;
                 records.push(r);
@@ -261,7 +274,7 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
     let min = records.last().map_or(0, |r| r.epoch);
     let mut probe = valid_end + 8;
     while probe + (BLOCK_HEADER_LEN as u64) <= bytes.len() as u64 {
-        if record_at(bytes, probe, min)?.is_some() {
+        if record_at(bytes, &mut sums, probe, min)?.is_some() {
             return Err(ManifestError::Corrupt(valid_end));
         }
         probe += 8;
@@ -479,5 +492,45 @@ mod tests {
         assert_eq!(r.last_epoch(), 6);
         assert_eq!(r.records.len(), 6);
         assert!(r.records.iter().all(|x| x.lost.is_none()));
+    }
+
+    /// `n` block headers 16 bytes apart after a damaged word, each claiming a body that runs to the end of the file
+    /// with a wrong checksum: every one is read by the forward search.
+    fn nested_records(n: u64) -> Vec<u8> {
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [2; 16])
+            .encode()
+            .to_vec();
+        f.extend_from_slice(&[0xFF; 8]);
+        let base = f.len() as u64;
+        let len = base + 16 * n + 64;
+        for i in 0..n {
+            let o = base + 16 * i;
+            let h = crate::block::BlockHeader {
+                block_type: 0x50,
+                flags: crate::block::FLAG_SKIPPABLE,
+                body_len: (len - o - 16) as u32,
+                body_crc32c: 0xDEAD_BEEF,
+            };
+            f.extend_from_slice(&h.encode());
+        }
+        f.resize(len as usize, 0x11);
+        f
+    }
+
+    #[test]
+    fn the_forward_search_over_nested_records_checksums_linear_bytes() {
+        for n in [500u64, 1_000, 2_000] {
+            let f = nested_records(n);
+            let len = f.len() as u64;
+            crate::crc::BYTES_HASHED.with(|c| c.set(0));
+            let r = read_manifest(&f, &[2; 16]).unwrap();
+            let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
+            assert!(r.records.is_empty() && r.torn);
+            // Twice the file in bodies, and a 12-byte header checksum per 8-byte step.
+            assert!(
+                hashed <= 2 * len + 12 * (len / 8),
+                "{hashed} bytes hashed for {len}"
+            );
+        }
     }
 }

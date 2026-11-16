@@ -3,15 +3,13 @@
 //! The batch layer (roadmap 4.3) produces the bodies of facts and entries blocks; this module frames them, counts
 //! their sequences and computes the commit block, and on reading decides whether a batch is complete.
 
-use crate::block::{
-    BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block, peek_header,
-    peek_raw, read_block,
-};
+use crate::block::{BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block};
 use crate::body::{COMMIT_LEN, Commit, DataPrefix};
 use crate::content::check_block;
 use crate::content_error::BodyError;
 use crate::crc::Crc32c;
 use crate::error::{Element, EncodeError, FormatError};
+use crate::scan::Reads;
 
 /// The most bytes of data blocks in one batch (A, common rules: a batch is at most 8 MiB of data blocks plus its
 /// commit block).
@@ -102,7 +100,7 @@ pub(crate) enum Refusal {
 /// Reads the batch starting at `o`, accepting it only if it ends at or below `limit` and its first sequence is at
 /// least `min_first`.
 pub(crate) fn read_batch<'a>(
-    bytes: &'a [u8],
+    reads: &mut Reads<'a>,
     id: &SegmentIdentity,
     o: u64,
     limit: u64,
@@ -121,7 +119,7 @@ pub(crate) fn read_batch<'a>(
     let commit_block = loop {
         // Sizes are judged on the header, before the body is checksummed: a data block that would take the batch
         // past 8 MiB, or a commit block of another length, ends the batch here.
-        if let Some(h) = peek_header(bytes, pos, limit) {
+        if let Some(h) = reads.peek(pos, limit) {
             let too_long = match h.block_type {
                 block_type::COMMIT => h.body_len as usize != COMMIT_LEN,
                 _ => pos - o + h.block_len() > MAX_BATCH_DATA,
@@ -135,7 +133,7 @@ pub(crate) fn read_batch<'a>(
                 return incomplete(fault);
             }
         }
-        let b = match read_block(bytes, pos, limit) {
+        let b = match reads.block(pos, limit) {
             Ok(b) => b,
             Err(f) => return incomplete(BatchFault::Block(f)),
         };
@@ -233,7 +231,12 @@ pub(crate) fn read_batch<'a>(
 /// block is reached within 8 MiB of data blocks, and its `block_count`, `batch_bytes`, generation and
 /// `batch_crc32c` hold. No data block body is checksummed, so this costs O(blocks); a candidate that passes it is a
 /// batch image for this store, file and offset, and only then is read in full.
-pub(crate) fn framing_holds(bytes: &[u8], id: &SegmentIdentity, o: u64, limit: u64) -> bool {
+pub(crate) fn framing_holds(
+    reads: &mut Reads<'_>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+) -> bool {
     let mut crc = Crc32c::new();
     crc.update(&id.store_id);
     crc.update(&id.file_id.to_le_bytes());
@@ -241,7 +244,7 @@ pub(crate) fn framing_holds(bytes: &[u8], id: &SegmentIdentity, o: u64, limit: u
     let mut pos = o;
     let mut count: u64 = 0;
     loop {
-        let Some((h, raw)) = peek_raw(bytes, pos, limit) else {
+        let Some((h, raw)) = reads.peek_raw(pos, limit) else {
             return false;
         };
         match h.block_type {
@@ -249,7 +252,7 @@ pub(crate) fn framing_holds(bytes: &[u8], id: &SegmentIdentity, o: u64, limit: u
                 if h.body_len as usize != COMMIT_LEN {
                     return false;
                 }
-                let Ok(b) = read_block(bytes, pos, limit) else {
+                let Ok(b) = reads.block(pos, limit) else {
                     return false;
                 };
                 let Ok(c) = Commit::decode(b.body) else {

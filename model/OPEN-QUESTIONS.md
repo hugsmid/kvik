@@ -21,7 +21,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-93 (b) and (c) | §5.7 tzdata version in force, §7 Readers | A release name standing for its rules; a writer that cannot write, and values other than calendar results in a reader of another release |
 | Q-94 | §7 compaction order, §8 Fill pressure, Corrupt block, §3 Disk space | Compaction in position order when the next segment is not local or is quarantined |
 | Q-96 | §6 Restart and resume, §4 Resync, Behind consumers | A resume replay with a segment missing in the middle, and `resync` per funnel or per consumer |
-| Q-110 | `format.md` A.2 Resynchronisation | The residual cost of resynchronising over nested batch images |
 | Q-111 | `format.md` common rules (Sizes), A.4 (Sizes) | A full facts block against the batch limit |
 | Q-115 (e), (f), (j), (k), (n) | §3 Commit, Segments, Disk space, Back-pressure; `format.md` A.8, A.13 | The commit path: the points still open |
 | Q-116 (a), (c), (k), (n) | §3 Recovery, Order of a start; `format.md` A.14; `design.md` Budgets | Recovery at a start: the points still open |
@@ -66,6 +65,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-230 | `format.md` common rules (Scan bound), A.2, A.5, A.6, A.14 | Body checks of checksum-valid bodies that nest |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -417,23 +417,6 @@ deliveries it has seen" on `resync` depends on which.
 middle is not examined. One `resync` delivery carries the state of every funnel in force (`engine::Resync`).
 **Needed.** What a resume replay does at a non-local segment in the middle, and whether `resync` is one delivery per
 consumer or per funnel.
-
-## Q-110 — The residual cost of resynchronising over nested batch images
-Found at the review of roadmap 4.2 (crate `kvik-log`). To be settled at gate 4.9.
-**Scenario.** Resynchronisation (`format.md` A.2) judges candidates on block headers and reads in full only a
-candidate whose framing and `batch_crc32c` hold. Such candidates can be as dense as one per 80 bytes: a 16-byte
-block header whose image nests inside the previous one, each closed by its own 64-byte commit block, all with valid
-`batch_crc32c`. Each is checksummed in full, so within one 8 MiB window the bytes hashed grow with the square of the
-number of images (about 40 n² bytes for n images; `log/src/scan.rs` `nested_batch_images_hash_each_image_once`).
-Building them needs the store id, the file id and the offsets, so only a process that can write the file can.
-**Implemented.** Each passing candidate is checksummed once; the cost is pinned by the test above.
-**Needed.** Whether the cost is accepted (write access is needed to cause it), or bounded, for example by a
-prefix-CRC table over the window so that each candidate's body checksum costs O(1) after one linear pass.
-**Gate 4.9** recommends accepting the cost now and stating the trust boundary (`design.md` Budgets: the restart
-budget holds for files the engine wrote, damaged or not, and a file crafted by a process with write access to the
-store is outside it; `SECURITY.md`: write access to the store directory is full trust), with the prefix-CRC table
-recorded as hardening before the format is declared stable (roadmap 10.3). Owner decision pending: the trust-boundary
-wording, which narrows a budget's scope.
 
 ## Q-111 — A full facts block against the batch limit
 Found at the review of roadmap 4.3 (crate `kvik-log`). To be settled at gate 4.9.
@@ -1330,6 +1313,25 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-230 — Body checks of checksum-valid bodies that nest
+Found by roadmap 4.9d (crates `kvik-log` and `kvik-files`), which applied the Q-110 ruling.
+**Scenario.** The scan bound (`format.md` A, common rules) makes checksumming and header reads linear in a file's
+length, but a block whose checksums hold still has its body checked by type: a facts or entries body is decoded in
+full (A.5, A.6), a manifest record's fields are parsed (A.14). A writer of the file can nest such bodies as Q-110's
+nested batch images do: n facts blocks nested inside one another a few dozen bytes apart, each with a valid `body_crc32c` and, for a resynchronisation
+candidate, a valid `batch_crc32c`, each body running to its own commit block and failing its checks at its last
+bytes. Each body is decoded once (a boundary read judges each block once, a resynchronisation candidate is unique
+per commit block), so the decoding grows with the sum of the bodies' lengths, with the square of n within one
+8 MiB window, as the checksumming did before the prefix table. The manifest's forward search decodes the fields of each
+checksum-valid record image in the same way. Building the bodies needs the checksums right, so only a writer of the
+file can; random damage stops at the checksum.
+**Implemented.** Each checksum-valid body is checked once per scan; the per-block cost is bounded by the batch limit
+(8 MiB) in a segment and the body limit (16 MiB) in the manifest, not by the file's length.
+**Needed.** One of: (1) accept, and state the rule as bounding checksums, header reads and memory, with body checks
+of checksum-valid bodies bounded per block; or (2) a mechanism that bounds them per window, which the acceptance rule
+(A.2) does not make obvious, since whether a candidate is accepted depends on its body checks. Recommendation: (1)
+for v1, with (2) recorded as hardening before the format is declared stable (roadmap 10.3).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1342,7 +1344,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110 by the owner's ruling and recorded Q-230.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1360,7 +1362,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-93 (b) and (c) | 7.3 | Calendar; (a) settled at gate 3.3 by the owner |
 | Q-94 | 6.3b | Compaction order; recorded after the tag, from the review of the Q-71 ruling; with 6.3b, which publishes compaction outputs (6.3a lays out the records only) |
 | Q-96 | 5.3 | Catch-up, resync and replay; recorded after the tag |
-| Q-110 | 4.9 | Gate; recorded at the review of roadmap 4.2; owner decision pending on the trust-boundary wording |
 | Q-111 | 4.9 | Gate; recorded at the review of roadmap 4.3; owner decision pending on the call-limit wording in `api.md` |
 | Q-115 (e), (j), (n) | 4.9 | Gate; owner decisions pending: the `space()` seam, the Windows wording, and bounds on the ingest queue's bytes and on blocked seals |
 | Q-115 (f), (k) | 5.1 | Series registry (the segment index's reach) and the interface (waits and statistics); deferred by gate 4.9; both implemented by roadmap 5.1 (see the question) |
@@ -1410,6 +1411,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-230 | 4.9 | Body checks of checksum-valid bodies that nest; recorded by roadmap 4.9d; owner decision pending |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1656,6 +1658,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-110 | The residual cost of resynchronising over nested batch images | `format.md` common rules (Scan bound), A.2, A.14; `design.md` Budgets; `SECURITY.md` (ruled by the owner: kvik defends against crafted files by bounding scan work per file, rather than placing a file crafted by a writer of the store outside the restart budget. Scenario: resynchronisation candidates whose framing and `batch_crc32c` hold can nest one per 80 bytes, and each was checksummed in full, about 40 n² bytes for n images in one 8 MiB window; boundary reads along a chain of blocks whose bodies are batch images walked the rest of the chain at every kept batch; the manifest's forward search checksummed each record image. Implemented by roadmap 4.9d: one prefix-CRC pass, a body checksum derived from two prefix values by a CRC shift, each block judged once by the boundary reads, the same acceptance rule. `log/src/scan/tests.rs` `nested_batch_images_checksum_at_most_twice_the_window`, `boundary_reads_along_one_chain_judge_each_block_once`; `log/tests/scan_bound.rs`; `files/src/image.rs` `nested_records_checksum_at_most_twice_the_file`; the fuzz targets assert the bound. Open part: body checks of checksum-valid bodies that nest, Q-230) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

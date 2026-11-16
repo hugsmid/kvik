@@ -130,7 +130,7 @@ fn step8(reg: u32, word: [u8; 8]) -> u32 {
 /// (`format.md` A, common rules: scan bound, Q-110).
 ///
 /// The table runs forward from the first range asked for; a range costs its unaligned tail (at most 7 bytes) and
-/// O(log length) arithmetic, plus the bytes the table has to grow by. Asked in rising order, as the scans do, each
+/// O(log length) arithmetic, plus the bytes the table has to grow by. Asked at rising starts, as the scans do, each
 /// byte enters the table at most once. [`PrefixCrc::forget_below`] bounds its memory to the span still asked for.
 #[derive(Clone)]
 pub struct PrefixCrc<'a> {
@@ -191,7 +191,7 @@ impl<'a> PrefixCrc<'a> {
             return Some(crc32c(crate::bytes::slice(self.bytes, start, len)?));
         }
         let aligned = start + (len & !7);
-        if self.sums.is_empty() || start < self.base || start > self.top() {
+        if self.sums.is_empty() || start < self.base {
             self.base = start;
             self.sums.clear();
             self.sums.push_back(0);
