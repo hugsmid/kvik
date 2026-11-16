@@ -626,6 +626,53 @@ fn s8_self_repair_a_loss_restored_in_full_and_lost_again_is_open_again() {
 }
 
 #[test]
+fn s8_self_repair_a_copy_swapped_in_after_its_object_was_judged_lost_is_watched_again() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    m.upload();
+    m.corrupt_hot(f);
+    m.scrub();
+    m.lose_object(f);
+    assert_eq!(judge(&mut m), vec![f]);
+    m.find_object(f);
+    assert!(m.restore_file(f));
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3)))
+    );
+    m.disk.hot.remove(&f);
+    m.lose_object(f);
+    assert_eq!(judge(&mut m), vec![f], "judged again");
+    assert!(only_loss(&m).degrades());
+    assert!(!held(&m, &p));
+}
+
+#[test]
+fn s8_self_repair_adjacent_segments_found_while_stopped_keep_a_loss_each() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    let (g, q) = sealed_facts(&mut m, s);
+    assert_eq!(p[2].next(), q[0]);
+    m.upload();
+    for _ in 0..2 {
+        m.crash();
+        m.corrupt_hot(f);
+        m.corrupt_hot(g);
+        m.scrub();
+        m.restart();
+        let ids: Vec<Position> = m.losses().iter().map(|l| l.identity).collect();
+        assert_eq!(ids, vec![p[0], q[0]]);
+        assert!(m.restore_file(f) && m.restore_file(g));
+        assert!(
+            m.losses()
+                .iter()
+                .all(|l| l.state == Some(LossState::Closed(Outcome::Restored(3))))
+        );
+        assert!(held(&m, &p) && held(&m, &q));
+    }
+}
+
+#[test]
 fn s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming() {
     let (mut m, s) = store(RepairConfig::default());
     let (f, p) = sealed_facts(&mut m, s);

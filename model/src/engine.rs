@@ -5211,12 +5211,15 @@ impl Model {
                 }
                 continue;
             }
+            // Runs of one segment each, so a range names one loss's identity.
+            let mut runs: Vec<(Position, Position)> = Vec::new();
             for p in lost {
-                match self.disk.found_lost.last_mut() {
+                match runs.last_mut() {
                     Some((_, end)) if end.next() == p => *end = p,
-                    _ => self.disk.found_lost.push((p, p)),
+                    _ => runs.push((p, p)),
                 }
             }
+            self.disk.found_lost.extend(runs);
         }
         bad
     }
@@ -5236,6 +5239,9 @@ impl Model {
         {
             self.disk.corrupt.remove(&f);
             self.disk.quarantined.remove(&f);
+            // The copy answered: the object is looked up again (§8
+            // Self-repair, Lost in the bucket).
+            self.disk.judged_lost.remove(&f);
             self.close_restored(f);
             true
         } else {
