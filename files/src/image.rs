@@ -373,6 +373,9 @@ mod tests {
             kvik_log::scan::FAILED_READS_PER_WINDOW
         );
         assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+        // Each failed read checks the shared field list.
+        let failed = kvik_log::scan::FAILED_READS_PER_WINDOW * 4 * 100_000;
+        assert!(stats.bytes_body_checked >= failed, "{stats:?}");
         // The record in the passed part of the window is not found: the file reads as a torn tail.
         let img = img.unwrap();
         assert!(img.records.is_empty() && img.corrupt.is_empty() && img.torn);
