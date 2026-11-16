@@ -51,11 +51,8 @@ proptest! {
         let seal = MS * seal_ms as u32;
         let (s, _) = run(Setup { floor, ceiling, seal, ..Setup::adaptive() }, &h);
         prop_assert!(s.w.stats().sealed_segments == 0, "seal jobs are not run here");
-        for pair in s.log_syncs.windows(2) {
-            if s.starts.contains(&pair[1]) {
-                prop_assert!(pair[1] - pair[0] >= floor.min(ceiling) / 2, "log syncs at {:?}", pair);
-            }
-        }
+        let close = batch_syncs_within_half_the_floor(&s, floor.min(ceiling));
+        prop_assert!(close.is_empty(), "log syncs at {:?}", close);
     }
 
     #[test]
@@ -122,6 +119,47 @@ proptest! {
         let bound = 1e3 * (level as f64 + (peak - level) as f64 * (7.0f64 / 8.0).powi(m as i32)) + m as f64;
         prop_assert!(est <= bound, "{} ns above {} ns", est, bound);
     }
+}
+
+/// Pairs of consecutive log syncs whose second is a batch sync started less than half of `floor` after the first.
+fn batch_syncs_within_half_the_floor(s: &Sim, floor: Duration) -> Vec<(Duration, Duration)> {
+    (1..s.log_syncs.len())
+        .filter(|&i| s.log_sync_is_batch[i] && s.log_syncs[i] - s.log_syncs[i - 1] < floor / 2)
+        .map(|i| (s.log_syncs[i - 1], s.log_syncs[i]))
+        .collect()
+}
+
+#[test]
+fn a_seal_sync_at_the_instant_a_0_ns_batch_sync_returns_is_not_a_batch_sync() {
+    let ms = [
+        0, 849, 31_849, 33_449, 59_449, 72_971, 73_586, 75_411, 75_625, 83_114, 96_927, 97_478,
+        99_513, 106_418, 107_353, 114_095, 125_086, 125_417, 136_133, 143_279, 145_559, 148_471,
+        168_471, 191_471, 226_471, 227_161, 229_418, 267_418, 269_241, 270_923, 276_898, 277_544,
+        285_533, 290_243, 292_504, 340_504, 340_525,
+    ];
+    let h = History {
+        calls: ms.iter().map(|&u| (START + US * u, WAKE)).collect(),
+        late: Duration::ZERO,
+        syncs: [0, 2_000, 0, 0, 0, 0, 0].map(|u| US * u).into(),
+    };
+    let floor = 500 * US;
+    let (s, _) = run(
+        Setup {
+            floor,
+            ceiling: 5 * MS,
+            seal: 34 * MS,
+            ..Setup::adaptive()
+        },
+        &h,
+    );
+    let same_instant = (1..s.log_syncs.len())
+        .filter(|&i| s.log_syncs[i] == s.log_syncs[i - 1] && !s.log_sync_is_batch[i])
+        .count();
+    assert!(
+        same_instant > 0,
+        "the history has a seal sync at a batch sync's instant"
+    );
+    assert_eq!(batch_syncs_within_half_the_floor(&s, floor), []);
 }
 
 #[test]

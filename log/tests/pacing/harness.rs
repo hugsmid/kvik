@@ -186,6 +186,8 @@ pub struct Sim {
     pub starts: Vec<Duration>,
     /// Start of every log sync, a timed seal's included.
     pub log_syncs: Vec<Duration>,
+    /// Whether each log sync was a batch's: a seal's sync can start at the same instant as the batch sync before it.
+    pub log_sync_is_batch: Vec<bool>,
     /// Start of the sync that covered each call, by call id.
     pub covered: BTreeMap<u64, Duration>,
     /// The interval in force after each batch sync.
@@ -238,6 +240,7 @@ impl Sim {
             times,
             starts: Vec::new(),
             log_syncs: Vec::new(),
+            log_sync_is_batch: Vec::new(),
             covered: BTreeMap::new(),
             intervals: Vec::new(),
             ceiling_breaks: Vec::new(),
@@ -326,6 +329,8 @@ impl Sim {
         self.create();
         if self.w.stats().syncs > syncs {
             self.log_syncs.push(now);
+            self.log_sync_is_batch
+                .push(self.w.stats().batches > batches);
         }
         if self.w.stats().batches > batches {
             self.starts.push(now);
