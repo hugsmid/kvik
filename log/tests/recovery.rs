@@ -3079,6 +3079,143 @@ fn a_damaged_header_and_batch_in_the_marks_segment_are_a_recorded_loss_at_every_
     }
 }
 
+/// Commits until the mark is in segment 4, with segments created ahead and never sealed.
+fn unsealed_segments() -> Rig {
+    let mut r = Rig::new(WriterConfig {
+        mark_sync: MarkSync::EveryCommit,
+        segment_size: 4096,
+        max_batch_bytes: 1024,
+        ..cfg()
+    });
+    for k in 0..400 {
+        r.submit(vec![fact(1, k)]);
+        r.step();
+        let fs = r.fs.clone();
+        let wall = r.wall;
+        let w = r.w.as_mut().unwrap();
+        if let Some(req) = w.segment_request(wall) {
+            let res = create_segment(&fs, &req, &w.halt());
+            w.segment_created(res);
+        }
+        r.advance(10 * MS);
+        if r.mark().unwrap().file_id >= 4 {
+            break;
+        }
+    }
+    assert!(
+        r.fs.paths()
+            .iter()
+            .all(|p| !p.to_string_lossy().ends_with(".kvl"))
+    );
+    r
+}
+
+/// Damages segment 1 of `r`: its header and every batch (0), all its bytes zeroed (1), or the file removed (2).
+/// Returns the last position it held.
+fn damage_segment_1(r: &mut Rig, how: u8) -> u64 {
+    let seg = log_path("00000000-0000000000000001.open");
+    let name = SegmentName::parse("00000000-0000000000000001.open").unwrap();
+    let bytes = r.fs.read(&seg).unwrap();
+    let held: Vec<(u64, u64)> = scan(&bytes, &segment_id(&name), ScanLimit::End)
+        .unwrap()
+        .batches
+        .iter()
+        .map(|b| (b.offset, b.commit.last_sequence))
+        .collect();
+    r.w = None;
+    match how {
+        0 => {
+            r.fs.poke(&seg, 8, &[0xff; 8]);
+            for &(at, _) in &held {
+                r.fs.poke(&seg, at as usize + 40, &[0xff; 8]);
+            }
+        }
+        1 => r.fs.poke(&seg, 0, &vec![0; bytes.len()]),
+        _ => r.fs.remove_file(&seg).unwrap(),
+    }
+    r.fs.restart();
+    held.last().unwrap().1
+}
+
+fn lost_ranges(r: &Rig) -> Vec<(u64, u64)> {
+    read_manifest(&r.fs.read(&dir().join("MANIFEST")).unwrap(), &STORE_ID)
+        .unwrap()
+        .lost_ranges()
+        .map(|l| (l.first.1, l.last.1))
+        .collect()
+}
+
+/// The lowest unsealed segment, with no sealed segment below it and the mark in a later one, damaged in its header
+/// and every batch, zeroed or missing: the positions it held are a recorded `data_lost` range from position 1, also
+/// when the start is cut at any operation and killed (Q-321).
+#[test]
+fn the_lowest_unsealed_segment_damaged_zeroed_or_missing_is_a_recorded_loss() {
+    for reboot in [false, true] {
+        for how in 0..3 {
+            let mut r = unsealed_segments();
+            let last = damage_segment_1(&mut r, how);
+            if reboot {
+                r.boot += 1;
+            }
+            let rep = r.open().expect("the start finishes");
+            assert_eq!(
+                lost_ranges(&r),
+                vec![(1, last)],
+                "reboot {reboot}, damage {how}"
+            );
+            assert!(
+                rep.losses
+                    .iter()
+                    .any(|l| l.kind == LossKind::DataLost
+                        && (l.first, l.last) == (Some(1), Some(last))),
+                "reboot {reboot}, damage {how}: {:?}",
+                rep.losses
+            );
+            let have = r.positions();
+            assert!(r.acked.keys().all(|s| have.contains_key(s) || *s <= last));
+        }
+    }
+    for n in 0..40 {
+        let mut r = unsealed_segments();
+        let last = damage_segment_1(&mut r, 0);
+        r.fs.crash_after(n);
+        if r.open().is_none() {
+            r.kill();
+            r.open().expect("the next start finishes");
+        }
+        assert_eq!(lost_ranges(&r), vec![(1, last)], "cut after {n}");
+    }
+}
+
+/// The only segment, holding the mark, damaged in its header and every batch, zeroed or missing: the positions up to
+/// the mark's are a recorded `data_lost` range (`spec.md` §3 Recovery rule 2, Q-321).
+#[test]
+fn the_marks_only_segment_damaged_zeroed_or_missing_is_a_recorded_loss() {
+    for reboot in [false, true] {
+        for how in 0..3 {
+            let mut r = Rig::new(WriterConfig {
+                mark_sync: MarkSync::EveryCommit,
+                ..cfg()
+            });
+            for k in 0..3 {
+                r.submit(vec![fact(1, k)]);
+                r.drain();
+            }
+            let last = damage_segment_1(&mut r, how);
+            assert_eq!(last, 3);
+            if reboot {
+                r.boot += 1;
+            }
+            r.open().expect("the start finishes");
+            assert_eq!(
+                lost_ranges(&r),
+                vec![(1, 3)],
+                "reboot {reboot}, damage {how}"
+            );
+        }
+    }
+}
+
 /// A remount within the boot can leave the next segment taken into use by its header alone (base F) while the batch
 /// beyond the mark sits in the mark's segment: rule 1 still truncates that batch, a reset point, and the recovery
 /// entry opens the header-only segment.

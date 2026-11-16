@@ -65,7 +65,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
-| Q-321 | §3 Recovery rule 2; `format.md` A.4 | A damaged header and every batch damaged in an unsealed segment below the mark's |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 
 ## Q-16 — Which commits refresh live staleness
@@ -1296,16 +1295,21 @@ Adoption and the first start, and `format.md` A.4, say so. The reference model h
 torn tail is a reset under rule 1 already, and its first start now also requires an empty invalid tail, a state its
 interface cannot reach (a definition is committed before any reading), so no test pins it.
 
-## Q-321 — A damaged header and every batch damaged in an unsealed segment below the mark's
+## Q-321 — The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it
 
-**Scenario.** Segment 1 holds one acknowledged batch and awaits its seal; segment 2 is in use and the mark names it.
-Media damage hits segment 1's header and its batch. The start finds segment 1 not in use (header invalid, no complete
-batch) and deletes it under `format.md` A.4; the chain starts at segment 2's base, so no gap is seen, and position 1
-is gone with no `data_lost` and no record.
-**Now.** Found by probe at the review of Q-320; not changed (the fix round was for Q-320 only).
-**Needed.** Proposed: a segment below the mark's that is not in use but holds non-zero bytes after its header is
-corruption of a segment that held batches; its positions, from the last sealed segment's end (or 1) to the base of
-the next segment in use, are recorded as a lost range before the file is deleted.
+**Scenario.** Segment 1 holds acknowledged batches and awaits its seal; no segment is sealed yet, and the mark names a
+later segment. Media damage hits segment 1's header and every batch, or zeroes the file, or the file is gone. A start
+found segment 1 not in use (or not at all) and began the chain at the next segment's own base, so no gap was seen:
+the positions vanished with no `data_lost`, no manifest record and no recovery entry, on the same boot or after a
+reboot.
+**Settled after the review of Q-320:** with no sealed segment, the chain of generation 0 starts at position 1, so the
+positions below the first segment kept are a gap, reported as `data_lost` and recorded as a lost range (`spec.md` §3
+Recovery rule 2; `format.md` A.4). This covers a damaged, a zeroed and a missing file alike, and a start cut at any
+operation, since the gap is read from the segments that remain
+(`the_lowest_unsealed_segment_damaged_zeroed_or_missing_is_a_recorded_loss`). When that segment holds the mark, the
+mark's position already gave the range (`the_marks_only_segment_damaged_zeroed_or_missing_is_a_recorded_loss`). A
+restored generation, whose first position is not 1, is left to roadmap 8.3. The reference model injects no damage to
+headers or whole segments.
 
 ## Q-322 — A torn mark update that makes a damaged older slot valid again
 
@@ -1399,7 +1403,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
-| Q-321 | 5.6 | Gate; recorded at the review of Q-320; a silent `data_lost` under media damage below the mark |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
@@ -1646,6 +1649,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-340 | Objects in the bucket that are not envelopes | `format.md` A.17 (owner's ruling when roadmap 8.3b was stacked on 8.1a's A.17: claim markers and checksum probes are unsealed objects of fixed form whose meaning lies in their key, and the only exceptions to "every object is an envelope"; this amends the Q-160 wording. The probe's content and the change of `restore/probe.rs` from a sealed random probe to it were decided at the stacking, under the ruling. A claim marker is the 12 bytes of A.17, read only by whether its key exists (Q-163); a checksum probe is the 19 ASCII bytes `kvik checksum probe` under a fresh `<sid>/probe/<nonce>`, stored only by a bucket that is refused. Scenario: A.17 said every object is an envelope while the restore executor put claim markers unsealed and sealed a random checksum probe; a sealed probe binds nothing a refused bucket's stray object needs, and a marker's store id and generation are already in its key. Neither holds any of the store's data. `backup/src/restore/probe.rs`; `backup/tests/restore_guards.rs` `a_bucket_without_checksum_checks_is_refused_before_the_claim_and_a_drill_does_not_probe`) |
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
+| Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

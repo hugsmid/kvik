@@ -357,6 +357,7 @@ fn plan(
     mark: &MarkRead,
     boot: [u8; 16],
     sealed_last: Option<(u64, u64, i64)>,
+    no_sealed: bool,
     manifest_highest: u64,
 ) -> Plan {
     let in_use: Vec<usize> = (0..segs.len()).filter(|&i| segs[i].in_use()).collect();
@@ -377,7 +378,7 @@ fn plan(
     // Beyond a readable mark every unused segment with non-zero bytes after its header is reported, wherever segments
     // in use lie (a start cut after taking a new segment into use for its entry leaves one above it); with no
     // readable mark, every such segment (Q-125, Q-320). In the mark's segment the mark's position makes it a rule 2
-    // loss; below it, Q-321.
+    // loss; below it, the gap rule's (Q-321).
     let mark_file = match mark {
         MarkRead::Readable { slot, .. } => Some(slot.file_id),
         _ => None,
@@ -501,7 +502,13 @@ fn plan(
     };
     // Losses: gaps in the kept positions (rule 2 regions and recovery-entry gaps), then the tail below the mark.
     let mut losses = Vec::new();
-    let mut expect: Option<u64> = sealed_last.map(|(_, l, _)| l + 1);
+    // With no sealed segment the log of generation 0 starts at position 1, so a lowest segment damaged, zeroed or
+    // missing leaves a gap below the first one kept (Q-321).
+    let log_start = chain
+        .first()
+        .filter(|&&i| no_sealed && segs[i].id.generation == 0)
+        .map(|_| 1);
+    let mut expect: Option<u64> = sealed_last.map(|(_, l, _)| l + 1).or(log_start);
     let mut prev: Option<(usize, u64, i64)> = None;
     let mut last_kept: Option<(usize, usize)> = None;
     let mut kept_order: Vec<(usize, usize, u64)> = Vec::new();
@@ -1036,6 +1043,7 @@ pub(super) fn start(
         &mark,
         boot,
         sealed_last,
+        sealed.is_empty(),
         manifest.highest_sequence(0).max(sourced.highest),
     );
     report.rule = p.rule;
