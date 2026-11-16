@@ -926,7 +926,7 @@ A disaster loses facts in files not backed up, which may already have been acted
     batches of facts (§3 Commit), and with the mark lost it is unbounded. On a store whose file system is unmounted
     within one boot, one batch committed since the last mark sync, whole or damaged, can be truncated by §3 Recovery
     rule 1, reported as `possible_loss` and delivered as a reset point (accepted limit). Flagged batches (§2.1
-    `durability` `written`) not yet synced, at most `max_unsynced` of them, can also be lost by a power loss, a kernel
+    `durability` `written`) not yet synced, those written within `max_unsynced` before the event, can also be lost by a power loss, a kernel
     crash, or a failed sync followed by a reboot: in rule 3's tail or with no byte left, reported as `possible_loss`
     (Q-251), or missing before a complete batch, a lost range reported as `data_lost`; a crash or restart of the
     process loses none (§3 Recovery rule 1). A remount within the boot can remove them with no report (open, Q-250). Corruption of a manifest record with no other copy loses no fact; the manifest is rebuilt
