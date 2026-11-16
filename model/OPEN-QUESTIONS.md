@@ -72,6 +72,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-263 | §8 Restore step 1, §7 Readers | What is set aside: whole batches, by their first position |
 | Q-264 | §3 Recovery rule 2, §8 Generations; Q-321 | Position 1 as the chain's start in a restored generation |
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
+| Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1412,6 +1413,15 @@ Recorded by roadmap 8.3c. To be settled by roadmap 6.3c.
 `OpenError::NotSupportedYet` rather than ignoring them; `recovery::start` takes `&mut StartOptions`, so 6.3c changes
 call sites only. Test: `log/tests/interfaces.rs`
 `open_with_refuses_the_recorder_and_the_seal_listener_until_their_providers_land`.
+## Q-268 — A reader on a restored directory
+Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+**Scenario.** A reader read only segments up to the one the mark names. A restored generation's first mark names
+file 0, as a drill leaves its directory, and later the mark names a segment of the new generation above every
+restored file; the restored segments of earlier generations were then never read.
+**Decided (8.3c).** A reader reads every segment of a generation below the mark's whole (they are sealed), whichever
+segment the mark names, and skips set-aside batches (Q-263) by the restored ends in `ReaderConfig::set_aside`, which
+the caller takes from the latest restore record (§8 Restore step 1). Test: `log/tests/generation.rs`
+`a_reader_reads_earlier_generations_past_what_is_set_aside`.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1498,6 +1508,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-263 | 8.3 | Decided by roadmap 8.3c; the corruption-report part open |
 | Q-264 | 8.3 | Owner's ruling needed: extend Q-321's rule to restored generations or keep it at generation 0 |
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
+| Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

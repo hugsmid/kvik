@@ -17,13 +17,14 @@ use kvik_log::fs::{Fs, MemFs, OpenMode};
 use kvik_log::manifest::{LossCause, LostRange, RECORD_LOST_RANGE, encode_record, read_manifest};
 use kvik_log::mark::{MarkSlot, ResetStamp, read_mark};
 use kvik_log::name::SegmentName;
+use kvik_log::reader::{LogReader, ReadEvent, ReaderConfig};
 use kvik_log::scan::{ScanLimit, scan};
 use kvik_log::setaside::{RestoredEnd, SetAside};
 use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
     Call, CallSource as _, GenerationStart, IngestQueue, LogWriter, LossKind, MarkSync, OpenError,
-    Position, StartOptions, StartReport, StartRule, WriterConfig, create_segment, init_generation,
-    seal_segment,
+    Position, StartOptions, StartReport, StartRule, SystemClock, WriterConfig, create_segment,
+    init_generation, seal_segment,
 };
 
 const STORE_ID: [u8; 16] = [6; 16];
@@ -572,4 +573,50 @@ fn a_loss_in_a_restored_generation_is_recorded_in_it_beside_one_of_generation_0(
         .map(|(g, l)| (g, l.first, l.last))
         .collect();
     assert_eq!(lost, vec![(1, (0, 2), (0, 2)), (1, (1, 2), (1, 2))]);
+}
+
+fn read_all(r: &Rig, set_aside: SetAside) -> Vec<(Position, Position)> {
+    let mut cfg = ReaderConfig::new(
+        dir(),
+        Arc::new(r.fs.clone()),
+        Arc::new(SystemClock::default()),
+        Some([r.boot; 16]),
+        [8; 16],
+    );
+    cfg.set_aside = set_aside;
+    let mut reader = LogReader::open(cfg).unwrap();
+    let update = reader.refresh().unwrap();
+    reader.close().unwrap();
+    update
+        .events
+        .into_iter()
+        .filter_map(|e| match e {
+            ReadEvent::Batch(b) => Some((b.first, b.last)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn at(generation: u32, sequence: u64) -> Position {
+    Position {
+        generation,
+        sequence,
+    }
+}
+
+/// A reader on a restored directory reads the earlier generations' segments whole, whatever segment the mark
+/// names, and skips what is set aside; with only the first mark, as a drill leaves it, it reads the restored log.
+#[test]
+fn a_reader_reads_earlier_generations_past_what_is_set_aside() {
+    let (mut r, end) = restored(cfg());
+    let aside = generation_start(end).set_aside;
+    assert_eq!(read_all(&r, aside.clone()), vec![(at(0, 1), at(0, end))]);
+    r.open();
+    r.submit(vec![fact(5, 0)]);
+    r.drain();
+    assert_eq!(
+        read_all(&r, aside),
+        vec![(at(0, 1), at(0, end)), (at(1, 1), at(1, 1))]
+    );
+    assert_eq!(read_all(&r, SetAside::default()).len(), 3);
 }
