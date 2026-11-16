@@ -550,9 +550,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore, `0x26` quarantine and `0x27` copy verified are
   laid out below. A rebuild never reconstructs `0x26` or `0x27`: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
-  another tier" is verified again, so their layouts may hold no fact that only they hold; a corruption whose
-  quarantine record a rebuild could not reconstruct keeps its alert by the file under `quarantine/` or, with nothing
-  local, by its loss's lost-range record (`spec.md` §8 Self-repair, Q-244). Until their items lay them
+  another tier" is verified again, so their layouts may hold no fact that only they hold; after a rebuild a
+  file under `quarantine/` that no carried record names is a corruption dated at the rebuild record, and a lost range
+  found again with cause 5 is one too, with no new field (`spec.md` §8 Self-repair, Q-244). Until their items lay them
   out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
   with field 100 added; the catalogue of files does not apply one. A reserved type stays written and carried as a
   field list once laid out; only its decoding becomes strict.

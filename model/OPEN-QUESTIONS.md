@@ -66,7 +66,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-243 | §8 Self-repair; `api.md` `repair_done` | `repair_done` under manual acknowledgement, across a restart |
-| Q-244 | §8 Self-repair, §7 Manifest; `format.md` A.14 `0x26` | Corruptions after a manifest rebuild: alerts and the repeated-corruption count |
 | Q-249 | §8 Self-repair stage 3, §7 Manifest | A torn closing record of a loss restored in full |
 
 ## Q-16 — Which commits refresh live staleness
@@ -1333,23 +1332,6 @@ so after a restart L is awaiting re-send again until `repair.resend_wait` passes
 ended, awaiting an operator") so that the state survives a restart. Proposed: no record; the application calls it
 again, and the wait bounds the state either way.
 
-## Q-244 — Corruptions after a manifest rebuild: alerts and the repeated-corruption count
-Recorded by roadmap 8.5a.
-**Scenario.** A rebuild never reconstructs `0x26` (`format.md` A.14). A quarantine record is itself the corrupt
-record; its corruption was not yet seen. If the file is still under `quarantine/`, the rebuild finds it there; if the
-corruption was an object lost in the bucket, nothing local shows it, but its lost-range record (cause 3) is carried
-or found again. Either way the alert stays. What is lost is the count: `repair.suspect_after` counts corruptions by
-the records that name them, and a corruption that was seen and whose quarantine record is gone is no longer counted.
-**Now.** `spec.md` §8 Self-repair and `format.md` A.14 say the alert is carried by the file under `quarantine/` or by
-the loss's lost-range record. The count may fall by the corruptions a rebuild could not reconstruct.
-**Needed.** Whether the rebuild record should carry a count of corruptions within the suspect window (a new `0x28`
-field), or whether a count low by at most the records of one corrupt span is accepted as is.
-**Recommendation (roadmap 8.5a, for the reviewer to confirm).** Carry it. Since Q-247 repeated corruption degrades
-health (`storage_suspect`), a count that a rebuild lowers could hide failing storage at the moment it is most likely
-(a corrupt manifest record is itself a corruption). Proposed: `0x28` field 8, repeated, each corruption the rebuild
-could not reconstruct that lay within the suspect window, as its record time `i64` and its kind `u8`; the count adds
-them until they leave the window. Cost: one field, written only by a rebuild.
-
 ## Q-249 — A torn closing record of a loss restored in full
 Recorded by roadmap 8.5a.
 **Scenario.** A copy is swapped in and the closing record "restored in full" is torn by a power loss. §8 Self-repair
@@ -1442,7 +1424,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-243 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
-| Q-244 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
 | Q-249 | 8.5d | The fault matrix with a kill loop; recorded by roadmap 8.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
@@ -1697,6 +1678,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-85 | A loss in the bucket found outside a restore | §8 Self-repair (Lost in the bucket), Corrupt block, No deletion, invariant 10, §11 Health (settled at roadmap 8.5a by the owner's ruling). Scenario: fill pressure moved a sealed segment off the local tiers once verified in deep; the scheduled check then finds the object gone, and no kept input can compact it again. Ruling: the object is judged by the owner's lookup rule, lost after 3 failed lookups spanning at least 10 minutes while the bucket answers (transient faults never count, Q-82); with a verified local copy it is uploaded again and is no loss; with none, the positions no other file holds are a lost range of cause 3, lost in the bucket, a `data_lost` that degrades health until closed (Q-124 (a)) and goes to the re-send stage; every case is a corruption, named by a quarantine record (`0x26` reason 4), and alerts until seen. An object that answers again while its loss is open restores it in full; once closed it stays closed (Q-246). `Model::lose_object`, `Model::check_bucket`; `tests/self_repair.rs` `s8_self_repair_lost_object_needs_three_lookups_over_ten_minutes_while_the_bucket_answers`, `s8_self_repair_a_lost_object_with_a_local_copy_is_uploaded_again`, `s8_self_repair_an_object_that_answers_again_restores_its_open_loss_in_full` |
 | Q-241 | What a restore carries of closing outcomes and corruptions | §8 Self-repair, Generations; `format.md` A.14 `0x25` fields 11 to 13 (settled at roadmap 8.5a by the owner's ruling). Scenario: a loss closed as "re-send ended" is carried in field 7 with identity, first and last only, and would read back as closed by an operator; quarantine records and "seen" marks are not carried, so a seen corruption would alert again and an unseen file-named one would stop. Ruling: a restore carries the repair outcomes and the corruptions not yet seen, so no alert is lost: field 11 the outcome of each carried range closed otherwise than by an operator, field 12 each corruption seen, field 13 each corruption not yet seen. `files/` decodes `0x25` strictly and refuses them until roadmap 8.5c writes and reads them; the model's restore carries no losses (Q-294) |
 | Q-247 | The default of `repair.suspect_after`, and what repeated corruption does | §8 Self-repair, Attention; §11 Health; `api.md` Configuration, `Reason::StorageSuspect` (settled at roadmap 8.5a by the owner's ruling). Scenario: every corruption alerts until seen, so a person who sees each one may not notice that the storage keeps corrupting data. Ruling: 2 corruptions in 30 days by default, configurable (`repair.suspect_after`); while the count of corruptions in the window, seen or not, is at or above it, health is degraded with the reason `storage_suspect` (`Reason::StorageSuspect`), as well as the alert, so failing storage stays visible; it ends when the window passes the older corruptions. The count is of findings, so one failing disk damaging the same file twice in 30 days makes the storage suspect (confirmed by the owner at the review of roadmap 8.5a). It is read from the manifest's records (quarantine records and the losses `losses()` reports, each once under its identity), never from a running counter, so a restart or a record that extends a loss counts nothing again (`s8_self_repair_corruptions_are_read_from_records_so_a_restart_or_growth_counts_once`). `tests/self_repair.rs` `s8_self_repair_repeated_corruption_makes_the_storage_suspect`, `s8_self_repair_a_second_corruption_of_the_same_file_alerts_and_counts` |
+| Q-244 | Corruptions after a manifest rebuild: alerts and the repeated-corruption count | §8 Self-repair, Attention, §7 Manifest; `format.md` A.14 (settled at the review of roadmap 8.5a by the owner's ruling, taking the reviewer's rule over the recommendation of a new `0x28` field). Scenario: a rebuild never reconstructs `0x26`; a corrupt span can hold quarantine records and seen marks, so after a rebuild an unseen corruption could lose its alert and the count of `repair.suspect_after` could fall. A new rebuild field listing the corruptions it "could not reconstruct" cannot be filled: valid `0x26` records are carried unchanged with field 100, and the only ones missing lie in the unreadable span. Ruling, with no new field: after a rebuild the corruptions are (a) those the carried quarantine and lost-range records name, as before; (b) the corrupt manifest record itself, named and dated by the rebuild record, so one lost `0x26` is offset by one gained; (c) each file under `quarantine/` that no carried record names, dated at the rebuild record, with no fresh `0x26`; (d) each lost range found again with cause 5 (unknown), dated at the rebuild record. Each alerts until seen. The count errs high for what can be seen, and is low only by corruptions already repaired and seen whose records lay in the same corrupt span, less one; that bound is accepted. The model has no manifest rebuild; roadmap 8.5c builds it |
 | Q-248 | `acknowledge_losses` on a loss whose copy is being brought back | §8 Self-repair, Acknowledging a loss (settled at roadmap 8.5a by the owner's ruling, as the model had it). Scenario: an operator acknowledges a recorded loss in stage 1; closed by an operator, Q-246 would keep its copy from being swapped in and the quarantined file would hold fatal health for ever. Ruling: `acknowledge_losses` cannot close a loss while its repair copy is in progress; it writes no closing record for it (it still names its corruption seen), and the loss closes as restored in full when the copy is swapped in. `tests/self_repair.rs` `s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming`; `tests/recovery_histories.rs` (the acknowledgement step) |
 
 ## Where the model differs from the specification
