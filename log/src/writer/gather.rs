@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(w.batch, want);
         assert_eq!(addresses(&w.batch), at);
         assert_eq!(w.batch_calls.len(), 3);
-        w.release_batch();
-        assert!(w.batch.is_empty() && w.batch_calls.is_empty());
+        w.step(Duration::from_millis(2), 2, &mut q);
+        assert_eq!(w.batch_held(), 0, "the next step frees the batch");
     }
 }
