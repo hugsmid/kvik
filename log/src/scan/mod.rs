@@ -282,6 +282,9 @@ pub struct Scanner<'a> {
     chains: Chains,
     walks: Walks,
     legacy: bool,
+    /// Set at the first boundary read that finds no complete batch: from there on the scan takes the bounded path
+    /// (prefix table, remembered verdicts); before it, each batch is read once with direct checksums (Q-231).
+    damaged: bool,
     nonzero_end: Option<u64>,
 }
 
@@ -324,7 +327,7 @@ impl<'a> Scanner<'a> {
         find_seals: bool,
         legacy: bool,
     ) -> Result<Self, (FormatError, ScanStats)> {
-        let mut reads = Reads::new(bytes, !legacy);
+        let mut reads = Reads::new(bytes);
         let fail = |e, r: &Reads<'_>| Err((e, r.stats()));
         let header = match read_header(bytes, id) {
             Ok(h) => h,
@@ -378,6 +381,7 @@ impl<'a> Scanner<'a> {
             chains: Chains::default(),
             walks: Walks::default(),
             legacy,
+            damaged: false,
             nonzero_end: None,
         })
     }
@@ -454,7 +458,7 @@ impl<'a> Iterator for Scanner<'a> {
         let last = self.last;
         let min_first = last.map_or(self.base, |l| l.saturating_add(1));
         self.reads.forget_below(pos);
-        let read = if self.legacy {
+        let read = if self.legacy || !self.damaged {
             read_batch(
                 &mut self.reads,
                 &self.id,
@@ -485,6 +489,11 @@ impl<'a> Iterator for Scanner<'a> {
             BatchFault::Content => LossCause::InvalidContent,
             _ => LossCause::Corruption,
         };
+        // One failed direct read per scan at most: a crafted file cannot make the scan leave the bounded path.
+        if !self.legacy && !self.damaged {
+            self.damaged = true;
+            self.reads.use_table();
+        }
         // An invalid region starts at `pos` (zeros below the limit included, Q-105 (a)); resynchronise (A.2).
         let end = self.nonzero_end(pos);
         let mut search = (!self.bounded && !self.legacy).then(|| CommitSearch::new(pos, end));

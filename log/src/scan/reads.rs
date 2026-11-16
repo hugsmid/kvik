@@ -1,8 +1,10 @@
 //! The block reads of one scan, and their count (`format.md` A, common rules: scan bound; Q-110).
 
+use crate::batch::MAX_BATCH_DATA;
 use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, peek_raw, read_block_with,
 };
+use crate::body::COMMIT_LEN;
 use crate::crc::{PrefixCrc, crc32c};
 
 /// Block headers a scan may visit per 8 bytes of the file: the sum of the passes over each block start (Q-110).
@@ -18,10 +20,12 @@ pub struct ScanStats {
 }
 
 impl ScanStats {
-    /// Whether the counts keep the scan bound for a file of `len` bytes: at most `2 · len` bytes checksummed and
-    /// [`HEADERS_PER_WORD`] headers per 8 bytes (`format.md` A, common rules).
+    /// Whether the counts keep the scan bound for a file of `len` bytes: at most `2 · len` bytes checksummed, plus
+    /// once more the bytes of the one direct read that found damage (at most a batch), and [`HEADERS_PER_WORD`]
+    /// headers per 8 bytes (`format.md` A, common rules: scan bound).
     pub fn within_bound(&self, len: u64) -> bool {
-        self.bytes_checksummed <= len.saturating_mul(2)
+        let first_read = len.min(MAX_BATCH_DATA + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64);
+        self.bytes_checksummed <= len.saturating_mul(2).saturating_add(first_read)
             && self.headers_visited <= (len / 8 + 2).saturating_mul(HEADERS_PER_WORD)
     }
 }
@@ -36,12 +40,20 @@ pub(crate) struct Reads<'a> {
 }
 
 impl<'a> Reads<'a> {
-    pub(crate) fn new(bytes: &'a [u8], table: bool) -> Self {
+    /// Reads that checksum bodies directly until [`Reads::use_table`].
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
-            sums: table.then(|| PrefixCrc::new(bytes)),
+            sums: None,
             direct: 0,
             headers: 0,
+        }
+    }
+
+    /// Takes body checksums from a prefix table from here on.
+    pub(crate) fn use_table(&mut self) {
+        if self.sums.is_none() {
+            self.sums = Some(PrefixCrc::new(self.bytes));
         }
     }
 

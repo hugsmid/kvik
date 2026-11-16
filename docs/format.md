@@ -38,12 +38,19 @@ specified here before the roadmap item that writes it.
   region, a torn tail or a lost range, and recovery never truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
-- **Scan bound.** A reader's work on a file is linear in its length whatever its bytes: at most twice the file's
-  length is checksummed, block headers are read a bounded number of times per 8 bytes, and memory is bounded by the
-  largest block the header limits allow. Files the engine wrote, damaged or not, are read with exactly the same
-  results as before. A body checksum is derived from a table of prefix checksums by a CRC shift, so a block image
-  nested in another costs arithmetic, not bytes; the acceptance rules (A.2, A.14) are unchanged (Q-110). The checks
-  of a checksum-valid body by its type are bounded per block, not per file (Q-230).
+- **Scan bound.** A reader's work on a file of L bytes is bounded whatever its bytes. At most 2L bytes are
+  checksummed, plus, in a log segment, once more the bytes of the one direct read that found the first damage (at most
+  a batch, 8 MiB). Block headers are read at most 16 times per 8 bytes. Working memory, beyond the file and what the
+  read reports, is about one batch in a segment and one block (16 MiB) in the manifest. A body whose checksum holds is
+  checked by its type (A.5, A.6, A.14) a bounded number of times per candidate, and a candidate's bodies span at most
+  a window w: in a segment w = 8 MiB (a batch), and resynchronisation reads a candidate in full only at the offset its
+  commit block names, so at most one candidate per commit block; in the manifest w = 16 MiB (a body), at most one
+  candidate per 8-byte step. These checks therefore cost at most about L/8 × w, linear in L for the fixed w; only a
+  writer of the file can reach that figure, as random damage stops at the checksum (Q-230). A body checksum is derived
+  from a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes
+  (Q-110). An undamaged segment is read in one pass of direct checksums; the bounded reading starts at the first
+  boundary read that finds no complete batch and holds to the end of the scan (Q-231). The acceptance rules (A.2,
+  A.14) are unchanged: files the engine wrote, damaged or not, are read with exactly the same results as before.
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |

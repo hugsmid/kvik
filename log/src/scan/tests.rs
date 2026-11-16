@@ -278,7 +278,8 @@ fn resynchronising_over_a_chain_longer_than_a_batch_remembers_at_most_a_batch_of
         encode_block(0x50, FLAG_SKIPPABLE, &body, &mut bytes).unwrap();
     }
     let len = bytes.len() as u64;
-    let mut reads = Reads::new(&bytes, true);
+    let mut reads = Reads::new(&bytes);
+    reads.use_table();
     let mut chains = Chains::default();
     let found = chains
         .resync(&mut reads, &id, HEADER_LEN as u64, len, 1, None)
@@ -340,18 +341,23 @@ fn resynchronising_in_many_regions_walks_a_shared_chain_once() {
     }
 }
 
-/// A block header claiming a body to the end of the file, then readable commit blocks every 4 KiB in a torn tail.
+/// A damaged word, then a resynchronisation candidate whose one data block (with a wrong body checksum) holds
+/// readable commit blocks every 4 KiB and runs to the candidate's own commit block at the end of the file: reading
+/// the candidate fills the prefix table to the end before the tail's commit search has passed its start.
 fn tail_of_commits(commits: u64) -> (Vec<u8>, SegmentIdentity) {
     let (mut b, id) = chain(0);
     b.truncate(HEADER_LEN);
-    let len = HEADER_LEN as u64 + 16 + 4_096 * commits;
-    let claim = crate::block::BlockHeader {
+    b.extend_from_slice(&[0xFF; 8]);
+    let o = b.len() as u64;
+    let commit_at = o + 16 + 4_096 * commits;
+    let h = crate::block::BlockHeader {
         block_type: 0x50,
         flags: FLAG_SKIPPABLE,
-        body_len: (len - HEADER_LEN as u64 - 16) as u32,
+        body_len: (commit_at - o - 16) as u32,
         body_crc32c: 0,
-    };
-    b.extend_from_slice(&claim.encode());
+    }
+    .encode();
+    b.extend_from_slice(&h);
     for i in 0..commits {
         let commit = Commit {
             generation: id.generation,
@@ -365,6 +371,21 @@ fn tail_of_commits(commits: u64) -> (Vec<u8>, SegmentIdentity) {
         b.resize(b.len() + 4_096 - 64, 0x11);
         encode_block(block_type::COMMIT, 0, &commit.encode(), &mut b).unwrap();
     }
+    let mut d = Vec::new();
+    d.extend_from_slice(&id.store_id);
+    d.extend_from_slice(&id.file_id.to_le_bytes());
+    d.extend_from_slice(&o.to_le_bytes());
+    d.extend_from_slice(&h[..12]);
+    let commit = Commit {
+        generation: id.generation,
+        block_count: 1,
+        first_sequence: 1,
+        last_sequence: 1,
+        commit_time: 0,
+        batch_bytes: commit_at - o,
+        batch_crc32c: crc32c(&d),
+    };
+    encode_block(block_type::COMMIT, 0, &commit.encode(), &mut b).unwrap();
     (b, id)
 }
 
@@ -378,8 +399,28 @@ fn a_torn_tail_with_readable_commits_checksums_each_byte_once() {
         assert_eq!(new, old);
         let r = new.unwrap();
         assert!(
-            matches!(&r.tail, Some(Tail::Torn { commits: c, .. }) if c.len() as u64 == commits)
+            matches!(&r.tail, Some(Tail::Torn { commits: c, .. }) if c.len() as u64 == commits + 1)
         );
         assert!(stats.bytes_checksummed <= len, "{stats:?} for {len} bytes");
     }
+}
+
+#[test]
+fn an_undamaged_segment_is_read_in_one_pass_of_direct_reads() {
+    let (mut bytes, id) = chain(0);
+    bytes.truncate(HEADER_LEN);
+    let k = 1_000u64;
+    for j in 0..k {
+        let at = bytes.len() as u64;
+        bytes.extend_from_slice(&alias_batch(&id, j + 1, at));
+    }
+    bytes.resize(bytes.len() + 4_096, 0);
+    let len = bytes.len() as u64;
+    let (r, stats) = scan_with_stats(&bytes, &id, ScanLimit::End);
+    let r = r.unwrap();
+    assert_eq!(r.batches.len() as u64, k);
+    assert!(matches!(r.tail, Some(Tail::Clean { .. })));
+    // Each of the two blocks of a batch: its header peeked, then read once.
+    assert!(stats.headers_visited <= 4 * k + 2, "{stats:?}");
+    assert!(stats.bytes_checksummed <= len, "{stats:?} for {len} bytes");
 }
