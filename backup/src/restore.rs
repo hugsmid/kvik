@@ -128,7 +128,7 @@ pub enum RestoreError {
     },
     /// A record of the generation read names a predecessor the bucket does not hold before it (format A.17; Q-611).
     #[error(
-        "generation {generation}'s record {epoch} names record {previous}, which the bucket does not hold before it"
+        "generation {generation}'s record {epoch} names record {previous}, which breaks the chain of its records"
     )]
     BrokenChain {
         /// The generation.

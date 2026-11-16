@@ -422,10 +422,27 @@ pub fn check_chain(listed: &[UploadedRecord]) -> Result<(), ChainBreak> {
     Ok(())
 }
 
-/// The epoch after the last record `read`, where `read` ends before `listed` does and that epoch is not listed: the
-/// listing may hide the end of the manifest a restore reads, which no later record names (Q-612).
-pub fn read_tail(listed: &[Record], read: &[Record]) -> Option<u64> {
-    let end = read.last()?.epoch;
-    let next = listed.iter().find(|r| r.epoch > end)?;
-    end.checked_add(1).filter(|e| *e != next.epoch)
+/// How many epochs after a record a restore asks for, so that a record hidden behind skipped epochs is still found
+/// (format A.14 lets epochs skip; Q-614).
+pub const TAIL_PROBES: u64 = 8;
+
+/// The epochs a restore asks for after the last listed record `last` (Q-612, Q-614).
+pub fn after_last(last: u64) -> impl Iterator<Item = u64> {
+    (1..=TAIL_PROBES).map_while(move |k| last.checked_add(k))
+}
+
+/// The epochs a restore asks for where `read` ends before `listed` does: those after the last read and below the
+/// next listed, since no later record names the end of the manifest it reads; with nothing read, epoch 1, the
+/// generation's first record, unless listed (Q-612, Q-614).
+pub fn read_tail(listed: &[Record], read: &[Record]) -> Vec<u64> {
+    let Some(end) = read.last().map(|r| r.epoch) else {
+        return match listed.first() {
+            Some(f) if f.epoch > 1 => vec![1],
+            _ => Vec::new(),
+        };
+    };
+    let Some(next) = listed.iter().find(|r| r.epoch > end).map(|r| r.epoch) else {
+        return Vec::new();
+    };
+    after_last(end).take_while(|e| *e < next).collect()
 }

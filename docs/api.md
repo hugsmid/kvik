@@ -478,8 +478,8 @@ only, boxed `Send` futures):
   record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
   store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a
   generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304). So is a record missing
-  from the listing that a later record names, or that follows the last listed or the last read, when `stat` reports
-  it (Q-611, Q-612). `BrokenChain`: a record of the generation read names a predecessor the bucket does not report,
+  from the listing that a later record names, or that lies within a few epochs after the last listed or the last
+  read, when `stat` reports it (Q-611, Q-612). `BrokenChain`: a record of the generation read names a predecessor the bucket does not report,
   or one no listing could hide (`format.md` A.17 Uploaded forms; `RestoreError::BrokenChain`, Q-611); a retry gives
   the same answer.
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and

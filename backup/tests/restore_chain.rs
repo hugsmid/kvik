@@ -9,7 +9,10 @@ use std::sync::Arc;
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::Keys;
-use kvik_backup::plan::{ChainBreak, PlanMode, check_chain, read_tail, records_to_read};
+use kvik_backup::plan::{
+    ChainBreak, PlanError, PlanMode, TAIL_PROBES, after_last, check_chain, read_tail,
+    records_to_read,
+};
 use kvik_backup::restore::{Prepared, RestoreDriver, RestoreError};
 use kvik_backup::uploaded::UploadedRecord;
 use kvik_files::record::{Body, Rebuild, Record};
@@ -183,16 +186,40 @@ fn check_chain_names_each_break() {
 }
 
 #[test]
-fn read_tail_is_the_epoch_after_the_records_read_only_when_the_listing_goes_on_without_it() {
+fn read_tail_is_the_epochs_between_the_records_read_and_the_next_listed_or_epoch_1_with_nothing_read()
+ {
     let (_, s1, s2) = segments();
     let records = |v: Vec<UploadedRecord>| v.into_iter().map(|u| u.record).collect::<Vec<_>>();
     let partial = records(rebuilt(&s1, &s2, false));
-    assert_eq!(read_tail(&partial, records_to_read(&partial)), Some(4));
+    assert_eq!(read_tail(&partial, records_to_read(&partial)), vec![4]);
     let whole = records(rebuilt(&s1, &s2, true));
-    assert_eq!(read_tail(&whole, records_to_read(&whole)), None);
+    assert_eq!(
+        read_tail(&whole, records_to_read(&whole)),
+        Vec::<u64>::new()
+    );
     let mut next = records(rebuilt(&s1, &s2, false));
     next[3].epoch = 4;
-    assert_eq!(read_tail(&next, records_to_read(&next)), None);
+    assert_eq!(read_tail(&next, records_to_read(&next)), Vec::<u64>::new());
+    let mut far = records(rebuilt(&s1, &s2, false));
+    for r in &mut far[3..] {
+        r.epoch += 20;
+    }
+    assert_eq!(
+        read_tail(&far, records_to_read(&far)),
+        (4..=3 + TAIL_PROBES).collect::<Vec<_>>()
+    );
+    let unread = &partial[3..];
+    assert_eq!(read_tail(unread, records_to_read(unread)), vec![1]);
+}
+
+#[test]
+fn after_last_asks_for_the_next_epochs_up_to_the_bound_and_never_past_the_last_epoch() {
+    assert_eq!(
+        after_last(4).collect::<Vec<_>>(),
+        (5..=4 + TAIL_PROBES).collect::<Vec<_>>()
+    );
+    assert_eq!(after_last(u64::MAX - 1).collect::<Vec<_>>(), vec![u64::MAX]);
+    assert_eq!(after_last(u64::MAX).count(), 0);
 }
 
 #[test]
@@ -426,4 +453,90 @@ fn q613_named_files_and_files_of_other_generations_are_not_reported() {
     );
     let p = prepare(&sink, PlanMode::Drill).unwrap();
     assert_eq!(p.unnamed, Vec::new());
+}
+
+/// Epochs 1, 2, then `skip` epochs skipped before the third record.
+fn skipping(s1: &Body, s2: &Body, skip: u64) -> Vec<UploadedRecord> {
+    vec![
+        up(0, rec(1, Body::Empty)),
+        up(1, rec(2, s1.clone())),
+        up(2, rec(3 + skip, s2.clone())),
+    ]
+}
+
+#[test]
+fn q614_a_last_record_hidden_behind_skipped_epochs_within_the_bound_is_a_lagging_listing() {
+    for skip in [1, 3, TAIL_PROBES - 1] {
+        let (src, s1, s2) = segments();
+        let sink = bucket(src, &skipping(&s1, &s2, skip));
+        sink.set(&key(3 + skip), Some(Fault::Unlisted));
+        both(&sink, lagging);
+        nothing_recorded(&sink);
+    }
+}
+
+#[test]
+fn q614_a_last_record_hidden_behind_more_skipped_epochs_than_the_bound_is_not_seen() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &skipping(&s1, &s2, TAIL_PROBES));
+    sink.set(&key(3 + TAIL_PROBES), Some(Fault::Unlisted));
+    both(&sink, |r| assert_eq!(r.unwrap().record.files.len(), 1));
+}
+
+#[test]
+fn q614_the_last_old_record_hidden_behind_skipped_epochs_before_a_partial_rebuilt_manifest_is_a_lagging_listing()
+ {
+    let (src, s1, s2) = segments();
+    let mut chain = plain(&s1, &s2);
+    chain.truncate(2);
+    chain.extend([
+        up(2, rec(6, s2.clone())),
+        up(0, rebuild(9)),
+        up(9, carried(10, 1, Body::Empty)),
+    ]);
+    let sink = bucket(src, &chain);
+    sink.set(&key(6), Some(Fault::Unlisted));
+    both(&sink, lagging);
+}
+
+/// A rebuilt manifest not yet whole, with nothing uploaded before it: what a restore lists when the old records are
+/// hidden or were never uploaded.
+fn unfinished_only(s1: &Body) -> Vec<UploadedRecord> {
+    vec![
+        up(0, rebuild(5)),
+        up(5, carried(6, 1, Body::Empty)),
+        up(6, carried(7, 2, s1.clone())),
+    ]
+}
+
+#[test]
+fn q614_old_records_hidden_before_a_listed_unfinished_rebuilt_manifest_are_a_lagging_listing() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &rebuilt(&s1, &s2, false));
+    for e in 1..=3 {
+        sink.set(&key(e), Some(Fault::Unlisted));
+    }
+    both(&sink, lagging);
+}
+
+#[test]
+fn q614_an_unfinished_rebuilt_manifest_with_nothing_before_it_reads_nothing() {
+    let (src, s1, _) = segments();
+    let sink = bucket(src, &unfinished_only(&s1));
+    both(&sink, |r| {
+        assert!(
+            matches!(r, Err(RestoreError::Plan(PlanError::NoRecords))),
+            "{r:?}"
+        );
+    });
+}
+
+#[test]
+fn q614_a_break_inside_an_unfinished_rebuilt_manifest_read_from_nothing_refuses_the_restore() {
+    let (src, s1, _) = segments();
+    let mut chain = unfinished_only(&s1);
+    chain.push(up(7, carried(8, 3, Body::Empty)));
+    let sink = bucket(src, &chain);
+    sink.set(&key(7), Some(Fault::Lose));
+    both(&sink, |r| broken(r, 8, 7));
 }

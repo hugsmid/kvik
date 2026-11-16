@@ -69,6 +69,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-611 | §8 Generations, Restore step 1; `api.md` Backup and restore | What a broken chain of uploaded records is, and what a restore does with one |
 | Q-612 | §8 Generations, Restore step 1; `api.md` Backup and restore | The tail check: a record after the last listed, found, not found or unanswered |
 | Q-613 | §8 Generations, Restore step 1 | Files of the generation read that no record names |
+| Q-614 | §8 Generations, Restore step 1; `format.md` A.17 | A restore that reads an earlier state with nothing found: what no check of 8.3g sees |
+| Q-615 | §8 Generations, Restore step 1 | The source records are read after the claim |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1329,15 +1331,14 @@ reads from the manifest, as it takes them into its queue; the restore driver wri
 **Reason.** The envelope is deterministic in its plaintext and the sink takes a repeated `put` only with identical
 bytes (A.17). A predecessor read from the bucket (the last record uploaded) would change with a listing that lags
 at a restart, so a repeated `put` would meet `Exists` and stop uploads; one read from the manifest cannot change.
-The cost: a rebuild record names nothing, so the chain cannot show a restore that reads the records before a
-rebuilt manifest not yet whole that the bucket has lost the last of them; the tail check (Q-612) finds one the
-listing hides when its epoch follows directly. The format is unreleased (`format.md` title; A.3 keeps golden files
-for released versions only) and no object of the earlier form is read, so the change is not made readable both
-ways.
+What the chain cannot show (a lost last record, the last old record before an unfinished rebuilt manifest) is
+Q-614, as is the format change itself (no version marker).
 **Model.** Not modelled: the model uploads no manifest records.
 **Tests.** `backup/src/uploaded.rs` (format vector, refusals both ways); `backup/tests/upload_chain.rs`
-(consecutive records, a restart, a rebuilt manifest after a restart and under a driver that outlives it); the
-uploaded bytes in `check_done` and in `upload_histories.rs`, `upload_bucket.rs`, `restore.rs`.
+(consecutive records, a restart, a rebuilt manifest after a restart and under a driver that outlives it, with old
+records pending, and a restart that leaves an old tail unuploaded), each bucket fed to `plan::check_chain`, as in
+`check_done` and `upload_histories.rs`; `backup/tests/upload_restored.rs` (the driver over a restored directory
+repeats the restore record byte for byte); the uploaded bytes in `upload_bucket.rs`, `restore.rs`.
 
 ## Q-611 — What a broken chain of uploaded records is, and what a restore does with one
 Recorded and decided by roadmap 8.3g. **Owner** for (g).
@@ -1361,35 +1362,43 @@ after the claim).
 (`api.md`); the mapping is roadmap 8.3d's.
 **Owner.** (g) Before this item a restore read whatever the listing showed: from a bucket that had lost a record it
 restored fewer files or an earlier end, and a full restore then claimed a generation that every later restore
-reads, so what the lost record named was lost for good with nothing reported. Now it refuses, and the store cannot
-be restored from that generation until an operator acts. A healthy bucket cannot give this refusal (the engine
-never deletes and versioning is required); a bucket that loses objects can, and from it a restore that used to
-succeed now fails. Built: the refusal, the conservative choice. Alternative for the owner: restore up to the record
-before the break and report the rest as lost, which needs a mechanism of its own.
+reads, so what the lost record named was lost for good with nothing reported. Now it refuses, and the refusal is
+total: one record object lost in the checked range makes every restore and every drill of that store fail for good,
+including what the records before the break hold. For a store that is gone (the case a restore is for) no operator
+action exists: no call restores past the break. A store still running heals by uploading a whole rebuilt manifest
+after the break (`a_break_before_a_whole_rebuilt_manifest_does_not_refuse_the_restore_that_reads_it`), which today
+only a rebuild for another reason triggers; a regular drill is what finds the break while the store can still heal.
+A healthy bucket cannot give this refusal (the engine never deletes and versioning is required); a bucket that loses
+objects can, and from it a restore that used to succeed now fails. Built: the refusal, the conservative choice.
+Alternatives for the owner: restore up to the record before the break and report the rest as lost, or let a store
+that finds the break upload a rebuilt manifest; each needs a mechanism of its own.
 **Model.** Not modelled: the model uploads no manifest records. `kvik/tests/restore_plan_model.rs` checks that the
 chain of every record list it builds passes.
 **Tests.** `backup/tests/restore_chain.rs` (each break, both modes, a break before and after the records read);
 `backup/tests/restore_chain_properties.rs`.
 
-## Q-612 — The tail check: a record after the last listed, found, not found or unanswered
+## Q-612 — The tail check: records after the last listed, found, not found or unanswered
 Recorded and decided by roadmap 8.3g. **Owner** for (d).
 **Scenario.** A listing that hides the newest records, or records uploaded after it, leave nothing for the chain
 (Q-611) to name: the restore reads an earlier state and, when it is full, claims a generation over it.
-**Decision.** (a) Right after the listing, before any record is fetched, the restore asks `stat` for the epoch
-after the last listed; and after the chain check, where the records read end before the listing (a rebuilt manifest
-not yet whole follows) and the epoch after the last read is not listed, for that epoch too (`plan::read_tail`).
-(b) Reported: `ListingIncomplete`, retried. Not reported: the restore goes on. Unanswered (transient or not): the
-restore fails with the sink's error and never goes on, since going on could read an earlier state. (c) Limit:
-epochs may skip (Q-610), so a hidden record whose epoch does not follow directly is not found by the tail check;
-one that a later listed record names is (Q-611).
+**Decision.** (a) Right after the listing, before any record is fetched, the restore asks `stat` for the
+`TAIL_PROBES` (8) epochs after the last listed (`plan::after_last`); after the chain check, where the records read
+end before the listing (a rebuilt manifest not yet whole follows), for the epochs after the last read and below the
+next listed, at most 8 (`plan::read_tail`); and where nothing is read (the listing starts with such a manifest),
+for epoch 1, the generation's first record, which a listing then hides if the bucket holds it. The bound of 8 lets a
+hidden record behind skipped epochs (format A.14) still be found (Q-614). (b) Reported: `ListingIncomplete`,
+retried. Not reported: the restore goes on. Unanswered (transient or not): the restore fails with the sink's error
+and never goes on, since going on could read an earlier state. (c) What no check finds is Q-614.
 **Owner.** (d) A drill on a live store, or a full restore while the source store still uploads (moving a store to
 another machine), can see the next record uploaded between its listing and the `stat`, and fail as
-`ListingIncomplete` where it passed before. The `stat` follows the listing directly to keep that window short, and
-a retry passes; a full restore retried takes a new generation (Q-304, the item that moves `ListingIncomplete`
-before the claim). Built as described; for the owner to accept.
+`ListingIncomplete` where it passed before. The `stat` follows the listing directly to keep that window short. A
+retry passes only while the listing lags less than the time between two record uploads of the source store; on a
+bucket whose listings lag longer, a drill or restore of a live store never passes. The source records are read
+after the claim (`backup/src/restore/driver.rs` `fresh`), so each retry of a full restore takes a new generation
+(Q-615). Built as described; for the owner to accept.
 **Model.** Not modelled.
 **Tests.** `backup/tests/restore_chain.rs` (`q612_*`: found, not found and unanswered, after the last listed and
-after the last read; the `stat` before the first fetch).
+after the last read; the `stat` before the first fetch; `q614_*` for the bound and for nothing read).
 
 ## Q-613 — Files of the generation read that no record names
 Recorded and decided by roadmap 8.3g. To be settled by roadmap 8.3d (how `Store::restore` reports them).
@@ -1407,6 +1416,44 @@ report), so an operator learns that the bucket holds data the restore left out.
 **Model.** Not modelled.
 **Tests.** `backup/tests/restore_chain.rs` (`q613_*`).
 
+## Q-614 — A restore that reads an earlier state with nothing found: what no check of 8.3g sees
+Recorded by the review of roadmap 8.3g. **Owner.**
+**Scenario.** Probed at the review; in each a drill passes and a full restore claims a generation over the earlier
+state, so the records it misses, and the files only they name, are read by no later restore, while every object is
+still in the bucket. (a) The bucket loses the last record of the generation read: nothing names it and the epoch
+after the last listed is absent. (b) A lagging listing hides the last record, whose epoch follows a skip of more
+than `TAIL_PROBES` epochs (every start may skip, format A.14). (c) The bucket loses the last record of an old
+manifest before a rebuilt manifest not yet whole: the rebuild record names nothing (Q-610), so the chain does not
+see it; hidden behind more than 8 skipped epochs, the tail check does not either. The only signal is
+`Prepared::unnamed` (Q-613), which names files those records listed, and nothing surfaces it before roadmap 8.3d.
+Before 8.3g every hidden or lost record did this (Q-304); 8.3g narrows the cases, it does not close them.
+**Now.** The cheapest mitigation needing no new object or record form is built: the tail check asks for the 8 epochs
+after the last listed and after the last read (Q-612), so (b) and the hidden form of (c) need a skip above 8. (a)
+and the lost form of (c) are unchanged.
+**Options.** A larger or configurable bound (cost: one `stat` per epoch at every restore and drill). A store-side
+marker object naming the last uploaded epoch, written after each record (cost: a second object per record and a
+rule for a lagging marker). A rebuild record naming the last record of the old manifest it uploaded (cost: the
+predecessor would come from the bucket, which Q-610 avoids). Surfacing `unnamed` as a "possibly incomplete"
+warning, or refusing a full restore while it is not empty (8.3d).
+**Format.** (f) `format.md` A.17's uploaded record form gained 8 leading bytes with no version marker; an object of
+the earlier form fails to decode, with a message that does not say why. Acceptable only while no kept bucket holds
+objects of the earlier form; for the owner to confirm.
+**Model.** Not modelled: the model uploads no manifest records.
+**Tests.** `backup/tests/restore_chain.rs` (`q614_*`: a hidden last record within and beyond the bound, the hidden
+last old record before an unfinished rebuilt manifest, old records hidden before one, a break inside one read from
+nothing); the property `one_break_in_the_records_a_restore_checks_refuses_it_or_makes_it_retry` draws no lost last
+record and no lost record before an opening rebuild record, since no check sees them.
+
+## Q-615 — The source records are read after the claim
+Recorded by the review of roadmap 8.3g. To be settled by roadmap 8.3d.
+**Scenario.** A full restore claims its generation, then lists and reads the source records (`fresh` in
+`backup/src/restore/driver.rs`). A `ListingIncomplete` there (Q-304, Q-611, Q-612), a broken chain or a sink fault
+fails it after the claim, and each retry claims another generation, which is never withdrawn. With a source store
+still uploading, or a listing that lags (Q-612 (d)), that can be many generations.
+**Model.** Not modelled.
+**Needed.** Suggested: read and check the source records before the claim, and read the claims again after it to see
+that no higher generation was claimed in between; or retry the read within one claim. With `Store::restore` (8.3d).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1419,7 +1466,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1486,10 +1533,12 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
-| Q-610 | 8.3 | The chain of epochs in uploaded manifest records; decided by roadmap 8.3g |
-| Q-611 | 8.3 | A broken chain of uploaded records; decided by roadmap 8.3g; owner: a bucket that lost a record now refuses the restore |
-| Q-612 | 8.3 | The tail check after the listing and after the records read; decided by roadmap 8.3g; owner: a store still uploading can make a restore retry |
+| Q-610 | 8.3 | The chain of epochs in uploaded manifest records; decided by roadmap 8.3g; what it cannot show is Q-614 |
+| Q-611 | 8.3 | A broken chain of uploaded records; decided by roadmap 8.3g; owner: one record object lost makes every restore and drill of the store fail for good, with no way out once the store is gone |
+| Q-612 | 8.3 | The tail check after the listing and after the records read; decided by roadmap 8.3g; owner: a store still uploading, or a listing that lags longer than its uploads, can make a restore retry, a full one taking a generation each time (Q-615) |
 | Q-613 | 8.3d | Files of the generation read that no record names; reported by roadmap 8.3g in `Prepared::unnamed`; surfaced by `Store::restore` at 8.3d |
+| Q-614 | 8.3 | Silent restore of an earlier state (a lost last record, a hidden one behind more than 8 skipped epochs, the last old record before an unfinished rebuilt manifest) and the uploaded form's missing version marker; recorded by the review of 8.3g; owner decision pending |
+| Q-615 | 8.3d | The source records read after the claim, so each retry takes a generation; recorded by the review of 8.3g |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1730,7 +1779,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-82 | How a restore tells that the bucket has lost or corrupted a listed file | §8 Restore, Failures and end (settled by roadmap 8.3b with the owner's thresholds: a wrong key is told by the key check value in `STORE`'s envelope header before any file is judged, `RestoreError::WrongKey`, and records nothing; a listed file is lost when `stat` reports it absent on 3 tries spanning at least 10 minutes while `STORE` is reported present in the same step; it is corrupt at once when the reported size or ciphertext SHA-256 differs from its copy, and after 3 downloads with the right key whose bytes are not the copy, whose chunks fail authentication or whose plaintext hash is not its description's (a sink's `HashMismatch` on a download counts as one); any other fault, a `Transient` download included, is retried with backoff and never counts. The thresholds are `RestoreConfig::lost_tries` and `lost_over`; tries are counted per run, so a restart starts them again. A lost or corrupt file becomes a lost range, cause 3 (Q-302), carrying the restore record's reset stamp, the one in force when it is recorded (§7 Readers, `format.md` A.14 field 13). `backup/src/restore/judge.rs`, `backup/tests/restore.rs`, `backup/tests/restore_properties.rs`) |
 | Q-213 | The checksum probe's key, which the key contract cannot build | `backup/src/keys.rs` (settled by roadmap 8.3b at its review, by Q-213's suggestion: the checksum probe keeps its own key `<sid>/probe/<nonce:32 hex>`, built by `Keys::checksum_probe` and parsed as `ObjectName::ChecksumProbe`, so a refused bucket's wrong-hash probe never lands on `<sid>/probe` and a later probe cannot mistake it for an earlier one) |
 | Q-214 | A restore that meets a bucket it must refuse | `api.md` Backup and restore, Restore (settled by roadmap 8.3b at its review, by Q-214's suggestion: `RestoreDriver::prepare` probes the bucket in a full restore after the key check and `STORE` and before reading the claims, with the probe `format.md` A.17 defines for `attach_backup` (`<sid>/probe` for conditional writes, then a wrong-hash `put` to a fresh `<sid>/probe/<nonce>` that must fail and leave nothing); a failure is the additive `RestoreError::Refused(Refused)` (`NoConditionalWrites`, `NoChecksums`), which `Store::restore` maps to `BackupError::Refused`; a sink fault during the probe stays `RestoreError::Sink`; a drill and a resumed restore do not probe; the probe's bytes come from the restorer's nonce source. `RestoreError::SeveralStores` maps to the additive `BackupError::SeveralStores { store_ids }`. A `stat` that reports no SHA-256 reaches the probe as the sink's `Failed` (the S3 sink refuses such a reply), so it fails the restore as `Sink`, not as `Refused(NoChecksums)`. `backup/src/restore/probe.rs`, `backup/tests/restore_guards.rs`) |
-| Q-304 | A manifest record object the bucket has lost or a listing does not show | `format.md` A.17 Uploaded forms, §8 Generations, `api.md` Backup and restore, Restore (settled by roadmap 8.3g: each uploaded record names its predecessor in its manifest (Q-610), a restore checks that chain and the epoch after the last listed and the last read (Q-611, Q-612). Scenario: a record missing from a listing that shows others left no trace, as epochs may skip, and the plan was made from fewer records with nothing reported. Decided at the review of roadmap 8.3b, and kept: a generation that lists no record while `stat` reports its record at epoch 1 is a lagging listing, `RestoreError::ListingIncomplete`, which `Store::restore` reports as `BackupError::Sink(Transient)`; with none reported the generation has no records (a claim whose restore stopped before its record). `backup/src/restore/driver.rs` `source_records`; `backup/tests/restore_guards.rs`, `backup/tests/restore_chain.rs`) |
+| Q-304 | A manifest record object the bucket has lost or a listing does not show | `format.md` A.17 Uploaded forms, §8 Generations, `api.md` Backup and restore, Restore (settled by roadmap 8.3g: each uploaded record names its predecessor in its manifest (Q-610), a restore checks that chain and the epochs after the last listed and the last read (Q-611, Q-612); the cases no check sees, where a restore still reads an earlier state with nothing reported, are the owner's Q-614. Scenario: a record missing from a listing that shows others left no trace, as epochs may skip, and the plan was made from fewer records with nothing reported. Decided at the review of roadmap 8.3b, and kept: a generation that lists no record while `stat` reports its record at epoch 1 is a lagging listing, `RestoreError::ListingIncomplete`, which `Store::restore` reports as `BackupError::Sink(Transient)`; with none reported the generation has no records (a claim whose restore stopped before its record). `backup/src/restore/driver.rs` `source_records`; `backup/tests/restore_guards.rs`, `backup/tests/restore_chain.rs`) |
 | Q-305 | A claim refused with `HashMismatch` while nothing is stored | §8 Generations; `api.md` Backup and restore, No overwrite (settled by roadmap 8.3b at its review. Scenario: a restore's claim `put` for generation g fails with `HashMismatch` and stores nothing; taking g + 1 leaves g unclaimed, and a later drill, which runs one above the highest claimed generation read by `stat` in ascending order (Q-163), stops at the gap, plans from an older generation and passes while ignoring the live one. Ruling: after a `HashMismatch` the restore reads the marker by `stat`; present, it takes the next generation (Q-161: the marker may be another restore's); absent, it tries g again, at most 3 tries of g, then fails with the sink's `HashMismatch` without taking another generation, since a sink that rejects every upload must not walk the generations. `backup/src/restore/driver.rs` `claim`, `backup/tests/restore_guards.rs`) |
 | Q-300 | The restore record's bytes ahead of its layout | `format.md` A.14 `0x25` (settled when roadmap 8.3b was stacked on 8.3a, as the question asked: the executor writes and reads the restore record with `RestoreRecord::to_body` and `from_body`, and the provisional codec is gone; `backup/src/restore/codec.rs` keeps only the uploaded form of a record. Scenario: the provisional codec wrote a carried loss as 100 fixed bytes, which 8.3a's strict check of every `0x25` in `Record::encode` refuses, and could not carry a lost range's reset stamp (field 13). Nothing was written with it. `backup/src/restore/codec.rs` `a_restore_record_round_trips_through_an_uploaded_block`; the executor tests in `backup/tests/restore.rs`) |
 | Q-340 | Objects in the bucket that are not envelopes | `format.md` A.17 (owner's ruling when roadmap 8.3b was stacked on 8.1a's A.17: claim markers and checksum probes are unsealed objects of fixed form whose meaning lies in their key, and the only exceptions to "every object is an envelope"; this amends the Q-160 wording. The probe's content and the change of `restore/probe.rs` from a sealed random probe to it were decided at the stacking, under the ruling. A claim marker is the 12 bytes of A.17, read only by whether its key exists (Q-163); a checksum probe is the 19 ASCII bytes `kvik checksum probe` under a fresh `<sid>/probe/<nonce>`, stored only by a bucket that is refused. Scenario: A.17 said every object is an envelope while the restore executor put claim markers unsealed and sealed a random checksum probe; a sealed probe binds nothing a refused bucket's stray object needs, and a marker's store id and generation are already in its key. Neither holds any of the store's data. `backup/src/restore/probe.rs`; `backup/tests/restore_guards.rs` `a_bucket_without_checksum_checks_is_refused_before_the_claim_and_a_drill_does_not_probe`) |

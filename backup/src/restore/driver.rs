@@ -22,8 +22,8 @@ use super::{
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
 use crate::plan::{
-    ChainBreak, PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, check_chain, read_tail,
-    records_to_read,
+    ChainBreak, PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, after_last, check_chain,
+    read_tail, records_to_read,
 };
 use crate::uploaded::UploadedRecord;
 use crate::{DriverFuture, LocalStore};
@@ -233,7 +233,7 @@ async fn source_records<S: BackupSink, E: Envelope>(
             continue;
         };
         // Q-612: right after the listing, so that a record uploaded since, or hidden by it, is seen.
-        if reported(sink, keys, g, last.checked_add(1)).await? {
+        if any_reported(sink, keys, g, after_last(last)).await? {
             return Err(incomplete);
         }
         listed.sort();
@@ -252,13 +252,14 @@ async fn source_records<S: BackupSink, E: Envelope>(
         }
         let records: Vec<Record> = uploaded.iter().map(|u| u.record.clone()).collect();
         let read = records_to_read(&records);
-        let first = read.first().map_or(records.len(), |f| {
+        // With nothing read the listing starts with an unfinished rebuilt manifest, checked from its first record.
+        let first = read.first().map_or(0, |f| {
             records.iter().position(|r| r.epoch == f.epoch).unwrap_or(0)
         });
         match check_chain(&uploaded[first..]) {
             Ok(()) => {}
             Err(ChainBreak::Missing { previous, .. })
-                if reported(sink, keys, g, Some(previous)).await? =>
+                if reported(sink, keys, g, previous).await? =>
             {
                 return Err(incomplete);
             }
@@ -278,7 +279,7 @@ async fn source_records<S: BackupSink, E: Envelope>(
                 .into());
             }
         }
-        if reported(sink, keys, g, read_tail(&records, read)).await? {
+        if any_reported(sink, keys, g, read_tail(&records, read)).await? {
             return Err(incomplete);
         }
         return Ok((g, read.to_vec()));
@@ -291,10 +292,24 @@ async fn reported<S: BackupSink>(
     sink: &S,
     keys: &Keys,
     g: u32,
-    epoch: Option<u64>,
+    epoch: u64,
 ) -> Result<bool, RestoreError> {
-    let Some(e) = epoch else { return Ok(false) };
-    Ok(sink.stat(&keys.record(g, e)).await?.is_some())
+    Ok(sink.stat(&keys.record(g, epoch)).await?.is_some())
+}
+
+/// Whether `stat` reports any of `epochs`, asked in order until one is.
+async fn any_reported<S: BackupSink>(
+    sink: &S,
+    keys: &Keys,
+    g: u32,
+    epochs: impl IntoIterator<Item = u64>,
+) -> Result<bool, RestoreError> {
+    for e in epochs {
+        if reported(sink, keys, g, e).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The files of generation `g` in the bucket that no record of `source` names (Q-613).
