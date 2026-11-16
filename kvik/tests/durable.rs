@@ -891,8 +891,12 @@ struct Run {
 /// writes no recovery or tzdata entry); facts are compared without them, and the as-of views at the positions each
 /// backend gave the same readings.
 fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (Run, Store) {
-    let mut zone = "Europe/London";
-    let mut s = open(zone);
+    // The zone in force: the site-zone entry of the greatest effective time, the later on a tie (spec §5.7).
+    let mut zones: std::collections::BTreeMap<i64, &str> = std::collections::BTreeMap::new();
+    let in_force = |z: &std::collections::BTreeMap<i64, &'static str>| {
+        z.values().next_back().copied().unwrap_or("Europe/London")
+    };
+    let mut s = open(in_force(&zones));
     let mut out = Vec::new();
     let mut ids: Vec<SeriesId> = specs()
         .into_iter()
@@ -992,7 +996,7 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
             Step::SiteZone(z, t) => {
                 let r = block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)));
                 if r.is_ok() {
-                    zone = ZONES[*z];
+                    zones.insert(*t, ZONES[*z]);
                 }
                 out.push(format!("zone {:?}", r.map_err(|e| e.to_string())));
             }
@@ -1004,7 +1008,7 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
             Step::Restart => {
                 block_on(s.shutdown()).unwrap();
                 drop(s);
-                s = open(zone);
+                s = open(in_force(&zones));
             }
         }
     }
