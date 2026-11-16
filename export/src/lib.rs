@@ -1,5 +1,5 @@
-//! Parquet export of kvik facts (roadmap 6.4). The schema is provisional until the owner approves it
-//! (`docs/export.md`, Q-190 to Q-197).
+//! Parquet export of kvik facts (roadmap 6.4). The schema is a user contract at export version 1 (`docs/export.md`,
+//! Q-190 to Q-197).
 //!
 //! [`export_series`] streams one series' facts from [`Reader::facts`] into one Parquet file. The exporter holds
 //! at most the open row group ([`ExportOptions::row_group_rows`]) plus one batch ([`ExportOptions::batch_rows`]),
@@ -42,6 +42,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 
 pub use batch::QUALITY_NAMES;
 pub use error::ExportError;
@@ -183,6 +184,8 @@ where
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(options.row_group_rows))
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
+        .set_column_dictionary_enabled(ColumnPath::from(column::QUALITY), true)
+        .set_column_dictionary_enabled(ColumnPath::from(column::SUPPLIED_QUALITY), true)
         .set_key_value_metadata(Some(
             kv.into_iter().map(|(k, v)| KeyValue::new(k, v)).collect(),
         ))

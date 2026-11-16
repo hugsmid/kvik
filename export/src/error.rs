@@ -21,7 +21,7 @@ pub enum ExportError {
         /// Why.
         reason: &'static str,
     },
-    /// The series has a kind or value type the provisional schema does not cover.
+    /// The series has a kind or value type the schema does not cover yet.
     #[error("series not supported by the export: {reason}")]
     UnsupportedSeries {
         /// Why.

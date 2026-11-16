@@ -311,6 +311,28 @@ fn every_column_chunk_is_zstd_compressed() {
 }
 
 #[test]
+fn quality_columns_are_dictionary_encoded() {
+    let rows: Vec<ExportRow> = (0..64)
+        .map(|i| row(1, i, i as u64 + 1, Value::F64(1.0)))
+        .collect();
+    let file = export_to_vec(&f64_series(1), &rows, &ExportOptions::default()).unwrap();
+    let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(&file),
+    )
+    .unwrap();
+    for c in b.metadata().row_group(0).columns() {
+        let name = c.column_path().string();
+        if name == column::QUALITY || name == column::SUPPLIED_QUALITY {
+            assert!(
+                c.encodings()
+                    .any(|e| e == parquet::basic::Encoding::RLE_DICTIONARY),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fact_flags_count_matches_the_flag_columns() {
     assert_eq!(size_of::<kvik::FactFlags>(), column::FLAGS.len());
 }
@@ -349,7 +371,7 @@ fn file_metadata_names_the_series_view_and_range() {
     let file = export_to_vec(&f64_series(1), &[], &options).unwrap();
     let f = open(&file);
     for (k, v) in [
-        ("kvik.export_version", "0"),
+        ("kvik.export_version", "1"),
         ("kvik.series_id", "1"),
         ("kvik.series_name", "site/meter/power"),
         ("kvik.unit", "W"),

@@ -1,22 +1,28 @@
-# kvik Parquet export, v0 (provisional; owner decision pending)
+# kvik Parquet export, version 1
 
 `spec.md` §11 leaves the Parquet export schema to a separate document; this is it. The schema is a promise to
-users, so every choice below is provisional until the owner decides the questions Q-190 to Q-197
-(`model/OPEN-QUESTIONS.md`), each recorded with a recommendation. The crate [`kvik-export`](../export/) implements
-this draft (roadmap 6.4a); roadmap 6.4b adds the differential check of compacted data against it. Parquet is the
-export format only (`design.md`); stored files keep the own format.
+users: the owner settled it on 2026-11-16 (Q-190 to Q-197, `model/OPEN-QUESTIONS.md`). The crate
+[`kvik-export`](../export/) implements it (roadmap 6.4a); roadmap 6.4b adds the differential check of compacted data
+against it. Parquet is the export format only (`design.md`); stored files keep the own format.
+
+## Compatibility (Q-190)
+
+Every file carries `kvik.export_version` = `1`. Adding a column or a metadata key is not a breaking change and keeps
+the version, so a reader ignores columns and keys it does not know. Renaming, retyping or removing a column or a
+metadata key, or changing what one holds, raises the version.
 
 ## Scope
 
 One call exports the facts of one series with `t` in a half-open range, in one view (`spec.md` §2.3), read through
 `Reader::facts`, into one Parquet file: one row per fact. Orphaned facts (`api.md` `export_orphaned`) and facts set
-aside by a restore (`export_set_aside`) stay separate calls that return facts for re-ingest (Q-191).
+aside by a restore (`export_set_aside`) stay separate calls that return facts for re-ingest; their Parquet form,
+the same schema in one file per call with rows of several series, comes with roadmap 8.3 (Q-191 (b)).
 
 ## Options
 
 | Option | Default | Meaning |
 |---|---|---|
-| `view` | `Current` (Q-191) | `Current`, `AsOf(P)`, `AsOfTime(T)` or `History` |
+| `view` | `Current` (Q-191) | `Current`, `AsOf(P)`, `AsOfTime(T)` or `History`; export `History` for re-ingest (`spec.md` §8 Re-ingest), as only it carries every revision and so the duplicate rule's state |
 | `range` | every `t` below `i64::MAX` | half-open range of event time |
 | `row_group_rows` | 131,072 | most rows in a row group |
 | `batch_rows` | 8,192 | rows gathered before they are handed to the writer; 1 to `MAX_BATCH_ROWS` (1,048,576) |
@@ -29,12 +35,12 @@ Reading); today both backends gather the range before the first fact is returned
 
 - One file per series per call. Row groups hold at most `row_group_rows` rows; an empty export is a valid file with
   the schema and no row group.
-- Columns are compressed with zstd at level 1 (`ZSTD_LEVEL`) and dictionary-encoded where the writer finds it
-  pays, so repeated names and quality strings cost little.
+- Columns are compressed with zstd at level 1 (`ZSTD_LEVEL`). `quality` and `supplied_quality` are always
+  dictionary-encoded (Q-194); other columns are where the writer finds it pays, so repeated names cost little.
 - The contract is the Parquet physical and logical types below. The Arrow schema is embedded as well
   (`ARROW:schema`) for Arrow readers; the crate's own read-back ignores it and reads the Parquet types alone.
 
-Caveat (Q-196): zstd is the crate's only C dependency (`zstd-sys`). Snappy or LZ4, both available in pure Rust,
+Note: zstd is the crate's only C dependency (`zstd-sys`). Snappy or LZ4, both available in pure Rust,
 would remove it at some cost in size; every common Parquet reader reads all three.
 
 ## Columns (Q-190)
@@ -65,7 +71,9 @@ would remove it at some cost in size; every common Parquet reader reads all thre
 | text | `BYTE_ARRAY`, `STRING` |
 
 A decimal series' scale is at most 18 (`spec.md` §2.1); a series with a higher scale is refused before any row is
-written. Calendar-length interval series are not exported yet; neither backend stores them (Q-197).
+written. Calendar-length interval series are not exported yet; neither backend stores them. When they are (roadmap
+7.3), each `interval_end` is taken from the interval zone under the tzdata version in force at export, which the
+metadata records (Q-197).
 
 Caveats:
 - (Q-190) `TIMESTAMP(NANOS)` and unsigned `INT(64, false)` are not read natively by every engine: some read
@@ -82,7 +90,7 @@ File key-value metadata, every value a string:
 
 | Key | Value |
 |---|---|
-| `kvik.export_version` | `0` while this schema is provisional (Q-190) |
+| `kvik.export_version` | `1` (Compatibility) |
 | `kvik.series_id`, `kvik.series_name`, `kvik.unit` | the series |
 | `kvik.kind` | `gauge`, `counter`, `state`, `text` or `interval` |
 | `kvik.value_type` | `f64`, `decimal(s)`, `bool`, `state` or `text` |
@@ -101,5 +109,6 @@ fails on: a value that does not match the series' value type, or a state index b
 present with the `no_value` flag, or absent without it (`NoValueMismatch`; facts from either backend never do this,
 so only rows given to `export_rows` can); a decimal stored above the column's scale, or beyond 19 digits after
 rescaling; `changed_at` missing on a versioned series or present on another; a `changed_at` of kind `time` above
-`i64::MAX` (ingest refuses one since Q-195, so only rows given to `export_rows` or a log that holds one can, Q-760); an interval end beyond the timestamp range; a fact of another series; a series kind the schema
-does not cover, or a decimal scale above 18 (`UnsupportedSeries`).
+`i64::MAX` (ingest refuses one, Q-195, so only rows given to `export_rows` or a log that holds one can, Q-760); an
+interval end beyond the timestamp range; a fact of another series; a series kind the schema does not cover, or a
+decimal scale above 18 (`UnsupportedSeries`).

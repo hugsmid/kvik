@@ -1,7 +1,7 @@
 # kvik-export
 
-Parquet export of a kvik store's facts (roadmap 6.4). The schema is provisional, drafted in
-[`docs/export.md`](../docs/export.md) with its open decisions (Q-190 to Q-197 in
+Parquet export of a kvik store's facts (roadmap 6.4). The schema, export version 1, is in
+[`docs/export.md`](../docs/export.md), with the decisions behind it (Q-190 to Q-197 in
 [`model/OPEN-QUESTIONS.md`](../model/OPEN-QUESTIONS.md)).
 
 - `export_series(&reader, id, &options, writer)` streams one series' facts from `Reader::facts` into one Parquet
