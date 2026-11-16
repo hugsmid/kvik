@@ -1310,6 +1310,11 @@ operation, since the gap is read from the segments that remain
 mark's position already gave the range (`the_marks_only_segment_damaged_zeroed_or_missing_is_a_recorded_loss`). A
 restored generation, whose first position is not 1, is left to roadmap 8.3. The reference model injects no damage to
 headers or whole segments.
+**Open part (settle by 8.1).** Position 1 as the start holds only while sealed segments stay in the log directory. If
+every sealed segment left it, the start would report a false `data_lost` from position 1 up to the first segment
+kept. Nothing evicts sealed segments today, so this is not live; eviction must give the log start another anchor
+(for example the last evicted segment's last position, recorded before it leaves) before the last sealed segment
+leaves the log directory.
 
 ## Q-322 — A torn mark update that makes a damaged older slot valid again
 
@@ -1403,6 +1408,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
 | Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
+| Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
