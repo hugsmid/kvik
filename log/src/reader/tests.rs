@@ -135,3 +135,245 @@ fn the_kept_bytes_are_those_of_the_followed_segment_and_a_whole_file_read_is_fre
     assert_eq!(u.state.durable.sequence, 20);
     assert_eq!((r.scratch.file_id, r.scratch.bytes.capacity()), (None, 0));
 }
+
+mod parts_and_lookup {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::facts::{FactFlags, FactRow, Quality, Value};
+    use crate::store::{NewStore, StoreDir};
+    use crate::writer::{Log, LogWriter, SystemClock, WriterConfig};
+
+    /// A store of small segments holding `calls` calls of 20 facts, series 0..20 at `t = call`, and every fifth
+    /// call a revision of series 3 at `t = 0`, once every segment before the open one is sealed.
+    fn store(calls: i64) -> (Arc<MemFs>, Log) {
+        let fs = Arc::new(MemFs::new());
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(fs.clone(), Path::new("s"), Some(&new)).unwrap();
+        let cfg = WriterConfig {
+            segment_size: 16 << 10,
+            max_batch_bytes: 4 << 10,
+            disk_critical: 0,
+            disk_low_bytes: 0,
+            relaxed_limits: true,
+            ..WriterConfig::default()
+        };
+        let w = LogWriter::open(store, cfg, Some([2; 16]), Duration::ZERO, 0).unwrap();
+        let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+        for k in 0..calls {
+            let mut items: Vec<Item> = (0..20).map(|i| fact(i, k, k as u64)).collect();
+            if k % 5 == 4 {
+                items.push(fact(3, 0, 1_000 + k as u64));
+            }
+            log.submit(items).unwrap().wait().unwrap();
+        }
+        let open = log.stats().open_file_id.unwrap();
+        for _ in 0..2_000 {
+            if names(&fs).iter().filter(|n| n.sealed).count() as u64 >= open - 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            names(&fs).iter().filter(|n| n.sealed).count() as u64,
+            open - 1
+        );
+        (fs, log)
+    }
+
+    fn fact(series: u32, t: i64, v: u64) -> Item {
+        Item::Fact(FactRow {
+            series_id: series,
+            t,
+            quality: Quality::Good,
+            flags: FactFlags::default(),
+            value: Value::F64(v),
+            changed_at: None,
+        })
+    }
+
+    fn names(fs: &MemFs) -> Vec<crate::name::SegmentName> {
+        let dir = Path::new("s").join(crate::store::LOG_DIR);
+        let mut v: Vec<_> = fs
+            .read_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| crate::name::SegmentName::parse(&e.name))
+            .collect();
+        v.sort_by_key(|n| n.file_id);
+        v
+    }
+
+    fn reader(fs: &Arc<MemFs>, id: u8) -> LogReader {
+        let clock = Arc::new(SystemClock::default());
+        LogReader::open(ReaderConfig::new(
+            "s",
+            fs.clone(),
+            clock,
+            Some([2; 16]),
+            [id; 16],
+        ))
+        .unwrap()
+    }
+
+    /// Every fact of the log by position, from one plain refresh.
+    fn all_facts(fs: &Arc<MemFs>) -> BTreeMap<Position, FactRow> {
+        let mut out = BTreeMap::new();
+        for e in reader(fs, 90).refresh().unwrap().events {
+            if let ReadEvent::Batch(b) = e {
+                let mut s = b.first.sequence;
+                for item in b.content.items {
+                    if let Item::Fact(r) = &item {
+                        out.insert(
+                            Position {
+                                generation: b.first.generation,
+                                sequence: s,
+                            },
+                            r.clone(),
+                        );
+                    }
+                    s += item.sequences();
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_bounded_refresh_returns_what_one_refresh_does_in_parts_and_frees_the_kept_file() {
+        let (fs, log) = store(300);
+        let whole = reader(&fs, 10).refresh().unwrap();
+        let mut r = reader(&fs, 11);
+        let mut events = Vec::new();
+        let mut parts = 0;
+        let mut kept = false;
+        loop {
+            let (u, more) = r.refresh_some(7).unwrap();
+            parts += 1;
+            kept |= r.scratch.whole.is_some();
+            let items: usize = u
+                .events
+                .iter()
+                .map(|e| match e {
+                    ReadEvent::Batch(b) => b.content.items.len(),
+                    _ => 0,
+                })
+                .sum();
+            if more {
+                assert!(items >= 7);
+                assert!(u.state.durable <= whole.state.durable);
+            }
+            events.extend(u.events);
+            if !more {
+                assert_eq!(u.state.durable, whole.state.durable);
+                break;
+            }
+        }
+        assert!(parts > 10, "{parts} parts");
+        assert!(kept, "an earlier segment's bytes were kept between parts");
+        assert_eq!(events, whole.events);
+        assert_eq!(r.scratch.whole, None);
+        assert!(r.refresh().unwrap().events.is_empty());
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_lookup_finds_every_fact_of_a_key_and_reads_only_the_segments_whose_index_may_hold_it() {
+        let (fs, log) = store(300);
+        let all = all_facts(&fs);
+        let mut r = reader(&fs, 12);
+        let wanted = [
+            Wanted {
+                series_id: 3,
+                from: 0,
+                to: 0,
+            },
+            Wanted {
+                series_id: 7,
+                from: 10,
+                to: 12,
+            },
+            Wanted {
+                series_id: 99,
+                from: 0,
+                to: 100,
+            },
+        ];
+        let got = r.lookup(&wanted, &|_, _| false).unwrap();
+        assert_eq!(got.complete, vec![true; 3]);
+        let want: Vec<(Position, FactRow)> = all
+            .iter()
+            .filter(|(_, f)| {
+                (f.series_id == 3 && f.t == 0) || (f.series_id == 7 && (10..=12).contains(&f.t))
+            })
+            .map(|(p, f)| (*p, f.clone()))
+            .collect();
+        let found: Vec<(Position, FactRow)> = got
+            .facts
+            .iter()
+            .map(|f| (f.position, f.row.clone()))
+            .collect();
+        assert_eq!(found, want);
+        assert_eq!(found.iter().filter(|(_, f)| f.series_id == 3).count(), 61);
+        let segments = names(&fs).len() as u64;
+        let narrow = r
+            .lookup(
+                &[Wanted {
+                    series_id: 7,
+                    from: 11,
+                    to: 11,
+                }],
+                &|_, _| false,
+            )
+            .unwrap();
+        assert_eq!(narrow.facts.len(), 1);
+        assert!(
+            narrow.segments_read < segments / 2,
+            "{} of {segments}",
+            narrow.segments_read
+        );
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_lookup_never_reads_damage_as_absence_unless_the_region_is_lost() {
+        let (fs, log) = store(300);
+        log.shutdown().unwrap();
+        let all = all_facts(&fs);
+        let first = names(&fs).into_iter().find(|n| n.sealed).unwrap();
+        let path = Path::new("s")
+            .join(crate::store::LOG_DIR)
+            .join(first.to_string());
+        let bytes = fs.read(&path).unwrap();
+        // A byte inside the first batch's data: the region starts at the header's end.
+        fs.poke(&path, HEADER_LEN + 40, &[bytes[HEADER_LEN + 40] ^ 0xFF]);
+        let damaged_t = all.values().find(|f| f.series_id == 5).unwrap().t;
+        let later = all
+            .values()
+            .filter(|f| f.series_id == 5)
+            .map(|f| f.t)
+            .max()
+            .unwrap();
+        let key = |t| Wanted {
+            series_id: 5,
+            from: t,
+            to: t,
+        };
+        let mut r = reader(&fs, 13);
+        let got = r
+            .lookup(&[key(damaged_t), key(later)], &|_, _| false)
+            .unwrap();
+        assert_eq!(got.complete, vec![false, true]);
+        assert_eq!(got.facts.len(), 1);
+        let lost = |id: u64, start: u64| id == first.file_id && start == HEADER_LEN as u64;
+        let got = r.lookup(&[key(damaged_t), key(later)], &lost).unwrap();
+        assert_eq!(got.complete, vec![true, true]);
+        assert_eq!(got.facts.len(), 1);
+    }
+}

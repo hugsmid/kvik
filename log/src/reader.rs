@@ -319,6 +319,8 @@ struct View {
 struct Scratch {
     file_id: Option<u64>,
     bytes: Vec<u8>,
+    /// The bytes are the whole of this earlier segment, kept because a bounded refresh stopped inside it.
+    whole: Option<u64>,
 }
 
 impl std::fmt::Debug for Scratch {
@@ -340,6 +342,8 @@ pub struct LogReader {
     view: View,
     lost: Vec<LostRange>,
     scratch: Scratch,
+    /// Sealed segments' indexes read by [`LogReader::lookup`], by file id.
+    seal_index: std::collections::HashMap<u64, lookup::SealIndex>,
     closed: bool,
 }
 
@@ -376,6 +380,7 @@ impl LogReader {
             view: View::default(),
             lost: Vec::new(),
             scratch: Scratch::default(),
+            seal_index: std::collections::HashMap::new(),
             closed: false,
             cfg,
         };
@@ -412,6 +417,17 @@ impl LogReader {
     /// renews the lease naming the manifest's current epoch (`api.md` `refresh`). On an error nothing the reader
     /// holds changes and nothing it found is lost: the next refresh finds it again.
     pub fn refresh(&mut self) -> Result<Update, ReaderError> {
+        self.refresh_inner(None).map(|(u, _)| u)
+    }
+
+    /// [`LogReader::refresh`] that stops after the batch that brings the items it returns to `max_items` or more,
+    /// so that a reader taking a long log holds one part of it at a time. Returns whether more may follow; until a
+    /// call returns `false`, [`ReaderState::durable`] is the last position returned rather than the mark's.
+    pub fn refresh_some(&mut self, max_items: usize) -> Result<(Update, bool), ReaderError> {
+        self.refresh_inner(Some(max_items.max(1)))
+    }
+
+    fn refresh_inner(&mut self, budget: Option<usize>) -> Result<(Update, bool), ReaderError> {
         let mark = self.read_mark()?;
         let (epoch, lost) = self.read_manifest()?;
         // The lease names the epoch before any file is read under it (`spec.md` §7 Readers).
@@ -419,37 +435,50 @@ impl LogReader {
         let mut view = self.view.clone();
         let mut events = Vec::new();
         let mut scratch = std::mem::take(&mut self.scratch);
-        let read = self.read_log(&mut view, &mark, &mut events, &mut scratch);
-        if scratch.file_id.is_none() {
+        let read = self.read_log(&mut view, &mark, &mut events, &mut scratch, budget);
+        if scratch.file_id.is_none() && scratch.whole.is_none() {
             scratch.bytes = Vec::new();
         }
         self.scratch = scratch;
         // The lease was written whatever the log held: keep its state.
         self.commit_lease(renewed);
-        read?;
+        let more = read?;
         // A mark with another reset stamp, or one that moved backwards, while the files were read: a start may have
         // rewritten what was read under the first one. Discard the pass; the next refresh checks what it holds and
         // reads again.
         if let Ok(again) = self.read_mark()
             && behind(&again, &mark)
         {
-            return Ok(Update {
-                state: self.state,
-                events: Vec::new(),
-            });
+            if self.scratch.whole.take().is_some() {
+                self.scratch.bytes = Vec::new();
+            }
+            return Ok((
+                Update {
+                    state: self.state,
+                    events: Vec::new(),
+                },
+                false,
+            ));
         }
         self.view = view;
         self.lost = lost;
-        self.state.durable = Position {
-            generation: mark.generation,
-            sequence: mark.last_sequence,
+        self.state.durable = if more {
+            self.view.taken
+        } else {
+            Position {
+                generation: mark.generation,
+                sequence: mark.last_sequence,
+            }
         };
         self.state.generation = mark.generation;
         self.state.stamp = mark.stamp;
-        Ok(Update {
-            state: self.state,
-            events,
-        })
+        Ok((
+            Update {
+                state: self.state,
+                events,
+            },
+            more,
+        ))
     }
 
     /// Renews the lease if half of `lease_refresh` has passed since it was written, keeping its epoch, or, once
@@ -485,7 +514,9 @@ impl LogReader {
         mark: &MarkSlot,
         events: &mut Vec<ReadEvent>,
         scratch: &mut Scratch,
-    ) -> Result<(), ReaderError> {
+        budget: Option<usize>,
+    ) -> Result<bool, ReaderError> {
+        let mut items = 0usize;
         // A new generation: everything taken is void and the log is read again from its start (Q-118 (c)).
         match view.generation {
             Some(g) if g != mark.generation => {
@@ -558,11 +589,16 @@ impl LogReader {
             }
             let whole = matches!(limit, ScanLimit::End);
             let follows = (!whole).then_some(file_id);
-            if scratch.file_id != follows {
-                scratch.bytes = Vec::new();
+            let kept = whole && resumed.is_some() && scratch.whole == Some(file_id);
+            scratch.whole = None;
+            if !kept {
+                if scratch.file_id != follows {
+                    scratch.bytes = Vec::new();
+                }
+                scratch.file_id = follows;
+                read_part(&mut scratch.bytes, &*f, from.offset, len, whole)
+                    .map_err(io_err(&path))?;
             }
-            scratch.file_id = follows;
-            read_part(&mut scratch.bytes, &*f, from.offset, len, whole).map_err(io_err(&path))?;
             let bytes = &scratch.bytes[..];
             let id = SegmentIdentity {
                 store_id: self.store_id,
@@ -594,7 +630,7 @@ impl LogReader {
                         // Never above the mark's last position, from any segment.
                         if g == mark.generation && last.sequence > mark.last_sequence {
                             view.resume = Some(before);
-                            return Ok(());
+                            return Ok(false);
                         }
                         let content =
                             BatchContent::decode(&b).map_err(|error| ReaderError::Content {
@@ -644,14 +680,21 @@ impl LogReader {
                             if view.recent.len() > RECENT {
                                 view.recent.pop_front();
                             }
+                            items += rb.content.items.len();
                             events.push(ReadEvent::Batch(rb));
                         }
                     }
                 }
                 view.resume = Some(s.resume_point());
+                if budget.is_some_and(|b| items >= b) {
+                    if whole {
+                        scratch.whole = Some(file_id);
+                    }
+                    return Ok(true);
+                }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Checks that the last batch returned still reads the same. If not, voids what was taken above the last
@@ -728,5 +771,8 @@ fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
 }
 
 mod files;
+mod lookup;
 #[cfg(test)]
 mod tests;
+
+pub use lookup::{FoundFact, Lookup, Wanted};
