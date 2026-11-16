@@ -692,9 +692,25 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         prop_oneof![Just(None), (0u64..3).prop_map(Some)],
         prop::bool::weighted(0.15),
     );
+    // A few keys of the plain gauge and the versioned series, so that duplicates and outranked facts of both meet
+    // within one call. Within a call, `changed_at` does not rise (Q-705).
+    let keyed = (
+        prop::sample::select(vec![0usize, 4]),
+        0i64..4,
+        0u8..2,
+        0u8..2,
+        0u64..3,
+    )
+        .prop_map(|(i, t, v, q, c)| (i, t, v, q, (i == 4).then_some(c), false));
     let step = prop_oneof![
         10 => (prop::collection::vec(reading, 1..6), any::<bool>())
             .prop_map(|(r, rev)| Step::Emit(r, rev)),
+        4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2)).prop_map(
+            |(mut r, rev)| {
+                r.sort_by_key(|x| std::cmp::Reverse(x.4));
+                Step::Emit(r, rev)
+            }
+        ),
         1 => (0usize..7, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
         1 => (0usize..7, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
         1 => (0usize..7).prop_map(Step::Define),

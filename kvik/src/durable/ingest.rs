@@ -8,6 +8,7 @@
 //! sees the calls before it whether or not their sync has returned yet.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as Slot;
 
 use kvik_log::content::Item;
 use kvik_log::entries::{
@@ -161,8 +162,15 @@ impl Decider {
     /// Takes a planned call's facts into the state, once it is queued; the same as noting each of its facts in
     /// order.
     pub(crate) fn apply(&mut self, plan: &mut Plan) {
-        for (key, known) in std::mem::take(&mut plan.history) {
-            self.history.entry(key).or_default().extend(known);
+        let history = std::mem::take(&mut plan.history);
+        self.history.reserve(history.len());
+        for (key, known) in history {
+            match self.history.entry(key) {
+                Slot::Occupied(mut e) => e.get_mut().extend(known),
+                Slot::Vacant(e) => {
+                    e.insert(known);
+                }
+            }
         }
         for (key, c) in std::mem::take(&mut plan.versions) {
             let v = self.versions.entry(key).or_insert(c);
@@ -225,8 +233,13 @@ impl Decider {
         call: u64,
     ) -> Plan {
         let revise = intent == Intent::Revise;
-        let mut plan = Plan::default();
-        let mut batch_history: HashMap<(u32, i64), Vec<Known>> = HashMap::new();
+        let mut plan = Plan {
+            decisions: Vec::with_capacity(readings.len()),
+            items: Vec::with_capacity(readings.len()),
+            ..Plan::default()
+        };
+        let mut batch_history: HashMap<(u32, i64), Vec<Known>> =
+            HashMap::with_capacity(readings.len());
         let mut batch_versions: HashMap<(u32, i64), u64> = HashMap::new();
         let mut batch_reference: HashMap<u32, i64> = HashMap::new();
         for r in readings {
@@ -267,11 +280,13 @@ impl Decider {
                 .into_iter()
                 .flatten()
                 .chain(batch_history.get(&key).into_iter().flatten());
-            let top = self
-                .versions
-                .get(&key)
-                .copied()
-                .max(batch_versions.get(&key).copied());
+            // Only a reading with a `changed_at` is compared with its key's highest one.
+            let top = r.changed_at.and_then(|_| {
+                self.versions
+                    .get(&key)
+                    .copied()
+                    .max(batch_versions.get(&key).copied())
+            });
             // The facts this reading duplicates (§2.4); a `changed_at` above every one of its key's is never a
             // duplicate.
             let matched: Vec<&Known> = match r.changed_at {
@@ -392,6 +407,51 @@ mod tests {
             quality: if v < 0.0 { Quality::Bad } else { Quality::Good },
             ..Reading::new(SeriesId(series), Timestamp(t), Value::F64(v))
         }
+    }
+
+    #[test]
+    fn a_call_mixing_versioned_and_unversioned_series_decides_duplicates_and_outranked_per_key() {
+        let clock = Clock {
+            wall: T0 + 3_600 * S,
+            synced: true,
+            future_tolerance: 60 * S,
+        };
+        let mut d = decider();
+        let first = [reading(2, T0, 1.0, Some(5)), reading(1, T0, 1.0, None)];
+        let mut first = d.plan(&first, Intent::Normal, clock, 1);
+        d.apply(&mut first);
+        let readings = [
+            reading(1, T0, 1.0, None),
+            reading(2, T0, 2.0, Some(3)),
+            reading(2, T0, 1.0, Some(5)),
+            reading(1, T0 + S, 1.0, None),
+            reading(2, T0 + S, 1.0, Some(1)),
+            reading(2, T0 + S, 3.0, Some(0)),
+            reading(1, T0 + S, 1.0, None),
+        ];
+        let plan = d.plan(&readings, Intent::Normal, clock, 2);
+        let got: Vec<_> = plan
+            .decisions
+            .iter()
+            .map(|x| match x {
+                Decision::Record { outranked, .. } => Some(*outranked),
+                Decision::Duplicate => None,
+                Decision::Refused(r) => panic!("refused: {r:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                None,
+                Some(true),
+                None,
+                Some(false),
+                Some(false),
+                Some(true),
+                None
+            ]
+        );
+        assert_eq!(plan.depends, Some(1));
     }
 
     #[test]
