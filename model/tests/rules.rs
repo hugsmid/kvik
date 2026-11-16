@@ -162,6 +162,28 @@ fn s2_5_unsynchronised_clock() {
     assert!(f.flags.host_time && !f.flags.unsynced_clock);
 }
 
+/// §2.2, Q-74: a fact flagged `unsynced_clock` does not raise the lateness
+/// reference, live or as a start rebuilds it.
+#[test]
+fn s2_2_an_unsynchronised_fact_leaves_the_lateness_reference_live_and_after_a_restart() {
+    let (mut m, s) = model(10 * SECOND);
+    let now = m.wall;
+    m.ingest(vec![Reading::num(s, now - 100 * SECOND, 1.0)])
+        .unwrap();
+    m.clock_synchronised = false;
+    m.ingest(vec![Reading::num(s, now + HOUR, 2.0)]).unwrap();
+    m.clock_synchronised = true;
+    let late_at = |m: &mut Model, t: Nanos| {
+        let p = m.ingest(vec![Reading::num(s, t, 3.0)]).unwrap().positions[0];
+        let f = m.facts().unwrap().into_iter().find(|f| f.position == p);
+        f.unwrap().flags.late
+    };
+    assert!(!late_at(&mut m, now - 50 * SECOND));
+    assert!(late_at(&mut m, now - 130 * SECOND));
+    m.restart();
+    assert!(!late_at(&mut m, now - 60 * SECOND));
+}
+
 #[test]
 fn s2_4_duplicates_within_one_batch() {
     let (mut m, s) = model(10 * SECOND);

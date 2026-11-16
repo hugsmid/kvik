@@ -13,7 +13,7 @@ use kvik::{
     ValueType, View, ZoneName,
 };
 use proptest::prelude::*;
-use proptest::test_runner::TestRunner;
+use proptest::test_runner::{TestCaseError, TestRunner};
 
 /// One step of a generated history.
 #[derive(Clone, Debug)]
@@ -36,7 +36,8 @@ enum Step {
 
 fn specs() -> Vec<SeriesSpec> {
     vec![
-        gauge("h/g/power"),
+        // S = 30 s: readings span 600 s, so the lateness reference's clause (spec §2.2) can fire.
+        gauge("h/g/power").staleness(Duration::from_secs(30)),
         SeriesSpec::new(
             "h/c/energy",
             Kind::Counter {
@@ -287,6 +288,33 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
     Run { out, facts, infos }
 }
 
+/// Runs `history` on both backends and compares what they give.
+fn compare(history: &[Step]) -> Result<(), TestCaseError> {
+    let m_clock = ManualClock::new(start());
+    let model = block_on(Store::open(
+        StoreConfig::new(
+            format!("kvik-test/differential/{}", next()),
+            "Europe/London",
+        )
+        .create_if_missing(true)
+        .backend(Backend::Model)
+        .env(Env::test(m_clock.clone())),
+    ))
+    .unwrap();
+    let w = World::new("differential");
+    let mut config = w.config();
+    config.log.min_sync_interval = Duration::ZERO;
+    let durable = block_on(Store::open(config)).unwrap();
+    let m = run(&model, &m_clock, history);
+    let d = run(&durable, &w.clock, history);
+    prop_assert_eq!(&m.out, &d.out);
+    prop_assert_eq!(&m.infos, &d.infos);
+    prop_assert_eq!(&m.facts, &d.facts);
+    block_on(durable.shutdown()).unwrap();
+    block_on(model.shutdown()).unwrap();
+    Ok(())
+}
+
 #[test]
 fn the_durable_backend_decides_as_the_model_does() {
     // Each case opens a durable store; a quarter of the configured cases keeps the deep run in bounds.
@@ -296,33 +324,20 @@ fn the_durable_backend_decides_as_the_model_does() {
         failure_persistence: None,
         ..ProptestConfig::default()
     });
-    runner
-        .run(&steps(), |history| {
-            let m_clock = ManualClock::new(start());
-            let model = block_on(Store::open(
-                StoreConfig::new(
-                    format!("kvik-test/differential/{}", next()),
-                    "Europe/London",
-                )
-                .create_if_missing(true)
-                .backend(Backend::Model)
-                .env(Env::test(m_clock.clone())),
-            ))
-            .unwrap();
-            let w = World::new("differential");
-            let mut config = w.config();
-            config.log.min_sync_interval = Duration::ZERO;
-            let durable = block_on(Store::open(config)).unwrap();
-            let m = run(&model, &m_clock, &history);
-            let d = run(&durable, &w.clock, &history);
-            prop_assert_eq!(&m.out, &d.out);
-            prop_assert_eq!(&m.infos, &d.infos);
-            prop_assert_eq!(&m.facts, &d.facts);
-            block_on(durable.shutdown()).unwrap();
-            block_on(model.shutdown()).unwrap();
-            Ok(())
-        })
-        .unwrap();
+    runner.run(&steps(), |history| compare(&history)).unwrap();
+}
+
+#[test]
+fn a_reading_taken_unsynchronised_leaves_the_lateness_reference_in_both_backends() {
+    let emit = |t| Step::Emit(vec![(0, t, 0, 0, None, false)], false);
+    compare(&[
+        emit(-100),
+        Step::Synced(false),
+        emit(100),
+        Step::Synced(true),
+        emit(0),
+    ])
+    .unwrap();
 }
 
 fn next() -> u64 {
