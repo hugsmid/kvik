@@ -79,6 +79,10 @@ pub(crate) enum Decision {
         outranked: bool,
         /// A supplied `Absent` (spec §2.5 `absent_supplied`).
         absent: bool,
+        /// Flagged `late` (spec §2.2).
+        late: bool,
+        /// Flagged `future` (spec §2.2).
+        future: bool,
     },
 }
 
@@ -90,8 +94,11 @@ pub(crate) struct Plan {
     /// The latest earlier call holding a fact a duplicate matched, if any: the duplicate is final only once that
     /// call is acknowledged (Q-123 (b)).
     pub(crate) depends: Option<u64>,
-    /// The call this plan is for.
-    call: u64,
+    /// What [`Decider::apply`] takes into the state: the plan's facts as `history`, `versions` and `reference`
+    /// hold them, so that `items` can be moved into the log.
+    history: HashMap<(u32, i64), Vec<Known>>,
+    versions: HashMap<(u32, i64), u64>,
+    reference: HashMap<u32, i64>,
 }
 
 /// The state decisions are made against: the registry and the history of every key, including calls queued but
@@ -151,12 +158,19 @@ impl Decider {
         }
     }
 
-    /// Takes a planned call's facts into the state, once it is queued.
-    pub(crate) fn apply(&mut self, plan: &Plan) {
-        for item in &plan.items {
-            if let Item::Fact(r) = item {
-                self.note(r, plan.call);
-            }
+    /// Takes a planned call's facts into the state, once it is queued; the same as noting each of its facts in
+    /// order.
+    pub(crate) fn apply(&mut self, plan: &mut Plan) {
+        for (key, known) in std::mem::take(&mut plan.history) {
+            self.history.entry(key).or_default().extend(known);
+        }
+        for (key, c) in std::mem::take(&mut plan.versions) {
+            let v = self.versions.entry(key).or_insert(c);
+            *v = (*v).max(c);
+        }
+        for (id, t) in std::mem::take(&mut plan.reference) {
+            let v = self.reference.entry(id).or_insert(t);
+            *v = (*v).max(t);
         }
     }
 
@@ -211,10 +225,7 @@ impl Decider {
         call: u64,
     ) -> Plan {
         let revise = intent == Intent::Revise;
-        let mut plan = Plan {
-            call,
-            ..Plan::default()
-        };
+        let mut plan = Plan::default();
         let mut batch_history: HashMap<(u32, i64), Vec<Known>> = HashMap::new();
         let mut batch_versions: HashMap<(u32, i64), u64> = HashMap::new();
         let mut batch_reference: HashMap<u32, i64> = HashMap::new();
@@ -331,9 +342,92 @@ impl Decider {
                 item: plan.items.len(),
                 outranked,
                 absent,
+                late,
+                future,
             });
             plan.items.push(Item::Fact(row));
         }
+        plan.history = batch_history;
+        plan.versions = batch_versions;
+        plan.reference = batch_reference;
         plan
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kvik_log::entries::Entry;
+
+    use super::*;
+    use crate::durable::registry::definition_of;
+    use crate::series::{ChangedAtKind, Kind, SeriesSpec, ValueType};
+    use crate::time::Timestamp;
+    use crate::types::{Quality, SeriesId};
+
+    const T0: i64 = 1_767_225_600_000_000_000;
+    const S: i64 = 1_000_000_000;
+
+    fn decider() -> Decider {
+        let mut d = Decider::default();
+        let gauge = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let versioned = gauge.clone().versioned(ChangedAtKind::Version);
+        for (id, spec) in [(1, gauge), (2, versioned)] {
+            let def = definition_of(&spec, id, Duration::from_secs(300)).unwrap();
+            d.registry.apply(&Entry::Definition(Box::new(def)));
+        }
+        d
+    }
+
+    fn reading(series: u32, t: i64, v: f64, changed_at: Option<u64>) -> Reading {
+        Reading {
+            changed_at,
+            quality: if v < 0.0 { Quality::Bad } else { Quality::Good },
+            ..Reading::new(SeriesId(series), Timestamp(t), Value::F64(v))
+        }
+    }
+
+    #[test]
+    fn apply_takes_in_what_noting_each_planned_fact_in_order_would() {
+        let clock = Clock {
+            wall: T0 + 3_600 * S,
+            synced: true,
+            future_tolerance: 60 * S,
+        };
+        let mut d = decider();
+        let mut first = d.plan(&[reading(1, T0, 1.0, None)], Intent::Normal, clock, 1);
+        d.apply(&mut first);
+        let readings = [
+            reading(1, T0, 2.0, None),
+            reading(1, T0 + S, 3.0, None),
+            reading(1, T0, 4.0, None),
+            reading(1, T0 - 7_200 * S, 5.0, None),
+            reading(1, T0 + 7_200 * S, 6.0, None),
+            reading(2, T0, 1.0, Some(3)),
+            reading(2, T0, 2.0, Some(9)),
+            reading(2, T0, 3.0, Some(5)),
+            reading(1, T0 + 2 * S, -1.0, None),
+        ];
+        let mut plan = d.plan(&readings, Intent::Normal, clock, 2);
+        let mut noted = d.clone();
+        for item in &plan.items {
+            if let Item::Fact(r) = item {
+                noted.note(r, 2);
+            }
+        }
+        assert_eq!(plan.items.len(), readings.len());
+        d.apply(&mut plan);
+        assert_eq!(d.history, noted.history);
+        assert_eq!(d.versions, noted.versions);
+        assert_eq!(d.reference, noted.reference);
+        assert_eq!(d.history[&(1, T0)].len(), 3);
+        assert_eq!(d.versions[&(2, T0)], 9);
     }
 }

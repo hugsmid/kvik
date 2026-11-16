@@ -845,8 +845,9 @@ impl Writer {
         }
         let mut d = lock(&self.decider);
         let call = self.next_call.fetch_add(1, Ordering::SeqCst);
-        let plan = d.plan(readings, intent, clock, call);
+        let mut plan = d.plan(readings, intent, clock, call);
         let started = Instant::now();
+        let refreshes = refreshing(&plan);
         let queued = if plan.items.is_empty() {
             None
         } else {
@@ -854,10 +855,11 @@ impl Writer {
             let r = {
                 let log = self.log();
                 let log = log.as_ref().ok_or(EmitError::Closed)?;
+                let items = std::mem::take(&mut plan.items);
                 if wait {
-                    log.submit(plan.items.clone())
+                    log.submit(items)
                 } else {
-                    log.try_submit(plan.items.clone())
+                    log.try_submit(items)
                 }
             };
             if wait {
@@ -881,7 +883,7 @@ impl Writer {
                 }
             }
         };
-        d.apply(&plan);
+        d.apply(&mut plan);
         // The call is tracked before the decision lock is released, so a later call that duplicates one of its
         // readings always finds it (lock order: decisions, then calls in flight).
         let mut inflight = lock(&self.inflight);
@@ -889,7 +891,7 @@ impl Writer {
         inflight.retain(|_, c| !c.acknowledged());
         let tracked = match queued {
             Some(pending) => {
-                let (clocks, ids) = (self.clocks.clone(), refreshing(&plan));
+                let (clocks, ids) = (self.clocks.clone(), refreshes);
                 let c = Completion::new(
                     pending,
                     Box::new(move || {
@@ -984,17 +986,17 @@ impl Writer {
                 Decision::Refused(x) => *st.refused.entry(*x).or_insert(0) += 1,
                 Decision::Duplicate => st.duplicates_dropped += 1,
                 Decision::Record {
-                    item,
                     outranked,
                     absent,
+                    late,
+                    future,
+                    ..
                 } => {
                     st.recorded += 1;
                     st.outranked_on_arrival += u64::from(*outranked);
                     st.absent_supplied += u64::from(*absent);
-                    if let Some(Item::Fact(row)) = plan.items.get(*item) {
-                        st.late += u64::from(row.flags.late);
-                        st.future += u64::from(row.flags.future);
-                    }
+                    st.late += u64::from(*late);
+                    st.future += u64::from(*future);
                 }
             }
         }
