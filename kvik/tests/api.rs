@@ -1532,6 +1532,45 @@ fn versioned_series_and_outranked_facts_on(b: Backend) {
 }
 
 #[test]
+fn a_reading_outranked_at_commit_stays_outranked_when_a_later_reading_of_its_call_becomes_current()
+{
+    for b in BACKENDS {
+        a_reading_outranked_at_commit_stays_outranked_on(b);
+    }
+}
+
+/// Q-705.
+fn a_reading_outranked_at_commit_stays_outranked_on(b: Backend) {
+    let (s, clock) = store_on(b, "outranked-in-call");
+    let v =
+        block_on(s.define_series(gauge("grid/area/price", 1).versioned(ChangedAtKind::Version)))
+            .unwrap();
+    let mut c = new_consumer(&s, "prices");
+    block_on(c.route(Funnel::facts(Select::Ids(vec![v])))).unwrap();
+    block_on(s.emit(&[num(v, 0, 1.0).changed_at(1)])).unwrap();
+    let ack =
+        block_on(s.emit(&[num(v, 0, 0.5).changed_at(0), num(v, 0, 2.0).changed_at(2)])).unwrap();
+    let outranked: Vec<bool> = ack
+        .outcomes
+        .iter()
+        .map(|o| match o {
+            Outcome::Recorded { outranked, .. } => *outranked,
+            o => panic!("{b:?}: {o:?}"),
+        })
+        .collect();
+    assert_eq!(outranked, vec![true, false], "{b:?}");
+    assert_eq!(s.series_stats(v).unwrap().outranked_on_arrival, 1, "{b:?}");
+    clock.advance(Duration::from_secs(1));
+    let flags: Vec<bool> = facts_of(&drain(&mut c))
+        .iter()
+        .map(|f| f.1.outranked)
+        .collect();
+    assert_eq!(flags, vec![false, true, false], "{b:?}");
+    let cur = facts(&s.reader(), v, at(0)..at(1), View::Current);
+    assert_eq!(cur[0].changed_at, Some(2), "{b:?}");
+}
+
+#[test]
 fn future_and_late_facts_are_flagged_and_counted() {
     for b in BACKENDS {
         future_and_late_facts_are_flagged_and_counted_on(b);

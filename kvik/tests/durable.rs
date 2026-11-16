@@ -845,7 +845,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         prop::bool::weighted(0.15),
     );
     // A few keys of the plain gauge and the versioned series, so that duplicates and outranked facts of both meet
-    // within one call, interleaved. Within a call the versioned readings' `changed_at` does not rise (Q-705).
+    // within one call, interleaved.
     let keyed = (
         prop::sample::select(vec![0usize, 4]),
         prop::sample::select(vec![0i64, 1, 2, 3, 1_500, 3_000]),
@@ -854,20 +854,16 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         0u64..3,
     )
         .prop_map(|(i, t, v, q, c)| (i, t, v, q, (i == 4).then_some(c), false));
+    // Calls on two keys of the versioned series alone, so that an earlier reading of a call is often outranked at
+    // commit while a later one becomes current (Q-705).
+    let versions = (prop::sample::select(vec![0i64, 1]), 0u8..2, 0u64..4)
+        .prop_map(|(t, v, c)| (4usize, t, v, 0u8, Some(c), false));
     let step = prop_oneof![
         10 => (prop::collection::vec(reading, 1..6), any::<bool>())
             .prop_map(|(r, rev)| Step::Emit(r, rev)),
-        4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2)).prop_map(
-            |(mut r, rev)| {
-                let at: Vec<usize> = (0..r.len()).filter(|&k| r[k].4.is_some()).collect();
-                let mut versioned: Vec<_> = at.iter().map(|&k| r[k]).collect();
-                versioned.sort_by_key(|x| std::cmp::Reverse(x.4));
-                for (k, x) in at.into_iter().zip(versioned) {
-                    r[k] = x;
-                }
-                Step::Emit(r, rev)
-            }
-        ),
+        4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2))
+            .prop_map(|(r, rev)| Step::Emit(r, rev)),
+        2 => prop::collection::vec(versions, 2..6).prop_map(|r| Step::Emit(r, false)),
         1 => (0usize..7, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
         1 => (0usize..7, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
         1 => (0usize..7).prop_map(Step::Define),
