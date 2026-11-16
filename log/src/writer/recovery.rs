@@ -476,6 +476,9 @@ fn plan(
                         && let Some(b) = s.batches.get(kept[i])
                         && let Some(rec) = b.recovery()
                         && rec.after == slot.last_sequence
+                        && !unused_dirty
+                            .iter()
+                            .any(|&u| segs[u].id.file_id > segs[i].id.file_id)
                         && b.offset == from
                         && s.last_nonzero <= b.offset + rec.tail_bytes.max(b.end - b.offset)
                         && !s
@@ -669,12 +672,13 @@ fn plan(
             {
                 let b = &s.batches[j];
                 let covered = mark_slot.is_some_and(|m| m.last_sequence >= b.first);
-                // With the mark lost, an unused segment with bytes above the entry's may have been written after it
-                // by the writer: not adopted, so that a new entry reports those bytes (Q-320).
-                let written_after = mark_slot.is_none()
-                    && p.unused_dirty
-                        .iter()
-                        .any(|&u| segs[u].id.file_id > segs[i].id.file_id);
+                // An unused segment with bytes in a later file may have been written after the entry by the writer,
+                // with the mark lost or its current slot damaged: not adopted, so that a new entry reports those
+                // bytes (Q-320).
+                let written_after = p
+                    .unused_dirty
+                    .iter()
+                    .any(|&u| segs[u].id.file_id > segs[i].id.file_id);
                 if let (Some(rec), false, false) = (b.recovery(), covered, written_after) {
                     // The tail it reported began where it was written; as the first batch of its segment it may have
                     // gone to a new segment, so then only its own length counts.

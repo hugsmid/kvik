@@ -2900,6 +2900,80 @@ fn an_entry_with_the_mark_lost_is_not_adopted_over_bytes_in_an_unused_segment_af
     r.check_started();
 }
 
+/// An old recovery entry, then a torn batch in an unused segment the writer wrote after it, then the mark's current
+/// slot damaged so that the older slot, which does not cover the entry, is read: the entry is not adopted, under rule
+/// 3 after a reboot or rule 1 on the same boot, and the bytes are reported before the segment is deleted (Q-320).
+#[test]
+fn an_entry_is_not_adopted_over_bytes_in_a_later_unused_segment_with_the_marks_current_slot_damaged()
+ {
+    for same_boot in [false, true] {
+        let mut reached = 0;
+        for fill in 1..60 {
+            for seed in 0..40 {
+                let mut r = Rig::new(WriterConfig {
+                    mark_sync: MarkSync::EveryCommit,
+                    segment_size: 4096,
+                    max_batch_bytes: 1024,
+                    ..cfg()
+                });
+                for k in 0..fill {
+                    r.submit(vec![fact(1, k)]);
+                    r.drain();
+                }
+                if same_boot {
+                    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+                    r.submit(vec![fact(1, 0)]);
+                    r.step();
+                    r.kill();
+                } else {
+                    r.power_loss(None);
+                }
+                if r.open().and_then(|rep| rep.entry).is_none() {
+                    continue;
+                }
+                let m = r.mark().unwrap();
+                r.fs.crash_after(2);
+                r.submit((0..11).map(|k| fact(2, k)).collect());
+                r.step();
+                r.w = None;
+                r.fs.power_loss_partial(seed);
+                r.fs.restart();
+                let unused = r.unused_bytes_beyond(Some(m));
+                if unused == 0
+                    || r.batches()
+                        .last()
+                        .is_none_or(|l| l.first_sequence != m.last_sequence)
+                {
+                    continue;
+                }
+                let mp = log_path("MARK");
+                let (idx, _) = read_mark(&r.fs.read(&mp).unwrap(), &STORE_ID)
+                    .unwrap()
+                    .unwrap();
+                r.fs.poke(&mp, SLOT_OFFSETS[idx], &[0xee; 8]);
+                let Some(older) = r.mark() else { continue };
+                assert!(older.last_sequence < m.last_sequence);
+                let rep = r.open().unwrap();
+                reached += 1;
+                let e = rep.entry.as_ref().unwrap();
+                assert!(
+                    !e.adopted,
+                    "same boot {same_boot}, fill {fill}, seed {seed}"
+                );
+                assert!(
+                    e.entry.tail_bytes >= unused,
+                    "fill {fill}, seed {seed}: {:?}",
+                    e.entry
+                );
+                assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
+                assert_eq!(r.unused_bytes_beyond(None), 0);
+                r.check_started();
+            }
+        }
+        assert!(reached >= 20, "same boot {same_boot}: {reached} states");
+    }
+}
+
 /// The readable commit blocks of an unused segment beyond the mark count in the entry, with its bytes (Q-320).
 #[test]
 fn an_unused_segments_readable_commit_blocks_count_in_the_entry() {

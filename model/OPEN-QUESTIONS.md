@@ -1266,15 +1266,23 @@ mark is reported before it is deleted. (a) The bytes after the header of every u
 segment, wherever segments in use lie, or of every unused segment when no mark is readable, are part of a recovery
 entry's tail: under rule 1 a reset point with a `possible_loss`, under rule 3 counted in the new entry's tail. With
 no readable mark such a store is never a first start; rule 3 writes the entry. The segment is deleted only after an
-entry that reports it is synced: the one written, or one adopted. An entry this start adopts was written by a start
-that saw the segment, except with the mark lost, where the writer may have written the segment after the entry; then
-an entry followed by such a segment in a later file is not adopted, and a new entry reports the bytes. A start cut
-short and then killed or remounted leaves the bytes, or a durable entry naming them, for the next start
+entry that reports it is synced: the one written, or one adopted. With the mark lost, or its current slot damaged so
+that an older slot is read, the writer may have written the segment after an entry the mark read does not cover, so
+an entry followed by such a segment in a later file is never adopted, on the rule 1 or the rule 3 path, and a new
+entry reports the bytes. A start cut short and then killed or remounted leaves the bytes, or a durable entry naming
+them, for the next start
 (`a_torn_batch_in_a_segment_never_taken_into_use_is_reported_before_it_is_deleted`,
 `a_torn_batch_in_a_segment_never_taken_into_use_is_in_a_reboots_entry`,
 `a_torn_batch_in_a_segment_never_taken_into_use_is_reported_with_the_mark_lost`,
 `an_entry_with_the_mark_lost_is_not_adopted_over_bytes_in_an_unused_segment_after_it`,
-`an_unused_segments_readable_commit_blocks_count_in_the_entry`). A damaged header counts the same way when bytes
+`an_unused_segments_readable_commit_blocks_count_in_the_entry`,
+`an_entry_is_not_adopted_over_bytes_in_a_later_unused_segment_with_the_marks_current_slot_damaged`). The same bytes
+can be reported twice, each time by an entry that is its own reset point and `possible_loss`: when a start's entry
+lies in a file below the segment and the start stops before its mark, the next start cannot tell that entry from one
+the writer wrote before the segment, and writes another; and when a start removes the segment and writes its mark,
+and a remount undoes the removal before the mark's directory sync, the next start finds the bytes beyond the new mark
+and resets again. A second report costs a second `resync` and no position; nothing adds up the bytes of several
+reports. A damaged header counts the same way when bytes
 follow it; with zeros after it nothing was written and the file is only deleted
 (`a_damaged_header_beyond_the_mark_is_a_reset_point_only_with_bytes_after_it`). (b) Valid seal blocks are not lost
 data and are sealed again, as step 2 says. (c) The one dropped batch is the adopted entry's reported tail: the kill

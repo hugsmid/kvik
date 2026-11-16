@@ -251,8 +251,9 @@ A.10) is treated as a different boot. The rules apply in this order:
    a reset point for every consumer (§4 Resync). A consumer whose cursor file was missing or unreadable is treated
    as having no cursor. **Adoption:** if the last kept batch is a recovery entry, a readable mark does not cover it,
    and the bytes after it show no later write (none lies beyond the end of the tail it reported, no readable
-   commit block among them has a commit time at or after the entry's, and, with no readable mark, no unused segment
-   after its own holds bytes after its header, Q-320), no recovery since has resumed: that entry is
+   commit block among them has a commit time at or after the entry's, and no unused segment in a later file holds
+   bytes after its header, which the writer may have written after the entry when the mark is lost or its current
+   slot damaged, Q-320), no recovery since has resumed: that entry is
    adopted, whether or not the mark is readable, no second entry is written, and the invalid bytes after it are the
    rest of the tail it reported (a mark update torn by a crash in step 6 is no new loss). Otherwise a new entry
    is written, and the bytes after the old one are a newly truncated tail that the new entry reports as
