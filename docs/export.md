@@ -8,8 +8,8 @@ against it. Parquet is the export format only (`design.md`); stored files keep t
 ## Compatibility (Q-190)
 
 Every file carries `kvik.export_version` = `1`. Adding a column or a metadata key is not a breaking change and keeps
-the version, so a reader ignores columns and keys it does not know. Renaming, retyping or removing a column or a
-metadata key, or changing what one holds, raises the version.
+the version, so a reader should ignore columns and keys it does not know. Renaming, retyping or removing a column or
+a metadata key raises the version.
 
 ## Scope
 

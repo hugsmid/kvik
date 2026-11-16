@@ -769,8 +769,8 @@ count the same transitions (`spec.md` §2.1 `value type`).
 
 **Scenario.** A user loads monthly exports into an analytics tool by column name. If a later release renames
 `supplied_quality` or turns `generation` signed, their queries break, although no fact changed.
-**Draft (roadmap 6.4a).** `docs/export.md` drafts the columns, their Parquet logical types and the file metadata; every file carries
-`kvik.export_version` = `0`, and the crate `kvik-export` writes and reads it back (round-trip tests in
+**Draft (roadmap 6.4a).** `docs/export.md` drafts the columns, their Parquet logical types and the file metadata; every
+file carries `kvik.export_version` = `0`, and the crate `kvik-export` writes and reads it back (round-trip tests in
 `export/tests/`).
 **Settled by the owner, 2026-11-16,** as recommended: the schema as drafted is a user contract, and every file
 carries `kvik.export_version` = `1`. Adding a column or a metadata key is not a breaking change; renaming, retyping or
@@ -782,8 +782,8 @@ removing one raises the version (`docs/export.md` Compatibility; `export/tests/r
 **Scenario.** A versioned price series has three revisions of the 14:00 value. An export in the current view holds
 one row for 14:00; one in the history view holds all three, which re-ingest into an empty store (§8 Re-ingest)
 needs to reproduce the revisions and the duplicate rule's state.
-**Draft (roadmap 6.4a).** `ExportOptions::view` defaults to `Current`, and `History`, `AsOf(P)` and `AsOfTime(T)` are options.
-Orphaned and set-aside facts are returned as facts by their own calls (`api.md`), not written to Parquet.
+**Draft (roadmap 6.4a).** `ExportOptions::view` defaults to `Current`, and `History`, `AsOf(P)` and `AsOfTime(T)` are
+options. Orphaned and set-aside facts are returned as facts by their own calls (`api.md`), not written to Parquet.
 **Settled by the owner, 2026-11-16,** as recommended. (a) The default view is `Current`; `docs/export.md` Options
 names `History` as the view to export for re-ingest. (b) Orphaned and set-aside facts get the same schema, one file
 per call with rows of several series, added with roadmap 8.3 (settle-by row).
@@ -792,10 +792,10 @@ per call with rows of several series, added with roadmap 8.3 (settle-by row).
 
 **Scenario.** A series is defined at scale 2 and raised to scale 4 (§2.1 `decimal scale`); facts are stored at
 both. One Parquet column has one `DECIMAL(p, s)`.
-**Draft (roadmap 6.4a).** `value` is `DECIMAL(19, s)`, `s` the series' scale, each value rescaled exactly (19 digits hold any `i64`
-units), and `stored_scale` keeps each fact's stored scale, so the units and stored scale come back unchanged; a
-fact stored above `s` is an error, never rounded. `SeriesInfo` exposes only the definition's scale, so the exporter
-uses it; decimal series are not stored by either backend yet, and the tests use synthetic rows
+**Draft (roadmap 6.4a).** `value` is `DECIMAL(19, s)`, `s` the series' scale, each value rescaled exactly (19 digits
+hold any `i64` units), and `stored_scale` keeps each fact's stored scale, so the units and stored scale come back
+unchanged; a fact stored above `s` is an error, never rounded. `SeriesInfo` exposes only the definition's scale, so the
+exporter uses it; decimal series are not stored by either backend yet, and the tests use synthetic rows
 (`export/tests/rows.rs` `decimals_round_trip_with_their_stored_scale`,
 `a_decimal_stored_above_the_export_scale_is_an_error_not_a_rounding`).
 **Settled by the owner, 2026-11-16,** as recommended. (a) `DECIMAL(19, scale in force)` with `stored_scale`. (b) The
@@ -813,9 +813,9 @@ settle-by row); until then the export refuses a fact stored above the definition
 
 **Scenario.** A dashboard filters `quality = 'good'`; a re-ingest needs a named state's index, which a reordered
 list of names would change.
-**Draft (roadmap 6.4a).** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`), dictionary-encoded; a
-named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and the declared
-names in the metadata.
+**Draft (roadmap 6.4a).** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`),
+dictionary-encoded; a named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and
+the declared names in the metadata.
 **Settled by the owner, 2026-11-16,** as recommended: quality as dictionary-encoded strings, which the writer now
 asks for explicitly (`export/tests/rows.rs` `quality_columns_are_dictionary_encoded`); a named state as its index in
 `value` with `state_name` beside it.
@@ -825,24 +825,25 @@ asks for explicitly (`export/tests/rows.rs` `quality_columns_are_dictionary_enco
 **Scenario.** An adapter sends `changed_at` = 2^63 on a series of `changed_at kind` `time`. §2.2 makes `changed_at` a
 `u64` and the store records it; a Parquet timestamp is a signed 64-bit integer and cannot hold it.
 **Draft (roadmap 6.4a).** The export fails with `ChangedAtOutOfRange` (`export/tests/rows.rs`
-`changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by
-`kvik.timing` = `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
+`changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by `kvik.timing`
+= `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
 **Settled by the owner, 2026-11-16,** as recommended. (a) A `changed_at` above `i64::MAX` on a series of `changed_at
-kind` `time` is refused at ingest and counted, as every other time in `format.md` is an `i64`: `Refusal::ChangedAtOutOfRange`
-on both backends, checked after `ChangedAtMissing`, `ChangedAtUnexpected` and `ReviseOnVersioned` (`spec.md` §2.2,
-`api.md` Errors; `model/tests/rules.rs` `s2_2_a_time_changed_at_above_i64_max_is_refused`, `kvik/tests/api.rs`
+kind` `time` is refused at ingest and counted, as every other time in `format.md` is an `i64`:
+`Refusal::ChangedAtOutOfRange` on both backends, checked after `ChangedAtMissing`, `ChangedAtUnexpected` and
+`ReviseOnVersioned` (`spec.md` §2.2, `api.md` Errors; `model/tests/rules.rs`
+`s2_2_a_time_changed_at_above_i64_max_is_refused`, `kvik/tests/api.rs`
 `a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not`). `i64::MAX` itself is accepted; a `changed_at` of
-kind `version` stays any `u64`. The export keeps `ChangedAtOutOfRange` for rows that reach it otherwise
-(`export_rows`, or a log that holds one, Q-760). (b) Forecast exports keep the column names `t` and `changed_at`; the
-label `kvik.timing` = `forecast` says which is the valid time and which the issue time.
+kind `version` stays any `u64`. The export keeps `ChangedAtOutOfRange` for rows that reach it otherwise (`export_rows`,
+or a log that holds one, Q-760). (b) Forecast exports keep the column names `t` and `changed_at`; the label
+`kvik.timing` = `forecast` says which is the valid time and which the issue time.
 
 ## Q-196 — Export file layout, compression and store-level metadata
 
 **Scenario.** A user exports a hundred series: a hundred files, each with a typed `value` column, or one file whose
 value column cannot have one type. Later they want to know which store and which durable point an export came from.
-**Draft (roadmap 6.4a).** One file per series per call; row groups of at most 131,072 rows; zstd level 1. The metadata names the
-series, view and range, not the store: its id, tzdata version, durable position and reset stamp are not reachable
-through the public `Reader` without a side effect (`refresh`).
+**Draft (roadmap 6.4a).** One file per series per call; row groups of at most 131,072 rows; zstd level 1. The metadata
+names the series, view and range, not the store: its id, tzdata version, durable position and reset stamp are not
+reachable through the public `Reader` without a side effect (`refresh`).
 **Settled by the owner, 2026-11-16,** as recommended, and beyond the draft. (a) One file per series per period. (b) Row
 groups of at most 131,072 rows; zstd level 1. Beyond the draft: store and site identity in every file's metadata now,
 and a partitioned path layout `site=<site>/series=<series>/month=<YYYY-MM>/` for consolidating many sites from a
@@ -869,8 +870,8 @@ bucket. Applied as follows (`docs/export.md` Options, Partitioned layout, Metada
 
 **Scenario.** A half-hourly import series is exported for a billing tool that wants each interval's end, not its
 length.
-**Draft (roadmap 6.4a).** An interval series has an `interval_end` column, `t + d` (F-14, F-17), and `kvik.interval_length_ns`.
-Calendar-length interval series are refused by the export, as neither backend stores them.
+**Draft (roadmap 6.4a).** An interval series has an `interval_end` column, `t + d` (F-14, F-17), and
+`kvik.interval_length_ns`. Calendar-length interval series are refused by the export, as neither backend stores them.
 **Settled by the owner, 2026-11-16,** as recommended: keep `interval_end`. For calendar lengths each end is taken from
 the interval zone under the tzdata version in force at export, recorded in the metadata; built with calendar-length
 interval series (roadmap 7.3, settle-by row).

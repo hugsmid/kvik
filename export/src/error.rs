@@ -71,7 +71,7 @@ pub enum ExportError {
         /// The fact's position.
         position: Position,
     },
-    /// A `changed_at` of kind `time` above `i64::MAX`, which a Parquet timestamp cannot hold; ingest refuses one (Q-195).
+    /// A `changed_at` of kind `time` above `i64::MAX`, beyond a Parquet timestamp; ingest refuses one (Q-195).
     #[error("fact at {position}: changed_at {changed_at} beyond the timestamp range")]
     ChangedAtOutOfRange {
         /// The fact's position.
