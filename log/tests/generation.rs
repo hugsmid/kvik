@@ -483,10 +483,9 @@ fn a_start_refuses_a_mark_or_segment_of_another_generation() {
     ));
 }
 
-/// Q-264: position 1 as the chain's start stays with generation 0 (Q-321); a restored generation's lowest unsealed
-/// segment gone leaves no gap below the next one.
-#[test]
-fn the_position_one_start_rule_is_limited_to_generation_0() {
+/// A restored generation with unsealed segments only: the lowest has acknowledged batches; ingest stops once the
+/// mark is two segments above it. Segments are created but never sealed.
+fn unsealed_in_generation_1() -> Rig {
     let small = WriterConfig {
         segment_size: 4096,
         max_batch_bytes: 1024,
@@ -494,7 +493,6 @@ fn the_position_one_start_rule_is_limited_to_generation_0() {
     };
     let (mut r, _) = restored(small);
     r.open();
-    // Segments are created but never sealed, so the lowest of generation 1 stays unsealed.
     for k in 0..400 {
         r.submit(vec![fact(5, k)]);
         r.step();
@@ -514,16 +512,77 @@ fn the_position_one_start_rule_is_limited_to_generation_0() {
             break;
         }
     }
-    let lowest = r
+    r
+}
+
+/// Damages the lowest unsealed segment of generation 1: its header and every batch (0), all its bytes zeroed (1),
+/// or the file removed (2). Returns the last position it held.
+fn damage_lowest(r: &mut Rig, how: u8) -> u64 {
+    let (n, path) = r
         .segments()
         .into_iter()
         .find(|(n, _)| n.generation == 1 && !n.sealed)
         .unwrap();
+    let id = SegmentIdentity {
+        store_id: STORE_ID,
+        file_id: n.file_id,
+        generation: 1,
+    };
+    let bytes = r.fs.read(&path).unwrap();
+    let held: Vec<(u64, u64)> = scan(&bytes, &id, ScanLimit::End)
+        .unwrap()
+        .batches
+        .iter()
+        .map(|b| (b.offset, b.commit.last_sequence))
+        .collect();
     r.kill();
-    r.fs.remove_file(&lowest.1).unwrap();
+    match how {
+        0 => {
+            r.fs.poke(&path, 8, &[0xff; 8]);
+            for &(at, _) in &held {
+                r.fs.poke(&path, at as usize + 40, &[0xff; 8]);
+            }
+        }
+        1 => r.fs.poke(&path, 0, &vec![0; bytes.len()]),
+        _ => r.fs.remove_file(&path).unwrap(),
+    }
     r.fs.restart();
-    r.open();
-    assert!(r.lost_ranges().is_empty(), "{:?}", r.lost_ranges());
+    held.last().unwrap().1
+}
+
+/// Q-264: with no sealed segment of its own, a restored generation's log starts at its first position, so its
+/// lowest unsealed segment damaged, zeroed or missing is a recorded `data_lost` range from there (Q-321 in
+/// generation 0, pinned in `recovery.rs`).
+#[test]
+fn a_restored_generations_lowest_segment_damaged_zeroed_or_missing_is_a_recorded_loss() {
+    for reboot in [false, true] {
+        for how in 0..3 {
+            let mut r = unsealed_in_generation_1();
+            let last = damage_lowest(&mut r, how);
+            if reboot {
+                r.boot += 1;
+            }
+            let rep = r.open();
+            let lost: Vec<_> = r
+                .lost_ranges()
+                .into_iter()
+                .map(|(g, l)| (g, l.first, l.last))
+                .collect();
+            assert_eq!(
+                lost,
+                vec![(1, (1, 1), (1, last))],
+                "reboot {reboot}, damage {how}"
+            );
+            assert!(
+                rep.losses
+                    .iter()
+                    .any(|l| l.kind == LossKind::DataLost
+                        && (l.first, l.last) == (Some(1), Some(last))),
+                "reboot {reboot}, damage {how}: {:?}",
+                rep.losses
+            );
+        }
+    }
 }
 
 /// A rule 2 region found in a restored generation is recorded in that generation, also beside a loss of generation 0
@@ -657,6 +716,13 @@ fn a_generation_starting_above_1_takes_ingest_at_its_stamps_sequence() {
     r.submit(vec![fact(5, 0)]);
     r.drain();
     assert_eq!(r.acked, vec![at(1, 5)]);
+    r.kill();
+    let rep = r.open();
+    assert!(
+        rep.losses.is_empty() && r.lost_ranges().is_empty(),
+        "{:?}",
+        rep.losses
+    );
 }
 
 /// F after a reboot in a restored generation counts its own cursor files, lost ranges and registry file only, and

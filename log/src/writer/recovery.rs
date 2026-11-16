@@ -358,7 +358,7 @@ fn plan(
     mark: &MarkRead,
     boot: [u8; 16],
     sealed_last: Option<(u64, u64, i64)>,
-    no_sealed: bool,
+    log_first: Option<u64>,
     manifest_highest: u64,
 ) -> Plan {
     let in_use: Vec<usize> = (0..segs.len()).filter(|&i| segs[i].in_use()).collect();
@@ -503,12 +503,9 @@ fn plan(
     };
     // Losses: gaps in the kept positions (rule 2 regions and recovery-entry gaps), then the tail below the mark.
     let mut losses = Vec::new();
-    // With no sealed segment the log of generation 0 starts at position 1, so a lowest segment damaged, zeroed or
-    // missing leaves a gap below the first one kept (Q-321).
-    let log_start = chain
-        .first()
-        .filter(|&&i| no_sealed && segs[i].id.generation == 0)
-        .map(|_| 1);
+    // With no sealed segment of its generation the log starts at the generation's first position, so a lowest segment
+    // damaged, zeroed or missing leaves a gap below the first one kept (Q-321, Q-264).
+    let log_start = chain.first().and(log_first);
     let mut expect: Option<u64> = sealed_last.map(|(_, l, _)| l + 1).or(log_start);
     let mut prev: Option<(usize, u64, i64)> = None;
     let mut last_kept: Option<(usize, usize)> = None;
@@ -1032,7 +1029,7 @@ pub(super) fn start(
         &mark,
         boot,
         sealed_last,
-        own_sealed.is_empty(),
+        own_sealed.is_empty().then_some(generation.first),
         manifest
             .highest_sequence(g)
             .max(sourced.highest)

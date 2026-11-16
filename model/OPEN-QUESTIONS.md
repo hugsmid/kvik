@@ -66,15 +66,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
-| Q-260 | §8 Generations, Restore step 1; §3 Order of a start; §7 Readers | A restored generation's first mark and the first start in it |
 | Q-261 | §8 Generations, §3 Recovery; `format.md` A.10, A.12 | Files of another generation at a start |
-| Q-262 | §8 Restore step 1, §3 Recovery rule 3, §2.1 id floor | The writer's scans in a restored generation: set-aside batches and the id floor |
 | Q-263 | §8 Restore step 1, §7 Readers | What is set aside: whole batches, by their first position |
-| Q-264 | §3 Recovery rule 2, §8 Generations; Q-321 | Position 1 as the chain's start in a restored generation |
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 | Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
-| Q-266 | §8 Generations, Restore; `api.md` Backup and restore | A full restore retried after a failure past its claim |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1317,7 +1313,7 @@ Recovery rule 2; `format.md` A.4). This covers a damaged, a zeroed and a missing
 operation, since the gap is read from the segments that remain
 (`the_lowest_unsealed_segment_damaged_zeroed_or_missing_is_a_recorded_loss`). When that segment holds the mark, the
 mark's position already gave the range (`the_marks_only_segment_damaged_zeroed_or_missing_is_a_recorded_loss`). A
-restored generation, whose first position is not 1, is left to roadmap 8.3. The reference model injects no damage to
+restored generation's log starts at its own first position (Q-264). The reference model injects no damage to
 headers or whole segments.
 **Open part (settle by 8.1).** Position 1 as the start holds only while sealed segments stay in the log directory. If
 every sealed segment left it, the start would report a false `data_lost` from position 1 up to the first segment
@@ -1340,7 +1336,7 @@ truncate after an older position.
 slot, valid or not, or writes both slots.
 
 ## Q-260 — A restored generation's first mark and the first start in it
-Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+Recorded by roadmap 8.3c. Settled by the owner's acceptance of the decision below.
 **Scenario.** A full restore installs its files and calls `init_generation`, which writes the generation's first mark:
 generation g, the restore record's reset stamp, no position (file 0, offset 0, last sequence one below the stamp's),
 and no boot identity, since the restore names none. The store then opens with `LogWriter::open_with`. Read as an
@@ -1358,8 +1354,8 @@ acknowledged batch of g cannot vanish whole by a crash (its creation syncs the d
 use); damage to it is Q-264. Tests: `log/tests/generation.rs`
 `a_restored_generation_takes_ingest_at_its_first_position_with_the_restores_stamp`,
 `init_generation_writes_the_first_mark_once_and_refuses_another_generations`.
-**Needed.** The owner's acceptance, and §8 Restore step 1 to say the first mark is written without a boot and is
-read as no mark by the generation's first start.
+**Settled (owner).** Accepted as decided, matching the model. For the spec text (§8 Restore step 1): the first mark is
+written without a boot and is read as no mark by the generation's first start.
 ## Q-261 — Files of another generation at a start
 Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
 **Scenario.** A restored directory holds sealed segments of generation 0 and the writer runs in generation 1. Sorted
@@ -1377,7 +1373,7 @@ whole positions, and losses found are recorded in the start's generation, with t
 `a_start_refuses_a_mark_or_segment_of_another_generation`,
 `a_loss_in_a_restored_generation_is_recorded_in_it_beside_one_of_generation_0`.
 ## Q-262 — The writer's scans in a restored generation: set-aside batches and the id floor
-Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+Recorded by roadmap 8.3c. Settled by the owner's acceptance of the decision below.
 **Scenario.** The first mark carries no id floor and a restore installs no registry file, so the first start of a
 restored generation would take id floor 0 and let a new series take an id the restored log, or a set-aside definition
 (§8 Restore step 1: its id stays reserved), already holds. The routing changes and interval lengths the start takes
@@ -1386,9 +1382,19 @@ from sealed segments above the registry file's `through` (Q-130, Q-115 (f)) were
 registry file of its own generation (`through` compared as a position), and with no such file every sealed segment
 (the cost of Q-116 (n)). A batch set aside (Q-263) counts toward the id floor, facts and definitions alike, and gives
 no consumer and no interval length; the rest give all three. Interval lengths apply in log order between the registry
-file's and the unsealed log's. The first start takes this floor into its mark. In generation 0 this changes three
-things: the sealed scan now feeds the id floor and interval lengths, a first start takes them from a registry file
-too, and an empty sealed segment no longer ends the scan when there is no registry file. Tests: `log/tests/generation.rs`
+file's and the unsealed log's. The first start takes this floor into its mark. Accepted by the owner.
+**What changes in generation 0** (`log/src/writer/generation.rs` `scan_sealed`, `log/src/writer/recovery.rs`
+`start`), three things and no others:
+1. The scan of sealed segments above the registry file's `through`, which read routing changes only, now also takes
+   every series id a fact or definition there names into the id floor, and every definition's interval length into
+   the intervals the writer's segment index uses, applied after the registry file's and before the unsealed log's.
+2. A first start (empty log, no readable mark, no lost range) took id floor 0 and no intervals and wrote floor 0 in
+   its mark; it now takes both from the registry file, if any, and from that scan, and writes that floor in its mark.
+   In generation 0 that scan finds no sealed segment there, so only a registry file can change the result.
+3. With no registry file, a sealed segment holding no batch no longer ends the scan (the old test `first <= 0`
+   held for it); every sealed segment is read. With a registry file the stop is unchanged (`through` is compared as
+   the position `(0, through)`, the same order as the bare sequence in generation 0).
+Tests: `log/tests/generation.rs`
 `set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`,
 `f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources`.
 ## Q-263 — What is set aside: whole batches, by their first position
@@ -1400,16 +1406,21 @@ that did would be served whole. Set-aside batches are skipped before a recovery 
 **Open.** An invalid region inside a set-aside segment is still reported by a reader as corruption; whether such a
 report should be dropped (its positions are set aside) is for 8.3d with the health report of set-aside ranges.
 ## Q-264 — Position 1 as the chain's start in a restored generation
-Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+Recorded by roadmap 8.3c. Settled by the owner's ruling.
 **Scenario.** Q-321 left "a restored generation, whose first position is not 1" to roadmap 8.3. A restore record's
 reset stamp is always at sequence 1 (`files/src/restore.rs` `RestoreRecord::check`; spec §8 Restore step 1:
 "Positions of the new generation start at sequence 1"), so that premise does not hold: in a restored generation with
 no sealed segment of its own, its lowest unsealed segment damaged, zeroed or removed leaves its positions gone with no
 `data_lost`, as in generation 0 before Q-321.
-**Built (8.3c), as briefed.** The rule stays limited to generation 0. Pinned: `log/tests/generation.rs`
-`the_position_one_start_rule_is_limited_to_generation_0`.
-**Needed.** The owner's ruling: extend the rule to a restored generation, starting at its stamp's sequence (a
-one-line change in `plan`), or keep it at generation 0 and say why in §3.
+**Settled (owner's ruling).** The premise was wrong; the rule is extended. In any generation with no sealed segment
+of its own, the generation's first position anchors the log start: position 1 in generation 0, the restore record's
+first position (its reset stamp's sequence) in a restored generation. A lowest segment damaged, zeroed or missing is
+then a recorded `data_lost` range from that anchor, as Q-125 and Q-321 have it (`plan`'s `log_first`). Q-321's open
+part (an anchor once sealed segments are evicted) applies to every generation. Tests: `log/tests/generation.rs`
+`a_restored_generations_lowest_segment_damaged_zeroed_or_missing_is_a_recorded_loss` (damaged, zeroed and missing,
+same boot and after a reboot), `a_generation_starting_above_1_takes_ingest_at_its_stamps_sequence` (the anchor is
+the stamp's sequence, not 1); generation 0 stays pinned by `log/tests/recovery.rs`
+`the_lowest_unsealed_segment_damaged_zeroed_or_missing_is_a_recorded_loss`.
 ## Q-267 — The start options 8.3c does not act on
 Recorded by roadmap 8.3c. To be settled by roadmap 6.3c.
 **Scenario.** `StartOptions` has three fields; `recorder` needs `FileRecorder` (6.3c) and `sealed` needs
@@ -1440,7 +1451,7 @@ next record is due; they are in no later generation's records, as §8 accepts. T
 uploaded. Not done here: the store maps the failure to read-only and fatal health (8.1d), and nothing reads the
 claims while the driver is idle (an idle writer uploads nothing). Tests: `backup/tests/upload_superseded.rs`.
 ## Q-266 — A full restore retried after a failure past its claim
-Recorded by roadmap 8.3c (review finding of 8.3b's fix round). To be settled by roadmap 8.3.
+Recorded by roadmap 8.3c (review finding of 8.3b's fix round). Settled by the owner's ruling for v1.
 **Scenario.** A full restore claims generation 1, then fails before its record is written (a transient fault reading
 the source records, a lagging listing, Q-304). `Store::restore` is called again and each retry claimed the next
 generation, so a bucket with a flaky listing walked the generations, each claim never withdrawn.
@@ -1450,7 +1461,11 @@ generation is claimed meanwhile, when it fails with `RestoreError::Superseded { 
 record would be superseded at once). A drill keeps nothing. Unchanged: a crash or a new process before the record
 starts again with the next generation (§8 Restore, row 28a, Q-39 (f)); keeping the claim across that would need a
 local note written before the claim, a new file. So `Store::restore` (roadmap 8.3d) closes the finding only if it
-retries `prepare` on the same driver; a call that builds a new driver claims the next generation. Tests: `backup/tests/restore_guards.rs`
+retries `prepare` on the same driver; a call that builds a new driver claims the next generation.
+**Settled (owner's ruling, v1).** In-memory reuse is accepted. A crash during a restore burns a generation, which is
+safe: a claim is never withdrawn and the restore already handles claim gaps (Q-305, Q-163). Follow-up: roadmap 8.3d
+retries `prepare` on the same `Restorer` within one `Store::restore`; a durable note of the claim, kept across a
+crash, is left for a later version. Tests: `backup/tests/restore_guards.rs`
 `a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation`,
 `a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more`.
 ## Open at v0.2
@@ -1533,15 +1548,11 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
-| Q-260 | 8.3 | Decided by roadmap 8.3c after the model; for the owner's acceptance |
 | Q-261 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
-| Q-262 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-263 | 8.3 | Decided by roadmap 8.3c; the corruption-report part open |
-| Q-264 | 8.3 | Owner's ruling needed: extend Q-321's rule to restored generations or keep it at generation 0 |
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
-| Q-266 | 8.3 | Decided by roadmap 8.3c; a durable note of the claim, for a crash, would be a new file and a spec change: the owner's call |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1788,6 +1799,10 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-260 | A restored generation's first mark and the first start in it | §8 Generations, Restore step 1; §3 Order of a start (settled by the owner's acceptance of roadmap 8.3c's decision, matching the model: the first mark `init_generation` writes is read as no mark by the generation's first start, which writes no recovery entry and takes ingest at the first position; see the question) |
+| Q-262 | The writer's scans in a restored generation: set-aside batches and the id floor | §8 Restore step 1, §3 Recovery rule 3, §2.1 (settled by the owner's acceptance of roadmap 8.3c's decision: set-aside batches reserve ids and give no consumer or interval; the three changes in generation 0 are listed in the question) |
+| Q-264 | Position 1 as the chain's start in a restored generation | §3 Recovery rule 2, §8 Generations (settled by the owner's ruling: with no sealed segment of its own, a generation's first position anchors the log start, so a lowest segment damaged, zeroed or missing is `data_lost` from it; see the question) |
+| Q-266 | A full restore retried after a failure past its claim | §8 Generations, Restore; `api.md` Backup and restore (settled by the owner's ruling for v1: in-memory claim reuse on the same driver; a crash burns a generation, which is safe; a durable note is a follow-up; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

@@ -232,7 +232,8 @@ A.10) is treated as a different boot. The rules apply in this order:
    followed by a complete batch, was synced (the mark is written only after a sync returns, and a batch only after
    the previous batch's sync), so it is corruption, not a torn tail. Later complete batches are kept and nothing is
    overwritten. The byte and position range, from the last valid batch (with none, from the last sealed segment's
-   end or position 1) to the next valid batch or, at the tail, to the mark's last position, is reported as `data_lost` when found and recorded in the manifest as a **lost range**
+   end or, with no sealed segment of the current generation, its first position: 1 in generation 0, the restore
+   record's in a restored generation, Q-264) to the next valid batch or, at the tail, to the mark's last position, is reported as `data_lost` when found and recorded in the manifest as a **lost range**
    by step 4 below; neither makes the store read-only. Its positions are not reused. A lost range is a reset point
    for consumers (§4 Resync).
 3. **Different boot id** (the machine rebooted, the page cache is gone), or the mark missing, unreadable or stale

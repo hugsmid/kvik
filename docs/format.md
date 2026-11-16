@@ -175,8 +175,9 @@ value); the file falls under the other rows. In the last segment in use a seal i
 A `.kvl` file is sealed and is not scanned by recovery. Whether a segment that is not the last in use lost data is
 decided only by the gap between its last sequence and the next segment's `base_sequence` (`spec.md` §3 Recovery
 rule 2), never by the bytes after its last batch. A start checks the gap rule for unsealed segments and against the
-last sealed one or, with no sealed segment, against position 1 of generation 0, so that a lowest segment damaged,
-zeroed or missing leaves a recorded gap (Q-321); gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
+last sealed one of the current generation or, with none, against the generation's first position (1 in generation
+0, the restore record's in a restored generation), so that a lowest segment damaged, zeroed or missing leaves a
+recorded gap (Q-321, Q-264); gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
 may be awaiting a seal.
 
 **Truncation is zero-filling.** Recovery never shortens an unsealed segment. It overwrites with zeros from the
