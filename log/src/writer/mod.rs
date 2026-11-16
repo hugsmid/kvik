@@ -38,6 +38,7 @@
 //! log.shutdown().unwrap();
 //! ```
 
+mod gather;
 mod maint;
 mod options;
 mod queue;
@@ -560,6 +561,9 @@ pub struct LogWriter {
     stats: LogStats,
     report: StartReport,
     leases: LeaseTable,
+    /// The last batch's entries and calls, kept until the calls are acknowledged ([`LogWriter::release_batch`]).
+    batch: Vec<Item>,
+    batch_calls: Vec<Call>,
 }
 
 fn reach(t: i64, interval: Option<&IntervalLength>) -> i64 {
@@ -664,6 +668,8 @@ impl LogWriter {
             disk: Disk::default(),
             waiting: None,
             report: r.report,
+            batch: Vec::new(),
+            batch_calls: Vec::new(),
         })
     }
 
@@ -1127,21 +1133,41 @@ impl LogWriter {
         wall: i64,
         back: &mut Vec<Call>,
     ) -> Option<Vec<Done>> {
-        let first = self.last_sequence + 1;
-        let commit_time = wall.max(self.last_commit_time);
+        self.release_batch();
+        let mut items = Vec::with_capacity(calls.iter().map(Call::len).sum());
+        let counts = gather::gather(&mut calls, &mut items);
         let mut content = BatchContent {
-            first_sequence: first,
-            received_at: commit_time,
-            items: calls.iter().flat_map(|c| c.items.iter().cloned()).collect(),
+            first_sequence: self.last_sequence + 1,
+            received_at: wall.max(self.last_commit_time),
+            items,
         };
+        let done = self.commit_content(&mut calls, counts, &mut content, now, back);
+        self.batch = content.items;
+        self.batch_calls = calls;
+        done
+    }
+
+    /// [`LogWriter::commit`] of `content`, the entries of `calls` (`counts` of each) moved into it; a call put back
+    /// gets its entries back.
+    fn commit_content(
+        &mut self,
+        calls: &mut Vec<Call>,
+        mut counts: Vec<usize>,
+        content: &mut BatchContent,
+        now: Duration,
+        back: &mut Vec<Call>,
+    ) -> Option<Vec<Done>> {
+        let first = content.first_sequence;
+        let commit_time = content.received_at;
         // Calls that encode alone may still not encode together (merged blocks that pass 8 MiB, or a recovery entry
         // that must be alone in its batch): the batch then takes the first call only. A lone call encodes as it did
         // when it was made, whatever its first sequence.
         let builder = match content.builder() {
             Ok(b) => b,
             Err(_) if calls.len() > 1 => {
-                back.extend(calls.split_off(1));
-                content.items = calls[0].items.clone();
+                gather::give_back(&mut calls[1..], &counts[1..], &mut content.items);
+                back.extend(calls.drain(1..));
+                counts.truncate(1);
                 content.builder().expect("a valid call encodes alone")
             }
             Err(_) => unreachable!("a valid call encodes alone"),
@@ -1154,22 +1180,23 @@ impl LogWriter {
         let mut next = None;
         if !fits {
             if self.ahead.is_none() {
+                gather::give_back(calls, &counts, &mut content.items);
                 let rest = std::mem::take(back);
-                back.extend(calls);
+                back.append(calls);
                 back.extend(rest);
                 return None;
             }
             if self.halted() {
-                return Some(Self::finished(&calls, CommitError::ReadOnly));
+                return Some(Self::finished(calls, CommitError::ReadOnly));
             }
             next = self.take_into_use(first, now);
             if next.is_none() {
-                return Some(Self::unknown(&calls));
+                return Some(Self::unknown(calls));
             }
         }
         // Nothing of this batch is written yet: a fault known now leaves it unstored.
         if self.halted() {
-            return Some(Self::finished(&calls, CommitError::ReadOnly));
+            return Some(Self::finished(calls, CommitError::ReadOnly));
         }
         let seg = next
             .as_ref()
@@ -1182,10 +1209,10 @@ impl LogWriter {
         let path = maint::segment_path(&self.log_dir, &seg.id, false);
         if let Err(e) = seg.file.write_at(&bytes, at) {
             self.fail(FaultOp::Write, &path, &e);
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         if self.halted() {
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         self.last_batch_due = Some(self.batch_sync_due(now));
         self.last_sync_start = Some(now);
@@ -1196,7 +1223,7 @@ impl LogWriter {
             .expect("a segment in use");
         if let Err(e) = seg.file.sync_data() {
             self.fail(FaultOp::Sync, &path, &e);
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         let last = content.last_sequence();
         // The batch is on stable storage: account for it in the segment's summary and index.
@@ -1270,7 +1297,7 @@ impl LogWriter {
         };
         let mp = self.mark_path.clone();
         if self.halted() {
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         let written = match self.mark.as_ref() {
             Some(m) => m.write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64),
@@ -1278,7 +1305,7 @@ impl LogWriter {
         };
         if let Err(e) = written {
             self.fail(FaultOp::MarkWrite, &mp, &e);
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         self.mark_slot = slot;
         self.mark_written = true;
@@ -1288,7 +1315,7 @@ impl LogWriter {
         if forced {
             self.sync_mark(now);
             if self.fault.is_some() {
-                return Some(Self::unknown(&calls));
+                return Some(Self::unknown(calls));
             }
         }
         self.stats.durable = Position {
@@ -1315,6 +1342,13 @@ impl LogWriter {
                 })
                 .collect(),
         )
+    }
+
+    /// Frees the last batch's entries and calls: the writer thread does so once the calls are acknowledged, off
+    /// the path to their acknowledgement.
+    pub(crate) fn release_batch(&mut self) {
+        self.batch = Vec::new();
+        self.batch_calls = Vec::new();
     }
 
     fn unknown(calls: &[Call]) -> Vec<Done> {

@@ -564,6 +564,7 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
         publish(s, &w);
         complete(s, step.done);
         s.room_cv.notify_all();
+        w.release_batch();
         let mut f = lock(&s.front);
         if f.shutdown {
             let stuck = f
