@@ -270,13 +270,13 @@ when read". Durations are `i64` nanoseconds. Strings are UTF-8 without a termina
 | Entry type | Fields |
 |---:|---|
 | 1 series definition | the table below |
-| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 to 26 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20 (26 only with 25 = 2, at least the scale in force). No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
+| 2 parameter change | 1 id; 20 effective time; then any of fields 7–12, with 27 whenever 8 is carried. Fields 23 to 26 and 28 may also be carried; they take effect at the entry's position, and an entry holding only them has no field 20 (26 only with 25 = 2, at least the scale in force). No other field is allowed (5 changes only by a scale raise; 13–19 and 22 are fixed for life). A change of 7 without 8 is written with field 8 holding the staleness limit in force after the change (`spec.md` §2.1: an S that was set is kept; one that was not becomes 3 × the new interval), and field 27 saying which, so the entry is self-contained |
 | 3 alias | 1 id; 2 name |
 | 4 retirement | 1 id; 21 `t_r` |
 | 5 routing change | 50 consumer name (A.12); 51 change `u8` (1 adds a funnel, 2 removes one, 3 declares `emits` only); 52 funnel id `u32` (changes 1 and 2); for change 1: 53 selection kind `u8` (0 none, 1 ids, 2 name pattern, 3 every series), 54 series id `u32` (repeated: the ids of kind 1; for kind 2, the ids a condition funnel's pattern was resolved to when routed, else none), 55 pattern (UTF-8, 1–255 bytes, kind 2 only), 56 aggregate `u8` (1 avg, 2 sum, 3 integral, 4 min, 5 max, 6 count, 7 increase, 8 rate, 9 last, 10 time in state) with 57 window width `i64` ns > 0, 58 state counted (5 bytes: tag 0 then a boolean byte and 3 zero bytes, or tag 1 then a named state's index `u32`; aggregate 10 only), 63 condition `u8` (1 threshold: 64 activation and 65 clear level, clear ≤ activation; 2 on change: 64 dead-band ≥ 0; 3 held for: 64 level, 66 duration; 4 stale for: 66 duration beyond the series' staleness limit in force at the entry's position), levels finite `f64` and durations `i64` ns ≥ 0; always: 60 the consumer's `emits` kind, 61 its ids (repeated), 62 its pattern, as 53 to 55 but never with resolved ids. Fields 53 to 58 and 63 to 66 appear only in change 1 (`spec.md` §4 Routing) |
 | 6 site zone | 30 zone name (UTF-8 IANA name, at most 63 bytes); 20 effective time |
 | 7 tzdata | 31 version (ASCII release name, at most 15 bytes) |
-| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable) |
+| 8 recovery | the only entry of its batch (`spec.md` §3 Recovery rule 3): 40 `after` `u64`; 41 reset stamp (16 bytes: the entry's own position `u64`, then a random nonce `u64`, never zero), written by every writer, an entry without it read as carrying none (`spec.md` §7 Readers); 42 boot id (16 bytes, zero where the platform has none); 43 tail bytes `u64`; 44 readable commit blocks `u32`; 45 mark state `u8` (0 readable, 1 missing, 2 unreadable: no valid slot, A.10; 3 stale, `spec.md` §3 Recovery rule 1); 46 id floor `u32` (0: no id assigned); 47 consumer name (repeated, one per consumer whose cursor file was missing or unreadable); 48 `written` level defined `u8` (1 when a series at the `written` level is defined in the kept log, making the entry a `possible_loss`, `spec.md` §3 Recovery rule 3; an entry without it reads as 0) |
 | 9 scale raise | 1 id; 5 decimal scale (the new scale, above the series' current scale); takes effect at its position (`spec.md` §2.1 `decimal scale`) |
 
 Series definition fields, all critical:
@@ -307,6 +307,7 @@ Series definition fields, all critical:
 | 25 | excess precision | u8: 0 round, 1 refuse, 2 auto-raise | value type 2 |
 | 26 | maximum scale | u8, 0–18, at least field 5 | field 25 = 2 |
 | 27 | staleness limit set | u8: 1 S was set by the caller, 0 S follows the expected interval | always; also in a parameter change carrying 8 |
+| 28 | durability level | u8: 0 `synced`, 1 `written` (`spec.md` §2.1 `durability`) | always; a definition written before roadmap 5.5b without it reads as 0 |
 
 **Checks** (a failure makes the block invalid, A.2; the presence and recovery checks are invalid content): `length`
 or a field overrunning its container; a critical field out of order or repeated when not marked repeated; a value
@@ -329,7 +330,12 @@ entries block until the next would take its body past 16 MiB.
 | 24 | 8 | `commit_time` | non-decreasing within a generation by construction: `received_at` and the commit time are the wall clock when the batch is formed, raised to the previous batch's commit time; a reader does not test it |
 | 32 | 8 | `batch_bytes` | from the first byte of the batch's first block header up to, not including, this block's header, padding included; so this header is at `o + batch_bytes`, where `o` is the batch's offset |
 | 40 | 4 | `batch_crc32c` | CRC32C over `store_id` (16 bytes), `file_id` (u64), `o` (u64), then bytes 0..12 of the header of every block before the commit block, in order: each header without its `header_crc32c`, so that the bodies are reached through their `body_crc32c` (a header followed by its own CRC32C would cancel out of the sum, Q-119) |
-| 44 | 4 | reserved | |
+| 44 | 4 | `flags` | bit 0 `written`: a flagged batch, acknowledged once written (`spec.md` §3 Commit), holding only facts of series at the `written` level; other bits zero, and a set bit not defined here is critical (common rules) |
+
+`flags` was reserved before roadmap 5.5a, and every batch written before then holds zero there: unflagged. A writer
+that sets bit 0 cannot be read correctly by a build that predates it, which reads reserved bytes as nothing (common
+rules); no release predates it (Q-253). Recovery keeps a complete flagged batch beyond a same-boot mark and counts
+only unflagged batches for the stale-mark test (`spec.md` §3 Recovery rule 1).
 
 A batch is **complete** when every data block is valid, the commit block is valid, `block_count` and `batch_bytes`
 match what precedes it, `batch_crc32c` matches, each data block's `first_sequence` equals the counted sequence, the
@@ -428,14 +434,15 @@ exists; a new file is created only when none exists.
 - **No boot identity** (`boot_id` zero) or `mark_sync = EveryCommit`: the mark is synced after every update, before
   the batch is acknowledged. Recovery then follows `spec.md` §3 as for any mark: a readable mark gives rule 1; a
   missing or unreadable mark gives rule 3.
-- **Same boot, page cache lost.** Rule 1 trusts the boot identity, because it must truncate a batch whose sync failed
-  and which sits complete in the page cache. Since a batch is written only after the previous batch's sync and mark
-  update, a current mark has at most one complete batch beyond it; two or more on the same boot mean the mark is
-  stale and rule 3 applies (`spec.md` §3 Recovery rule 1, with its accepted limit). The recovery entry records mark
+- **Same boot, page cache lost.** Rule 1 trusts the boot identity, because it must truncate an unflagged batch whose
+  sync failed and which sits complete in the page cache, and keep the flagged batches there (A.7). Since a batch is
+  written only after the previous unflagged batch's sync and mark update, a current mark has beyond it flagged
+  batches and at most one complete unflagged batch, the last; a complete unflagged batch followed by another
+  complete batch on the same boot means the mark is stale and rule 3 applies (`spec.md` §3 Recovery rule 1, with its accepted limit). The recovery entry records mark
   state 3.
 - **No usable mark.** With the mark missing, unreadable or stale, recovery cannot rule out the same boot, so it
-  writes the last complete batch again before its first sync (`spec.md` §3 Recovery rule 3), with the segment's
-  header when that batch is the segment's first. It does the same when the last complete batch is a recovery entry
+  writes the last complete batch, and the flagged batches directly before it, again before its first sync
+  (`spec.md` §3 Recovery rule 3), with the segment's header when the first of them is the segment's first. It does the same when the last complete batch is a recovery entry
   that the mark does not cover, whatever the mark, as the start that wrote it may have failed its sync (Q-117).
 - Readers of an unsealed segment never read past `offset`; they open the mark by path for each read of it. Sealed
   segments are read whole.
@@ -446,7 +453,7 @@ exists; a new file is created only when none exists.
 - Golden files for v1, including: an unsealed segment with a torn final batch; segments with a recovery entry, with
   a gap before a recovery entry, and with an adopted recovery entry followed by the rest of a torn tail; corruption
   inside a segment with a kept batch after it; each seal state of A.4; a mark with one torn slot; a stale mark below
-  acknowledged batches after a power loss; a block with an unknown ignorable and an unknown critical element; the
+  acknowledged batches after a power loss; flagged batches beyond a same-boot mark, then an unflagged one (A.7); a block with an unknown ignorable and an unknown critical element; the
   store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file.
 - A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor, lease and registry
   file decoders included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
