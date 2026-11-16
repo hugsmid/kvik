@@ -22,10 +22,14 @@ impl Model {
     /// While the engine is down on the boot of a failed sync: the pages whose
     /// write-back failed were marked clean and are reclaimed, so the batches
     /// beyond the mark read back as zeros; the mark's page, still dirty, is
-    /// kept (§3 Recovery rule 3, Last batch written again; Q-254).
+    /// kept (§3 Recovery rule 3, Last batch written again; Q-254). Refused
+    /// unless a log sync failed since the last start that synced.
     pub fn evict_failed_write_back(&mut self) -> Result<(), Error> {
         if self.vol.is_some() {
             return Err(Error::BadFault("stop the engine first"));
+        }
+        if !self.disk.write_back_failed {
+            return Err(Error::BadFault("no failed write-back to evict"));
         }
         let mark = self.disk.mark;
         self.drop_page_cache_keeping(0);

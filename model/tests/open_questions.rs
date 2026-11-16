@@ -1021,3 +1021,27 @@ fn q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positi
         .positions[0];
     assert_eq!(again, first, "given again with no reset point");
 }
+
+/// Q-254: the eviction injection needs a failed write-back since the last
+/// start that synced; a crash alone leaves dirty pages, which are not evicted.
+#[test]
+fn q254_eviction_is_refused_without_a_failed_sync() {
+    use kvik_model::engine::{Fault, WriteOutcome};
+    let (mut m, _, s) = written_level_store();
+    m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap();
+    m.crash();
+    assert!(m.evict_failed_write_back().is_err(), "a crash alone");
+    m.restart();
+    let _ = m.emit(Reading::num(s, T0 + 1, 2.0));
+    assert!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Lost)))
+            .is_err()
+    );
+    m.crash();
+    m.restart();
+    m.crash();
+    assert!(
+        m.evict_failed_write_back().is_err(),
+        "a start synced since the failure"
+    );
+}

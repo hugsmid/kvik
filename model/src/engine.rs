@@ -1211,6 +1211,9 @@ pub struct Disk {
     /// the log is on stable storage, though [`Disk::mark`] may lag the last
     /// log sync, so a further power loss or remount drops none.
     pub cache_lost: bool,
+    /// A log sync failed and no start has synced since: the pages whose
+    /// write-back failed are clean and may be reclaimed (Q-254).
+    pub write_back_failed: bool,
     /// Durable consumer cursors (last confirmed position).
     pub cursors: BTreeMap<ConsumerId, Position>,
     /// Durable latches, one per condition funnel, written with the cursor
@@ -2043,6 +2046,7 @@ impl Model {
         let sync_failed = self.recover_tail(recovery_sync_fails);
         // Read-only after a failed recovery sync: nothing more is written.
         if !sync_failed {
+            self.disk.write_back_failed = false;
             self.clean_up_files();
         }
         self.verify_restored();
@@ -2858,6 +2862,7 @@ impl Model {
             }
             Some(Fault::SyncError(outcome)) => {
                 self.disk.tail_fate = Some(outcome);
+                self.disk.write_back_failed = true;
                 let v = self.vol_mut()?;
                 v.read_only = true;
                 v.sync_failed = true;
