@@ -1362,7 +1362,7 @@ swapped in and holds no error (`tests/self_repair.rs`
 for the live store; the closing record stands in every generation.
 
 ## Q-601 — A corruption named by an epoch across restore generations
-Recorded at the re-check of roadmap 8.5a. The lead's to settle.
+Recorded at roadmap 8.5a; a technical question, settled by 8.5b.
 **Scenario.** A corruption seen names a file by kind, `file_id` and the epoch of its quarantine record, and a
 corrupt manifest record by its epoch (`format.md` A.14); `0x25` fields 12 and 13 carry these values into the next
 generation. An epoch is unique only within one generation's manifest (records are keyed by generation and epoch),
