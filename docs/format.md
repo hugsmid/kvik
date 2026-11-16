@@ -537,7 +537,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   positions; field 2: the epoch of a rebuild record acknowledged; field 3: outcome `u8`, 1 restored in full, 2 re-send
   ended, 3 by an operator, absent meaning 3; field 4: positions restored `u64`, present exactly with outcome 1;
   repeated field 5: a corruption seen, below; a record with outcome 1 or 2 is a closing record of self-repair and
-  names exactly one loss in field 1, `spec.md` §8 Self-repair; fields 3 to 5 are written from roadmap 8.5c); `0x28` rebuild (1 the corrupt record's epoch as
+  names exactly one loss in field 1, `spec.md` §8 Self-repair; one with outcome 1 closes only the lost-range records of
+  that identity with a lower epoch, so a later one opens the loss again; fields 3 to 5 are written from roadmap 8.5c); `0x28` rebuild (1 the corrupt record's epoch as
   presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`;
   5 `file_id` floor, repeated, one per file kind: kind `u8`, id `u64`, 2^32 above the highest id of that kind in any
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first

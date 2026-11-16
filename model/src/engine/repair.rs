@@ -138,15 +138,14 @@ impl Model {
                 .is_some_and(|v| v.resend_done.contains(&identity))
     }
 
-    /// Whether a quarantined file holding the loss's first position has a
-    /// verified copy to swap in (stage 1).
+    /// Whether a quarantined file holding the loss's first position may
+    /// still get a copy to swap in (stage 1).
     fn copy_pending(&self, l: &Loss) -> bool {
         let Some(first) = l.first else {
             return false;
         };
         self.disk.quarantined.iter().any(|f| {
-            self.disk.verified_elsewhere(*f)
-                && self.disk.files[f].entries().any(|e| e.position == first)
+            self.disk.copy_may_come(*f) && self.disk.files[f].entries().any(|e| e.position == first)
         })
     }
 
@@ -274,11 +273,14 @@ impl Model {
     }
 
     /// Whether a quarantined file still holds an error open (§8 Corrupt
-    /// block): it does until swapped, except a sealed log segment with no
-    /// copy whose lost positions are recorded.
+    /// block, Self-repair): a sealed log segment does only while a swap can
+    /// still happen or its lost positions are only found, not recorded.
     pub(super) fn quarantine_open(&self, f: FileId) -> bool {
         let file = &self.disk.files[&f];
-        if file.class != FileClass::Segment || !file.sealed || self.disk.verified_elsewhere(f) {
+        if file.class != FileClass::Segment || !file.sealed {
+            return true;
+        }
+        if self.disk.copy_may_come(f) && !self.holds_closed_loss(f) {
             return true;
         }
         file.entries().any(|e| {
@@ -569,14 +571,17 @@ impl Model {
             let lost: Vec<Position> = self.disk.files[&f]
                 .entries()
                 .map(|e| e.position)
-                .filter(|p| !held.contains(p) && !self.disk.is_lost(*p))
+                .filter(|p| !held.contains(p) && !self.disk.is_hidden(*p))
                 .collect();
             self.record_runs(&lost, LossCause::LostInBucket);
         }
         Ok(judged)
     }
 
-    /// Records each run of consecutive positions as a lost range of `cause`.
+    /// Records each run of consecutive positions as a lost range of `cause`;
+    /// a run overlapping a recorded loss names its identity (§3 Order of a
+    /// start, step 4), so a loss restored in full and lost again is open
+    /// again under the same identity (§8 Self-repair stage 1).
     pub(super) fn record_runs(&mut self, lost: &[Position], cause: LossCause) {
         let mut runs: Vec<(Position, Position)> = Vec::new();
         for p in lost {
@@ -587,6 +592,12 @@ impl Model {
         }
         let stamp = self.stamp_in_force();
         for (from, to) in runs {
+            let identity = self
+                .disk
+                .lost_records()
+                .iter()
+                .find(|r| r.from <= to && from <= r.to)
+                .map_or(from, |r| r.identity);
             let epoch = self.disk.epoch();
             self.disk.manifest.push(ManifestRecord {
                 epoch,
@@ -594,7 +605,7 @@ impl Model {
                 op: ManifestOp::LostRange {
                     from,
                     to,
-                    identity: from,
+                    identity,
                     cause,
                     stamp,
                 },

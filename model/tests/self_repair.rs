@@ -442,16 +442,115 @@ fn s8_self_repair_a_closed_loss_is_not_restored_from_a_copy_found_later() {
     m.lose_object(f);
     m.corrupt_hot(f);
     m.scrub();
-    assert_eq!(only_loss(&m).cause, LossCause::Corruption, "no copy to try");
+    assert_eq!(judge(&mut m), vec![f]);
+    assert_eq!(only_loss(&m).cause, LossCause::LostInBucket);
+    // The hot finding and the lost object are two corruptions (Q-247).
+    let suspect = Reason::StorageSuspect(2);
+    let h = m.health();
+    assert_eq!(h.level, Level::Degraded, "no swap can happen");
+    assert!(!h.reasons.contains(&Reason::Quarantined(f)));
     m.advance(DAY);
     assert_eq!(m.repair(), Ok(1));
+    assert_eq!(m.health().reasons, vec![suspect.clone()]);
     m.find_object(f);
+    m.check_bucket().unwrap();
     assert!(!m.restore_file(f), "Q-246");
     assert!(!held(&m, &p));
     assert_eq!(
         only_loss(&m).state,
         Some(LossState::Closed(Outcome::ResendEnded))
     );
+    assert_eq!(
+        m.health().reasons,
+        vec![suspect],
+        "the late copy holds no error"
+    );
+    m.crash();
+    m.restart();
+    m.advance(40 * DAY);
+    assert_eq!(m.health().level, Level::Ok, "never fatal again");
+}
+
+#[test]
+fn s8_self_repair_stage_1_waits_for_the_lost_object_rule_before_recording() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    m.upload();
+    m.lose_object(f);
+    m.corrupt_hot(f);
+    m.scrub();
+    m.check_bucket().unwrap();
+    assert!(m.losses().is_empty(), "one absent lookup records nothing");
+    assert!(m.disk.lost_ranges().is_empty());
+    let h = m.health();
+    assert_eq!(h.level, Level::Fatal);
+    assert!(h.reasons.contains(&Reason::Quarantined(f)));
+    m.find_object(f);
+    assert!(m.restore_file(f));
+    assert!(m.losses().is_empty(), "no loss, no reset point");
+    assert!(held(&m, &p));
+    assert_eq!(m.health().level, Level::Ok);
+}
+
+#[test]
+fn s8_self_repair_no_copy_is_swapped_in_while_the_store_cannot_write() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    m.upload();
+    m.crash();
+    m.corrupt_hot(f);
+    m.scrub();
+    assert!(!m.restore_file(f), "a swap is a manifest record");
+    m.restart();
+    assert_eq!(only_loss(&m).state, Some(LossState::Copying));
+    assert!(m.restore_file(f));
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3)))
+    );
+    assert!(held(&m, &p));
+    m.advance(DAY);
+    assert_eq!(m.repair(), Ok(0));
+    assert_eq!(m.health().level, Level::Ok);
+}
+
+#[test]
+fn s8_self_repair_a_loss_restored_from_deep_and_damaged_again_with_deep_gone_is_open_again() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    m.upload();
+    m.crash();
+    m.corrupt_hot(f);
+    m.scrub();
+    m.restart();
+    assert!(m.restore_file(f));
+    let identity = only_loss(&m).identity;
+    m.acknowledge_corruptions(&[finding(&m, f)]).unwrap();
+    m.advance(7 * DAY);
+    m.lose_object(f);
+    m.corrupt_hot(f);
+    m.scrub();
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3))),
+        "waits for the lost-object rule"
+    );
+    assert_eq!(m.health().level, Level::Fatal);
+    assert_eq!(judge(&mut m), vec![f]);
+    let l = only_loss(&m);
+    assert_eq!(l.identity, identity);
+    assert!(matches!(l.state, Some(LossState::AwaitingResend { .. })));
+    assert_eq!(m.health().level, Level::Degraded);
+    let unseen = m
+        .attention()
+        .iter()
+        .filter(|a| matches!(a, Alert::Corruption(_)))
+        .count();
+    assert_eq!(unseen, 2, "the hot finding and the lost object");
+    m.crash();
+    m.restart();
+    assert!(m.facts().unwrap().is_empty());
+    assert!(!held(&m, &p));
 }
 
 #[test]
@@ -472,6 +571,55 @@ fn s8_self_repair_an_object_that_answers_again_restores_its_open_loss_in_full() 
     assert!(held(&m, &p));
     assert_eq!(m.health().level, Level::Ok);
     assert_eq!(m.attention(), vec![Alert::Corruption(finding(&m, f))]);
+}
+
+/// Three lookups 5 minutes apart: the object is judged at the third.
+fn judge(m: &mut Model) -> Vec<FileId> {
+    let mut judged = Vec::new();
+    for i in 0..3 {
+        if i > 0 {
+            m.advance(5 * MINUTE);
+        }
+        judged.extend(m.check_bucket().unwrap());
+    }
+    judged
+}
+
+#[test]
+fn s8_self_repair_a_loss_restored_in_full_and_lost_again_is_open_again() {
+    let (mut m, f, p) = lost_in_bucket(false);
+    assert_eq!(judge(&mut m), vec![f]);
+    let identity = only_loss(&m).identity;
+    m.find_object(f);
+    m.check_bucket().unwrap();
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3)))
+    );
+    let first = finding(&m, f);
+    m.acknowledge_corruptions(&[first]).unwrap();
+    m.advance(7 * DAY);
+    m.lose_object(f);
+    assert_eq!(judge(&mut m), vec![f]);
+    let l = only_loss(&m);
+    assert_eq!(l.identity, identity, "the same loss");
+    assert!(matches!(l.state, Some(LossState::AwaitingResend { .. })));
+    assert!(!held(&m, &p));
+    assert_eq!(m.health().level, Level::Degraded);
+    let second = finding(&m, f);
+    assert_ne!(second, first);
+    assert!(m.attention().contains(&Alert::Corruption(second)));
+    m.crash();
+    m.restart();
+    assert!(m.facts().unwrap().is_empty());
+    assert!(only_loss(&m).degrades());
+    m.find_object(f);
+    m.check_bucket().unwrap();
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::Restored(3)))
+    );
+    assert!(held(&m, &p));
 }
 
 #[test]

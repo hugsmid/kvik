@@ -1607,6 +1607,18 @@ impl Disk {
         self.cold.contains(&f) || self.in_bucket(f)
     }
 
+    /// Whether a copy outside the fast disk is there or may still come: a
+    /// verified copy now, or an upload not judged lost, however the bucket
+    /// answers now (§8 Self-repair stage 1).
+    pub fn copy_may_come(&self, f: FileId) -> bool {
+        let uploaded = self
+            .bucket
+            .objects
+            .get(&f)
+            .is_some_and(|(h, _)| Some(*h) == self.manifest_hash(f));
+        self.verified_elsewhere(f) || (uploaded && !self.judged_lost.contains(&f))
+    }
+
     /// Whether the bucket holds the file with the manifest's hash.
     pub fn in_bucket(&self, f: FileId) -> bool {
         let want = self.manifest_hash(f);
@@ -1682,23 +1694,31 @@ impl Disk {
         out
     }
 
-    /// The recorded lost ranges not closed as restored in full.
+    /// The recorded lost ranges not closed as restored in full by a record
+    /// written after them.
     fn hidden_ranges(&self) -> Vec<(Position, Position)> {
-        let restored: Vec<Acknowledged> = self
+        let restored: Vec<(u64, Acknowledged)> = self
             .acknowledged()
             .into_iter()
-            .map(|(_, a)| a)
-            .filter(|a| matches!(a.outcome, Outcome::Restored(_)))
+            .filter(|(_, a)| matches!(a.outcome, Outcome::Restored(_)))
             .collect();
         self.lost_records()
             .into_iter()
             .filter(|r| {
-                !restored
-                    .iter()
-                    .any(|a| a.identity == r.identity && a.from <= r.from && r.to <= a.to)
+                !restored.iter().any(|(epoch, a)| {
+                    *epoch > r.epoch && a.identity == r.identity && a.from <= r.from && r.to <= a.to
+                })
             })
             .map(|r| (r.from, r.to))
             .collect()
+    }
+
+    /// Whether `p` lies in a recorded lost range that holds nothing: not
+    /// restored in full since (§8 Self-repair stage 1).
+    pub fn is_hidden(&self, p: Position) -> bool {
+        self.hidden_ranges()
+            .iter()
+            .any(|(from, to)| *from <= p && p <= *to)
     }
 
     /// Every distinct fact readable from any tier.
@@ -5179,12 +5199,16 @@ impl Model {
                 .map(|e| e.position)
                 .filter(|p| {
                     !held.contains(p)
-                        && !self.disk.is_lost(*p)
+                        && !self.disk.is_hidden(*p)
                         && !self.disk.found_lost.iter().any(|(a, b)| a <= p && p <= b)
                 })
                 .collect();
             if writable {
-                self.record_runs(&lost, LossCause::Corruption);
+                // Stage 1 waits while a copy may still come: deep is not
+                // reached, or the lost-object rule has not judged it lost.
+                if !self.disk.copy_may_come(*f) {
+                    self.record_runs(&lost, LossCause::Corruption);
+                }
                 continue;
             }
             for p in lost {
@@ -5197,21 +5221,22 @@ impl Model {
         bad
     }
 
-    /// Replaces a quarantined hot copy with a verified copy from another tier.
-    /// Returns whether a copy was found.
+    /// Replaces a quarantined hot copy with a verified copy from another tier,
+    /// by a manifest record, so not while the engine cannot write (§8 Corrupt
+    /// block). Returns whether a copy was swapped in.
     /// A recorded loss the copy holds again is closed as restored in full
     /// (§8 Self-repair stage 1); a copy of a file holding a closed loss is
     /// not swapped in (Q-246).
     pub fn restore_file(&mut self, f: FileId) -> bool {
-        if self.disk.quarantined.contains(&f)
+        let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
+        if writable
+            && self.disk.quarantined.contains(&f)
             && self.disk.verified_elsewhere(f)
             && !self.holds_closed_loss(f)
         {
             self.disk.corrupt.remove(&f);
             self.disk.quarantined.remove(&f);
-            if self.vol.as_ref().is_some_and(|v| !v.read_only) {
-                self.close_restored(f);
-            }
+            self.close_restored(f);
             true
         } else {
             false

@@ -318,21 +318,36 @@ pub fn losses(
     for r in recorded {
         add(r.identity, r.cause, r.from, r.to, true);
     }
+    let mut found_again = Vec::new();
     for (from, to) in found {
         // A range found again before it is recorded is the same loss.
         let identity = recorded
             .iter()
             .find(|r| r.from <= *to && *from <= r.to)
             .map_or(*from, |r| r.identity);
+        found_again.push(identity);
         add(identity, LossCause::Corruption, *from, *to, false);
     }
     for l in &mut out {
-        // The latest closing record that covers the present range.
-        let closed = acknowledged.iter().rev().map(|(_, a)| a).find(|a| {
-            a.identity == l.identity
-                && l.first.is_some_and(|f| a.from <= f)
-                && l.last.is_some_and(|t| t <= a.to)
-        });
+        // The latest closing record that covers the present range; one
+        // "restored in full" no longer closes a loss whose positions were
+        // lost again after it (§8 Self-repair stage 1).
+        let closed = acknowledged
+            .iter()
+            .rev()
+            .find(|(_, a)| {
+                a.identity == l.identity
+                    && l.first.is_some_and(|f| a.from <= f)
+                    && l.last.is_some_and(|t| t <= a.to)
+            })
+            .filter(|(epoch, a)| {
+                !matches!(a.outcome, Outcome::Restored(_))
+                    || !(found_again.contains(&l.identity)
+                        || recorded
+                            .iter()
+                            .any(|r| r.identity == l.identity && r.epoch > *epoch))
+            })
+            .map(|(_, a)| a);
         l.acknowledged = closed.is_some();
         l.state = Some(match closed {
             Some(a) => LossState::Closed(a.outcome),
