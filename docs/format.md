@@ -538,7 +538,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   ended, 3 by an operator, absent meaning 3; field 4: positions restored `u64`, present exactly with outcome 1;
   repeated field 5: a corruption seen, below; a record with outcome 1 or 2 is a closing record of self-repair and
   names exactly one loss in field 1, `spec.md` §8 Self-repair; one with outcome 1 closes only the lost-range records of
-  that identity with a lower epoch, so a later one opens the loss again; fields 3 to 5 are written from roadmap 8.5c); `0x28` rebuild (1 the corrupt record's epoch as
+  that identity with a lower epoch, so a later one opens the loss again; a record names at least one of fields 1, 2 and 5; fields 3 to 5 are
+  decoded from roadmap 8.5b, which refuses a record holding them until then, and written from roadmap 8.5c); `0x28` rebuild (1 the corrupt record's epoch as
   presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`;
   5 `file_id` floor, repeated, one per file kind: kind `u8`, id `u64`, 2^32 above the highest id of that kind in any
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
@@ -560,8 +561,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `u8` (1 damaged on hot, 2 damaged on cold, 3 damaged in deep, 4 lost in the bucket); 3 the copy tried first `u8` (0
   none, 1 hot, 2 cold, 3 deep, 4 the mirror path). Each field exactly once; another field below `0x8000` is
   unsupported. Appended when a file is found damaged or judged lost, before a copy is fetched; it names a
-  corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. Decoded strictly
-  from roadmap 8.5b; until then it is read as a reserved type.
+  corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. A reason 4 with no later `0x27` for the file
+  takes its copy out of a restore's plan (Q-295): its positions are already a recorded loss, or no loss at all. A
+  re-upload from a verified local copy writes a new `0x27`, as does an object that answers again while its loss is
+  open and so restores it in full; whether one that answers again after its loss was closed otherwise gets one, and
+  so returns to a restore's plan, is Q-600. Decoded strictly
+  from roadmap 8.5b, with `0x24` fields 3 to 5 and `0x25` fields 11 to 13; until then it is read as a reserved type.
 - Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 24 bytes): 0 kind `u8` (1 a file, by its
   quarantine record; 2 a lost range, by its loss's identity; 3 a manifest record); 1 reserved (3 bytes); 4 for a
   file, its kind `u8`, 3 reserved and `file_id` `u64` (12 bytes, as an input entry of a file description), then the
@@ -615,7 +620,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   identity (position), outcome `u8` (1 or 2), 3 reserved, positions restored `u64` (0 with outcome 2), in strictly
   ascending order of identity, each naming a field 7 range; 12 repeated, a corruption seen carried, as `0x24` field
   5, in the order read; 13 repeated, a corruption not yet seen carried, as `0x24` field 5, in the order read, each
-  named once in fields 12 and 13 together (fields 11 to 13 are written from roadmap 8.5c, Q-241). In every range
+  named once in fields 12 and 13 together (fields 11 to 13 are decoded from roadmap 8.5b, which refuses a record holding them until then, and written from
+  roadmap 8.5c, Q-241). In every range
   first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
   lost range, is a version refusal. A reader keeps a restore record's fields in the order read, as for a reserved
   type, so it is carried unchanged; canonical writing puts them in ascending id order. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000
