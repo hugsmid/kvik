@@ -1009,3 +1009,18 @@ fn a_damaged_newest_generation_falls_back_to_the_previous_one() {
     assert!(d.groups.iter().all(Option::is_some));
     assert_eq!(d.segments().cloned().collect::<Vec<_>>(), r.sealed());
 }
+
+#[test]
+fn a_group_of_another_generation_than_the_root_names_is_not_used() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 300, 0);
+    r.settle();
+    let d = r.load().unwrap();
+    let last = d.root.groups.last().unwrap().number;
+    let gens = directory::generations(&r.fs, &dir(), Family::Group(last));
+    assert_eq!(gens.len(), 2, "the open group was written at least twice");
+    r.fs.remove_file(&gens[0].1).unwrap();
+    // The previous generation still matches the catalogue, but it lists fewer segments than the root says.
+    let d = r.load().unwrap();
+    assert!(d.groups.last().unwrap().is_none());
+}
