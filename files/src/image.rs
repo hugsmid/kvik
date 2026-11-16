@@ -88,6 +88,7 @@ struct Search<'a> {
     bytes: &'a [u8],
     sums: PrefixCrc<'a>,
     headers: u64,
+    body: u64,
 }
 
 impl<'a> Search<'a> {
@@ -96,6 +97,7 @@ impl<'a> Search<'a> {
             bytes,
             sums: PrefixCrc::new(bytes),
             headers: 0,
+            body: 0,
         }
     }
 
@@ -103,6 +105,7 @@ impl<'a> Search<'a> {
         ScanStats {
             bytes_checksummed: self.sums.checksummed(),
             headers_visited: self.headers,
+            bytes_body_checked: self.body,
         }
     }
 
@@ -139,6 +142,7 @@ impl<'a> Search<'a> {
         if self.sums.range(body_start as u64, body.len() as u64) != Some(h.body_crc32c) {
             return Ok(None);
         }
+        self.body += body.len() as u64;
         match Record::decode(h.block_type, h.skippable(), body) {
             Ok(r) if r.epoch > min_epoch => Ok(Some(Placed {
                 offset: at,

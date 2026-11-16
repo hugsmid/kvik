@@ -423,4 +423,6 @@ fn an_undamaged_segment_is_read_in_one_pass_of_direct_reads() {
     // Each of the two blocks of a batch: its header peeked, then read once.
     assert!(stats.headers_visited <= 4 * k + 2, "{stats:?}");
     assert!(stats.bytes_checksummed <= len, "{stats:?} for {len} bytes");
+    let bodies: usize = r.batches.iter().map(|b| b.blocks[0].block.body.len()).sum();
+    assert_eq!(stats.bytes_body_checked, bodies as u64);
 }

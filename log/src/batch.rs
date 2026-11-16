@@ -5,7 +5,6 @@
 
 use crate::block::{BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block};
 use crate::body::{COMMIT_LEN, Commit, DataPrefix};
-use crate::content::check_block;
 use crate::content_error::BodyError;
 use crate::crc::Crc32c;
 use crate::error::{Element, EncodeError, FormatError};
@@ -142,7 +141,7 @@ pub(crate) fn read_batch<'a>(
             block_type::COMMIT => break b,
             // The body checks of A.5 and A.6; an unknown critical element inside is refused like an unknown
             // critical block.
-            block_type::FACTS | block_type::ENTRIES => match check_block(t, b.body) {
+            block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body) {
                 Ok((p, r)) => {
                     recovery |= r;
                     Some(p)

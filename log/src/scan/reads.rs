@@ -4,7 +4,9 @@ use crate::batch::MAX_BATCH_DATA;
 use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, peek_raw, read_block_with,
 };
-use crate::body::COMMIT_LEN;
+use crate::body::{COMMIT_LEN, DataPrefix};
+use crate::content::check_block;
+use crate::content_error::BodyError;
 use crate::crc::{PrefixCrc, crc32c};
 
 /// Block headers a scan may visit per 8 bytes of the file: the sum of the passes over each block start (Q-110).
@@ -17,6 +19,8 @@ pub struct ScanStats {
     pub bytes_checksummed: u64,
     /// Block headers read and checked (each a 12-byte checksum).
     pub headers_visited: u64,
+    /// Body bytes passed to the checks of their type (A.5, A.6; a manifest record's fields, A.14).
+    pub bytes_body_checked: u64,
 }
 
 impl ScanStats {
@@ -37,6 +41,7 @@ pub(crate) struct Reads<'a> {
     sums: Option<PrefixCrc<'a>>,
     direct: u64,
     headers: u64,
+    body: u64,
 }
 
 impl<'a> Reads<'a> {
@@ -47,6 +52,7 @@ impl<'a> Reads<'a> {
             sums: None,
             direct: 0,
             headers: 0,
+            body: 0,
         }
     }
 
@@ -61,7 +67,14 @@ impl<'a> Reads<'a> {
         ScanStats {
             bytes_checksummed: self.direct + self.sums.as_ref().map_or(0, PrefixCrc::checksummed),
             headers_visited: self.headers,
+            bytes_body_checked: self.body,
         }
+    }
+
+    /// The checks of a facts or entries body (A.5, A.6), counted.
+    pub(crate) fn check_body(&mut self, t: u8, body: &[u8]) -> Result<(DataPrefix, bool), BodyError> {
+        self.body += body.len() as u64;
+        check_block(t, body)
     }
 
     pub(crate) fn forget_below(&mut self, offset: u64) {

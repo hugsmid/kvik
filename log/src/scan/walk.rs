@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use crate::batch::{BatchFault, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, read_batch};
 use crate::block::block_type;
 use crate::body::{COMMIT_LEN, Commit};
-use crate::content::check_block;
 use crate::content_error::BodyError;
 use crate::error::{Element, FormatError};
 
@@ -80,7 +79,7 @@ fn judge(reads: &mut Reads<'_>, p: u64, o: u64, limit: u64) -> Judged {
     let t = b.header.block_type;
     match t {
         block_type::COMMIT => stop(Stop::Commit(Commit::decode(b.body).ok())),
-        block_type::FACTS | block_type::ENTRIES => match check_block(t, b.body) {
+        block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body) {
             Ok(_) => Judged::Pass(b.next_offset()),
             Err(BodyError::Unsupported(element)) => stop(Stop::Refuse(element)),
             Err(_) => stop(Stop::Fault(BatchFault::Content)),
