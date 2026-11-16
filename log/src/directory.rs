@@ -2,13 +2,15 @@
 //! (kind 17). Each is an A.1 header and one block, checksummed, written under a new `file_id` to a temporary name and
 //! renamed, never synced; the previous generation of each family is kept, and a reader takes the newest valid one.
 //!
-//! - [`logdir`]: the root and its groups of 256 sealed segments, checked against the catalogue.
+//! - [`logdir`]: the root and its groups of 256 sealed segments.
+//! - [`catalogue`]: what a log directory is checked against, and loading and rebuilding one.
 //! - [`series`]: one entry per series, supplied by the crate that owns their meaning through
 //!   [`crate::writer::SealHook`].
 //! - [`status`]: the writer's counters, health and pressure flag for other processes.
 //! - [`cadence`]: when the series directory is written, bounded in uncovered bytes.
 
 pub mod cadence;
+pub mod catalogue;
 pub mod logdir;
 pub mod series;
 pub mod status;
