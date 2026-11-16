@@ -239,7 +239,8 @@ A.10) is treated as a different boot. The rules apply in this order:
    (rule 1): any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
    batch's last position and the end of a lost range found at the tail under rule 2. Let F = 1 + the highest
    sequence of the current generation among K and every position named by a local cursor file, manifest record or
-   derived file. Recovery writes a **recovery entry** at F, alone in its batch, at the next write position (after
+   derived file (the registry file, `format.md` A.16, and the files of A.18).
+   Recovery writes a **recovery entry** at F, alone in its batch, at the next write position (after
    the kept bytes or after the lost region at the tail; in a new segment when the open one is full): `after` = K, a
    new **reset stamp** (the sequence F and a random nonce, never zero; the mark carries it from then on), the
    boot id, the tail's length in bytes up to the last non-zero byte, the readable commit blocks in it (the tail reported
@@ -650,13 +651,26 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
   `after`; it compares the mark's reset stamp before and after reading, and discards what it read if the stamp
   changed meanwhile. A reader reads nothing without a renewed lease: if the lease write fails, the open or refresh
-  returns the error. Positions are read in order, so a reader that cannot read a file returns the error for that
-  file and reads nothing at or past it until it can. A manifest record a reader cannot take an epoch from is an
+  returns the error. Positions are read in order, so a reader catching up (a consumer, a live read's tail) that
+  cannot read a file returns the error for that file and reads nothing at or past it until it can; a query (roadmap
+  9.0f) returns the error only if the file's segment index (`format.md` A.8) lists one of its series or the file has
+  entries, and otherwise passes over it. A manifest record a reader cannot take an epoch from is an
   error of the manifest for the reader. Accepted residuals: a reader may read a mark that is not yet synced (from
   the page cache, before a start's sync of it or after that sync failed); the new reset stamp of the start that then
   truncates voids what it took. Corruption events reported by a pass that a start overtook (it truncated and wrote
   past the old mark before the reader read the mark again) may be wrong; the next refresh's check of the last batch
   still finds the rewrite.
+- **Derived files** (`format.md` A.18): the log directory (the sealed segments, with their sequence and commit-time
+  ranges, checked against the catalogue), the series directory (per series, as of a position: the latest recorded
+  `t`, the lateness reference, counts, the live candidate and the next pending fact) and the status file (the
+  writer's counters, health and pressure flag). Only the writer writes them, on its maintenance thread; they are
+  checksummed, renamed into place and never synced or backed up, and none names a position above the last synced
+  mark. A reader treats a missing, invalid or behind one as absent and reads the log instead, up to an allowance of
+  sealed bytes; the files speed reads up and never change a result. A series directory, or a root, is a function of
+  the kept log while its `through` with the reset stamp it records, judged as a saved point (below), is kept or void
+  above no lower position; the writer, which judges at each start, keeps one written under the current stamp or with
+  `through` at or below the `after` of the recovery entry its start wrote (Q-776). A part of the log directory whose
+  segments the catalogue no longer describes (a replaced segment, a restore, a manifest rebuild) is not used.
 - **Reset stamp and saved points.** The mark carries the current reset stamp: zero until the first reset, then
   the stamp of the last recovery entry a start wrote (§3 Recovery rules 1 and 3) or of the last restore record (§8
   Generations; its sequence is the restored generation's first position, its nonce fresh). A position kept for later
