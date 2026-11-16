@@ -170,6 +170,8 @@ fn the_delivery_reader_refreshes_at_most_once_per_batch_sync() {
 fn an_idle_store_writes_no_delivery_lease_before_its_renewal_is_due() {
     let (store, _clock, counts, ids) = counted("idle-lease", 1);
     block_on(store.emit(&[num(ids[0], 0, 1.0)])).unwrap();
+    // With no consumer the batch is read back after the emit returns (Q-706); a tick takes it.
+    store.tick().unwrap();
     let (l0, _) = snapshot(&counts);
     for _ in 0..5 {
         store.tick().unwrap();

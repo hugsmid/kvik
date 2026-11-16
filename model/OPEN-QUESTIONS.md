@@ -1405,7 +1405,8 @@ statistics). `emit` runs no timers, takes no batch and waits for no wake while t
 before, named by a cursor file or the log), is raised by `take_consumer` before the pump that sets a consumer up, and
 is never lowered; an emit that read it lowered therefore had its batch acknowledged before that pump, which takes it
 before the consumer exists. A consumer not taken in this run receives and evaluates nothing, so starting raised for
-known consumers is a precaution.
+known consumers is a precaution. `an_idle_store_writes_no_delivery_lease_before_its_renewal_is_due`
+(`kvik/tests/write_path.rs`) therefore takes the emit's batch with a tick before it counts lease writes.
 **Pinned by.** `with_no_consumer_an_emit_returns_without_taking_its_batch`,
 `with_no_consumer_an_emit_never_waits_for_the_deliverer`,
 `an_emit_returning_after_a_consumer_is_set_up_has_taken_its_batch`,
