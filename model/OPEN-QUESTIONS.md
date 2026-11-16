@@ -1423,9 +1423,9 @@ decision), `a_lookup_never_reads_damage_as_absence_unless_the_region_is_lost` (u
 Recorded by roadmap 11.0. To be settled by the owner before gate 5.6.
 **Scenario.** §5.1 gives the recent window "default 15 minutes, at most 1 024 facts", and §11 says every default is a
 configuration key; `api.md` Configuration names no key for it, and the design of 11.0 does not make it one. A store
-of 2,000 series at one reading a second holds about 1.8 million facts in windows (about 130 MiB in the writer and as
-much in the deliverer, `docs/measurements/store-emit-throughput.md`); a smaller window trades memory for slow-path
-reads of late data (§13 Duplicate check on replay, Memory per series).
+of 2,000 series at one reading a second holds about 1.8 million facts in the writer's windows and as many in the
+deliverer's, some 400–440 MiB in all (`docs/measurements/store-emit-throughput.md`); a smaller window trades memory
+for slow-path reads of late data (§13 Duplicate check on replay, Memory per series).
 **Decided by the lead.** Constants (`kvik/src/durable/history.rs`: `WINDOW_SPAN`, `WINDOW_FACTS`), the span at least
 an interval series' length; calendar lengths are not supported yet. A key named `limits.recent_window` would be
 additive if the owner wants one.
