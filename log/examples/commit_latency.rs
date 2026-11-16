@@ -5,12 +5,12 @@
 //! cargo run --release --locked -p kvik-log --example commit_latency -- <dir> [options]
 //!
 //!   --short        about 2 minutes instead of about 8 (the CI run)
-//!   --only <load>  run only the loads whose name contains <load>
+//!   --only <load>  run only the load named <load>, or else the loads whose name starts with it
 //!   --repeat <n>   run the whole matrix n times
 //!   --any-fs       also run on a file system whose sync does nothing (tmpfs, ramfs)
 //!   --keep         keep the stores
 //!   --disk <text>  describe the disk where it cannot be found out (a class, never a model or serial)
-//!   --setup <text> run only the writer settings whose label starts with <text>
+//!   --setup <text> run only the writer setting labelled <text>, or else those whose label starts with it
 //!   --sync-delay <ms>  sleep this long in every `sync_data`, standing in for a slow device
 //! ```
 //!
@@ -878,6 +878,16 @@ fn sync_calls(dir: &Path, short: bool) -> io::Result<Vec<CallRow>> {
 
 // ----- the report -----
 
+/// Whether a `--only` or `--setup` filter selects `name`: the name equal to it if there is one, else every name that
+/// starts with it.
+fn selects(filter: Option<&str>, name: &str, all: &[String]) -> bool {
+    match filter {
+        None => true,
+        Some(f) if all.iter().any(|n| n == f) => name == f,
+        Some(f) => name.starts_with(f),
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut dir = None;
@@ -898,11 +908,14 @@ fn main() {
             "--disk" => disk_note = args.next(),
             "--setup" => setup_filter = args.next(),
             "--sync-delay" => {
-                let ms: f64 = args
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .expect("--sync-delay takes milliseconds");
-                sync_delay = Duration::from_secs_f64(ms / 1e3);
+                let ms = args.next().and_then(|n| n.parse::<f64>().ok());
+                match ms.and_then(|ms| Duration::try_from_secs_f64(ms / 1e3).ok()) {
+                    Some(d) => sync_delay = d,
+                    None => {
+                        eprintln!("--sync-delay takes a number of milliseconds, zero or more");
+                        std::process::exit(2);
+                    }
+                }
             }
             "--repeat" => {
                 repeat = args
@@ -992,10 +1005,8 @@ fn main() {
     let mut restarts = Vec::new();
     for rep in 0..repeat {
         for (si, setup) in Setup::ALL.iter().copied().enumerate() {
-            if setup_filter
-                .as_ref()
-                .is_some_and(|f| !setup.label().starts_with(f.as_str()))
-            {
+            let labels: Vec<_> = Setup::ALL.iter().map(Setup::label).collect();
+            if !selects(setup_filter.as_deref(), &setup.label(), &labels) {
                 continue;
             }
             let dir = root.join(format!("store-{rep}-{si}"));
@@ -1033,11 +1044,9 @@ fn main() {
                 .wait()
                 .expect("warm-up acknowledged");
             std::thread::sleep(Duration::from_millis(500));
+            let names: Vec<_> = loads(short).iter().map(|(l, _)| l.name()).collect();
             for (load, secs) in loads(short) {
-                if only
-                    .as_ref()
-                    .is_some_and(|o| !load.name().contains(o.as_str()))
-                {
+                if !selects(only.as_deref(), &load.name(), &names) {
                     continue;
                 }
                 let r = run_load(&log, &sync_log, load, secs, setup);
@@ -1214,6 +1223,21 @@ mod tests {
             before.elapsed() < STAMP_TIMEOUT / 2,
             "the wake notifies the waiter"
         );
+    }
+
+    #[test]
+    fn a_filter_selects_the_name_equal_to_it_else_every_name_it_starts() {
+        let all: Vec<String> = [
+            "back to back, 1 writer",
+            "back to back, 1 writer × 2000/call",
+        ]
+        .map(String::from)
+        .into();
+        assert!(selects(Some("back to back, 1 writer"), &all[0], &all));
+        assert!(!selects(Some("back to back, 1 writer"), &all[1], &all));
+        assert!(selects(Some("back to back"), &all[1], &all));
+        assert!(!selects(Some("1 writer"), &all[0], &all));
+        assert!(selects(None, &all[1], &all));
     }
 
     #[test]
