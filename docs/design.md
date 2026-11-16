@@ -21,7 +21,8 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 ## Intended shape
 1. **Log.** Readings are validated, stamped and appended to the log in batches; a batch is synced before
    anything else sees it (group commit; no added delay after a quiet period; batch syncs due at least
-   `min_sync_interval`, default 10 ms, apart).
+   the batch-sync interval apart, which follows the sync's duration between `sync_interval_floor` and
+   `min_sync_interval`, both 10 ms by default).
 2. **Delivery.** Only after the sync, funnels deliver to consumers and live state updates. A funnel is a route
    compiled from configuration: series selection, optional windowed operator, condition, consumer. A consumer
    that falls behind catches up from the log; it never blocks the log or other consumers.
@@ -57,13 +58,15 @@ footprint is small for embedded use, and decoding is fast for large scans. Parqu
 the mark synced at every commit (it has no verified boot identity), and is held neither to these budgets nor to the
 durability guarantees of spec §3 Sync primitive. The relaxed figure is enough, as device and human reaction times in automation
 are tens to hundreds of milliseconds. Roadmap 2.2 found that each durable sync writes a minimum amount, which
-unbatched small writers multiply, so batch syncs are due at least `min_sync_interval` apart (spec §3 Group commit);
+unbatched small writers multiply, so batch syncs are due at least the batch-sync interval apart (spec §3 Group commit):
+eight times the smoothed sync duration, between `sync_interval_floor` and `min_sync_interval`, so a device whose sync
+is cheap waits little and one whose sync is dear keeps the ceiling;
 a late start delays later syncs only while the load stays at the bound (Q-310). The default of 10 ms adds on average under half the interval, and only
 when syncs are back to back, inside the p99 budget;
 the first reading after a pause is synced at once; and it caps host writes from many staggered writers. The p50
 ≤ 5 ms budget applies while syncs are not back to back, roughly up to 100 synced batches a second; above that rate
-batching adds a wait of up to `min_sync_interval` (about half of it at the median) in exchange for fewer syncs, and
-a caller who needs lower latency at high rates sets it lower or to 0.
+batching adds a wait of up to the interval (about half of it at the median) in exchange for fewer syncs, and a caller
+who needs lower latency at high rates sets the floor lower, or `min_sync_interval` to 0.
 
 **Size.** [Roadmap 2.1](measurements/2.1-chunk-encodings.md) measured the own encoding 8–14 % smaller than Parquet
 with ALP for decimal `f64` data, about 1 % for the same series declared as scaled `i64`, and larger than Parquet's

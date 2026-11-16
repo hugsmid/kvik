@@ -34,7 +34,7 @@ the rest is filled in by the roadmap items named.
 let store = Store::open(
     StoreConfig::new(path, tz)        // tz: the site zone at creation; checked at every later open
         .create_if_missing(true)       // creates only in a missing or empty directory (format.md A.12)
-        .log(LogConfig::default())     // segment size, seal interval, min_sync_interval, batch size, mark sync
+        .log(LogConfig::default())     // segment size, seal interval, sync interval and floor, batch size, mark sync
         .limits(Limits::default())     // queue sizes, series ceiling, disk marks
         .tiers(TierConfig::default())  // cold path, age and fill thresholds
         .env(Env::system()),           // clock, file system, boot identity, tzdata, entropy
@@ -66,7 +66,8 @@ The keys roadmap section 4 needs; all may change between opens.
 |---|---|---|---|
 | `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
-| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
+| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: the ceiling of the batch-sync interval, and the interval until the first batch sync after a start. Batch syncs are due at least the interval apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound, whatever the floor. Mark syncs, timed or forced, are not bounded by it |
+| `log.sync_interval_floor` | `Duration` | 10 ms | spec §3 Group commit (Q-710): the least batch-sync interval. Between it and `min_sync_interval` the interval is eight times the smoothed batch-sync duration, so batch syncs run at most 1/`sync_interval_floor` per second over time (100 at the default); at or above `min_sync_interval` the interval is fixed there. No limits |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
@@ -385,7 +386,8 @@ pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
 // LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
-//            open_file_id, sealed_segments, bytes, manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+//            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
+//            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }
@@ -413,6 +415,9 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
   `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
+  `LogStats.sync_interval` is the batch-sync interval in force and `sync_time` the smoothed batch-sync duration it
+  follows (`None` before the first batch sync after a start); the model backend, which does not sync, reports zero and
+  `None`.
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
   calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,
