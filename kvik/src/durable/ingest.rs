@@ -280,7 +280,6 @@ impl Decider {
                 .into_iter()
                 .flatten()
                 .chain(batch_history.get(&key).into_iter().flatten());
-            // Only a reading with a `changed_at` is compared with its key's highest one.
             let top = r.changed_at.and_then(|_| {
                 self.versions
                     .get(&key)

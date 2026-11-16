@@ -1369,6 +1369,52 @@ fn a_mark_at_the_header_end_of_a_segment_not_read_before_still_has_its_header_ch
     assert!(matches!(r.refresh(), Err(ReaderError::Unsupported { .. })));
 }
 
+/// Four batches of two read, then the segment cut to `len` without a start (damage): what was kept from earlier
+/// reads must not stand in for the missing bytes.
+fn truncated_below_the_mark(len: impl Fn(&[u64]) -> u64) -> Update {
+    let mut r = Rig::new(cfg());
+    let mut ends = Vec::new();
+    for k in 0..4 {
+        r.submit(items(2, k * 10));
+        r.drain();
+        ends.push(r.mark().unwrap().offset);
+    }
+    r.refresh().unwrap();
+    assert_eq!(r.held.items.len(), 8);
+    let f =
+        r.fs.open(
+            &log_path("00000000-0000000000000001.open"),
+            OpenMode::ReadWrite,
+        )
+        .unwrap();
+    f.set_len(len(&ends)).unwrap();
+    r.refresh().unwrap()
+}
+
+#[test]
+fn a_segment_truncated_below_the_mark_is_read_as_zeros_not_as_the_bytes_kept_from_before() {
+    let u = truncated_below_the_mark(|ends| ends[1]);
+    assert!(matches!(u.events[0], ReadEvent::Void { above, .. } if above.sequence == 4));
+    assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
+    assert!(
+        u.events
+            .iter()
+            .any(|e| matches!(e, ReadEvent::Corruption { .. }))
+    );
+}
+
+#[test]
+fn a_segment_truncated_inside_its_header_is_read_as_zeros_not_as_the_header_kept_from_before() {
+    let u = truncated_below_the_mark(|_| 40);
+    assert!(matches!(u.events[0], ReadEvent::Void { above, .. } if above.sequence == 0));
+    assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
+    assert!(
+        u.events
+            .iter()
+            .any(|e| matches!(e, ReadEvent::Corruption { .. }))
+    );
+}
+
 #[test]
 fn the_mark_is_read_at_most_nine_times_per_call() {
     for (hidden, ok) in [(8, true), (9, false)] {

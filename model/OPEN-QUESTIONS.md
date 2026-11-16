@@ -1341,8 +1341,12 @@ when its durable position is at or above the writer's (`LogStats::durable`), and
 lease is still renewed at least every `lease_refresh`. A refresh there would read nothing: only the writer's process
 changes the log while it holds the store lock, so no rewrite, void or region can appear below that position (§7
 Readers), and in this build the manifest is written only at a start (`StartOptions::recorder` is refused), so the
-lease already names the current epoch. Every refresh that does run follows the full reader protocol (Q-703). With
-16 callers acknowledged by one batch sync, one refresh runs instead of 17.
+lease already names the current epoch. Every refresh that does run follows the full reader protocol of §7 Readers.
+With 16 callers acknowledged by one batch sync, one refresh runs instead of 17. A failing `keep_alive` is counted in
+`DeliveryStats::refresh_errors` although nothing was read, and an idle store no longer checks its last batch again
+every second, so damage to it is voided at the next batch. Any reader also skips opening the mark's segment while
+the mark has not moved, so a header damaged after it was first read is reported when the mark next moves, not at the
+next refresh.
 **Open part.** Once manifest records are written during a run (publish and retire, tiers), an idle writer's delivery
 reader would keep naming the epoch of its last refresh, which `keep_alive` renews unchanged, and so hold retired files
 (§7 Retired files: "no live reader lease names an older epoch") until the next batch. That item must also require the
