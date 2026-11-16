@@ -350,6 +350,15 @@ fn init_generation_writes_the_first_mark_once_and_refuses_another_generations() 
     let before = r.fs.read(&log_path("MARK"));
     init_generation(&store, &generation_start(end), T0).unwrap();
     assert_eq!(r.fs.read(&log_path("MARK")), before);
+    let restamped = GenerationStart {
+        stamp: ResetStamp {
+            sequence: 1,
+            nonce: 78,
+        },
+        ..generation_start(end)
+    };
+    init_generation(&store, &restamped, T0).unwrap();
+    assert_eq!(r.fs.read(&log_path("MARK")), before);
     let other = GenerationStart {
         generation: 2,
         ..generation_start(end)
@@ -619,4 +628,129 @@ fn a_reader_reads_earlier_generations_past_what_is_set_aside() {
         vec![(at(0, 1), at(0, end)), (at(1, 1), at(1, 1))]
     );
     assert_eq!(read_all(&r, SetAside::default()).len(), 3);
+}
+
+/// The first position comes from the stamp, not a literal 1.
+#[test]
+fn a_generation_starting_above_1_takes_ingest_at_its_stamps_sequence() {
+    let (files, end) = source();
+    let fs = MemFs::new();
+    let store = StoreDir::open(Arc::new(fs.clone()), &dir(), Some(&new_store())).unwrap();
+    for (n, bytes) in &files {
+        let f = fs
+            .open(&log_path(&n.to_string()), OpenMode::CreateNew)
+            .unwrap();
+        f.write_at(bytes, 0).unwrap();
+    }
+    let start = GenerationStart {
+        stamp: ResetStamp {
+            sequence: 5,
+            nonce: 3,
+        },
+        ..generation_start(end)
+    };
+    init_generation(&store, &start, T0).unwrap();
+    drop(store);
+    let mut r = Rig::on(fs, cfg(), Some(start));
+    assert_eq!(r.mark().last_sequence, 4);
+    assert_eq!(r.open().rule, StartRule::FirstStart);
+    r.submit(vec![fact(5, 0)]);
+    r.drain();
+    assert_eq!(r.acked, vec![at(1, 5)]);
+}
+
+/// F after a reboot in a restored generation counts its own cursor files, lost ranges and registry file only, and
+/// a registry file of this generation covers the sealed log below its `through` as a position (Q-262).
+#[test]
+fn f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources() {
+    use kvik_log::cursor::{CursorState, append};
+    use kvik_log::registry::{RegistryFile, write};
+    let (mut r, _) = restored(cfg());
+    r.open();
+    r.submit(vec![fact(5, 0)]);
+    r.drain();
+    r.kill();
+    let state = |consumer: &str, generation, sequence| CursorState {
+        consumer: consumer.into(),
+        position: at(generation, sequence),
+        latches: Vec::new(),
+        reset: None,
+    };
+    append(&r.fs, &dir(), STORE_ID, 1, T0, &state("other", 1, 12), None).unwrap();
+    append(&r.fs, &dir(), STORE_ID, 0, T0, &state("old", 0, 90), None).unwrap();
+    r.boot += 1;
+    let e = r.open().entry.unwrap();
+    assert_eq!(e.sequence, 13, "F above the cursor of this generation only");
+    assert_eq!(e.entry.consumers, vec!["kept".to_string()]);
+    r.kill();
+    let lost = LostRange {
+        identity: (1, 20),
+        first: (1, 20),
+        last: (1, 30),
+        file_id: 1,
+        offset: 0,
+        length: 0,
+        cause: LossCause::Corruption,
+        boot_id: [0; 16],
+        id_floor: 0,
+        time_before: None,
+        time_after: None,
+        extends: false,
+        stamp: Some(stamp()),
+    };
+    let manifest = dir().join("MANIFEST");
+    let f = r.fs.open(&manifest, OpenMode::ReadWrite).unwrap();
+    f.write_at(
+        &encode_record(RECORD_LOST_RANGE, 9, 1, T0, Some(&lost)),
+        f.len().unwrap(),
+    )
+    .unwrap();
+    r.boot += 1;
+    let e = r.open().entry.unwrap();
+    assert_eq!(e.sequence, 31, "F above this generation's lost range");
+    r.kill();
+    for (generation, floor) in [(0, 90), (1, 50)] {
+        let file = RegistryFile {
+            generation,
+            through: 0,
+            max_series_id: floor,
+            entries: Vec::new(),
+        };
+        write(&r.fs, &dir(), STORE_ID, T0, &file).unwrap();
+    }
+    r.boot += 1;
+    let e = r.open().entry.unwrap();
+    assert_eq!(e.entry.id_floor, 50);
+    assert!(e.entry.consumers.is_empty(), "{:?}", e.entry.consumers);
+}
+
+/// A recovery entry that needs a new segment takes it in the start's generation.
+#[test]
+fn a_recovery_entry_in_a_new_segment_is_in_the_restored_generation() {
+    let (mut r, _) = restored(cfg());
+    r.open();
+    r.submit(vec![fact(5, 0)]);
+    r.drain();
+    r.kill();
+    for (n, p) in r.segments() {
+        if n.generation == 1 && !n.sealed {
+            r.fs.remove_file(&p).unwrap();
+        }
+    }
+    r.fs.restart();
+    r.boot += 1;
+    let rep = r.open();
+    assert!(rep.entry.is_some());
+    let open: Vec<SegmentName> = r
+        .segments()
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| !n.sealed)
+        .collect();
+    assert!(
+        !open.is_empty() && open.iter().all(|n| n.generation == 1),
+        "{open:?}"
+    );
+    r.kill();
+    r.open();
 }

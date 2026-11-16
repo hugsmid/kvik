@@ -177,8 +177,8 @@ pub(super) fn scan_sealed(
     out
 }
 
-/// Writes the first mark of a restored generation, its stamp and no position, unless the directory holds it
-/// already (`spec.md` §8 Restore step 1; Q-260). A restore calls it once, after its files are installed.
+/// Writes the first mark of a restored generation, its stamp and no position, unless the directory holds a mark of
+/// that generation already (`spec.md` §8 Restore step 1; Q-260). A restore calls it once, after its files are installed.
 pub fn init_generation(
     store: &StoreDir,
     start: &GenerationStart,
@@ -197,7 +197,7 @@ pub fn init_generation(
     if let Some(b) = &existing
         && let Some((_, m)) = read_mark(b, &store_id).map_err(StoreError::Unsupported)?
     {
-        return if m.generation == generation.g && m.stamp == generation.stamp {
+        return if m.generation == generation.g {
             Ok(())
         } else {
             Err(StoreError::Generation {

@@ -1352,8 +1352,8 @@ of a restored generation: no mark and nothing of the current generation in the l
 generation g above 0 reads that first mark as no mark when nothing of generation g is in the log (no segment of g in use or sealed, no written unused segment, no lost range of g): it
 writes the first mark again with its own boot and the same stamp, writes no recovery entry, and the writer resumes at
 the stamp's sequence minus one. Generation 0 is unchanged (its first mark is written by its first start, with the
-boot). `init_generation` is idempotent: a mark of g with the same stamp is left alone, a torn one written again, a
-mark of another generation or stamp refused (`StoreError::Generation`). Safe because a segment that held an
+boot). `init_generation` is idempotent: any readable mark of g is left alone, a torn one written again, a mark of
+another generation refused (`StoreError::Generation`). Safe because a segment that held an
 acknowledged batch of g cannot vanish whole by a crash (its creation syncs the directory before it is taken into
 use); damage to it is Q-264. Tests: `log/tests/generation.rs`
 `a_restored_generation_takes_ingest_at_its_first_position_with_the_restores_stamp`,
@@ -1386,8 +1386,11 @@ from sealed segments above the registry file's `through` (Q-130, Q-115 (f)) were
 registry file of its own generation (`through` compared as a position), and with no such file every sealed segment
 (the cost of Q-116 (n)). A batch set aside (Q-263) counts toward the id floor, facts and definitions alike, and gives
 no consumer and no interval length; the rest give all three. Interval lengths apply in log order between the registry
-file's and the unsealed log's. The first start takes this floor into its mark. Tests: `log/tests/generation.rs`
-`set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`.
+file's and the unsealed log's. The first start takes this floor into its mark. In generation 0 this changes three
+things: the sealed scan now feeds the id floor and interval lengths, a first start takes them from a registry file
+too, and an empty sealed segment no longer ends the scan when there is no registry file. Tests: `log/tests/generation.rs`
+`set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`,
+`f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources`.
 ## Q-263 — What is set aside: whole batches, by their first position
 Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
 **Scenario.** §8 Restore step 1 sets aside positions; the writer's and the reader's scans skip batches.
@@ -1442,11 +1445,12 @@ Recorded by roadmap 8.3c (review finding of 8.3b's fix round). To be settled by 
 the source records, a lagging listing, Q-304). `Store::restore` is called again and each retry claimed the next
 generation, so a bucket with a flaky listing walked the generations, each claim never withdrawn.
 **Decided (8.3c).** A `Restorer` keeps the store id, generation and nonce it claimed across failed `prepare` calls; a
-retry for the same store runs in that generation with that nonce (its marker's) and claims nothing, unless a higher
+retry on the same driver for the same store runs in that generation with that nonce (its marker's) and claims nothing, unless a higher
 generation is claimed meanwhile, when it fails with `RestoreError::Superseded { by }` and claims nothing more (the
 record would be superseded at once). A drill keeps nothing. Unchanged: a crash or a new process before the record
 starts again with the next generation (§8 Restore, row 28a, Q-39 (f)); keeping the claim across that would need a
-local note written before the claim, a new file. Tests: `backup/tests/restore_guards.rs`
+local note written before the claim, a new file. So `Store::restore` (roadmap 8.3d) closes the finding only if it
+retries `prepare` on the same driver; a call that builds a new driver claims the next generation. Tests: `backup/tests/restore_guards.rs`
 `a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation`,
 `a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more`.
 ## Open at v0.2
