@@ -39,10 +39,11 @@ specified here before the roadmap item that writes it.
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
 - **Scan bound.** A reader's work on a file is linear in its length whatever its bytes: at most twice the file's
-  length is checksummed, and memory is bounded by the largest block the header limits allow. Files the engine wrote,
-  damaged or not, are read exactly as before. A body checksum is derived from a table of prefix checksums by a CRC
-  shift, so a block image nested in another costs arithmetic, not bytes; the acceptance rules (A.2, A.14) are
-  unchanged (Q-110). The checks of a checksum-valid body by its type are bounded per block, not per file (Q-230).
+  length is checksummed, block headers are read a bounded number of times per 8 bytes, and memory is bounded by the
+  largest block the header limits allow. Files the engine wrote, damaged or not, are read with exactly the same
+  results as before. A body checksum is derived from a table of prefix checksums by a CRC shift, so a block image
+  nested in another costs arithmetic, not bytes; the acceptance rules (A.2, A.14) are unchanged (Q-110). The checks
+  of a checksum-valid body by its type are bounded per block, not per file (Q-230).
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |

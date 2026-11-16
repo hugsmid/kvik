@@ -66,6 +66,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-230 | `format.md` common rules (Scan bound), A.2, A.5, A.6, A.14 | Body checks of checksum-valid bodies that nest |
+| Q-231 | `format.md` common rules (Scan bound); `design.md` Budgets (restart) | The bounded scan's cost on undamaged segments |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1332,6 +1333,22 @@ of checksum-valid bodies bounded per block; or (2) a mechanism that bounds them 
 (A.2) does not make obvious, since whether a candidate is accepted depends on its body checks. Recommendation: (1)
 for v1, with (2) recorded as hardening before the format is declared stable (roadmap 10.3).
 
+## Q-231 — The bounded scan's cost on undamaged segments
+Found by roadmap 4.9d, which applied the Q-110 ruling.
+**Scenario.** A start scans each unsealed segment whole. On a full, undamaged 64 MiB segment (the default
+`log.segment_size`), in a release build on the development machine, the reference scan (each body checksummed
+directly, as before) takes 56 ms with 280,000 small batches and 32 ms with 15,000 large ones; the bounded scan takes
+165 ms and 75 ms. Of the difference, about two thirds is the boundary read judging each block (checksum lookup and
+body checks) before `read_batch` reads the same blocks again, and one third the prefix table, filled 8 bytes at a time,
+against the library checksum. Results are equal (the differential property); only time differs. The warm start
+measured on the target for Q-116 (n) was 0.39–0.74 s against the 1 s restart budget.
+**Implemented.** As described; no figure is pinned.
+**Needed.** Whether the cost is accepted. Proposed, if not: at a boundary read, read the batch directly when the
+remembered chain end already names a commit whose `batch_bytes` fits, and walk block by block only when that read
+fails, which keeps each block judged once on damaged files and one pass on healthy ones (measured with the walk
+removed: 90 ms and 55 ms); and fill the table with a faster register update. Either is a change to `log/src/scan/`
+only, with the same differential.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1412,6 +1429,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-230 | 4.9 | Body checks of checksum-valid bodies that nest; recorded by roadmap 4.9d; owner decision pending |
+| Q-231 | 4.9 | The bounded scan's cost on undamaged segments; recorded by roadmap 4.9d; owner decision pending; the cold start of Q-116 (n) measures it on the target |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
