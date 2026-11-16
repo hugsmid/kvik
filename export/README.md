@@ -6,7 +6,11 @@ Parquet export of a kvik store's facts (roadmap 6.4). The schema, export version
 
 - `export_series(&reader, id, &options, writer)` streams one series' facts from `Reader::facts` into one Parquet
   file; the exporter holds at most one row group and one batch of rows (end to end once `Reader::facts` streams).
-- `export_rows` does the same for rows from any source; `SeriesSchema::from_info` gives a series' schema.
+- `export_partitioned(&reader, id, &options, open)` writes one file per UTC month with a fact, at
+  `site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet`; `options.site` names the site and `options.store_id`
+  the store, both also written to every file's metadata.
+- `export_rows` does the same as `export_series` for rows from any source; `SeriesSchema::from_info` gives a series'
+  schema.
 - `read_rows` reads a file back into `ExportRow`s from its Parquet types alone.
 
 Built on the `parquet` crate (Apache-2.0) with only its `arrow` and `zstd` features.

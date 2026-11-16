@@ -4,7 +4,9 @@
 //! [`export_series`] streams one series' facts from [`Reader::facts`] into one Parquet file. The exporter holds
 //! at most the open row group ([`ExportOptions::row_group_rows`]) plus one batch ([`ExportOptions::batch_rows`]),
 //! whatever the number of facts; the bound holds end to end once `Reader::facts` streams (today both backends
-//! gather the range first). [`read_rows`] reads a file back into [`ExportRow`]s.
+//! gather the range first). [`export_partitioned`] writes one file per UTC month in the layout
+//! `site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet`. [`read_rows`] reads a file back into
+//! [`ExportRow`]s.
 //!
 //! ```
 //! use kvik_export::{ExportOptions, SeriesSchema, ValueKind, KindName, TimingName, export_rows, read_rows};
@@ -31,6 +33,7 @@
 
 mod batch;
 mod error;
+mod layout;
 mod read;
 mod row;
 mod schema;
@@ -46,6 +49,9 @@ use parquet::schema::types::ColumnPath;
 
 pub use batch::QUALITY_NAMES;
 pub use error::ExportError;
+pub use layout::{
+    MAX_SITE_LEN, Month, check_site, escape_segment, file_name, partition_dir, unescape_segment,
+};
 pub use read::{ExportReader, read_rows};
 pub use row::{ExportRow, Flags};
 pub use schema::{
@@ -60,7 +66,7 @@ pub const ZSTD_LEVEL: i32 = 1;
 pub const MAX_BATCH_ROWS: usize = 1 << 20;
 
 /// How an export reads and writes (`docs/export.md` Options).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExportOptions {
     /// The view read (spec §2.3); [`View::Current`] by default (Q-191).
@@ -71,6 +77,11 @@ pub struct ExportOptions {
     pub row_group_rows: usize,
     /// Rows buffered before they are handed to the writer, 1 to [`MAX_BATCH_ROWS`]. Default 8,192.
     pub batch_rows: usize,
+    /// The site label written as `kvik.site` and naming the partition folder; checked by [`check_site`].
+    pub site: Option<String>,
+    /// The store id written as `kvik.store_id`; given by the caller until the store's own metadata reaches the
+    /// export (roadmap 8.3, Q-196).
+    pub store_id: Option<[u8; 16]>,
 }
 
 impl Default for ExportOptions {
@@ -80,6 +91,8 @@ impl Default for ExportOptions {
             range: TimeRange::new(Timestamp(i64::MIN), Timestamp(i64::MAX)),
             row_group_rows: 131_072,
             batch_rows: 8_192,
+            site: None,
+            store_id: None,
         }
     }
 }
@@ -109,6 +122,18 @@ impl ExportOptions {
         self
     }
 
+    /// Sets the site label.
+    pub fn site(mut self, site: impl Into<String>) -> Self {
+        self.site = Some(site.into());
+        self
+    }
+
+    /// Sets the store id.
+    pub fn store_id(mut self, id: [u8; 16]) -> Self {
+        self.store_id = Some(id);
+        self
+    }
+
     fn metadata(&self) -> Result<Vec<(String, String)>, ExportError> {
         if self.row_group_rows == 0 {
             return Err(ExportError::InvalidOptions {
@@ -131,11 +156,19 @@ impl ExportOptions {
                 });
             }
         };
-        Ok(vec![
+        let mut kv = vec![
             ("kvik.view".into(), view),
             ("kvik.range_from_ns".into(), self.range.from.0.to_string()),
             ("kvik.range_to_ns".into(), self.range.to.0.to_string()),
-        ])
+        ];
+        if let Some(site) = &self.site {
+            check_site(site)?;
+            kv.push(("kvik.site".into(), site.clone()));
+        }
+        if let Some(id) = self.store_id {
+            kv.push(("kvik.store_id".into(), lower_hex(&id)));
+        }
+        Ok(kv)
     }
 }
 
@@ -147,6 +180,67 @@ pub struct ExportSummary {
     pub rows: u64,
     /// Row groups written.
     pub row_groups: usize,
+}
+
+/// `bytes` as lower-case hex, as `format.md` A.17 writes a store id.
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One file of a partitioned export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PartitionFile {
+    /// Its path relative to the bucket or folder: [`partition_dir`] / [`file_name`].
+    pub path: String,
+    /// Its month.
+    pub month: Month,
+    /// What it holds.
+    pub summary: ExportSummary,
+}
+
+/// Exports one series' facts in `options.range` and `options.view`, one file per UTC month that holds a fact, at
+/// `site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet` (`docs/export.md` Partitioned layout, Q-196).
+/// `open` is given each file's relative path in month order; `options.site` is required. Each month is read on
+/// its own, after one pass over the range that finds the months.
+pub fn export_partitioned<W, F>(
+    reader: &Reader,
+    id: SeriesId,
+    options: &ExportOptions,
+    mut open: F,
+) -> Result<Vec<PartitionFile>, ExportError>
+where
+    W: Write + Send,
+    F: FnMut(&str) -> std::io::Result<W>,
+{
+    options.metadata()?;
+    let site = options.site.as_deref().ok_or(ExportError::InvalidOptions {
+        reason: "a partitioned export needs a site",
+    })?;
+    let name = file_name(options.view)?;
+    let series = reader.series(id)?;
+    SeriesSchema::from_info(&series)?;
+    let mut months = std::collections::BTreeSet::new();
+    for f in reader.facts(id, options.range, options.view)? {
+        months.insert(Month::of(f?.t));
+    }
+    let mut files = Vec::with_capacity(months.len());
+    for month in months {
+        let m = month.range();
+        let range = TimeRange::new(m.from.max(options.range.from), m.to.min(options.range.to));
+        let path = format!("{}/{name}", partition_dir(site, &series.name, month));
+        let out = open(&path).map_err(|source| ExportError::Open {
+            path: path.clone(),
+            source,
+        })?;
+        let summary = export_series(reader, id, &options.clone().range(range), out)?;
+        files.push(PartitionFile {
+            path,
+            month,
+            summary,
+        });
+    }
+    Ok(files)
 }
 
 /// Exports one series' facts in `options.range` and `options.view` from a reader into one Parquet file.

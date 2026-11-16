@@ -85,6 +85,14 @@ pub enum ExportError {
         /// The fact's position.
         position: Position,
     },
+    /// A partitioned export could not open one of its files.
+    #[error("cannot open {path}: {source}")]
+    Open {
+        /// The file's relative path.
+        path: String,
+        /// Why.
+        source: std::io::Error,
+    },
     /// A file that does not follow the export schema.
     #[error("not an export file: {reason}")]
     NotAnExport {

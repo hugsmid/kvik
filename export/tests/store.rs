@@ -31,6 +31,7 @@ fn assert_round_trip(r: &Reader, id: SeriesId, view: View) -> Vec<u8> {
     let expected = facts(r, id, view);
     assert!(!expected.is_empty());
     assert_eq!(bits(&read_back(&file)), bits(&expected), "{view:?}");
+    assert_eq!(open(&file).metadata("kvik.export_version"), Some("1"));
     file
 }
 

@@ -717,6 +717,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bytes",
+ "jiff",
  "kvik",
  "parquet",
  "proptest",

@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 arrow-array = "60.1"
 arrow-schema = "60.1"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 kvik = { path = "../kvik" }
 parquet = { version = "60.1", default-features = false, features = ["arrow", "zstd"] }
 thiserror = "2"
