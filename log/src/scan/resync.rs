@@ -19,12 +19,23 @@ struct ChainEnd {
     batch_bytes: u64,
 }
 
-/// The chain ends of the block starts walked so far, from the current position on; kept across the regions of a
+/// What is known of the chain through a block start.
+#[derive(Clone, Copy, Debug)]
+enum Link {
+    End(Option<ChainEnd>),
+    /// The chain runs on through this block start, not yet walked: a walk stops more than a batch beyond its
+    /// candidate, so the remembered starts span at most one batch (`format.md` A, common rules: scan bound).
+    Through(u64),
+}
+
+/// The chains of the block starts walked so far, from the current position on; kept across the regions of a
 /// scan, so each block start is walked once per scan (Q-110).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Chains {
-    ends: BTreeMap<u64, Option<ChainEnd>>,
+    links: BTreeMap<u64, Link>,
     pruned: u64,
+    #[cfg(test)]
+    pub(crate) peak: usize,
 }
 
 /// The readable commit blocks of a tail (`spec.md` §3 Recovery rule 3), collected alongside the candidates so the
@@ -32,19 +43,23 @@ pub(crate) struct Chains {
 #[derive(Debug)]
 pub(crate) struct CommitSearch {
     next: u64,
+    end: u64,
     pub(crate) found: Vec<ReadableCommit>,
 }
 
 impl CommitSearch {
-    pub(crate) fn new(from: u64) -> Self {
+    /// A search of the steps in `[from, end)`, `end` being just past the last non-zero byte.
+    pub(crate) fn new(from: u64, end: u64) -> Self {
         Self {
             next: from,
+            end,
             found: Vec::new(),
         }
     }
 
     /// Visits every step below `to`.
     fn advance(&mut self, reads: &mut Reads<'_>, to: u64, limit: u64) {
+        let to = to.min(self.end);
         while self.next < to && self.next + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
             self.next = commit_step(reads, self.next, limit, &mut self.found);
         }
@@ -113,7 +128,7 @@ impl Chains {
             }
             // Block starts below `o`, and table entries below the commit search, are never asked about again.
             if o.saturating_sub(self.pruned) >= 1 << 16 {
-                self.ends = self.ends.split_off(&o);
+                self.links = self.links.split_off(&o);
                 self.pruned = o;
                 reads.forget_below(commits.as_deref().map_or(o, |c| c.next.min(o)));
             }
@@ -144,37 +159,56 @@ impl Chains {
     }
 
     /// The commit block that the chain of block headers from `o` ends in, or `None` if the chain ends in anything
-    /// else: a header that is not valid, a seal block, or a block too long for a batch. Bodies are not read, except
-    /// the `batch_bytes` field of a commit body. Every block start walked, the failing one included, is remembered.
+    /// else: a header that is not valid, a seal block, or a block too long for a batch, or if it runs on more than a
+    /// batch beyond `o`. Bodies are not read, except the `batch_bytes` field of a commit body. Every block start
+    /// walked, the failing one included, is remembered.
     fn chain_end(&mut self, reads: &mut Reads<'_>, o: u64, limit: u64) -> Option<ChainEnd> {
         let mut walked = Vec::new();
         let mut p = o;
         let end = loop {
-            if let Some(known) = self.ends.get(&p) {
-                break *known;
+            match self.links.get(&p) {
+                Some(Link::End(known)) => break Some(*known),
+                Some(Link::Through(q)) => {
+                    walked.push(p);
+                    p = *q;
+                    continue;
+                }
+                None => {}
+            }
+            if p - o > MAX_BATCH_DATA {
+                break None;
             }
             walked.push(p);
             let Some(h) = reads.peek(p, limit) else {
-                break None;
+                break Some(None);
             };
             match h.block_type {
                 block_type::COMMIT if h.body_len as usize == COMMIT_LEN => {
                     let field = p + (BLOCK_HEADER_LEN + 32) as u64;
-                    break slice(reads.bytes, field, 8)
-                        .filter(|_| p + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit)
-                        .map(|b| ChainEnd {
-                            at: p,
-                            batch_bytes: u64_at(b, 0),
-                        });
+                    break Some(
+                        slice(reads.bytes, field, 8)
+                            .filter(|_| p + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit)
+                            .map(|b| ChainEnd {
+                                at: p,
+                                batch_bytes: u64_at(b, 0),
+                            }),
+                    );
                 }
-                block_type::COMMIT | block_type::SEGMENT_INDEX | block_type::TRAILER => break None,
-                _ if h.block_len() > MAX_BATCH_DATA => break None,
+                block_type::COMMIT | block_type::SEGMENT_INDEX | block_type::TRAILER => {
+                    break Some(None);
+                }
+                _ if h.block_len() > MAX_BATCH_DATA => break Some(None),
                 _ => p += h.block_len(),
             }
         };
+        let link = end.map_or(Link::Through(p), Link::End);
         for w in walked {
-            self.ends.insert(w, end);
+            self.links.insert(w, link);
         }
-        end
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.links.len());
+        }
+        end.flatten()
     }
 }

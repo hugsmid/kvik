@@ -203,6 +203,8 @@ impl<'a> PrefixCrc<'a> {
             self.reg = step8(self.reg, word.try_into().ok()?);
             self.sums.push_back(!self.reg);
             self.checksummed += 8;
+            #[cfg(test)]
+            BYTES_HASHED.with(|c| c.set(c.get() + 8));
         }
         let index = |o: u64| ((o - self.base) / 8) as usize;
         let head =

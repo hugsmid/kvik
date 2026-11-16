@@ -282,6 +282,7 @@ pub struct Scanner<'a> {
     chains: Chains,
     walks: Walks,
     legacy: bool,
+    nonzero_end: Option<u64>,
 }
 
 impl<'a> Scanner<'a> {
@@ -377,6 +378,7 @@ impl<'a> Scanner<'a> {
             chains: Chains::default(),
             walks: Walks::default(),
             legacy,
+            nonzero_end: None,
         })
     }
 
@@ -416,6 +418,15 @@ impl<'a> Scanner<'a> {
     fn finish(&mut self, tail: Tail) {
         self.done = true;
         self.tail = Some(tail);
+    }
+
+    /// Just past the last non-zero byte of the area at or above `pos`, or `pos`; found once per scan.
+    fn nonzero_end(&mut self, pos: u64) -> u64 {
+        let (bytes, area_end) = (self.bytes, self.area_end);
+        let end = *self
+            .nonzero_end
+            .get_or_insert_with(|| last_non_zero_end(bytes, 0, area_end));
+        end.max(pos)
     }
 
     fn keep(&mut self, b: Batch<'a>) -> Found<'a> {
@@ -475,7 +486,11 @@ impl<'a> Iterator for Scanner<'a> {
             _ => LossCause::Corruption,
         };
         // An invalid region starts at `pos` (zeros below the limit included, Q-105 (a)); resynchronise (A.2).
-        let mut search = (!self.bounded && !self.legacy).then(|| CommitSearch::new(pos));
+        let end = self.nonzero_end(pos);
+        let mut search = (!self.bounded && !self.legacy).then(|| CommitSearch::new(pos, end));
+        if self.legacy {
+            self.chains = Chains::default();
+        }
         let found = self.chains.resync(
             &mut self.reads,
             &self.id,
@@ -513,7 +528,6 @@ impl<'a> Iterator for Scanner<'a> {
                 })))
             }
             Ok(None) => {
-                let end = last_non_zero_end(bytes, pos, area_end);
                 let commits = match search {
                     Some(s) => s.below(end),
                     None => readable_commits(&mut self.reads, pos, end, area_end),

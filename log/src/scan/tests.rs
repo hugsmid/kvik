@@ -259,3 +259,27 @@ fn a_resumed_scan_continues_where_the_last_stopped() {
     .unwrap();
     assert!(matches!(s.next(), Some(Ok(Found::Region(_)))));
 }
+
+#[test]
+fn resynchronising_over_a_chain_longer_than_a_batch_remembers_at_most_a_batch_of_block_starts() {
+    let (mut bytes, id) = chain(0);
+    bytes.truncate(HEADER_LEN);
+    bytes.extend_from_slice(&[0xFF; 8]);
+    let body = [0u8; 112];
+    while bytes.len() < 3 * crate::batch::MAX_BATCH_DATA as usize {
+        encode_block(0x50, FLAG_SKIPPABLE, &body, &mut bytes).unwrap();
+    }
+    let len = bytes.len() as u64;
+    let mut reads = Reads::new(&bytes, true);
+    let mut chains = Chains::default();
+    let found = chains
+        .resync(&mut reads, &id, HEADER_LEN as u64, len, 1, None)
+        .unwrap();
+    assert!(found.is_none());
+    let bound = ((crate::batch::MAX_BATCH_DATA + (1 << 16)) / 128 + 16) as usize;
+    assert!(
+        chains.peak <= bound,
+        "{} block starts remembered, bound {bound}",
+        chains.peak
+    );
+}
