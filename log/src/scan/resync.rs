@@ -34,6 +34,8 @@ enum Link {
 pub(crate) struct Chains {
     links: BTreeMap<u64, Link>,
     pruned: u64,
+    /// The reference scan's walks run to the chain's end, as before the scan bound.
+    reference: bool,
     #[cfg(test)]
     pub(crate) peak: usize,
 }
@@ -103,6 +105,14 @@ pub(crate) fn readable_commits(
 }
 
 impl Chains {
+    /// The chains of one region of the reference scan.
+    pub(crate) fn reference() -> Self {
+        Self {
+            reference: true,
+            ..Self::default()
+        }
+    }
+
     /// Steps forward 8 bytes at a time from an invalid region at `start` and returns the first complete batch
     /// (A.2). With `commits`, also runs the tail's commit search up to the limit.
     ///
@@ -175,7 +185,7 @@ impl Chains {
                 }
                 None => {}
             }
-            if p - o > MAX_BATCH_DATA {
+            if !self.reference && p - o > MAX_BATCH_DATA {
                 break None;
             }
             walked.push(p);

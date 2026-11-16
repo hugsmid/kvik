@@ -489,7 +489,7 @@ impl<'a> Iterator for Scanner<'a> {
         let end = self.nonzero_end(pos);
         let mut search = (!self.bounded && !self.legacy).then(|| CommitSearch::new(pos, end));
         if self.legacy {
-            self.chains = Chains::default();
+            self.chains = Chains::reference();
         }
         let found = self.chains.resync(
             &mut self.reads,
