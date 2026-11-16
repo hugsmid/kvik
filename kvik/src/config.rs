@@ -149,8 +149,11 @@ pub struct LogConfig {
     pub segment_size: u64,
     /// A segment is sealed after this long at the latest (default 5 minutes).
     pub seal_interval: Duration,
-    /// Batch syncs are due at least this far apart (default 10 ms; 0 disables; spec §3 Group commit).
+    /// The ceiling of the batch-sync interval (default 10 ms; 0 disables the bound; spec §3 Group commit).
     pub min_sync_interval: Duration,
+    /// The least batch-sync interval, which adapts to the sync's duration between this and `min_sync_interval`;
+    /// at or above `min_sync_interval` the interval is fixed (default 10 ms; spec §3 Group commit, Q-710).
+    pub sync_interval_floor: Duration,
     /// Largest batch (default 1 MiB; 64 KiB to 8 MiB).
     pub max_batch_bytes: u64,
     /// Mark sync (default every second).
@@ -163,6 +166,7 @@ impl Default for LogConfig {
             segment_size: 64 << 20,
             seal_interval: Duration::from_secs(300),
             min_sync_interval: Duration::from_millis(10),
+            sync_interval_floor: kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR,
             max_batch_bytes: 1 << 20,
             mark_sync: MarkSync::Interval(Duration::from_secs(1)),
         }

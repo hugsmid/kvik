@@ -271,7 +271,8 @@ pub struct Log {
 
 impl Log {
     /// Starts `kvik-writer` and `kvik-maint` on an opened writer.
-    pub fn start(writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+    pub fn start(mut writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        writer.set_sync_clock(clock.clone());
         let cfg = writer.config().clone();
         let shared = Arc::new(Shared {
             front: Mutex::new(Front {

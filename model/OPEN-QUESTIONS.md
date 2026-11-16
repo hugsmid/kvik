@@ -1330,6 +1330,45 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-710 — The default floor of the batch-sync interval
+
+**Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
+`log.min_sync_interval` (spec §3 Group commit). With a floor of 2 ms a fast device waits about 2 ms instead of 10,
+and a store of 1,000 unbatched 1 Hz series on it runs up to 500 batch syncs a second instead of 100: at 4 KiB a
+sync, about 173 GiB of host writes a day against 35 GiB, roughly a decade of a 600 TBW drive if sustained. Spec §3
+states the bound as at most 1/`min_sync_interval` per second (100 at the default), §13 Sync rate and SSD wear names
+a longer `min_sync_interval` as the remedy, and `design.md` Budgets ties p50 ≤ 5 ms to about 100 synced batches a
+second.
+**Settled by the owner's ruling:** the default `log.sync_interval_floor` is 2 ms. Spec §3 states the bound as at
+most 1/`sync_interval_floor` batch syncs per second (500 at the default), and `api.md` Configuration states the
+wear ceiling; a deployment on flash that is sensitive to wear sets a longer floor, up to `min_sync_interval`, where
+the interval is fixed. The interval lands first with the floor at 10 ms, which changes no behaviour; the default
+moves in a change of its own once the commit latency rows show no regression against the fixed 10 ms rows (no
+worse p50 or p99 at any load, no lower throughput).
+
+## Q-711 — New fields in the log crate's `WriterConfig` and `LogStats`
+
+**Scenario.** `kvik_log::writer::WriterConfig` gains `sync_interval_floor`, and `LogStats` gains `sync_interval`
+and `sync_time`. Neither struct is `#[non_exhaustive]`, so a caller that builds one naming every field no longer
+compiles.
+**Decided by the lead.** The fields are added; no `#[non_exhaustive]`, which would itself break callers by
+forbidding struct expressions outside the crate (every test and benchmark builds `WriterConfig` with
+`..WriterConfig::default()`; no literal in the tree names every field). The log crate is not published.
+`kvik::LogConfig` and `kvik::LogStats` are `#[non_exhaustive]` already and take the new key and statistics
+compatibly.
+
+## Q-712 — The constants of the adaptive interval
+
+**Scenario.** The interval is eight times a smoothed batch-sync duration (`log/src/writer/pacing.rs`); the estimate
+rises to a longer sample at once and falls by an eighth of the difference per shorter one. A multiplier of 4 would
+halve the wait on a mid-speed device and double its sync rate up to the floor; rising at once holds a device with
+frequent short outliers near the ceiling; with the mark synced at every commit each batch brings a mark sync that
+could be timed with it.
+**Decided by the lead.** Multiplier 8, a fall of an eighth, a rise at once; with the mark synced at every commit only
+the batch sync is sampled, so device syncs are up to twice the batch-sync bound, as today. None is a configuration
+key. The commit latency sweep over multipliers 4, 8 and 16 at a 2 ms floor may change the multiplier before the
+default floor changes (Q-710). Pinned by the unit tests of `pacing.rs` and `log/tests/pacing.rs`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1342,7 +1381,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-712; the owner settled Q-710 and the lead decided Q-711 and Q-712.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1410,6 +1449,9 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling; the interval lands at 10 ms (no change) and the default moves in its own change after the commit latency rows |
+| Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
+| Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the multiplier may change with the sweep before the default floor does |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

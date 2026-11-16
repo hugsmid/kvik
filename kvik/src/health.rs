@@ -344,6 +344,10 @@ pub struct LogStats {
     pub sealed_segments: u64,
     /// Bytes in the log (model accounting).
     pub bytes: u64,
+    /// The batch-sync interval in force (spec §3 Group commit); zero with the model backend, which does not sync.
+    pub sync_interval: Duration,
+    /// The smoothed duration of a batch sync; `None` before the first, and with the model backend.
+    pub sync_time: Option<Duration>,
     /// Manifest records rebuilt from local files.
     pub manifest_rebuilds: u64,
     /// Losses a manifest rebuild listed under their first missing position,
