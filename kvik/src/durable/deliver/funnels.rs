@@ -3,9 +3,8 @@
 //! their timers, and the condition deliveries they emit.
 
 use std::collections::BTreeMap;
-use std::ops::Bound;
 
-use kvik_log::entries::{RouteCondition, Versioning};
+use kvik_log::entries::RouteCondition;
 use kvik_log::facts::Value as LogValue;
 use kvik_log::writer::Position as LogPos;
 use kvik_model::condition::{ConditionState as MState, ResumeHistory, Runner};
@@ -14,7 +13,7 @@ use super::{Ctx, Deliverer, Pend, next};
 use crate::consume::TriggerCause;
 use crate::durable::index::Stored;
 use crate::durable::routing::{FunnelRec, model_condition, numeric};
-use crate::durable::windows::live_fact;
+use crate::durable::windows::{live_with, may_be_live, params};
 use crate::read::Live;
 use crate::series::Timing;
 use crate::types::SeriesId;
@@ -51,15 +50,32 @@ impl Deliverer {
         }
     }
 
+    /// The live-state fact of a series at `now` (`spec.md` §2.3): the current fact with the greatest `t ≤ now` that
+    /// is not bad quality (for an observed interval series, `t + d ≤ now`); a forecast series has none.
+    pub(super) fn live_fact(&self, s: u32, now: i64) -> Option<Stored> {
+        let series = self.view.registry.get(s)?;
+        let p = params(&series.def);
+        if series.spec.timing == Timing::Forecast {
+            return None;
+        }
+        let mut found = None;
+        self.back(s, now, &mut |f| {
+            if may_be_live(series, &p, f, now) {
+                found = Some(f.clone());
+                false
+            } else {
+                true
+            }
+        });
+        found
+    }
+
     /// The value a condition sees now: the live-state value of its series (`spec.md` §2.3), for a numeric series.
     pub(super) fn value_of(&self, s: u32, now: i64) -> Option<f64> {
         if !numeric(&self.view.registry, s) {
             return None;
         }
-        live_fact(&self.index, SeriesId(s), now)
-            .ok()
-            .flatten()
-            .and_then(number)
+        self.live_fact(s, now).as_ref().and_then(number)
     }
 
     /// For a stale-for condition over a scheduled series, `now − t` of its live-state fact (`None` without one).
@@ -74,12 +90,8 @@ impl Deliverer {
             .registry
             .get(s)
             .is_some_and(|x| x.spec.timing == Timing::Scheduled);
-        (scheduled && matches!(c, RouteCondition::StaleFor { .. })).then(|| {
-            live_fact(&self.index, SeriesId(s), now)
-                .ok()
-                .flatten()
-                .map(|x| now - x.row.t)
-        })
+        (scheduled && matches!(c, RouteCondition::StaleFor { .. }))
+            .then(|| self.live_fact(s, now).map(|x| now - x.row.t))
     }
 
     /// Whether a funnel's live-state value may have changed since `since` without a new fact: a fact of its series
@@ -94,11 +106,12 @@ impl Deliverer {
             }
             _ => 0,
         };
-        let versioned = series.def.versioning != Versioning::None;
-        self.index
-            .current_between(s, versioned, Bound::Unbounded, Bound::Unbounded, true)
-            .next()
-            .is_some_and(|f| f.row.t.saturating_add(length) > since)
+        let mut latest = None;
+        self.back(s, i64::MAX, &mut |f| {
+            latest = Some(f.row.t);
+            false
+        });
+        latest.is_some_and(|t| t.saturating_add(length) > since)
     }
 
     /// What a resume rebuilds of a condition's past (`spec.md` §6 Restart and resume), as the reference model does.
@@ -111,28 +124,18 @@ impl Deliverer {
         let mut h = ResumeHistory::default();
         match c {
             RouteCondition::HeldFor { above, .. } => {
-                let versioned = self
-                    .view
-                    .registry
-                    .get(s)
-                    .is_some_and(|x| x.def.versioning != Versioning::None);
                 let mut start = None;
-                for f in self.index.current_between(
-                    s,
-                    versioned,
-                    Bound::Unbounded,
-                    Bound::Included(ctx.now),
-                    true,
-                ) {
+                self.back(s, ctx.now, &mut |f| {
                     if f.row.quality == kvik_log::facts::Quality::Bad || f.no_value() {
-                        continue;
+                        return true;
                     }
                     if number(f).is_some_and(|v| v > *above) {
                         start = Some(f.row.t);
+                        true
                     } else {
-                        break;
+                        false
                     }
-                }
+                });
                 h.above_for = start.map_or(0, |t| ctx.now - t);
             }
             RouteCondition::StaleFor { .. } => {
@@ -145,8 +148,13 @@ impl Deliverer {
 
     /// Live state (`spec.md` §2.3, §5.4) of a series for a resync.
     pub(super) fn live_of(&self, s: u32, ctx: &Ctx<'_>) -> Live {
-        crate::durable::windows::live_in(&self.index, ctx.clocks, SeriesId(s), ctx.now)
-            .unwrap_or(Live::None)
+        let Some(series) = self.view.registry.get(s) else {
+            return Live::None;
+        };
+        match self.live_fact(s, ctx.now) {
+            Some(f) => live_with(&params(&series.def), ctx.clocks, SeriesId(s), &f, ctx.now),
+            None => Live::None,
+        }
     }
 
     /// Evaluates a consumer's condition funnels: on a taken batch, those whose series has a fact fed in it; on the

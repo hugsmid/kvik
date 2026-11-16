@@ -43,6 +43,7 @@ log-reader      log   reader
 log-pacing      log   pacing
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
+kvik-durable    kvik  durable
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs

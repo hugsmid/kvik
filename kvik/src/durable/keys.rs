@@ -32,21 +32,14 @@ pub(crate) trait LocalFacts: Send + std::fmt::Debug {
     fn between(&mut self, series: u32, from: i64, to: i64) -> Option<Vec<FoundFact>>;
 }
 
-/// [`LocalFacts`] on the local log.
+/// [`LocalFacts`] on a log reader of this process and the regions its owner passed over as lost.
 #[derive(Debug)]
-pub(crate) struct LogFacts {
-    reader: LogReader,
-    /// Invalid regions the start passed over, by segment and offset.
-    lost: BTreeSet<(u64, u64)>,
+pub(crate) struct OnLog<'a> {
+    pub(crate) reader: &'a mut LogReader,
+    pub(crate) lost: &'a BTreeSet<(u64, u64)>,
 }
 
-impl LogFacts {
-    pub(crate) fn new(reader: LogReader, lost: BTreeSet<(u64, u64)>) -> Self {
-        LogFacts { reader, lost }
-    }
-}
-
-impl LocalFacts for LogFacts {
+impl LocalFacts for OnLog<'_> {
     fn at(&mut self, keys: &[Key]) -> Found {
         let wanted: Vec<Wanted> = keys
             .iter()
@@ -56,7 +49,7 @@ impl LocalFacts for LogFacts {
                 to: t,
             })
             .collect();
-        let lost = &self.lost;
+        let lost = self.lost;
         let mut out = Found::default();
         match self.reader.lookup(&wanted, &|f, o| lost.contains(&(f, o))) {
             Ok(l) => {
@@ -86,7 +79,7 @@ impl LocalFacts for LogFacts {
             from,
             to,
         }];
-        let lost = &self.lost;
+        let lost = self.lost;
         let l = self
             .reader
             .lookup(&wanted, &|f, o| lost.contains(&(f, o)))
@@ -94,5 +87,36 @@ impl LocalFacts for LogFacts {
         let mut facts = l.facts;
         facts.sort_by_key(|f| f.position);
         l.complete[0].then_some(facts)
+    }
+}
+
+/// [`LocalFacts`] on a log reader it owns.
+#[derive(Debug)]
+pub(crate) struct LogFacts {
+    reader: LogReader,
+    /// Invalid regions the start passed over, by segment and offset.
+    lost: BTreeSet<(u64, u64)>,
+}
+
+impl LogFacts {
+    pub(crate) fn new(reader: LogReader, lost: BTreeSet<(u64, u64)>) -> Self {
+        LogFacts { reader, lost }
+    }
+
+    fn on(&mut self) -> OnLog<'_> {
+        OnLog {
+            reader: &mut self.reader,
+            lost: &self.lost,
+        }
+    }
+}
+
+impl LocalFacts for LogFacts {
+    fn at(&mut self, keys: &[Key]) -> Found {
+        self.on().at(keys)
+    }
+
+    fn between(&mut self, series: u32, from: i64, to: i64) -> Option<Vec<FoundFact>> {
+        self.on().between(series, from, to)
     }
 }

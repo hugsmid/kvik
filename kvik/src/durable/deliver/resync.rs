@@ -119,7 +119,7 @@ impl Deliverer {
                 return;
             }
             let limit = rt.resume.unwrap_or(self.head);
-            self.restore_items(at);
+            self.restore_items(at, ctx);
             let mut view = match self.consumers.get_mut(name).and_then(|rt| rt.view.take()) {
                 Some((p, v)) if p == at => v,
                 _ => self.view_before(at),

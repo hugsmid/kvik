@@ -21,11 +21,13 @@
 mod confirm;
 mod funnels;
 mod hub;
+mod recent;
 mod resync;
 
 pub(crate) use hub::Hub;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -51,6 +53,9 @@ use crate::consume::{Delivery, Funnel, FunnelId, ResyncCause, Start, TriggerCaus
 use crate::env::Env;
 use crate::health::{ConsumerStats, DeliveryStats};
 use crate::types::SavedPoint;
+
+/// Items the open takes from the log at a time.
+const LOAD_PART: usize = 1 << 16;
 
 /// How often a consumer's cursor file is written at most, and the timer cadence (`spec.md` §4 Consumer state, §6
 /// Cadence).
@@ -197,19 +202,24 @@ struct Rt {
 /// See the module documentation.
 #[derive(Debug)]
 pub(crate) struct Deliverer {
-    reader: Option<LogReader>,
+    /// Also read for facts outside the recent window, from calls that hold the deliverer shared ([`recent`]).
+    reader: RefCell<Option<LogReader>>,
     store_id: [u8; 16],
+    /// The registry, entries and commit times of the kept log; no facts (roadmap 11.0).
     index: Index,
+    recent: recent::Recent,
+    /// Invalid regions the reader passed over, by segment and offset: lost (Q-750).
+    damaged: BTreeSet<(u64, u64)>,
+    /// Reads of the log for facts outside the recent window.
+    slow: Cell<u64>,
     /// The kept log by position, from `items_from` up (the lowest cursor); below it, a consumer that needs older
-    /// records has them rebuilt from the index ([`Deliverer::restore_items`]).
+    /// records has them read from the log again ([`Deliverer::restore_items`]).
     items: BTreeMap<LogPos, Rec>,
     items_from: LogPos,
     /// Every entry that is not a fact, by position: the routes and registry at any position.
     entries: BTreeMap<LogPos, Entry>,
     /// Batches read and not yet taken.
     pending: VecDeque<ReadBatch>,
-    /// The highest `changed_at` per key of a versioned series.
-    top: BTreeMap<(u32, i64), u64>,
     /// Per series, the receive time of its last fact that was not outranked (`spec.md` §6 Restart and resume).
     last_arrival: BTreeMap<u32, i64>,
     view: View,
@@ -258,14 +268,16 @@ impl Deliverer {
         cfg.lease_refresh = Duration::from_secs(30 * 60);
         let reader = LogReader::open(cfg).map_err(|e| io::Error::other(e.to_string()))?;
         let mut d = Deliverer {
-            reader: Some(reader),
+            reader: RefCell::new(Some(reader)),
             store_id,
-            index: Index::default(),
+            index: Index::without_facts(),
+            recent: recent::Recent::default(),
+            damaged: BTreeSet::new(),
+            slow: Cell::new(0),
             items: BTreeMap::new(),
             items_from: LogPos::default(),
             entries: BTreeMap::new(),
             pending: VecDeque::new(),
-            top: BTreeMap::new(),
             last_arrival: BTreeMap::new(),
             view: View::default(),
             head: LogPos::default(),
@@ -281,29 +293,38 @@ impl Deliverer {
             stats: DeliveryStats::default(),
             loading: true,
         };
+        // `now` places the recent window while the log is taken (roadmap 11.0).
         let ctx = Ctx {
             watch: None,
             env,
             dir,
             clocks,
-            now: 0,
+            now: clocks.now(),
             wall: 0,
             mono: 0,
         };
-        // The kept log, read whole before anything is delivered: a read that fails stops the open.
-        let first = d
-            .reader
-            .as_mut()
-            .map(LogReader::refresh)
-            .transpose()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        d.take_events(first.map(|u| u.events).unwrap_or_default());
-        d.pump(&ctx);
+        // The kept log, read in parts before anything is delivered: a read that fails stops the open.
+        loop {
+            let read = d
+                .reader
+                .get_mut()
+                .as_mut()
+                .map(|r| r.refresh_some(LOAD_PART))
+                .transpose()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let Some((u, more)) = read else { break };
+            d.take_events(u.events);
+            d.take_pending(&ctx);
+            if !more {
+                break;
+            }
+        }
         d.loading = false;
         // Lost ranges not described by a recovery entry are reset points: `forget_above` the position before, id
         // its last position (`spec.md` §4 Resync).
         let lost: Vec<_> = d
             .reader
+            .get_mut()
             .as_ref()
             .map(|r| r.lost_ranges().to_vec())
             .unwrap_or_default();
@@ -366,7 +387,10 @@ impl Deliverer {
 
     /// Counts of what taking the log met.
     pub(crate) fn delivery_stats(&self) -> DeliveryStats {
-        self.stats.clone()
+        DeliveryStats {
+            slow_path: self.slow.get(),
+            ..self.stats.clone()
+        }
     }
 
     fn take_events(&mut self, events: Vec<ReadEvent>) {
@@ -376,14 +400,17 @@ impl Deliverer {
                 ReadEvent::Void { above, .. } => self.void(above),
                 // A region below the mark: the writer's next start records the loss; positions in it are never
                 // delivered.
-                ReadEvent::Corruption { .. } => self.stats.corruptions += 1,
+                ReadEvent::Corruption { file_id, region } => {
+                    self.stats.corruptions += 1;
+                    self.damaged.insert((file_id, region.start));
+                }
             }
         }
     }
 
     /// Takes the batches acknowledged since the last call.
     pub(crate) fn pump(&mut self, ctx: &Ctx<'_>) {
-        let Some(r) = self.reader.as_mut() else {
+        let Some(r) = self.reader.get_mut().as_mut() else {
             return;
         };
         // A refresh that fails changes nothing the reader holds; the next one reads it again. It is counted.
@@ -392,7 +419,14 @@ impl Deliverer {
             Ok(None) => {}
             Err(_) => self.stats.refresh_errors += 1,
         }
+        self.take_pending(ctx);
+    }
+
+    /// Takes the batches read that are acknowledged.
+    fn take_pending(&mut self, ctx: &Ctx<'_>) {
         let stats = ctx.watch.map(Watch::stats);
+        let mut read: HashMap<crate::durable::history::Key, Vec<kvik_log::reader::FoundFact>> =
+            HashMap::new();
         let mut took = false;
         while let Some(b) = self.pending.front() {
             if let Some(st) = &stats {
@@ -402,7 +436,7 @@ impl Deliverer {
                 }
             }
             let b = self.pending.pop_front().expect("looked at above");
-            self.take_batch(b, ctx);
+            self.take_batch(b, ctx, &mut read);
             took = true;
         }
         if took {
@@ -430,8 +464,8 @@ impl Deliverer {
         self.items_from = self.items_from.max(next(floor));
     }
 
-    /// Rebuilds the records from `at` up to where they are kept, from the index's facts and the entries.
-    fn restore_items(&mut self, at: LogPos) {
+    /// Rebuilds the records from `at` up to where they are kept, from the entries and the log's facts.
+    fn restore_items(&mut self, at: LogPos, ctx: &Ctx<'_>) {
         if at >= self.items_from {
             return;
         }
@@ -439,29 +473,7 @@ impl Deliverer {
         for (p, e) in self.entries.range(at..to) {
             self.items.insert(*p, Rec::Entry(e.clone()));
         }
-        let mut facts = Vec::new();
-        for id in self.index.fact_series() {
-            // In `(t, position)` order, so the facts of one key are neighbours.
-            let all: Vec<&Stored> = self.index.series_facts(id).collect();
-            for (k, f) in all.iter().enumerate() {
-                if f.position < at || f.position >= to {
-                    continue;
-                }
-                // Outranked at commit: an earlier fact of the key with a higher `changed_at` (`spec.md` §4).
-                let outranked = f.row.changed_at.is_some_and(|c| {
-                    all[..k]
-                        .iter()
-                        .rev()
-                        .take_while(|g| g.row.t == f.row.t)
-                        .chain(all[k + 1..].iter().take_while(|g| g.row.t == f.row.t))
-                        .any(|g| {
-                            g.position < f.position && g.row.changed_at.is_some_and(|gc| gc > c)
-                        })
-                });
-                facts.push(((*f).clone(), outranked));
-            }
-        }
-        for (stored, outranked) in facts {
+        for (stored, outranked) in self.facts_between(at, to, ctx) {
             self.items.insert(
                 stored.position,
                 Rec::Fact(Arc::new(FactRec { stored, outranked })),
@@ -476,6 +488,7 @@ impl Deliverer {
             above,
             cause: kvik_log::reader::VoidCause::Rewritten,
         }]);
+        self.recent.void(above);
         self.items.retain(|p, _| *p <= above);
         self.items_from = self.items_from.min(next(above));
         self.entries.retain(|p, _| *p <= above);
@@ -488,8 +501,32 @@ impl Deliverer {
         self.view = view;
     }
 
-    fn take_batch(&mut self, b: ReadBatch, ctx: &Ctx<'_>) {
-        self.index.apply(&[ReadEvent::Batch(b.clone())]);
+    fn take_batch(
+        &mut self,
+        b: ReadBatch,
+        ctx: &Ctx<'_>,
+        read: &mut HashMap<crate::durable::history::Key, Vec<kvik_log::reader::FoundFact>>,
+    ) {
+        self.index.batch(&b);
+        // Versioned facts below the recent window: their keys' earlier facts are read from the log, once per pass.
+        let mut keys: Vec<crate::durable::history::Key> = b
+            .content
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Fact(r) if r.changed_at.is_some() => Some((r.series_id, r.t)),
+                _ => None,
+            })
+            .filter(|k| self.recent.key(*k).is_none() && !read.contains_key(k))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if !keys.is_empty() {
+            let found = self.read_keys(&keys);
+            for k in keys {
+                read.insert(k, found.facts.get(&k).cloned().unwrap_or_default());
+            }
+        }
         let mut fed: Vec<u32> = Vec::new();
         let mut sequence = b.first.sequence;
         let names: Vec<String> = self.consumers.keys().cloned().collect();
@@ -504,11 +541,7 @@ impl Deliverer {
                     let key = (row.series_id, row.t);
                     let outranked = row
                         .changed_at
-                        .is_some_and(|c| self.top.get(&key).is_some_and(|t| c < *t));
-                    if let Some(c) = row.changed_at {
-                        let t = self.top.entry(key).or_insert(c);
-                        *t = (*t).max(c);
-                    }
+                        .is_some_and(|c| self.outranked(key, p, c, read));
                     let rec = Arc::new(FactRec {
                         stored: Stored {
                             position: p,
@@ -518,6 +551,8 @@ impl Deliverer {
                         outranked,
                     });
                     let series = rec.stored.row.series_id;
+                    let span = crate::durable::history::span_of(&self.view.registry, series);
+                    self.recent.note(&rec, span, ctx.now);
                     if !outranked {
                         fed.push(series);
                         self.last_arrival.insert(series, b.content.received_at);
@@ -598,6 +633,7 @@ impl Deliverer {
         let p = super::index::log_pos(point.position);
         let current = self
             .reader
+            .borrow()
             .as_ref()
             .map(|r| r.state().stamp)
             .unwrap_or_default();
@@ -638,6 +674,7 @@ impl Deliverer {
         }
         let lost: Vec<_> = self
             .reader
+            .borrow()
             .as_ref()
             .map(|r| r.lost_ranges().to_vec())
             .unwrap_or_default();
@@ -793,7 +830,7 @@ impl Deliverer {
 
     /// Closes the log reader (its lease is deleted).
     pub(crate) fn close(&mut self) {
-        if let Some(r) = self.reader.take() {
+        if let Some(r) = self.reader.get_mut().take() {
             let _ = r.close();
         }
     }

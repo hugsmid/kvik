@@ -70,6 +70,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-705 | §2.3, §4 Outranked facts; `api.md` `Outcome` | The model backend's `outranked` when a later reading of the same call outranks an earlier one |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-750 | §2.4, §3 Recovery rule 2, §8 Corrupt block | The slow path of the duplicate rule meeting damage found during a run |
+| Q-751 | §5.1, §11 | The recent window's span and cap as configuration keys |
+| Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
+| Q-753 | §2.3 Live state, §4 Outranked facts, §5.1, §6 Restart and resume | What the deliverer keeps in memory and reads from the log |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1416,6 +1419,52 @@ alternative), once quarantine exists.
 **Pinned by.** `a_key_that_cannot_be_read_is_recorded_unchecked_unless_a_known_fact_matches` (unit test of the
 decision), `a_lookup_never_reads_damage_as_absence_unless_the_region_is_lost` (unit test of the log reader).
 
+## Q-751 — The recent window's span and cap as configuration keys
+Recorded by roadmap 11.0. To be settled by the owner before gate 5.6.
+**Scenario.** §5.1 gives the recent window "default 15 minutes, at most 1 024 facts", and §11 says every default is a
+configuration key; `api.md` Configuration names no key for it, and the design of 11.0 does not make it one. A store
+of 2,000 series at one reading a second holds about 1.8 million facts in windows (about 130 MiB in the writer and as
+much in the deliverer, `docs/measurements/store-emit-throughput.md`); a smaller window trades memory for slow-path
+reads of late data (§13 Duplicate check on replay, Memory per series).
+**Decided by the lead.** Constants (`kvik/src/durable/history.rs`: `WINDOW_SPAN`, `WINDOW_FACTS`), the span at least
+an interval series' length; calendar lengths are not supported yet. A key named `limits.recent_window` would be
+additive if the owner wants one.
+
+## Q-752 — A start's time and the revised-key index before tree checkpoints exist
+Recorded by roadmap 11.0. To be settled by roadmap 7.1b (tree files and checkpoints).
+**Scenario.** §8 has each tree checkpoint carry the revised-key index, the version index and each series' latest
+recorded `t`, so a start replays only the log after the checkpoint (§13 Restart ≤ 1 s). No checkpoint exists yet. A
+store holding a few million readings is opened.
+**Decision.** The writer's start reads the whole log once, in parts of 65,536 items, keeping only the registry,
+commit times and recovery entries, each series' latest `t` and lateness reference, its recent window, the keys
+revised within the window as they leave it, and the per-series counters rebuilt from the log (`recorded`, `late`,
+`future`); the deliverer's open does the same for its own state. Memory at start is bounded by those and one part of
+the log; the start's time stays proportional to the log. The in-memory revised-key index is complete for each key it
+holds, but holds only the keys this process saw revised in the window or read whole by the slow path: a key revised
+outside the window before a restart is found by the slow path, not the index, until the index is persisted. A part
+that voids what came before it (a recovery entry voiding intact batches above its `after`, which the recovery rules
+leave no room for) cannot be undone from that state, so the start then reads the log again whole into memory, as
+before 11.0.
+**Open.** A start bounded in time needs the persisted state of §8 (the tree checkpoint), a change to the formats;
+the counters rebuilt at a start need it too.
+
+## Q-753 — What the deliverer keeps in memory and reads from the log
+Recorded by roadmap 11.0. To be settled by roadmap 5.6 (delivery looked at as a whole).
+**Scenario.** The deliverer kept an index of every fact for live state (§2.3), held-for history (§6 Restart and
+resume), whether a fact was outranked when committed (§4) and the records of a consumer that is behind.
+**Decision.** Per series it keeps every fact taken with `t` at or above a floor: the earlier of the series' latest `t`
+and `now`, less the recent window's span, so the facts a live-state fact can come from as `now` advances (scheduled
+values ahead of `now` included) stay in memory; at most 1,024 facts below that point. A fact of a versioned series
+below the floor is judged outranked from its key's facts read from the log (once per taken batch for all such
+keys); live state and held-for history before the floor are read a span at a time, each span 16 times the last; a
+consumer behind has its records read again from the log by position. Each read is counted in
+`DeliveryStats::slow_path`. The deliverer's view of a run of bad facts longer than the window therefore costs reads
+of the log on every evaluation of a condition on that series.
+**Pinned by.** `the_deliverer_holds_its_recent_window_and_reads_older_facts_from_the_log`,
+`a_fact_taken_below_the_window_is_judged_outranked_from_the_log` (unit tests of the deliverer);
+`deliveries_follow_the_model_over_restarts` (`kvik/tests/consumer_properties.rs`), whose histories jump past the
+window.
+
 ## Q-710 — The default floor of the batch-sync interval
 
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
@@ -1492,7 +1541,7 @@ of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
 
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-753.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1564,6 +1613,9 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-705 | 5.5 | The model backend's `outranked` within one call; recorded by the store-path quick wins |
 | Q-706 | 5.5 | An emit's read-back with no consumer registered; recorded by the store-path quick wins, not built |
 | Q-750 | 6.3b | The duplicate rule's slow path on damage found during a run: recorded unchecked; recorded by roadmap 11.0 |
+| Q-751 | 5.6 | The recent window as a configuration key; constants decided by the lead with roadmap 11.0, awaiting the owner |
+| Q-752 | 7.1b | A start bounded in memory but not in time until tree checkpoints carry the decision state; recorded by roadmap 11.0 |
+| Q-753 | 5.6 | The deliverer's recent window and its reads of the log; decided by the lead with roadmap 11.0 |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |

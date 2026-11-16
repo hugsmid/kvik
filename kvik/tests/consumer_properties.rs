@@ -5,6 +5,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::world::{World, gauge, ready, resync};
@@ -82,6 +83,8 @@ fn steps(crashes: bool) -> impl Strategy<Value = Vec<Step>> {
     let step = prop_oneof![
         10 => (0usize..4, any::<u8>()).prop_map(|(i, v)| Step::Emit(i, v)),
         4 => (0u64..3).prop_map(Step::Advance),
+        // Beyond the recent window (15 minutes), so live state and held-for history are read from the log.
+        1 => (1_000u64..3_000).prop_map(Step::Advance),
         1 => Just(Step::Tick),
         4 => (0usize..2, funnel_kind()).prop_map(|(c, k)| Step::Route(c, k)),
         1 => (0usize..2, 0usize..3).prop_map(|(c, n)| Step::Unroute(c, n)),
@@ -226,7 +229,11 @@ fn run(
         match step {
             Step::Emit(i, v) => {
                 let id = ids.get(*i).copied().unwrap_or(SeriesId(999));
-                let value = f64::from(*v % 8) * 15.0;
+                // A bad reading now and then, so that the live-state fact may lie before the recent window.
+                let value = match *v % 9 {
+                    8 => f64::NAN,
+                    k => f64::from(k) * 15.0,
+                };
                 let r = block_on(s.emit(&[Reading::new(id, clock.wall(), Value::F64(value))]));
                 match r {
                     Ok(a) => {
@@ -310,9 +317,13 @@ fn run(
         }
     }
     drop(cs);
+    SLOW.fetch_add(s.stats().delivery.slow_path, Ordering::Relaxed);
     block_on(s.shutdown()).unwrap();
     rec.out
 }
+
+/// The deliverer's reads of the log for facts outside its recent window, over the differential histories.
+static SLOW: AtomicU64 = AtomicU64::new(0);
 
 fn next_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -357,6 +368,10 @@ fn deliveries_follow_the_model_over_restarts() {
             Ok(())
         })
         .unwrap();
+    assert!(
+        SLOW.load(Ordering::Relaxed) > 0,
+        "some history reads facts outside the deliverer's recent window"
+    );
 }
 
 /// What the crash test knows of one consumer.
