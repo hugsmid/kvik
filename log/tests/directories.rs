@@ -163,11 +163,15 @@ fn fold(batches: &Batches, limit: u64, written_at: i64) -> (Position, Vec<Series
 struct Hook {
     fs: MemFs,
     health: Mutex<u8>,
+    /// Added to the position the entries are as of: a hook that oversteps the limit it is given.
+    overshoot: Mutex<u64>,
 }
 
 impl SealHook for Hook {
     fn series(&self, limit: Position, written_at: i64) -> Option<(Position, Vec<SeriesEntry>)> {
-        Some(fold(&batches(&self.fs), limit.sequence, written_at))
+        let (mut through, entries) = fold(&batches(&self.fs), limit.sequence, written_at);
+        through.sequence += *self.overshoot.lock().unwrap();
+        Some((through, entries))
     }
     fn status(&self) -> Option<StatusContent> {
         Some(StatusContent {
@@ -212,6 +216,7 @@ impl Rig {
             hook: Arc::new(Hook {
                 fs: fs.clone(),
                 health: Mutex::new(health::OK),
+                overshoot: Mutex::new(0),
             }),
             fs,
             clock: Arc::new(ManualClock::default()),
@@ -1023,4 +1028,52 @@ fn a_group_of_another_generation_than_the_root_names_is_not_used() {
     // The previous generation still matches the catalogue, but it lists fewer segments than the root says.
     let d = r.load().unwrap();
     assert!(d.groups.last().unwrap().is_none());
+}
+
+#[test]
+fn entries_a_hook_gives_above_the_synced_mark_are_not_written() {
+    let mut r = Rig::new(cfg());
+    *r.hook.overshoot.lock().unwrap() = 1;
+    ingest(&mut r, 300, 0);
+    r.settle();
+    assert_eq!(r.series(), None);
+    *r.hook.overshoot.lock().unwrap() = 0;
+    ingest(&mut r, 100, 10_000_000);
+    r.settle();
+    assert!(r.series().is_some());
+}
+
+#[test]
+fn seals_listed_together_across_a_group_boundary_are_all_written() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 6_000, 0);
+    r.settle();
+    let before = r.sealed().len();
+    assert!(before < logdir::GROUP_SEGMENTS, "{before}");
+    let d = r.dirs.take();
+    ingest(&mut r, 800, 90_000_000);
+    r.settle();
+    assert!(r.sealed().len() > logdir::GROUP_SEGMENTS);
+    r.dirs = d;
+    r.settle();
+    let d = r.load().unwrap();
+    assert!(d.groups.iter().all(Option::is_some));
+    assert_eq!(d.segments().cloned().collect::<Vec<_>>(), r.sealed());
+}
+
+#[test]
+fn a_seal_handed_over_after_the_files_were_read_is_listed_once() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 300, 0);
+    r.settle();
+    // Seals the new directories hear of although they find them on disk when they first run.
+    r.dirs = None;
+    ingest(&mut r, 200, 10_000_000);
+    r.settle();
+    assert!(!r.sealed_records.is_empty());
+    r.open();
+    r.settle();
+    let d = r.load().unwrap();
+    assert!(d.groups.iter().all(Option::is_some));
+    assert_eq!(d.segments().cloned().collect::<Vec<_>>(), r.sealed());
 }
