@@ -586,7 +586,11 @@ fn fail_to_open(r: &mut Rig, id: u64, tries: u32) {
         assert_eq!(r.w.reasons(), want, "try {k}");
         let due = r.now + retry_wait(k);
         let next = r.w.step(r.now, r.wall, &mut r.q).next;
-        assert!(next.is_some_and(|t| t <= due), "try {k}: {next:?}");
+        // A seal that came due in this turn wakes the writer when it ends, and the retry time counts again then.
+        assert!(
+            r.w.seals_running() || next.is_some_and(|t| t <= due),
+            "try {k}: {next:?}"
+        );
     }
 }
 
@@ -662,4 +666,31 @@ fn a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow()
         p.wait().unwrap();
     }
     assert!(sealed_files(&fs.inner).contains_key(&3));
+}
+
+#[test]
+fn a_due_retry_that_cannot_be_handed_out_does_not_wake_the_writer_at_once() {
+    let fs = sealed_store(2);
+    let ids: Vec<u64> = sealed_files(&fs.inner).keys().copied().collect();
+    let mut r = Rig::open(fs);
+    r.fs.fail_opens(&seg_path(ids[0], true).to_string_lossy());
+    assert!(try_describe(&mut r, ids[0], 0).is_err());
+    // The second is handed out and still being described when the first's retry comes due.
+    assert_eq!(r.w.take_unlisted(r.now), Some(unlisted(ids[1])));
+    r.now += retry_wait(0) + seal_rig::MS;
+    let mut turns = 0;
+    loop {
+        let next = r.w.step(r.now, r.wall, &mut r.q).next;
+        if next.is_none_or(|t| t > r.now) {
+            break;
+        }
+        turns += 1;
+        assert!(turns < 3, "the writer turns at once: {next:?}");
+    }
+    assert!(r.w.take_unlisted(r.now).is_none());
+    let res = describe_sealed(&r.fs, r.w.log_dir(), &unlisted(ids[1]));
+    r.w.unlisted_done(res, r.now);
+    let next = r.w.step(r.now, r.wall, &mut r.q).next;
+    assert!(next.is_some_and(|t| t <= r.now), "{next:?}");
+    assert_eq!(r.w.take_unlisted(r.now), Some(unlisted(ids[0])));
 }

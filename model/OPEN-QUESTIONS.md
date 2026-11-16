@@ -1382,7 +1382,9 @@ waited for a whole segment's read). (c) No description
 taken as the hash at seal. A failure to open or read it (`DescribeError::Io`: a sharing violation, a descriptor limit,
 a permission, an I/O error that may clear) is retried within the run, 10 s after the first failure and then twice as
 long each time up to 10 minutes (`DESCRIBE_RETRY_INTERVAL`, `DESCRIBE_RETRY_MAX`), at the writer's timer, so never
-in a busy loop; the segment stays unlisted meanwhile, and health names it once the wait reaches its cap (Q-640). Only a failed check
+in a busy loop: a retry time counts for the writer's next turn only while it could be handed out (none in flight, no
+seal ready or running), and what closes that gate wakes the writer when it ends (scenario from the re-check of
+roadmap 6.3b: a retry due while another description was reading spun the writer loop); the segment stays unlisted meanwhile, and health names it once the wait reaches its cap (Q-640). Only a failed check
 (`NotSealed`, `Invalid`: header, trailer, end marker, `file_crc32c`) is damage: health is degraded by
 `Reason::SegmentDamaged { file_id }` (`api.md` Health; `spec.md` §8 Corrupt block, §11) while the writer runs, and
 raised again at each start until a description succeeds: a damaged unlisted segment is damaged data, held degraded
@@ -1398,6 +1400,7 @@ for the rest of the run, while the same error on a seal is `SealBlocked` and ret
 `a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow`,
 `a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it`,
 `a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears`,
+`a_due_retry_that_cannot_be_handed_out_does_not_wake_the_writer_at_once`,
 `a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
 `describe_sealed_refuses_each_check_it_makes`,
 `a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against

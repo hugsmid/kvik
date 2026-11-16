@@ -1099,7 +1099,13 @@ impl LogWriter {
         if let Some(t) = self.blocked.iter().map(|(_, t)| *t).min() {
             at(t);
         }
-        if let Some(t) = self.describe_retry.iter().map(|(_, t, _)| *t).min() {
+        // Only while `take_unlisted` could hand the retry out; the description or seal that closes that gate wakes
+        // the writer when it finishes, so a due retry never spins the loop.
+        if self.fault.is_none()
+            && self.describing.is_none()
+            && !self.seals_running()
+            && let Some(t) = self.describe_retry.iter().map(|(_, t, _)| *t).min()
+        {
             at(t);
         }
         next
