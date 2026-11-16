@@ -57,3 +57,57 @@ Re-measured once that change was in, the same way (three alternated runs, load u
 The gain holds: the ranges for one writer overlap here because of one fast run of the old build, while the medians
 (436 k and 519 k) and CPU per reading keep the earlier picture; 16 writers stay at 4–6×.
 
+
+## Bounded decision history (roadmap 11.0)
+The writer's decision state and the deliverer's facts are bounded by the recent window (spec §5.1) and the
+revised-key index; keys outside them are read from the local log (the slow path, spec §2.4). Harness:
+[`kvik/examples/history_memory.rs`](../../kvik/examples/history_memory.rs), one writer, one reading per series per call,
+each call one second after the last, `log.min_sync_interval = 0`, no consumer. Before is the tree the change is based
+on, with the harness added; after is the tree with it. The builds alternated, each run started once the one-minute
+load average was under 2.0, on the same 4-core shared virtual machine. **Indicative.**
+
+**Memory as readings accumulate** (2,000 series, 2,000 readings per call, 4 million readings; resident memory in MiB,
+the same in both runs of each build):
+
+| Readings | 0.5 M | 1 M | 2 M | 3 M | 4 M |
+|---|---|---|---|---|---|
+| before | 284 | 546 | 1,084 | 1,532 | 2,089 |
+| after | 125 | 233 | 424 | 443 | 400 |
+
+Before grows about 520 MiB per million readings. After levels off once 15 minutes of readings are held (1.8 million
+readings here): about 1.8 million facts in the writer's window and as many in the deliverer's, some 400–440 MiB in
+all, whatever the store's age. Readings per second (mean over the run): before 456 and 509 k, after 458 and 464 k.
+
+**A workload with late readings** (500 series, 6,000 calls, 3 million readings; after the first hour every tenth call
+also repeats ten readings of an hour earlier, duplicates, and records ten new readings two hours earlier, all outside
+the window): 4,800 readings took the slow path (0.16 %), in 240 calls, one read of the log per call.
+
+| Build | Resident at 3 M | Call with late readings | Other calls | Readings/s (mean) |
+|---|---|---|---|---|
+| before | 1,532 MiB | 1.98–2.26 ms | 1.55–1.80 ms | 258–291 k |
+| after | 159–160 MiB | 6.3–6.4 ms | 1.63–1.66 ms | 289–291 k |
+
+**Cost of the slow path on the ingest path**, after: the extra time of a call whose 20 late readings are read in one
+pass, over the other calls of the same run, and per slow-path reading. The read keeps, per segment, each batch's place
+and range of event times, so a later read decodes only the batches that may hold a key and those appended since; the
+first read after a start maps every segment it needs. A first version without that map is shown for comparison.
+
+| Store | Readings | Extra per call | Per slow-path reading | Without the map, per reading |
+|---|---|---|---|---|
+| small: 100 series | 0.5 M | 1.0 ms | 0.05 ms | 1.4 ms |
+| middle: 500 series | 3 M | 4.7 ms | 0.23 ms | 6.8 ms |
+| large: 2,000 series | 10 M | 12 ms | 0.60 ms | 16 ms |
+
+The cost grows with the bytes of the segments a key's event time may be in (the open segment is scanned for new
+batches at every read); a replay of an hour across many series is a stated slow path (spec §13 Duplicate check on
+replay).
+
+**Start of a store holding 4 million readings** (2,000 series, 193 MB on disk; each open in a new process):
+
+| Build | Open | Resident after the open |
+|---|---|---|
+| before | 9.0–10.1 s | 3,509 MiB |
+| after | 7.3–9.6 s | 428 MiB |
+
+The start still reads the whole log once (Q-752): it keeps only the window, the revised keys met in it and the
+counters, so its memory is bounded; its time stays proportional to the log until tree checkpoints carry that state.
