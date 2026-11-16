@@ -111,7 +111,7 @@ fn counted(name: &str, n: usize) -> (Store, ManualClock, Arc<Mutex<Counts>>, Vec
     log.min_sync_interval = Duration::ZERO;
     let dir = format!("write-path/{name}");
     let store = block_on(Store::open(
-        StoreConfig::new(&dir, "Europe/London")
+        StoreConfig::new(&dir, "Etc/UTC")
             .create_if_missing(true)
             .env(env)
             .log(log),

@@ -1316,19 +1316,22 @@ fn a_refresh_reads_of_its_segment_only_the_header_the_new_bytes_and_the_last_bat
         ends.push(r.mark().unwrap().offset);
     }
     r.refresh().unwrap();
-    let (m0, m1) = (ends[ends.len() - 2], ends[ends.len() - 1]);
-    assert!(m1 > 64 << 10, "a high offset in the segment: {m1}");
+    let (before_last, last) = (ends[ends.len() - 2], ends[ends.len() - 1]);
+    assert!(last > 64 << 10, "a high offset in the segment: {last}");
     segment_reads(&read);
     r.submit(items(20, 9_000));
     r.drain();
-    let m2 = r.mark().unwrap().offset;
+    let new = r.mark().unwrap().offset;
     r.refresh().unwrap();
     let header = kvik_log::header::HEADER_LEN as u64;
-    assert_eq!(segment_reads(&read), (header + (m2 - m1) + (m1 - m0), 1));
+    assert_eq!(
+        segment_reads(&read),
+        (header + (new - last) + (last - before_last), 1)
+    );
     // Nothing new: only the check of the last batch reads the segment.
     let u = r.refresh().unwrap();
     assert!(u.events.is_empty());
-    assert_eq!(segment_reads(&read), (m2 - m1, 1));
+    assert_eq!(segment_reads(&read), (new - last, 1));
     r.check_caught_up();
 }
 
