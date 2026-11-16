@@ -19,7 +19,8 @@ computation for exact equality.
 | Ingest (lateness, future readings, invalid values, the clock before synchronisation, retirement, interval phase), duplicates, commit with crash points, durable mark (in the page cache and as last synced, every commit or timed), recovery by boot id (rules 1–3: stale marks, recovery entries at F with reset stamps and id floors, gaps, power losses and remounts that lose acknowledged batches, lost marks and cursor files), losses and their acknowledgement, saved points, delivery (run-time routes, condition funnels and timer deliveries, cursors and latches, catch-up, resync, reset points carrying `forget_above` and waiting for their confirmation), compaction and compaction of compacted files, atomic manifest records, reader leases, retirement, tiers, backup, tree checkpoints, generations, stepwise restore | `engine` (the start's recovery in `engine::recovery`) |
 
 The model does not yet follow every rule of the specification; [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) lists where
-it differs, and the open questions in the specification itself.
+it differs, and the open questions in the specification itself. It has no timing: group commit's schedule and its
+adaptive batch-sync interval are tested on the log crate's writer (`log/tests/cadence.rs`, `log/tests/pacing.rs`).
 
 ## Tests
 

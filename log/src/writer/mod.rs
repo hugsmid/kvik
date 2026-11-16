@@ -41,6 +41,7 @@
 mod gather;
 mod maint;
 mod options;
+mod pacing;
 mod queue;
 pub mod recovery;
 pub mod sources;
@@ -72,6 +73,7 @@ use crate::lease::LeaseTable;
 use crate::mark::{MarkSlot, SLOT_OFFSETS};
 use crate::segment::SealSummary;
 use crate::store::{LEASES_DIR, MARK, StoreDir, StoreError};
+use pacing::SyncPace;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -85,6 +87,8 @@ pub const SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// The most entries in one call, whatever the queue's capacity (`api.md` Writing).
 pub const MAX_CALL_ENTRIES: usize = 65_536;
 const DAY_NS: i64 = 86_400_000_000_000;
+/// The default `log.sync_interval_floor` (Q-710).
+pub const DEFAULT_SYNC_INTERVAL_FLOOR: Duration = Duration::from_millis(2);
 
 /// When the mark file is synced (`api.md` `log.mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,9 +106,12 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// `log.seal_interval`: a segment in use this long is sealed, if it holds a batch.
     pub seal_interval: Duration,
-    /// `log.min_sync_interval`: batch syncs are due at least this far apart (spec §3 Group commit, Q-310); zero
-    /// disables the bound.
+    /// `log.min_sync_interval`: the ceiling of the batch-sync interval, and the interval before the first sample
+    /// (spec §3 Group commit, Q-310); zero disables the bound.
     pub min_sync_interval: Duration,
+    /// `log.sync_interval_floor`: the least batch-sync interval; at or above `min_sync_interval` the interval is
+    /// fixed (spec §3 Group commit, Q-710).
+    pub sync_interval_floor: Duration,
     /// `log.max_batch_bytes`: 64 KiB to 8 MiB.
     pub max_batch_bytes: u64,
     /// `log.mark_sync`.
@@ -130,6 +137,7 @@ impl Default for WriterConfig {
             segment_size: 64 * MIB,
             seal_interval: Duration::from_secs(300),
             min_sync_interval: Duration::from_millis(10),
+            sync_interval_floor: DEFAULT_SYNC_INTERVAL_FLOOR,
             max_batch_bytes: MIB,
             mark_sync: MarkSync::Interval(Duration::from_secs(1)),
             ingest_queue: 65_536,
@@ -460,6 +468,10 @@ pub struct LogStats {
     pub mark_syncs: u64,
     /// The highest series id assigned.
     pub max_series_id: u32,
+    /// The batch-sync interval in force (spec §3 Group commit).
+    pub sync_interval: Duration,
+    /// The smoothed duration of a batch sync; `None` before the first sample.
+    pub sync_time: Option<Duration>,
 }
 
 /// A finished call: its id and its result.
@@ -550,6 +562,9 @@ pub struct LogWriter {
     last_batch_due: Option<Duration>,
     /// When the previous log sync started, a timed seal's included.
     last_sync_start: Option<Duration>,
+    /// Times batch syncs for the pace; with none, the interval stays at `min_sync_interval`.
+    sync_clock: Option<Arc<dyn Clock>>,
+    pace: SyncPace,
     fault: Option<Fault>,
     halt: Arc<Halt>,
     seals: Vec<SealJob>,
@@ -632,6 +647,8 @@ impl LogWriter {
                 syncs: 0,
                 mark_syncs: 0,
                 max_series_id: r.max_series_id,
+                sync_interval: cfg.min_sync_interval,
+                sync_time: None,
             },
             fs,
             store,
@@ -659,6 +676,8 @@ impl LogWriter {
             intervals: r.intervals,
             last_batch_due: None,
             last_sync_start: None,
+            sync_clock: None,
+            pace: SyncPace::default(),
             fault: r.fault,
             halt,
             seals: r.seals,
@@ -736,18 +755,30 @@ impl LogWriter {
         r
     }
 
-    /// The earliest time the next batch sync may start: `min_sync_interval` after the previous batch sync was due
-    /// and half of it after the previous log sync started (spec §3 Group commit, Q-310).
+    /// Times each batch sync on `clock`, so that the interval adapts to the device (spec §3 Group commit);
+    /// [`Log::start`] passes its clock.
+    pub fn set_sync_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.sync_clock = Some(clock);
+    }
+
+    /// The batch-sync interval in force: `min_sync_interval` before the first sample.
+    pub fn sync_interval(&self) -> Duration {
+        self.pace
+            .interval(self.cfg.sync_interval_floor, self.cfg.min_sync_interval)
+    }
+
+    /// The earliest time the next batch sync may start: the interval after the previous batch sync was due and half
+    /// of it after the previous log sync started (spec §3 Group commit, Q-310).
     pub fn sync_ready_at(&self) -> Duration {
         let spaced = self
             .last_sync_start
-            .map_or(Duration::ZERO, |s| s + self.cfg.min_sync_interval / 2);
+            .map_or(Duration::ZERO, |s| s + self.sync_interval() / 2);
         self.grid_ready_at().max(spaced)
     }
 
     fn grid_ready_at(&self) -> Duration {
         self.last_batch_due
-            .map_or(Duration::ZERO, |d| d + self.cfg.min_sync_interval)
+            .map_or(Duration::ZERO, |d| d + self.sync_interval())
     }
 
     /// When a batch sync starting at `now` was due: when the previous one's due time let it start, but at most one
@@ -755,7 +786,7 @@ impl LogWriter {
     /// only while the load stays at the bound (Q-310).
     fn batch_sync_due(&self, now: Duration) -> Duration {
         self.grid_ready_at()
-            .max(now.saturating_sub(self.cfg.min_sync_interval))
+            .max(now.saturating_sub(self.sync_interval()))
     }
 
     fn fail(&mut self, op: FaultOp, path: &Path, e: &io::Error) {
@@ -1222,9 +1253,16 @@ impl LogWriter {
             .as_ref()
             .or(self.open.as_ref())
             .expect("a segment in use");
+        let before = self.sync_clock.as_ref().map(|c| c.monotonic());
         if let Err(e) = seg.file.sync_data() {
             self.fail(FaultOp::Sync, &path, &e);
             return Some(Self::unknown(calls));
+        }
+        if let (Some(c), Some(b)) = (&self.sync_clock, before) {
+            self.pace
+                .sample(pacing::nanos(c.monotonic().saturating_sub(b)));
+            self.stats.sync_interval = self.sync_interval();
+            self.stats.sync_time = self.pace.estimate();
         }
         let last = content.last_sequence();
         // The batch is on stable storage: account for it in the segment's summary and index.

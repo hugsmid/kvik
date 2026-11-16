@@ -1104,6 +1104,8 @@ impl Writer {
                 open_file_id: ls.as_ref().and_then(|s| s.open_file_id),
                 sealed_segments: ls.as_ref().map_or(0, |s| s.sealed_segments),
                 bytes: ls.as_ref().map_or(0, |s| s.bytes),
+                sync_interval: ls.as_ref().map_or(Duration::ZERO, |s| s.sync_interval),
+                sync_time: ls.as_ref().and_then(|s| s.sync_time),
                 manifest_rebuilds: 0,
                 loss_identities_rebuilt: 0,
             },
@@ -1169,6 +1171,7 @@ fn writer_config(config: &StoreConfig) -> WriterConfig {
         segment_size: l.segment_size,
         seal_interval: l.seal_interval,
         min_sync_interval: l.min_sync_interval,
+        sync_interval_floor: l.sync_interval_floor,
         max_batch_bytes: l.max_batch_bytes,
         mark_sync: match l.mark_sync {
             MarkSync::Interval(d) => LogMarkSync::Interval(d),

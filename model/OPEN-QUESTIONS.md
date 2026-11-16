@@ -1390,6 +1390,68 @@ at the next one"; "invalid regions below the durable mark the delivery reader pa
 small change with a test that a consumer registered after many such calls receives what its start promises; if no,
 the read-back stays on the caller's thread until acknowledged batches are handed to the deliverer in memory.
 
+## Q-710 — The default floor of the batch-sync interval
+
+**Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
+`log.min_sync_interval` (spec §3 Group commit). With a floor of 2 ms a fast device waits about 2 ms instead of 10,
+and a store of 1,000 unbatched 1 Hz series on it runs up to 500 batch syncs a second instead of 100: at 4 KiB a
+sync, about 165 GiB of host writes a day against 33 GiB, roughly a decade of a 600 TBW drive if sustained. Spec §3
+states the bound as at most 1/`min_sync_interval` per second (100 at the default), §13 Sync rate and SSD wear names
+a longer `min_sync_interval` as the remedy, and `design.md` Budgets ties p50 ≤ 5 ms to about 100 synced batches a
+second.
+**Settled by the owner's ruling:** the default `log.sync_interval_floor` is 2 ms. Spec §3 states the bound as at
+most 1/`sync_interval_floor` batch syncs per second (500 at the default), and `api.md` Configuration states the
+wear ceiling; a deployment on flash that is sensitive to wear sets a longer floor, up to `min_sync_interval`, where
+the interval is fixed. The interval landed with the floor at 10 ms, which changed no behaviour; the default moved
+to 2 ms in a change of its own after the commit latency rows (`docs/measurements/4.8-adaptive-sync-interval.md`)
+showed no regression against the fixed 10 ms rows beyond their run-to-run spread. The design's own marks were not
+all met on that machine: one writer of 2,000-reading batches ran at about twice the fixed rate but far below bound 0,
+since its sync of about 0.5 ms keeps the interval near 4 ms; the owner's ruling did not depend on them.
+
+## Q-711 — New fields in the log crate's `WriterConfig` and `LogStats`
+
+**Scenario.** `kvik_log::writer::WriterConfig` gains `sync_interval_floor`, and `LogStats` gains `sync_interval`
+and `sync_time`. Neither struct is `#[non_exhaustive]`, so a caller that builds one naming every field no longer
+compiles.
+**Decided by the lead.** The fields are added; no `#[non_exhaustive]`, which would itself break callers by
+forbidding struct expressions outside the crate (every test and benchmark builds `WriterConfig` with
+`..WriterConfig::default()`; no literal in the tree names every field). The log crate is not published.
+`kvik::LogConfig` and `kvik::LogStats` are `#[non_exhaustive]` already and take the new key and statistics
+compatibly.
+
+## Q-712 — The constants of the adaptive interval
+
+**Scenario.** The interval is eight times a smoothed batch-sync duration (`log/src/writer/pacing.rs`); the estimate
+rises to a longer sample at once and falls by an eighth of the difference per shorter one. A multiplier of 4 would
+halve the wait on a mid-speed device and double its sync rate up to the floor; rising at once holds a device with
+frequent short outliers near the ceiling; with the mark synced at every commit each batch brings a mark sync that
+could be timed with it.
+**Decided by the lead.** Multiplier 8, a fall of an eighth, a rise at once; with the mark synced at every commit only
+the batch sync is sampled, so device syncs are up to twice the batch-sync bound, as today. None is a configuration
+key. The commit latency sweep over multipliers 4, 8 and 16 at a 2 ms floor kept 8
+(`docs/measurements/4.8-adaptive-sync-interval.md`): 4 halved the wait again but ran about 1.7 times the syncs of 8
+at 1,000 calls a second and the lowest saturation throughput of the three; 16 stayed near the fixed schedule.
+Pinned by the unit tests of `pacing.rs` and `log/tests/pacing.rs`.
+**Noted at the review.** The first sample after a start moves the interval from the ceiling to the estimate in one
+step, not by an eighth, so a burst right after the first reading can start syncs half a floor apart where the fixed
+schedule allows one; this stays inside the stated rate and spacing bounds, which the properties of
+`log/tests/pacing.rs` check. The sample grows with the batch and the batch with the interval, so under saturation
+with 1 MiB batches the interval holds itself near the ceiling, and a single closed-loop writer of large calls runs
+well below bound 0 (`docs/measurements/4.8-adaptive-sync-interval.md`); the run on the Linux NVMe target decides
+whether the multiplier or the floor needs tuning for single closed-loop writers.
+
+## Q-713 — A `min_sync_interval` beyond `u64` nanoseconds
+
+**Scenario.** `log.min_sync_interval` has no upper limit. A value near `Duration::MAX` overflowed the additions of the
+sync schedule (the previous due time or sync start plus the interval) and panicked the writer thread; with the
+adaptive interval, a ceiling above about 584 years also changed value at the first sample, which converts it to
+`u64` nanoseconds.
+**Settled with the review of the adaptive interval:** the interval is held in `u64` nanoseconds whether or not there
+is an estimate, so a ceiling above about 584 years counts as 584 years from the start. No configuration that was
+accepted is refused, and the schedule's additions stay far inside `Duration`
+(`a_ceiling_near_the_largest_duration_schedules_without_overflow`,
+`a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample`).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1403,6 +1465,8 @@ the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
+
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1473,6 +1537,10 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-704 | 6.3b | The delivery reader's skipped refresh once the manifest changes during a run; recorded by the store-path quick wins |
 | Q-705 | 5.5 | The model backend's `outranked` within one call; recorded by the store-path quick wins |
 | Q-706 | 5.5 | An emit's read-back with no consumer registered; recorded by the store-path quick wins, not built |
+
+| Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
+| Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
+| Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the sweep kept 8; awaiting the owner's acceptance |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1719,6 +1787,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
@@ -1831,7 +1900,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Cursor file synced at most every 1 s | §4 Consumer state (and at once when a confirmation changes a latch, Q-132) | The cursor and the latches are durable at once on confirmation; the mark file is synced first when the cursor would name a position above the last synced mark (§3 Durable mark) | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Group commit and `min_sync_interval` | §3 Group commit: batch syncs are due at least the interval apart and start at least half of it after any log sync (Q-310); a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
+| Group commit and the batch-sync interval | §3 Group commit: batch syncs are due at least the interval apart and start at least half of it after any log sync (Q-310); the interval follows the smoothed batch-sync duration between `sync_interval_floor` and `min_sync_interval` (Q-710 to Q-712); a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous); `log/tests/pacing.rs` checks the writer against a reference schedule | — |
 | Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
 | Unknown condition and live state during a restore | §6 Conditions, §2.3 Live state, §4 Resync, §8 Restore step 2, invariant 16 (Q-49 (b)): an evaluation with no local detail is skipped and counted (`evaluations_unknown`), the condition keeps its latched state, `resync` reports "unknown", and the first evaluation with detail is a transition if it differs from the latch or there is none; live state of a series whose latest recorded `t` no local fact or stored node holds is unknown, not none | Not modelled: a series that stores no level answers windows and live state during a restore from its local facts, without a flag; nothing is reported unknown or counted | — |

@@ -1755,6 +1755,8 @@ impl Slot {
                     .filter(|f| f.sealed && f.class == km::engine::FileClass::Segment)
                     .count() as u64,
                 bytes: self.model.disk.used_bytes(self.model.config.entry_bytes),
+                sync_interval: std::time::Duration::ZERO,
+                sync_time: None,
                 manifest_rebuilds: 0,
                 loss_identities_rebuilt: 0,
             },
