@@ -78,7 +78,15 @@ The keys roadmap section 4 needs; all may change between opens.
 Keys of later sections (consumer queue, tiers, tree, leases, backup, `mirror_path`) are listed by their items. One is
 fixed already: `manifest.rebuild_wait` (roadmap 6.3), `RebuildWait::After(Duration)` (default 15 minutes) or
 `RebuildWait::Never`, how long the store stays read-only while deep cannot say whether it holds a copy of a corrupt
-manifest record before it rebuilds provisionally (spec §7 Manifest).
+manifest record before it rebuilds provisionally (spec §7 Manifest). The self-repair keys (spec §8 Self-repair,
+roadmap 8.5) are fixed too:
+
+| Key | Type | Default | Limits |
+|---|---|---|---|
+| `repair.acknowledge` | `RepairAcknowledge::Automatic` or `Manual` | `Automatic` | `Manual`: a loss whose re-send stage has ended waits for `acknowledge_losses` |
+| `repair.resend_wait` | `Duration` | 24 h | 0: nothing listens for re-send requests, and stage 2 ends at once (Q-242) |
+| `repair.lost_tries`, `repair.lost_over` | `u32`, `Duration` | 3, 10 min | the scheduled check's lost-object rule, as `RestoreConfig::lost_tries` and `lost_over` (Q-82) |
+| `repair.suspect_after` | `u32` corruptions in a `Duration` | 2 in 30 days | ≥ 1 |
 
 ## Core types (accepted at gate 3.3)
 ```rust
@@ -377,9 +385,24 @@ pub struct LossReport { pub identity: Position, pub kind: LossKind /* DataLost |
     pub first: Option<Position>, pub last: Option<Position>, pub file_id: Option<u64>, pub bytes: u64,
     pub readable_commit_blocks: u32, pub mark_state: MarkState /* Readable | Missing | Unreadable | Stale */,
     pub boot_id: Option<[u8; 16]>, pub commit_time_before: Option<Timestamp>, pub commit_time_after: Option<Timestamp>,
-    pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool }
+    pub cursors_missing: Vec<String>, pub recorded: bool, pub acknowledged: bool /* closed, by any outcome */,
+    pub state: Option<LossState> /* None for a PossibleLoss */ }
+pub enum LossState { Found, Copying, AwaitingResend { until: Timestamp }, AwaitingOperator, Closed(Closed) }
+pub enum Closed { Restored { positions: u64 }, ResendEnded, Operator }
 pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for ever; Store and Reader
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
+pub struct ResendRequest { pub identity: Position, pub first: Position, pub last: Position,
+    pub received_after: Option<Timestamp>, pub received_before: Option<Timestamp>,
+    pub series: Option<Vec<(SeriesId, Timestamp, Timestamp)>> /* None: every series */, pub until: Timestamp }
+pub fn repairs(&self) -> impl Stream<Item = ResendRequest>;  // Store only; every open request, then new ones
+pub async fn repair_done(&self, identity: Position) -> Result<(), WriteError>;
+pub enum Alert { Corruption(CorruptionReport), StorageSuspect { corruptions: u32, within: Span },
+    Fault(Fault), BackupFailed { since: Timestamp } }
+pub enum CorruptionId { File { kind: u8, file_id: u64 }, Range(Position), ManifestRecord { epoch: u64 } }
+pub struct CorruptionReport { pub id: CorruptionId, pub found_at: Timestamp, pub loss: Option<Position>,
+    pub repaired: bool }
+pub fn attention(&self) -> Vec<Alert>;                      // Store and Reader; empty: nobody needs to look
+pub async fn acknowledge_corruptions(&self, ids: &[CorruptionId]) -> Result<(), WriteError>;
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
@@ -396,9 +419,15 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
 ```
 - A loss's identity is the first position of its range when it was first reported; a `PossibleLoss` has its
   recovery entry's position, and the gap before that entry is a `DataLost` with cause `TruncatedTail`. Reports are read from the
-  manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is acknowledged; a
-  `PossibleLoss` is listed by `losses()`, counted, never degrades and needs no acknowledgement (spec §8 Acknowledging
-  a loss, §11 Health). `acknowledge_losses` is refused while read-only and in a drill. A corrupt manifest record with
+  manifest and the recovery entries at every start. A `DataLost` holds health `Degraded` until it is closed (spec §8
+  Self-repair): restored in full from a copy, its re-send stage ended (`repair_done`, `repair.resend_wait`), or by
+  `acknowledge_losses`, which with `repair.acknowledge = Manual` is the only way once the re-send stage has ended. A
+  `PossibleLoss` is listed by `losses()`, counted, never degrades, has no state and needs no acknowledgement (spec §8
+  Acknowledging a loss, §11 Health). `acknowledge_losses`, `acknowledge_corruptions` and `repair_done` are refused
+  while read-only and in a drill; `repair_done` of a loss not awaiting re-send writes nothing. Re-sent readings go
+  through `emit` and take new positions. `attention()` lists what needs a person (spec §8 Self-repair, Attention):
+  each corruption until it is seen, repaired or not, repeated corruption, a fault and a failed or stalled backup; it
+  never changes `Health`. `acknowledge_losses` also marks as seen the corruption each loss came from. A corrupt manifest record with
   no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,
   which is refused while read-only and in a drill as `acknowledge_losses` is, and whose torn acknowledgement record is
   given again as for `acknowledge_losses` (spec §7 Manifest).
