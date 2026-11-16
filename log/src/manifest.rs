@@ -205,13 +205,13 @@ fn record_at(
         return Ok(None);
     }
     let epoch = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
+    if epoch <= min_epoch {
+        return Ok(None);
+    }
     let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
     let Some(list) = fields(&body[RECORD_PREFIX..]) else {
         return Ok(None);
     };
-    if epoch <= min_epoch {
-        return Ok(None);
-    }
     let lost = match t {
         RECORD_LOST_RANGE => match decode_lost(&list) {
             Some(l) => Some(l),
