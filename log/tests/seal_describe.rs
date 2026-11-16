@@ -621,3 +621,37 @@ fn segment_unreadable_clears_when_a_read_succeeds() {
     let got = by_id(&r.w.take_sealed());
     assert_eq!(got[&id], expected(id, &bytes));
 }
+
+#[test]
+fn a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow() {
+    use std::sync::mpsc;
+
+    let fs = sealed_store(2);
+    // Without the segment created ahead, the start asks for one and hands out a description in the same turn; the
+    // description waits behind the held creation.
+    fs.inner.remove_file(&seg_path(4, false)).unwrap();
+    let (entered, release) = fs.hold_next_maint_sync_dir();
+    let log = start_log(&fs);
+    entered
+        .recv_timeout(seal_rig::WAIT)
+        .expect("a creation ahead at the start");
+    // More than the open segment holds, so a seal follows the creation.
+    let pending: Vec<_> = (0..20)
+        .map(|c| {
+            let items = (0..40).map(|i| seal_rig::fact(1 + i % 3, c * 40 + i64::from(i)));
+            log.submit(items.collect()).unwrap()
+        })
+        .collect();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || done_tx.send(log.shutdown()).unwrap());
+    std::thread::sleep(200 * seal_rig::MS);
+    release.send(()).unwrap();
+    done_rx
+        .recv_timeout(seal_rig::WAIT)
+        .expect("the shutdown completes")
+        .unwrap();
+    for p in pending {
+        p.wait().unwrap();
+    }
+    assert!(sealed_files(&fs.inner).contains_key(&3));
+}

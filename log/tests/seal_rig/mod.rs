@@ -75,6 +75,7 @@ struct WatchState {
     fail: Vec<String>,
     fail_open: Vec<String>,
     hold: Option<(Sender<()>, Receiver<()>)>,
+    hold_sync_dir: Option<(Sender<()>, Receiver<()>)>,
 }
 
 #[derive(Debug)]
@@ -128,6 +129,17 @@ impl Watch {
     }
 }
 
+impl Watch {
+    /// Holds the next directory sync on `kvik-maint` (a creation ahead or a seal): `entered` is signalled, then the
+    /// sync waits for `release`.
+    pub fn hold_next_maint_sync_dir(&self) -> (Receiver<()>, Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        self.state.lock().unwrap().hold_sync_dir = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+}
+
 impl Fs for Watch {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>> {
         let name = path.to_string_lossy();
@@ -160,6 +172,15 @@ impl Fs for Watch {
         self.inner.remove_file(path)
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        let hold = if std::thread::current().name() == Some("kvik-maint") {
+            self.state.lock().unwrap().hold_sync_dir.take()
+        } else {
+            None
+        };
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            let _ = release.recv();
+        }
         self.inner.sync_dir(path)
     }
     fn free_space(&self, path: &Path) -> io::Result<u64> {
