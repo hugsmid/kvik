@@ -409,4 +409,32 @@ mod tests {
         // A ceiling for a slow shared machine; the restart budget is 1 s.
         assert!(elapsed.as_secs() < 5, "{elapsed:?} for {len} bytes");
     }
+
+    #[test]
+    fn a_damaged_record_between_valid_ones_is_one_corrupt_span_found_by_the_search() {
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+            .encode()
+            .to_vec();
+        for e in 1..=4 {
+            f.extend(empty(e));
+        }
+        let (third, fourth) = (HEADER_LEN as u64 + 80, HEADER_LEN as u64 + 120);
+        f[third as usize..fourth as usize].fill(0xFF);
+        let (img, stats) = read_with_stats(&f, &[9; 16]);
+        let img = img.unwrap();
+        let epochs: Vec<u64> = img.records().map(|r| r.epoch).collect();
+        assert_eq!(epochs, [1, 2, 4]);
+        assert_eq!(
+            img.corrupt,
+            [CorruptSpan {
+                offset: third,
+                end: fourth,
+                after_epoch: 2,
+                before_epoch: 4,
+            }]
+        );
+        assert!(!img.torn);
+        // Three records read in turn, four steps of the search inside the damaged record, then the record found.
+        assert_eq!(stats.headers_visited, 8);
+    }
 }
