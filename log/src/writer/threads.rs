@@ -672,11 +672,15 @@ fn maint_loop(s: &Shared) {
     let _guard = MaintGuard(s);
     loop {
         let mut m = lock(&s.maint);
-        while m.request.is_none() && m.jobs.is_empty() && m.describe.is_none() && !m.stop {
+        loop {
+            // A description dropped at shutdown leaves the thread waiting for the seals the writer still hands out.
+            if s.stopping.load(Ordering::SeqCst) {
+                m.describe = None;
+            }
+            if m.request.is_some() || !m.jobs.is_empty() || m.describe.is_some() || m.stop {
+                break;
+            }
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
-        }
-        if s.stopping.load(Ordering::SeqCst) {
-            m.describe = None;
         }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
