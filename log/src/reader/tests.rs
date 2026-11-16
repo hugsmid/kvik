@@ -381,6 +381,11 @@ mod parts_and_lookup {
             .unwrap();
         assert_eq!(got.complete, vec![false, true]);
         assert_eq!(got.facts.len(), 1);
+        // The region is now in the segment's map: a later lookup still reports it.
+        let again = r
+            .lookup(&[key(damaged_t), key(later)], &|_, _| false)
+            .unwrap();
+        assert_eq!(again.complete, vec![false, true]);
         let lost = |id: u64, start: u64| id == first.file_id && start == HEADER_LEN as u64;
         let got = r.lookup(&[key(damaged_t), key(later)], &lost).unwrap();
         assert_eq!(got.complete, vec![true, true]);
