@@ -391,33 +391,32 @@ mod parts_and_lookup {
     fn a_lookup_after_appends_finds_what_a_first_lookup_finds() {
         let (fs, log) = store(150);
         let mut r = reader(&fs, 14);
-        let wanted = |t| {
-            [
-                Wanted {
-                    series_id: 3,
-                    from: 0,
-                    to: 0,
-                },
-                Wanted {
-                    series_id: 8,
-                    from: t,
-                    to: t + 3,
-                },
-            ]
-        };
+        let wanted = [
+            Wanted {
+                series_id: 3,
+                from: 0,
+                to: 0,
+            },
+            Wanted {
+                series_id: 8,
+                from: 100,
+                to: i64::MAX,
+            },
+        ];
         let found = |l: Lookup| -> Vec<(Position, FactRow)> {
+            assert_eq!(l.complete, [true, true]);
             l.facts.into_iter().map(|f| (f.position, f.row)).collect()
         };
-        for round in 0..4 {
-            let t = 40 * round;
-            let again = found(r.lookup(&wanted(t), &|_, _| false).unwrap());
-            let fresh = found(reader(&fs, 15).lookup(&wanted(t), &|_, _| false).unwrap());
+        let mut seen = 0;
+        for round in 0..6 {
+            let again = found(r.lookup(&wanted, &|_, _| false).unwrap());
+            let fresh = found(reader(&fs, 15).lookup(&wanted, &|_, _| false).unwrap());
             assert_eq!(again, fresh, "round {round}");
-            assert!(!again.is_empty());
-            for k in 0..40 {
-                let items: Vec<Item> = (0..20).map(|i| fact(i, 150 + 40 * round + k, 1)).collect();
-                log.submit(items).unwrap().wait().unwrap();
-            }
+            assert!(again.len() > seen);
+            seen = again.len();
+            // Small appends, which stay in the segment the first lookup mapped.
+            let items: Vec<Item> = (0..20).map(|i| fact(i, 150 + round, 1)).collect();
+            log.submit(items).unwrap().wait().unwrap();
             log.submit(vec![fact(3, 0, 7_000 + round as u64)])
                 .unwrap()
                 .wait()
