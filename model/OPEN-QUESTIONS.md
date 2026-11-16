@@ -68,7 +68,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
-| Q-640 | §8 Corrupt block, §11 Health; `api.md` Health | A description that never stops failing to open or read its segment |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1383,7 +1382,7 @@ waited for a whole segment's read). (c) No description
 taken as the hash at seal. A failure to open or read it (`DescribeError::Io`: a sharing violation, a descriptor limit,
 a permission, an I/O error that may clear) is retried within the run, 10 s after the first failure and then twice as
 long each time up to 10 minutes (`DESCRIBE_RETRY_INTERVAL`, `DESCRIBE_RETRY_MAX`), at the writer's timer, so never
-in a busy loop; meanwhile health is unchanged and the segment stays unlisted (Q-640). Only a failed check
+in a busy loop; the segment stays unlisted meanwhile, and health names it once the wait reaches its cap (Q-640). Only a failed check
 (`NotSealed`, `Invalid`: header, trailer, end marker, `file_crc32c`) is damage: health is degraded by
 `Reason::SegmentDamaged { file_id }` (`api.md` Health; `spec.md` §8 Corrupt block, §11) while the writer runs, and
 raised again at each start until a description succeeds: a damaged unlisted segment is damaged data, held degraded
@@ -1398,7 +1397,7 @@ for the rest of the run, while the same error on a seal is `SealBlocked` and ret
 `a_shutdown_drops_a_description_in_flight_before_its_next_read`,
 `a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it`,
 `a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears`,
-`a_description_that_never_opens_is_retried_with_doubling_waits_up_to_the_cap_and_never_degrades_health`,
+`a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
 `describe_sealed_refuses_each_check_it_makes`,
 `a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
 the records `kvik-files` encodes,
@@ -1409,15 +1408,19 @@ that matched every log reason stopped compiling once `SegmentDamaged` merged, wi
 **Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
 
 ## Q-640 — A description that never stops failing to open or read its segment
-Recorded at the review of roadmap 6.3b, with the retry of Q-221 (c).
+Recorded at the review of roadmap 6.3b, with the retry of Q-221 (c); settled by the lead's ruling at its re-check.
 **Scenario.** An unlisted sealed segment's permissions change, or another program holds it open for the whole run.
 Every try of its description fails with `DescribeError::Io`; it is tried again every 10 minutes once the wait reaches
-its cap, health names nothing, and the segment is not listed, so it is not uploaded and a restore ends the restored
-log at its range (as for a damaged one) while the store reports itself healthy. A restart tries again from 10 s.
-**Needed.** Whether a failure that outlasts some bound (a number of tries, or a time) is reported, and how: a health
-reason (a new variant, or `SegmentDamaged` after the bound) or a statistic. Until decided, health is unchanged while
-it is retried (`log/tests/seal_describe.rs`
-`a_description_that_never_opens_is_retried_with_doubling_waits_up_to_the_cap_and_never_degrades_health`).
+its cap, and the segment is not listed, so it is not uploaded and a restore ends the restored log at its range (as
+for a damaged one). Silent, the store would report itself healthy throughout.
+**Decided.** A description that keeps failing does not stay silent: from the failure that sets the 10-minute wait
+(`DESCRIBE_RETRY_MAX`), health is degraded by `Reason::SegmentUnreadable { file_id }` (`api.md` Health; `spec.md` §8
+Corrupt block, §11), not `SegmentDamaged`, which stays for failed checks (Q-221 (c)). Retries go on at the cap; the
+reason clears when a read succeeds (with a description, or with a failed check, which raises `SegmentDamaged`
+instead). A restart starts the waits again from 10 s and raises the reason again at the cap. Reason: an unlisted
+segment is never backed up, so a silent indefinite retry is a hidden loss of backup. `log/tests/seal_describe.rs`
+`a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
+`segment_unreadable_clears_when_a_read_succeeds`.
 
 ## Open at v0.2
 
@@ -1431,7 +1434,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1501,7 +1504,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
-| Q-640 | 8.5a | A description failing to open or read for ever; recorded at the review of roadmap 6.3b; whether health reports it after a bound |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1748,6 +1750,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-640 | A description that never stops failing to open or read its segment | `spec.md` §8 Corrupt block, §11; `api.md` Health (settled by the lead's ruling at the re-check of roadmap 6.3b: `SegmentUnreadable` once the retry wait reaches its 10-minute cap, cleared when a read succeeds; an unlisted segment is never backed up, so a silent indefinite retry is a hidden loss of backup) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

@@ -364,7 +364,7 @@ pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRo
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }
 pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64 }, DiskCritical { free: u64 },
-    SealBlocked { file_id: u64 }, SegmentDamaged { file_id: u64 },
+    SealBlocked { file_id: u64 }, SegmentDamaged { file_id: u64 }, SegmentUnreadable { file_id: u64 },
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
@@ -413,7 +413,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
   `SealBlocked` lasts until the seal succeeds. `SegmentDamaged` names a sealed segment that no manifest record lists
   and that fails its checks (`format.md` A.9, Q-221 (c)): it lasts while the store runs and is raised again at each
-  start until the file is repaired. A failure to open or read such a segment is retried and degrades nothing (Q-640). A mark synced at every commit (no boot identity, or configured) is
+  start until the file is repaired. A failure to open or read such a segment is retried; once the wait
+  between tries has reached its cap of 10 minutes, `SegmentUnreadable` names it until a read succeeds (Q-640). A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per

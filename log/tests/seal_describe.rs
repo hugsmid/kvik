@@ -543,38 +543,81 @@ fn a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_onc
     assert_eq!(r.w.reasons(), vec![]);
 }
 
-#[test]
-fn a_description_that_never_opens_is_retried_with_doubling_waits_up_to_the_cap_and_never_degrades_health()
- {
+fn retry_wait(k: u32) -> std::time::Duration {
     use kvik_log::writer::{DESCRIBE_RETRY_INTERVAL, DESCRIBE_RETRY_MAX};
 
+    (DESCRIBE_RETRY_INTERVAL * 2u32.pow(k)).min(DESCRIBE_RETRY_MAX)
+}
+
+/// Runs seal jobs that came due, then hands out `id` at `r.now` and reports `res` for it.
+fn try_describe(r: &mut Rig, id: u64, k: u32) -> Result<(), DescribeError> {
+    for job in r.w.take_seal_jobs(r.now) {
+        let res = kvik_log::writer::seal_segment_described(&r.fs, &job, &r.w.halt());
+        r.w.seal_done(job, res, r.now);
+        r.create();
+    }
+    assert_eq!(r.w.take_unlisted(r.now), Some(unlisted(id)), "try {k}");
+    let res = describe_sealed(&r.fs, r.w.log_dir(), &unlisted(id));
+    let out = res.as_ref().map(drop).map_err(|e| match e {
+        DescribeError::Io(e) => DescribeError::Io(e.kind().into()),
+        DescribeError::NotSealed => DescribeError::NotSealed,
+        DescribeError::Invalid(m) => DescribeError::Invalid(m),
+    });
+    r.w.unlisted_done(res, r.now);
+    out
+}
+
+/// Tries `id` `tries` times, each failing to open, at the retry times; the store stays writable throughout.
+fn fail_to_open(r: &mut Rig, id: u64, tries: u32) {
+    for k in 0..tries {
+        if k > 0 {
+            r.now += retry_wait(k - 1) - seal_rig::MS;
+            assert!(r.w.take_unlisted(r.now).is_none(), "try {k}");
+            r.now += seal_rig::MS;
+        }
+        assert!(matches!(try_describe(r, id, k), Err(DescribeError::Io(_))));
+        assert!(r.w.fault().is_none());
+        let unreadable = retry_wait(k) == kvik_log::writer::DESCRIBE_RETRY_MAX;
+        let want = if unreadable {
+            vec![Reason::SegmentUnreadable { file_id: id }]
+        } else {
+            vec![]
+        };
+        assert_eq!(r.w.reasons(), want, "try {k}");
+        let due = r.now + retry_wait(k);
+        let next = r.w.step(r.now, r.wall, &mut r.q).next;
+        assert!(next.is_some_and(|t| t <= due), "try {k}: {next:?}");
+    }
+}
+
+#[test]
+fn a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap()
+ {
     let fs = sealed_store(1);
     let id = *sealed_files(&fs.inner).keys().next().unwrap();
     let mut r = Rig::open(fs);
     r.fs.fail_opens(&seg_path(id, true).to_string_lossy());
-    let wait = |k: u32| (DESCRIBE_RETRY_INTERVAL * 2u32.pow(k)).min(DESCRIBE_RETRY_MAX);
-    for k in 0..9 {
-        if k > 0 {
-            r.now += wait(k - 1) - seal_rig::MS;
-            assert!(r.w.take_unlisted(r.now).is_none(), "try {k}");
-            r.now += seal_rig::MS;
-        }
-        // A timed seal comes due on the way; it goes first.
-        for job in r.w.take_seal_jobs(r.now) {
-            let res = kvik_log::writer::seal_segment_described(&r.fs, &job, &r.w.halt());
-            r.w.seal_done(job, res, r.now);
-            r.create();
-        }
-        assert_eq!(r.w.take_unlisted(r.now), Some(unlisted(id)), "try {k}");
-        let res = describe_sealed(&r.fs, r.w.log_dir(), &unlisted(id));
-        assert!(matches!(res, Err(DescribeError::Io(_))));
-        r.w.unlisted_done(res, r.now);
-        assert!(r.w.fault().is_none());
-        assert_eq!(r.w.reasons(), vec![]);
-        let due = r.now + wait(k);
-        let next = r.w.step(r.now, r.wall, &mut r.q).next;
-        assert!(next.is_some_and(|t| t <= due), "try {k}: {next:?}");
-    }
-    assert_eq!(wait(6), DESCRIBE_RETRY_MAX);
+    fail_to_open(&mut r, id, 9);
+    assert!(retry_wait(5) < kvik_log::writer::DESCRIBE_RETRY_MAX);
+    assert_eq!(retry_wait(6), kvik_log::writer::DESCRIBE_RETRY_MAX);
     assert!(r.w.take_sealed().iter().all(|f| f.id.file_id != id));
+}
+
+#[test]
+fn segment_unreadable_clears_when_a_read_succeeds() {
+    let fs = sealed_store(1);
+    let (id, bytes) = sealed_files(&fs.inner).into_iter().next().unwrap();
+    let mut r = Rig::open(fs);
+    r.fs.fail_opens(&seg_path(id, true).to_string_lossy());
+    fail_to_open(&mut r, id, 7);
+    assert_eq!(
+        r.w.reasons(),
+        vec![Reason::SegmentUnreadable { file_id: id }]
+    );
+    r.fs.clear_failures();
+    r.now += retry_wait(6);
+    assert!(try_describe(&mut r, id, 7).is_ok());
+    assert_eq!(r.w.reasons(), vec![]);
+    let got = by_id(&r.w.take_sealed());
+    assert_eq!(got[&id], expected(id, &bytes));
 }

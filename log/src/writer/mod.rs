@@ -424,6 +424,12 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
+    /// A sealed segment no manifest record lists still cannot be opened or read once its retry wait has reached
+    /// [`DESCRIBE_RETRY_MAX`]; retries go on (Q-640).
+    SegmentUnreadable {
+        /// The segment.
+        file_id: u64,
+    },
 }
 
 /// Why the mark is synced at every commit.
@@ -574,6 +580,8 @@ pub struct LogWriter {
     describe_retry: Vec<(SegmentIdentity, Duration, Duration)>,
     /// Unlisted segments that failed a check this run (Q-221 (c)).
     damaged: BTreeSet<u64>,
+    /// Unlisted segments whose retry wait has reached its cap without a read succeeding (Q-640).
+    unreadable: BTreeSet<u64>,
     described: Vec<SealedFile>,
     disk: Disk,
     waiting: Option<Wait>,
@@ -685,6 +693,7 @@ impl LogWriter {
             describing: None,
             describe_retry: Vec::new(),
             damaged: BTreeSet::new(),
+            unreadable: BTreeSet::new(),
             described: Vec::new(),
             disk: Disk::default(),
             waiting: None,
@@ -756,6 +765,11 @@ impl LogWriter {
             self.damaged
                 .iter()
                 .map(|&file_id| Reason::SegmentDamaged { file_id }),
+        );
+        r.extend(
+            self.unreadable
+                .iter()
+                .map(|&file_id| Reason::SegmentUnreadable { file_id }),
         );
         r
     }
@@ -894,12 +908,16 @@ impl LogWriter {
 
     /// The result of describing a segment [`LogWriter::take_unlisted`] handed out (Q-221 (c)). A failure to open or
     /// read it is tried again after [`DESCRIBE_RETRY_INTERVAL`], doubled at each further failure up to
-    /// [`DESCRIBE_RETRY_MAX`], with health unchanged. A segment that fails its checks stays unlisted, sets no fault
-    /// and degrades health as [`Reason::SegmentDamaged`] until the writer stops; the next start tries it again.
+    /// [`DESCRIBE_RETRY_MAX`]; once the wait reaches that cap health is degraded as [`Reason::SegmentUnreadable`]
+    /// until a read succeeds (Q-640). A segment that fails its checks stays unlisted, sets no fault and degrades
+    /// health as [`Reason::SegmentDamaged`] until the writer stops; the next start tries it again.
     pub fn unlisted_done(&mut self, result: Result<SealedFile, DescribeError>, now: Duration) {
         let Some((id, waited)) = self.describing.take() else {
             return;
         };
+        if !matches!(result, Err(DescribeError::Io(_))) {
+            self.unreadable.remove(&id.file_id);
+        }
         match result {
             Ok(f) => self.described.push(f),
             Err(DescribeError::Io(_)) => {
@@ -908,6 +926,9 @@ impl LogWriter {
                 } else {
                     waited.saturating_mul(2).min(DESCRIBE_RETRY_MAX)
                 };
+                if wait >= DESCRIBE_RETRY_MAX {
+                    self.unreadable.insert(id.file_id);
+                }
                 self.describe_retry
                     .push((id, now.saturating_add(wait), wait));
             }
