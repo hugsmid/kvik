@@ -1347,9 +1347,9 @@ and no boot identity, since the restore names none. The store then opens with `L
 ordinary mark of another boot, rule 3 would write a recovery entry at the generation's first position, so every full
 restore would put ingest one above it, and a reader would see a reset stamp change before anything was written.
 **Decided (8.3c).** The model's start (`model/src/engine/recovery.rs` `recover_tail`: "the first start of a store, or
-of a restored generation: no mark and nothing of the current generation in the log") and `design-interfaces` §5 (10)
-both take ingest at the first position. A start in generation g above 0 reads that first mark as no mark when nothing
-of generation g is in the log (no segment of g in use or sealed, no written unused segment, no lost range of g): it
+of a restored generation: no mark and nothing of the current generation in the log") and §8 Restore step 1
+("Positions of the new generation start at sequence 1") both take ingest at the first position. A start in
+generation g above 0 reads that first mark as no mark when nothing of generation g is in the log (no segment of g in use or sealed, no written unused segment, no lost range of g): it
 writes the first mark again with its own boot and the same stamp, writes no recovery entry, and the writer resumes at
 the stamp's sequence minus one. Generation 0 is unchanged (its first mark is written by its first start, with the
 boot). `init_generation` is idempotent: a mark of g with the same stamp is left alone, a torn one written again, a
@@ -1371,7 +1371,7 @@ lost ranges of generation 0 in the manifest, which the start compared by bare se
 generation only; sealed segments of earlier generations are read only by the scan of Q-262. A mark of another
 generation, an unsealed segment of another generation, or a sealed segment of a later generation refuses the start
 (`StoreError::Generation { found, start }`): the caller passed the wrong generation, or the directory was not
-initialised (an unfinished restore is resumed with `restore` again, F4). Lost ranges are compared and extended by
+initialised (an unfinished restore is resumed with `restore` again, Q-164 (c)). Lost ranges are compared and extended by
 whole positions, and losses found are recorded in the start's generation, with the record keyed by it. Tests:
 `log/tests/generation.rs` `earlier_generations_sealed_segments_take_no_part_in_the_chain`,
 `a_start_refuses_a_mark_or_segment_of_another_generation`,
@@ -1425,7 +1425,7 @@ segment the mark names, and skips set-aside batches (Q-263) by the restored ends
 the caller takes from the latest restore record (§8 Restore step 1). Test: `log/tests/generation.rs`
 `a_reader_reads_earlier_generations_past_what_is_set_aside`.
 ## Q-265 — When a writer reads the claims, and what it does on a higher one
-Recorded by roadmap 8.3c (review finding F10 of 8.1c). To be settled by roadmap 8.1d.
+Recorded by roadmap 8.3c (a review finding of roadmap 8.1c). To be settled by roadmap 8.1d.
 **Scenario.** §8 Generations: a writer that finds a higher generation claimed stops uploading and becomes
 read-only. The upload driver never read the claims and had no way to report it: a store whose bucket a restore had
 claimed past went on uploading records of its generation that no later restore reads.
