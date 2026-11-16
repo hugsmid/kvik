@@ -846,8 +846,8 @@ impl Writer {
         let mut d = lock(&self.decider);
         let call = self.next_call.fetch_add(1, Ordering::SeqCst);
         let mut plan = d.plan(readings, intent, clock, call);
-        let refreshes = refreshing(&plan);
         let started = Instant::now();
+        let refreshes = refreshing(&plan);
         let queued = if plan.items.is_empty() {
             None
         } else {
