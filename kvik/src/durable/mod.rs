@@ -896,14 +896,7 @@ impl Writer {
         let tracked = match queued {
             Some(pending) => {
                 let (clocks, ids) = (self.clocks.clone(), refreshes);
-                let c = Completion::new(
-                    pending,
-                    Box::new(move || {
-                        for id in ids {
-                            clocks.refresh(id);
-                        }
-                    }),
-                );
+                let c = Completion::new(pending, Box::new(move || clocks.refresh(&ids)));
                 inflight.insert(call, c.clone());
                 Some((c, true))
             }
