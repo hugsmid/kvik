@@ -252,4 +252,22 @@ mod tests {
         }
         assert!(t.checksummed() <= bytes.len() as u64);
     }
+
+    #[test]
+    fn forgetting_below_an_offset_keeps_the_table_from_that_offset() {
+        let bytes: Vec<u8> = (0..256u32).map(|i| (i * 13 + 1) as u8).collect();
+        let mut t = PrefixCrc::new(&bytes);
+        assert_eq!(t.range(0, 128), Some(crc32c(&bytes[..128])));
+        t.forget_below(64);
+        assert_eq!(t.range(64, 32), Some(crc32c(&bytes[64..96])));
+        assert_eq!(t.checksummed(), 128);
+    }
+
+    #[test]
+    fn a_range_off_an_8_byte_boundary_is_checksummed_directly_and_counted() {
+        let bytes: Vec<u8> = (0..64u32).map(|i| (i * 7 + 5) as u8).collect();
+        let mut t = PrefixCrc::new(&bytes);
+        assert_eq!(t.range(3, 10), Some(crc32c(&bytes[3..13])));
+        assert_eq!(t.checksummed(), 10);
+    }
 }

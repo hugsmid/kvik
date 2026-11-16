@@ -606,7 +606,40 @@ mod tests {
             encode_block(0x50, crate::block::FLAG_SKIPPABLE, &body, &mut m).unwrap();
         }
         let (r, stats) = read_manifest_with_stats(&m, &[2; 16]);
-        assert!(r.unwrap().torn);
+        let r = r.unwrap();
+        assert!(r.torn);
         assert_eq!(stats.bytes_body_checked, kept);
+        // The records and the damaged word, then one header per step of the forward search.
+        let steps = (m.len() as u64 - 16 - (r.valid_end + 8)) / 8 + 1;
+        assert_eq!(stats.headers_visited, 3 + steps);
+    }
+
+    #[test]
+    fn a_header_of_a_newer_major_another_kind_or_another_store_is_refused() {
+        let record = encode_record(RECORD_EMPTY, 1, 0, 0, None);
+        let with = |h: FileHeader| [h.encode().to_vec(), record.clone()].concat();
+        let mut newer = FileHeader::new(kind::MANIFEST, 0, 0, 0, [2; 16]);
+        newer.format_major = crate::FORMAT_MAJOR + 1;
+        assert!(matches!(
+            read_manifest(&with(newer), &[2; 16]),
+            Err(ManifestError::Unsupported(_))
+        ));
+        let segment = FileHeader::new(kind::LOG_SEGMENT, 0, 0, 0, [2; 16]);
+        assert_eq!(
+            read_manifest(&with(segment), &[2; 16]),
+            Err(ManifestError::Header)
+        );
+        let other = FileHeader::new(kind::MANIFEST, 0, 0, 0, [3; 16]);
+        assert_eq!(
+            read_manifest(&with(other), &[2; 16]),
+            Err(ManifestError::Header)
+        );
+        // A whole manifest is read with one header per record and no search.
+        let (r, stats) = read_manifest_with_stats(
+            &with(FileHeader::new(kind::MANIFEST, 0, 0, 0, [2; 16])),
+            &[2; 16],
+        );
+        assert!(!r.unwrap().torn);
+        assert_eq!(stats.headers_visited, 1);
     }
 }
