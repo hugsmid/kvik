@@ -891,12 +891,13 @@ fn q77_day_whose_midnight_occurs_twice_starts_at_the_earlier() {
     assert_eq!(nov1.node.count, 150);
 }
 
-/// Q-250 (open, the owner's ruling): flagged batches acknowledged and
-/// delivered, then removed whole by a remount within the boot, leave nothing
-/// beyond the mark; the start sees a clean crash and gives their positions
-/// again with no reset point and no `possible_loss`.
-#[test]
-fn q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again() {
+/// A store with the timed mark sync, one consumer and a series at the
+/// `written` level (§2.1 `durability`).
+fn written_level_store() -> (
+    kvik_model::engine::Model,
+    kvik_model::engine::ConsumerId,
+    SeriesId,
+) {
     use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, MarkSync, Model, Selection};
     use kvik_model::registry::Durability;
     let c = ConsumerId(1);
@@ -921,10 +922,71 @@ fn q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again(
         )
         .unwrap();
     m.drain().unwrap();
+    (m, c, s)
+}
+
+/// Q-250 (open, the owner's ruling): flagged batches acknowledged and
+/// delivered, then removed whole by a remount within the boot, leave nothing
+/// beyond the mark; the start sees a clean crash and gives their positions
+/// again with no reset point and no `possible_loss`.
+#[test]
+fn q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again() {
+    let (mut m, c, s) = written_level_store();
     let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
     m.ingest(vec![Reading::num(s, T0 + 1, 2.0)]).unwrap();
     assert_eq!(m.poll(c, 10).unwrap()[0].position, first, "delivered");
     m.remount();
+    m.restart();
+    assert!(m.recovery_entries().is_empty());
+    assert!(m.losses().is_empty());
+    let again = m
+        .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, first, "given again with no reset point");
+}
+
+/// Q-250 (open): a remount after which the first flagged batch reached the
+/// disk and the second did not: rule 1 keeps the first, and the second's
+/// position is given again with no reset point.
+#[test]
+fn q250_a_remount_keeping_part_of_the_flagged_batches_gives_the_rest_again() {
+    let (mut m, c, s) = written_level_store();
+    let kept = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    let lost = m
+        .ingest(vec![Reading::num(s, T0 + 1, 2.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(m.poll(c, 10).unwrap().len(), 2, "both delivered");
+    m.remount_keeping(1);
+    m.restart();
+    assert!(m.disk.live_entries().contains_key(&kept));
+    assert!(m.recovery_entries().is_empty());
+    assert!(m.losses().is_empty());
+    let again = m
+        .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, lost, "given again with no reset point");
+}
+
+/// Q-254 (open, the owner's ruling): flagged batches acknowledged and
+/// delivered, then a failed sync; the pages whose write-back failed are
+/// clean and reclaimed before a restart on the same boot, so rule 1 finds
+/// nothing beyond the mark and gives their positions again with no report.
+#[test]
+fn q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positions_again() {
+    use kvik_model::engine::{Fault, WriteOutcome};
+    let (mut m, c, s) = written_level_store();
+    let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    assert_eq!(m.poll(c, 10).unwrap()[0].position, first, "delivered");
+    let _ = m.emit(Reading::num(s, T0 + 1, 2.0));
+    assert!(
+        m.commit(Some(Fault::SyncError(WriteOutcome::Lost)))
+            .is_err()
+    );
+    m.crash();
+    m.evict_failed_write_back().unwrap();
     m.restart();
     assert!(m.recovery_entries().is_empty());
     assert!(m.losses().is_empty());

@@ -15,6 +15,7 @@ use crate::recovery::{
     ResetPoint, ResetStamp, SavedPoint, Tail,
 };
 
+mod faults;
 mod recovery;
 use crate::registry::{
     Durability, Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions,

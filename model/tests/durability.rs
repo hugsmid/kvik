@@ -479,3 +479,42 @@ fn s3_no_flag_outlives_a_flagged_batch_that_a_power_loss_or_a_start_removes() {
     assert!(m.disk.live_entries().contains_key(&kept));
     assert!(flags_name_flagged_batches(&m, fast), "truncated by rule 1");
 }
+
+#[test]
+fn s3_a_confirmation_at_or_below_the_mark_forces_no_log_sync() {
+    let (mut m, fast, _) = levels_model();
+    let synced = commit(&mut m, fast, 1);
+    m.sync_log();
+    commit(&mut m, fast, 2);
+    let got = m.receive(C, 1).unwrap();
+    assert_eq!(got[0].position, synced);
+    m.confirm_delivery(C, got[0].id()).unwrap();
+    assert_eq!(
+        mark(&m),
+        synced,
+        "the later flagged batch waits for its sync"
+    );
+}
+
+#[test]
+fn s3_a_complete_flagged_batch_after_a_damaged_one_is_kept_and_the_damage_is_a_lost_range() {
+    let (mut m, fast, _) = levels_model();
+    let first = commit(&mut m, fast, 1);
+    let damaged = commit(&mut m, fast, 2);
+    let second = m.disk.files[&m.disk.active.unwrap()].batches.len() - 1;
+    let last = commit(&mut m, fast, 3);
+    m.sync_log();
+    m.crash();
+    m.corrupt_open_batch(second).unwrap();
+    m.remount();
+    m.restart();
+    assert!(
+        fact_at(&m, first) && fact_at(&m, last),
+        "both kept by rule 1"
+    );
+    assert!(!fact_at(&m, damaged));
+    assert!(m.recovery_entries().is_empty(), "rule 2, not a reset");
+    assert!(m.losses().iter().any(|l| l.kind == LossKind::DataLost
+        && l.first == Some(damaged)
+        && l.last == Some(damaged)));
+}
