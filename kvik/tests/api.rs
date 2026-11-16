@@ -1532,6 +1532,26 @@ fn versioned_series_and_outranked_facts_on(b: Backend) {
 }
 
 #[test]
+fn the_store_id_is_the_same_through_every_reader_and_after_a_reopen() {
+    for b in BACKENDS {
+        let name = "store-id";
+        let (s, clock) = store_on(b, name);
+        let id = s.reader().store_id();
+        assert_ne!(id, [0u8; 16], "{b:?}");
+        let other = Reader::open(reader_on(b, name, &clock)).unwrap();
+        assert_eq!(other.store_id(), id, "{b:?}");
+        drop(other);
+        drop(s);
+        let (again, _clock) = store_on(b, name);
+        assert_eq!(again.reader().store_id(), id, "{b:?}");
+        let mut config = config_on(b, "store-id-other", &clock);
+        config.env.entropy = Arc::new(kvik::env::FixedEntropy::new(100));
+        let fresh = block_on(Store::open(config)).unwrap();
+        assert_eq!(fresh.reader().store_id()[0], 100, "{b:?}");
+    }
+}
+
+#[test]
 fn a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not() {
     for b in BACKENDS {
         a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not_on(b);

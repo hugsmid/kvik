@@ -43,6 +43,7 @@ pub(crate) struct DurableReader {
     clocks: Arc<Clocks>,
     /// The site zone at creation, from the store descriptor: in force before the first site-zone entry (spec §5.7).
     created_zone: String,
+    store_id: [u8; 16],
 }
 
 pub(crate) fn open_error(dir: &Path, e: ReaderError) -> OpenError {
@@ -107,9 +108,8 @@ impl DurableReader {
         );
         cfg.lease_refresh = lease_refresh;
         let log = LogReader::open(cfg).map_err(|e| open_error(dir, e))?;
-        let created_zone = kvik_log::store::read_descriptor(&*env.fs, dir)
-            .map_err(|e| super::store_error(dir, e))?
-            .site_zone;
+        let descriptor = kvik_log::store::read_descriptor(&*env.fs, dir)
+            .map_err(|e| super::store_error(dir, e))?;
         Ok(DurableReader {
             dir: dir.to_path_buf(),
             state: Mutex::new(State {
@@ -117,7 +117,8 @@ impl DurableReader {
                 index: Index::default(),
             }),
             clocks,
-            created_zone,
+            created_zone: descriptor.site_zone,
+            store_id: descriptor.store_id,
         })
     }
 
@@ -134,6 +135,11 @@ impl DurableReader {
     /// The site zone at creation.
     pub(crate) fn created_zone(&self) -> &str {
         &self.created_zone
+    }
+
+    /// The store id, from the descriptor read at open.
+    pub(crate) fn store_id(&self) -> [u8; 16] {
+        self.store_id
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

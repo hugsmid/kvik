@@ -299,6 +299,7 @@ enum Live { Value(Fact), None, Unknown }
 ```rust
 pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min }; blocking
 pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease
+pub fn store_id(&self) -> [u8; 16];   // added for the export (Q-196): the id read at open; no file read, no lease renewal
 pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
 pub struct ResetStamp { pub sequence: u64, pub nonce: u64 }      // zero before any reset (spec §7 Readers)
 pub struct SavedPoint { pub position: Position, pub stamp: ResetStamp }
@@ -308,7 +309,9 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 - Every read call first reads the mark and the entries appended since the reader's last call, so it sees data up to
   the mark at call time. The lease is written at open and renewed by any call once half of `lease_refresh` has
   passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
-  epoch on its next call. There is no background task.
+  epoch on its next call. There is no background task. `store_id` is the exception: an additive item (Q-196), it
+  returns the store id (`format.md` A.1) read with the descriptor at open and reads nothing. On the model backend it
+  is generated at creation from the environment's entropy and kept while the process lives.
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
   (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
   reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
