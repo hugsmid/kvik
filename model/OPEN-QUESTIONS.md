@@ -63,7 +63,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-303 | §8 Generations, §7 Readers; `format.md` A.1 kind 12 | The local restore record file |
 | Q-304 | §8 Generations, Restore step 1 | A manifest record object the bucket has lost or a listing does not show |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
-| Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe's wrong-hash put under the conditional-write probe's key |
+| Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
+| Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1214,18 +1215,38 @@ to the call source, for one batch after a quiet period.
 after a late start, saturation with late wakes and stalls, a burst after a quiet period, a stray call at and just
 below the bound. macOS before and after:
 `docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
-## Q-341 — The attach probe's wrong-hash put under the conditional-write probe's key
+## Q-341 — The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore
 Recorded when roadmap 8.3b was stacked on 8.1c. To be settled by roadmap 8.1d.
-**Scenario.** `format.md` A.17 Probe has `attach_backup` put the checksum probe, with a wrong SHA-256, to a fresh
+**Scenario.** (a) `format.md` A.17 Probe has `attach_backup` put the checksum probe, with a wrong SHA-256, to a fresh
 `<sid>/probe/<nonce>`; the attach probe (`backup/src/upload/probe.rs`, Q-283) puts it to `<sid>/probe`, the
 conditional-write probe's key, and never builds `Keys::checksum_probe`. That is the folding Q-213 warned of: a bucket
 that does not check stores the wrong-hash object at `<sid>/probe` and is refused; at the next attach the key is
 present, the wrong-hash `put` fails with `Exists`, which cannot be told from a checked hash, and only the later
 checks of the reported hash stand between the refused bucket and its acceptance. The restore's probe
-(`backup/src/restore/probe.rs`) follows A.17.
+(`backup/src/restore/probe.rs`) follows A.17. (b) A full restore's probe leaves at `<sid>/probe` an envelope of 16
+random bytes, for ever. The restored store then attaches to the bucket it was restored from: the attach probe puts
+its own fixed probe to that key with the right hash, the sink refuses it with `Exists`, and the attach fails with
+`Refused::Sink(Exists)`. This is the normal path of every restored store. The other order passes: a restore's probe
+accepts the object an earlier attach left.
 **Model.** Not modelled.
-**Needed.** The attach probe moved to A.17's checksum probe (the shared form in `restore/probe.rs`), with a test of a
-second attach to a bucket refused once for `NoChecksums`; or A.17 amended to the attach probe's form with the reason.
+**Needed.** One probe for both callers: the attach probe moved to A.17's form (the shared code in
+`restore/probe.rs`: an existing `<sid>/probe` must fail a second put and be reported unchanged, then the checksum
+probe under a fresh `<sid>/probe/<nonce>`), with tests of a second attach to a bucket refused once for
+`NoChecksums` and of an attach after a full restore; or A.17 amended to the attach probe's form with the reason.
+Neither path is reachable before 8.1d: `Store::attach_backup` and `Store::restore` return `NotSupportedYet`.
+
+## Q-342 — `backed_up_through` in a restored generation
+Recorded when roadmap 8.3b was stacked on 8.1c. To be settled by roadmap 8.1d.
+**Scenario.** A full restore installs segments 1 to 3 of generation 0 and writes its restore record, whose fold
+gives each file a deep copy and the verified mark (8.3a), so the upload queue skips them. The upload cursor counts a
+file as copied only from a fresh copy-verified record (`backup/src/upload/driver.rs` `fresh_copy`, `copied_at`;
+Q-280), and none is written for a file the queue skips. After the restore record and two later records of
+generation 1 are uploaded, the driver reports `backed_up_through: None` with nothing queued, and the figure stays
+there until a rebuild carries the restore record and the files are verified again. It under-reports, so nothing is
+evicted early.
+**Model.** Not modelled.
+**Needed.** Suggested: the cursor takes the files a fresh (uncarried) restore record lists as copied at its epoch,
+with a test of the figure after a restore; with `BackupStats` (8.1d), which reports it.
 
 ## Open at v0.2
 
@@ -1239,7 +1260,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1303,7 +1324,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-303 | 8.3 | The local restore record file (kind 12); recorded by roadmap 8.3b |
 | Q-304 | 8.3 | A manifest record lost or not listed; recorded by roadmap 8.3b; an empty listing decided at its review; the chain of epochs and tail check is its own item, with `format.md` A.17 (8.1b) |
 | Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
-| Q-341 | 8.1d | The attach probe's checksum probe key; recorded when 8.3b was stacked on 8.1c |
+| Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
+| Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
