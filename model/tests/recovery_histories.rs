@@ -649,8 +649,11 @@ impl RWorld {
                         && l.first.zip(l.last).is_some_and(|(a, b)| a <= *p && *p <= b)
                         && !matches!(l.state, Some(LossState::Closed(Outcome::Restored(_))))
                 });
-                let pending = sealed.iter().any(|(f, q)| {
-                    q == p && m.disk.bucket.missing.contains(f) && !m.disk.judged_lost.contains(f)
+                // Any file holding it, a compacted one included.
+                let pending = m.disk.files.iter().any(|(f, file)| {
+                    m.disk.bucket.missing.contains(f)
+                        && !m.disk.judged_lost.contains(f)
+                        && file.entries().any(|e| e.position == *p)
                 });
                 prop_assert!(open || pending, "{:?} unreadable outside an open loss", p);
             }
@@ -760,6 +763,22 @@ proptest! {
     ) {
         run_recovery(&ops, &mut Seen::default(), Checks { inv25: false, inv26: false, inv27: true })?;
     }
+}
+
+#[test]
+fn recovery_history_a_compacted_object_lost_while_read_only_waits_for_the_lost_object_rule() {
+    let ops = [
+        ROp::PowerLoss(0),
+        ROp::Ingest(1, None),
+        ROp::Ingest(1, None),
+        ROp::Define,
+        ROp::Compact,
+        ROp::CorruptSealed(0),
+        ROp::Upload,
+        ROp::Restart(true),
+        ROp::LoseEvicted(0),
+    ];
+    run_recovery(&ops, &mut Seen::default(), ALL).unwrap();
 }
 
 /// Guards the recovery-history properties (invariants 25–27): positions
