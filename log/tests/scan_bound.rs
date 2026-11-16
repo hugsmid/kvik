@@ -131,6 +131,11 @@ fn build(pieces: &[Piece], seal: Option<bool>, damage: &[Damage]) -> Vec<u8> {
         s.set_len(end);
     }
     let mut f = s.into_bytes();
+    apply(&mut f, damage);
+    f
+}
+
+fn apply(f: &mut Vec<u8>, damage: &[Damage]) {
     for d in damage {
         let len = f.len();
         if len == 0 {
@@ -156,12 +161,14 @@ fn build(pieces: &[Piece], seal: Option<bool>, damage: &[Damage]) -> Vec<u8> {
             Damage::Cut(i) => f.truncate(i.index(len + 1)),
         }
     }
-    f
 }
 
 fn agree(f: &[u8], mark: prop::sample::Index) -> Result<(), TestCaseError> {
+    agree_at(f, (mark.index(f.len() + 1) as u64) & !7)
+}
+
+fn agree_at(f: &[u8], mark: u64) -> Result<(), TestCaseError> {
     let len = f.len() as u64;
-    let mark = (mark.index(f.len() + 1) as u64) & !7;
     for limit in [ScanLimit::End, ScanLimit::Mark(mark)] {
         let (new, stats) = scan_with_stats(f, &ID, limit);
         let (old, _) = legacy::scan(f, &ID, limit);
@@ -184,5 +191,89 @@ proptest! {
         mark in any::<prop::sample::Index>(),
     ) {
         agree(&build(&pieces, seal, &damage), mark)?;
+    }
+}
+
+/// A batch of a facts block and a skippable block holding a valid batch image at its own offset, `over` bytes past
+/// the 8 MiB of data a batch may hold (negative: below it). Returns the next sequence.
+fn big_batch(f: &mut Vec<u8>, seq: u64, over: i64, t: i64) -> u64 {
+    use kvik_log::batch::MAX_BATCH_DATA;
+    use kvik_log::block::block_type;
+    let at = f.len() as u64;
+    let first = facts_body(seq, T0, &[(1, T0, 0.0)]);
+    let head = 16 + first.len().div_ceil(8) as u64 * 8 + 16;
+    let mut filler = vec![0x11u8; (MAX_BATCH_DATA as i64 + over - head as i64) as usize];
+    let inner_at = at + head + 4 * 4_096;
+    let inner = facts(seq + 1, 2).encode(&ID, inner_at, t).unwrap();
+    filler[4 * 4_096..4 * 4_096 + inner.len()].copy_from_slice(&inner);
+    let blocks = [
+        (block_type::FACTS, 0, first),
+        (0x50, FLAG_SKIPPABLE, filler),
+    ];
+    f.extend_from_slice(&raw_batch(&ID, at, &blocks, seq, seq, t));
+    seq + 3
+}
+
+/// Small batches around two batches near the 8 MiB limit, the batch before each damaged: the first is met by a
+/// boundary read once the scan has found damage, the second by resynchronisation.
+fn near_limit(over: [i64; 2], damage: &[Damage]) -> Vec<u8> {
+    let mut s = SegmentImage::create_ahead(ID, T0, 4_096).unwrap();
+    s.take_into_use(1).unwrap();
+    let mut f = s.into_bytes();
+    f.truncate(kvik_log::header::HEADER_LEN);
+    let mut seq = 1;
+    let small = |f: &mut Vec<u8>, seq: &mut u64, damaged: bool| {
+        let at = f.len();
+        f.extend_from_slice(&facts(*seq, 2).encode(&ID, at as u64, T0).unwrap());
+        if damaged {
+            let last = f.len() - 1;
+            f[last - 8] ^= 1;
+        }
+        *seq += 2;
+    };
+    small(&mut f, &mut seq, false);
+    small(&mut f, &mut seq, true);
+    small(&mut f, &mut seq, false);
+    seq = big_batch(&mut f, seq, over[0], T0);
+    small(&mut f, &mut seq, true);
+    seq = big_batch(&mut f, seq, over[1], T0);
+    small(&mut f, &mut seq, false);
+    f.resize(f.len() + 4_096, 0);
+    apply(&mut f, damage);
+    f
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    #[test]
+    fn the_bounded_scan_agrees_with_the_reference_scan_across_the_batch_and_pruning_limits(
+        over in [prop::sample::select(vec![-16i64, -8, 0, 8]), prop::sample::select(vec![-16i64, -8, 0, 8])],
+        damage in prop::collection::vec(damage(), 0..3),
+        mark in any::<prop::sample::Index>(),
+    ) {
+        agree(&near_limit(over, &damage), mark)?;
+    }
+}
+
+#[test]
+fn batches_of_exactly_the_limit_are_kept_and_a_word_over_it_is_not() {
+    use kvik_log::batch::MAX_BATCH_DATA;
+    for (over, at_limit) in [([0, 0], 2), ([8, 0], 1), ([0, 8], 1), ([8, 8], 0)] {
+        let f = near_limit(over, &[]);
+        agree_at(&f, (f.len() as u64 / 2) & !7).unwrap();
+        let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
+        let r = r.unwrap();
+        let kept = r
+            .batches
+            .iter()
+            .filter(|b| b.commit.batch_bytes == MAX_BATCH_DATA);
+        assert_eq!(kept.count(), at_limit, "{over:?}");
+        assert!(
+            r.batches
+                .iter()
+                .all(|b| b.commit.batch_bytes <= MAX_BATCH_DATA)
+        );
+        assert!(stats.within_bound(f.len() as u64), "{stats:?}");
     }
 }
