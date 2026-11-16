@@ -139,6 +139,8 @@ pub struct Directories {
     full: Vec<GroupEntry>,
     open: Group,
     open_written: Option<u32>,
+    /// Groups that filled before their last version was written.
+    unwritten: Vec<Group>,
     pending: Vec<SegmentRecord>,
     root_dirty: bool,
     // The series directory.
@@ -192,6 +194,7 @@ impl Directories {
                 segments: Vec::new(),
             },
             open_written: None,
+            unwritten: Vec::new(),
             pending: Vec::new(),
             root_dirty: false,
             series_through: None,
@@ -402,6 +405,15 @@ impl Directories {
         Ok(())
     }
 
+    fn listed_through(&self) -> Position {
+        self.open
+            .segments
+            .last()
+            .map(SegmentRecord::last)
+            .or_else(|| self.full.last().map(|g| g.last))
+            .unwrap_or_default()
+    }
+
     fn root(&self) -> Root {
         let mut groups = self.full.clone();
         if !self.open.segments.is_empty() {
@@ -432,6 +444,10 @@ impl Directories {
         self.pending.sort_by_key(SegmentRecord::last);
         let ready = self.pending.partition_point(|r| r.last() <= synced);
         for r in self.pending.drain(..ready).collect::<Vec<_>>() {
+            // A segment sealed before the files were read is already listed.
+            if r.last() <= self.listed_through() {
+                continue;
+            }
             if self.open.segments.len() == logdir::GROUP_SEGMENTS {
                 let number = self.open.number + 1;
                 let full = std::mem::replace(
@@ -442,6 +458,9 @@ impl Directories {
                     },
                 );
                 self.full.push(full.entry());
+                if self.open_written != Some(full.segments.len() as u32) {
+                    self.unwritten.push(full);
+                }
                 self.open_written = Some(0);
             }
             if self.series_through.is_none_or(|t| r.last() > t) {
@@ -472,6 +491,16 @@ impl Directories {
 
     fn write_log_directory(&mut self, wall: i64) -> bool {
         let store_id = self.store_id;
+        while let Some(g) = self.unwritten.first().cloned() {
+            if !self.write(
+                Family::Group(g.number),
+                |f| encode_group(&g, f, store_id),
+                wall,
+            ) {
+                return false;
+            }
+            self.unwritten.remove(0);
+        }
         let n = self.open.segments.len() as u32;
         if n > 0 && self.open_written != Some(n) {
             let g = self.open.clone();

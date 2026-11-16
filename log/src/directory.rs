@@ -365,6 +365,52 @@ pub fn remove_family(fs: &dyn Fs, store_dir: &Path, family: Family) -> io::Resul
     Ok(())
 }
 
+/// The derived files as a source of F (`spec.md` §3 Recovery rule 3): the highest position the valid root, series
+/// directory and status file of the current generation name. A file of a newer version is passed over: the writer
+/// writes none of its family, and none names a position above the last synced mark.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DerivedSource;
+
+impl crate::writer::sources::PositionSource for DerivedSource {
+    fn kind(&self) -> &'static str {
+        "derived file"
+    }
+
+    fn read(
+        &self,
+        ctx: &crate::writer::sources::SourceContext<'_>,
+    ) -> Result<crate::writer::sources::SourceReport, FormatError> {
+        let id = ctx.store_id;
+        let at = |p: Position| (p.generation == ctx.generation).then_some(p.sequence);
+        let root = read_latest(ctx.fs, ctx.store_dir, Family::Root, |b| {
+            logdir::Root::decode(b, &id)
+        })
+        .ok()
+        .flatten()
+        .and_then(|(_, r)| at(r.through));
+        let series = read_latest(ctx.fs, ctx.store_dir, Family::Series, |b| {
+            series::SeriesDirectory::decode(b, &id)
+        })
+        .ok()
+        .flatten()
+        .and_then(|(_, d)| at(d.through));
+        let status = read_latest(ctx.fs, ctx.store_dir, Family::Status, |b| {
+            status::StatusFile::decode(b, &id)
+        })
+        .ok()
+        .flatten()
+        .and_then(|(_, s)| at(s.mark_synced));
+        Ok(crate::writer::sources::SourceReport {
+            highest: [root, series, status]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(0),
+            named: Vec::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

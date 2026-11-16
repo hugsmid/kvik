@@ -3,9 +3,9 @@
 //! A start that writes a recovery entry places it at F = 1 + the highest sequence of the current generation among
 //! the last kept position and every position named by a local cursor file, manifest record or derived file, so no
 //! position such a file names is assigned again. The manifest is read by the start itself; every other kind of file
-//! contributes through a [`PositionSource`], listed in [`sources`]: the registry file (`format.md` A.16) and cursor
-//! files (A.15) so far. Each later kind of derived file (compacted chunks, summary trees) adds its own source there,
-//! with a test that a position it names raises F.
+//! contributes through a [`PositionSource`], listed in [`sources`]: the registry file (`format.md` A.16), cursor
+//! files (A.15) and the derived files (A.18) so far. Each later kind of derived file (compacted chunks, summary
+//! trees) adds its own source there, with a test that a position it names raises F.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -73,6 +73,7 @@ pub fn sources() -> Vec<Box<dyn PositionSource>> {
     vec![
         Box::new(RegistrySource),
         Box::new(crate::cursor::CursorSource),
+        Box::new(crate::directory::DerivedSource),
     ]
 }
 

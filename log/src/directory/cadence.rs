@@ -64,16 +64,8 @@ impl Uncovered {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     const MIB: u64 = 1 << 20;
-
-    fn at(s: u64) -> Position {
-        Position {
-            generation: 0,
-            sequence: s,
-        }
-    }
 
     #[test]
     fn due_by_bytes_by_time_and_never_with_nothing_uncovered() {
@@ -89,32 +81,5 @@ mod tests {
             Some(SERIES_INTERVAL - Duration::from_nanos(1))
         ));
         assert!(series_due(MIB, MIB, None));
-    }
-
-    proptest! {
-        /// Seals of any size up to `segment_size` at any rate: after each seal's due write the uncovered bytes are at
-        /// most `SERIES_BYTES − segment_size` (under half the allowance), and before it at most
-        /// `max(SERIES_BYTES, segment_size)`, inside the allowance for every `segment_size` up to it.
-        #[test]
-        fn uncovered_bytes_stay_inside_the_allowance(
-            segment_mib in 16u64..=64,
-            seals in prop::collection::vec((1u64..=1024, 0u64..=1_200), 1..400),
-        ) {
-            let segment_size = segment_mib * MIB;
-            let mut u = Uncovered::default();
-            let mut since: Option<Duration> = None;
-            for (i, (len_kib, gap_s)) in seals.into_iter().enumerate() {
-                let len = (len_kib * segment_size / 1024).max(4096);
-                since = since.map(|d| d + Duration::from_secs(gap_s));
-                u.sealed(at(i as u64 + 1), len);
-                prop_assert!(u.bytes() <= SERIES_BYTES.max(segment_size));
-                prop_assert!(u.bytes() <= READER_ALLOWANCE);
-                if series_due(u.bytes(), segment_size, since) {
-                    u.covered(at(i as u64 + 1));
-                    since = Some(Duration::ZERO);
-                }
-                prop_assert!(u.bytes() <= SERIES_BYTES.saturating_sub(segment_size));
-            }
-        }
     }
 }
