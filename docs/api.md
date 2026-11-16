@@ -132,9 +132,9 @@ pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timesta
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
     Io { path, source } }
 ```
-Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence) and
-`ConsumerError::RouteCycle` (a route or a change of `emits`), and `DefineError::RouteCycle` for an alias, each naming
-the cycle (roadmap 5.2). A `Start::Position` whose saved point is unknown is `ConsumerError::UnknownPoint`. Backup
+Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence),
+`ConsumerError::Pattern(RouteError)` (a name pattern refused, below) and `ConsumerError::RouteCycle` (a route or a
+change of `emits`), and `DefineError::RouteCycle` for an alias, each naming the cycle (roadmap 5.2). A `Start::Position` whose saved point is unknown is `ConsumerError::UnknownPoint`. Backup
 errors are added by roadmap 8.2.
 
 ## Handles and life cycle (accepted at gate 3.3)
@@ -287,11 +287,18 @@ enum Live { Value(Fact), None, Unknown }
   route, a change of `emits` or an alias (`store.alias`) that closes a cycle between consumers is refused with the
   error `RouteCycle`, naming the cycle (spec §4 Routing). Routes are kept across restarts: `route` with a funnel equal
   to one in force returns that funnel's id and writes nothing, keeping its latch, so an application may route its
-  funnels at every start, as the example does (Q-91 (c)). Whether two name patterns overlap must be decidable from
-  the two patterns alone. The pattern grammar is provisional until roadmap 5.6 (`model/OPEN-QUESTIONS.md`, Q-88): a
-  name pattern has as many `/`-separated segments as the names it matches, and `*` matches any run of characters
-  within one segment; two patterns overlap when they have as many segments and, in each, some string that both
-  match.
+  funnels at every start, as the example does (Q-91 (c)).
+- A name pattern, in a funnel or in `emits`, has exactly the three `/`-separated segments of a name, each a literal
+  or `*`, which matches one whole segment (spec §4 Funnel, Q-88). It is refused when routes are compiled, on both
+  backends, with `ConsumerError::Pattern` and a `RouteError`: `Segments { found }` (not three segments),
+  `EmptySegment`, `PartialWildcard` (a `*` inside a segment, such as `plant/line-*/power`) or `TooLong { len }`
+  (over 255 bytes). There is no escape: a name segment holding `*` is matched only by `*`. Two patterns overlap
+  when, segment by segment, they are equal or either is `*`; an id overlaps a pattern when any name of its series
+  matches it, aliases included.
+```rust
+#[non_exhaustive]
+pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySegment, PartialWildcard }
+```
 
 ## Reader processes (accepted at gate 3.3)
 ```rust

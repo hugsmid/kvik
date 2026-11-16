@@ -252,7 +252,7 @@ fn emits_are_declared_and_routing_cycles_are_refused() {
     // A consumer's own cycle, through two patterns that one name could match.
     let p = new_consumer(&s, "p", Select::Names("loop/*/a".into()));
     assert!(matches!(
-        block_on(p.route(Funnel::facts(Select::Names("loop/x*/*".into())))),
+        block_on(p.route(Funnel::facts(Select::Names("loop/x/*".into())))),
         Err(ConsumerError::RouteCycle(_))
     ));
     // An alias that would make an id selected by p match what p emits is refused.

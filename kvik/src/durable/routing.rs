@@ -15,8 +15,9 @@ use kvik_log::entries::{
 use kvik_log::writer::Position as LogPos;
 
 use super::registry::Registry;
-use crate::backend::{Error, convert, matches_pattern};
+use crate::backend::{Error, convert};
 use crate::consume::{Condition, Funnel, Operator, Select};
+use crate::pattern;
 use crate::read::Aggregate;
 use crate::series::{Kind, StateValues, Timing};
 use crate::types::{SeriesId, Value};
@@ -70,7 +71,7 @@ pub(crate) struct View {
 fn resolve(registry: &Registry, pattern: &str) -> BTreeSet<u32> {
     registry
         .iter()
-        .filter(|s| !s.retired() && s.names.iter().any(|n| matches_pattern(pattern, n)))
+        .filter(|s| !s.retired() && s.names.iter().any(|n| pattern::matches(pattern, n)))
         .map(|s| s.def.id)
         .collect()
 }
@@ -196,7 +197,7 @@ impl View {
             Selection::Pattern { pattern, .. } => self
                 .registry
                 .get(series)
-                .is_some_and(|s| s.names.iter().any(|n| matches_pattern(&pattern, n))),
+                .is_some_and(|s| s.names.iter().any(|n| pattern::matches(&pattern, n))),
         }
     }
 
@@ -289,47 +290,11 @@ pub(crate) fn overlap(a: &Selection, b: &Selection, names: &dyn Fn(u32) -> Vec<S
         (S::Ids(x), S::Ids(y)) => x.iter().any(|i| y.contains(i)),
         (S::Ids(ids), S::Pattern { pattern, .. }) | (S::Pattern { pattern, .. }, S::Ids(ids)) => {
             ids.iter()
-                .any(|i| names(*i).iter().any(|n| matches_pattern(pattern, n)))
+                .any(|i| names(*i).iter().any(|n| pattern::matches(pattern, n)))
         }
-        (S::Pattern { pattern: p, .. }, S::Pattern { pattern: q, .. }) => patterns_overlap(p, q),
+        (S::Pattern { pattern: p, .. }, S::Pattern { pattern: q, .. }) => pattern::overlap(p, q),
         _ => false,
     }
-}
-
-/// Whether some name matches both patterns: the same number of `/`-separated segments, and in each segment some
-/// string that both globs match (`*` matching any run of characters within a segment, Q-88).
-pub(crate) fn patterns_overlap(p: &str, q: &str) -> bool {
-    let (a, b): (Vec<&str>, Vec<&str>) = (p.split('/').collect(), q.split('/').collect());
-    a.len() == b.len()
-        && a.iter()
-            .zip(&b)
-            .all(|(x, y)| globs_meet(x.as_bytes(), y.as_bytes()))
-}
-
-fn globs_meet(p: &[u8], q: &[u8]) -> bool {
-    // seen[i][j]: the suffixes p[i..] and q[j..] were found to share no string.
-    let mut seen = vec![vec![false; q.len() + 1]; p.len() + 1];
-    fn go(p: &[u8], q: &[u8], i: usize, j: usize, seen: &mut Vec<Vec<bool>>) -> bool {
-        if seen[i][j] {
-            return false;
-        }
-        let r = match (p.get(i), q.get(j)) {
-            (None, None) => true,
-            (Some(b'*'), _) => {
-                go(p, q, i + 1, j, seen) || (j < q.len() && go(p, q, i, j + 1, seen))
-            }
-            (_, Some(b'*')) => {
-                go(p, q, i, j + 1, seen) || (i < p.len() && go(p, q, i + 1, j, seen))
-            }
-            (Some(x), Some(y)) => x == y && go(p, q, i + 1, j + 1, seen),
-            _ => false,
-        };
-        if !r {
-            seen[i][j] = true;
-        }
-        r
-    }
-    go(p, q, 0, 0, &mut seen)
 }
 
 /// A selection as the log carries it, for `emits` (no pattern is resolved).
@@ -364,8 +329,8 @@ fn route_err(s: &str) -> Error {
 }
 
 /// The routing change that adds `funnel` as funnel `id` of `consumer`, with `emits` in force, checked against the
-/// registry as the model backend checks it (`model/OPEN-QUESTIONS.md` Q-88 for patterns). Operators are refused:
-/// they need windows over recent facts (roadmap 5.4).
+/// registry as the model backend checks it, the pattern first (spec §4 Funnel). Operators are refused: they need
+/// windows over recent facts (roadmap 5.4).
 pub(crate) fn add_change(
     registry: &Registry,
     consumer: &str,
@@ -373,6 +338,9 @@ pub(crate) fn add_change(
     funnel: &Funnel,
     emits: Selection,
 ) -> Result<Routing, Error> {
+    if let Select::Names(p) = &funnel.series {
+        pattern::check(p).map_err(Error::Pattern)?;
+    }
     if funnel.operator.is_some() {
         return Err(Error::NotSupportedYet(
             "a funnel with an operator on the durable backend (windowed operators come with roadmap 5.4)",
@@ -390,9 +358,6 @@ pub(crate) fn add_change(
             Selection::Ids(ids.iter().map(|i| i.0).collect())
         }
         Select::Names(p) => {
-            if p.is_empty() || p.len() > 255 {
-                return Err(route_err("a name pattern is 1 to 255 bytes"));
-            }
             let resolved = if funnel.condition.is_some() {
                 resolve(registry, p).into_iter().collect()
             } else {
@@ -551,22 +516,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn patterns_overlap_within_segments() {
-        assert!(patterns_overlap("plant/*/power", "plant/line-*/power"));
-        assert!(patterns_overlap("plant/*/power", "*/a/*"));
-        assert!(patterns_overlap("a*b/x/y", "*c*/x/y"));
-        assert!(!patterns_overlap("plant/*/power", "plant/*/energy"));
-        assert!(!patterns_overlap("plant/*/power", "plant/*"));
-        assert!(!patterns_overlap("a*b/x/y", "c*/x/y"));
-        // "abab" matches both.
-        assert!(patterns_overlap("ab*/x/y", "*ba*b/x/y"));
-        assert!(!patterns_overlap("ab/x/y", "*ba*b/x/y"));
-    }
-
-    #[test]
     fn selections_overlap() {
         let names = |id: u32| match id {
             1 => vec!["site/a/power".to_string()],
+            3 => vec!["site/c/raw".to_string(), "site/c/power".to_string()],
             _ => vec!["site/b/energy".to_string()],
         };
         let pat = |p: &str| Selection::Pattern {
@@ -581,6 +534,22 @@ mod tests {
         assert!(!overlap(
             &Selection::Ids(vec![2]),
             &pat("site/*/power"),
+            &names
+        ));
+        assert!(overlap(
+            &pat("site/*/power"),
+            &Selection::Ids(vec![3]),
+            &names
+        ));
+        assert!(!overlap(
+            &Selection::Ids(vec![2]),
+            &pat("site/b/power"),
+            &names
+        ));
+        assert!(overlap(&pat("site/*/power"), &pat("*/a/*"), &names));
+        assert!(!overlap(
+            &pat("site/*/power"),
+            &pat("site/*/energy"),
             &names
         ));
         assert!(overlap(&Selection::All, &Selection::Ids(vec![2]), &names));

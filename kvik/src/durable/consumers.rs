@@ -112,6 +112,9 @@ impl Writer {
                 "a consumer name is [a-z0-9][a-z0-9._-]{0,63} (format.md A.12)".into(),
             ));
         }
+        if let Select::Names(p) = emits {
+            crate::pattern::check(p).map_err(Error::Pattern)?;
+        }
         let emits = emits_in(emits);
         let mut d = lock(&self.decider);
         let change = hub.run(|dl, c| -> Result<Option<Routing>, Error> {

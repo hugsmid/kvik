@@ -174,7 +174,7 @@ Different from `docs/api.md`:
   result struct is `#[non_exhaustive]`, built with `new`, the setters, or `default()` and field assignment.
 - **Errors**: the backend adds `NotSupportedYet` to `DefineError`, `ConsumerError::NotSupportedYet`,
   `QueryError::Invalid` (a malformed query) and `QueryError::Closed`. `ConsumerError` carries the funnel-compilation
-  errors (`Route`, `RouteCycle`) and `UnknownPoint`, and `DefineError::RouteCycle` refuses an alias that closes a cycle; `BackupError`
+  errors (`Route`, `Pattern` with its `RouteError`, `RouteCycle`) and `UnknownPoint`, and `DefineError::RouteCycle` refuses an alias that closes a cycle; `BackupError`
   stands in for the backup errors that roadmap 8.2 settles.
 - **`Health::Closed`** after the writer shuts down, and **`Reason::ClockSkew`** (spec §9 row 5).
 - **`Backend`**, `StoreConfig::backend` and `ReaderConfig::backend` choose the backend.
@@ -202,6 +202,5 @@ Different from `docs/api.md`:
   `counter_regressions`, `IngestStats.waits`, and `Limits.consumer_queue` and `max_consumers` (keys of later
   sections that the backend needs).
 
-Name patterns in a funnel's selection and in `emits` work, but their grammar is provisional (`*` within one
-`/`-separated segment; two patterns overlap when every segment has a string both match), as the specification does
-not define one yet ([Q-88](../model/OPEN-QUESTIONS.md#q-88--the-grammar-of-name-patterns)).
+Name patterns in a funnel's selection and in `emits` have three segments, each a literal or a whole-segment `*`;
+both backends refuse any other pattern with `ConsumerError::Pattern` (spec §4 Funnel, Q-88).

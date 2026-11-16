@@ -214,23 +214,6 @@ fn model_config(config: &StoreConfig) -> Result<km::engine::Config> {
     })
 }
 
-/// Whether `name` matches `pattern`: the same number of `/`-separated
-/// segments, `*` matching any run of characters within a segment.
-pub(crate) fn matches_pattern(pattern: &str, name: &str) -> bool {
-    fn segment(p: &[u8], s: &[u8]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some((b'*', rest)) => (0..=s.len()).any(|i| segment(rest, &s[i..])),
-            Some((c, rest)) => s.first() == Some(c) && segment(rest, &s[1..]),
-        }
-    }
-    let (p, n): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), name.split('/').collect());
-    p.len() == n.len()
-        && p.iter()
-            .zip(&n)
-            .all(|(p, n)| segment(p.as_bytes(), n.as_bytes()))
-}
-
 fn without_name(spec: &SeriesSpec) -> SeriesSpec {
     SeriesSpec {
         name: String::new(),
@@ -621,7 +604,7 @@ impl Slot {
             .registry()
             .map_err(convert::error)?
             .live()
-            .filter(|d| d.names.iter().any(|n| matches_pattern(pattern, n)))
+            .filter(|d| d.names.iter().any(|n| crate::pattern::matches(pattern, n)))
             .map(|d| d.id)
             .collect())
     }
@@ -912,6 +895,9 @@ impl Slot {
             return Err(Error::Closed);
         }
         self.up()?;
+        if let Select::Names(p) = emits {
+            crate::pattern::check(p).map_err(Error::Pattern)?;
+        }
         if *emits != Select::None {
             return Err(Error::NotSupportedYet(
                 "a consumer that emits readings (emits other than Select::None): the model \
@@ -1029,6 +1015,9 @@ impl Slot {
         let cid = self.bound(epoch, name)?;
         if self.model.is_read_only() {
             return Err(Error::ReadOnly("routing changes are log entries".into()));
+        }
+        if let Select::Names(p) = &funnel.series {
+            crate::pattern::check(p).map_err(Error::Pattern)?;
         }
         // The same definition again (a consumer that routes at every start) is the funnel in force, with its latch
         // (Q-91 (c)).
@@ -1814,21 +1803,5 @@ impl Slot {
             self.sync_clock();
         }
         ts(self.model.now)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::matches_pattern;
-
-    #[test]
-    fn patterns_match_within_segments() {
-        assert!(matches_pattern("plant/*/power", "plant/line-1/power"));
-        assert!(matches_pattern("plant/line-*/p*r", "plant/line-12/power"));
-        assert!(!matches_pattern("plant/*/power", "plant/line-1/sub/power"));
-        assert!(!matches_pattern("plant/*/power", "plant/line-1/energy"));
-        assert!(matches_pattern("a/b/c", "a/b/c"));
-        assert!(matches_pattern("*/*/*", "a/b/c"));
-        assert!(!matches_pattern("*", "a/b"));
     }
 }
