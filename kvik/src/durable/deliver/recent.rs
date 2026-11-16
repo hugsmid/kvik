@@ -38,54 +38,131 @@ fn tp(f: &FactRec) -> (i64, LogPos) {
     (f.stored.row.t, f.stored.position)
 }
 
-/// See the module documentation.
-#[derive(Debug, Default)]
+/// Bytes a fact takes in a window: its slot, its shared record and a text value's bytes.
+fn fact_bytes(f: &FactRec) -> usize {
+    let heap = match &f.stored.row.value {
+        kvik_log::facts::Value::Text(t) => t.capacity(),
+        _ => 0,
+    };
+    std::mem::size_of::<Arc<FactRec>>()
+        + std::mem::size_of::<FactRec>()
+        + 2 * std::mem::size_of::<usize>()
+        + heap
+}
+
+/// See the module documentation. Memory is bounded per series by the window's span and `cap` facts whatever `now`
+/// is, and over all series by `budget` bytes, above which each series' oldest key leaves in turn (Q-751).
+#[derive(Debug)]
 pub(super) struct Recent {
+    cap: usize,
+    budget: usize,
+    bytes: usize,
     series: HashMap<u32, Win>,
+    order: Vec<u32>,
+    cursor: usize,
+}
+
+impl Default for Recent {
+    fn default() -> Self {
+        Recent::with_limits(WINDOW_FACTS, usize::MAX)
+    }
 }
 
 impl Recent {
+    /// Windows of at most `cap` facts a series and `budget` bytes in all.
+    pub(super) fn with_limits(cap: usize, budget: usize) -> Self {
+        Recent {
+            cap,
+            budget,
+            bytes: 0,
+            series: HashMap::new(),
+            order: Vec::new(),
+            cursor: 0,
+        }
+    }
+
     /// Takes in a fact taken from the log at `now`, of a series whose window span `span` gives, asked once per
     /// series.
     pub(super) fn note(&mut self, rec: &Arc<FactRec>, span: impl FnOnce() -> i64, now: i64) {
         let t = rec.stored.row.t;
-        let w = self
-            .series
-            .entry(rec.stored.row.series_id)
-            .or_insert_with(|| Win {
-                latest: t,
-                floor: i64::MIN,
-                span: span(),
-                facts: VecDeque::new(),
-            });
+        let id = rec.stored.row.series_id;
+        let w = match self.series.entry(id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.order.push(id);
+                e.insert(Win {
+                    latest: t,
+                    floor: i64::MIN,
+                    span: span(),
+                    facts: VecDeque::new(),
+                })
+            }
+        };
         if t < w.floor {
             return;
         }
         let at = w.facts.partition_point(|f| tp(f) <= tp(rec));
+        if w.facts.len() >= self.cap && w.facts.len() == w.facts.capacity() {
+            w.facts.reserve_exact(1);
+        }
         w.facts.insert(at, rec.clone());
+        self.bytes += fact_bytes(rec);
         w.latest = w.latest.max(t);
         let edge = w.latest.min(now);
         w.floor = w.floor.max(edge.saturating_sub(w.span));
+        let mut freed = 0;
         while w.facts.front().is_some_and(|f| f.stored.row.t < w.floor) {
-            w.facts.pop_front();
+            freed += w.facts.pop_front().map_or(0, |f| fact_bytes(&f));
         }
-        while w.facts.len() > WINDOW_FACTS {
+        // The cap holds whatever `now` is: a fact at or ahead of it that leaves is read from the log when needed.
+        while w.facts.len() > self.cap {
             let t0 = w.facts[0].stored.row.t;
-            if t0 >= edge {
-                break;
-            }
             while w.facts.front().is_some_and(|f| f.stored.row.t == t0) {
-                w.facts.pop_front();
+                freed += w.facts.pop_front().map_or(0, |f| fact_bytes(&f));
             }
             w.floor = t0.saturating_add(1);
+        }
+        self.bytes -= freed;
+        self.keep_budget();
+    }
+
+    /// Takes each series' oldest key in turn until the bytes held are within the budget.
+    fn keep_budget(&mut self) {
+        let mut idle = 0;
+        while self.bytes > self.budget && idle < self.order.len() {
+            self.cursor = (self.cursor + 1) % self.order.len();
+            let Some(w) = self.series.get_mut(&self.order[self.cursor]) else {
+                idle += 1;
+                continue;
+            };
+            let Some(t0) = w.facts.front().map(|f| f.stored.row.t) else {
+                idle += 1;
+                continue;
+            };
+            idle = 0;
+            while w.facts.front().is_some_and(|f| f.stored.row.t == t0) {
+                self.bytes -= w.facts.pop_front().map_or(0, |f| fact_bytes(&f));
+            }
+            w.floor = w.floor.max(t0.saturating_add(1));
+            if w.facts.capacity() > 2 * w.facts.len() + 16 {
+                w.facts.shrink_to(w.facts.len() + w.facts.len() / 2);
+            }
         }
     }
 
     /// Forgets the facts above `above`.
     pub(super) fn void(&mut self, above: LogPos) {
+        let mut freed = 0;
         for w in self.series.values_mut() {
-            w.facts.retain(|f| f.stored.position <= above);
+            w.facts.retain(|f| {
+                let keep = f.stored.position <= above;
+                if !keep {
+                    freed += fact_bytes(f);
+                }
+                keep
+            });
         }
+        self.bytes -= freed;
     }
 
     /// The facts of a key in position order, or `None` when the key is below the window.
@@ -118,6 +195,12 @@ impl Recent {
     #[cfg(test)]
     pub(super) fn held(&self) -> usize {
         self.series.values().map(|w| w.facts.len()).sum()
+    }
+
+    /// Bytes held, over all series.
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -344,6 +427,94 @@ fn read_positions(
         }
         if !more {
             return Some(out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
+
+    use super::*;
+
+    const S: i64 = 1_000_000_000;
+    const SPAN: i64 = 10 * S;
+
+    fn rec(series: u32, t: i64, sequence: u64) -> Arc<FactRec> {
+        Arc::new(FactRec {
+            stored: Stored {
+                position: LogPos {
+                    generation: 0,
+                    sequence,
+                },
+                received_at: 0,
+                row: FactRow {
+                    series_id: series,
+                    t,
+                    quality: Quality::Good,
+                    flags: FactFlags::default(),
+                    value: Value::F64(0),
+                    changed_at: None,
+                },
+            },
+            outranked: false,
+            unchecked: false,
+        })
+    }
+
+    /// Notes one fact a second for series 1, `t` from 0 to `n - 1`, at `now`.
+    fn filled(r: &mut Recent, n: i64, now: i64) {
+        for k in 0..n {
+            r.note(&rec(1, k * S, k as u64 + 1), || SPAN, now);
+        }
+    }
+
+    #[test]
+    fn the_window_holds_every_fact_from_its_floor_and_none_below() {
+        let mut r = Recent::with_limits(1_000, usize::MAX);
+        filled(&mut r, 100, 1_000 * S);
+        let floor = 99 * S - SPAN;
+        assert_eq!(r.floor(1), floor);
+        assert_eq!(r.key((1, floor)).map(|v| v.len()), Some(1));
+        assert!(r.key((1, floor - S)).is_none());
+        assert_eq!(r.held(), 11);
+    }
+
+    #[test]
+    fn the_window_follows_now_when_it_is_behind_the_data() {
+        let mut r = Recent::with_limits(1_000, usize::MAX);
+        filled(&mut r, 100, 50 * S);
+        assert_eq!(r.floor(1), 50 * S - SPAN);
+        assert_eq!(r.held(), 60);
+    }
+
+    #[test]
+    fn the_cap_holds_whatever_now_is_and_raises_the_floor_past_the_key_that_left() {
+        let mut r = Recent::with_limits(4, usize::MAX);
+        filled(&mut r, 8, 0);
+        assert_eq!(r.held(), 4);
+        assert_eq!(r.floor(1), 3 * S + 1);
+        assert!(r.key((1, 3 * S)).is_none());
+        assert_eq!(r.key((1, 4 * S)).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn the_windows_stay_within_their_byte_budget() {
+        let one = fact_bytes(&rec(1, 0, 1));
+        let mut r = Recent::with_limits(1_000, 50 * one);
+        for k in 0..400u64 {
+            r.note(
+                &rec((k % 20) as u32, (k / 20) as i64 * S, k + 1),
+                || SPAN,
+                i64::MAX,
+            );
+            assert!(r.bytes() <= 50 * one);
+        }
+        assert_eq!(r.held(), 50);
+        // Each series keeps its newest facts; what left is below its floor.
+        for s in 0..20 {
+            assert!(r.key((s, 0)).is_none());
+            assert_eq!(r.key((s, 19 * S)).map(|v| v.len()), Some(1));
         }
     }
 }

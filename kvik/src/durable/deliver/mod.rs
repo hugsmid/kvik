@@ -263,6 +263,7 @@ impl Deliverer {
         store_id: [u8; 16],
         capacity: usize,
         max_consumers: usize,
+        window_budget: usize,
     ) -> io::Result<Deliverer> {
         let mut id = [0u8; 16];
         env.entropy.fill(&mut id);
@@ -279,7 +280,10 @@ impl Deliverer {
             reader: RefCell::new(Some(reader)),
             store_id,
             index: Index::without_facts(),
-            recent: recent::Recent::default(),
+            recent: recent::Recent::with_limits(
+                crate::durable::history::WINDOW_FACTS,
+                window_budget,
+            ),
             damaged: crate::durable::keys::Lost::default(),
             slow: Cell::new(0),
             incomplete: Cell::new(false),

@@ -342,10 +342,8 @@ pub struct LogReader {
     view: View,
     lost: Vec<LostRange>,
     scratch: Scratch,
-    /// Sealed segments' indexes read by [`LogReader::lookup`], by file id.
-    seal_index: std::collections::HashMap<u64, lookup::SealIndex>,
-    /// What [`LogReader::lookup`] has read of each segment, by file id.
-    maps: std::collections::HashMap<u64, lookup::SegmentMap>,
+    /// What [`LogReader::lookup`] keeps of sealed segments' indexes and of segments' batches.
+    caches: lookup::Caches,
     closed: bool,
 }
 
@@ -382,8 +380,7 @@ impl LogReader {
             view: View::default(),
             lost: Vec::new(),
             scratch: Scratch::default(),
-            seal_index: std::collections::HashMap::new(),
-            maps: std::collections::HashMap::new(),
+            caches: lookup::Caches::default(),
             closed: false,
             cfg,
         };
@@ -779,4 +776,4 @@ mod lookup;
 #[cfg(test)]
 mod tests;
 
-pub use lookup::{FoundFact, Lookup, Wanted};
+pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted};

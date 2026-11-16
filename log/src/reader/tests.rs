@@ -330,7 +330,15 @@ mod parts_and_lookup {
                 .sum();
             if more {
                 assert!(items >= 7);
-                assert!(u.state.durable <= whole.state.durable);
+                let last = u.events.iter().rev().find_map(|e| match e {
+                    ReadEvent::Batch(b) => Some(b.last),
+                    _ => None,
+                });
+                assert_eq!(
+                    Some(u.state.durable),
+                    last,
+                    "a part reports the last position it returned"
+                );
             }
             events.extend(u.events);
             if !more {
@@ -517,5 +525,174 @@ mod parts_and_lookup {
         assert!(!got.lease_kept);
         assert_eq!(got.complete, [true]);
         assert!(!got.facts.is_empty());
+    }
+
+    #[test]
+    fn a_lookup_in_small_parts_and_small_caches_finds_what_one_in_large_ones_finds() {
+        let (fs, log) = store(300);
+        let wanted = [
+            Wanted {
+                series_id: 3,
+                from: 0,
+                to: 0,
+            },
+            Wanted {
+                series_id: 9,
+                from: 20,
+                to: 260,
+            },
+        ];
+        let found = |l: Lookup| -> Vec<(Position, FactRow)> {
+            assert_eq!(l.complete, [true, true]);
+            l.facts.into_iter().map(|f| (f.position, f.row)).collect()
+        };
+        let want = found(reader(&fs, 30).lookup(&wanted, &|_, _, _| false).unwrap());
+        let mut r = reader(&fs, 31);
+        r.caches.limit(600, 256);
+        for round in 0..3 {
+            let got = found(r.lookup(&wanted, &|_, _, _| false).unwrap());
+            assert_eq!(got, want, "round {round}");
+            assert!(r.caches.bytes() <= 600, "{}", r.caches.bytes());
+        }
+        // Damage in a small part is still never read as absence.
+        log.shutdown().unwrap();
+        let first = names(&fs).into_iter().find(|n| n.sealed).unwrap();
+        let path = Path::new("s")
+            .join(crate::store::LOG_DIR)
+            .join(first.to_string());
+        let bytes = fs.read(&path).unwrap();
+        fs.poke(&path, HEADER_LEN + 40, &[bytes[HEADER_LEN + 40] ^ 0xFF]);
+        let everything = Wanted {
+            series_id: 3,
+            from: 0,
+            to: 0,
+        };
+        let mut r = reader(&fs, 32);
+        r.caches.limit(600, 256);
+        assert_eq!(
+            r.lookup(&[everything], &|_, _, _| false).unwrap().complete,
+            [false]
+        );
+    }
+
+    #[test]
+    fn every_part_size_returns_what_one_refresh_does() {
+        let (fs, log) = store(120);
+        let whole = reader(&fs, 40).refresh().unwrap().events;
+        for budget in 1..=12 {
+            let mut r = reader(&fs, 41);
+            let mut events = Vec::new();
+            loop {
+                let (u, more) = r.refresh_some(budget).unwrap();
+                events.extend(u.events);
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(events, whole, "parts of {budget}");
+        }
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_lookup_takes_nothing_above_the_marks_last_position() {
+        let (fs, log) = store(60);
+        log.shutdown().unwrap();
+        let path = Path::new("s")
+            .join(crate::store::LOG_DIR)
+            .join(crate::store::MARK);
+        let (_, m) = crate::mark::read_mark(&fs.read(&path).unwrap(), &[1; 16])
+            .unwrap()
+            .unwrap();
+        let behind = crate::mark::MarkSlot {
+            counter: m.counter + 1,
+            last_sequence: 200,
+            ..m
+        };
+        fs.poke(
+            &path,
+            0,
+            &crate::mark::encode_mark_file([Some(behind), None]),
+        );
+        let got = reader(&fs, 42)
+            .lookup(
+                &[Wanted {
+                    series_id: 3,
+                    from: i64::MIN,
+                    to: i64::MAX,
+                }],
+                &|_, _, _| false,
+            )
+            .unwrap();
+        assert!(!got.facts.is_empty());
+        assert!(got.facts.iter().all(|f| f.position.sequence <= 200));
+    }
+
+    #[test]
+    fn a_missing_mark_segment_leaves_every_range_incomplete() {
+        let (fs, log) = store(60);
+        log.shutdown().unwrap();
+        let open = names(&fs).into_iter().rfind(|n| !n.sealed).unwrap();
+        let mut r = reader(&fs, 43);
+        r.refresh().unwrap();
+        let mark = r.read_mark().unwrap();
+        let mark_name = names(&fs)
+            .into_iter()
+            .find(|n| n.file_id == mark.file_id)
+            .unwrap_or(open);
+        fs.remove_file(
+            &Path::new("s")
+                .join(crate::store::LOG_DIR)
+                .join(mark_name.to_string()),
+        )
+        .unwrap();
+        let got = r
+            .lookup(
+                &[Wanted {
+                    series_id: 3,
+                    from: 0,
+                    to: 0,
+                }],
+                &|_, _, _| false,
+            )
+            .unwrap();
+        assert_eq!(got.complete, [false]);
+    }
+
+    #[test]
+    fn a_recovery_entry_voids_what_precedes_it_at_every_lookup() {
+        let (fs, log) = store(10);
+        let before = log.stats().durable.sequence;
+        log.submit(vec![fact(4, 1_000, 1), fact(4, 1_001, 1)])
+            .unwrap()
+            .wait()
+            .unwrap();
+        // An entry naming `before` as the last kept position voids the two facts just written.
+        let r = crate::entries::Recovery {
+            after: before,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes: 0,
+            readable_commits: 0,
+            mark_state: crate::entries::MarkState::Readable,
+            id_floor: 0,
+            consumers: Vec::new(),
+        };
+        log.submit(vec![Item::Entry(crate::entries::Entry::Recovery(r))])
+            .unwrap()
+            .wait()
+            .unwrap();
+        log.shutdown().unwrap();
+        let wanted = [Wanted {
+            series_id: 4,
+            from: 1_000,
+            to: 1_001,
+        }];
+        let mut r = reader(&fs, 44);
+        for round in 0..2 {
+            let got = r.lookup(&wanted, &|_, _, _| false).unwrap();
+            assert_eq!(got.complete, [true]);
+            assert!(got.facts.is_empty(), "round {round}: {:?}", got.facts);
+        }
     }
 }

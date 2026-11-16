@@ -162,6 +162,8 @@ pub(crate) fn store_error(dir: &Path, e: StoreError) -> OpenError {
 #[derive(Debug, Default)]
 struct Counters {
     series: BTreeMap<u32, SeriesStats>,
+    /// The start read the kept log whole into memory (Q-752).
+    start_whole: bool,
     waits: BTreeMap<Wait, u64>,
     waited: Duration,
     slow_path: u64,
@@ -386,11 +388,15 @@ impl Writer {
         let start_fault = writer.fault().cloned();
         // The kept log, read once in parts: the registry, the decision state and the counters (roadmap 11.0).
         let kept = match start::log_reader(&dir, &env) {
-            Ok(r) => start::read_kept(r, || start::log_reader(&dir, &env)).map_err(|e| {
-                OpenError::Io {
-                    path: dir.clone(),
-                    source: io::Error::other(e.to_string()),
-                }
+            Ok(r) => start::read_kept(
+                r,
+                || start::log_reader(&dir, &env),
+                start::PART,
+                window_budget(&config.limits),
+            )
+            .map_err(|e| OpenError::Io {
+                path: dir.clone(),
+                source: io::Error::other(e.to_string()),
             })?,
             // A start that could not write may leave no readable mark: the store opens read-only.
             Err(_) if start_fault.is_some() => start::Kept::unreadable(),
@@ -401,6 +407,7 @@ impl Writer {
             decider,
             counters: series_counters,
             local,
+            read_whole,
         } = kept;
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
@@ -418,6 +425,7 @@ impl Writer {
         let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
         let counters = Counters {
             series: series_counters,
+            start_whole: read_whole,
             ..Counters::default()
         };
         // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
@@ -447,6 +455,7 @@ impl Writer {
             descriptor.store_id,
             config.limits.consumer_queue,
             config.limits.max_consumers,
+            window_budget(&config.limits),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
@@ -1123,6 +1132,7 @@ impl Writer {
                     max: c.max_latency,
                 },
                 slow_path: c.slow_path,
+                start_whole: c.start_whole,
             },
             log: LogStats {
                 durable: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.durable)),
@@ -1194,6 +1204,11 @@ fn tzdata_name(v: &str) -> String {
     } else {
         v.to_string()
     }
+}
+
+/// Each side's share of `limits.window_memory`: the writer's decision windows and the deliverer's windows (Q-751).
+fn window_budget(l: &Limits) -> usize {
+    usize::try_from(l.window_memory / 2).unwrap_or(usize::MAX)
 }
 
 fn writer_config(config: &StoreConfig) -> WriterConfig {

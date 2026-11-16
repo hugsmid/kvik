@@ -116,6 +116,7 @@ pub use backup::{
 };
 pub use config::{
     Backend, DiskLow, Limits, LogConfig, MarkSync, ReaderConfig, StoreConfig, TierConfig,
+    WINDOW_MEMORY_DESKTOP, WINDOW_MEMORY_MINIMAL,
 };
 pub use consume::{
     Condition, ConditionState, Delivery, DeliveryFlags, DeliveryId, DeliveryKind, Funnel, FunnelId,

@@ -180,7 +180,7 @@ mod bounded {
 
     fn open(env: &Env, dir: &str) -> Deliverer {
         let clocks = Clocks::new(env.clock.clone());
-        Deliverer::open(Path::new(dir), env, &clocks, [0; 16], 4_096, 64).unwrap()
+        Deliverer::open(Path::new(dir), env, &clocks, [0; 16], 4_096, 64, usize::MAX).unwrap()
     }
 
     #[test]

@@ -331,6 +331,9 @@ pub struct IngestStats {
     /// the recent window and the revised-key index, so read from the local log (spec §2.4; zero with the model
     /// backend).
     pub slow_path: u64,
+    /// The store's start read the kept log whole into memory, its read in parts having met a part that voids an
+    /// earlier one (Q-752; false with the model backend).
+    pub start_whole: bool,
 }
 
 /// How the mark is synced.

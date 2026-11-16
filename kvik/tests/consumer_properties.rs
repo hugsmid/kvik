@@ -362,7 +362,11 @@ fn deliveries_follow_the_model_over_restarts() {
                 &m_clock,
                 &history,
             );
-            let w = World::quiet(&format!("differential-{}", next_id()));
+            let mut w = World::quiet(&format!("differential-{}", next_id()));
+            // Every other history with windows of a few dozen facts (Q-751).
+            if next_id().is_multiple_of(2) {
+                w.window_memory = Some(8 << 10);
+            }
             let d = run(w.open(), &|| w.open(), &w.clock, &history);
             prop_assert_eq!(m, d);
             Ok(())

@@ -23,7 +23,7 @@ use crate::env::Env;
 use crate::health::SeriesStats;
 
 /// Items a start takes from the log at a time.
-const PART: usize = 1 << 16;
+pub(crate) const PART: usize = 1 << 16;
 
 /// What a start reads from the kept log.
 pub(crate) struct Kept {
@@ -31,6 +31,8 @@ pub(crate) struct Kept {
     pub(crate) decider: Decider,
     pub(crate) counters: BTreeMap<u32, SeriesStats>,
     pub(crate) local: Box<dyn LocalFacts>,
+    /// The log was read again whole into memory (module documentation).
+    pub(crate) read_whole: bool,
 }
 
 impl Kept {
@@ -41,6 +43,7 @@ impl Kept {
             decider: Decider::default(),
             counters: BTreeMap::new(),
             local: Box::new(Unreadable),
+            read_whole: false,
         }
     }
 }
@@ -83,17 +86,20 @@ fn count(counters: &mut BTreeMap<u32, SeriesStats>, row: &kvik_log::facts::FactR
     st.future += u64::from(row.flags.future);
 }
 
-/// Reads the kept log with `reader` (see the module documentation); `open` gives a fresh reader for a read again.
+/// Reads the kept log with `reader` in parts of `part` items (see the module documentation), into a decision state
+/// of at most `budget` bytes; `open` gives a fresh reader for a read again.
 pub(crate) fn read_kept(
     mut reader: LogReader,
     open: impl FnOnce() -> Result<LogReader, ReaderError>,
+    part: usize,
+    budget: usize,
 ) -> Result<Kept, ReaderError> {
     let mut index = Index::without_facts();
-    let mut decider = Decider::default();
+    let mut decider = Decider::with_budget(budget);
     let mut counters = BTreeMap::new();
     let mut lost = Lost::default();
     loop {
-        let (u, more) = reader.refresh_some(PART)?;
+        let (u, more) = reader.refresh_some(part)?;
         for e in u.events {
             match e {
                 ReadEvent::Batch(b) => {
@@ -107,7 +113,7 @@ pub(crate) fn read_kept(
                 }
                 ReadEvent::Void { .. } => {
                     let _ = reader.close();
-                    return read_whole(open()?);
+                    return read_whole(open()?, budget);
                 }
                 ReadEvent::Corruption { file_id, region } => {
                     lost.insert(file_id, region.start, region.end);
@@ -124,11 +130,12 @@ pub(crate) fn read_kept(
         decider,
         counters,
         local: Box::new(LogFacts::new(reader, lost)),
+        read_whole: false,
     })
 }
 
 /// The log read whole into an index of every fact.
-fn read_whole(mut reader: LogReader) -> Result<Kept, ReaderError> {
+pub(crate) fn read_whole(mut reader: LogReader, budget: usize) -> Result<Kept, ReaderError> {
     let events = reader.refresh()?.events;
     let mut index = Index::default();
     index.apply(&events);
@@ -145,12 +152,13 @@ fn read_whole(mut reader: LogReader) -> Result<Kept, ReaderError> {
             count(&mut counters, &f.row);
         }
     }
-    let decider = Decider::from_index(&index);
+    let decider = Decider::from_index(&index, budget);
     Ok(Kept {
         index,
         decider,
         counters,
         local: Box::new(LogFacts::new(reader, lost)),
+        read_whole: true,
     })
 }
 
@@ -222,7 +230,13 @@ mod tests {
             block_on(s.emit(&readings)).unwrap();
         }
         block_on(s.shutdown()).unwrap();
-        let kept = read_kept(log_reader(dir, &env).unwrap(), || log_reader(dir, &env)).unwrap();
+        let kept = read_kept(
+            log_reader(dir, &env).unwrap(),
+            || log_reader(dir, &env),
+            PART,
+            usize::MAX,
+        )
+        .unwrap();
         let held = kept.decider.history.held();
         assert!(held.window <= 4 * 901, "{held:?}");
         assert!(held.window <= 4 * WINDOW_FACTS);

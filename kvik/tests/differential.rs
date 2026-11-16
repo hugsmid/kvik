@@ -404,6 +404,11 @@ fn the_durable_backend_decides_as_the_model_does() {
             let w = World::new("differential");
             let mut config = w.config();
             config.log.min_sync_interval = Duration::ZERO;
+            // Every other history with windows of a few dozen facts, so that the byte budget sends keys to the
+            // slow path (Q-751).
+            if next().is_multiple_of(2) {
+                config.limits.window_memory = 8 << 10;
+            }
             // A restart opens with the site zone in force (`docs/api.md` Opening).
             let in_zone = |c: &StoreConfig, z: &str| {
                 let mut c = c.clone();

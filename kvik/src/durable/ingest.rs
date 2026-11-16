@@ -112,10 +112,10 @@ fn on_phase(interval: Option<&LogInterval>, t: i64) -> bool {
 
 impl Decider {
     /// The state of the kept log in a full index (a start whose read of the log was voided part-way).
-    pub(crate) fn from_index(index: &Index) -> Self {
+    pub(crate) fn from_index(index: &Index, budget: usize) -> Self {
         let mut d = Decider {
             registry: index.registry().clone(),
-            ..Decider::default()
+            history: History::with_budget(budget),
         };
         let mut facts: Vec<_> = index
             .fact_series()
@@ -128,6 +128,14 @@ impl Decider {
             d.note_kept(&f.row, || span);
         }
         d
+    }
+
+    /// An empty state whose windows and revised-key index hold at most `budget` bytes.
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Decider {
+            registry: Registry::default(),
+            history: History::with_budget(budget),
+        }
     }
 
     /// Takes in a fact of the kept log, read in log order at the start, of a series whose window span `span` gives.

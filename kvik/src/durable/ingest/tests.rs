@@ -341,8 +341,9 @@ proptest! {
         history in steps(),
         span in 1i64..20,
         cap in 1usize..6,
+        budget in prop_oneof![Just(usize::MAX), 0usize..2_000],
     ) {
-        let mut bounded = decider(History::with_window(span * S, cap));
+        let mut bounded = decider(History::with_window_and_budget(span * S, cap, budget));
         let mut all = decider(History::with_window(i64::MAX, usize::MAX));
         let mut mem = Mem::default();
         let mut call = 1;
@@ -406,5 +407,38 @@ proptest! {
         prop_assert_eq!(held.overlay, 0);
         prop_assert_eq!(held.series, series.min(n));
         prop_assert_eq!(mem.reads, 0);
+    }
+
+    #[test]
+    fn the_decision_state_stays_within_its_byte_budget(
+        n in 1usize..3_000,
+        series in 1u32..60,
+        budget in 1_000usize..40_000,
+        revisions in prop::collection::btree_set(0usize..3_000, 0..40),
+    ) {
+        let mut d = decider(History::with_budget(budget));
+        for id in 4..series + 4 {
+            let spec = SeriesSpec::new(format!("a/s{id}/v"), Kind::Gauge { value: ValueType::F64 }, "W");
+            let def = definition_of(&spec, id, Duration::from_secs(300)).unwrap();
+            d.registry.apply(&Entry::Definition(Box::new(def)));
+        }
+        let mut mem = Mem::default();
+        for k in 0..n {
+            let id = (k as u32 % series) + 4;
+            let t = T0 + (k as u32 / series) as i64 * S;
+            let mut call = vec![reading(id, t, 1.0, None)];
+            if revisions.contains(&k) {
+                call.push(reading(id, t, 2.0, None));
+            }
+            commit(&mut d, &mut mem, &call, Intent::Normal, k as u64 + 1);
+            d.readable_below(k as u64 + 2);
+            mem.readable_below = k as u64 + 2;
+            let held = d.history.held();
+            // Within the budget once the call is acknowledged, but for the call just applied.
+            prop_assert!(held.bytes <= budget + 2 * 200, "{held:?}");
+        }
+        // Everything acknowledged: a replay of the first reading is still a duplicate, from the log.
+        let plan = commit(&mut d, &mut mem, &[reading(4, T0, 1.0, None)], Intent::Normal, n as u64 + 1);
+        prop_assert_eq!(&plan.decisions, &vec![Decision::Duplicate]);
     }
 }
