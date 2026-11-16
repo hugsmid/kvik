@@ -10,7 +10,7 @@
 //!   --any-fs       also run on a file system whose sync does nothing (tmpfs, ramfs)
 //!   --keep         keep the stores
 //!   --disk <text>  describe the disk where it cannot be found out (a class, never a model or serial)
-//!   --setup <text> run only the writer settings whose label contains <text>
+//!   --setup <text> run only the writer settings whose label starts with <text>
 //!   --sync-delay <ms>  sleep this long in every `sync_data`, standing in for a slow device
 //! ```
 //!
@@ -994,7 +994,7 @@ fn main() {
         for (si, setup) in Setup::ALL.iter().copied().enumerate() {
             if setup_filter
                 .as_ref()
-                .is_some_and(|f| !setup.label().contains(f.as_str()))
+                .is_some_and(|f| !setup.label().starts_with(f.as_str()))
             {
                 continue;
             }
