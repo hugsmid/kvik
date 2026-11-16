@@ -14,7 +14,7 @@ use kvik::{
 };
 use kvik_export::{
     ExportError, ExportOptions, ExportRow, MAX_SITE_LEN, Month, check_site, escape_segment,
-    export_partitioned, file_name, partition_dir, unescape_segment,
+    export_partitioned, file_name, partial_file_name, partition_dir, unescape_segment,
 };
 use proptest::prelude::*;
 
@@ -23,14 +23,17 @@ fn ts(s: &str) -> Timestamp {
 }
 
 #[test]
-fn a_site_label_is_lower_case_letters_digits_hyphens_and_underscores() {
+fn a_site_label_is_a_lower_case_letter_then_letters_digits_hyphens_and_underscores() {
     let long = "a".repeat(MAX_SITE_LEN);
-    for ok in ["a", "0", "site-1", "north_2", "a-", long.as_str()] {
+    for ok in ["a", "a0", "site-1", "north_2", "a-", long.as_str()] {
         assert!(check_site(ok).is_ok(), "{ok:?}");
     }
     let too_long = "a".repeat(MAX_SITE_LEN + 1);
     for bad in [
         "",
+        "0",
+        "0042",
+        "9a",
         "-a",
         "_a",
         "Site",
@@ -133,10 +136,21 @@ proptest! {
     }
 
     #[test]
-    fn a_segment_that_unescapes_is_the_escape_of_its_name(segment in "[a-z0-9_%A-Fa-f.-]{0,24}") {
-        if let Some(name) = unescape_segment(&segment) {
-            prop_assert_eq!(escape_segment(&name), segment);
-        }
+    fn a_segment_built_from_valid_tokens_is_the_escape_of_its_name((segment, name) in valid_segment()) {
+        prop_assert_eq!(unescape_segment(&segment), Some(name.clone()));
+        prop_assert_eq!(escape_segment(&name), segment);
+    }
+
+    #[test]
+    fn a_segment_with_one_invalid_token_does_not_unescape(
+        (tokens, at, bad) in (valid_tokens(), any::<prop::sample::Index>(), prop::sample::select(INVALID.to_vec())),
+    ) {
+        let mut tokens: Vec<String> = tokens.into_iter().map(|(t, _)| t).collect();
+        // A cut escape is only invalid at the end: before a digit token it would complete itself.
+        let at = if bad.starts_with('%') && bad.len() < 3 { tokens.len() } else { at.index(tokens.len() + 1) };
+        tokens.insert(at, bad.to_string());
+        let broken = tokens.concat();
+        prop_assert_eq!(unescape_segment(&broken), None, "{}", broken);
     }
 
     #[test]
@@ -154,6 +168,48 @@ proptest! {
             prop_assert_eq!(before.range().to, r.from);
         }
     }
+}
+
+/// Tokens no escape contains: a byte that is escaped, lower-case hex, an escape of a kept byte, a cut escape, a
+/// bare `%` at the end, and an escape that starts invalid UTF-8.
+const INVALID: [&str; 7] = [".", "A", "%2f", "%61", "%4", "%", "%FF"];
+
+/// Tokens of a canonical segment (a kept byte as itself, any other character as the `%XX` of each of its UTF-8
+/// bytes), each with the part of the name it stands for.
+fn valid_tokens() -> impl Strategy<Value = Vec<(String, String)>> {
+    prop::collection::vec(
+        prop_oneof![
+            prop::sample::select(b"abcxyz0189-_".to_vec()).prop_map(char::from),
+            any::<char>(),
+        ],
+        0..24,
+    )
+    .prop_map(|chars| {
+        chars
+            .into_iter()
+            .map(|c| {
+                let mut buf = [0u8; 4];
+                let mut token = String::new();
+                for &b in c.encode_utf8(&mut buf).as_bytes() {
+                    if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' {
+                        token.push(char::from(b));
+                    } else {
+                        token.push_str(&format!("%{b:02X}"));
+                    }
+                }
+                (token, c.to_string())
+            })
+            .collect()
+    })
+}
+
+/// A canonical segment built from [`valid_tokens`], with the name it stands for.
+fn valid_segment() -> impl Strategy<Value = (String, String)> {
+    valid_tokens().prop_map(|tokens| {
+        let segment = tokens.iter().map(|(t, _)| t.as_str()).collect();
+        let name = tokens.iter().map(|(_, n)| n.as_str()).collect();
+        (segment, name)
+    })
 }
 
 /// The UTC year and month of `t` by days-from-civil arithmetic, independent of jiff.
@@ -210,6 +266,10 @@ fn file_names_follow_the_view() {
     assert_eq!(
         file_name(View::AsOfTime(Timestamp(-5))).unwrap(),
         "as_of_time--5.parquet"
+    );
+    assert_eq!(
+        partial_file_name(View::Current, TimeRange::new(Timestamp(-5), Timestamp(7))).unwrap(),
+        "current.partial--5_7.parquet"
     );
     assert_eq!(
         partition_dir(
@@ -294,8 +354,8 @@ fn a_partitioned_export_writes_one_file_per_utc_month_with_facts_on_both_backend
             .collect();
         assert_eq!(block_on(store.emit(&readings)).unwrap().recorded(), 5);
         let r = store.reader();
-        let store_id = [7u8; 16];
-        let options = ExportOptions::default().site("site-1").store_id(store_id);
+        let hex: String = r.store_id().iter().map(|b| format!("{b:02x}")).collect();
+        let options = ExportOptions::default().site("site-1");
         let files = partitioned(&r, id, &options).unwrap();
         let dir = "site=site-1/series=plant%2Fline-1%2F%50ower";
         assert_eq!(
@@ -325,7 +385,7 @@ fn a_partitioned_export_writes_one_file_per_utc_month_with_facts_on_both_backend
                 Some(range.to.0.to_string().as_str())
             );
             assert_eq!(f.metadata("kvik.site"), Some("site-1"));
-            assert_eq!(f.metadata("kvik.store_id"), Some("07".repeat(16).as_str()));
+            assert_eq!(f.metadata("kvik.store_id"), Some(hex.as_str()));
             assert_eq!(f.metadata("kvik.series_name"), Some("plant/line-1/Power"));
         }
         assert_eq!(read_back(&files[0].1).len(), 2);
@@ -336,8 +396,34 @@ fn a_partitioned_export_writes_one_file_per_utc_month_with_facts_on_both_backend
             .view(View::History)
             .range(ts("2026-01-20T00:00:00Z")..ts("2026-02-10T00:00:00Z"));
         let files = partitioned(&r, id, &clipped).unwrap();
-        assert_eq!(files.len(), 2, "{backend:?}");
-        assert!(files[0].0.ends_with("month=2026-01/history.parquet"));
+        let (from, to) = (ts("2026-01-20T00:00:00Z").0, ts("2026-02-10T00:00:00Z").0);
+        let (feb, mar) = (ts("2026-02-01T00:00:00Z").0, ts("2026-03-01T00:00:00Z").0);
+        assert_eq!(
+            files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+            vec![
+                format!("{dir}/month=2026-01/history.partial-{from}_{feb}.parquet"),
+                format!("{dir}/month=2026-02/history.partial-{feb}_{to}.parquet"),
+            ],
+            "{backend:?}"
+        );
+        let to_march = options.clone().range(Timestamp(from)..Timestamp(mar));
+        assert_eq!(
+            partitioned(&r, id, &to_march)
+                .unwrap()
+                .iter()
+                .map(|f| f.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{dir}/month=2026-01/current.partial-{from}_{feb}.parquet"),
+                format!("{dir}/month=2026-02/current.parquet"),
+            ],
+            "{backend:?}"
+        );
+        let other = options.clone().store_id([0xEE; 16]);
+        assert!(matches!(
+            partitioned(&r, id, &other),
+            Err(ExportError::InvalidOptions { .. })
+        ));
         let f = open(&files[0].1);
         assert_eq!(
             f.metadata("kvik.range_from_ns"),
@@ -350,6 +436,53 @@ fn a_partitioned_export_writes_one_file_per_utc_month_with_facts_on_both_backend
         );
         assert_eq!(read_back(&files[0].1).len(), 1);
         assert_eq!(read_back(&files[1].1).len(), 1);
+    }
+}
+
+#[test]
+fn a_partitioned_export_as_of_a_point_writes_only_the_months_with_a_fact_then_on_both_backends() {
+    for backend in BACKENDS {
+        let (store, clock) = store_on(backend, "partitioned-as-of");
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let id = block_on(store.define_series(spec)).unwrap();
+        let january = block_on(store.emit(&[Reading::new(
+            id,
+            ts("2026-01-10T00:00:00Z"),
+            Value::F64(1.0),
+        )]))
+        .unwrap();
+        let point = january.last().unwrap();
+        let between = Timestamp(clock.wall().0 + 5_000_000_000);
+        clock.advance(Duration::from_secs(10));
+        block_on(store.emit(&[Reading::new(
+            id,
+            ts("2026-03-10T00:00:00Z"),
+            Value::F64(2.0),
+        )]))
+        .unwrap();
+        let r = store.reader();
+        let options = ExportOptions::default().site("s");
+        assert_eq!(
+            partitioned(&r, id, &options).unwrap().len(),
+            2,
+            "{backend:?}"
+        );
+        for view in [View::AsOf(point), View::AsOfTime(between)] {
+            let files = partitioned(&r, id, &options.clone().view(view)).unwrap();
+            let name = file_name(view).unwrap();
+            assert_eq!(
+                files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+                vec![format!("site=s/series=a%2Fb%2Fc/month=2026-01/{name}")],
+                "{backend:?} {view:?}"
+            );
+            assert_eq!(read_back(&files[0].1).len(), 1);
+        }
     }
 }
 
@@ -414,6 +547,38 @@ fn a_partitioned_export_needs_a_valid_site_and_reports_a_file_it_cannot_open() {
     assert!(
         matches!(&err, ExportError::Open { path, .. } if path == "site=s/series=a%2Fb%2Fc/month=2026-01/current.parquet"),
         "{err}"
+    );
+    block_on(store.emit(&[Reading::new(
+        id,
+        ts("2026-02-05T12:00:00Z"),
+        Value::F64(2.0),
+    )]))
+    .unwrap();
+    let files: Files = Arc::default();
+    let sink = files.clone();
+    let err = export_partitioned(
+        &r,
+        id,
+        &ExportOptions::default().site("s"),
+        move |path: &str| {
+            if path.contains("month=2026-02") {
+                return Err(io::Error::other("full"));
+            }
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            sink.lock().unwrap().push((path.to_string(), buf.clone()));
+            Ok(Shared(buf))
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Open { path, .. } if path.contains("month=2026-02")),
+        "{err}"
+    );
+    let first = files.lock().unwrap()[0].1.lock().unwrap().clone();
+    assert_eq!(
+        read_back(&first).len(),
+        1,
+        "the file before the failure is complete"
     );
     let empty = r.facts(
         id,

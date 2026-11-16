@@ -816,9 +816,9 @@ list of names would change.
 **Draft (roadmap 6.4a).** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`),
 dictionary-encoded; a named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and
 the declared names in the metadata.
-**Settled by the owner, 2026-11-16,** as recommended: quality as dictionary-encoded strings, which the writer now
-asks for explicitly (`export/tests/rows.rs` `quality_columns_are_dictionary_encoded`); a named state as its index in
-`value` with `state_name` beside it.
+**Settled by the owner, 2026-11-16,** as recommended: quality as dictionary-encoded strings (the outcome pinned by
+`export/tests/rows.rs` `quality_columns_are_dictionary_encoded`; the writer's explicit request matches its default
+today); a named state as its index in `value` with `state_name` beside it.
 
 ## Q-195 — A `changed_at` of kind `time` beyond the timestamp range; forecast labels
 
@@ -847,24 +847,34 @@ reachable through the public `Reader` without a side effect (`refresh`).
 **Settled by the owner, 2026-11-16,** as recommended, and beyond the draft. (a) One file per series per period. (b) Row
 groups of at most 131,072 rows; zstd level 1. Beyond the draft: store and site identity in every file's metadata now,
 and a partitioned path layout `site=<site>/series=<series>/month=<YYYY-MM>/` for consolidating many sites from a
-bucket. Applied as follows (`docs/export.md` Options, Partitioned layout, Metadata; `export/tests/layout.rs`):
-- `kvik.site` and `kvik.store_id` (32 lower-case hex digits, as `format.md` A.17 writes a store id) are written when
-  the options give them. The store id is an explicit option, because the public `Reader` cannot read it without a
-  side effect; the store-level metadata the store gives itself (store id, tzdata version, durable position, reset
-  stamp) comes with the export call in the store's interface, and the saved point of a continued export (row 7b)
-  after 5.3 (c, settle-by row 8.3).
-- A site label is 1 to 64 bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter or digit: one folder on
-  every file system and bucket, case-folding or not, and never `.` or `..`.
+bucket. Applied as follows (`docs/export.md` Options, Partitioned layout, Metadata; `export/tests/layout.rs`), the
+choices below being the implementation's, not the ruling's:
+- `kvik.store_id` (32 lower-case hex digits, as `format.md` A.17 writes a store id) is in every file `export_series`
+  and `export_partitioned` write: they take it from `Reader::store_id`, an additive read-only item of the interface
+  that returns the id read at open (`api.md` Reader processes; `kvik/tests/api.rs`
+  `the_store_id_is_the_same_through_every_reader_and_after_a_reopen`), and refuse a different one in the options.
+  `kvik.site` is in every partitioned file, which needs a site; `export_series` writes it when given. `export_rows`,
+  which has no reader, writes either only when given.
+- The rest of the store-level metadata (tzdata version, durable position, reset stamp) is not reachable through the
+  public `Reader` without a side effect (`refresh`), so it is not yet in the files; it comes with the export call in
+  the store's interface, and the saved point of a continued export (row 7b) after 5.3 (c, settle-by row 8.3).
+- A site label is 1 to 64 bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter: one folder on every file
+  system and bucket, case-folding or not, never `.` or `..`, and never read as a number by a Hive-style reader
+  (pyarrow and polars read `site=0042` as 42).
 - `export_partitioned` writes one file per series per UTC month with a fact, at
   `site=<site>/series=<escaped name>/month=<YYYY-MM>/<view>.parquet`. The name is escaped byte by byte: `a`–`z`,
   `0`–`9`, `-` and `_` kept, every other byte `%XX` in upper-case hex; reversible, one segment per name, and
   injective under case folding (property tests `any_name_round_trips_through_its_segment`,
-  `a_segment_that_unescapes_is_the_escape_of_its_name`). The month is the UTC month of `t` for every series,
-  interval series included (an interval goes under the month of its start): it needs no tzdata, so it is the same
-  in every release and site zone and months line up across sites (`months_cut_at_utc_midnight_on_the_first`,
-  `a_month_holds_its_timestamps_and_starts_where_the_last_ends` against a days-from-civil oracle). The file name is
-  the view (`current`, `history`, `as_of-<g>-<s>`, `as_of_time-<ns>`), so exports in different views do not replace
-  one another. Long and renamed names: Q-761.
+  `a_segment_built_from_valid_tokens_is_the_escape_of_its_name`, `a_segment_with_one_invalid_token_does_not_unescape`).
+  An all-digit name gives an all-digit segment, so `docs/export.md` tells readers to declare the partition columns
+  as strings. The month is the UTC month of `t` for every series, interval series included (an interval goes under
+  the month of its start): it needs no tzdata, so it is the same in every release and site zone and months line up
+  across sites (`months_cut_at_utc_midnight_on_the_first`, `a_month_holds_its_timestamps_and_starts_where_the_last_ends`
+  against a days-from-civil oracle). The file name is the view (`current`, `history`, `as_of-<g>-<s>`,
+  `as_of_time-<ns>`), so exports in different views do not replace one another; a month the range cuts is named
+  `<view>.partial-<from_ns>_<to_ns>.parquet`, so it never replaces a whole month's file. The files of one call are
+  not one cut of the store, and a caller publishes them after the call returns (`docs/export.md` Partitioned
+  layout). Long and renamed names: Q-761.
 
 ## Q-197 — The interval end in an export, and calendar-length interval series
 
@@ -1359,9 +1369,11 @@ rule and refusing it at recovery would turn a valid older log into a loss.
 
 ## Q-761 — Long and renamed series names in the partitioned layout
 
-**Scenario.** (a) A series name may be up to 255 bytes (`spec.md` §2.1). Its escaped segment in the partitioned
-layout (Q-196) is up to three times as long, so `series=<segment>` can exceed the 255-byte limit most local file
-systems put on one file name, although a bucket key (1,024 bytes) holds the whole path. (b) A series renamed in
+**Scenario.** (a) A series name may be up to 255 bytes (`format.md` A.6 definition field 2). Its escaped segment in
+the partitioned layout (Q-196) is up to three times as long, so `series=<segment>` can exceed the 255-byte limit most
+local file systems put on one file name. The longest path is 952 bytes (a 64-byte site, a 765-byte segment and the
+longest partial `as_of` file name), so a bucket key (1,024 bytes) holds it only while the caller's own prefix is at
+most 72 bytes. (b) A series renamed in
 March is filed under its new name from March on, and so is January when it is exported again, so one series' months
 sit in two folders.
 **Now.** The layout is as settled: the folder is the escaped display name at export time; `kvik.series_id` in every
@@ -1422,7 +1434,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-175 | 6.3b | An intermediate output no record and no local file describes; recorded at the review of roadmap 6.3a; needs two corrupt merges, so it arises only once 6.3b publishes compaction outputs |
 | Q-191 (b) | 8.3 | Parquet form of orphaned and set-aside facts; settled by the owner, 2026-11-16 (the export schema, one file per call); built with the export call at 8.3 |
 | Q-192 (b) | 6.4b | The scale in force on `SeriesInfo` or the export call; settled by the owner, 2026-11-16; comes with decimal series on the durable backend, `ScaleAboveExport` until then |
-| Q-196 (c) | 8.3 | Store-level metadata from the store itself (store id, tzdata version, durable position, reset stamp) with the export call in the store's interface; the saved point of a continued export after 5.3; settled by the owner, 2026-11-16; the store id is an export option until then |
+| Q-196 (c) | 8.3 | Store-level metadata beyond the store id (tzdata version, durable position, reset stamp) with the export call in the store's interface; the saved point of a continued export after 5.3; settled by the owner, 2026-11-16; the store id is in every file already, from `Reader::store_id` |
 | Q-197 (calendar lengths) | 7.3 | Interval ends of calendar-length series from the interval zone, tzdata version in the metadata; settled by the owner, 2026-11-16; built with calendar-length interval series |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; the remaining mismatches, Q-213 and Q-214, settled by 8.3b |
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
@@ -1687,7 +1699,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-193 | Fact flags as boolean columns or a bitfield | `docs/export.md` Columns (settled by the owner, 2026-11-16: boolean columns) |
 | Q-194 | Quality and named states in the export | `docs/export.md` Columns and File layout (settled by the owner, 2026-11-16: dictionary-encoded quality strings; a named state as index plus `state_name`) |
 | Q-195 | A `changed_at` of kind `time` beyond the timestamp range; forecast labels | `spec.md` §2.2, `api.md` Errors and Writing, `format.md` A.5, `docs/export.md` (settled by the owner, 2026-11-16: (a) refused at ingest with `Refusal::ChangedAtOutOfRange` on both backends, `i64::MAX` accepted; (b) forecast exports keep their column names, labelled by `kvik.timing`; the stored case is Q-760) |
-| Q-196 | Export file layout, compression and store-level metadata | `docs/export.md` File layout, Partitioned layout, Options and Metadata (settled by the owner, 2026-11-16: one file per series per period, row groups of at most 131,072 rows, zstd level 1; site and store identity in the metadata; `site=<site>/series=<escaped name>/month=<UTC YYYY-MM>/<view>.parquet`; store-level metadata from the store itself at 8.3, Q-196 (c); names: Q-761) |
+| Q-196 | Export file layout, compression and store-level metadata | `docs/export.md` File layout, Partitioned layout, Options and Metadata; `api.md` Reader processes (settled by the owner, 2026-11-16: one file per series per period, row groups of at most 131,072 rows, zstd level 1; site and store identity in the metadata, the store id from `Reader::store_id`; `site=<site>/series=<escaped name>/month=<UTC YYYY-MM>/<view>.parquet`, a clipped month as `<view>.partial-<from_ns>_<to_ns>.parquet`; the rest of the store-level metadata at 8.3, Q-196 (c); names: Q-761) |
 | Q-197 | The interval end in an export, and calendar-length interval series | `docs/export.md` Columns (settled by the owner, 2026-11-16: keep `interval_end`; calendar-length ends from the interval zone under the tzdata version in force at export, recorded in the metadata, built at 7.3) |
 | Q-108 | A restore from a rebuilt manifest only partly uploaded | §8 Generations (settled by roadmap 8.3a, as the question suggested: a rebuilt manifest counts for a restore only once it is whole in the bucket, its closing empty record, the one without field 100, uploaded; the restore reads from the last such rebuild record up to the next rebuild record, and with none whole it reads the records before the first rebuild record that opens a rebuilt manifest, which the old manifest uploaded before it; records upload in epoch order, so a whole rebuilt manifest is self-contained). Scenario: a rebuild record and some carried records are in the bucket, the rest not; read from the rebuild record, a restore misses files named only by records not yet carried, and their positions become a gap or a set-aside range although the bucket holds the files and the records naming them. A rule keyed on the rebuild record alone reads that truncated list. What a whole rebuilt manifest restores before its files are verified again is Q-295. The selection is `kvik_backup::plan::records_to_read`, which the restore driver applies before the fold (`backup/tests/restore_plan.rs` `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `q108_records_after_a_whole_rebuilt_manifest_are_read_with_it_and_a_later_partial_one_is_not`) |
 | Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, the general case of the rule). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`); a gap that holds a position of a listed segment with no copy is never bridged, since the entry is then not the next restored position. The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The loss side is guaranteed by the log's start, which goes read-only rather than seal without the record. The listing side rests on the sealed-segment record being appended after the start that recorded the gaps, which is roadmap 6.3b's and not yet built (`format.md` A.14): 6.3b must state it as an invariant with a test (no sealed-segment record has an epoch below a lost-range record of the start that preceded its seal), and roadmap 8.4a needs a kill-loop case with a truncated tail, a seal and a restore. Should it fail, the plan ends the log at the gap and sets later data aside: conservative. The hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing`, `the_restored_end_is_the_one_the_spec_walks_to` |

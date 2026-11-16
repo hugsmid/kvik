@@ -9,7 +9,8 @@ against it. Parquet is the export format only (`design.md`); stored files keep t
 
 Every file carries `kvik.export_version` = `1`. Adding a column or a metadata key is not a breaking change and keeps
 the version, so a reader should ignore columns and keys it does not know. Renaming, retyping or removing a column or
-a metadata key raises the version.
+a metadata key raises the version. No file column may be named `site`, `series` or `month`: Hive-style readers of the
+partitioned layout add columns of those names.
 
 ## Scope
 
@@ -27,18 +28,19 @@ the same schema in one file per call with rows of several series, comes with roa
 | `range` | every `t` below `i64::MAX` | half-open range of event time |
 | `row_group_rows` | 131,072 | most rows in a row group |
 | `batch_rows` | 8,192 | rows gathered before they are handed to the writer; 1 to `MAX_BATCH_ROWS` (1,048,576) |
-| `site` | none | site label, written as `kvik.site` and naming the partition folder: 1 to 64 bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter or digit (`check_site`) |
-| `store_id` | none | the store id, written as `kvik.store_id` |
+| `site` | none | site label, written as `kvik.site` and naming the partition folder: 1 to 64 bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter (`check_site`) |
+| `store_id` | the reader's | written as `kvik.store_id`; `export_series` and `export_partitioned` take it from `Reader::store_id` and refuse a different one; `export_rows`, which has no reader, writes it only when given |
 
 The writer holds the open row group in memory, so the exporter's memory is bounded by `row_group_rows` plus one
 batch, whatever the number of facts. The bound holds end to end once `Reader::facts` streams block by block (`api.md`
 Reading); today both backends gather the range before the first fact is returned. Rows are written in the order
 `Reader::facts` returns them.
 
-The store id is an option because the public `Reader` cannot read it, nor the tzdata version, durable position or
-reset stamp, without a side effect (`refresh`). Until the export call joins the store's interface (roadmap 8.3), the
-caller passes it; the store-level metadata the store gives itself, and the saved point of a continued export (row 7b,
-after 5.3), come then (Q-196 (c)).
+Every file `export_series` or `export_partitioned` writes carries the store id, which `Reader::store_id` gives
+without reading a file (`api.md` Reader processes), and every partitioned file the site label. The rest of the
+store-level metadata (tzdata version, durable position, reset stamp) is not reachable through the public `Reader`
+without a side effect (`refresh`); it comes with the export call in the store's interface (roadmap 8.3), and the
+saved point of a continued export (row 7b) after 5.3 (Q-196 (c)).
 
 ## File layout (Q-196)
 
@@ -57,29 +59,57 @@ would remove it at some cost in size; every common Parquet reader reads all thre
 For consolidating many sites' exports in one bucket, `export_partitioned` writes, under a site label it requires,
 
 ```text
-site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet
+site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet                          a whole month
+site=<site>/series=<series>/month=<YYYY-MM>/<view>.partial-<from_ns>_<to_ns>.parquet   a month clipped by range
 ```
 
 - `<site>` is the site label as given; `check_site` refuses any other byte, so the folder is the same on every file
-  system and bucket, whether or not it folds case.
+  system and bucket, whether or not it folds case, and its first letter keeps a reader from taking it for a number.
 - `<series>` is the series' display name, escaped: bytes `a`–`z`, `0`–`9`, `-` and `_` are kept and every other byte,
   upper-case letters, `/`, `.` and `%` included, is written as `%XX` in upper-case hex (`escape_segment`). The
   escape is reversible (`unescape_segment`), one name has exactly one segment, and two names never share a folder
-  even where case is folded. Hive-style readers that percent-decode partition values read the name back; they add
-  `site`, `series` and `month` columns, which no file column is named. A name's segment is up to three times its
-  length, so a long name can exceed a local file system's 255-byte limit on a file name; and a renamed series is
-  filed under its new name from then on, earlier months exported again included, with `kvik.series_id` tying the
-  two (Q-761).
+  even where case is folded. DuckDB, pyarrow and polars decode it back to the name, non-ASCII names included; Hive
+  and Spark were not checked, and may decode a multi-byte character one byte at a time (`kvik.series_name` in the
+  footer is exact either way). A name's segment is up to three times its length, so a long name can exceed a local
+  file system's 255-byte limit on a file name; and a renamed series is filed under its new name from then on,
+  earlier months exported again included, with `kvik.series_id` tying the two (Q-761).
 - `<YYYY-MM>` is the UTC month of `t`, for every series: `t` is UTC, so the cut needs no tzdata and is the same in
   every release and every site's zone, and months line up across sites. An interval is filed under the month of its
-  start. A file holds the facts with `t` in its month and in `range`, and its `kvik.range_from_ns` and
-  `kvik.range_to_ns` say which.
+  start.
 - `<view>` is `current`, `history`, `as_of-<generation>-<sequence>` or `as_of_time-<ns>`, so exports in different
   views do not replace one another; a query over the bucket picks one name.
+- A month wholly inside `range` is written as `<view>.parquet` and holds the whole month. A month that `range` cuts
+  is written as `<view>.partial-<from_ns>_<to_ns>.parquet`, its bounds those of the clipped range (signed decimal
+  nanoseconds, as `kvik.range_from_ns` and `kvik.range_to_ns` hold them), so a partial export never replaces a whole
+  month's file. A reader takes whole months by the exact name (`*/current.parquet`) and tells a partial file by
+  `.partial-` in its name or by its range keys. An export that should replace whole months passes a range of whole
+  months.
 - One file per series per month. Only months with a fact in `range` get a file. `open` is called with each file's
-  relative path, in month order; one pass over `range` finds the months, then each month is read and written on its
-  own, so each file is as consistent as one `export_series` call. A failure stops the export: the files before it
-  are complete, the one it was writing is not.
+  relative path, in month order.
+
+Reading the bucket: Hive-style readers add `site`, `series` and `month` columns and guess their types, so an
+all-digit escaped series name such as `0042` is read as the number 42. Declare the three as strings:
+
+```text
+DuckDB:  read_parquet('<root>/**/*.parquet', hive_partitioning = true, hive_types = {'site': VARCHAR, 'series': VARCHAR, 'month': VARCHAR})
+pyarrow: pyarrow.dataset.dataset(root, format="parquet", partitioning=pyarrow.dataset.partitioning(pyarrow.schema([("site", pyarrow.string()), ("series", pyarrow.string()), ("month", pyarrow.string())]), flavor="hive"))
+polars:  polars.scan_parquet(root + "/**/*.parquet", hive_partitioning=True, hive_schema={"site": polars.String, "series": polars.String, "month": polars.String})
+```
+
+Consistency and cost: one pass over `range` finds the months, then each month is read and written on its own. Each
+file is as consistent as one `export_series` call, but the files of one call are not one cut of the store: a reader
+sees commits made while the call runs, so a later month's file can hold a fact committed after an earlier month's
+file was written, and a month whose first fact is committed between the two passes gets no file until the next
+call. The range is read twice, and the first pass holds the whole range in memory until `Reader::facts` streams
+(Options), so a call over a series' whole history reads it twice; a periodic export should pass the months it means
+to refresh.
+
+Publishing: on success and on failure alike the writer `open` returned is dropped, with no signal between. A failure
+stops the export: the files before it are complete, the one it was writing has no footer. So `open` should hand out a
+temporary name or an in-memory buffer, and the caller publishes the paths in the returned list once the call returns
+`Ok`, and discards everything on `Err`; a writer that truncates the final path, or uploads when dropped, can replace
+a good file with a broken one. A per-file completion signal is left to the export call in the store's interface
+(roadmap 8.3).
 
 ## Columns (Q-190)
 
@@ -138,8 +168,8 @@ File key-value metadata, every value a string:
 | `kvik.interval_length_ns` | interval series only: `d` in nanoseconds |
 | `kvik.view` | `current`, `history`, `as_of <generation>:<sequence>` or `as_of_time <ns>` |
 | `kvik.range_from_ns`, `kvik.range_to_ns` | the range of `t` |
-| `kvik.site` | the site label, when given |
-| `kvik.store_id` | the store id as 32 lower-case hex digits (`format.md` A.17 Keys), when given |
+| `kvik.site` | the site label: in every partitioned file, and in others when given |
+| `kvik.store_id` | the store id as 32 lower-case hex digits (`format.md` A.17 Keys): in every file of `export_series` and `export_partitioned`, and from `export_rows` when given |
 
 ## Errors
 
@@ -151,5 +181,6 @@ so only rows given to `export_rows` can); a decimal stored above the column's sc
 rescaling; `changed_at` missing on a versioned series or present on another; a `changed_at` of kind `time` above
 `i64::MAX` (ingest refuses one, Q-195, so only rows given to `export_rows` or a log that holds one can, Q-760); an
 interval end beyond the timestamp range; a fact of another series; a series kind the schema does not cover, or a
-decimal scale above 18 (`UnsupportedSeries`). A site label outside its alphabet, or a partitioned export without one,
-is `InvalidOptions`; a file the partitioned export cannot open is `Open`, with its path.
+decimal scale above 18 (`UnsupportedSeries`). A site label outside its alphabet, a partitioned export without one, or
+a store id other than the reader's is `InvalidOptions`; a file the partitioned export cannot open is `Open`, with its
+path.

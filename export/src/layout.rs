@@ -13,19 +13,19 @@ use crate::ExportError;
 /// The longest site label, in bytes.
 pub const MAX_SITE_LEN: usize = 64;
 
-/// Checks a site label: 1 to [`MAX_SITE_LEN`] bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter or
-/// digit, so that `site=<site>` is the same folder on every file system and bucket.
+/// Checks a site label: 1 to [`MAX_SITE_LEN`] bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter, so
+/// that `site=<site>` is the same folder on every file system and bucket and no reader takes it for a number.
 pub fn check_site(site: &str) -> Result<(), ExportError> {
     let b = site.as_bytes();
     let ok = !b.is_empty()
         && b.len() <= MAX_SITE_LEN
-        && b[0].is_ascii_alphanumeric()
+        && b[0].is_ascii_lowercase()
         && b.iter().all(|&c| kept(c));
     if ok {
         Ok(())
     } else {
         Err(ExportError::InvalidOptions {
-            reason: "a site label is 1 to 64 bytes of a-z, 0-9, '-' and '_', starting with a letter or digit",
+            reason: "a site label is 1 to 64 bytes of a-z, 0-9, '-' and '_', starting with a letter",
         })
     }
 }
@@ -151,14 +151,29 @@ pub fn partition_dir(site: &str, series: &str, month: Month) -> String {
     )
 }
 
-/// The file name of an export in its month's folder, from its view: `current.parquet`, `history.parquet`,
+/// The file name of a whole month's export in its folder, from its view: `current.parquet`, `history.parquet`,
 /// `as_of-<generation>-<sequence>.parquet` or `as_of_time-<ns>.parquet`.
 pub fn file_name(view: View) -> Result<String, ExportError> {
+    Ok(format!("{}.parquet", view_stem(view)?))
+}
+
+/// The file name of a month clipped to `range`: `<view>.partial-<from_ns>_<to_ns>.parquet`, so it never replaces
+/// the whole month's [`file_name`].
+pub fn partial_file_name(view: View, range: TimeRange) -> Result<String, ExportError> {
+    Ok(format!(
+        "{}.partial-{}_{}.parquet",
+        view_stem(view)?,
+        range.from.0,
+        range.to.0
+    ))
+}
+
+fn view_stem(view: View) -> Result<String, ExportError> {
     Ok(match view {
-        View::Current => "current.parquet".into(),
-        View::History => "history.parquet".into(),
-        View::AsOf(p) => format!("as_of-{}-{}.parquet", p.generation, p.sequence),
-        View::AsOfTime(t) => format!("as_of_time-{}.parquet", t.0),
+        View::Current => "current".into(),
+        View::History => "history".into(),
+        View::AsOf(p) => format!("as_of-{}-{}", p.generation, p.sequence),
+        View::AsOfTime(t) => format!("as_of_time-{}", t.0),
         _ => {
             return Err(ExportError::InvalidOptions {
                 reason: "a view the export does not know",

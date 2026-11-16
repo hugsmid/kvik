@@ -50,7 +50,8 @@ use parquet::schema::types::ColumnPath;
 pub use batch::QUALITY_NAMES;
 pub use error::ExportError;
 pub use layout::{
-    MAX_SITE_LEN, Month, check_site, escape_segment, file_name, partition_dir, unescape_segment,
+    MAX_SITE_LEN, Month, check_site, escape_segment, file_name, partial_file_name, partition_dir,
+    unescape_segment,
 };
 pub use read::{ExportReader, read_rows};
 pub use row::{ExportRow, Flags};
@@ -79,8 +80,8 @@ pub struct ExportOptions {
     pub batch_rows: usize,
     /// The site label written as `kvik.site` and naming the partition folder; checked by [`check_site`].
     pub site: Option<String>,
-    /// The store id written as `kvik.store_id`; given by the caller until the store's own metadata reaches the
-    /// export (roadmap 8.3, Q-196).
+    /// The store id written as `kvik.store_id`. [`export_series`] and [`export_partitioned`] take it from the
+    /// reader ([`Reader::store_id`]) and refuse a different one; [`export_rows`] writes it only when given (Q-196).
     pub store_id: Option<[u8; 16]>,
 }
 
@@ -213,7 +214,7 @@ where
     W: Write + Send,
     F: FnMut(&str) -> std::io::Result<W>,
 {
-    options.metadata()?;
+    let options = &with_store(reader, options)?;
     let site = options.site.as_deref().ok_or(ExportError::InvalidOptions {
         reason: "a partitioned export needs a site",
     })?;
@@ -228,7 +229,12 @@ where
     for month in months {
         let m = month.range();
         let range = TimeRange::new(m.from.max(options.range.from), m.to.min(options.range.to));
-        let path = format!("{}/{name}", partition_dir(site, &series.name, month));
+        let dir = partition_dir(site, &series.name, month);
+        let path = if range == m {
+            format!("{dir}/{name}")
+        } else {
+            format!("{dir}/{}", partial_file_name(options.view, range)?)
+        };
         let out = open(&path).map_err(|source| ExportError::Open {
             path: path.clone(),
             source,
@@ -243,14 +249,28 @@ where
     Ok(files)
 }
 
-/// Exports one series' facts in `options.range` and `options.view` from a reader into one Parquet file.
+/// The options with the reader's store id (Q-196); one given that differs is refused.
+fn with_store(reader: &Reader, options: &ExportOptions) -> Result<ExportOptions, ExportError> {
+    let id = reader.store_id();
+    if options.store_id.is_some_and(|given| given != id) {
+        return Err(ExportError::InvalidOptions {
+            reason: "store_id is not the reader's store id",
+        });
+    }
+    let options = options.clone().store_id(id);
+    options.metadata()?;
+    Ok(options)
+}
+
+/// Exports one series' facts in `options.range` and `options.view` from a reader into one Parquet file, with the
+/// reader's store id as `kvik.store_id`.
 pub fn export_series<W: Write + Send>(
     reader: &Reader,
     id: SeriesId,
     options: &ExportOptions,
     out: W,
 ) -> Result<ExportSummary, ExportError> {
-    options.metadata()?;
+    let options = &with_store(reader, options)?;
     let series = SeriesSchema::from_info(&reader.series(id)?)?;
     let facts = reader.facts(id, options.range, options.view)?;
     export_rows(
