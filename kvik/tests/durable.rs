@@ -693,7 +693,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         prop::bool::weighted(0.15),
     );
     // A few keys of the plain gauge and the versioned series, so that duplicates and outranked facts of both meet
-    // within one call. Within a call, `changed_at` does not rise (Q-705).
+    // within one call, interleaved. Within a call the versioned readings' `changed_at` does not rise (Q-705).
     let keyed = (
         prop::sample::select(vec![0usize, 4]),
         0i64..4,
@@ -707,7 +707,12 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
             .prop_map(|(r, rev)| Step::Emit(r, rev)),
         4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2)).prop_map(
             |(mut r, rev)| {
-                r.sort_by_key(|x| std::cmp::Reverse(x.4));
+                let at: Vec<usize> = (0..r.len()).filter(|&k| r[k].4.is_some()).collect();
+                let mut versioned: Vec<_> = at.iter().map(|&k| r[k]).collect();
+                versioned.sort_by_key(|x| std::cmp::Reverse(x.4));
+                for (k, x) in at.into_iter().zip(versioned) {
+                    r[k] = x;
+                }
                 Step::Emit(r, rev)
             }
         ),
