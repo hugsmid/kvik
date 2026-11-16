@@ -27,7 +27,7 @@ mod resync;
 pub(crate) use hub::Hub;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -209,7 +209,7 @@ pub(crate) struct Deliverer {
     index: Index,
     recent: recent::Recent,
     /// Invalid regions the reader passed over, by segment and offset: lost (Q-750).
-    damaged: BTreeSet<(u64, u64)>,
+    damaged: crate::durable::keys::Lost,
     /// Reads of the log for facts outside the recent window.
     slow: Cell<u64>,
     /// The kept log by position, from `items_from` up (the lowest cursor); below it, a consumer that needs older
@@ -272,7 +272,7 @@ impl Deliverer {
             store_id,
             index: Index::without_facts(),
             recent: recent::Recent::default(),
-            damaged: BTreeSet::new(),
+            damaged: crate::durable::keys::Lost::default(),
             slow: Cell::new(0),
             items: BTreeMap::new(),
             items_from: LogPos::default(),
@@ -402,7 +402,7 @@ impl Deliverer {
                 // delivered.
                 ReadEvent::Corruption { file_id, region } => {
                     self.stats.corruptions += 1;
-                    self.damaged.insert((file_id, region.start));
+                    self.damaged.insert(file_id, region.start, region.end);
                 }
             }
         }

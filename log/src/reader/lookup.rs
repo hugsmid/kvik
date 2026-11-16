@@ -66,7 +66,8 @@ pub(super) type SealIndex = Option<Vec<IndexRecord>>;
 #[derive(Clone, Debug, Default)]
 pub(super) struct SegmentMap {
     batches: Vec<Span>,
-    regions: Vec<u64>,
+    /// Invalid regions met, by start and end offset.
+    regions: Vec<(u64, u64)>,
     resume: Option<Resume>,
     /// A recovery entry was met: what precedes it in the segment may be void (module documentation), so the segment
     /// is read whole by every lookup.
@@ -116,14 +117,14 @@ fn read_batch_at(
 }
 
 impl LogReader {
-    /// The facts in the `wanted` ranges in the local log up to the durable mark. `lost(file_id, start)` names the
-    /// invalid regions whose positions the caller takes as lost (`spec.md` §3 Recovery rule 2); any other region
+    /// The facts in the `wanted` ranges in the local log up to the durable mark. `lost(file_id, start, end)` names
+    /// the invalid regions whose positions the caller takes as lost (`spec.md` §3 Recovery rule 2); any other region
     /// in a segment that may hold a range, and any segment that cannot be read, leaves that range incomplete. Fails
     /// only when the mark or the segment listing cannot be read.
     pub fn lookup(
         &mut self,
         wanted: &[Wanted],
-        lost: &dyn Fn(u64, u64) -> bool,
+        lost: &dyn Fn(u64, u64, u64) -> bool,
     ) -> Result<Lookup, ReaderError> {
         let mark = self.read_mark()?;
         self.keep_alive()?;
@@ -207,7 +208,7 @@ impl LogReader {
         (generation, last_sequence): (u32, u64),
         wanted: &[Wanted],
         candidates: &[usize],
-        lost: &dyn Fn(u64, u64) -> bool,
+        lost: &dyn Fn(u64, u64, u64) -> bool,
         facts: &mut Vec<FoundFact>,
     ) -> bool {
         let file_id = name.file_id;
@@ -297,7 +298,7 @@ impl LogReader {
             facts.truncate(first);
             map = SegmentMap::default();
         }
-        let mut whole = map.regions.iter().all(|r| lost(file_id, *r));
+        let mut whole = map.regions.iter().all(|(a, z)| lost(file_id, *a, *z));
         let from = map.resume.unwrap_or(Resume {
             offset: HEADER_LEN as u64,
             last_sequence: None,
@@ -318,8 +319,8 @@ impl LogReader {
             match found {
                 Err(_) => return false,
                 Ok(Found::Region(r)) => {
-                    map.regions.push(r.start);
-                    if !lost(file_id, r.start) {
+                    map.regions.push((r.start, r.end));
+                    if !lost(file_id, r.start, r.end) {
                         whole = false;
                     }
                 }
@@ -330,10 +331,10 @@ impl LogReader {
                         break;
                     }
                     let Ok(content) = BatchContent::decode(&b) else {
-                        // Not kept in the map: read again by every later lookup.
+                        // Kept as a region, so that every later lookup of the segment is incomplete too.
                         whole = false;
                         map.resume = Some(scanner.resume_point());
-                        map.regions.push(b.offset);
+                        map.regions.push((b.offset, b.end()));
                         continue;
                     };
                     let (min_t, max_t) = content

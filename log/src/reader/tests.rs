@@ -245,6 +245,69 @@ mod parts_and_lookup {
         out
     }
 
+    /// The one invalid region a fresh reader passes over in segment `file_id`, as `(start, end)`.
+    fn passed_over(fs: &Arc<MemFs>, file_id: u64) -> (u64, u64) {
+        let regions: Vec<(u64, u64)> = reader(fs, 91)
+            .refresh()
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|e| match e {
+                ReadEvent::Corruption { file_id: f, region } if f == file_id => {
+                    Some((region.start, region.end))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        regions[0]
+    }
+
+    #[test]
+    fn damage_that_lengthens_a_lost_region_is_not_read_as_absence() {
+        let (fs, log) = store(300);
+        log.shutdown().unwrap();
+        let first = names(&fs).into_iter().find(|n| n.sealed).unwrap();
+        let path = Path::new("s")
+            .join(crate::store::LOG_DIR)
+            .join(first.to_string());
+        let bytes = fs.read(&path).unwrap();
+        // The first batch is damaged before the start: the region it leaves is lost.
+        fs.poke(&path, HEADER_LEN + 40, &[bytes[HEADER_LEN + 40] ^ 0xFF]);
+        let region = passed_over(&fs, first.file_id);
+        let lost = |id: u64, a: u64, z: u64| id == first.file_id && region.0 <= a && z <= region.1;
+        let everything = Wanted {
+            series_id: 5,
+            from: i64::MIN,
+            to: i64::MAX,
+        };
+        let mut r = reader(&fs, 21);
+        let before = r.lookup(&[everything], &lost).unwrap();
+        assert_eq!(before.complete, [true]);
+        // More damage during the run, further on, until it reaches the batch after the lost region.
+        let mut at = HEADER_LEN + 40;
+        loop {
+            at += 97;
+            assert!(at < bytes.len() / 2, "no second batch met");
+            fs.poke(&path, at, &[bytes[at] ^ 0xFF]);
+            let got = reader(&fs, 22).lookup(&[everything], &lost).unwrap();
+            let kept = r.lookup(&[everything], &lost).unwrap();
+            if got.facts.len() < before.facts.len() {
+                assert_eq!(
+                    got.complete,
+                    [false],
+                    "fresh reader: damage at {at} read as absence"
+                );
+                assert_eq!(
+                    kept.complete,
+                    [false],
+                    "mapped reader: damage at {at} read as absence"
+                );
+                break;
+            }
+        }
+    }
+
     #[test]
     fn a_bounded_refresh_returns_what_one_refresh_does_in_parts_and_frees_the_kept_file() {
         let (fs, log) = store(300);
@@ -305,7 +368,7 @@ mod parts_and_lookup {
                 to: 100,
             },
         ];
-        let got = r.lookup(&wanted, &|_, _| false).unwrap();
+        let got = r.lookup(&wanted, &|_, _, _| false).unwrap();
         assert_eq!(got.complete, vec![true; 3]);
         let want: Vec<(Position, FactRow)> = all
             .iter()
@@ -329,7 +392,7 @@ mod parts_and_lookup {
                     from: 11,
                     to: 11,
                 }],
-                &|_, _| false,
+                &|_, _, _| false,
             )
             .unwrap();
         assert_eq!(narrow.facts.len(), 1);
@@ -358,7 +421,7 @@ mod parts_and_lookup {
         };
         // A first lookup maps every segment; the damage comes after, in a batch the map holds.
         assert_eq!(
-            r.lookup(&[everything], &|_, _| false).unwrap().complete,
+            r.lookup(&[everything], &|_, _, _| false).unwrap().complete,
             [true]
         );
         let bytes = fs.read(&path).unwrap();
@@ -377,16 +440,17 @@ mod parts_and_lookup {
             to: t,
         };
         let got = r
-            .lookup(&[key(damaged_t), key(later)], &|_, _| false)
+            .lookup(&[key(damaged_t), key(later)], &|_, _, _| false)
             .unwrap();
         assert_eq!(got.complete, vec![false, true]);
         assert_eq!(got.facts.len(), 1);
         // The region is now in the segment's map: a later lookup still reports it.
         let again = r
-            .lookup(&[key(damaged_t), key(later)], &|_, _| false)
+            .lookup(&[key(damaged_t), key(later)], &|_, _, _| false)
             .unwrap();
         assert_eq!(again.complete, vec![false, true]);
-        let lost = |id: u64, start: u64| id == first.file_id && start == HEADER_LEN as u64;
+        let region = passed_over(&fs, first.file_id);
+        let lost = |id: u64, a: u64, z: u64| id == first.file_id && region.0 <= a && z <= region.1;
         let got = r.lookup(&[key(damaged_t), key(later)], &lost).unwrap();
         assert_eq!(got.complete, vec![true, true]);
         assert_eq!(got.facts.len(), 1);
@@ -414,8 +478,8 @@ mod parts_and_lookup {
         };
         let mut seen = 0;
         for round in 0..6 {
-            let again = found(r.lookup(&wanted, &|_, _| false).unwrap());
-            let fresh = found(reader(&fs, 15).lookup(&wanted, &|_, _| false).unwrap());
+            let again = found(r.lookup(&wanted, &|_, _, _| false).unwrap());
+            let fresh = found(reader(&fs, 15).lookup(&wanted, &|_, _, _| false).unwrap());
             assert_eq!(again, fresh, "round {round}");
             assert!(again.len() > seen);
             seen = again.len();

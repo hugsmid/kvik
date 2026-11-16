@@ -6,7 +6,7 @@
 //! A part that voids what was taken before (a recovery entry voiding intact batches above its `after`) cannot be
 //! undone from that state: the log is then read again whole into an index of every fact, as before roadmap 11.0.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use super::LogClock;
 use super::history::{Key, span_of};
 use super::index::Index;
 use super::ingest::Decider;
-use super::keys::{Found, LocalFacts, LogFacts};
+use super::keys::{Found, LocalFacts, LogFacts, Lost};
 use crate::env::Env;
 use crate::health::SeriesStats;
 
@@ -91,7 +91,7 @@ pub(crate) fn read_kept(
     let mut index = Index::without_facts();
     let mut decider = Decider::default();
     let mut counters = BTreeMap::new();
-    let mut lost = BTreeSet::new();
+    let mut lost = Lost::default();
     loop {
         let (u, more) = reader.refresh_some(PART)?;
         for e in u.events {
@@ -110,7 +110,7 @@ pub(crate) fn read_kept(
                     return read_whole(open()?);
                 }
                 ReadEvent::Corruption { file_id, region } => {
-                    lost.insert((file_id, region.start));
+                    lost.insert(file_id, region.start, region.end);
                 }
             }
         }
@@ -132,13 +132,12 @@ fn read_whole(mut reader: LogReader) -> Result<Kept, ReaderError> {
     let events = reader.refresh()?.events;
     let mut index = Index::default();
     index.apply(&events);
-    let lost = events
-        .iter()
-        .filter_map(|e| match e {
-            ReadEvent::Corruption { file_id, region } => Some((*file_id, region.start)),
-            _ => None,
-        })
-        .collect();
+    let mut lost = Lost::default();
+    for e in &events {
+        if let ReadEvent::Corruption { file_id, region } = e {
+            lost.insert(*file_id, region.start, region.end);
+        }
+    }
     drop(events);
     let mut counters = BTreeMap::new();
     for id in index.fact_series() {
