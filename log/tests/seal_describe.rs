@@ -645,7 +645,15 @@ fn a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow()
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || done_tx.send(log.shutdown()).unwrap());
     std::thread::sleep(200 * seal_rig::MS);
+    // The writer is held at its next write, before it can hand out the seal, while the maintenance thread looks for
+    // work with the description dropped and nothing else queued.
+    let (writing, write) = fs.hold_next_write_on("kvik-writer");
     release.send(()).unwrap();
+    writing
+        .recv_timeout(seal_rig::WAIT)
+        .expect("a write after the creation");
+    std::thread::sleep(200 * seal_rig::MS);
+    write.send(()).unwrap();
     done_rx
         .recv_timeout(seal_rig::WAIT)
         .expect("the shutdown completes")

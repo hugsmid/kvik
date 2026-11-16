@@ -76,6 +76,7 @@ struct WatchState {
     fail_open: Vec<String>,
     hold: Option<(Sender<()>, Receiver<()>)>,
     hold_sync_dir: Option<(Sender<()>, Receiver<()>)>,
+    hold_write: Option<(&'static str, Sender<()>, Receiver<()>)>,
 }
 
 #[derive(Debug)]
@@ -136,6 +137,13 @@ impl Watch {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         self.state.lock().unwrap().hold_sync_dir = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+    /// Holds the next file write on the thread named `thread`, as [`Watch::hold_next_maint_sync_dir`] does.
+    pub fn hold_next_write_on(&self, thread: &'static str) -> (Receiver<()>, Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        self.state.lock().unwrap().hold_write = Some((thread, entered_tx, release_rx));
         (entered_rx, release_tx)
     }
 }
@@ -217,6 +225,18 @@ impl FsFile for WatchFile {
         Ok(n)
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let hold = {
+            let mut s = self.state.lock().unwrap();
+            let here = std::thread::current().name().map(str::to_owned);
+            match &s.hold_write {
+                Some((t, _, _)) if here.as_deref() == Some(*t) => s.hold_write.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, entered, release)) = hold {
+            entered.send(()).unwrap();
+            let _ = release.recv();
+        }
         self.inner.write_at(buf, offset)
     }
     fn sync_data(&self) -> io::Result<()> {
