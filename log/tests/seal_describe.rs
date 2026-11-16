@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use kvik_log::batch::SegmentIdentity;
-use kvik_log::block::encode_block;
+use kvik_log::block::{BLOCK_HEADER_LEN, block_type, encode_block};
+use kvik_log::body::{END_MARKER_LEN, TRAILER_LEN, Trailer};
 use kvik_log::fs::{FaultOp, Fs, MemFs, OpenMode};
 use kvik_log::manifest::{RECORD_SEALED, read_manifest};
 use kvik_log::scan::{ScanLimit, scan};
@@ -260,6 +261,21 @@ fn describe_sealed_refuses_each_check_it_makes() {
         describe(&put(&bytes[..n - 8]), id),
         Err(DescribeError::NotSealed)
     ));
+    // A trailer with a valid checksum that names no batches.
+    let at = n - END_MARKER_LEN - TRAILER_LEN - BLOCK_HEADER_LEN;
+    let mut again = Vec::new();
+    let mut t = Trailer::decode(&bytes[at + BLOCK_HEADER_LEN..n - END_MARKER_LEN]).unwrap();
+    encode_block(block_type::TRAILER, 0, &t.encode(), &mut again).unwrap();
+    assert_eq!(again, bytes[at..n - END_MARKER_LEN]);
+    t.batch_count = 0;
+    again.clear();
+    encode_block(block_type::TRAILER, 0, &t.encode(), &mut again).unwrap();
+    let mut b = bytes.clone();
+    b[at..n - END_MARKER_LEN].copy_from_slice(&again);
+    assert!(matches!(
+        describe(&put(&b), id),
+        Err(DescribeError::Invalid(_))
+    ));
     // A batch byte, which `file_crc32c` covers.
     let mut b = bytes.clone();
     b[200] ^= 0x10;
@@ -292,4 +308,35 @@ proptest! {
         mem.open(&seg_path(*id, true), OpenMode::CreateNew).unwrap().write_at(&b, 0).unwrap();
         prop_assert!(describe(&mem, *id).is_err(), "byte {} of {}", at, b.len());
     }
+}
+
+#[test]
+fn no_segment_is_described_while_a_seal_is_ready_or_running() {
+    let mut r = Rig::open(sealed_store(2));
+    r.maint();
+    r.fill(1);
+    // Killed with a full segment not yet sealed: the next start seals it before it describes anything.
+    let fs = r.fs.clone();
+    drop(r);
+    fs.inner.restart();
+    let mut r = Rig::open(fs);
+    let jobs = r.w.take_seal_jobs(r.now);
+    assert_eq!(jobs.len(), 1);
+    assert!(r.w.take_unlisted().is_none());
+    for job in jobs {
+        let res = kvik_log::writer::seal_segment_described(&r.fs, &job, &r.w.halt());
+        r.w.seal_done(job, res, r.now);
+    }
+    assert!(r.w.take_unlisted().is_some());
+}
+
+#[test]
+fn no_segment_is_described_after_a_fault() {
+    let mut r = Rig::open(sealed_store(2));
+    r.fill(1);
+    r.fs.fail_reads(".open");
+    r.maint();
+    assert!(r.w.fault().is_some());
+    assert!(r.w.take_unlisted().is_none());
+    assert!(r.described.is_empty());
 }
