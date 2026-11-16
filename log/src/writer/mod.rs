@@ -899,8 +899,10 @@ impl LogWriter {
 
     /// One turn of the writer thread at monotonic time `now` and wall clock `wall`: checks free space, syncs the
     /// mark when its timer is due, seals a segment by time, and commits one batch from `source` if a log sync may
-    /// start. After a fault, every call in `source` fails with [`CommitError::ReadOnly`].
+    /// start. After a fault, every call in `source` fails with [`CommitError::ReadOnly`]. The previous turn's
+    /// batch is freed first.
     pub fn step(&mut self, now: Duration, wall: i64, source: &mut dyn CallSource) -> Step {
+        self.release_batch();
         let mut step = Step::default();
         self.sync_halt();
         if self.fault.is_none() {
@@ -1133,7 +1135,6 @@ impl LogWriter {
         wall: i64,
         back: &mut Vec<Call>,
     ) -> Option<Vec<Done>> {
-        self.release_batch();
         let mut items = Vec::with_capacity(calls.iter().map(Call::len).sum());
         let counts = gather::gather(&mut calls, &mut items);
         let mut content = BatchContent {
@@ -1345,10 +1346,16 @@ impl LogWriter {
     }
 
     /// Frees the last batch's entries and calls: the writer thread does so once the calls are acknowledged, off
-    /// the path to their acknowledgement.
+    /// the path to their acknowledgement; [`LogWriter::step`] does so at its start.
     pub(crate) fn release_batch(&mut self) {
         self.batch = Vec::new();
         self.batch_calls = Vec::new();
+    }
+
+    /// Entries and calls of the last batch still held.
+    #[cfg(test)]
+    pub(crate) fn batch_held(&self) -> usize {
+        self.batch.len() + self.batch_calls.len()
     }
 
     fn unknown(calls: &[Call]) -> Vec<Done> {
