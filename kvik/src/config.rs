@@ -152,7 +152,7 @@ pub struct LogConfig {
     /// The ceiling of the batch-sync interval (default 10 ms; 0 disables the bound; spec §3 Group commit).
     pub min_sync_interval: Duration,
     /// The least batch-sync interval, which adapts to the sync's duration between this and `min_sync_interval`;
-    /// at or above `min_sync_interval` the interval is fixed (default 10 ms; spec §3 Group commit, Q-710).
+    /// at or above `min_sync_interval` the interval is fixed (default 2 ms; spec §3 Group commit, Q-710).
     pub sync_interval_floor: Duration,
     /// Largest batch (default 1 MiB; 64 KiB to 8 MiB).
     pub max_batch_bytes: u64,

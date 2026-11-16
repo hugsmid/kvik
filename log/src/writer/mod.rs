@@ -87,7 +87,7 @@ pub const SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 pub const MAX_CALL_ENTRIES: usize = 65_536;
 const DAY_NS: i64 = 86_400_000_000_000;
 /// The default `log.sync_interval_floor` (Q-710).
-pub const DEFAULT_SYNC_INTERVAL_FLOOR: Duration = Duration::from_millis(10);
+pub const DEFAULT_SYNC_INTERVAL_FLOOR: Duration = Duration::from_millis(2);
 
 /// When the mark file is synced (`api.md` `log.mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

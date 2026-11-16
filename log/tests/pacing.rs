@@ -808,3 +808,10 @@ fn log_start_times_batch_syncs_on_its_clock() {
     assert_eq!(stats.sync_interval, 4 * MS);
     log.shutdown().unwrap();
 }
+
+#[test]
+fn the_default_floor_is_2_ms_under_a_10_ms_ceiling() {
+    let cfg = WriterConfig::default();
+    assert_eq!(cfg.sync_interval_floor, FLOOR);
+    assert_eq!(cfg.min_sync_interval, CEILING);
+}

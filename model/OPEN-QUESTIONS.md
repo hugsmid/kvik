@@ -1342,9 +1342,11 @@ second.
 **Settled by the owner's ruling:** the default `log.sync_interval_floor` is 2 ms. Spec §3 states the bound as at
 most 1/`sync_interval_floor` batch syncs per second (500 at the default), and `api.md` Configuration states the
 wear ceiling; a deployment on flash that is sensitive to wear sets a longer floor, up to `min_sync_interval`, where
-the interval is fixed. The interval lands first with the floor at 10 ms, which changes no behaviour; the default
-moves in a change of its own once the commit latency rows show no regression against the fixed 10 ms rows (no
-worse p50 or p99 at any load, no lower throughput).
+the interval is fixed. The interval landed with the floor at 10 ms, which changed no behaviour; the default moved
+to 2 ms in a change of its own after the commit latency rows (`docs/measurements/4.8-adaptive-sync-interval.md`)
+showed no regression against the fixed 10 ms rows beyond their run-to-run spread. The design's own marks were not
+all met on that machine: one writer of 2,000-reading batches ran at about twice the fixed rate but far below bound 0,
+since its sync of about 0.5 ms keeps the interval near 4 ms; the owner's ruling did not depend on them.
 
 ## Q-711 — New fields in the log crate's `WriterConfig` and `LogStats`
 
@@ -1366,8 +1368,10 @@ frequent short outliers near the ceiling; with the mark synced at every commit e
 could be timed with it.
 **Decided by the lead.** Multiplier 8, a fall of an eighth, a rise at once; with the mark synced at every commit only
 the batch sync is sampled, so device syncs are up to twice the batch-sync bound, as today. None is a configuration
-key. The commit latency sweep over multipliers 4, 8 and 16 at a 2 ms floor may change the multiplier before the
-default floor changes (Q-710). Pinned by the unit tests of `pacing.rs` and `log/tests/pacing.rs`.
+key. The commit latency sweep over multipliers 4, 8 and 16 at a 2 ms floor kept 8
+(`docs/measurements/4.8-adaptive-sync-interval.md`): 4 halved the wait again but ran about 1.7 times the syncs of 8
+at 1,000 calls a second and the lowest saturation throughput of the three; 16 stayed near the fixed schedule.
+Pinned by the unit tests of `pacing.rs` and `log/tests/pacing.rs`.
 
 ## Open at v0.2
 
@@ -1449,9 +1453,9 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
-| Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling; the interval lands at 10 ms (no change) and the default moves in its own change after the commit latency rows |
+| Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
-| Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the multiplier may change with the sweep before the default floor does |
+| Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the sweep kept 8; awaiting the owner's acceptance |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
