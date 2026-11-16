@@ -1351,7 +1351,7 @@ the stamp's sequence minus one. Generation 0 is unchanged (its first mark is wri
 boot). `init_generation` is idempotent: any readable mark of g is left alone, a torn one written again, a mark of
 another generation refused (`StoreError::Generation`). Safe because a segment that held an
 acknowledged batch of g cannot vanish whole by a crash (its creation syncs the directory before it is taken into
-use); damage to it is Q-264. Tests: `log/tests/generation.rs`
+use); damage to it is Q-264. Tests: `log/tests/generation/main.rs`
 `a_restored_generation_takes_ingest_at_its_first_position_with_the_restores_stamp`,
 `init_generation_writes_the_first_mark_once_and_refuses_another_generations`.
 **Settled (owner).** Accepted as decided, matching the model. For the spec text (§8 Restore step 1): the first mark is
@@ -1369,7 +1369,7 @@ generation, an unsealed segment of another generation, or a sealed segment of a 
 (`StoreError::Generation { found, start }`): the caller passed the wrong generation, or the directory was not
 initialised (an unfinished restore is resumed with `restore` again, Q-164 (c)). Lost ranges are compared and extended by
 whole positions, and losses found are recorded in the start's generation, with the record keyed by it. Tests:
-`log/tests/generation.rs` `earlier_generations_sealed_segments_take_no_part_in_the_chain`,
+`log/tests/generation/main.rs` `earlier_generations_sealed_segments_take_no_part_in_the_chain`,
 `a_start_refuses_a_mark_or_segment_of_another_generation`,
 `a_loss_in_a_restored_generation_is_recorded_in_it_beside_one_of_generation_0`.
 ## Q-262 — The writer's scans in a restored generation: set-aside batches and the id floor
@@ -1394,7 +1394,7 @@ file's and the unsealed log's. The first start takes this floor into its mark. A
 3. With no registry file, a sealed segment holding no batch no longer ends the scan (the old test `first <= 0`
    held for it); every sealed segment is read. With a registry file the stop is unchanged (`through` is compared as
    the position `(0, through)`, the same order as the bare sequence in generation 0).
-Tests: `log/tests/generation.rs`
+Tests: `log/tests/generation/main.rs`
 `set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`,
 `f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources`.
 ## Q-263 — What is set aside: whole batches, by their first position
@@ -1416,7 +1416,7 @@ no sealed segment of its own, its lowest unsealed segment damaged, zeroed or rem
 of its own, the generation's first position anchors the log start: position 1 in generation 0, the restore record's
 first position (its reset stamp's sequence) in a restored generation. A lowest segment damaged, zeroed or missing is
 then a recorded `data_lost` range from that anchor, as Q-125 and Q-321 have it (`plan`'s `log_first`). Q-321's open
-part (an anchor once sealed segments are evicted) applies to every generation. Tests: `log/tests/generation.rs`
+part (an anchor once sealed segments are evicted) applies to every generation. Tests: `log/tests/generation/main.rs`
 `a_restored_generations_lowest_segment_damaged_zeroed_or_missing_is_a_recorded_loss` (damaged, zeroed and missing,
 same boot and after a reboot), `a_generation_starting_above_1_takes_ingest_at_its_stamps_sequence` (the anchor is
 the stamp's sequence, not 1); generation 0 stays pinned by `log/tests/recovery.rs`
@@ -1436,7 +1436,7 @@ file 0, as a drill leaves its directory, and later the mark names a segment of t
 restored file; the restored segments of earlier generations were then never read.
 **Decided (8.3c).** A reader reads every segment of a generation below the mark's whole (they are sealed), whichever
 segment the mark names, and skips set-aside batches (Q-263) by the restored ends in `ReaderConfig::set_aside`, which
-the caller takes from the latest restore record (§8 Restore step 1). Test: `log/tests/generation.rs`
+the caller takes from the latest restore record (§8 Restore step 1). Test: `log/tests/generation/main.rs`
 `a_reader_reads_earlier_generations_past_what_is_set_aside`.
 ## Q-265 — When a writer reads the claims, and what it does on a higher one
 Recorded by roadmap 8.3c (a review finding of roadmap 8.1c). To be settled by roadmap 8.1d.
