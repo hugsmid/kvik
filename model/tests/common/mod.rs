@@ -9,7 +9,7 @@ use kvik_model::engine::{
     Envelope, Fault, Funnel, FunnelId, Model, Operator, RouteChange, Selection, WriteOutcome,
 };
 use kvik_model::oracle;
-use kvik_model::registry::{ChangedAtKind, RetentionClass, SeriesOptions, Timing};
+use kvik_model::registry::{ChangedAtKind, Durability, RetentionClass, SeriesOptions, Timing};
 use kvik_model::summary::Aggregate;
 use kvik_model::summary::Params;
 use kvik_model::types::{
@@ -400,6 +400,19 @@ pub const NAMES: [&str; 4] = [
 
 /// A model with three series (gauge, counter, state), wall clock at T0 + 1 h.
 pub fn machine() -> (Model, Vec<SeriesId>) {
+    machine_written(0)
+}
+
+/// [`machine`] with the series whose bit is set in `written` at the
+/// `written` durability level (§2.1 `durability`).
+pub fn machine_written(written: u8) -> (Model, Vec<SeriesId>) {
+    let level = |i: usize| {
+        if written & (1 << i) != 0 {
+            Durability::Written
+        } else {
+            Durability::Synced
+        }
+    };
     let cfg = Config {
         seal_after_batches: 3,
         merge_threshold: 1,
@@ -416,7 +429,10 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
                 value_type(*k),
                 "1",
                 5 * SECOND,
-                SeriesOptions::expected(SECOND),
+                SeriesOptions {
+                    durability: level(i),
+                    ..SeriesOptions::expected(SECOND)
+                },
             )
             .unwrap()
         })
@@ -430,6 +446,7 @@ pub fn machine() -> (Model, Vec<SeriesId>) {
             5 * SECOND,
             SeriesOptions {
                 expected_interval: Some(SECOND),
+                durability: level(VERSIONED),
                 ..SeriesOptions::versioned(ChangedAtKind::Version)
             },
         )
@@ -478,6 +495,20 @@ pub fn durable(m: &Model) -> BTreeMap<Position, Fact> {
     m.disk
         .all_facts()
         .into_iter()
+        .map(|f| (f.position, f))
+        .collect()
+}
+
+/// Facts of flagged batches on disk beyond the durable mark, delivered once
+/// written (§3 Commit; invariants 2 and 11).
+pub fn written_beyond_mark(m: &Model) -> BTreeMap<Position, Fact> {
+    let last = m.disk.mark.map_or(Position::ORIGIN, |k| k.last);
+    m.disk
+        .flagged
+        .iter()
+        .filter_map(|(f, b)| m.disk.files.get(f)?.batches.get(*b))
+        .flatten()
+        .filter_map(|e| e.fact().filter(|x| x.position > last).cloned())
         .map(|f| (f.position, f))
         .collect()
 }
@@ -538,7 +569,8 @@ pub fn apply(m: &mut Model, ids: &[SeriesId], op: &Op) -> Result<(), String> {
         Op::JumpWall(d) => m.jump_wall(*d),
         Op::Poll { c, n } => {
             let got = m.poll(cid(*c), *n).map_err(|e| e.to_string())?;
-            let dur = durable(m);
+            let mut dur = durable(m);
+            dur.extend(written_beyond_mark(m));
             for d in got {
                 if dur.get(&d.position) != Some(&d.fact) {
                     return Err(format!("delivered position {} is not durable", d.position));
@@ -1076,7 +1108,8 @@ pub fn apply_delivery(m: &mut Model, ids: &[SeriesId], op: &DOp) -> Result<(), S
             // Engine-side catch-up runs whenever the queue has room.
             let _ = m.catch_up(cid(*c), 2 * *n);
             let got = m.receive(cid(*c), *n).map_err(|e| e.to_string())?;
-            let dur = durable(m);
+            let mut dur = durable(m);
+            dur.extend(written_beyond_mark(m));
             for d in got {
                 if let Some(f) = d.fact()
                     && dur.get(&d.position) != Some(f)
