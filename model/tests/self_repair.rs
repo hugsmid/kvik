@@ -1,7 +1,10 @@
 //! Self-repair (spec §8 Self-repair): the loss life cycle, closing records,
-//! the alert on every corruption, and the scheduled check of the bucket.
+//! the alert on every corruption, and the scheduled check of the bucket;
+//! the property tests are in `self_repair/properties.rs`.
 
 mod common;
+#[path = "self_repair/properties.rs"]
+mod properties;
 
 use common::T0;
 use kvik_model::engine::{
