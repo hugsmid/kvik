@@ -355,11 +355,21 @@ fn damage_below_a_found_loss_grows_it_downward_under_its_first_identity() {
     let w = World::new("extend-down");
     let s = w.open();
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
-    let at = emit_notes(&s, id, &["DOWN-ONE", "DOWN-TWO", "DOWN-THREE"]);
+    let mut at = Vec::new();
+    for (i, t) in ["DOWN-ONE", "DOWN-TWO", "DOWN-THREE"].iter().enumerate() {
+        w.clock.advance(std::time::Duration::from_secs(10));
+        at.push(
+            block_on(s.emit(&[note(id, i as i64, t)]))
+                .unwrap()
+                .first()
+                .unwrap(),
+        );
+    }
     let (two, three) = (at[1], at[2]);
     damage(&w, b"DOWN-THREE");
     let r = w.reader();
     assert_eq!(data_lost(&r.losses()), data_lost(&s.losses()));
+    let before_three = s.losses()[0].commit_time_before;
     damage(&w, b"DOWN-TWO");
     let grown = vec![(three, Some(two), Some(three), false)];
     assert_eq!(data_lost(&s.losses()), grown);
@@ -368,6 +378,20 @@ fn damage_below_a_found_loss_grows_it_downward_under_its_first_identity() {
     assert_eq!(history(&r, id).len(), 1);
     let ack = block_on(s.emit(&[note(id, 1, "DOWN-TWO")])).unwrap();
     assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
-    // The identity the next start records is open (Q-203).
+    let open_side = s.losses()[0].clone();
+    assert_ne!(open_side.commit_time_before, before_three);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    // The next start records the grown range under its own first position, not the first-reported identity
+    // (Q-203).
+    let s = w.open();
+    let recorded = vec![(two, Some(two), Some(three), true)];
+    assert_eq!(data_lost(&s.losses()), recorded);
+    assert_eq!(data_lost(&r.losses()), recorded);
+    assert_eq!(
+        s.losses()[0].commit_time_before,
+        open_side.commit_time_before
+    );
     block_on(s.shutdown()).unwrap();
 }

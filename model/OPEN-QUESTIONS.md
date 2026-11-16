@@ -922,9 +922,10 @@ The next start scans one region, finds no record of it and records it under the 
 §3 Recovery rule 2 says the start records a loss found while open "under the same identity", and step 4 makes the
 identity the first position of the range when it was first reported; the start cannot know that position, which no
 file holds.
-**Now.** Open processes report identity THREE; after the next start every process reports identity TWO, recorded
-(`kvik/tests/durable_losses.rs` `damage_below_a_found_loss_grows_it_downward_under_its_first_identity` pins the open
-side only). Acknowledgements are held in memory (Q-123 (d)), so none is lost across the start today.
+**Now.** Open processes report identity THREE; after the next start every process, a reader process opened before
+it included, reports identity TWO, recorded, with the same range and commit times (`kvik/tests/durable_losses.rs`
+`damage_below_a_found_loss_grows_it_downward_under_its_first_identity` pins both). Acknowledgements are held in memory
+(Q-123 (d)), so none is lost across the start today.
 **Needed.** Either an accepted limit (a loss found while open that grows downward before it is recorded may be
 recorded under its lower first position; an acknowledgement given under the old identity lapses), or a place that
 carries the first-reported identity to the next start. Settled with Q-123 (d), which writes acknowledgement records.
