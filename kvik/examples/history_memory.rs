@@ -160,6 +160,9 @@ fn main() {
     let (mut recorded, mut duplicates) = (0u64, 0u64);
     let mut last = Instant::now();
     let mut since = 0u64;
+    // Time of the calls holding late readings and of the others, and how many of each.
+    let (mut late_time, mut late_calls) = (Duration::ZERO, 0u32);
+    let (mut plain_time, mut plain_calls) = (Duration::ZERO, 0u32);
     println!("calls readings rss_mib readings_per_s slow_path");
     for c in 0..a.calls {
         let t = base + c as i64 * s;
@@ -167,7 +170,8 @@ fn main() {
         for (k, id) in ids.iter().enumerate() {
             batch.push(Reading::new(*id, Timestamp(t), Value::F64((c + k) as f64)));
         }
-        if a.late_every > 0 && c % a.late_every == a.late_every - 1 && c >= 3_600 {
+        let late = a.late_every > 0 && c % a.late_every == a.late_every - 1 && c >= 3_600;
+        if late {
             for k in 0..10 {
                 let back = c - 3_600;
                 batch.push(Reading::new(
@@ -182,7 +186,15 @@ fn main() {
                 ));
             }
         }
+        let started = Instant::now();
         let ack = block_on(store.emit(&batch)).expect("emit");
+        if late {
+            late_time += started.elapsed();
+            late_calls += 1;
+        } else if c >= 3_600 {
+            plain_time += started.elapsed();
+            plain_calls += 1;
+        }
         for o in &ack.outcomes {
             match o {
                 Outcome::Recorded { .. } => recorded += 1,
@@ -206,6 +218,13 @@ fn main() {
         }
     }
     println!("recorded {recorded}, duplicates {duplicates}");
+    if late_calls > 0 && plain_calls > 0 {
+        println!(
+            "after the first hour: {late_calls} calls with late readings, mean {:.2} ms; {plain_calls} others, mean {:.2} ms",
+            late_time.as_secs_f64() * 1e3 / f64::from(late_calls),
+            plain_time.as_secs_f64() * 1e3 / f64::from(plain_calls)
+        );
+    }
     block_on(store.shutdown()).expect("shutdown");
     drop(store);
     if a.reopen {

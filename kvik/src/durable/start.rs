@@ -101,7 +101,7 @@ pub(crate) fn read_kept(
                     for item in &b.content.items {
                         if let Item::Fact(row) = item {
                             count(&mut counters, row);
-                            decider.note_kept(row, span_of(index.registry(), row.series_id));
+                            decider.note_kept(row, || span_of(index.registry(), row.series_id));
                         }
                     }
                 }

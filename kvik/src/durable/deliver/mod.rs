@@ -551,8 +551,12 @@ impl Deliverer {
                         outranked,
                     });
                     let series = rec.stored.row.series_id;
-                    let span = crate::durable::history::span_of(&self.view.registry, series);
-                    self.recent.note(&rec, span, ctx.now);
+                    let registry = &self.view.registry;
+                    self.recent.note(
+                        &rec,
+                        || crate::durable::history::span_of(registry, series),
+                        ctx.now,
+                    );
                     if !outranked {
                         fed.push(series);
                         self.last_arrival.insert(series, b.content.received_at);

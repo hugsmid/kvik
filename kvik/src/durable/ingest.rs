@@ -123,13 +123,15 @@ impl Decider {
             .collect();
         facts.sort_by_key(|f| f.position);
         for f in facts {
-            d.note_kept(&f.row, span_of(&d.registry, f.row.series_id));
+            let id = f.row.series_id;
+            let span = span_of(&d.registry, id);
+            d.note_kept(&f.row, || span);
         }
         d
     }
 
-    /// Takes in a fact of the kept log, read in log order at the start, of a series whose window span is `span`.
-    pub(crate) fn note_kept(&mut self, r: &FactRow, span: i64) {
+    /// Takes in a fact of the kept log, read in log order at the start, of a series whose window span `span` gives.
+    pub(crate) fn note_kept(&mut self, r: &FactRow, span: impl FnOnce() -> i64) {
         let reference = !r.flags.future && !r.flags.unsynced_clock;
         self.history
             .note((r.series_id, r.t), reference, Known::of(r, 0), span, None);
@@ -145,9 +147,15 @@ impl Decider {
     pub(crate) fn apply(&mut self, plan: &mut Plan) {
         let mut whole = std::mem::take(&mut plan.whole);
         for n in std::mem::take(&mut plan.notes) {
-            let span = span_of(&self.registry, n.key.0);
             let w = whole.remove(&n.key);
-            self.history.note(n.key, n.reference, n.known, span, w);
+            let registry = &self.registry;
+            self.history.note(
+                n.key,
+                n.reference,
+                n.known,
+                || span_of(registry, n.key.0),
+                w,
+            );
         }
     }
 

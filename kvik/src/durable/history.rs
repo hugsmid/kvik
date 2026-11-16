@@ -179,20 +179,23 @@ impl History {
         }
     }
 
-    /// Takes in a recorded fact of a series whose window span is `span`; `reference`: it raises the lateness
-    /// reference. `whole` is the key's complete history before it when the slow path read it, so that a key with
-    /// more than one fact enters the revised-key index.
+    /// Takes in a recorded fact of a series whose window span `span` gives, asked once per series; `reference`: it
+    /// raises the lateness reference. `whole` is the key's complete history before it when the slow path read it, so
+    /// that a key with more than one fact enters the revised-key index.
     pub(crate) fn note(
         &mut self,
         key: Key,
         reference: bool,
         known: Known,
-        span: i64,
+        span: impl FnOnce() -> i64,
         whole: Option<Vec<Known>>,
     ) {
         let (id, t) = key;
-        let span = self.span.unwrap_or(span);
-        let s = self.series.entry(id).or_insert_with(|| Series::new(span));
+        let fixed = self.span;
+        let s = self
+            .series
+            .entry(id)
+            .or_insert_with(|| Series::new(fixed.unwrap_or_else(span)));
         if reference {
             s.reference = s.reference.max(Some(t));
         }
@@ -245,22 +248,28 @@ impl History {
         };
         let Some(latest) = s.latest else { return };
         s.floor = s.floor.max(latest.saturating_sub(s.span));
-        let mut out: Vec<(i64, Known)> = Vec::new();
-        while s.window.front().is_some_and(|(t, _)| *t < s.floor) {
-            out.extend(s.window.pop_front());
-        }
-        while s.window.len() > cap {
-            let t = s.window[0].0;
-            while s.window.front().is_some_and(|(u, _)| *u == t) {
-                out.extend(s.window.pop_front());
+        let readable = self.readable_below;
+        let mut out: Vec<(i64, Vec<Known>)> = Vec::new();
+        while let Some(&(t, _)) = s.window.front() {
+            if t >= s.floor {
+                if s.window.len() <= cap {
+                    break;
+                }
+                s.floor = t.saturating_add(1);
             }
-            s.floor = t.saturating_add(1);
+            let (_, k) = s.window.pop_front().expect("looked at above");
+            let alone = s.window.front().is_none_or(|(u, _)| *u != t)
+                && out.last().is_none_or(|(u, _)| *u != t);
+            // The common case, a key of one fact the log already shows, leaves without a trace.
+            if alone && (k.call == 0 || k.call < readable) {
+                continue;
+            }
+            match out.last_mut() {
+                Some((u, facts)) if *u == t => facts.push(k),
+                _ => out.push((t, vec![k])),
+            }
         }
-        let mut i = 0;
-        while i < out.len() {
-            let t = out[i].0;
-            let n = out[i..].iter().take_while(|(u, _)| *u == t).count();
-            let facts: Vec<Known> = out[i..i + n].iter().map(|(_, k)| k.clone()).collect();
+        for (t, facts) in out {
             if facts.len() > 1 {
                 self.revised.insert((id, t), facts);
             } else {
@@ -268,7 +277,6 @@ impl History {
                     self.overlay((id, t), k);
                 }
             }
-            i += n;
         }
     }
 

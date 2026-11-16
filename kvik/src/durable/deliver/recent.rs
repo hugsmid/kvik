@@ -29,6 +29,7 @@ const WIDEN: i64 = 16;
 struct Win {
     latest: i64,
     floor: i64,
+    span: i64,
     /// In `(t, position)` order.
     facts: VecDeque<Arc<FactRec>>,
 }
@@ -44,8 +45,9 @@ pub(super) struct Recent {
 }
 
 impl Recent {
-    /// Takes in a fact taken from the log, of a series whose window spans `span`, at `now`.
-    pub(super) fn note(&mut self, rec: &Arc<FactRec>, span: i64, now: i64) {
+    /// Takes in a fact taken from the log at `now`, of a series whose window span `span` gives, asked once per
+    /// series.
+    pub(super) fn note(&mut self, rec: &Arc<FactRec>, span: impl FnOnce() -> i64, now: i64) {
         let t = rec.stored.row.t;
         let w = self
             .series
@@ -53,6 +55,7 @@ impl Recent {
             .or_insert_with(|| Win {
                 latest: t,
                 floor: i64::MIN,
+                span: span(),
                 facts: VecDeque::new(),
             });
         if t < w.floor {
@@ -62,7 +65,7 @@ impl Recent {
         w.facts.insert(at, rec.clone());
         w.latest = w.latest.max(t);
         let edge = w.latest.min(now);
-        w.floor = w.floor.max(edge.saturating_sub(span));
+        w.floor = w.floor.max(edge.saturating_sub(w.span));
         while w.facts.front().is_some_and(|f| f.stored.row.t < w.floor) {
             w.facts.pop_front();
         }
