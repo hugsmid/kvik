@@ -21,7 +21,10 @@ use super::{
 };
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ClaimMarker, Keys, ObjectName};
-use crate::plan::{PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, records_to_read};
+use crate::plan::{
+    ChainBreak, PlanError, PlanFn, PlanInput, PlanMode, RestorePlan, check_chain, read_tail,
+    records_to_read,
+};
 use crate::uploaded::UploadedRecord;
 use crate::{DriverFuture, LocalStore};
 
@@ -199,8 +202,9 @@ async fn claim<S: BackupSink>(
 }
 
 /// The records a restore reads (`plan::records_to_read`, Q-108) of the highest generation below `generation` that has
-/// any.
-/// A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304).
+/// any. A generation that lists none counts as having none only if `stat` reports no record at epoch 1 (Q-304). The
+/// records from the first read to the last listed must chain (Q-611), and `stat` must report no record after the last
+/// listed or, where the records read end before the listing, after the last read (Q-612).
 async fn source_records<S: BackupSink, E: Envelope>(
     sink: &S,
     env: &E,
@@ -220,30 +224,77 @@ async fn source_records<S: BackupSink, E: Envelope>(
                 _ => None,
             })
             .collect();
-        if listed.is_empty() {
+        let incomplete = RestoreError::ListingIncomplete { generation: g };
+        let Some(last) = listed.iter().map(|(e, _)| *e).max() else {
             // Q-304: absence from a listing proves nothing; a generation's first record is at epoch 1.
             if sink.stat(&keys.record(g, 1)).await?.is_some() {
-                return Err(RestoreError::ListingIncomplete { generation: g });
+                return Err(incomplete);
             }
             continue;
+        };
+        // Q-612: right after the listing, so that a record uploaded since, or hidden by it, is seen.
+        if reported(sink, keys, g, last.checked_add(1)).await? {
+            return Err(incomplete);
         }
         listed.sort();
-        let mut out: Vec<Record> = Vec::with_capacity(listed.len());
+        let mut uploaded: Vec<UploadedRecord> = Vec::with_capacity(listed.len());
         for (epoch, key) in listed {
             let plain = open(env, &key, &sink.get(&key, None).await?)?;
-            let r = UploadedRecord::decode(&plain)?.record;
-            if r.epoch != epoch {
+            let u = UploadedRecord::decode(&plain)?;
+            if u.record.epoch != epoch || u.record.generation != g {
                 return Err(RestoreError::Record(
                     kvik_files::record::RecordError::Invalid(
-                        "an uploaded record under another epoch's key",
+                        "an uploaded record under another record's key",
                     ),
                 ));
             }
-            out.push(r);
+            uploaded.push(u);
         }
-        return Ok((g, records_to_read(&out).to_vec()));
+        let records: Vec<Record> = uploaded.iter().map(|u| u.record.clone()).collect();
+        let read = records_to_read(&records);
+        let first = read.first().map_or(records.len(), |f| {
+            records.iter().position(|r| r.epoch == f.epoch).unwrap_or(0)
+        });
+        match check_chain(&uploaded[first..]) {
+            Ok(()) => {}
+            Err(ChainBreak::Missing { previous, .. })
+                if reported(sink, keys, g, Some(previous)).await? =>
+            {
+                return Err(incomplete);
+            }
+            Err(
+                ChainBreak::Missing { epoch, previous } | ChainBreak::Forked { epoch, previous },
+            ) => {
+                return Err(RestoreError::BrokenChain {
+                    generation: g,
+                    epoch,
+                    previous,
+                });
+            }
+            Err(ChainBreak::Repeated { epoch }) => {
+                return Err(SinkError::Failed {
+                    reason: format!("a listing of generation {g}'s records repeats epoch {epoch}"),
+                }
+                .into());
+            }
+        }
+        if reported(sink, keys, g, read_tail(&records, read)).await? {
+            return Err(incomplete);
+        }
+        return Ok((g, read.to_vec()));
     }
     Err(PlanError::NoRecords.into())
+}
+
+/// Whether `stat` reports record `epoch` of generation `g`; an unanswered `stat` fails the restore (Q-612).
+async fn reported<S: BackupSink>(
+    sink: &S,
+    keys: &Keys,
+    g: u32,
+    epoch: Option<u64>,
+) -> Result<bool, RestoreError> {
+    let Some(e) = epoch else { return Ok(false) };
+    Ok(sink.stat(&keys.record(g, e)).await?.is_some())
 }
 
 fn by_position(files: &[RestoredFile]) -> Vec<RestoredFile> {

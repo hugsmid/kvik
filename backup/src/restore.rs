@@ -116,11 +116,24 @@ pub enum RestoreError {
         /// The higher generation.
         by: u32,
     },
-    /// A generation's records list empty while `stat` reports its first record: the listing lags; retry (Q-304).
+    /// A record the listing of a generation's records does not show is reported by `stat`: the listing lags; retry
+    /// (Q-304, Q-611, Q-612).
     #[error("the listing of generation {generation}'s records is incomplete; retry")]
     ListingIncomplete {
         /// The generation.
         generation: u32,
+    },
+    /// A record of the generation read names a predecessor the bucket does not hold before it (format A.17; Q-611).
+    #[error(
+        "generation {generation}'s record {epoch} names record {previous}, which the bucket does not hold before it"
+    )]
+    BrokenChain {
+        /// The generation.
+        generation: u32,
+        /// The record.
+        epoch: u64,
+        /// The epoch it names.
+        previous: u64,
     },
     /// No plan can be made.
     #[error(transparent)]
