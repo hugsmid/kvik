@@ -333,7 +333,7 @@ impl Sim {
         }
         if let (Some(&batch), Some(&log)) = (self.starts.last(), self.log_syncs.last()) {
             let c = self.setup.ceiling;
-            if self.w.sync_ready_at() > (batch + c).max(log + c / 2) {
+            if self.w.sync_ready_at() > batch.saturating_add(c).max(log.saturating_add(c / 2)) {
                 self.ceiling_breaks.push((now, self.w.sync_ready_at()));
             }
         }

@@ -32,12 +32,12 @@ impl SyncPace {
     }
 
     /// The interval in force: the ceiling with no estimate, else the estimate times [`MULTIPLIER`] within
-    /// `[min(floor, ceiling), ceiling]`.
+    /// `[min(floor, ceiling), ceiling]`; in `u64` nanoseconds either way (Q-713).
     pub(crate) fn interval(&self, floor: Duration, ceiling: Duration) -> Duration {
-        let Some(d) = self.estimate else {
-            return ceiling;
-        };
         let c = nanos(ceiling);
+        let Some(d) = self.estimate else {
+            return Duration::from_nanos(c);
+        };
         let f = nanos(floor).min(c);
         Duration::from_nanos(d.saturating_mul(MULTIPLIER).clamp(f, c))
     }
@@ -142,6 +142,13 @@ mod tests {
         assert_eq!(p.interval(FLOOR, max), max);
         let p = pace(&[u64::MAX, 0]);
         assert_eq!(est(&p), u64::MAX - u64::MAX / 8);
+    }
+
+    #[test]
+    fn a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample() {
+        let top = Duration::from_nanos(u64::MAX);
+        assert_eq!(SyncPace::default().interval(FLOOR, Duration::MAX), top);
+        assert_eq!(pace(&[u64::MAX]).interval(FLOOR, Duration::MAX), top);
     }
 
     #[test]

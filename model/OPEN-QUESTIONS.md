@@ -1372,6 +1372,25 @@ key. The commit latency sweep over multipliers 4, 8 and 16 at a 2 ms floor kept 
 (`docs/measurements/4.8-adaptive-sync-interval.md`): 4 halved the wait again but ran about 1.7 times the syncs of 8
 at 1,000 calls a second and the lowest saturation throughput of the three; 16 stayed near the fixed schedule.
 Pinned by the unit tests of `pacing.rs` and `log/tests/pacing.rs`.
+**Noted at the review.** The first sample after a start moves the interval from the ceiling to the estimate in one
+step, not by an eighth, so a burst right after the first reading can start syncs half a floor apart where the fixed
+schedule allows one; this stays inside the stated rate and spacing bounds, which the properties of
+`log/tests/pacing.rs` check. The sample grows with the batch and the batch with the interval, so under saturation
+with 1 MiB batches the interval holds itself near the ceiling, and a single closed-loop writer of large calls runs
+well below bound 0 (`docs/measurements/4.8-adaptive-sync-interval.md`); the run on the Linux NVMe target decides
+whether the multiplier or the floor needs tuning for single closed-loop writers.
+
+## Q-713 — A `min_sync_interval` beyond `u64` nanoseconds
+
+**Scenario.** `log.min_sync_interval` has no upper limit. A value near `Duration::MAX` overflowed the additions of the
+sync schedule (the previous due time or sync start plus the interval) and panicked the writer thread; with the
+adaptive interval, a ceiling above about 584 years also changed value at the first sample, which converts it to
+`u64` nanoseconds.
+**Settled with the review of the adaptive interval:** the interval is held in `u64` nanoseconds whether or not there
+is an estimate, so a ceiling above about 584 years counts as 584 years from the start. No configuration that was
+accepted is refused, and the schedule's additions stay far inside `Duration`
+(`a_ceiling_near_the_largest_duration_schedules_without_overflow`,
+`a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample`).
 
 ## Open at v0.2
 
@@ -1385,7 +1404,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-712; the owner settled Q-710 and the lead decided Q-711 and Q-712.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1702,6 +1721,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

@@ -392,3 +392,25 @@ fn the_default_floor_is_2_ms_under_a_10_ms_ceiling() {
     assert_eq!(cfg.sync_interval_floor, FLOOR);
     assert_eq!(cfg.min_sync_interval, CEILING);
 }
+
+#[test]
+fn a_ceiling_near_the_largest_duration_schedules_without_overflow() {
+    let run = |clock| {
+        let mut s = Sim::new(Setup {
+            ceiling: Duration::MAX,
+            clock,
+            ..Setup::adaptive()
+        });
+        s.push();
+        s.turn(START, FAST);
+        s.push();
+        s.turn(START + MS, FAST);
+        s
+    };
+    let fixed = run(false);
+    assert_eq!(fixed.starts, [START]);
+    assert_eq!(fixed.w.sync_ready_at(), Duration::from_nanos(u64::MAX));
+    let adaptive = run(true);
+    assert_eq!(adaptive.starts, [START, START + MS]);
+    assert_eq!(adaptive.w.sync_interval(), FLOOR);
+}
