@@ -269,6 +269,47 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
 }
 
 #[test]
+fn a_reading_that_leaves_the_window_before_its_call_is_acknowledged_is_still_found() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    let w = World::new("left-before-acknowledged");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hook_armed = armed.clone();
+    w.fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        let in_use = p
+            .to_str()
+            .is_some_and(|p| p.ends_with("-0000000000000001.open"));
+        if in_use && hook_armed.swap(false, Ordering::SeqCst) {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    })));
+    armed.store(true, Ordering::SeqCst);
+    // One call whose second reading moves the window an hour past its first: the first leaves the window while the
+    // call is not yet in the log.
+    let original = s.try_emit(&[num(g, 0, 1.0), num(g, 3_600, 2.0)]).unwrap();
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the original's sync started");
+    let mut duplicate = std::pin::pin!(s.try_emit(&[num(g, 0, 1.0)]).unwrap());
+    let woken = Arc::new(common::Flag::default());
+    assert!(common::poll_once(duplicate.as_mut(), &woken).is_pending());
+    release.send(()).unwrap();
+    assert_eq!(block_on(original).unwrap().recorded(), 2);
+    assert_eq!(
+        block_on(duplicate.as_mut()).unwrap().outcomes,
+        vec![Outcome::Duplicate]
+    );
+    w.fs.set_sync_hook(None);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
 fn a_duplicate_of_a_queued_reading_waits_for_the_original() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
