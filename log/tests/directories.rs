@@ -974,3 +974,38 @@ fn a_position_a_derived_file_names_raises_f() {
     let e = r.w.as_ref().unwrap().start_report().entry.clone().unwrap();
     assert_eq!(e.sequence, mark + 41, "F above the derived file's position");
 }
+
+#[test]
+fn a_damaged_newest_generation_falls_back_to_the_previous_one() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 400, 0);
+    r.settle();
+    ingest(&mut r, 400, 20_000_000);
+    r.settle();
+    for family in [Family::Root, Family::Series] {
+        let gens = directory::generations(&r.fs, &dir(), family);
+        assert_eq!(gens.len(), 2, "{family:?}");
+        // One bit of the newest's body flipped: invalid, so a reader takes the previous generation.
+        let mut newest = r.fs.read(&gens[0].1).unwrap();
+        newest[90] ^= 1;
+        r.fs.remove_file(&gens[0].1).unwrap();
+        let f =
+            r.fs.open(&gens[0].1, kvik_log::fs::OpenMode::CreateNew)
+                .unwrap();
+        f.write_at(&newest, 0).unwrap();
+        drop(f);
+        let found = match family {
+            Family::Root => read_latest(&r.fs, &dir(), family, |b| Root::decode(b, &STORE_ID))
+                .unwrap()
+                .map(|(f, _)| f.file_id),
+            _ => r.series().map(|(f, _)| f.file_id),
+        };
+        assert_eq!(found, Some(gens[1].0), "{family:?}");
+    }
+    // The writer rebuilds forward from what it finds and ends where it was.
+    r.open();
+    r.settle();
+    let d = r.load().unwrap();
+    assert!(d.groups.iter().all(Option::is_some));
+    assert_eq!(d.segments().cloned().collect::<Vec<_>>(), r.sealed());
+}
