@@ -40,6 +40,7 @@ log-writer      log   writer
 log-recovery    log   recovery    --rest
 log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
+log-pacing      log   pacing
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-restore-plan kvik restore_plan_model
