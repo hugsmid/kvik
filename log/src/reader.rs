@@ -312,6 +312,16 @@ struct View {
 /// A segment opened by name, under the extension it was found with.
 type OpenSegment = (SegmentName, Box<dyn FsFile>);
 
+/// The bytes of the segment being read, kept between refreshes so that a refresh reads and zeroes only what is new.
+#[derive(Default)]
+struct Scratch(Vec<u8>);
+
+impl std::fmt::Debug for Scratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Scratch({} bytes)", self.0.len())
+    }
+}
+
 /// A reader of the log. See the module documentation.
 #[derive(Debug)]
 pub struct LogReader {
@@ -324,6 +334,7 @@ pub struct LogReader {
     state: ReaderState,
     view: View,
     lost: Vec<LostRange>,
+    scratch: Scratch,
     closed: bool,
 }
 
@@ -359,6 +370,7 @@ impl LogReader {
             },
             view: View::default(),
             lost: Vec::new(),
+            scratch: Scratch::default(),
             closed: false,
             cfg,
         };
@@ -401,7 +413,9 @@ impl LogReader {
         let renewed = self.renew_slot(epoch, mark.generation)?;
         let mut view = self.view.clone();
         let mut events = Vec::new();
-        let read = self.read_log(&mut view, &mark, &mut events);
+        let mut buf = std::mem::take(&mut self.scratch.0);
+        let read = self.read_log(&mut view, &mark, &mut events, &mut buf);
+        self.scratch.0 = buf;
         // The lease was written whatever the log held: keep its state.
         self.commit_lease(renewed);
         read?;
@@ -585,6 +599,7 @@ impl LogReader {
         view: &mut View,
         mark: &MarkSlot,
         events: &mut Vec<ReadEvent>,
+        bytes: &mut Vec<u8>,
     ) -> Result<(), ReaderError> {
         // A new generation: everything taken is void and the log is read again from its start (Q-118 (c)).
         match view.generation {
@@ -627,20 +642,22 @@ impl LogReader {
             } else {
                 ScanLimit::End
             };
-            let from = if file_id == view.file_id {
+            let resumed = if file_id == view.file_id {
                 view.resume
             } else {
                 None
             };
-            let from = from.unwrap_or(Resume {
+            let from = resumed.unwrap_or(Resume {
                 offset: HEADER_LEN as u64,
                 last_sequence: None,
             });
-            if let ScanLimit::Mark(m) = limit
-                && from.offset > m.max(HEADER_LEN as u64)
-            {
-                // The mark is behind the point reached in its segment: nothing new is below it.
-                break;
+            if let ScanLimit::Mark(m) = limit {
+                let m = m.max(HEADER_LEN as u64);
+                // The mark is behind the point reached in its segment, or at it: nothing new is below it. At it, the
+                // pass that reached that point checked the header.
+                if from.offset > m || (resumed.is_some() && from.offset == m) {
+                    break;
+                }
             }
             // An earlier segment that is gone would leave its positions unread: an error, as for the mark's.
             let Some((n, f)) = self.open_segment(name)? else {
@@ -654,7 +671,9 @@ impl LogReader {
             if len > MAX_SEGMENT_FILE {
                 return Err(ReaderError::TooLong { path, len });
             }
-            let bytes = read_part(&*f, from.offset, len).map_err(io_err(&path))?;
+            let whole = matches!(limit, ScanLimit::End);
+            read_part(bytes, &*f, from.offset, len, whole).map_err(io_err(&path))?;
+            let bytes = &bytes[..];
             let id = SegmentIdentity {
                 store_id: self.store_id,
                 file_id,
@@ -664,7 +683,7 @@ impl LogReader {
                 path: path.clone(),
                 error,
             };
-            let mut s = Scanner::resume(&bytes, &id, limit, from).map_err(refused)?;
+            let mut s = Scanner::resume(bytes, &id, limit, from).map_err(refused)?;
             view.file_id = file_id;
             view.resume = Some(from);
             loop {
@@ -839,16 +858,67 @@ fn read_at_full(f: &dyn FsFile, buf: &mut [u8], offset: u64) -> io::Result<usize
     Ok(at)
 }
 
-/// A buffer of `len` bytes holding the file's header and its bytes from `from` to `len`; the bytes between are
-/// zero and never looked at (a scan resumed at `from` reads only forward). Bytes past the end of the file are zero.
-fn read_part(f: &dyn FsFile, from: u64, len: u64) -> io::Result<Vec<u8>> {
+/// Makes `b` the file's first `len` bytes as a scan resumed at `from` reads them: the header and the bytes from
+/// `from`, zero past the end of the file. The bytes between keep what `b` held unless `whole`: a scan to the mark reads
+/// only forward from `from`; one to the end looks for seal blocks backwards from the last non-zero byte.
+fn read_part(b: &mut Vec<u8>, f: &dyn FsFile, from: u64, len: u64, whole: bool) -> io::Result<()> {
     let len = usize::try_from(len).map_err(io::Error::other)?;
-    let mut b = vec![0u8; len];
-    let head = len.min(HEADER_LEN);
-    read_at_full(f, &mut b[..head], 0)?;
     let from = usize::try_from(from).map_err(io::Error::other)?.min(len);
-    if from < len {
-        read_at_full(f, &mut b[from..], from as u64)?;
+    b.resize(len, 0);
+    let head = len.min(HEADER_LEN);
+    let got = read_at_full(f, &mut b[..head], 0)?;
+    b[got..head].fill(0);
+    if whole {
+        b[head..from.max(head)].fill(0);
     }
-    Ok(b)
+    if from < len {
+        let got = read_at_full(f, &mut b[from..], from as u64)?;
+        b[from + got..].fill(0);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::MemFs;
+
+    fn file(len: usize) -> Box<dyn FsFile> {
+        let fs = MemFs::new();
+        let f = fs.open(Path::new("f"), OpenMode::CreateNew).unwrap();
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
+        f.write_at(&bytes, 0).unwrap();
+        f
+    }
+
+    #[test]
+    fn a_read_up_to_the_mark_writes_only_the_header_and_the_bytes_from_the_resume_point() {
+        let f = file(4_096);
+        let mut b = vec![0xAA; 1_024];
+        read_part(&mut b, &*f, 2_048, 3_072, false).unwrap();
+        let mut want = vec![0u8; 4_096];
+        f.read_at(&mut want, 0).unwrap();
+        assert_eq!(b.len(), 3_072);
+        assert_eq!(b[..HEADER_LEN], want[..HEADER_LEN]);
+        assert!(b[HEADER_LEN..1_024].iter().all(|&x| x == 0xAA));
+        assert!(b[1_024..2_048].iter().all(|&x| x == 0));
+        assert_eq!(b[2_048..], want[2_048..3_072]);
+    }
+
+    #[test]
+    fn a_read_to_the_end_zeroes_the_gap_and_bytes_past_the_end_of_the_file() {
+        let f = file(3_000);
+        let mut b = vec![0xAA; 4_096];
+        read_part(&mut b, &*f, 2_048, 3_072, true).unwrap();
+        let mut want = vec![0u8; 3_000];
+        f.read_at(&mut want, 0).unwrap();
+        assert_eq!(b[..HEADER_LEN], want[..HEADER_LEN]);
+        assert!(b[HEADER_LEN..2_048].iter().all(|&x| x == 0));
+        assert_eq!(b[2_048..3_000], want[2_048..]);
+        assert!(b[3_000..].iter().all(|&x| x == 0));
+        let short = file(40);
+        let mut b = vec![0xAA; 128];
+        read_part(&mut b, &*short, HEADER_LEN as u64, 128, false).unwrap();
+        assert!(b[40..].iter().all(|&x| x == 0));
+    }
 }
