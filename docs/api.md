@@ -69,7 +69,7 @@ The keys roadmap section 4 needs; all may change between opens.
 | `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
-| `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the longest a flagged batch (a batch of series at `Durability::Written`) waits for its sync (spec §3 Commit); it bounds what a power loss or a kernel crash removes of readings already acknowledged |
+| `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
 | `limits.series_ceiling` | `u32` | 100,000 | |
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
@@ -179,9 +179,12 @@ exactly to the current one. `set_excess_precision(id, policy) -> Result<(), Defi
 that takes effect at its position (spec §2.1 `excess precision`); a maximum scale below the current scale is
 `DefineError::Invalid`. `set_durability(id, level) -> Result<(), DefineError>` appends a parameter change that takes
 effect at its position (spec §2.1 `durability`); `enum Durability { Synced, Written }`, `Synced` by default.
-`Written` acknowledges and delivers a reading once its batch is written, before its sync: it survives a crash or
-restart of the process, and a power loss or a kernel crash within `log.max_unsynced` of it can remove it, which a
-later start reports as `PossibleLoss` with a reset point. Every call in this section is synced whatever the level.
+`Written` acknowledges and delivers a reading once its batch is written, before its sync (after any default-level
+sync already in flight, Q-255). A crash or restart of the process keeps it while the page cache holds it. A power
+loss or a kernel crash before its sync returns can remove it: a later start reports `PossibleLoss` with a reset point,
+or `DataLost` when a later batch reached the disk and it did not (Q-257). Two removals go unreported (open): a
+remount within the boot (Q-250), and a failed sync whose pages are evicted before a restart on the same boot (Q-254).
+Every call in this section is synced whatever the level, and a change of level takes effect at its position (Q-256).
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
 series; a day may start at a declared local time instead of midnight:
@@ -212,10 +215,11 @@ store.emit_with(&readings, Intent::Revise).await?;
 - **One call is one batch unit:** its readings are committed in one batch or not at all, in order. A call is at
   most `min(65,536, limits.ingest_queue)` readings and 8 MiB plain-encoded (`EmitError::TooLarge` otherwise; the
   caller splits). Several calls may share a batch. Calls from different tasks are ordered by commit.
-- Outcomes are decided at commit (a retirement committed while a reading waits refuses it). A call all of whose
-  readings are of series at `Durability::Written` is a flagged batch (spec §3 Batches): `emit` and `Pending` resolve
-  once it is written, and every `Recorded` outcome says `Written`. Any other call resolves at the default level, its
-  outcomes say `Synced`: `emit` and `Pending`
+- Outcomes are decided at commit (a retirement committed while a reading waits refuses it). Calls share a batch only
+  with calls of the same class (spec §3 Batches, Q-255): a call all of whose readings are of series at
+  `Durability::Written` goes into a flagged batch, and `emit` and `Pending` resolve once it is written, after any
+  default-level sync already in flight; every `Recorded` outcome carries the level it was acknowledged at, here
+  `Written`. Any other call resolves at the default level, its outcomes say `Synced`: `emit` and `Pending`
   resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
   the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
   a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
@@ -424,7 +428,7 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
   `acknowledged` is the last position acknowledged at either level and `durable` the last synced one ("durable up
   to"); they differ only while flagged batches wait for their sync (spec §3 Commit). A recovery entry written while
-  a series at `Durability::Written` is defined is a `PossibleLoss` (spec §3 Recovery rule 3; Q-251).
+  a series is at `Durability::Written` is a `PossibleLoss` (spec §3 Recovery rule 3; Q-251).
   `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.

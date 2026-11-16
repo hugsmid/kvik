@@ -173,7 +173,7 @@ impl Model {
             cursors_missing: std::mem::take(&mut self.disk.lost_cursors)
                 .into_iter()
                 .collect(),
-            written_level: self.written_level_defined(),
+            written_level: self.written_level_in_force(),
         };
         // Step 5: the entry, alone in its batch.
         self.append_batch(vec![Entry {
@@ -326,9 +326,10 @@ impl Model {
             .unwrap_or(0)
     }
 
-    /// Whether a series at the `written` level is defined in the kept log or
-    /// the restore's checkpoint (§3 Recovery rule 3, Q-251).
-    fn written_level_defined(&self) -> bool {
+    /// Whether a series is at the `written` level in the registry at K (§3
+    /// Recovery rule 3, Q-251): levels are fixed for life here (Q-256), so a
+    /// definition in the kept log or the restore's checkpoint says it.
+    fn written_level_in_force(&self) -> bool {
         let written = |o: &SeriesOptions| o.durability == Durability::Written;
         let log = self
             .disk

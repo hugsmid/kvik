@@ -11,12 +11,12 @@
 in one library, with no database service.**
 
 kvik is designed to sit inside the application that talks to the devices. Readings go into a checksummed, append-only
-log and are synced to disk before anything reacts to them; the same library then delivers them to in-process
-consumers, keeps per-series summaries for drill-down from years to seconds, and moves old files to cheaper storage
-and an off-site bucket; the engine itself never deletes a fact. Typical uses are home and building automation, energy
-monitoring, small industrial or laboratory installations and edge devices: places where per-second data from many
-sources must be acted on quickly, kept for years and restored to a known, recorded point after a failure
-([who it is for](#who-it-is-for)).
+log and are synced to disk before anything reacts to them (a series may opt for acknowledgement once written); the
+same library then delivers them to in-process consumers, keeps per-series summaries for drill-down from years to
+seconds, and moves old files to cheaper storage and an off-site bucket; the engine itself never deletes a fact.
+Typical uses are home and building automation, energy monitoring, small industrial or laboratory installations and
+edge devices: places where per-second data from many sources must be acted on quickly, kept for years and restored to
+a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 
 > [!IMPORTANT]
 > **Status: design stage. The engine does not exist yet.**
@@ -77,7 +77,9 @@ sources must be acted on quickly, kept for years and restored to a known, record
 From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 
 - **Durable before anything reacts.** A batch of readings is synced and the durable mark moved before adapters are
-  acknowledged, summaries are updated or any consumer or reader process sees it.
+  acknowledged, summaries are updated or any consumer or reader process sees it; a series at the faster durability
+  level is acknowledged once written, its sync starting within `max_unsynced`, and reader processes still see it
+  only once synced.
 - **Late and corrected data are recorded.** A reading is never edited in place; a correction is a new fact and the
   old one stays as a revision. Sources that revise what they have published declare a *versioned series*, so a
   replay cannot undo a correction that carries a higher `changed_at`.

@@ -82,7 +82,7 @@ pub struct RecoveryEntry {
     pub id_floor: u32,
     /// The consumers whose cursor file was missing or unreadable.
     pub cursors_missing: Vec<ConsumerId>,
-    /// A series at the `written` level was defined in the kept log, so
+    /// A series was at the `written` level in the registry at `after`, so
     /// flagged batches may have vanished without a byte (`format.md` A.6
     /// field 48, Q-251).
     pub written_level: bool,
@@ -98,7 +98,7 @@ impl RecoveryEntry {
 
     /// Whether the entry is a `possible_loss` (§11 Health): it names a
     /// non-empty tail, a mark that was not readable or stale, a missing or
-    /// unreadable cursor file, or a series at the `written` level defined
+    /// unreadable cursor file, or a series at the `written` level in force
     /// (Q-251). Its gap, if any, is a `data_lost` (Q-124 (a)).
     pub fn possible_loss(&self) -> bool {
         !self.tail.is_empty()

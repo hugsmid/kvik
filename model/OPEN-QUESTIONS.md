@@ -69,6 +69,14 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-251 | §3 Recovery rule 3, Adoption, §11 Health; `format.md` A.6 field 48 | Which recovery entries report a `possible_loss` for the faster level |
 | Q-252 | §2.1 `durability`; `api.md` Writing, Configuration | A per-call wait for the sync on a faster-level series, and the `max_unsynced` default |
 | Q-253 | `format.md` A.7 `flags`, A.3 | The commit-block flag in formerly reserved bytes, which earlier builds read as nothing |
+| Q-254 | §1 principles 3 and 5, §2.1 `durability`, §3 Write or sync failure, Recovery rule 1, rows 7 and 12, invariant 10; `api.md` Series | Acknowledged faster-level batches evicted after a failed write-back, then a restart on the same boot |
+| Q-255 | §2.1 `durability`, §3 Batches, Commit, Group commit; `api.md` Writing | How calls of two levels are cut into batches and acknowledged |
+| Q-256 | §2.1 `durability`; `api.md` Series | The level changed at run time by `set_durability` |
+| Q-257 | §2.1 `durability`, §3 Recovery rule 2, invariant 10 | Faster-level readings lost out of order reported as `data_lost` |
+| Q-258 | §3 Recovery rule 1, invariant 10 | Default-level batches after flagged ones truncated by a remount where they were kept before |
+| Q-259 | §1 principle 3, invariants 2 and 11 | What sees a faster-level reading before it is durable |
+| Q-680 | `api.md` Writing, Health | `Outcome::Recorded` carrying the level and `LogStats.acknowledged` |
+| Q-681 | §2.1 `durability`, §3 Commit, invariant 10; `api.md` Configuration | What `max_unsynced` bounds |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -729,7 +737,8 @@ crash keeps checksum-valid complete batches beyond the mark.
   after the last kept batch is truncated, and a complete batch or any non-zero byte there is still a reset point and
   `possible_loss` (Q-125, Q-320), with K the last kept position. The stale-mark test counts unflagged batches only: a
   complete unflagged batch beyond the mark followed by any complete batch. A process crash therefore loses no
-  acknowledged faster-level reading and costs no reset point
+  acknowledged faster-level reading the page cache still holds and costs no reset point (a remount, Q-250, or pages
+  evicted after a failed write-back, Q-254, can remove them unreported)
   (`tests/durability.rs` `s3_process_crash_keeps_flagged_batches_beyond_the_mark_with_no_reset_point`,
   `s3_process_crash_keeps_flagged_batches_and_resets_after_an_unflagged_one`,
   `s3_flagged_batches_do_not_make_a_same_boot_mark_stale`).
@@ -1383,35 +1392,43 @@ volume detached): the page cache is gone and none of 101 to 140 reached the disk
 and a readable mark at 100 with nothing beyond it: rule 1 sees a clean process crash, writes no recovery entry, and
 gives 101 onwards to new readings. The consumer that acted on 120 receives no reset point and no `possible_loss` is
 listed: a silent loss and a reused position, which principle 5 forbids. Syncing the mark at every commit, the
-existing advice for remountable media (Q-125), does not help: the batches were never synced at all.
+existing advice for remountable media (Q-125), does not help: the batches were never synced at all. (b) Partial
+write-back: before the remount the cache wrote back 101 to 110 and none of 111 to 140. Rule 1 keeps 101 to 110 as
+acknowledged flagged batches and finds nothing after them, so 111 onwards are given again, also with no report.
 **Now.** Stated as open in principle 5, rule 1's accepted limit and invariant 10; no rule invented. The model pins
-the gap (`tests/open_questions.rs` `q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again`).
+the gap (`tests/open_questions.rs` `q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again`,
+`q250_a_remount_keeping_part_of_the_flagged_batches_gives_the_rest_again`), and the reuse property of the recovery
+histories excludes only remounts that lose a flagged batch. Q-254 is the same failure with no remount.
 **Options.** (a) Accept and document: the `written` level is not for media that may be remounted within a boot, and
 opening such a store with a `written` series is the operator's choice. (b) Before acknowledging the first flagged
 batch after a sync, sync a mark update that says flagged batches may follow (one sync per `max_unsynced` window, not
 per batch); a same-boot start that finds the flag and nothing beyond the mark writes a reset point with a
 `possible_loss`. This costs one mark sync of latency for the first faster-level reading of each window. (c) Refuse
 the `written` level unless `log.mark_sync` is `EveryCommit` (does not close the gap; listed to rule it out).
-Proposed: (b) if the latency is acceptable, else (a).
+Proposed: (b) if the latency is acceptable, else (a). (b) also closes Q-254; (a) does not.
 
 ## Q-251 — Which recovery entries report a `possible_loss` for the faster level
-Recorded by roadmap 5.5a. To be settled by 5.5b.
+Recorded by roadmap 5.5a. To be settled by 5.5b. **OWNER**: (b) and (c) change what health promises.
 **Scenario.** (a) A store has a `written` series. A power cut removes flagged batches 101 to 140 entirely (zeros on
 disk). After the reboot rule 3 keeps up to 100 and writes an entry with an empty tail and a readable mark, which by
 §11 before 5.5a was no `possible_loss`: consumers got a reset point but health listed nothing. (b) The same store
 shuts down cleanly and the machine reboots: the entry is the same, though nothing was lost. (c) With the mark's
 current slot damaged after a completed rule 3 start, an older slot is read that does not cover that start's entry;
 the writer had resumed and acknowledged flagged batches that left no byte, and the entry is adopted.
-**Decided at 5.5a (provisional).** A recovery entry written while a series at the `written` level is defined in the
-kept log is a `possible_loss` whatever its tail (`format.md` A.6 field 48; `spec.md` §3 Recovery rule 3, §11), so
+**Decided at 5.5a (provisional).** A recovery entry written while a series is at the `written` level in the
+registry at its `after` (K) is a `possible_loss` whatever its tail (`format.md` A.6 field 48; `spec.md` §3 Recovery rule 3, §11), so
 (a) is reported, at the price of (b) being reported too. With the mark missing or unreadable and such a series
-defined, an entry is never adopted (a doubtful case costs a second report). Reason: honest without a new mechanism;
-the definition entries that make a series `written` are synced with the mark before they are acknowledged, so the
-kept log after a reboot always holds them (`tests/durability.rs`
+in force, an entry is never adopted (a doubtful case costs a second report). Reason: honest without a new mechanism;
+the definitions and parameter changes that make a series `written` are synced with the mark before they are
+acknowledged, so the registry at K after a reboot always holds them. The model, whose levels are fixed for life,
+reads the definitions (`tests/durability.rs`
 `s3_a_reboot_entry_is_a_possible_loss_while_a_written_series_is_defined`).
 **Open.** (b) A clean-shutdown bit in the mark's reserved bytes, written by the final mark update and cleared by
 the next, would let a start after a clean shutdown report nothing. (c) is not covered: a damaged current slot is
 not detectable from the slot read; proposed with Q-322's numbering change.
+**As built.** Every start after a reboot lists a `possible_loss` while any series is at the `written` level, a
+clean shutdown included; (c) is unreported. **Proposed to the owner:** accept (b) until the clean-shutdown bit
+removes the false reports; settle (c) with Q-322, until then an accepted limit.
 
 ## Q-252 — A per-call wait for the sync on a faster-level series, and the `max_unsynced` default
 Recorded by roadmap 5.5a. **Needs the owner's ruling**; to be settled by 5.5c.
@@ -1434,6 +1451,97 @@ which keeps complete batches). A set bit other than bit 0 is critical, like a fa
 holds zero (unflagged), and the golden files stay valid. If a released build must refuse such a store, the
 alternative is a new non-skippable commit block type (`0x0E`, same body), which an earlier reader refuses as an
 unknown critical block; 5.5b chooses when it writes the flag.
+**OWNER.** As built: a build from before 5.5b reads a flagged batch as unflagged, and `format.md` A.3's "readers do
+not test reserved bytes" has this exception. Proposed: accept while no release predates the flag.
+
+## Q-254 — Acknowledged faster-level batches evicted after a failed write-back, then a restart on the same boot
+Recorded at the review of roadmap 5.5a. **OWNER** (it decides what the faster level promises across a failed sync).
+**Scenario.** A price series is at the `written` level; the mark is at 100. Batches 101 and 102 are written,
+acknowledged and delivered, and a consumer acts on 101. The `max_unsynced` sync, or the next default-level batch's,
+fails: the engine goes read-only (§3 Write or sync failure). On Linux the failed write-back leaves the pages of 101
+and 102 clean (§3 Recovery rule 3, Last batch written again; the 4.9 fault trial saw exactly this), so the kernel
+may reclaim them at any time, and a file system that drops them at the error loses them at once. The operator
+restarts the process on the same boot. The bytes beyond the mark read back as zeros: rule 1 finds nothing beyond
+the mark, writes no recovery entry and gives 101 onwards to new readings. The consumer that acted on 101 gets no
+reset point and nothing is listed: a silent loss and a reused position, against principle 5. For a default-level
+batch the same eviction is harmless, as it was never acknowledged.
+**Why Q-250 (a) does not cover it.** No remount is involved, and every medium can fail a sync: refusing the level on
+remountable media leaves the case open. Q-250 (b), a synced marker before the first flagged acknowledgement of each
+window, does cover it: the start finds the marker and nothing beyond the mark and writes a reset point.
+**Now.** Stated as open wherever the text promised that a process restart loses no faster-level reading (principles
+3 and 5, §2.1, §3 Write or sync failure, rule 1, rows 7 and 12, invariant 10, `api.md`); no rule invented. The
+model injects the eviction (`Model::evict_failed_write_back`) and pins the gap (`tests/open_questions.rs`
+`q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positions_again`).
+**Options.** (a) Q-250 (b): the synced marker per `max_unsynced` window. (b) After a failed sync with flagged batches
+beyond the mark, the writer, now read-only, records the failure durably (a mark slot flag written and synced on
+another handle, or a small file) before anything else; the next start that finds it writes a reset point with a
+`possible_loss` for the range beyond the mark, and a `data_lost` for any of it found missing before a complete
+batch. A failed device may refuse that write too, so (b) narrows the case rather than closing it. (c) Refuse the
+`written` level on platforms where a failed write-back drops or cleans the pages (Linux today), which leaves it to
+development platforms. (d) Accept and document as a limit of the level.
+**Proposed.** (a) if Q-250 (b) is chosen; otherwise (b), and (d) for what (b) cannot reach.
+
+## Q-255 — How calls of two levels are cut into batches and acknowledged
+Recorded at the review of roadmap 5.5a. **OWNER** (Q-170's note said each reading is acknowledged at its own level).
+**Scenario.** (a) One call holds a reading of a `written` series and one of a `synced` series. (b) Calls W1, S1, W2
+(W of `written` series only, S otherwise) queue behind a default-level sync. (c) In a store mixing levels under load,
+a `written` reading arrives while a default-level batch's sync is in flight.
+**As built (spec §3 Batches, Commit; `api.md` Writing).** (a) The call is acknowledged whole at the default level:
+an acknowledgement is per call and the stricter level never weakens a promise. (b) The queue is cut by call into runs
+of one class: W1, S1 and W2 are three batches, W2 acknowledged after S1's sync, and calls share a batch only within
+a class, so default-level calls still group. (c) The `written` reading waits for that sync, so its latency is the
+sync's, not a write's; writing flagged batches during a sync would change what rules 1 to 3 can find beyond the mark.
+The model commits the queue as one batch, flagged only when every reading is at the `written` level.
+**Proposed.** Accept (a) and (b); accept (c) for now and measure the mixed-load latency at 5.5b.
+
+## Q-256 — The level changed at run time by `set_durability`
+Recorded at the review of roadmap 5.5a. **OWNER** (the owner's request said "per series definition").
+**As built (spec §2.1 `durability`; `api.md` Series).** `set_durability` appends a parameter change that takes effect
+at its position, like a change of retention class; it changes no fact and is always synced with the mark before it
+is acknowledged. The model fixes the level for the life of a series (Q-60).
+**Proposed.** Accept.
+
+## Q-257 — Faster-level readings lost out of order reported as `data_lost`
+Recorded at the review of roadmap 5.5a. **OWNER** (it decides which report a known loss of delivered readings gets).
+**Scenario.** Flagged batches 101 to 103 are written with no sync between them; a power loss leaves 101 and 103 on
+disk and 102 as zeros.
+**As built (spec §3 Recovery rule 2).** 102 is a lost range: `data_lost`, health degraded until acknowledged,
+positions not reused, a reset point for cursors below it. Not modelled (the model writes back in order); the engine's
+kill loop at 5.5b covers it on the same boot and after a reboot.
+**Proposed.** Accept: it is a known loss of delivered readings. Alternative: report a range holding only flagged
+batches as `possible_loss`.
+
+## Q-258 — Default-level batches after flagged ones truncated by a remount where they were kept before
+Recorded at the review of roadmap 5.5a. **OWNER.**
+**Scenario.** Under the timed mark sync, flagged batches then one default-level batch are committed after the last
+mark sync, and the file system is remounted within the boot. Before 5.5a two batches beyond a same-boot mark made it
+stale and rule 3 kept both; now flagged batches do not count, so the default-level batch is the one complete
+unflagged batch beyond the kept ones and rule 1 truncates it as a reset point (reported, the accepted limit of
+invariant 10). The wording "one batch" still holds; it happens more often in a store mixing levels.
+**Proposed.** Accept; `log.mark_sync = EveryCommit` avoids it, as today.
+
+## Q-259 — What sees a faster-level reading before it is durable
+Recorded at the review of roadmap 5.5a. **OWNER.**
+**As built (principle 3, renamed "React after acknowledgement"; invariants 2 and 11 relaxed).** Consumers,
+conditions, live state, the tree and the writer's own queries see a `written` reading once its batch is written;
+reader processes, cursor files and derived files see it only once synced. A consumer that sends commands on such a
+series can have its reason withdrawn by a reset point, or silently (Q-250, Q-254).
+**Proposed.** Confirm.
+
+## Q-680 — `Outcome::Recorded` carrying the level and `LogStats.acknowledged`
+Recorded at the review of roadmap 5.5a. **OWNER** (public interface).
+**As built (`api.md` Writing, Health).** `Outcome::Recorded` gains `durability`, the level the reading was
+acknowledged at; `LogStats` gains `acknowledged` beside `durable` ("durable up to"). Not in the model.
+**Proposed.** Accept.
+
+## Q-681 — What `max_unsynced` bounds
+Recorded at the review of roadmap 5.5a. **OWNER** only if a hard bound is wanted.
+**Scenario.** The writer starts the log sync 1 s after the first flagged batch, and the device takes 3 s to complete
+it while flagged batches keep arriving; a power loss then removes about 4 s of acknowledged readings.
+**As built.** The text says what holds: an event removes what was written since the last log sync that returned,
+and the writer starts that sync at the latest `max_unsynced` after the first flagged batch (spec §2.1, invariant 10;
+`api.md` Configuration). **Proposed.** Keep the wording; a hard bound would make ingest of `written` series wait
+while a sync overruns.
 
 ## Open at v0.2
 
@@ -1447,7 +1555,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1515,9 +1623,17 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-250 | 5.5b | Unsynced faster-level batches lost to a remount; recorded by roadmap 5.5a; owner decision pending |
-| Q-251 | 5.5b | `possible_loss` for the faster level; recorded by roadmap 5.5a; decided provisionally, the clean-shutdown refinement open |
+| Q-251 | 5.5b | `possible_loss` for the faster level; recorded by roadmap 5.5a; decided provisionally, the clean-shutdown refinement open; owner confirmation pending |
 | Q-252 | 5.5c | A per-call sync and the `max_unsynced` default; recorded by roadmap 5.5a; owner decision pending |
-| Q-253 | 5.5b | The commit-block flag in reserved bytes; recorded and decided by roadmap 5.5a, the block type left to 5.5b |
+| Q-253 | 5.5b | The commit-block flag in reserved bytes; recorded and decided by roadmap 5.5a, the block type left to 5.5b; owner confirmation pending |
+| Q-254 | 5.5b | Faster-level batches evicted after a failed write-back; recorded at the review of 5.5a; owner decision pending |
+| Q-255 | 5.5b | Cutting calls of two levels into batches; recorded at the review of 5.5a; owner confirmation pending |
+| Q-256 | 5.5b | `set_durability` at run time; recorded at the review of 5.5a; owner confirmation pending |
+| Q-257 | 5.5b | Out-of-order loss as `data_lost`; recorded at the review of 5.5a; owner confirmation pending |
+| Q-258 | 5.5b | Default-level batches truncated after flagged ones on a remount; recorded at the review of 5.5a; owner confirmation pending |
+| Q-259 | 5.5b | Visibility before durability; recorded at the review of 5.5a; owner confirmation pending |
+| Q-680 | 5.5b | `Outcome` level and `LogStats.acknowledged`; recorded at the review of 5.5a; owner confirmation pending |
+| Q-681 | 5.5b | What `max_unsynced` bounds; recorded at the review of 5.5a; owner decision only for a hard bound |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1861,7 +1977,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
-| Durability levels | §2.1 `durability`, §3 Batches, Commit, Recovery rules 1–3 | The level is fixed for the life of a series (no parameter change, Q-60); the queue commits as one batch, flagged only when every reading is at the `written` level (the engine cuts batches by call); `max_unsynced` is the caller's `sync_log`; batches reach the disk in order, so an invalid region before a complete flagged batch (rule 2) and writing kept batches again are not modelled; adoption is not modelled | `tests/durability.rs` |
+| Durability levels | §2.1 `durability`, §3 Batches, Commit, Recovery rules 1–3 | The level is fixed for the life of a series (no parameter change, Q-60, Q-256), so the registry at K is read from the definitions; the queue commits as one batch, flagged only when every reading is at the `written` level (the engine cuts the queue by call into runs of one class, Q-255); `max_unsynced` is the caller's `sync_log`; batches reach the disk in order, so an invalid region before a complete flagged batch (rule 2, Q-257) and writing kept batches again are not modelled; adoption is not modelled; `Outcome`'s level and `LogStats.acknowledged` are not modelled (Q-680); a failed sync keeps its flagged batches on the same boot unless `evict_failed_write_back` drops them (Q-254); `remount_keeping` says how many unsynced flagged batches reached the disk (Q-250) | `tests/durability.rs` |
 | Effective-dated parameters | §2.1, §5.1 | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so neither a later change of the expected interval, which leaves the stored levels as they are (§5.1), nor a past-effective change of a parameter a node depends on (Q-83) arises | `calendar_depends_on_zone_utc_levels_do_not` |
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |

@@ -21,8 +21,10 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 ## Intended shape
 1. **Log.** Readings are validated, stamped and appended to the log in batches; a batch is synced before
    anything else sees it (group commit; no added delay after a quiet period; batch syncs due at least
-   `min_sync_interval`, default 10 ms, apart).
-2. **Delivery.** Only after the sync, funnels deliver to consumers and live state updates. A funnel is a route
+   `min_sync_interval`, default 10 ms, apart), except a batch of series at the faster durability level, seen once
+   written, its sync starting within `max_unsynced` (spec §2.1 `durability`).
+2. **Delivery.** Only after its acknowledgement (the sync, or the write at the faster level), funnels deliver to
+   consumers and live state updates. A funnel is a route
    compiled from configuration: series selection, optional windowed operator, condition, consumer. A consumer
    that falls behind catches up from the log; it never blocks the log or other consumers.
 3. **Summary tree.** Per series, summaries over time: stored 1-minute and 15-minute nodes, calendar days and
