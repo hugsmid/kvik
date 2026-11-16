@@ -477,7 +477,11 @@ only, boxed `Send` futures):
   (Q-164 (c)). `WrongKey` comes before any file is fetched. `NotEmpty`: the directory holds files and no restore
   record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
   store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a
-  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304).
+  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304). A full restore whose
+  `prepare` fails after its claim is retried in the generation it claimed, while no higher one is claimed (Q-266).
+- **Superseded writer.** The upload driver reads the claim above its generation before each record upload; once a
+  restore has claimed one, every step fails with `UploadError::Superseded { by }` and nothing more is uploaded, and
+  the store becomes read-only with fatal health (the store's wiring is roadmap 8.1d; spec §8 Generations; Q-265).
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
   SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
   which the sampled download checks. Eviction (roadmap 8.1) requires one.

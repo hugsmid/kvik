@@ -97,6 +97,13 @@ pub enum UploadError {
     /// The bucket reported other content than was uploaded.
     #[error(transparent)]
     Verify(#[from] VerifyError),
+    /// A restore claimed a generation above the store's: uploads stop for good and the store becomes read-only
+    /// (`spec.md` §8 Generations; Q-265).
+    #[error("generation {by} was claimed by a restore")]
+    Superseded {
+        /// The highest generation claimed.
+        by: u32,
+    },
 }
 
 /// Where the uploads stand; "stalled" is the caller's rule over `failing_since`.

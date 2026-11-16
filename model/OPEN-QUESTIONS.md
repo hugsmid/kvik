@@ -73,6 +73,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-264 | §3 Recovery rule 2, §8 Generations; Q-321 | Position 1 as the chain's start in a restored generation |
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
+| Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1422,6 +1423,18 @@ restored file; the restored segments of earlier generations were then never read
 segment the mark names, and skips set-aside batches (Q-263) by the restored ends in `ReaderConfig::set_aside`, which
 the caller takes from the latest restore record (§8 Restore step 1). Test: `log/tests/generation.rs`
 `a_reader_reads_earlier_generations_past_what_is_set_aside`.
+## Q-265 — When a writer reads the claims, and what it does on a higher one
+Recorded by roadmap 8.3c (review finding F10 of 8.1c). To be settled by roadmap 8.1d.
+**Scenario.** §8 Generations: a writer that finds a higher generation claimed stops uploading and becomes
+read-only. The upload driver never read the claims and had no way to report it: a store whose bucket a restore had
+claimed past went on uploading records of its generation that no later restore reads.
+**Decided (8.3c).** Before each record `put` the driver reads the claims above the record's generation by `stat`,
+in ascending order (claims leave no gap, Q-305, so one `stat` answers when none is higher). On a higher claim the
+step fails with the additive `UploadError::Superseded { by }`, `by` the highest claimed, and every later step fails
+the same way without touching the bucket, also if the marker later reads as absent. Files may still go up until the
+next record is due; they are in no later generation's records, as §8 accepts. The cost is one `stat` per record
+uploaded. Not done here: the store maps the failure to read-only and fatal health (8.1d), and nothing reads the
+claims while the driver is idle (an idle writer uploads nothing). Tests: `backup/tests/upload_superseded.rs`.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1509,6 +1522,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-264 | 8.3 | Owner's ruling needed: extend Q-321's rule to restored generations or keep it at generation 0 |
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
+| Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

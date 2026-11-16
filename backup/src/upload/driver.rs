@@ -41,6 +41,8 @@ pub struct Uploader<S, E, M> {
     attempt: u32,
     awaiting: Option<Awaiting>,
     progress: Progress,
+    /// A higher generation claimed, once found (Q-265).
+    superseded: Option<u32>,
 }
 
 /// Where the record uploads stand: read from the bucket at the first step, then kept (Q-282).
@@ -166,10 +168,14 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
             attempt: 0,
             awaiting: None,
             progress: Progress::default(),
+            superseded: None,
         }
     }
 
     async fn run(&mut self, now: Duration) -> Step {
+        if let Some(by) = self.superseded {
+            return Step::Failed(UploadError::Superseded { by });
+        }
         if self.manifest.holds() {
             return Step::Held;
         }
@@ -318,6 +324,7 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         self.manifest.settle(r.epoch).map_err(port)?;
         let key = self.keys.record(r.generation, r.epoch);
         if self.looked_up(&key, now).await?.is_none() {
+            self.check_claims(r.generation).await?;
             let plain = r
                 .encode()
                 .map_err(|e| io_stop(io::Error::new(io::ErrorKind::InvalidData, e)))?;
@@ -327,6 +334,29 @@ impl<S: BackupSink, E: Envelope, M: ManifestPort> Uploader<S, E, M> {
         if let Some(c) = self.cursor.as_mut() {
             c.pending.pop_front();
             c.uploaded = c.uploaded.max(r.epoch);
+        }
+        Ok(())
+    }
+
+    /// Q-265: before each record `put` the claims above `g` are read by `stat`, in ascending order; claims leave no
+    /// gap (Q-305), so one `stat` tells whether a restore has superseded `g`.
+    async fn check_claims(&mut self, g: u32) -> Out<()> {
+        let mut top = g;
+        while let Some(next) = top.checked_add(1) {
+            if self
+                .sink
+                .stat(&self.keys.claim(next))
+                .await
+                .map_err(sink_stop)?
+                .is_none()
+            {
+                break;
+            }
+            top = next;
+        }
+        if top > g {
+            self.superseded = Some(top);
+            return Err(Stop::Fail(UploadError::Superseded { by: top }));
         }
         Ok(())
     }
