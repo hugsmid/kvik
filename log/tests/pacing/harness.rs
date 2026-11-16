@@ -2,13 +2,14 @@
 //! histories and the reference schedule.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kvik_log::content::Item;
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
-use kvik_log::fs::MemFs;
+use kvik_log::fs::{DirEntry, Fs, FsFile, MemFs, OpenMode};
 use kvik_log::store::{MARK, NewStore, StoreDir};
 use kvik_log::writer::{
     Call, CallSource, Clock, IngestQueue, LogWriter, MarkSync, WriterConfig, create_segment,
@@ -44,12 +45,83 @@ impl Clock for ManualClock {
     }
 }
 
-/// How long the next segment and mark syncs take, while armed.
+/// How long the next segment and mark syncs, and every write, take while armed.
 #[derive(Debug, Default)]
 pub struct SyncTimes {
     pub armed: bool,
     pub segment: Duration,
     pub mark: Duration,
+    pub write: Duration,
+}
+
+/// [`MemFs`] whose writes advance the manual clock while armed.
+#[derive(Debug, Clone)]
+pub struct TimedWrites {
+    inner: MemFs,
+    clock: Arc<ManualClock>,
+    times: Arc<Mutex<SyncTimes>>,
+}
+
+#[derive(Debug)]
+struct TimedFile {
+    inner: Box<dyn FsFile>,
+    fs: TimedWrites,
+}
+
+impl Fs for TimedWrites {
+    fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>> {
+        Ok(Box::new(TimedFile {
+            inner: self.inner.open(path, mode)?,
+            fs: self.clone(),
+        }))
+    }
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        self.inner.sync_dir(path)
+    }
+    fn free_space(&self, path: &Path) -> io::Result<u64> {
+        self.inner.free_space(path)
+    }
+}
+
+impl FsFile for TimedFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let t = lock(&self.fs.times);
+        if t.armed {
+            *lock(&self.fs.clock.0) += t.write;
+        }
+        drop(t);
+        self.inner.write_at(buf, offset)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
 }
 
 pub fn fact(t: i64) -> Item {
@@ -121,6 +193,8 @@ pub struct Sim {
     /// Turns after which the next batch sync may wait more than a ceiling after the last batch sync and more than
     /// half one after the last log sync: the turn's time and the writer's ready time.
     pub ceiling_breaks: Vec<(Duration, Duration)>,
+    /// How long each write takes during a turn.
+    pub write: Duration,
     pub pushed: i64,
 }
 
@@ -154,7 +228,7 @@ impl Sim {
         clock: Arc<ManualClock>,
         times: Arc<Mutex<SyncTimes>>,
     ) -> Self {
-        let w = Self::open_writer(&fs, setup, &clock);
+        let w = Self::open_writer(&Self::timed(&fs, &clock, &times), setup, &clock);
         let mut s = Self {
             fs,
             setup,
@@ -167,13 +241,22 @@ impl Sim {
             covered: BTreeMap::new(),
             intervals: Vec::new(),
             ceiling_breaks: Vec::new(),
+            write: Duration::ZERO,
             pushed: 0,
         };
         s.create();
         s
     }
 
-    pub fn open_writer(fs: &MemFs, setup: Setup, clock: &Arc<ManualClock>) -> LogWriter {
+    fn timed(fs: &MemFs, clock: &Arc<ManualClock>, times: &Arc<Mutex<SyncTimes>>) -> TimedWrites {
+        TimedWrites {
+            inner: fs.clone(),
+            clock: clock.clone(),
+            times: times.clone(),
+        }
+    }
+
+    pub fn open_writer(fs: &TimedWrites, setup: Setup, clock: &Arc<ManualClock>) -> LogWriter {
         let store = StoreDir::open(Arc::new(fs.clone()), &PathBuf::from("store"), None).unwrap();
         let mut w = LogWriter::open(store, setup.config(), Some([9; 16]), START, T0).unwrap();
         if setup.clock {
@@ -199,7 +282,8 @@ impl Sim {
 
     pub fn create(&mut self) {
         if let Some(req) = self.w.segment_request(T0) {
-            let r = create_segment(&self.fs, &req, &self.w.halt());
+            let fs = Self::timed(&self.fs, &self.clock, &self.times);
+            let r = create_segment(&fs, &req, &self.w.halt());
             self.w.segment_created(r);
         }
     }
@@ -227,6 +311,7 @@ impl Sim {
             armed: true,
             segment,
             mark,
+            write: self.write,
         };
         let before = self.clock.monotonic();
         let step = self.w.step(now, T0 + now.as_nanos() as i64, &mut self.q);

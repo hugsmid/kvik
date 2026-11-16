@@ -230,6 +230,24 @@ fn a_failed_sync_leaves_the_estimate_alone() {
 }
 
 #[test]
+fn only_the_batch_sync_is_timed_not_the_batch_write_or_the_mark_update() {
+    let mut s = Sim::new(Setup::adaptive());
+    s.write = 25 * MS;
+    let mut at = START;
+    for _ in 0..10 {
+        s.push();
+        let (_, busy) = s.turn(at, FAST);
+        assert!(
+            busy >= 50 * MS + FAST,
+            "the batch write and the mark update were timed: {busy:?}"
+        );
+        at += Duration::from_secs(1);
+    }
+    assert_eq!(s.w.stats().sync_time, Some(FAST));
+    assert_eq!(s.w.stats().sync_interval, FLOOR);
+}
+
+#[test]
 fn a_mark_sync_leaves_the_estimate_alone() {
     for mark in [NO_MARK, MarkSync::EveryCommit] {
         let mut s = Sim::new(Setup {
