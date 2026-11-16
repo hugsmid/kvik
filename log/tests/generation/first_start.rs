@@ -2,19 +2,22 @@
 //! no mark, the id floor the first start takes, and a crash at every operation of `init_generation` and that start.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kvik_log::content::Item;
 use kvik_log::cursor::{CursorState, append};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
-use kvik_log::mark::ResetStamp;
+use kvik_log::mark::{MarkSlot, ResetStamp, read_mark};
 use kvik_log::setaside::{RestoredEnd, SetAside};
+use kvik_log::store::StoreDir;
 use kvik_log::writer::{
-    GenerationStart, LossKind, MarkSync, Position, StartReport, StartRule, WriterConfig,
+    GenerationStart, LogWriter, LossKind, MarkSync, Position, StartOptions, StartReport, StartRule,
+    WriterConfig, init_generation,
 };
 
-use super::at;
 use super::rig::*;
+use super::{at, read_all};
 
 /// A mark synced only once an hour: the generation's first mark stays the durable one while batches are acknowledged.
 fn lazy() -> WriterConfig {
@@ -257,4 +260,138 @@ fn a_recovery_entrys_id_floor_in_the_sealed_log_counts_at_the_first_start() {
     let mut g1 = restored_from(&sealed_files(&r), generation_start(end), cfg());
     assert_eq!(g1.open().rule, StartRule::FirstStart);
     assert_eq!(g1.mark().max_series_id, 12);
+}
+
+fn read_mark_of(fs: &MemFs) -> Option<MarkSlot> {
+    let b = fs.read(&log_path("MARK"))?;
+    read_mark(&b, &STORE_ID).ok().flatten().map(|(_, m)| m)
+}
+
+/// How a stopped process comes back.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    /// Killed and started again on the same boot, the page cache kept.
+    Kill,
+    PowerLoss,
+    PartialPowerLoss(u64),
+}
+
+/// A crash at every operation of `init_generation`, the first start and its first commit, then a kill, a whole or a
+/// partial power loss and `init_generation` and a start again. Only the mark `init_generation` wrote is read as no
+/// mark (Q-260); nothing acknowledged is lost or acknowledged again; no `data_lost`.
+#[test]
+fn a_crash_at_every_operation_of_init_generation_and_the_first_start() {
+    let (files, end) = source();
+    let start = generation_start(end);
+    let stops = [
+        Stop::Kill,
+        Stop::PowerLoss,
+        Stop::PartialPowerLoss(1),
+        Stop::PartialPowerLoss(2),
+        Stop::PartialPowerLoss(3),
+        Stop::PartialPowerLoss(4),
+        Stop::PartialPowerLoss(5),
+    ];
+    for config in [cfg(), lazy()] {
+        for stop in stops {
+            let mut points = 0;
+            for n in 0.. {
+                let ctx = format!("{:?}, {stop:?}, crash after {n}", config.mark_sync);
+                let fs = installed(&files);
+                fs.crash_after(n);
+                let mut r = Rig::on(fs.clone(), config.clone(), Some(start.clone()));
+                let init = StoreDir::open(Arc::new(fs.clone()), &dir(), None)
+                    .ok()
+                    .map(|s| init_generation(&s, &start, T0));
+                if matches!(init, Some(Ok(()))) && !fs.crashed() {
+                    let opts = StartOptions {
+                        generation: Some(start.clone()),
+                        ..StartOptions::default()
+                    };
+                    if let Ok(store) = StoreDir::open(Arc::new(fs.clone()), &dir(), None)
+                        && let Ok(w) = LogWriter::open_with(
+                            store,
+                            config.clone(),
+                            Some([1; 16]),
+                            r.now,
+                            r.wall,
+                            opts,
+                        )
+                        && w.fault().is_none()
+                    {
+                        r.w = Some(w);
+                        r.maint();
+                        r.submit(vec![fact(5, 0)]);
+                        r.drain();
+                    }
+                }
+                let acked = std::mem::take(&mut r.acked);
+                let crashed = fs.crashed();
+                r.w = None;
+                match stop {
+                    Stop::Kill => {}
+                    Stop::PowerLoss => fs.power_loss(),
+                    Stop::PartialPowerLoss(s) => fs.power_loss_partial(s * 1000 + n as u64),
+                }
+                fs.restart();
+                let store = StoreDir::open(Arc::new(fs.clone()), &dir(), None).unwrap();
+                init_generation(&store, &start, T0).unwrap_or_else(|e| panic!("{ctx}: {e:?}"));
+                drop(store);
+                let before = read_mark_of(&fs).unwrap_or_else(|| panic!("{ctx}: no mark"));
+                r.boot = if matches!(stop, Stop::Kill) { 1 } else { 2 };
+                let rep = r.try_open().unwrap_or_else(|e| panic!("{ctx}: {e:?}"));
+                let m = r.mark();
+                assert_eq!((m.generation, m.boot_id), (1, [r.boot; 16]), "{ctx}");
+                assert!(
+                    rep.losses.iter().all(|l| l.kind != LossKind::DataLost),
+                    "{ctx}: {rep:?}"
+                );
+                if before.boot_id == [0; 16] {
+                    assert!(acked.is_empty(), "{ctx}: acknowledged under the first mark");
+                    assert_eq!(rep.rule, StartRule::FirstStart, "{ctx}");
+                    assert!(
+                        rep.entry.is_none() && rep.losses.is_empty(),
+                        "{ctx}: {rep:?}"
+                    );
+                    assert_eq!((m.stamp, m.max_series_id), (stamp(), 9), "{ctx}");
+                } else {
+                    assert_ne!(rep.rule, StartRule::FirstStart, "{ctx}");
+                    if matches!(rep.rule, StartRule::Reboot(_)) {
+                        assert!(rep.entry.is_some(), "{ctx}");
+                    }
+                    assert_eq!(m.stamp == stamp(), rep.entry.is_none(), "{ctx}");
+                }
+                let kept = read_all(&r, start.set_aside.clone());
+                for p in &acked {
+                    assert!(
+                        kept.iter().any(|(f, l)| f <= p && p <= l),
+                        "{ctx}: {p:?} lost from {kept:?}"
+                    );
+                }
+                r.submit(vec![fact(5, 1)]);
+                r.drain();
+                let next = *r.acked.last().unwrap_or_else(|| panic!("{ctx}: no ack"));
+                let top = kept
+                    .iter()
+                    .filter(|(_, l)| l.generation == 1)
+                    .map(|(_, l)| l.sequence)
+                    .max();
+                let expected = match &rep.entry {
+                    Some(e) => e.sequence + 1,
+                    None => top.map_or(1, |t| t + 1),
+                };
+                assert_eq!(next, at(1, expected), "{ctx}");
+                assert!(acked.iter().all(|p| p.sequence < next.sequence), "{ctx}");
+                if !crashed {
+                    break;
+                }
+                points += 1;
+            }
+            assert!(
+                points >= 20,
+                "{:?}, {stop:?}: {points} crash points",
+                config.mark_sync
+            );
+        }
+    }
 }
