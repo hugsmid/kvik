@@ -41,7 +41,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-192 | §2.1 `decimal scale`; `docs/export.md` | Decimal values in the export, and the scale in force on `SeriesInfo` |
 | Q-193 | §2.2 fact flags; `docs/export.md` | Fact flags as boolean columns or a bitfield |
 | Q-194 | §2.1 `kind`, §2.2 `quality`; `docs/export.md` | Quality and named states in the export |
-| Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
 | Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
 | Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
 | Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
@@ -66,6 +65,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-760 | §2.2 `changed_at`; `format.md` A.5 | A stored `changed_at` of kind `time` above `i64::MAX` |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -836,10 +836,14 @@ to worst), smaller but needing a key; a named state as its name only, with the i
 **Now.** The export fails with `ChangedAtOutOfRange` (`export/tests/rows.rs`
 `changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by
 `kvik.timing` = `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
-**Needed (owner decision pending).** (a) Recommendation: a rule that a `time` `changed_at` above `i64::MAX` is refused
-at ingest, as every other time in `format.md` is an `i64`; alternatively the column becomes `INT(64, false)` for both
-kinds, with the kind in the metadata. (b) Whether forecast exports rename their columns (`valid_time`,
-`issue_time`). Recommendation: no; the metadata label suffices and the column names stay stable.
+**Settled by the owner, 2026-11-16,** as recommended. (a) A `changed_at` above `i64::MAX` on a series of `changed_at
+kind` `time` is refused at ingest and counted, as every other time in `format.md` is an `i64`: `Refusal::ChangedAtOutOfRange`
+on both backends, checked after `ChangedAtMissing`, `ChangedAtUnexpected` and `ReviseOnVersioned` (`spec.md` §2.2,
+`api.md` Errors; `model/tests/rules.rs` `s2_2_a_time_changed_at_above_i64_max_is_refused`, `kvik/tests/api.rs`
+`a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not`). `i64::MAX` itself is accepted; a `changed_at` of
+kind `version` stays any `u64`. The export keeps `ChangedAtOutOfRange` for rows that reach it otherwise
+(`export_rows`, or a log that holds one, Q-760). (b) Forecast exports keep the column names `t` and `changed_at`; the
+label `kvik.timing` = `forecast` says which is the valid time and which the issue time.
 
 ## Q-196 — Export file layout, compression and store-level metadata
 
@@ -1330,6 +1334,19 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-760 — A stored `changed_at` of kind `time` above `i64::MAX`
+
+**Scenario.** Since Q-195 (a) ingest refuses a `changed_at` above `i64::MAX` on a series of `changed_at kind` `time`.
+A log written before that rule, or by other software, holds a fact row of such a series with `changed_at` = 2^63
+(`format.md` A.5 column 8). Recovery and the readers accept it as stored; the export then fails on that series with
+`ChangedAtOutOfRange`.
+**Now.** A reader accepts any `u64` in column 8 (`format.md` A.5); only ingest checks the range. The facts block
+alone does not know the series' versioning, so a check would sit with the registry, as the Q-182 check of a
+definition's state names does in its own entry.
+**Needed.** Whether such a row is invalid content in the log (recovery treats the batch as damaged), is kept and
+reported, or stays accepted as now. Recommendation: accept it as now, because no store has recorded one under the
+rule and refusing it at recovery would turn a valid older log into a loss.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1384,7 +1401,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-192 | 6.4 | Decimal export; recorded by roadmap 6.4a; owner decision pending; the scale in force on `SeriesInfo` comes with decimal series in the durable backend |
 | Q-193 | 6.4 | Flag columns; recorded by roadmap 6.4a; owner decision pending |
 | Q-194 | 6.4 | Quality and state columns; recorded by roadmap 6.4a; owner decision pending |
-| Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
 | Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
 | Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; the remaining mismatches, Q-213 and Q-214, settled by 8.3b |
@@ -1410,6 +1426,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-760 | 5.6 | Gate; recorded when the owner's ruling on Q-195 (a) was applied |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1642,6 +1659,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-180 | Stored nodes keep sums, integrals and increases exact | `spec.md` §5.6, §6, invariants 6, 7, 21, 22; `format-tree.md` T.3 (settled at the review of roadmap 7.1a: exact, stored as dyadic numbers, folded with a dyadic accumulator; measurements in the question) |
 | Q-181 | Which zero is the minimum of +0.0 and −0.0 | `spec.md` §5.2, §5.6; `format-tree.md` T.5 (settled at the review of roadmap 7.1a: IEEE total order, −0.0 below +0.0) |
 | Q-182 | A state name declared twice | `spec.md` §2.1 `value type`; `format.md` A.6 field 13 (settled at the review of roadmap 7.1a: names are distinct, a definition repeating one is refused) |
+| Q-195 | A `changed_at` of kind `time` beyond the timestamp range; forecast labels | `spec.md` §2.2, `api.md` Errors and Writing, `format.md` A.5, `docs/export.md` (settled by the owner, 2026-11-16: (a) refused at ingest with `Refusal::ChangedAtOutOfRange` on both backends, `i64::MAX` accepted; (b) forecast exports keep their column names, labelled by `kvik.timing`; the stored case is Q-760) |
 | Q-108 | A restore from a rebuilt manifest only partly uploaded | §8 Generations (settled by roadmap 8.3a, as the question suggested: a rebuilt manifest counts for a restore only once it is whole in the bucket, its closing empty record, the one without field 100, uploaded; the restore reads from the last such rebuild record up to the next rebuild record, and with none whole it reads the records before the first rebuild record that opens a rebuilt manifest, which the old manifest uploaded before it; records upload in epoch order, so a whole rebuilt manifest is self-contained). Scenario: a rebuild record and some carried records are in the bucket, the rest not; read from the rebuild record, a restore misses files named only by records not yet carried, and their positions become a gap or a set-aside range although the bucket holds the files and the records naming them. A rule keyed on the rebuild record alone reads that truncated list. What a whole rebuilt manifest restores before its files are verified again is Q-295. The selection is `kvik_backup::plan::records_to_read`, which the restore driver applies before the fold (`backup/tests/restore_plan.rs` `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `q108_records_after_a_whole_rebuilt_manifest_are_read_with_it_and_a_later_partial_one_is_not`) |
 | Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, the general case of the rule). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`); a gap that holds a position of a listed segment with no copy is never bridged, since the entry is then not the next restored position. The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The loss side is guaranteed by the log's start, which goes read-only rather than seal without the record. The listing side rests on the sealed-segment record being appended after the start that recorded the gaps, which is roadmap 6.3b's and not yet built (`format.md` A.14): 6.3b must state it as an invariant with a test (no sealed-segment record has an epoch below a lost-range record of the start that preceded its seal), and roadmap 8.4a needs a kill-loop case with a truncated tail, a seal and a restore. Should it fail, the plan ends the log at the gap and sets later data aside: conservative. The hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing`, `the_restored_end_is_the_one_the_spec_walks_to` |
 | Q-293 | What a restore plan lists, places and fetches | §8 Restore steps 1 and 3, Generations; `format.md` A.14 `0x25` (decided by roadmap 8.3a). Every live file with a recorded copy in deep is listed, set-aside files included, and no other file; the copy counts whether or not a fresh check has marked it verified since a rebuild (Q-295). A listed file's tier is the one the source records give it, which is where the restore places it (step 3). The files fetched are every listed log segment (with no tree checkpoint, step 1 downloads the whole sealed log) and every other listed file placed on hot or cold, in ascending position. The restored log is scanned over log segments only: a compacted file holds only some positions of its range, and log segments are never retired by compaction (§7). When the source generation's sequence 1 is not held, the restored end is that of the restore record read, or `0:0` in generation 0. Positions of an earlier generation at or below a carried end that no copied segment or recorded loss holds fail the plan: `NotCopied` when a listed segment without a copy holds them, else `MissingBelowEnd`. Scenario: a store compacted some segments into a current file in deep and lost no segment; the plan fetches the segments, lists the compacted file and leaves it in deep. Tests: `backup/tests/restore_plan.rs` `a_listed_segment_with_no_copy_ends_the_restored_log_and_is_not_named`, `a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap`, `a_compacted_file_left_in_deep_is_listed_but_not_fetched`, `a_file_missing_at_or_below_a_carried_end_fails_the_plan`, `the_plan_names_every_copied_file_and_never_one_without_a_copy`, `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark` |

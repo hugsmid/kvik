@@ -112,7 +112,7 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
 ```rust
 pub enum Refusal {                 // per reading, in Ack; each counted per series
     UnknownSeries, Retired, WrongType, StateOutOfRange, TextTooLong, ChangedAtMissing, ChangedAtUnexpected,
-    ReviseOnVersioned, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
+    ReviseOnVersioned, ChangedAtOutOfRange, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
 pub enum Wait { QueueFull, DiskFull, UnsyncedClock }                // back-pressure: not a refusal, not a fault
 pub enum EmitError {               // per call
     Busy(Wait),                    // try_emit only: nothing was queued
@@ -216,7 +216,9 @@ store.emit_with(&readings, Intent::Revise).await?;
   which is acknowledged after every batch before it (Q-123 (b)).
 - Individual readings may be refused (`Refusal`, reported per index); a non-finite value is recorded, not refused,
   and so is a decimal value out of range, whose outcome says so (`out_of_range`, spec §2.5).
-  A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`.
+  A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`, and a
+  `changed_at` above `i64::MAX` on a series of `changed_at kind` `time` with `Refusal::ChangedAtOutOfRange` (spec
+  §2.2, Q-195).
 - **Back-pressure** is a wait, with its reason: `try_emit` returns `Busy(Wait)`, including `UnsyncedClock` when the
   call holds a host-stamped reading; `emit` waits, and `stats().ingest.waiting` and health name the reason. There is
   no timeout parameter: a caller that must not wait uses `try_emit`.

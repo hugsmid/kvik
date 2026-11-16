@@ -1532,6 +1532,59 @@ fn versioned_series_and_outranked_facts_on(b: Backend) {
 }
 
 #[test]
+fn a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not() {
+    for b in BACKENDS {
+        a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not_on(b);
+    }
+}
+
+fn a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not_on(b: Backend) {
+    let (s, _clock) = store_on(b, "changed-at-range");
+    let time =
+        block_on(s.define_series(gauge("grid/area/issued", 1).versioned(ChangedAtKind::Time)))
+            .unwrap();
+    let version =
+        block_on(s.define_series(gauge("grid/area/counted", 1).versioned(ChangedAtKind::Version)))
+            .unwrap();
+    let max = i64::MAX as u64;
+    let ack = block_on(s.emit(&[
+        num(time, 0, 1.0).changed_at(max),
+        num(time, 1, 1.0).changed_at(max + 1),
+        num(time, 2, 1.0).changed_at(u64::MAX),
+        num(version, 0, 1.0).changed_at(u64::MAX),
+    ]))
+    .unwrap();
+    assert_eq!(
+        refused(&ack),
+        vec![
+            (1, Refusal::ChangedAtOutOfRange),
+            (2, Refusal::ChangedAtOutOfRange)
+        ],
+        "{b:?}"
+    );
+    assert_eq!(ack.recorded(), 2);
+    assert_eq!(
+        s.series_stats(time).unwrap().refused[&Refusal::ChangedAtOutOfRange],
+        2
+    );
+    let revise =
+        block_on(s.emit_with(&[num(time, 3, 1.0).changed_at(max + 1)], Intent::Revise)).unwrap();
+    assert_eq!(refused(&revise), vec![(0, Refusal::ReviseOnVersioned)]);
+    let r = s.reader();
+    assert_eq!(
+        facts(&r, time, at(0)..at(4), View::History)
+            .iter()
+            .map(|f| f.changed_at)
+            .collect::<Vec<_>>(),
+        vec![Some(max)]
+    );
+    assert_eq!(
+        facts(&r, version, at(0)..at(1), View::Current)[0].changed_at,
+        Some(u64::MAX)
+    );
+}
+
+#[test]
 fn future_facts_are_flagged() {
     for b in BACKENDS {
         future_facts_are_flagged_on(b);

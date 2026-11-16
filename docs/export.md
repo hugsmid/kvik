@@ -101,5 +101,5 @@ fails on: a value that does not match the series' value type, or a state index b
 present with the `no_value` flag, or absent without it (`NoValueMismatch`; facts from either backend never do this,
 so only rows given to `export_rows` can); a decimal stored above the column's scale, or beyond 19 digits after
 rescaling; `changed_at` missing on a versioned series or present on another; a `changed_at` of kind `time` above
-`i64::MAX` (Q-195); an interval end beyond the timestamp range; a fact of another series; a series kind the schema
+`i64::MAX` (ingest refuses one since Q-195, so only rows given to `export_rows` or a log that holds one can, Q-760); an interval end beyond the timestamp range; a fact of another series; a series kind the schema
 does not cover, or a decimal scale above 18 (`UnsupportedSeries`).

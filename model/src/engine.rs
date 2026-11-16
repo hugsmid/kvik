@@ -17,7 +17,8 @@ use crate::recovery::{
 
 mod recovery;
 use crate::registry::{
-    Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
+    ChangedAtKind, Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef,
+    SeriesOptions, Timing,
 };
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{LEVELS, SeriesTree, TreeError};
@@ -688,6 +689,9 @@ pub enum Refusal {
     /// value there is a fact with a higher `changed_at`.
     #[error("revise on a versioned series")]
     ReviseOnVersioned,
+    /// A `changed_at` above `i64::MAX` on a series of `changed_at kind` `time` (§2.2, Q-195).
+    #[error("changed_at of kind time above i64::MAX")]
+    ChangedAtOutOfRange,
     /// A reading of an interval series whose `t` is off its phase (§2.1).
     #[error("t off the interval phase")]
     OffPhase,
@@ -2569,6 +2573,11 @@ impl Model {
             (false, true) => return Err(Refusal::ChangedAtUnexpected.into()),
             (true, true) if revise => return Err(Refusal::ReviseOnVersioned.into()),
             _ => {}
+        }
+        if d.options.versioned == Some(ChangedAtKind::Time)
+            && r.changed_at.is_some_and(|c| i64::try_from(c).is_err())
+        {
+            return Err(Refusal::ChangedAtOutOfRange.into());
         }
         let non_finite = matches!(r.value, Value::Num(x) if !x.is_finite());
         if !non_finite && !r.value.fits(d.value_type) {
