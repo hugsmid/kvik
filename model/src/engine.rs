@@ -1206,6 +1206,10 @@ pub struct Disk {
     /// What a power loss leaves of the active segment's batches past the mark
     /// (written, not covered by the mark). `None` when there are none.
     pub tail_fate: Option<WriteOutcome>,
+    /// No batch written since the page cache was last lost: every batch of
+    /// the log is on stable storage, though [`Disk::mark`] may lag the last
+    /// log sync, so a further power loss or remount drops none.
+    pub cache_lost: bool,
     /// Durable consumer cursors (last confirmed position).
     pub cursors: BTreeMap<ConsumerId, Position>,
     /// Durable latches, one per condition funnel, written with the cursor
@@ -2943,6 +2947,7 @@ impl Model {
     fn append_batch(&mut self, batch: Vec<Entry>) {
         self.ensure_active();
         let id = self.disk.active.expect("active");
+        self.disk.cache_lost = false;
         self.disk
             .files
             .get_mut(&id)

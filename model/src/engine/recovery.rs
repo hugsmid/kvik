@@ -82,7 +82,7 @@ impl Model {
     /// survived; the model writes back in order (an earlier batch missing
     /// before a later one is rule 2, not modelled).
     fn drop_page_cache_keeping(&mut self, keep: usize) {
-        if let Some(active) = self.disk.active {
+        if let Some(active) = self.disk.active.filter(|_| !self.disk.cache_lost) {
             let len = self.disk.files[&active].batches.len();
             let fate = self.disk.tail_fate;
             let floor = match self.disk.mark {
@@ -109,6 +109,7 @@ impl Model {
         }
         self.disk.tail_fate = None;
         self.disk.mark = self.disk.synced_mark;
+        self.disk.cache_lost = true;
     }
 
     /// Forgets the flags of the batches of `file` from index `from` on, which

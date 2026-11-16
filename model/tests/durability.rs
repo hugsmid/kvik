@@ -241,3 +241,25 @@ fn s3_a_seal_syncs_flagged_batches_first() {
     assert!(m.disk.files[&open].sealed);
     assert_eq!(mark(&m), p);
 }
+
+#[test]
+fn s3_a_second_power_loss_before_a_start_drops_no_synced_batch() {
+    let (mut m, fast, slow) = levels_model();
+    let ps = [
+        commit(&mut m, slow, 1),
+        commit(&mut m, fast, 2),
+        commit(&mut m, slow, 3),
+    ];
+    assert!(
+        m.disk.synced_mark.unwrap().last < ps[0],
+        "the mark file lags"
+    );
+    m.power_loss();
+    m.power_loss();
+    m.restart();
+    let live = m.disk.live_entries();
+    assert!(ps.iter().all(|p| live.contains_key(p)));
+    let (_, e) = m.recovery_entries().into_iter().next_back().unwrap();
+    assert_eq!(e.after, ps[2]);
+    assert!(m.losses().iter().all(|l| l.kind != LossKind::DataLost));
+}
