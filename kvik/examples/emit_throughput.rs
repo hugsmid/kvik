@@ -9,7 +9,8 @@
 //! one new timestamp, series taken in turn from the writer's share (a gauge, every twentieth a boolean state;
 //! expected interval 1 s), with `log.min_sync_interval = 0`. Prints one line: calls/s, readings/s, cores used
 //! (process CPU over wall time, from `/proc/self/stat`; `-` elsewhere) and CPU per reading. The store is created in
-//! `emit-throughput-store` under `--dir`, which must not exist yet, and only that is removed afterwards.
+//! `emit-throughput-store` under `--dir`, which must not exist yet; only that is removed afterwards, and `--dir`
+//! too if the run created it.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -96,6 +97,7 @@ fn cpu_seconds() -> Option<f64> {
 
 fn main() {
     let a = args();
+    let made_dir = !a.dir.exists();
     let store_dir = a.dir.join("emit-throughput-store");
     assert!(
         !store_dir.exists(),
@@ -187,4 +189,7 @@ fn main() {
     );
     block_on(store.shutdown()).expect("shutdown");
     let _ = std::fs::remove_dir_all(&store_dir);
+    if made_dir {
+        let _ = std::fs::remove_dir(&a.dir);
+    }
 }

@@ -314,6 +314,10 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   own window clock, `now`, from its open. It has no instant of the writer's last commit, so it measures the live
   staleness of an observed series in event time, `now − t` of the live-state fact (open: Q-140).
 - `reader.health()` reports what the files hold (loss reports), not the writer's counters.
+- Between calls a reader keeps the bytes of the log segment it follows up to the mark, so that a call reads only
+  what is new: at most one segment's bytes (`segment_size`, 64 MiB by default) per reader handle while it follows a
+  segment. They are freed when it moves to another segment; a whole earlier segment read in one call is freed at
+  the end of that call. The store's own delivery reader holds the same.
 
 ## Reading
 ```rust

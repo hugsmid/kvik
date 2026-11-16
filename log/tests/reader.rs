@@ -1404,9 +1404,39 @@ fn a_segment_truncated_below_the_mark_is_read_as_zeros_not_as_the_bytes_kept_fro
 }
 
 #[test]
-fn a_segment_truncated_inside_its_header_is_read_as_zeros_not_as_the_header_kept_from_before() {
+fn a_segment_truncated_inside_its_header_voids_everything_and_reports_corruption() {
     let u = truncated_below_the_mark(|_| 40);
     assert!(matches!(u.events[0], ReadEvent::Void { above, .. } if above.sequence == 0));
+    assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
+    assert!(
+        u.events
+            .iter()
+            .any(|e| matches!(e, ReadEvent::Corruption { .. }))
+    );
+}
+
+/// A file breaking the rule that a file id is never reused: the kept header of the earlier file must not stand in for
+/// its missing one.
+#[test]
+fn an_empty_segment_of_a_new_generation_under_a_read_file_id_is_read_with_a_zeroed_header_not_the_kept_one()
+ {
+    let mut r = Rig::new(cfg());
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    r.kill();
+    r.fs.remove_file(&log_path("00000000-0000000000000001.open"))
+        .unwrap();
+    r.fs.open(
+        &log_path("00000001-0000000000000001.open"),
+        OpenMode::CreateNew,
+    )
+    .unwrap();
+    let mut m = r.mark().unwrap();
+    m.generation = 1;
+    m.counter += 1;
+    r.fs.poke(&log_path("MARK"), 0, &encode_mark_file([Some(m), None]));
+    let u = r.refresh().unwrap();
     assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
     assert!(
         u.events
