@@ -402,7 +402,13 @@ mod tests {
             future_tolerance: 60 * S,
         };
         let mut d = decider();
-        let mut first = d.plan(&[reading(1, T0, 1.0, None)], Intent::Normal, clock, 1);
+        // The state is above the plan: a later time on series 1, a higher version at series 2's key.
+        let first = [
+            reading(1, T0, 1.0, None),
+            reading(1, T0 + 3_000 * S, 1.0, None),
+            reading(2, T0, 1.0, Some(20)),
+        ];
+        let mut first = d.plan(&first, Intent::Normal, clock, 1);
         d.apply(&mut first);
         let readings = [
             reading(1, T0, 2.0, None),
@@ -428,6 +434,8 @@ mod tests {
         assert_eq!(d.versions, noted.versions);
         assert_eq!(d.reference, noted.reference);
         assert_eq!(d.history[&(1, T0)].len(), 3);
-        assert_eq!(d.versions[&(2, T0)], 9);
+        assert_eq!(d.history[&(2, T0)].len(), 4);
+        assert_eq!(d.reference[&1], T0 + 3_000 * S);
+        assert_eq!(d.versions[&(2, T0)], 20);
     }
 }
