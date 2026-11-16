@@ -385,6 +385,17 @@ impl Deliverer {
         &self.view
     }
 
+    /// The last position taken.
+    #[cfg(test)]
+    pub(crate) fn head(&self) -> LogPos {
+        self.head
+    }
+
+    /// Whether any consumer is known: taken in this run, or named by a cursor file or the log.
+    pub(crate) fn has_consumers(&self) -> bool {
+        !self.consumers.is_empty()
+    }
+
     /// Counts of what taking the log met.
     pub(crate) fn delivery_stats(&self) -> DeliveryStats {
         DeliveryStats {

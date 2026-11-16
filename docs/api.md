@@ -387,12 +387,14 @@ pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for e
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
-pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
+pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats,
+    pub delivery: DeliveryStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max },
 //               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */ }
 // LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
 //            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+// DeliveryStats { refresh_errors, corruptions, slow_path }   // durable backend; zero on the model backend
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }
@@ -418,6 +420,12 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   `LossCause::Unknown` is the cause of a loss that a manifest rebuild found again with no cause given by a valid
   record or recovery entry. Losses that a rebuild lists under their first missing position because no valid record
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
+- `Stats.delivery` counts what the store's delivery reader met taking the committed log: failed reads of the log,
+  tried again at the next one (`refresh_errors`), invalid regions below the durable mark it passed over
+  (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). While no consumer
+  is known to the store (none taken in this run, none named by a cursor file or the log), an `emit` returns without
+  reading its batch back; the `kvik-deliver` thread reads it shortly after. These counts may then lag an emit's
+  return, and `refresh_errors` counts the failed reads, not the calls (Q-706).
   `SealBlocked` lasts until the seal succeeds. A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
   `LogStats.sync_interval` is the batch-sync interval in force and `sync_time` the smoothed batch-sync duration it

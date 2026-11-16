@@ -67,7 +67,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-704 | §7 Readers, Leases, Retired files | The writer's own delivery reader skips a refresh at the writer's durable position; that needs a manifest that changes only at a start |
-| Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-750 | §2.4, §3 Recovery rule 2, §8 Corrupt block | The slow path of the duplicate rule meeting damage found during a run |
 | Q-751 | §5.1, §11 | The recent window's span and cap as configuration keys |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1378,7 +1377,7 @@ alone, so that an earlier reading outranked at commit and a later one that becom
 (`kvik/tests/api.rs`, both backends); `the_durable_backend_decides_as_the_model_does`.
 
 ## Q-706 — An emit's read-back of its batch when no consumer is registered
-Recorded by the store-path quick wins. To be settled by roadmap 5.5 (delivery benchmarks).
+Recorded by the store-path quick wins. Settled by the lead.
 **Scenario.** After its acknowledgement every durable `emit` takes the deliverer's lock, reads its batch back
 through the delivery reader (`pump`) and waits for the consumers it woke; before deciding, it takes the same lock to
 run the timers. With no consumer registered none of this has an observer, and leaving it to the `kvik-deliver`
@@ -1399,6 +1398,23 @@ registered? `api.md` gives them no more than their descriptions ("reads of the l
 at the next one"; "invalid regions below the durable mark the delivery reader passed over"). If yes, the skip is a
 small change with a test that a consumer registered after many such calls receives what its start promises; if no,
 the read-back stays on the caller's thread until acknowledged batches are handed to the deliverer in memory.
+**Settled by the lead: yes.** With no consumer registered, `refresh_errors` and `corruptions` may lag an emit's return;
+the `kvik-deliver` thread counts them shortly after, and `refresh_errors` counts reads, not calls (`api.md` Health and
+statistics). `emit` runs no timers, takes no batch and waits for no wake while the hub's consumer flag is lowered
+(`kvik/src/durable/consumers.rs`, `deliver/hub.rs`). The flag starts raised when the start found any consumer (taken
+before, named by a cursor file or the log), is raised by `take_consumer` before the pump that sets a consumer up, and
+is never lowered; an emit that read it lowered therefore had its batch acknowledged before that pump, which takes it
+before the consumer exists. A consumer not taken in this run receives and evaluates nothing, so starting raised for
+known consumers is a precaution.
+**Pinned by.** `with_no_consumer_an_emit_returns_without_taking_its_batch`,
+`with_no_consumer_an_emit_never_waits_for_the_deliverer`,
+`an_emit_returning_after_a_consumer_is_set_up_has_taken_its_batch`,
+`a_batch_acknowledged_while_a_consumer_is_taken_is_before_its_start`,
+`with_a_consumer_an_emit_returns_after_taking_its_batch_and_waking_it` (unit tests in
+`kvik/src/durable/registering.rs`, with pause points);
+`a_consumer_taken_during_emits_receives_every_fact_after_its_route_once_and_in_order`,
+`a_consumer_taken_after_many_emits_without_one_receives_what_its_start_promises`,
+`the_delivery_counters_reach_the_same_counts_with_or_without_a_consumer` (`kvik/tests/emit_without_consumers.rs`).
 
 ## Q-750 — The slow path of the duplicate rule meeting damage found during a run
 Recorded by roadmap 11.0. To be settled by roadmap 6.3b, with the quarantine of §8 Corrupt block.
@@ -1541,7 +1557,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706.
 
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-753.
 
@@ -1612,7 +1628,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-704 | 6.3b | The delivery reader's skipped refresh once the manifest changes during a run; recorded by the store-path quick wins |
-| Q-706 | 5.5 | An emit's read-back with no consumer registered; recorded by the store-path quick wins, not built |
 | Q-750 | 6.3b | The duplicate rule's slow path on damage found during a run: recorded unchecked; recorded by roadmap 11.0 |
 | Q-751 | 5.6 | The recent window as a configuration key; constants decided by the lead with roadmap 11.0, awaiting the owner |
 | Q-752 | 7.1b | A start bounded in memory but not in time until tree checkpoints carry the decision state; recorded by roadmap 11.0 |
@@ -1869,6 +1884,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
 | Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
 | Q-705 | The model backend's `outranked` when a later reading of the same call outranks an earlier one | `kvik/src/backend/mod.rs`, the model's `CommitReport` (settled by the lead, as proposed: the model backend takes `outranked` from the engine's commit-time judgement, as the durable backend and the reference model's engine already decide) |
+| Q-706 | An emit's read-back of its batch when no consumer is registered | `api.md` Health and statistics; `kvik/src/durable/consumers.rs`, `deliver/hub.rs` (settled by the lead: with no consumer registered an emit leaves timers and read-back to the `kvik-deliver` thread, and `refresh_errors` and `corruptions` may lag its return; a flag raised before `take_consumer` pumps keeps what a consumer receives unchanged) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

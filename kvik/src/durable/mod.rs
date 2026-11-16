@@ -21,7 +21,11 @@ mod history;
 mod index;
 mod ingest;
 mod keys;
+#[cfg(test)]
+mod pause;
 pub(crate) mod reader;
+#[cfg(test)]
+mod registering;
 mod registry;
 mod routing;
 mod start;
@@ -922,7 +926,7 @@ impl Writer {
         drop(inflight);
         drop(d);
         #[cfg(test)]
-        tests::after_decision(&self.dir);
+        pause::at(&self.dir, pause::Point::AfterDecision);
         self.count(readings, &plan);
         let decisions = plan.decisions;
         let Some((completion, own)) = tracked else {
@@ -936,6 +940,8 @@ impl Writer {
                     me.note_latency(started.elapsed());
                 }
                 if r.is_ok() {
+                    #[cfg(test)]
+                    pause::at(&me.dir, pause::Point::AfterAck);
                     me.deliver();
                 }
                 match r {
@@ -1344,6 +1350,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use super::pause::{Gate, Point};
     use super::{Emitted, Writer};
     use crate::config::{LogConfig, StoreConfig};
     use crate::env::{Env, ManualClock, MemFs};
@@ -1351,25 +1358,8 @@ mod tests {
     use crate::series::{Kind, SeriesSpec, ValueType};
     use crate::types::{Intent, Reading, Value};
 
-    type Hook = Arc<dyn Fn() + Send + Sync>;
-
-    /// A pause point right after a call's decision, for the store in the given directory.
-    static AFTER_DECISION: Mutex<Option<(PathBuf, Hook)>> = Mutex::new(None);
-
-    pub(super) fn after_decision(dir: &Path) {
-        let hook = AFTER_DECISION
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(d, _)| d == dir)
-            .map(|(_, h)| h.clone());
-        if let Some(h) = hook {
-            h();
-        }
-    }
-
     /// Polls a queued call to its end on this thread.
-    fn wait(mut q: super::Queued) -> Result<crate::types::Ack, EmitError> {
+    pub(super) fn wait(mut q: super::Queued) -> Result<crate::types::Ack, EmitError> {
         let mut cx = Context::from_waker(Waker::noop());
         loop {
             if let Poll::Ready(r) = q.poll(&mut cx) {
@@ -1424,20 +1414,7 @@ mod tests {
                 failing.fail_syncs(true);
             }
         })));
-        // The original's call pauses right after its decision.
-        let (paused_tx, paused) = mpsc::channel::<()>();
-        let (resume, resume_rx) = mpsc::channel::<()>();
-        let resume_rx = Mutex::new(resume_rx);
-        let pause_armed = AtomicBool::new(true);
-        *AFTER_DECISION.lock().unwrap() = Some((
-            dir.clone(),
-            Arc::new(move || {
-                if pause_armed.swap(false, Ordering::SeqCst) {
-                    paused_tx.send(()).unwrap();
-                    resume_rx.lock().unwrap().recv().unwrap();
-                }
-            }),
-        ));
+        let paused = Gate::new(&dir, Point::AfterDecision);
 
         let w2 = w.clone();
         let first = reading.clone();
@@ -1446,16 +1423,14 @@ mod tests {
             Ok(Emitted::Ready(a)) => Ok(a),
             Err(e) => Err(e),
         });
-        paused
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the original paused after its decision");
+        paused.reached();
         // The duplicate, decided now, must wait for the original's call.
         let duplicate = match w.emit(&reading, Intent::Normal, false) {
             Ok(Emitted::Queued(q)) => q,
             Ok(Emitted::Ready(a)) => panic!("acknowledged before the original: {:?}", a.outcomes),
             Err(e) => panic!("{e:?}"),
         };
-        resume.send(()).unwrap();
+        paused.release();
         sync_seen
             .recv_timeout(Duration::from_secs(5))
             .expect("the original's sync started");
@@ -1465,7 +1440,6 @@ mod tests {
             original.join().unwrap(),
             Err(EmitError::OutcomeUnknown(_))
         ));
-        *AFTER_DECISION.lock().unwrap() = None;
         fs.set_sync_hook(None);
     }
 }

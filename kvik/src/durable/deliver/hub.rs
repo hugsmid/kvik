@@ -26,6 +26,9 @@ pub(crate) struct Hub {
     /// A cursor file write or sync failed: the store is read-only (`spec.md` §3 Write or sync failure).
     pub(crate) fault: Mutex<Option<LogFault>>,
     pub(crate) closed: AtomicBool,
+    /// A consumer is known or being taken; never lowered. Until then an `emit` leaves the timers and the read-back of
+    /// its batch to the `kvik-deliver` thread (Q-706).
+    consumers: AtomicBool,
     /// When the timers last ran, on the process's clock: the `kvik-deliver` thread runs them only when no call has
     /// for a second, so calls that run them (emits, polls, `tick`) keep the order the model backend gives; and not
     /// at all when the environment turns background timers off (`Env::background_timers`).
@@ -48,6 +51,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Hub {
     pub(crate) fn new(d: Deliverer, env: Env, dir: &Path, clocks: Arc<Clocks>) -> Arc<Hub> {
         Arc::new(Hub {
+            consumers: AtomicBool::new(d.has_consumers()),
             deliverer: Mutex::new(d),
             watch: Mutex::new(None),
             env,
@@ -99,6 +103,17 @@ impl Hub {
                 .wait_while(w, |w| w.1 < target)
                 .unwrap_or_else(PoisonError::into_inner),
         );
+    }
+
+    /// Raised before a consumer is taken, ahead of the pump that sets it up: every batch acknowledged before an emit
+    /// read the flag lowered is then taken before the consumer exists (Q-706).
+    pub(crate) fn consumer_coming(&self) {
+        self.consumers.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether an emit must take its batch and run the timers itself (Q-706).
+    pub(crate) fn has_consumers(&self) -> bool {
+        self.consumers.load(Ordering::SeqCst)
     }
 
     /// Notes that the timers ran.
@@ -154,6 +169,11 @@ impl Hub {
                     if watch.stopped() || hub.closed.load(Ordering::SeqCst) {
                         break;
                     }
+                    #[cfg(test)]
+                    crate::durable::pause::at(
+                        &hub.dir,
+                        crate::durable::pause::Point::DeliverThread,
+                    );
                     let due = timers && lock(&hub.last_tick).elapsed() >= Duration::from_secs(1);
                     if due {
                         hub.ticked();
