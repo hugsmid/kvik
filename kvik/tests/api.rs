@@ -1542,7 +1542,9 @@ fn the_store_id_is_the_same_through_every_reader_and_after_a_reopen() {
         assert_eq!(other.store_id(), id, "{b:?}");
         drop(other);
         drop(s);
-        let (again, _clock) = store_on(b, name);
+        let mut reopen = config_on(b, name, &clock);
+        reopen.env.entropy = Arc::new(kvik::env::FixedEntropy::new(50));
+        let again = block_on(Store::open(reopen)).unwrap();
         assert_eq!(again.reader().store_id(), id, "{b:?}");
         let mut config = config_on(b, "store-id-other", &clock);
         config.env.entropy = Arc::new(kvik::env::FixedEntropy::new(100));
