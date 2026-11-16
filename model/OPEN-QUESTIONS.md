@@ -1340,7 +1340,7 @@ ways.
 uploaded bytes in `check_done` and in `upload_histories.rs`, `upload_bucket.rs`, `restore.rs`.
 
 ## Q-611 — What a broken chain of uploaded records is, and what a restore does with one
-Recorded and decided by roadmap 8.3g. **Owner** for (f).
+Recorded and decided by roadmap 8.3g. **Owner** for (g).
 **Scenario.** A restore reads a generation's records (Q-108) and each names its predecessor (Q-610). A record the
 bucket has lost, or a listing does not show, makes the record after it name an epoch that is not listed.
 **Decision.** (a) What is checked: the listed records from the first one the restore reads to the last listed, in
@@ -1354,11 +1354,12 @@ reported, the listing lags, `RestoreError::ListingIncomplete` (retried, as in Q-
 before it, or an epoch at or below the record listed before it; no listing can cause that, so `BrokenChain` without
 a `stat`. (e) An epoch listed twice can only be the listing's fault, since a key names one object: the sink's
 `Failed`. A record whose generation or epoch is not its key's is invalid (`RestoreError::Record`), so no chain
-crosses generations. (f) A `stat` that does not answer fails the restore with its error. All before the claim's
-record is written, so a refused full restore uploads nothing (its claim stands, as for every failure after it).
+crosses generations. (f) A `stat` that does not answer fails the restore with its error. All of this comes before
+the restore record is written, so a refused full restore uploads no record (its claim stands, as for every failure
+after the claim).
 `Store::restore` reports `BrokenChain` as the additive `BackupError::BrokenChain { generation, epoch }`
 (`api.md`); the mapping is roadmap 8.3d's.
-**Owner.** (f) Before this item a restore read whatever the listing showed: from a bucket that had lost a record it
+**Owner.** (g) Before this item a restore read whatever the listing showed: from a bucket that had lost a record it
 restored fewer files or an earlier end, and a full restore then claimed a generation that every later restore
 reads, so what the lost record named was lost for good with nothing reported. Now it refuses, and the store cannot
 be restored from that generation until an operator acts. A healthy bucket cannot give this refusal (the engine
