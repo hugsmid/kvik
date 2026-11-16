@@ -182,7 +182,10 @@ fn damage_next_to_a_found_loss_extends_it_and_needs_a_new_acknowledgement() {
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     let mut three = Position::ORIGIN;
     for (i, t) in ["EXT-ONE", "EXT-TWO", "EXT-THREE"].iter().enumerate() {
-        three = block_on(s.emit(&[note(id, i as i64, t)])).unwrap().first().unwrap();
+        three = block_on(s.emit(&[note(id, i as i64, t)]))
+            .unwrap()
+            .first()
+            .unwrap();
     }
     damage(&w, b"EXT-THREE");
     let r = w.reader();
@@ -192,7 +195,10 @@ fn damage_next_to_a_found_loss_extends_it_and_needs_a_new_acknowledgement() {
     block_on(s.acknowledge_losses(&[three])).unwrap();
     assert!(matches!(s.health(), Health::Ok));
 
-    let four = block_on(s.emit(&[note(id, 3, "EXT-FOUR")])).unwrap().first().unwrap();
+    let four = block_on(s.emit(&[note(id, 3, "EXT-FOUR")]))
+        .unwrap()
+        .first()
+        .unwrap();
     damage(&w, b"EXT-FOUR");
     // One loss under its first identity, grown to hold FOUR: no longer acknowledged (spec §8 Acknowledging a loss).
     let grown = vec![(three, Some(three), Some(four), false)];
@@ -224,7 +230,12 @@ fn damage_to_a_batch_read_after_a_found_loss_extends_it_in_every_process() {
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     let mut at = Vec::new();
     for (i, t) in ["VOID-ONE", "VOID-TWO", "VOID-THREE"].iter().enumerate() {
-        at.push(block_on(s.emit(&[note(id, i as i64, t)])).unwrap().first().unwrap());
+        at.push(
+            block_on(s.emit(&[note(id, i as i64, t)]))
+                .unwrap()
+                .first()
+                .unwrap(),
+        );
     }
     let (two, three) = (at[1], at[2]);
     damage(&w, b"VOID-TWO");

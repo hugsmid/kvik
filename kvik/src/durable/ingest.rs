@@ -418,3 +418,132 @@ impl Decider {
         plan
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kvik_log::entries::Entry;
+
+    use super::*;
+    use crate::durable::registry::definition_of;
+    use crate::series::{ChangedAtKind, Kind, SeriesSpec, ValueType};
+    use crate::time::Timestamp;
+    use crate::types::SeriesId;
+
+    const SEC: i64 = 1_000_000_000;
+    const WALL: i64 = 1_000_000 * SEC;
+
+    fn decider(spec: SeriesSpec) -> Decider {
+        let mut d = Decider::default();
+        let def = definition_of(&spec, 1, Duration::from_secs(3600)).unwrap();
+        d.registry.apply(&Entry::Definition(Box::new(def)));
+        d
+    }
+
+    /// An observed gauge with S = 10 s, so `late` by the reference is more than 20 s behind it.
+    fn observed() -> Decider {
+        decider(
+            SeriesSpec::new(
+                "a/b/power",
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+            .staleness(Duration::from_secs(10)),
+        )
+    }
+
+    fn reading(t: i64, v: f64) -> Reading {
+        Reading::new(SeriesId(1), Timestamp(t), Value::F64(v))
+    }
+
+    fn pos(sequence: u64) -> LogPos {
+        LogPos {
+            generation: 0,
+            sequence,
+        }
+    }
+
+    fn plan(d: &Decider, r: Reading, call: u64, synced: bool) -> Plan {
+        let clock = Clock {
+            wall: WALL,
+            synced,
+            future_tolerance: 60 * SEC,
+        };
+        d.plan(&[r], Intent::Normal, clock, call)
+    }
+
+    /// Plans, queues and acknowledges a call of one reading at position `at`.
+    fn record(d: &mut Decider, r: Reading, call: u64, at: u64, synced: bool) {
+        let p = plan(d, r, call, synced);
+        assert!(matches!(p.decisions[0], Decision::Record { .. }));
+        d.apply(&p);
+        d.placed(call, pos(at), pos(at));
+    }
+
+    fn late(p: &Plan) -> bool {
+        match &p.items[..] {
+            [Item::Fact(f)] => f.flags.late,
+            other => panic!("one fact expected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reading_only_a_lost_version_outranked_is_not_outranked() {
+        let mut d = decider(
+            SeriesSpec::new(
+                "a/b/price",
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "p",
+            )
+            .versioned(ChangedAtKind::Version),
+        );
+        let t = WALL - 10 * SEC;
+        record(&mut d, reading(t, 1.0).changed_at(1), 1, 1, true);
+        record(&mut d, reading(t, 2.0).changed_at(2), 2, 2, true);
+        d.lose(pos(2), pos(2));
+        let p = plan(&d, reading(t, 3.0).changed_at(1), 3, true);
+        assert_eq!(
+            p.decisions,
+            vec![Decision::Record {
+                item: 0,
+                outranked: false,
+                absent: false
+            }]
+        );
+    }
+
+    #[test]
+    fn a_lost_latest_fact_no_longer_holds_the_lateness_reference() {
+        let mut d = observed();
+        record(&mut d, reading(WALL - 100 * SEC, 1.0), 1, 1, true);
+        record(&mut d, reading(WALL, 2.0), 2, 2, true);
+        assert!(late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
+        d.lose(pos(2), pos(2));
+        assert!(!late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
+        assert!(late(&plan(&d, reading(WALL - 130 * SEC, 3.0), 3, true)));
+    }
+
+    #[test]
+    fn a_call_acknowledged_inside_a_range_already_lost_leaves_the_history() {
+        let mut d = observed();
+        let p = plan(&d, reading(WALL - 5 * SEC, 1.0), 1, true);
+        d.apply(&p);
+        d.lose(pos(4), pos(6));
+        d.placed(1, pos(5), pos(5));
+        let replay = plan(&d, reading(WALL - 5 * SEC, 1.0), 2, true);
+        assert!(matches!(replay.decisions[0], Decision::Record { .. }));
+    }
+
+    #[test]
+    fn a_fact_taken_while_the_clock_is_unsynchronised_leaves_the_lateness_reference_alone() {
+        let mut d = observed();
+        record(&mut d, reading(WALL - 100 * SEC, 1.0), 1, 1, true);
+        record(&mut d, reading(WALL, 2.0), 2, 2, false);
+        assert!(!late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
+    }
+}
