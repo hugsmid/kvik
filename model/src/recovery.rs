@@ -258,6 +258,8 @@ pub struct LostRecord {
     pub cause: LossCause,
     /// When the record was written.
     pub at: i64,
+    /// The record's epoch.
+    pub epoch: u64,
 }
 
 /// An acknowledgement or closing record's entry (§8 Acknowledging a loss,
@@ -287,7 +289,7 @@ pub fn losses(
     recorded: &[LostRecord],
     found: &[(Position, Position)],
     recoveries: &[(Position, RecoveryEntry)],
-    acknowledged: &[Acknowledged],
+    acknowledged: &[(u64, Acknowledged)],
     stage: impl Fn(&Loss) -> LossState,
 ) -> Vec<Loss> {
     let mut out: Vec<Loss> = Vec::new();
@@ -326,7 +328,7 @@ pub fn losses(
     }
     for l in &mut out {
         // The latest closing record that covers the present range.
-        let closed = acknowledged.iter().rev().find(|a| {
+        let closed = acknowledged.iter().rev().map(|(_, a)| a).find(|a| {
             a.identity == l.identity
                 && l.first.is_some_and(|f| a.from <= f)
                 && l.last.is_some_and(|t| t <= a.to)
@@ -581,6 +583,7 @@ mod tests {
             to: p(6),
             cause: LossCause::TruncatedTail,
             at: 0,
+            epoch: 1,
         };
         let l = losses(&[gap], &[], &[(p(7), e.clone())], &[], |_| LossState::Found);
         assert_eq!(l.len(), 1);

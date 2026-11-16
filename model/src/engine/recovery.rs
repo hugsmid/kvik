@@ -391,9 +391,11 @@ impl Model {
     /// engine could not write. A range that overlaps a recorded loss names its
     /// identity (§3 Order of a start, step 4).
     fn record_lost_ranges(&mut self) {
-        let quarantined: Vec<FileId> = self.disk.quarantined.iter().copied().collect();
-        for f in quarantined {
-            self.record_quarantine(f, QuarantineCause::Damaged);
+        let unrecorded = std::mem::take(&mut self.disk.unrecorded);
+        for f in unrecorded {
+            if self.disk.quarantined.contains(&f) {
+                self.record_quarantine(f, QuarantineCause::Damaged);
+            }
         }
         let at = self.wall;
         let stamp = self.stamp_in_force();

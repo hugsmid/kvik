@@ -756,7 +756,8 @@ fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     assert!(h.reasons.contains(&Reason::DataLost(p, p)));
     assert!(
         m.attention()
-            .contains(&Alert::Corruption(Corruption::File(f)))
+            .iter()
+            .any(|a| matches!(a, Alert::Corruption(Corruption::File(g, Some(_))) if *g == f))
     );
     // Its positions are not issued again, also after a restart.
     m.restart();

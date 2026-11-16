@@ -399,7 +399,8 @@ pub fn repairs(&self) -> impl Stream<Item = ResendRequest>;  // Store only; ever
 pub async fn repair_done(&self, identity: Position) -> Result<(), WriteError>;
 pub enum Alert { Corruption(CorruptionReport), StorageSuspect { corruptions: u32, within: Span },
     Fault(Fault), BackupFailed { since: Timestamp } }
-pub enum CorruptionId { File { kind: u8, file_id: u64 }, Range(Position), ManifestRecord { epoch: u64 } }
+pub enum CorruptionId { File { kind: u8, file_id: u64, epoch: Option<u64> /* its quarantine record; None until
+    written */ }, Range(Position), ManifestRecord { epoch: u64 } }   // one per finding (`format.md` A.14)
 pub struct CorruptionReport { pub id: CorruptionId, pub found_at: Timestamp, pub loss: Option<Position>,
     pub repaired: bool }
 pub fn attention(&self) -> Vec<Alert>;                      // Store and Reader; empty: nobody needs to look

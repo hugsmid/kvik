@@ -561,11 +561,15 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   unsupported. Appended when a file is found damaged or judged lost, before a copy is fetched; it names a
   corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. Decoded strictly
   from roadmap 8.5b; until then it is read as a reserved type.
-- Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 16 bytes): 0 kind `u8` (1 a file, by its
+- Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 24 bytes): 0 kind `u8` (1 a file, by its
   quarantine record; 2 a lost range, by its loss's identity; 3 a manifest record); 1 reserved (3 bytes); 4 for a
-  file, its kind `u8`, 3 reserved and `file_id` `u64`, as an input entry of a file description; for a lost range, the
-  identity (position); for a manifest record, its epoch `u64` then 4 reserved bytes. Naming a corruption seen twice
-  changes nothing.
+  file, its kind `u8`, 3 reserved and `file_id` `u64` (12 bytes, as an input entry of a file description), then the
+  epoch `u64` of the quarantine record that names this finding of it (matched against field 100 where a record has
+  it) or, for a file under `quarantine/` that no valid record names after a rebuild, of that rebuild record (Q-244);
+  for a lost range, the identity (a position, 12 bytes) then 8 reserved bytes; for a manifest record, its epoch `u64`
+  then 12 reserved bytes. Each finding of a file is a corruption of its own: a file found damaged or judged lost
+  again, after its copy was swapped in or its object answered again, has a new quarantine record and is a new
+  corruption, so seeing an earlier finding does not see it. Naming a corruption seen twice changes nothing.
 - Copy verified (`0x27`, Q-281): 1 the file, a file description (below), so the record repeats the file's kind,
   position range and plaintext hash as every record naming a file does, and a record describing a file otherwise than
   an earlier record is refused; 2 the tier

@@ -1204,6 +1204,14 @@ pub struct Disk {
     pub corrupt: BTreeSet<FileId>,
     /// Quarantined hot copies.
     pub quarantined: BTreeSet<FileId>,
+    /// Quarantined files that no quarantine record names yet: found while
+    /// the engine could not write, recorded by the next start that can (§8
+    /// Self-repair, Attention).
+    pub unrecorded: BTreeSet<FileId>,
+    /// Objects judged lost by the scheduled check whose loss no copy has
+    /// restored since (a `0x26` reason 4 with no later `0x27`, `format.md`
+    /// A.14): looked up no more (§8 Self-repair, Lost in the bucket).
+    pub judged_lost: BTreeSet<FileId>,
     /// Batches of the open segment whose bytes were damaged (fault
     /// injection), each with the first and last position it held; the next
     /// recovery finds them (§3 Recovery rule 2).
@@ -1435,18 +1443,22 @@ impl Disk {
                     to,
                     cause,
                     at: r.at,
+                    epoch: r.epoch,
                 }),
                 _ => None,
             })
             .collect()
     }
 
-    /// Every acknowledgement the manifest holds (§8 Acknowledging a loss).
-    pub fn acknowledged(&self) -> Vec<Acknowledged> {
+    /// Every acknowledgement the manifest holds (§8 Acknowledging a loss),
+    /// each with the epoch of its record.
+    pub fn acknowledged(&self) -> Vec<(u64, Acknowledged)> {
         self.manifest
             .iter()
             .flat_map(|r| match &r.op {
-                ManifestOp::Acknowledge { losses, .. } => losses.clone(),
+                ManifestOp::Acknowledge { losses, .. } => {
+                    losses.iter().map(|a| (r.epoch, *a)).collect()
+                }
                 _ => Vec::new(),
             })
             .collect()
@@ -1485,7 +1497,7 @@ impl Disk {
                 .map(|a| a.to)
                 .chain(seen.iter().filter_map(|c| match c {
                     Corruption::Range(p) => Some(*p),
-                    Corruption::File(_) => None,
+                    Corruption::File(..) => None,
                 }))
                 .collect(),
             ManifestOp::Quarantine { .. } => Vec::new(),
@@ -1675,6 +1687,7 @@ impl Disk {
         let restored: Vec<Acknowledged> = self
             .acknowledged()
             .into_iter()
+            .map(|(_, a)| a)
             .filter(|a| matches!(a.outcome, Outcome::Restored(_)))
             .collect();
         self.lost_records()
@@ -5138,10 +5151,13 @@ impl Model {
         let writable = self.vol.as_ref().is_some_and(|v| !v.read_only);
         for f in &bad {
             self.disk.quarantined.insert(*f);
-            // A corruption, named by its record (§8 Self-repair); a start
-            // writes it for a file quarantined while the store could not.
+            // Each finding is a corruption of its own, named by its record
+            // (§8 Self-repair, Attention); a start writes it for a file
+            // quarantined while the store could not.
             if writable {
                 self.record_quarantine(*f, QuarantineCause::Damaged);
+            } else {
+                self.disk.unrecorded.insert(*f);
             }
         }
         // §8 Corrupt block: a sealed log segment with no other copy loses

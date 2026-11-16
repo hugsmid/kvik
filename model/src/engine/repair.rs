@@ -51,9 +51,10 @@ pub enum QuarantineCause {
 /// A corruption (§8 Self-repair, Attention; `format.md` A.14 corruption seen).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Corruption {
-    /// A file, named by its quarantine record or its place under
-    /// `quarantine/`.
-    File(FileId),
+    /// One finding of a file damaged or lost: the file and the epoch of the
+    /// quarantine record naming it, `None` while no record does. A second
+    /// finding of the same file is a corruption of its own.
+    File(FileId, Option<u64>),
     /// A region a start found, named by its loss's identity.
     Range(Position),
 }
@@ -239,8 +240,9 @@ impl Model {
     }
 
     /// Closes as restored in full every recorded, open `data_lost` whose
-    /// range the file `f` now holds again (§8 Self-repair stage 1).
-    pub(super) fn close_restored(&mut self, f: FileId) {
+    /// range the file `f` now holds again (§8 Self-repair stage 1). Returns
+    /// how many were closed.
+    pub(super) fn close_restored(&mut self, f: FileId) -> usize {
         let held: BTreeSet<Position> = self.disk.files[&f].entries().map(|e| e.position).collect();
         let restored: Vec<(Loss, u64)> = self
             .losses()
@@ -253,9 +255,10 @@ impl Model {
                 whole.then_some((l, n))
             })
             .collect();
-        for (l, n) in restored {
-            self.close(&l, Outcome::Restored(n));
+        for (l, n) in &restored {
+            self.close(l, Outcome::Restored(*n));
         }
+        restored.len()
     }
 
     /// Whether the file `f` holds a position of a closed loss that was not
@@ -306,11 +309,8 @@ impl Model {
         held
     }
 
-    /// Appends a quarantine record for `f` unless one names it.
+    /// Appends a quarantine record for one finding of `f`.
     pub(super) fn record_quarantine(&mut self, f: FileId, cause: QuarantineCause) {
-        if self.quarantine_records().iter().any(|(g, _)| *g == f) {
-            return;
-        }
         let epoch = self.disk.epoch();
         self.disk.manifest.push(ManifestRecord {
             epoch,
@@ -319,23 +319,13 @@ impl Model {
         });
     }
 
-    fn quarantine_records(&self) -> Vec<(FileId, Nanos)> {
+    /// Every quarantine record: the file, the record's epoch and time.
+    fn quarantine_records(&self) -> Vec<(FileId, u64, Nanos)> {
         self.disk
             .manifest
             .iter()
             .filter_map(|r| match r.op {
-                ManifestOp::Quarantine { file, .. } => Some((file, r.at)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn quarantine_records_of(&self, cause: QuarantineCause) -> Vec<FileId> {
-        self.disk
-            .manifest
-            .iter()
-            .filter_map(|r| match r.op {
-                ManifestOp::Quarantine { file, cause: c } if c == cause => Some(file),
+                ManifestOp::Quarantine { file, .. } => Some((file, r.epoch, r.at)),
                 _ => None,
             })
             .collect()
@@ -352,57 +342,74 @@ impl Model {
             .collect()
     }
 
-    /// Every corruption (§8 Self-repair, Attention): each file a quarantine
-    /// record names or that lies under `quarantine/`, and each region of a
-    /// `data_lost` by corruption that no such file holds. A truncated tail
-    /// and a `possible_loss` are not corruptions.
+    /// Every corruption (§8 Self-repair, Attention): each quarantine record,
+    /// each quarantined file no record names yet, and each region of a
+    /// `data_lost` by corruption that no such finding caused. A loss is
+    /// linked to the finding of a file holding its range recorded last before
+    /// each of its lost-range records. A truncated tail and a
+    /// `possible_loss` are not corruptions.
     pub fn corruptions(&self) -> Vec<CorruptionReport> {
         let seen = self.seen();
-        let mut files: Vec<(FileId, Option<Nanos>)> = self
+        let unrecorded = self
+            .disk
+            .unrecorded
+            .iter()
+            .filter(|f| self.disk.quarantined.contains(f))
+            .map(|f| (Corruption::File(*f, None), None));
+        let mut out: Vec<CorruptionReport> = self
             .quarantine_records()
             .into_iter()
-            .map(|(f, at)| (f, Some(at)))
-            .collect();
-        for f in &self.disk.quarantined {
-            if !files.iter().any(|(g, _)| g == f) {
-                files.push((*f, None));
-            }
-        }
-        let mut out: Vec<CorruptionReport> = files
-            .iter()
-            .map(|(f, at)| CorruptionReport {
-                id: Corruption::File(*f),
+            .map(|(f, epoch, at)| (Corruption::File(f, Some(epoch)), Some(at)))
+            .chain(unrecorded)
+            .map(|(id, at)| CorruptionReport {
+                id,
                 loss: None,
-                seen: seen.contains(&Corruption::File(*f)),
-                at: *at,
+                seen: seen.contains(&id),
+                at,
             })
             .collect();
+        let holds = |f: FileId, p: Position| self.disk.files[&f].entries().any(|e| e.position == p);
         let records = self.disk.lost_records();
         for l in self.losses().into_iter().filter(|l| {
             l.kind == LossKind::DataLost
                 && matches!(l.cause, LossCause::Corruption | LossCause::LostInBucket)
         }) {
-            let file = l.first.and_then(|first| {
-                files
-                    .iter()
-                    .map(|(f, _)| *f)
-                    .find(|f| self.disk.files[f].entries().any(|e| e.position == first))
-            });
-            match file {
-                Some(f) => {
-                    if let Some(c) = out.iter_mut().find(|c| c.id == Corruption::File(f)) {
-                        c.loss = Some(l.identity);
-                    }
-                }
-                None => out.push(CorruptionReport {
-                    id: Corruption::Range(l.identity),
+            let mut causes: Vec<Corruption> = records
+                .iter()
+                .filter(|r| r.identity == l.identity)
+                .filter_map(|r| {
+                    out.iter()
+                        .filter_map(|c| match c.id {
+                            Corruption::File(f, Some(e)) if e < r.epoch && holds(f, r.from) => {
+                                Some((e, c.id))
+                            }
+                            _ => None,
+                        })
+                        .max()
+                        .map(|(_, id)| id)
+                })
+                .collect();
+            if let Some(first) = l.first.filter(|_| causes.is_empty()) {
+                causes.extend(
+                    out.iter()
+                        .map(|c| c.id)
+                        .filter(|id| matches!(id, Corruption::File(f, None) if holds(*f, first))),
+                );
+            }
+            if causes.is_empty() {
+                let id = Corruption::Range(l.identity);
+                out.push(CorruptionReport {
+                    id,
                     loss: Some(l.identity),
-                    seen: seen.contains(&Corruption::Range(l.identity)),
+                    seen: seen.contains(&id),
                     at: records
                         .iter()
                         .find(|r| r.identity == l.identity)
                         .map(|r| r.at),
-                }),
+                });
+            }
+            for c in out.iter_mut().filter(|c| causes.contains(&c.id)) {
+                c.loss = Some(l.identity);
             }
         }
         out.sort_by_key(|c| c.id);
@@ -511,14 +518,19 @@ impl Model {
             return Ok(Vec::new());
         }
         // An object judged lost that answers again restores its open loss in
-        // full (stage 1); a closed one stays closed (Q-246).
+        // full (stage 1) and is looked up again from then on; one whose loss
+        // is closed stays closed and judged (Q-246, Q-600).
         let back: Vec<FileId> = self
-            .quarantine_records_of(QuarantineCause::LostInBucket)
-            .into_iter()
+            .disk
+            .judged_lost
+            .iter()
+            .copied()
             .filter(|f| self.disk.in_bucket(*f))
             .collect();
         for f in back {
-            self.close_restored(f);
+            if self.close_restored(f) > 0 {
+                self.disk.judged_lost.remove(&f);
+            }
         }
         let wall = self.wall;
         let missing: Vec<FileId> = self
@@ -527,7 +539,9 @@ impl Model {
             .missing
             .iter()
             .copied()
-            .filter(|f| self.disk.bucket.objects.contains_key(f))
+            .filter(|f| {
+                self.disk.bucket.objects.contains_key(f) && !self.disk.judged_lost.contains(f)
+            })
             .collect();
         let cfg = self.config.repair;
         let mut judged = Vec::new();
@@ -550,6 +564,7 @@ impl Model {
                 self.disk.bucket.missing.remove(&f);
                 continue;
             }
+            self.disk.judged_lost.insert(f);
             let held = self.held_without(f, false);
             let lost: Vec<Position> = self.disk.files[&f]
                 .entries()
