@@ -279,6 +279,7 @@ pub(crate) fn definition(spec: &SeriesSpec) -> Result<ModelDefinition, Error> {
         counter,
         lateness_bound: opt(spec.lateness_bound)?,
         interval,
+        durability: km::registry::Durability::Synced,
     };
     Ok(ModelDefinition {
         kind,

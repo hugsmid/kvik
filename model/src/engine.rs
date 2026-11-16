@@ -17,7 +17,8 @@ use crate::recovery::{
 
 mod recovery;
 use crate::registry::{
-    Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
+    Durability, Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions,
+    Timing,
 };
 use crate::summary::{Aggregate, Node, Params};
 use crate::tree::{LEVELS, SeriesTree, TreeError};
@@ -1185,6 +1186,9 @@ pub struct Disk {
     /// injection), each with the first and last position it held; the next
     /// recovery finds them (§3 Recovery rule 2).
     pub damaged: BTreeMap<(FileId, usize), (Position, Position)>,
+    /// Batches of the log flagged in their commit block: acknowledged once
+    /// written (§3 Batches, `format.md` A.7).
+    pub flagged: BTreeSet<(FileId, usize)>,
     /// Lost ranges of sealed segments found while the engine could not write
     /// (read-only or stopped): reported as found, recorded by the next
     /// recovery that can write (Q-79).
@@ -2805,6 +2809,15 @@ impl Model {
             });
         }
         v.next_position = next;
+        // §3 Batches: flagged only when every reading is at the `written`
+        // level; a mixed batch takes the default level.
+        let flagged = batch.iter().all(|e| {
+            e.fact().is_some_and(|f| {
+                v.registry
+                    .get(f.series)
+                    .is_some_and(|d| d.options.durability == Durability::Written)
+            })
+        });
         self.counters.duplicates_dropped += duplicates as u64;
         self.counters.non_finite += non_finite;
         self.counters.negative_counter += negative;
@@ -2822,6 +2835,11 @@ impl Model {
         }
         // Write: the batch is in the active segment, past the durable mark.
         self.append_batch(batch.clone());
+        if flagged {
+            let id = self.disk.active.expect("active");
+            let b = self.disk.files[&id].batches.len() - 1;
+            self.disk.flagged.insert((id, b));
+        }
         match fault {
             Some(Fault::Crash(CrashPoint::AfterWrite(outcome))) => {
                 self.disk.tail_fate = Some(outcome);
@@ -2849,8 +2867,11 @@ impl Model {
             self.crash();
             return Err(Error::Crashed);
         }
-        // Durable mark; only now may anything see the batch.
-        self.sync_mark();
+        // Durable mark; only now may anything see the batch, except a flagged
+        // batch, which is seen once written and synced later (§3 Commit).
+        if !flagged {
+            self.sync_mark();
+        }
         if fault == Some(Fault::Crash(CrashPoint::AfterSync)) {
             self.crash();
             return Err(Error::Crashed);
@@ -2948,9 +2969,13 @@ impl Model {
             return;
         }
         if self.disk.tail_len() > 0 {
-            // Batches past the durable mark (failed sync): the segment is not
-            // sealed until a restart has decided what reached the disk.
-            return;
+            // Batches past the durable mark after a failed sync: the segment
+            // is not sealed until a restart has decided what reached the
+            // disk. Flagged batches are synced first (§3 Commit).
+            if self.disk.tail_fate.is_some() {
+                return;
+            }
+            self.sync_mark();
         }
         if let Some(id) = self.disk.active.take() {
             let wall = self.wall;
@@ -3877,6 +3902,14 @@ impl Model {
     }
 
     fn confirm_prefix(&mut self, i: usize, n: usize, p: Position) {
+        self.sync_log_through(p);
+        // A flagged position not yet synced while read-only: the cursor and
+        // latch writes naming it wait, here for ever (§3 Durable mark,
+        // invariant 26).
+        let p = match self.disk.mark {
+            Some(m) if self.disk.tail_len() > 0 && m.last < p => m.last,
+            _ => p,
+        };
         let v = self.vol.as_mut().expect("up");
         let c = &mut v.consumers[i];
         let id = c.decl.id;
@@ -3909,7 +3942,7 @@ impl Model {
             }
         };
         let mut gc_confirmed = false;
-        for d in &done {
+        for d in done.iter().filter(|d| d.position <= p) {
             match &d.kind {
                 DeliveryKind::Trigger(t) => latch(t.funnel, t.incarnation, &t.state, d.position),
                 DeliveryKind::Resync(r) => {
@@ -5157,6 +5190,7 @@ impl Model {
         };
         // A derived file names no position above the last synced mark (§3
         // Durable mark, invariant 26).
+        self.sync_log_through(position);
         self.disk.cover(position);
         self.disk.checkpoints.push(cp);
         Ok(position)

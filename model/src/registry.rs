@@ -52,6 +52,16 @@ impl RetentionClass {
     }
 }
 
+/// When a reading is acknowledged and delivered (§2.1 `durability`, §3 Commit).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Durability {
+    /// After the sync that covers it.
+    #[default]
+    Synced,
+    /// Once its batch is written, before the sync: a flagged batch.
+    Written,
+}
+
 /// Definition fields beyond kind, type, unit and staleness limit (§2.1).
 /// The model fixes them for the life of a series: it has no parameter
 /// entries with an effective time (see `OPEN-QUESTIONS.md`, Q-60).
@@ -79,6 +89,9 @@ pub struct SeriesOptions {
     /// serves only the first clause of `late` (§2.2), as an interval reading
     /// is valid for its interval and holds nothing (§5.2, §5.4).
     pub interval: Option<IntervalSpec>,
+    /// Durability level (§2.1); a parameter change in the specification,
+    /// fixed for life here like every option (Q-60).
+    pub durability: Durability,
 }
 
 impl SeriesOptions {
@@ -102,6 +115,14 @@ impl SeriesOptions {
     pub fn interval(length: Nanos, phase: Nanos) -> Self {
         SeriesOptions {
             interval: Some(IntervalSpec { length, phase }),
+            ..SeriesOptions::default()
+        }
+    }
+
+    /// A series at the given durability level.
+    pub fn durability(durability: Durability) -> Self {
+        SeriesOptions {
+            durability,
             ..SeriesOptions::default()
         }
     }

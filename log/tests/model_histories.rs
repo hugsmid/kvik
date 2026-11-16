@@ -951,6 +951,7 @@ impl World {
             },
             lateness_bound: Some(e * (1 + i64::from(s.lateness))),
             interval,
+            durability: kvik_model::registry::Durability::Synced,
         };
         self.names += 1;
         let name = format!("line/s{}", self.names);

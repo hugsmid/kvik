@@ -125,6 +125,7 @@ fn model_event() -> impl Strategy<Value = RegistryEvent> {
                 counter: CounterRules::default(),
                 lateness_bound: Some(interval / 2),
                 interval: None,
+                durability: kvik_model::registry::Durability::Synced,
             };
             if kind == Kind::Counter {
                 options.counter = CounterRules {
