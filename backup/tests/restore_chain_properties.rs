@@ -1,6 +1,7 @@
 //! Property tests of the chain of uploaded records at a restore (Q-611): chains built as the upload driver writes
 //! them, with skipped epochs and rebuilt manifests, restore; one random break among the records a restore checks
-//! refuses it, or makes it retry where the bucket still holds the record.
+//! refuses it, or makes it retry where the bucket still holds the record; a break before a whole rebuilt manifest
+//! refuses nothing.
 
 mod support;
 
@@ -21,8 +22,8 @@ use support::*;
 struct Chain(Vec<(u64, Record)>);
 
 /// Old records with skipped epochs, the second and third naming the two segments; then, if drawn, a rebuilt manifest
-/// carrying them, whole or not, and records after it.
-fn chain(src: &Source) -> impl Strategy<Value = Chain> + use<> {
+/// carrying them, whole or not (always whole with `whole_only`), and records after it.
+fn chain(src: &Source, whole_only: bool) -> impl Strategy<Value = Chain> + use<> {
     let bodies = [
         Body::Sealed(vec![src.segments[0].0.clone()]),
         Body::Sealed(vec![src.segments[1].0.clone()]),
@@ -32,6 +33,11 @@ fn chain(src: &Source) -> impl Strategy<Value = Chain> + use<> {
         prop::option::of((any::<bool>(), 1u64..4, 0usize..3)),
     )
         .prop_map(move |(steps, rebuild)| {
+            let rebuild = match rebuild {
+                _ if !whole_only => rebuild,
+                Some((_, step, after)) => Some((true, step, after)),
+                None => Some((true, 1, 0)),
+            };
             let mut epoch = 0;
             let mut next = |step: u64| {
                 epoch += step;
@@ -120,35 +126,49 @@ fn prepare(
     block_on(restorer(sink.clone(), &fs, mode(drill), KEY).prepare(100))
 }
 
-/// The records a break may hit and the restore must see: from the first record read, not the last for a lost or
-/// hidden one, and not one whose successor opens a rebuilt manifest and so names none (Q-610); for a renamed one,
-/// any but the first and those that open a rebuilt manifest, whose predecessor is fixed.
-fn targets(c: &Chain, b: Break) -> Vec<usize> {
+/// The index of the first record a restore reads.
+fn start(c: &Chain) -> usize {
     let records: Vec<Record> = c.0.iter().map(|(_, r)| r.clone()).collect();
     let read = records_to_read(&records);
-    let start = records
+    records
         .iter()
         .position(|r| Some(r.epoch) == read.first().map(|f| f.epoch))
-        .unwrap();
-    let n = records.len();
+        .unwrap()
+}
+
+/// The records a break may hit and the restore must see, from the first record read. A lost record must not be the
+/// last, nor one whose successor opens a rebuilt manifest and so names none: no check sees those (Q-614). A hidden
+/// one may be any, as epochs skip less than `TAIL_PROBES` here. A renamed one is any but the first and those that
+/// open a rebuilt manifest, whose predecessor is fixed.
+fn targets(c: &Chain, b: Break) -> Vec<usize> {
+    let s = start(c);
+    let n = c.0.len();
+    let opens = |i: usize| opens_manifest(&c.0[i].1);
     match b {
-        Break::Lose | Break::Hide => (start..n - 1)
-            .filter(|&i| !opens_manifest(&records[i + 1]))
-            .collect(),
-        Break::Rename => (start.max(1)..n)
-            .filter(|&i| !opens_manifest(&records[i]))
-            .collect(),
+        Break::Lose => (s..n - 1).filter(|&i| !opens(i + 1)).collect(),
+        Break::Hide => (s..n).collect(),
+        Break::Rename => (s.max(1)..n).filter(|&i| !opens(i)).collect(),
     }
 }
 
-fn source_and_chain() -> impl Strategy<Value = (Source, Chain)> {
+fn source_and_chain(whole_only: bool) -> impl Strategy<Value = (Source, Chain)> {
     let src = source(ID, 2, false);
-    chain(&src).prop_map(move |c| (src.clone(), c))
+    chain(&src, whole_only).prop_map(move |c| (src.clone(), c))
+}
+
+/// Gives record `i` a predecessor other than its own, drawn from `wrong`.
+fn rename(c: &mut Chain, i: usize, wrong: u64) {
+    let (right, epoch) = (c.0[i].0, c.0[i].1.epoch);
+    let mut w = wrong % (epoch - 1);
+    if w >= right {
+        w += 1;
+    }
+    c.0[i].0 = w;
 }
 
 proptest! {
     #[test]
-    fn a_chain_as_the_upload_driver_writes_it_restores((src, c) in source_and_chain(), drill in any::<bool>()) {
+    fn a_chain_as_the_upload_driver_writes_it_restores((src, c) in source_and_chain(false), drill in any::<bool>()) {
         let sink = bucket(src, &c);
         let p = prepare(&sink, drill);
         prop_assert!(p.is_ok(), "{:?}", p);
@@ -156,7 +176,7 @@ proptest! {
 
     #[test]
     fn one_break_in_the_records_a_restore_checks_refuses_it_or_makes_it_retry(
-        (src, mut c) in source_and_chain(),
+        (src, mut c) in source_and_chain(false),
         kind in prop_oneof![Just(Break::Lose), Just(Break::Hide), Just(Break::Rename)],
         at in any::<prop::sample::Index>(),
         wrong in any::<u64>(),
@@ -165,12 +185,7 @@ proptest! {
         let i = at.get(&targets(&c, kind)).to_owned();
         let epoch = c.0[i].1.epoch;
         if let Break::Rename = kind {
-            let right = c.0[i].0;
-            let mut w = wrong % (epoch - 1);
-            if w >= right {
-                w += 1;
-            }
-            c.0[i].0 = w;
+            rename(&mut c, i, wrong);
         }
         let sink = bucket(src, &c);
         let key = Keys::new(ID).record(0, epoch);
@@ -190,5 +205,27 @@ proptest! {
                 "{:?}", r
             ),
         }
+    }
+
+    #[test]
+    fn a_break_before_a_whole_rebuilt_manifest_never_refuses_the_restore_that_reads_it(
+        (src, mut c) in source_and_chain(true),
+        lose in any::<bool>(),
+        at in any::<prop::sample::Index>(),
+        wrong in any::<u64>(),
+        drill in any::<bool>(),
+    ) {
+        let old: Vec<usize> = (0..start(&c)).filter(|&i| lose || i > 0).collect();
+        let i = at.get(&old).to_owned();
+        let epoch = c.0[i].1.epoch;
+        if !lose {
+            rename(&mut c, i, wrong);
+        }
+        let sink = bucket(src, &c);
+        if lose {
+            sink.set(&Keys::new(ID).record(0, epoch), Some(Fault::Lose));
+        }
+        let p = prepare(&sink, drill);
+        prop_assert!(p.is_ok(), "{:?}", p);
     }
 }
