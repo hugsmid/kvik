@@ -730,7 +730,7 @@ crash keeps checksum-valid complete batches beyond the mark.
   `possible_loss` (Q-125, Q-320), with K the last kept position. The stale-mark test counts unflagged batches only: a
   complete unflagged batch beyond the mark followed by any complete batch. A process crash therefore loses no
   acknowledged faster-level reading and costs no reset point
-  (`tests/rules.rs` `s3_process_crash_keeps_flagged_batches_beyond_the_mark_with_no_reset_point`,
+  (`tests/durability.rs` `s3_process_crash_keeps_flagged_batches_beyond_the_mark_with_no_reset_point`,
   `s3_process_crash_keeps_flagged_batches_and_resets_after_an_unflagged_one`,
   `s3_flagged_batches_do_not_make_a_same_boot_mark_stale`).
 - *Rule 2.* An invalid region followed by a complete batch stays corruption: flagged batches written with no sync
@@ -741,7 +741,9 @@ crash keeps checksum-valid complete batches beyond the mark.
   loss is in the torn tail or left no byte, and the recovery entry is a reset point (`forget_above` K) for consumers
   that acted on it; its `possible_loss` is Q-251. The "last batch written again" rule covers the flagged batches
   directly before the last complete batch, back to the nearest unflagged one
-  (`s3_power_loss_removing_flagged_batches_is_a_reset_point_and_possible_loss`).
+  (`s3_power_loss_removing_flagged_batches_is_a_reset_point_and_possible_loss`; the recovery histories of invariants
+  25–27 commit flagged batches, sync the log, keep flagged batches on a same-boot start and lose them in power
+  losses, guarded by `recovery_generator_coverage`).
 - *Not offered yet:* a per-call wait for the sync (Q-252).
 
 
@@ -1405,7 +1407,7 @@ kept log is a `possible_loss` whatever its tail (`format.md` A.6 field 48; `spec
 (a) is reported, at the price of (b) being reported too. With the mark missing or unreadable and such a series
 defined, an entry is never adopted (a doubtful case costs a second report). Reason: honest without a new mechanism;
 the definition entries that make a series `written` are synced with the mark before they are acknowledged, so the
-kept log after a reboot always holds them (`tests/rules.rs`
+kept log after a reboot always holds them (`tests/durability.rs`
 `s3_a_reboot_entry_is_a_possible_loss_while_a_written_series_is_defined`).
 **Open.** (b) A clean-shutdown bit in the mark's reserved bytes, written by the final mark update and cleared by
 the next, would let a start after a clean shutdown report nothing. (c) is not covered: a damaged current slot is
@@ -1859,6 +1861,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
+| Durability levels | §2.1 `durability`, §3 Batches, Commit, Recovery rules 1–3 | The level is fixed for the life of a series (no parameter change, Q-60); the queue commits as one batch, flagged only when every reading is at the `written` level (the engine cuts batches by call); `max_unsynced` is the caller's `sync_log`; batches reach the disk in order, so an invalid region before a complete flagged batch (rule 2) and writing kept batches again are not modelled; adoption is not modelled | `tests/durability.rs` |
 | Effective-dated parameters | §2.1, §5.1 | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so neither a later change of the expected interval, which leaves the stored levels as they are (§5.1), nor a past-effective change of a parameter a node depends on (Q-83) arises | `calendar_depends_on_zone_utc_levels_do_not` |
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |

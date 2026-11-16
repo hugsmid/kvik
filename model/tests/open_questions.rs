@@ -890,3 +890,47 @@ fn q77_day_whose_midnight_occurs_twice_starts_at_the_earlier() {
     );
     assert_eq!(nov1.node.count, 150);
 }
+
+/// Q-250 (open, the owner's ruling): flagged batches acknowledged and
+/// delivered, then removed whole by a remount within the boot, leave nothing
+/// beyond the mark; the start sees a clean crash and gives their positions
+/// again with no reset point and no `possible_loss`.
+#[test]
+fn q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again() {
+    use kvik_model::engine::{Config, ConsumerDecl, ConsumerId, MarkSync, Model, Selection};
+    use kvik_model::registry::Durability;
+    let c = ConsumerId(1);
+    let consumer = ConsumerDecl {
+        id: c,
+        selection: Selection::All,
+        capacity: 100,
+    };
+    let cfg = Config {
+        mark_sync: MarkSync::Timed,
+        ..Config::default()
+    };
+    let mut m = Model::new(cfg, vec![consumer], T0 + 3_600 * SECOND);
+    let s = m
+        .define_with(
+            "market/feed/price",
+            Kind::Gauge,
+            ValueType::Number,
+            "1",
+            10 * SECOND,
+            SeriesOptions::durability(Durability::Written),
+        )
+        .unwrap();
+    m.drain().unwrap();
+    let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    m.ingest(vec![Reading::num(s, T0 + 1, 2.0)]).unwrap();
+    assert_eq!(m.poll(c, 10).unwrap()[0].position, first, "delivered");
+    m.remount();
+    m.restart();
+    assert!(m.recovery_entries().is_empty());
+    assert!(m.losses().is_empty());
+    let again = m
+        .ingest(vec![Reading::num(s, T0 + 2, 3.0)])
+        .unwrap()
+        .positions[0];
+    assert_eq!(again, first, "given again with no reset point");
+}

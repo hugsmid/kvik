@@ -4,7 +4,8 @@
 //! take and confirm deliveries, crash, lose power (losing acknowledged
 //! batches above the last synced mark), remount, lose the mark or a cursor
 //! file, damage a batch, fail a start's sync, acknowledge losses, compact,
-//! upload, move files off the local tiers and let time pass.
+//! upload, move files off the local tiers and let time pass. A second series
+//! is at the `written` level: its batches are flagged (§3 Batches, Q-170).
 
 mod common;
 
@@ -33,6 +34,12 @@ fn cases(n: u32) -> ProptestConfig {
 enum ROp {
     /// Readings committed in one batch, with a fault or none.
     Ingest(u8, Option<kvik_model::engine::Fault>),
+    /// The same on the series at the `written` level: a flagged batch.
+    IngestWritten(u8, Option<kvik_model::engine::Fault>),
+    /// The log sync that `max_unsynced` bounds (§3 Commit).
+    SyncLog,
+    /// A power loss keeping this many flagged batches not yet synced.
+    PowerLossKeeping(usize),
     /// A definition: a batch that is not only facts forces a mark sync.
     Define,
     /// The timed mark sync fires.
@@ -95,7 +102,10 @@ fn arb_rop() -> impl Strategy<Value = ROp> {
         outcome.prop_map(Fault::SyncError),
     ];
     prop_oneof![
-        8 => (1u8..4, proptest::option::weighted(0.15, fault)).prop_map(|(n, f)| ROp::Ingest(n, f)),
+        8 => (1u8..4, proptest::option::weighted(0.15, fault.clone())).prop_map(|(n, f)| ROp::Ingest(n, f)),
+        4 => (1u8..4, proptest::option::weighted(0.15, fault)).prop_map(|(n, f)| ROp::IngestWritten(n, f)),
+        1 => Just(ROp::SyncLog),
+        1 => (0usize..3).prop_map(ROp::PowerLossKeeping),
         1 => Just(ROp::Define),
         1 => Just(ROp::SyncMark),
         12 => (0usize..2, 4usize..16).prop_map(|(c, n)| ROp::Take { c, n }),
@@ -136,6 +146,10 @@ struct Seen {
     stale: usize,
     gaps: usize,
     rule_1_resets: usize,
+    /// Starts on the same boot that kept flagged batches beyond the mark.
+    flagged_kept: usize,
+    /// Entries that are a `possible_loss` only for the `written` level.
+    written_resets: usize,
     acknowledged: usize,
     possible: usize,
     data_lost: usize,
@@ -167,6 +181,7 @@ const ALL: Checks = Checks {
 struct RWorld {
     m: kvik_model::engine::Model,
     s: kvik_model::types::SeriesId,
+    fast: kvik_model::types::SeriesId,
     t: Nanos,
     defs: usize,
     last: [Option<kvik_model::engine::DeliveryId>; 2],
@@ -199,9 +214,22 @@ impl RWorld {
                 5 * SECOND,
             )
             .unwrap();
+        let fast = m
+            .define_with(
+                "market/feed/price",
+                Kind::Gauge,
+                kvik_model::types::ValueType::Number,
+                "1",
+                5 * SECOND,
+                kvik_model::registry::SeriesOptions::durability(
+                    kvik_model::registry::Durability::Written,
+                ),
+            )
+            .unwrap();
         RWorld {
             m,
             s,
+            fast,
             t: T0,
             defs: 0,
             last: [None, None],
@@ -221,6 +249,7 @@ impl RWorld {
         use kvik_model::recovery::MarkState;
         let entries = self.m.recovery_entries().len();
         let mark_boot = self.m.disk.mark.map(|m| m.boot);
+        let pending = self.pending_flagged();
         // A step that needs the engine starts it first, so histories spend
         // most of their time up.
         let needs_up = !matches!(
@@ -230,6 +259,8 @@ impl RWorld {
                 | ROp::Advance(_)
                 | ROp::Crash
                 | ROp::PowerLoss(_)
+                | ROp::PowerLossKeeping(_)
+                | ROp::SyncLog
                 | ROp::Remount
                 | ROp::LoseMark(_)
                 | ROp::LoseMarkAndBatches(_)
@@ -251,6 +282,21 @@ impl RWorld {
                         .emit(kvik_model::types::Reading::num(self.s, self.t, 1.0));
                 }
                 let _ = self.m.commit(*fault);
+            }
+            ROp::IngestWritten(n, fault) if up => {
+                for _ in 0..*n {
+                    self.t += SECOND;
+                    let _ = self
+                        .m
+                        .emit(kvik_model::types::Reading::num(self.fast, self.t, 1.0));
+                }
+                let _ = self.m.commit(*fault);
+            }
+            ROp::SyncLog => self.m.sync_log(),
+            ROp::PowerLossKeeping(k) => {
+                if self.m.is_up() {
+                    self.m.power_loss_keeping(*k);
+                }
             }
             ROp::Define if up => {
                 self.defs += 1;
@@ -396,13 +442,46 @@ impl RWorld {
         if !matches!(op, ROp::Take { .. }) {
             self.last = self.last.map(|l| l.filter(|_| self.m.is_up()));
         }
+        if let Some(last) = pending
+            && self.m.is_up()
+            && self
+                .m
+                .disk
+                .mark
+                .is_some_and(|m| Some(m.boot) == mark_boot && m.last >= last)
+        {
+            seen.flagged_kept += 1;
+        }
         for (p, e) in self.m.recovery_entries().into_iter().skip(entries) {
+            seen.written_resets += usize::from(
+                e.written_level
+                    && e.tail.is_empty()
+                    && e.mark_state == MarkState::Readable
+                    && e.cursors_missing.is_empty(),
+            );
             seen.stale += usize::from(e.mark_state == MarkState::Stale);
             seen.gaps += usize::from(e.gap(p).is_some());
             seen.rule_1_resets +=
                 usize::from(e.mark_state == MarkState::Readable && mark_boot == Some(e.boot));
         }
         self.check(seen)
+    }
+
+    /// The last position of the flagged batches beyond the mark while the
+    /// engine is down on the boot that wrote them, which a start keeps (§3
+    /// Recovery rule 1).
+    fn pending_flagged(&self) -> Option<kvik_model::types::Position> {
+        let d = &self.m.disk;
+        let (f, mark) = (d.active?, d.mark?);
+        if self.m.is_up() || mark.boot != self.m.boot {
+            return None;
+        }
+        let floor = if mark.file == f { mark.batches } else { 0 };
+        let batches = &d.files[&f].batches;
+        let run = (floor..batches.len()).take_while(|b| d.flagged.contains(&(f, *b)));
+        run.last()
+            .and_then(|b| batches[b].last())
+            .map(|e| e.position)
     }
 
     fn check(&self, seen: &mut Seen) -> Result<(), TestCaseError> {
@@ -569,7 +648,8 @@ proptest! {
 /// Guards the recovery-history properties (invariants 25–27): positions
 /// delivered and then assigned again after a reset, `resync`s carrying
 /// `forget_above`, confirmations that forced a mark sync, stale marks, gaps,
-/// rule 1 resets, acknowledged losses and both kinds of loss.
+/// rule 1 resets, flagged batches kept by a same-boot start, entries reported
+/// only for the `written` level, acknowledged losses and both kinds of loss.
 #[test]
 fn recovery_generator_coverage() {
     use proptest::strategy::ValueTree;
@@ -589,12 +669,14 @@ fn recovery_generator_coverage() {
         seen.stale += s.stale;
         seen.gaps += s.gaps;
         seen.rule_1_resets += s.rule_1_resets;
+        seen.flagged_kept += s.flagged_kept;
+        seen.written_resets += s.written_resets;
         seen.acknowledged += s.acknowledged;
         possible += usize::from(s.possible > 0);
         data_lost += usize::from(s.data_lost > 0);
     }
     eprintln!(
-        "reassigned {} forget-resyncs {} behind-resyncs {} forced-syncs {} stale {} gaps {} rule-1 {} acknowledged {} possible {possible} data-lost {data_lost}",
+        "reassigned {} forget-resyncs {} behind-resyncs {} forced-syncs {} stale {} gaps {} rule-1 {} flagged-kept {} written-resets {} acknowledged {} possible {possible} data-lost {data_lost}",
         seen.reassigned,
         seen.forget_resyncs,
         seen.behind_resyncs,
@@ -602,10 +684,13 @@ fn recovery_generator_coverage() {
         seen.stale,
         seen.gaps,
         seen.rule_1_resets,
+        seen.flagged_kept,
+        seen.written_resets,
         seen.acknowledged
     );
     assert!(seen.reassigned > 5 && seen.forget_resyncs > 100 && seen.forced_syncs > 20);
     assert!(seen.behind_resyncs > 20);
     assert!(seen.stale > 20 && seen.gaps > 5 && seen.rule_1_resets > 20);
+    assert!(seen.flagged_kept > 20 && seen.written_resets > 20);
     assert!(seen.acknowledged > 50 && possible > 100 && data_lost > 50);
 }
