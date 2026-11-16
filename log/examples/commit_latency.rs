@@ -10,6 +10,8 @@
 //!   --any-fs       also run on a file system whose sync does nothing (tmpfs, ramfs)
 //!   --keep         keep the stores
 //!   --disk <text>  describe the disk where it cannot be found out (a class, never a model or serial)
+//!   --setup <text> run only the writer settings whose label contains <text>
+//!   --sync-delay <ms>  sleep this long in every `sync_data`, standing in for a slow device
 //! ```
 //!
 //! The run works in a `kvik-commit-latency` subdirectory of `<dir>`, removed at the end, and prints Markdown: the
@@ -17,8 +19,8 @@
 //! every acknowledged call, throughput and syncs per load, and the time to open the store again. Latency runs from
 //! the submit call to the acknowledgement, stamped on the writer thread as it completes the call.
 //!
-//! Nothing here changes the writer: the stores run [`WriterConfig::default`] except for `min_sync_interval` and
-//! the mark sync, on [`StdFs`] wrapped to time each sync.
+//! Nothing here changes the writer: the stores run [`WriterConfig::default`] except for `min_sync_interval`,
+//! `sync_interval_floor` and the mark sync, on [`StdFs`] wrapped to time each sync.
 
 #![forbid(unsafe_code)]
 
@@ -90,6 +92,7 @@ impl SyncLog {
 #[derive(Debug)]
 struct TimingFs {
     log: Arc<SyncLog>,
+    delay: Duration,
 }
 
 #[derive(Debug)]
@@ -98,6 +101,7 @@ struct TimingFile {
     data: SyncKind,
     all: SyncKind,
     log: Arc<SyncLog>,
+    delay: Duration,
 }
 
 impl Fs for TimingFs {
@@ -116,6 +120,7 @@ impl Fs for TimingFs {
             data,
             all,
             log: self.log.clone(),
+            delay: self.delay,
         }))
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -150,6 +155,9 @@ impl FsFile for TimingFile {
     }
     fn sync_data(&self) -> io::Result<()> {
         let t = Instant::now();
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         let r = self.inner.sync_data();
         self.log.record(self.data, t);
         r
@@ -319,8 +327,15 @@ enum Load {
     Steady { series: u32 },
     /// Every `every_ms`, `calls` calls of one reading submitted back to back.
     Burst { calls: u32, every_ms: u64 },
-    /// One writer, one reading per call, each call submitted when the previous one is acknowledged.
-    BackToBack,
+    /// `writers` writers at `per_sec` calls a second in all, each periodic at its own pseudo-random phase, with
+    /// `readings` readings per call (open loop).
+    Paced {
+        writers: u32,
+        per_sec: u32,
+        readings: u32,
+    },
+    /// One writer, `readings` readings per call, each call submitted when the previous one is acknowledged.
+    BackToBack { readings: u32 },
     /// `threads` writers submitting calls of `readings` readings as fast as back-pressure allows.
     Saturation { threads: u32, readings: u32 },
 }
@@ -331,7 +346,13 @@ impl Load {
             Load::Quiet { min_ms, max_ms } => format!("quiet ({min_ms}–{max_ms} ms apart)"),
             Load::Steady { series } => format!("steady {series} × 1 Hz"),
             Load::Burst { calls, every_ms } => format!("burst {calls} every {every_ms} ms"),
-            Load::BackToBack => "back to back, 1 writer".into(),
+            Load::Paced {
+                writers,
+                per_sec,
+                readings,
+            } => format!("{writers} writers, {per_sec} calls/s × {readings}"),
+            Load::BackToBack { readings: 1 } => "back to back, 1 writer".into(),
+            Load::BackToBack { readings } => format!("back to back, 1 writer × {readings}/call"),
             Load::Saturation { threads, readings } => {
                 format!("saturation {threads} × {readings}/call")
             }
@@ -360,11 +381,27 @@ fn loads(short: bool) -> Vec<(Load, u64)> {
             },
             d(20, 4),
         ),
-        (Load::BackToBack, d(10, 3)),
+        (
+            Load::Paced {
+                writers: 16,
+                per_sec: 200,
+                readings: 10,
+            },
+            d(20, 5),
+        ),
+        (Load::BackToBack { readings: 1 }, d(10, 3)),
+        (Load::BackToBack { readings: 2000 }, d(10, 3)),
         (
             Load::Saturation {
                 threads: 4,
                 readings: 100,
+            },
+            d(5, 2),
+        ),
+        (
+            Load::Saturation {
+                threads: 16,
+                readings: 10,
             },
             d(5, 2),
         ),
@@ -375,26 +412,47 @@ fn loads(short: bool) -> Vec<(Load, u64)> {
 #[derive(Clone, Copy, Debug)]
 struct Setup {
     min_sync: Duration,
+    floor: Duration,
     every_commit: bool,
 }
 
 impl Setup {
-    const ALL: [Setup; 3] = [
+    const ALL: [Setup; 4] = [
         Setup {
             min_sync: Duration::ZERO,
+            floor: Duration::ZERO,
             every_commit: false,
         },
         Setup {
             min_sync: Duration::from_millis(10),
+            floor: Duration::from_millis(10),
             every_commit: false,
         },
         Setup {
             min_sync: Duration::from_millis(10),
+            floor: Duration::from_millis(2),
+            every_commit: false,
+        },
+        Setup {
+            min_sync: Duration::from_millis(10),
+            floor: Duration::from_millis(10),
             every_commit: true,
         },
     ];
+    /// `min_sync_interval`, with the floor where the interval adapts.
     fn interval(&self) -> String {
-        format!("{} ms", self.min_sync.as_millis())
+        if self.floor >= self.min_sync {
+            format!("{} ms", self.min_sync.as_millis())
+        } else {
+            format!(
+                "adaptive {}–{} ms",
+                self.floor.as_millis(),
+                self.min_sync.as_millis()
+            )
+        }
+    }
+    fn label(&self) -> String {
+        format!("{}, {}", self.interval(), self.mark())
     }
     fn mark(&self) -> &'static str {
         if self.every_commit {
@@ -406,6 +464,7 @@ impl Setup {
     fn config(&self) -> WriterConfig {
         WriterConfig {
             min_sync_interval: self.min_sync,
+            sync_interval_floor: self.floor,
             mark_sync: if self.every_commit {
                 MarkSync::EveryCommit
             } else {
@@ -481,8 +540,9 @@ impl Lcg {
     }
 }
 
-/// The open-loop schedule of a paced load: offsets from the start, with the series of each call.
-fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
+/// The open-loop schedule of a paced load: offsets from the start, with the first series and the number of
+/// readings of each call.
+fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32, u32)> {
     let end = Duration::from_secs(secs);
     let mut out = Vec::new();
     match load {
@@ -490,7 +550,7 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
             let mut rng = Lcg(0x9e37_79b9_7f4a_7c15);
             let mut t = Duration::ZERO;
             while t < end {
-                out.push((t, 1));
+                out.push((t, 1, 1));
                 t += Duration::from_millis(min_ms + rng.next() % (max_ms - min_ms + 1));
             }
         }
@@ -499,7 +559,7 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
             let mut t = Duration::ZERO;
             let mut i = 0;
             while t < end {
-                out.push((t, 1 + i % series));
+                out.push((t, 1 + i % series, 1));
                 i += 1;
                 t = step * i;
             }
@@ -507,13 +567,33 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
         Load::Burst { calls, every_ms } => {
             let mut t = Duration::ZERO;
             while t < end {
-                out.extend((0..calls).map(|c| (t, 1 + c)));
+                out.extend((0..calls).map(|c| (t, 1 + c, 1)));
                 t += Duration::from_millis(every_ms);
             }
         }
-        Load::BackToBack | Load::Saturation { .. } => {}
+        Load::Paced {
+            writers,
+            per_sec,
+            readings,
+        } => {
+            let mut rng = Lcg(0x2545_f491_4f6c_dd1d);
+            let period = Duration::from_secs(1) * writers / per_sec;
+            for w in 0..writers {
+                let mut t = period.mul_f64((rng.next() % 1000) as f64 / 1000.0);
+                while t < end {
+                    out.push((t, 1 + w * readings, readings));
+                    t += period;
+                }
+            }
+            out.sort_unstable();
+        }
+        Load::BackToBack { .. } | Load::Saturation { .. } => {}
     }
     out
+}
+
+fn readings(first: u32, count: u32, n: u64) -> Vec<Item> {
+    (first..first + count).map(|s| reading(s, n)).collect()
 }
 
 /// What one load under one setup measured.
@@ -531,6 +611,8 @@ struct Run {
     mark_syncs: u64,
     batches: u64,
     sealed: u64,
+    sync_interval: Duration,
+    sync_time: Option<Duration>,
     sync_samples: Vec<(SyncKind, u64)>,
 }
 
@@ -543,11 +625,11 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
     let mut lag = Vec::new();
     let mut busy = 0;
     let mut calls = 0u64;
-    let mut readings = 0u64;
+    let mut total = 0u64;
     match load {
-        Load::Quiet { .. } | Load::Steady { .. } | Load::Burst { .. } => {
+        Load::Quiet { .. } | Load::Steady { .. } | Load::Burst { .. } | Load::Paced { .. } => {
             let mut prev = None;
-            for (off, series) in schedule(load, secs) {
+            for (off, series, count) in schedule(load, secs) {
                 let due = start + off;
                 wait_until(due);
                 if prev != Some(off) {
@@ -555,11 +637,11 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                 }
                 prev = Some(off);
                 let t0 = Instant::now();
-                let p = match log.try_submit(vec![reading(series, calls)]) {
+                let p = match log.try_submit(readings(series, count, calls)) {
                     Ok(p) => p,
                     Err(SubmitError::Busy(_)) => {
                         busy += 1;
-                        log.submit(vec![reading(series, calls)])
+                        log.submit(readings(series, count, calls))
                             .expect("submit after back-pressure")
                     }
                     Err(e) => panic!("submit failed: {e}"),
@@ -569,15 +651,15 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                     break;
                 }
                 calls += 1;
-                readings += 1;
+                total += u64::from(count);
             }
         }
-        Load::BackToBack => {
+        Load::BackToBack { readings: count } => {
             let end = start + Duration::from_secs(secs);
             while Instant::now() < end {
                 let t0 = Instant::now();
                 let p = log
-                    .submit(vec![reading(1, calls)])
+                    .submit(readings(1, count, calls))
                     .expect("submit back to back");
                 let mut s = track(t0, p);
                 if let Outcome::Pending(p) = s.outcome {
@@ -587,7 +669,7 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                     break;
                 }
                 calls += 1;
-                readings += 1;
+                total += u64::from(count);
             }
         }
         Load::Saturation {
@@ -619,7 +701,7 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
             for h in handles {
                 let n = h.join().expect("a saturation writer");
                 calls += n;
-                readings += n * u64::from(per_call);
+                total += n * u64::from(per_call);
             }
         }
     }
@@ -636,12 +718,14 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
         busy,
         failed,
         calls,
-        readings,
+        readings: total,
         secs,
         syncs: after.syncs - before.syncs,
         mark_syncs: after.mark_syncs - before.mark_syncs,
         batches: after.batches - before.batches,
         sealed: after.sealed_segments - before.sealed_segments,
+        sync_interval: after.sync_interval,
+        sync_time: after.sync_time,
         sync_samples: sync_log.take(),
     }
 }
@@ -803,6 +887,8 @@ fn main() {
     let mut only: Option<String> = None;
     let mut repeat = 1u32;
     let mut disk_note: Option<String> = None;
+    let mut setup_filter: Option<String> = None;
+    let mut sync_delay = Duration::ZERO;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--short" => short = true,
@@ -810,6 +896,14 @@ fn main() {
             "--any-fs" => any_fs = true,
             "--only" => only = args.next(),
             "--disk" => disk_note = args.next(),
+            "--setup" => setup_filter = args.next(),
+            "--sync-delay" => {
+                let ms: f64 = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .expect("--sync-delay takes milliseconds");
+                sync_delay = Duration::from_secs_f64(ms / 1e3);
+            }
             "--repeat" => {
                 repeat = args
                     .next()
@@ -824,7 +918,8 @@ fn main() {
     }
     let Some(base) = dir else {
         eprintln!(
-            "usage: commit_latency <dir> [--short] [--only <load>] [--repeat <n>] [--any-fs] [--keep] [--disk <text>]"
+            "usage: commit_latency <dir> [--short] [--only <load>] [--repeat <n>] [--any-fs] [--keep] [--disk <text>] \
+             [--setup <text>] [--sync-delay <ms>]"
         );
         std::process::exit(2);
     };
@@ -848,13 +943,19 @@ fn main() {
         w,
         "## Environment\n\n| Item | Value |\n|---|---|\n\
          | Run | {} |\n| Platform | {} {}, {} |\n| CPUs | {} |\n| File system | {fstype} |\n| Disk | {disk} |\n\
-         | Sync primitive | {} |\n| Timer slack | {} |\n| Build | {} |\n| Load average at start | {} |",
+         | Sync primitive | {} |\n| Sync delay added | {} |\n| Timer slack | {} |\n| Build | {} |\n\
+         | Load average at start | {} |",
         if short { "short" } else { "full" },
         std::env::consts::OS,
         std::env::consts::ARCH,
         os_version(),
         std::thread::available_parallelism().map_or(0, |n| n.get()),
         sync_primitive(),
+        if sync_delay.is_zero() {
+            "none".to_owned()
+        } else {
+            format!("{} ms in every `sync_data`", ms(nanos(sync_delay)))
+        },
         timer_slack(),
         if cfg!(debug_assertions) {
             "debug (not a valid measurement)"
@@ -891,10 +992,17 @@ fn main() {
     let mut restarts = Vec::new();
     for rep in 0..repeat {
         for (si, setup) in Setup::ALL.iter().copied().enumerate() {
+            if setup_filter
+                .as_ref()
+                .is_some_and(|f| !setup.label().contains(f.as_str()))
+            {
+                continue;
+            }
             let dir = root.join(format!("store-{rep}-{si}"));
             let sync_log = Arc::new(SyncLog::default());
             let fs: Arc<dyn Fs> = Arc::new(TimingFs {
                 log: sync_log.clone(),
+                delay: sync_delay,
             });
             let new = NewStore {
                 store_id: STORE_ID,
@@ -969,13 +1077,14 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Commit latency per acknowledged call, ms\n\n\
-         | Load | `min_sync_interval` | Mark sync |{rh} Calls | p50 | p90 | p99 | p99.9 | max | Lag p99 | Lag max | Busy |\n\
+         | Load | Interval | Mark sync |{rh} Calls | p50 | p90 | p99 | p99.9 | max | Lag p99 | Lag max | Busy |\n\
          |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for (rep, r) in &runs {
         // How late the generator sent, for the open-loop loads: latency counts from the submit call, so lateness
         // would not show in it (coordinated omission) but would bunch arrivals.
-        let (lag, lag_max) = if matches!(r.load, Load::BackToBack | Load::Saturation { .. }) {
+        let (lag, lag_max) = if matches!(r.load, Load::BackToBack { .. } | Load::Saturation { .. })
+        {
             ("–".into(), "–".into())
         } else {
             (pct(&r.lag, 99.0), ms(r.lag.last().copied().unwrap_or(0)))
@@ -1001,9 +1110,10 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Throughput and syncs\n\n\
-         | Load | `min_sync_interval` | Mark sync |{rh} Seconds | Calls/s | Readings/s | Log syncs/s | Readings per batch | \
-         Mark syncs | Sealed | Batch sync p50 | p99 | max | Mark sync p50 | max |\n\
-         |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+         | Load | Interval | Mark sync |{rh} Seconds | Calls/s | Readings/s | Log syncs/s | Readings per batch | \
+         Calls per batch | Interval at end | Sync time at end | Mark syncs | Sealed | Batch sync p50 | p99 | max | \
+         Mark sync p50 | max |\n\
+         |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for (rep, r) in &runs {
         let kind = |k: SyncKind| {
@@ -1027,7 +1137,7 @@ fn main() {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} |{} {:.1} | {:.0} | {:.0} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} |{} {:.1} | {:.0} | {:.0} | {:.0} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.load.name(),
             r.setup.interval(),
             r.setup.mark(),
@@ -1037,6 +1147,9 @@ fn main() {
             r.readings as f64 / secs,
             r.syncs as f64 / secs,
             r.readings as f64 / r.batches.max(1) as f64,
+            r.calls as f64 / r.batches.max(1) as f64,
+            ms(nanos(r.sync_interval)),
+            r.sync_time.map_or("–".into(), |t| ms(nanos(t))),
             r.mark_syncs,
             r.sealed,
             m(&seg, 50.0),
@@ -1049,7 +1162,7 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Opening the store again after the run (clean shutdown, warm page cache)\n\n\
-         | `min_sync_interval` | Mark sync |{rh} Segments | MiB | Same boot ms | Rule | Another boot ms | Rule |\n\
+         | Interval | Mark sync |{rh} Segments | MiB | Same boot ms | Rule | Another boot ms | Rule |\n\
          |---|---|{rs}---:|---:|---:|---|---:|---|"
     );
     for (rep, r) in &restarts {
