@@ -15,7 +15,7 @@ use kvik_log::registry::RegistryFile;
 use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 use kvik_log::writer::Position as LogPos;
 
-use super::loss::merge;
+use super::loss::{self, merge};
 use super::registry::{Registry, Series};
 use crate::backend::Error;
 use crate::health::{LossCause, LossKind, LossReport, MarkState};
@@ -202,8 +202,14 @@ impl Index {
             recorded: false,
             acknowledged: false,
         };
-        if self.found.iter().any(|f| f.identity == report.identity) {
-            return None;
+        // A region that overlaps a loss already found is that loss, grown, under its first identity (spec §3 Order
+        // of a start step 4).
+        let overlaps = |f: &&mut LossReport| f.first <= report.last && report.first <= f.last;
+        if let Some(f) = self.found.iter_mut().find(overlaps) {
+            if !loss::widen(f, &report) {
+                return None;
+            }
+            return Some(f.clone());
         }
         self.found.push(report.clone());
         Some(report)
@@ -259,8 +265,7 @@ impl Index {
             f.retain(|(_, p), _| keep(p));
         }
         self.facts.retain(|_, f| !f.is_empty());
-        self.found
-            .retain(|l| l.first.is_some_and(|p| keep(&log_pos(p))));
+        // Found losses outlive a void: lost positions are never reused (spec §3 Recovery rule 2).
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);

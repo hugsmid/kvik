@@ -306,7 +306,8 @@ struct View {
     resume: Option<Resume>,
     taken: Position,
     recent: VecDeque<Fingerprint>,
-    regions: BTreeSet<(u64, u64)>,
+    /// Regions returned, by file and byte span: one met again with a new extent is returned again (Q-200).
+    regions: BTreeSet<(u64, u64, u64)>,
 }
 
 /// A segment opened by name, under the extension it was found with.
@@ -672,7 +673,7 @@ impl LogReader {
                 let Some(found) = s.next() else { break };
                 match found.map_err(refused)? {
                     Found::Region(region) => {
-                        if view.regions.insert((file_id, region.start)) {
+                        if view.regions.insert((file_id, region.start, region.end)) {
                             events.push(ReadEvent::Corruption { file_id, region });
                         }
                     }

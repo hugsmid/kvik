@@ -170,3 +170,193 @@ fn unreadable_loss_reports_degrade_health() {
     assert!(unknown(s.reader().health()));
     assert!(unknown(r.health()));
 }
+
+fn degraded_by(h: &Health, identity: Position) -> bool {
+    matches!(h, Health::Degraded { reasons } if reasons.iter().any(|r| matches!(r, Reason::DataLost(l) if l.identity == identity)))
+}
+
+#[test]
+fn damage_next_to_a_found_loss_extends_it_and_needs_a_new_acknowledgement() {
+    let w = World::new("extend-found");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let mut three = Position::ORIGIN;
+    for (i, t) in ["EXT-ONE", "EXT-TWO", "EXT-THREE"].iter().enumerate() {
+        three = block_on(s.emit(&[note(id, i as i64, t)])).unwrap().first().unwrap();
+    }
+    damage(&w, b"EXT-THREE");
+    let r = w.reader();
+    let first = vec![(three, Some(three), Some(three), false)];
+    assert_eq!(data_lost(&r.losses()), first);
+    assert_eq!(data_lost(&s.losses()), first);
+    block_on(s.acknowledge_losses(&[three])).unwrap();
+    assert!(matches!(s.health(), Health::Ok));
+
+    let four = block_on(s.emit(&[note(id, 3, "EXT-FOUR")])).unwrap().first().unwrap();
+    damage(&w, b"EXT-FOUR");
+    // One loss under its first identity, grown to hold FOUR: no longer acknowledged (spec §8 Acknowledging a loss).
+    let grown = vec![(three, Some(three), Some(four), false)];
+    assert_eq!(history(&s.reader(), id).len(), 2);
+    assert_eq!(history(&r, id).len(), 2);
+    assert_eq!(data_lost(&s.losses()), grown);
+    assert_eq!(data_lost(&r.losses()), grown);
+    assert!(degraded_by(&s.health(), three), "{:?}", s.health());
+    assert!(degraded_by(&r.health(), three));
+    let ack = block_on(s.emit(&[note(id, 3, "EXT-FOUR")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
+    block_on(s.acknowledge_losses(&[three])).unwrap();
+    assert!(matches!(s.health(), Health::Ok));
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    let s = w.open();
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(three, Some(three), Some(four), true)]
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn damage_to_a_batch_read_after_a_found_loss_extends_it_in_every_process() {
+    let w = World::new("void-after-loss");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let mut at = Vec::new();
+    for (i, t) in ["VOID-ONE", "VOID-TWO", "VOID-THREE"].iter().enumerate() {
+        at.push(block_on(s.emit(&[note(id, i as i64, t)])).unwrap().first().unwrap());
+    }
+    let (two, three) = (at[1], at[2]);
+    damage(&w, b"VOID-TWO");
+    let r = w.reader();
+    let first = vec![(two, Some(two), Some(two), false)];
+    assert_eq!(data_lost(&r.losses()), first);
+    assert_eq!(data_lost(&s.losses()), first);
+    assert_eq!(history(&r, id).len(), 2);
+    assert_eq!(history(&s.reader(), id).len(), 2);
+
+    damage(&w, b"VOID-THREE");
+    let grown = vec![(two, Some(two), Some(three), false)];
+    for reader in [&r, &s.reader()] {
+        assert_eq!(history(reader, id).len(), 1);
+        let losses = reader.losses();
+        assert_eq!(data_lost(&losses), grown);
+        assert_eq!(losses[0].commit_time_after, None);
+        assert!(degraded_by(&reader.health(), two), "{:?}", reader.health());
+    }
+    assert_eq!(data_lost(&s.losses()), grown);
+    for (i, t) in [(1, "VOID-TWO"), (2, "VOID-THREE")] {
+        let ack = block_on(s.emit(&[note(id, i, t)])).unwrap();
+        assert_eq!(ack.recorded(), 1, "{t}: {:?}", ack.outcomes);
+    }
+    let ack = block_on(s.emit(&[note(id, 0, "VOID-ONE")])).unwrap();
+    assert_eq!(ack.duplicates_dropped(), 1);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    let s = w.open();
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(two, Some(two), Some(three), true)]
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+fn emit_notes(s: &Store, id: kvik::SeriesId, texts: &[&str]) -> Vec<Position> {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            block_on(s.emit(&[note(id, i as i64, t)]))
+                .unwrap()
+                .first()
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn damage_next_to_a_recorded_loss_grows_it_unrecorded_until_the_next_start() {
+    let w = World::new("extend-recorded");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let three = emit_notes(&s, id, &["REC-ONE", "REC-TWO", "REC-THREE"])[2];
+    damage(&w, b"REC-THREE");
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    let s = w.open();
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(three, Some(three), Some(three), true)]
+    );
+    block_on(s.acknowledge_losses(&[three])).unwrap();
+    assert!(matches!(s.health(), Health::Ok));
+    let four = block_on(s.emit(&[note(id, 3, "REC-FOUR")]))
+        .unwrap()
+        .first()
+        .unwrap();
+    damage(&w, b"REC-FOUR");
+    let r = w.reader();
+    let grown = vec![(three, Some(three), Some(four), false)];
+    assert_eq!(data_lost(&s.losses()), grown);
+    assert_eq!(data_lost(&r.losses()), grown);
+    assert!(degraded_by(&s.health(), three), "{:?}", s.health());
+    let ack = block_on(s.emit(&[note(id, 3, "REC-FOUR")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+
+    let s = w.open();
+    let recorded = vec![(three, Some(three), Some(four), true)];
+    assert_eq!(data_lost(&s.losses()), recorded);
+    assert_eq!(data_lost(&r.losses()), recorded);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn losses_keep_the_grown_range_the_process_holds_when_the_reports_cannot_be_read() {
+    let w = World::new("extend-unreadable");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let three = emit_notes(&s, id, &["HELD-ONE", "HELD-TWO", "HELD-THREE"])[2];
+    damage(&w, b"HELD-THREE");
+    assert_eq!(s.losses().len(), 1);
+    let four = block_on(s.emit(&[note(id, 3, "HELD-FOUR")]))
+        .unwrap()
+        .first()
+        .unwrap();
+    damage(&w, b"HELD-FOUR");
+    let grown = vec![(three, Some(three), Some(four), false)];
+    assert_eq!(data_lost(&s.losses()), grown);
+
+    let mark = Path::new(&w.dir).join("log").join("MARK");
+    let len = w.fs.read(&mark).unwrap().len();
+    w.fs.poke(&mark, 0, &vec![0xA5; len]);
+    assert_eq!(data_lost(&s.losses()), grown);
+    assert!(
+        matches!(&s.health(), Health::Degraded { reasons } if reasons.iter().any(|x| matches!(x, Reason::LossesUnknown { .. })) && reasons.iter().any(|x| matches!(x, Reason::DataLost(l) if l.last == Some(four))))
+    );
+}
+
+#[test]
+fn damage_below_a_found_loss_grows_it_downward_under_its_first_identity() {
+    let w = World::new("extend-down");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let at = emit_notes(&s, id, &["DOWN-ONE", "DOWN-TWO", "DOWN-THREE"]);
+    let (two, three) = (at[1], at[2]);
+    damage(&w, b"DOWN-THREE");
+    let r = w.reader();
+    assert_eq!(data_lost(&r.losses()), data_lost(&s.losses()));
+    damage(&w, b"DOWN-TWO");
+    let grown = vec![(three, Some(two), Some(three), false)];
+    assert_eq!(data_lost(&s.losses()), grown);
+    assert_eq!(data_lost(&r.losses()), grown);
+    assert_eq!(history(&s.reader(), id).len(), 1);
+    assert_eq!(history(&r, id).len(), 1);
+    let ack = block_on(s.emit(&[note(id, 1, "DOWN-TWO")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
+    // The identity the next start records is open (Q-203).
+    block_on(s.shutdown()).unwrap();
+}

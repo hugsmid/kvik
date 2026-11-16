@@ -137,7 +137,7 @@ impl Writer {
             decider: Mutex::new(Decider::from_index(&index)),
             counters: Mutex::new(counters),
             reader: Mutex::new(Some(Arc::new(reader))),
-            acknowledged: Mutex::new(BTreeSet::new()),
+            acknowledged: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
             closed: AtomicBool::new(false),

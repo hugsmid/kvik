@@ -20,7 +20,11 @@ impl Writer {
         loss::merge(&mut out, found);
         loss::merge(&mut out, self.latch.found());
         for l in &mut out {
-            l.acknowledged = acked.contains(&l.identity);
+            l.acknowledged = match acked.get(&l.identity) {
+                Some(Some((first, last))) => *first <= l.first && l.last <= *last,
+                Some(None) => true,
+                None => false,
+            };
         }
         (out, error)
     }
@@ -29,7 +33,14 @@ impl Writer {
     /// written yet.
     pub(crate) fn acknowledge_losses(&self, ids: &[Position]) -> Result<(), WriteError> {
         self.writable().map_err(|e| e.write(&self.dir))?;
-        lock(&self.acknowledged).extend(ids.iter().copied());
+        let losses = self.losses();
+        lock(&self.acknowledged).extend(ids.iter().map(|id| {
+            let range = losses
+                .iter()
+                .find(|l| l.identity == *id && l.kind == LossKind::DataLost)
+                .map(|l| (l.first, l.last));
+            (*id, range)
+        }));
         Ok(())
     }
 

@@ -30,7 +30,7 @@ mod routing;
 mod status;
 mod windows;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -190,7 +190,9 @@ pub(crate) struct Writer {
     decider: Mutex<Decider>,
     counters: Mutex<Counters>,
     reader: Mutex<Option<Arc<DurableReader>>>,
-    acknowledged: Mutex<BTreeSet<Position>>,
+    /// Acknowledged loss identities, each with the range it had then; `None` for one no report held (spec §8
+    /// Acknowledging a loss: a range that grows needs a new acknowledgement).
+    acknowledged: Mutex<BTreeMap<Position, Option<(Option<Position>, Option<Position>)>>>,
     /// Calls queued and not yet known to be acknowledged, by call number (Q-123 (b)).
     inflight: Mutex<BTreeMap<u64, Arc<Completion>>>,
     next_call: AtomicU64,

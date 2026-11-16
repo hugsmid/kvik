@@ -235,10 +235,15 @@ A.10) is treated as a different boot. The rules apply in this order:
    end or position 1) to the next valid batch or, at the tail, to the mark's last position, is reported as `data_lost` when found and recorded in the manifest as a **lost range**
    by step 4 below; neither makes the store read-only. Its positions are not reused. A lost range is a reset point
    for consumers (§4 Resync). A region below the mark is also found while the store is open, by a read of the
-   writer's process or of a reader process that has not read those bytes before: that process reports it from then
-   on, not yet recorded, and the next start finds it again and records it under the same identity. Once the writer's
-   process has found it, the facts it held are in no key's history (§2.4), so a replay of one is recorded again
-   (Q-200).
+   writer's process or of a reader process that has not read those bytes before, or that reads them again because
+   the newest batch it has read no longer reads the same: that process reports it from then on, not yet recorded,
+   and the next start finds it again and records it under the same identity (one that grew downward: Q-203). A
+   region that overlaps a loss already found or recorded grows that loss under its identity, as in step 4; the
+   grown loss is not recorded until a record covers it, and needs a new acknowledgement (§8 Acknowledging a loss).
+   Once the writer's process has found it, the facts it held are in no key's history (§2.4), so a replay of one is
+   recorded again. Accepted limit: damage to an older batch the writer's process has read (the kept log, read at its
+   start, included) is found by other readers and by the next start; until that start a replay of a fact it took is
+   acknowledged as a duplicate although the fact is gone (Q-200).
 3. **Different boot id** (the machine rebooted, the page cache is gone), or the mark missing, unreadable or stale
    (rule 1): any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
    batch's last position and the end of a lost range found at the tail under rule 2. Let F = 1 + the highest

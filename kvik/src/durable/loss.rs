@@ -32,8 +32,11 @@ impl Latch {
             if let (Some(a), Some(b)) = (l.first, l.last) {
                 s.fresh.push((log_pos(a), log_pos(b)));
             }
-            if !s.found.iter().any(|f| same_loss(f, l)) {
-                s.found.push(l.clone());
+            match s.found.iter_mut().find(|f| same_loss(f, l)) {
+                Some(f) => {
+                    widen(f, l);
+                }
+                None => s.found.push(l.clone()),
             }
         }
     }
@@ -65,11 +68,38 @@ fn same_loss(a: &LossReport, b: &LossReport) -> bool {
     }
 }
 
-/// Adds to `into` each report of `extra` that stands for no loss already there, then orders them by identity.
+fn covers(a: &LossReport, b: &LossReport) -> bool {
+    a.first <= b.first && b.last <= a.last
+}
+
+/// Grows lost range `into` to hold `by`, a report of the same loss, keeping its identity (spec §3 Order of a start
+/// step 4). The grown loss is recorded only if a recorded report covers it (Q-200). Returns whether it grew.
+pub(crate) fn widen(into: &mut LossReport, by: &LossReport) -> bool {
+    if into.kind != LossKind::DataLost || covers(into, by) {
+        return false;
+    }
+    into.recorded = by.recorded && covers(by, into);
+    if by.first < into.first {
+        into.first = by.first;
+        into.commit_time_before = by.commit_time_before;
+    }
+    if by.last > into.last {
+        into.last = by.last;
+        into.commit_time_after = by.commit_time_after;
+    }
+    into.bytes = into.bytes.max(by.bytes);
+    true
+}
+
+/// Adds to `into` each report of `extra` that stands for no loss already there, grows the loss it stands for
+/// otherwise, then orders them by identity.
 pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = LossReport>) {
     for l in extra {
-        if !into.iter().any(|x| same_loss(x, &l)) {
-            into.push(l);
+        match into.iter_mut().find(|x| same_loss(x, &l)) {
+            Some(x) => {
+                widen(x, &l);
+            }
+            None => into.push(l),
         }
     }
     into.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
