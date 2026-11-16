@@ -9,13 +9,15 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::maint::{
-    AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest, describe_sealed,
+    AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest,
+    describe_sealed_until,
 };
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Done, Fault, FaultOp, Halt, IngestQueue,
@@ -185,6 +187,8 @@ struct Shared {
     maint_cv: Condvar,
     info: Mutex<Info>,
     progress_cv: Condvar,
+    /// A shutdown has begun: no description is handed out and one in flight is dropped (Q-221 (b)).
+    stopping: AtomicBool,
     halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
@@ -304,6 +308,7 @@ impl Log {
                 sealed: Vec::new(),
             }),
             progress_cv: Condvar::new(),
+            stopping: AtomicBool::new(false),
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
             clock,
@@ -429,14 +434,15 @@ impl Log {
         lock(&self.shared.front).queue.depth()
     }
 
-    /// Clean shutdown: commits the calls already queued, finishes the seals under way, syncs the mark and joins
-    /// both threads. Calls that cannot be committed (ingest waiting on the disk) fail with
+    /// Clean shutdown: commits the calls already queued, finishes the seals under way, drops a description in flight
+    /// (Q-221 (b)), syncs the mark and joins both threads. Calls that cannot be committed (ingest waiting on the disk) fail with
     /// [`CommitError::ShutDown`]. Returns the fault if the store became read-only.
     pub fn shutdown(mut self) -> Result<(), Fault> {
         self.stop()
     }
 
     fn stop(&mut self) -> Result<(), Fault> {
+        self.shared.stopping.store(true, Ordering::SeqCst);
         {
             lock(&self.shared.front).shutdown = true;
         }
@@ -490,7 +496,9 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     let jobs = w.take_seal_jobs(now);
     work |= !jobs.is_empty();
     m.jobs.extend(jobs);
-    if let Some(id) = w.take_unlisted() {
+    if !s.stopping.load(Ordering::SeqCst)
+        && let Some(id) = w.take_unlisted()
+    {
         m.describe = Some((w.log_dir().to_path_buf(), id));
         work = true;
     }
@@ -667,6 +675,9 @@ fn maint_loop(s: &Shared) {
         while m.request.is_none() && m.jobs.is_empty() && m.describe.is_none() && !m.stop {
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
         }
+        if s.stopping.load(Ordering::SeqCst) {
+            m.describe = None;
+        }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
             m.request = None;
@@ -687,12 +698,12 @@ fn maint_loop(s: &Shared) {
             drop(m);
             let r = seal_segment_described(&*s.fs, &job, &s.halt);
             lock(&s.maint).results.push((job, r));
-        } else if !m.stop
-            && let Some((dir, id)) = m.describe.take()
-        {
+        } else if let Some((dir, id)) = m.describe.take() {
             drop(m);
-            let r = describe_sealed(&*s.fs, &dir, &id);
-            lock(&s.maint).described = Some(r);
+            let stop = || s.stopping.load(Ordering::SeqCst) || s.halt.is_set();
+            if let Some(r) = describe_sealed_until(&*s.fs, &dir, &id, &stop) {
+                lock(&s.maint).described = Some(r);
+            }
         } else {
             return;
         }

@@ -250,17 +250,17 @@ pub fn seal_segment_described(
 }
 
 /// Reads `file` from 0 to `end`, `SEAL_READ` bytes at a time, so memory does not grow with `segment_size`
-/// (Q-115 (l)); `each` gets every piece with its offset.
+/// (Q-115 (l)); `each` gets every piece with its offset. `Err(None)` once `stop` holds before a read.
 fn read_through(
     file: &dyn FsFile,
     end: u64,
-    halt: Option<&Halt>,
+    stop: &dyn Fn() -> bool,
     mut each: impl FnMut(u64, &[u8]),
 ) -> Result<(), Option<io::Error>> {
     let mut buf = vec![0u8; SEAL_READ.min(usize::try_from(end).unwrap_or(SEAL_READ))];
     let mut at = 0u64;
     while at < end {
-        if halt.is_some_and(|h| h.is_set()) {
+        if stop() {
             return Err(None);
         }
         let want = usize::try_from(end - at).map_or(buf.len(), |n| n.min(buf.len()));
@@ -279,7 +279,7 @@ fn read_through(
 fn prepare(job: &SealJob, path: &Path, halt: &Halt) -> Result<Prepared, SealError> {
     let mut crc = Crc32c::new();
     let mut sha = Sha256::new();
-    read_through(&*job.file, job.end, Some(halt), |_, b| {
+    read_through(&*job.file, job.end, &|| halt.is_set(), |_, b| {
         crc.update(b);
         sha.update(b);
     })
@@ -404,26 +404,54 @@ pub fn describe_sealed(
     log_dir: &Path,
     id: &SegmentIdentity,
 ) -> Result<SealedFile, DescribeError> {
+    describe_sealed_until(fs, log_dir, id, &|| false)
+        .unwrap_or_else(|| Err(DescribeError::Io(io::ErrorKind::Interrupted.into())))
+}
+
+/// [`describe_sealed`], abandoned with `None` before its next file operation once `stop` holds (Q-221 (b)).
+pub(crate) fn describe_sealed_until(
+    fs: &dyn Fs,
+    log_dir: &Path,
+    id: &SegmentIdentity,
+    stop: &dyn Fn() -> bool,
+) -> Option<Result<SealedFile, DescribeError>> {
+    match describe_inner(fs, log_dir, id, stop) {
+        Ok(f) => Some(Ok(f)),
+        Err(e) => e.map(Err),
+    }
+}
+
+fn describe_inner(
+    fs: &dyn Fs,
+    log_dir: &Path,
+    id: &SegmentIdentity,
+    stop: &dyn Fn() -> bool,
+) -> Result<SealedFile, Option<DescribeError>> {
+    let go = || if stop() { Err(None) } else { Ok(()) };
+    let io = |e| Some(DescribeError::Io(e));
+    go()?;
     let path = segment_path(log_dir, id, true);
-    let file = fs.open(&path, OpenMode::Read).map_err(DescribeError::Io)?;
-    let len = file.len().map_err(DescribeError::Io)?;
+    let file = fs.open(&path, OpenMode::Read).map_err(io)?;
+    let len = file.len().map_err(io)?;
     let trailer_offset = len
         .checked_sub(TAIL_LEN as u64)
         .filter(|&o| o >= HEADER_LEN as u64)
-        .ok_or(DescribeError::NotSealed)?;
+        .ok_or(Some(DescribeError::NotSealed))?;
     let mut head = [0u8; HEADER_LEN];
     let mut tail = [0u8; TAIL_LEN];
-    read_exact(&*file, &mut head, 0).map_err(DescribeError::Io)?;
-    read_exact(&*file, &mut tail, trailer_offset).map_err(DescribeError::Io)?;
+    go()?;
+    read_exact(&*file, &mut head, 0).map_err(io)?;
+    go()?;
+    read_exact(&*file, &mut tail, trailer_offset).map_err(io)?;
     let marker_at = BLOCK_HEADER_LEN + TRAILER_LEN;
     if decode_end_marker(&tail[marker_at..]) != Some(trailer_offset) {
-        return Err(DescribeError::NotSealed);
+        return Err(Some(DescribeError::NotSealed));
     }
     let trailer = read_block(&tail, 0, marker_at as u64)
         .ok()
         .filter(|b| b.header.block_type == block_type::TRAILER)
         .and_then(|b| Trailer::decode(b.body).ok())
-        .ok_or(DescribeError::NotSealed)?;
+        .ok_or(Some(DescribeError::NotSealed))?;
     let header_agrees = FileHeader::decode(&head).is_some_and(|h| {
         h.kind == kind::LOG_SEGMENT
             && h.store_id == id.store_id
@@ -431,22 +459,24 @@ pub fn describe_sealed(
             && h.file_id == id.file_id
     });
     if !header_agrees {
-        return Err(DescribeError::Invalid("header disagrees with the name"));
+        return Err(Some(DescribeError::Invalid(
+            "header disagrees with the name",
+        )));
     }
     if trailer.batch_count == 0 || trailer.first_sequence > trailer.last_sequence {
-        return Err(DescribeError::Invalid("trailer names no batches"));
+        return Err(Some(DescribeError::Invalid("trailer names no batches")));
     }
     let mut crc = Crc32c::new();
     let mut sha = Sha256::new();
-    read_through(&*file, len, None, |at, b| {
+    read_through(&*file, len, stop, |at, b| {
         let below =
             usize::try_from(trailer_offset.saturating_sub(at)).map_or(b.len(), |n| n.min(b.len()));
         crc.update(&b[..below]);
         sha.update(b);
     })
-    .map_err(|e| DescribeError::Io(e.unwrap_or_else(|| io::ErrorKind::Interrupted.into())))?;
+    .map_err(|e| e.map(DescribeError::Io))?;
     if crc.finish() != trailer.file_crc32c {
-        return Err(DescribeError::Invalid("file_crc32c does not match"));
+        return Err(Some(DescribeError::Invalid("file_crc32c does not match")));
     }
     Ok(SealedFile {
         id: *id,

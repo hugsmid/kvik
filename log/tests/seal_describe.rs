@@ -452,3 +452,53 @@ fn a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread() {
         assert_eq!(got[id], expected(*id, bytes));
     }
 }
+
+fn start_log(fs: &Watch) -> kvik_log::writer::Log {
+    use std::sync::Arc;
+
+    use kvik_log::store::StoreDir;
+    use kvik_log::writer::{Log, LogWriter, SystemClock};
+
+    let store = StoreDir::open(Arc::new(fs.clone()), &dir(), None).unwrap();
+    let w = LogWriter::open(
+        store,
+        seal_rig::cfg(),
+        Some([1; 16]),
+        std::time::Duration::ZERO,
+        T0,
+    )
+    .unwrap();
+    Log::start(w, Arc::new(SystemClock::default())).unwrap()
+}
+
+#[test]
+fn a_shutdown_drops_a_description_in_flight_before_its_next_read() {
+    use std::time::Instant;
+
+    use kvik_log::header::HEADER_LEN;
+
+    let fs = sealed_store(2);
+    let files = sealed_files(&fs.inner);
+    let (entered, release) = fs.hold_next_maint_read();
+    let log = start_log(&fs);
+    entered.recv_timeout(seal_rig::WAIT).unwrap();
+    fs.reset_reads();
+    let watch = log.watch();
+    let stopping = std::thread::spawn(move || log.shutdown());
+    let deadline = Instant::now() + seal_rig::WAIT;
+    while !watch.stopped() {
+        assert!(Instant::now() < deadline, "the writer did not stop");
+        std::thread::sleep(seal_rig::MS);
+    }
+    release.send(()).unwrap();
+    stopping.join().unwrap().unwrap();
+    let read: Vec<u64> = files
+        .keys()
+        .map(|&id| fs.read_of(&seg_path(id, true)))
+        .collect();
+    assert_eq!(read, vec![HEADER_LEN as u64, 0]);
+    // Found again at the next start.
+    let mut r = Rig::open(fs);
+    r.maint();
+    assert_eq!(by_id(&r.described).len(), 2);
+}

@@ -1373,8 +1373,11 @@ restore's field 9, set-aside segments included), so a segment a restore placed i
 the new generation (scenario from the review of roadmap 6.3b: after a restore, earlier generations' segments are named
 only by the `0x25`). The writer hands them out one at a time (`LogWriter::take_unlisted`, run by
 `writer::describe_sealed` on `kvik-maint`), only while no seal is ready or running and the store is writable, outside
-`seals_running` and `sealed_segments`; a shutdown drops one not started, so neither a start nor a shutdown waits for
-them, and one not described when the writer stops is found again at the next start. (c) No description
+`seals_running` and `sealed_segments`. Once a shutdown begins none is handed out, and one in flight is dropped before
+its next file operation (a read is at most 1 MiB), so neither a start nor a shutdown waits for a description beyond
+the read under way; one not described when the writer stops is found again at the next start (the owner's ruling at
+the review of roadmap 6.3b; scenario: a stop in the first minutes of a run, with every sealed segment still queued,
+waited for a whole segment's read). (c) No description
 (`DescribeError`): the segment stays unnamed, nothing is written, no fault is set, and the next start tries again; a
 damaged file's hash is never taken as the hash at seal. Health is degraded by `Reason::SegmentDamaged { file_id }`
 (`api.md` Health) while the writer runs, and raised again at each start until a description succeeds: an unreadable
@@ -1385,11 +1388,12 @@ acknowledgement (the owner's ruling on (c), at the review of roadmap 6.3b). `log
 `a_start_skips_every_segment_a_record_lists_by_generation_and_id`,
 `no_segment_is_described_while_a_seal_is_ready_or_running`,
 `a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread`,
+`a_shutdown_drops_a_description_in_flight_before_its_next_read`,
 `a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health_naming_it`,
 `describe_sealed_refuses_each_check_it_makes`,
 `a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
 the records `kvik-files` encodes,
-`listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`). Not pinned by a test: that a shutdown drops a description not started.
+`listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`).
 (d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
 outside the crate; `kvik` maps those it knows and skips any other. Scenario (the review of roadmap 6.3b): a branch
 that matched every log reason stopped compiling once `SegmentDamaged` merged, with no textual conflict to warn of it.
