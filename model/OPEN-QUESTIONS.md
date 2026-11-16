@@ -1398,7 +1398,8 @@ restored generation would take id floor 0 and let a new series take an id the re
 from sealed segments above the registry file's `through` (Q-130, Q-115 (f)) were read from generation 0 only.
 **Decided (8.3c).** The start's sealed scan reads every sealed segment of its generation and earlier ones above the
 registry file of its own generation (`through` compared as a position), and with no such file every sealed segment
-(the cost of Q-116 (n)). A batch set aside (Q-263) counts toward the id floor, facts and definitions alike, and gives
+(the cost of Q-116 (n)). Every batch there counts toward the id floor, facts, definitions and a recovery entry's
+floor alike (an id a rule 1 truncation reserved lives only in its entry's floor); a batch set aside (Q-263) counts too, and gives
 no consumer and no interval length; the rest give all three. Interval lengths apply in log order between the registry
 file's and the unsealed log's. The first start takes this floor into its mark. Accepted by the owner.
 **What changes in generation 0** (`log/src/writer/generation.rs` `scan_sealed`, `log/src/writer/recovery.rs`
@@ -1414,7 +1415,8 @@ file's and the unsealed log's. The first start takes this floor into its mark. A
    the position `(0, through)`, the same order as the bare sequence in generation 0).
 Tests: `log/tests/generation/main.rs`
 `set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`,
-`f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources`.
+`f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources`; `log/tests/generation/first_start.rs`
+`a_recovery_entrys_id_floor_in_the_sealed_log_counts_at_the_first_start`.
 ## Q-263 — What is set aside: whole batches, by their first position
 Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
 **Scenario.** §8 Restore step 1 sets aside positions; the writer's and the reader's scans skip batches.

@@ -105,7 +105,8 @@ impl Gen {
 pub(super) struct SealedScan {
     /// Consumers named by routing changes.
     pub consumers: BTreeSet<String>,
-    /// The highest series id defined or used, set-aside batches included (`spec.md` §8 Restore step 1).
+    /// The highest series id defined, used or carried by a recovery entry's floor, set-aside batches included
+    /// (`spec.md` §8 Restore step 1).
     pub id_floor: u32,
     /// Interval lengths by definition, in log order.
     pub intervals: Vec<(u32, IntervalLength)>,
@@ -162,6 +163,7 @@ pub(super) fn scan_sealed(
                     Item::Entry(Entry::Routing(rc)) if !aside => {
                         out.consumers.insert(rc.consumer.clone());
                     }
+                    Item::Entry(Entry::Recovery(r)) => out.id_floor = out.id_floor.max(r.id_floor),
                     _ => {}
                 }
             }

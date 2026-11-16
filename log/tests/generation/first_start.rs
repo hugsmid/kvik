@@ -1,10 +1,11 @@
 //! The first start of a restored generation and the starts after it (Q-260, Q-262, Q-264): which mark is read as
 //! no mark, the id floor the first start takes, and a crash at every operation of `init_generation` and that start.
 
+use std::io;
 use std::time::Duration;
 
 use kvik_log::cursor::{CursorState, append};
-use kvik_log::fs::{Fs, MemFs};
+use kvik_log::fs::{FaultOp, Fs, MemFs};
 use kvik_log::mark::ResetStamp;
 use kvik_log::writer::{
     GenerationStart, LossKind, MarkSync, Position, StartReport, StartRule, WriterConfig,
@@ -173,4 +174,30 @@ fn a_generation_starting_above_1_loses_nothing_below_its_first_position_after_it
     r.submit(vec![fact(5, 0)]);
     r.drain();
     assert_eq!(r.acked, vec![at(1, 6)]);
+}
+
+/// The id floor a rule 1 recovery entry carries (an id held only by the batch it truncated) counts in the sealed
+/// scan, which is the only source at a restored generation's first start.
+#[test]
+fn a_recovery_entrys_id_floor_in_the_sealed_log_counts_at_the_first_start() {
+    let mut r = Rig::on(MemFs::new(), cfg(), None);
+    r.open();
+    r.submit(vec![interval_series(5)]);
+    r.drain();
+    r.fs.fail_nth(FaultOp::Write, "MARK", 0, io::ErrorKind::Other);
+    r.submit(vec![interval_series(12)]);
+    r.step();
+    r.kill();
+    let e = r
+        .open()
+        .entry
+        .expect("rule 1 truncates the batch beyond the mark");
+    assert!(e.entry.id_floor >= 12);
+    r.submit(vec![fact(5, 0)]);
+    r.drain();
+    r.timed_seal();
+    let end = r.acked.last().unwrap().sequence;
+    let mut g1 = restored_from(&sealed_files(&r), generation_start(end), cfg());
+    assert_eq!(g1.open().rule, StartRule::FirstStart);
+    assert_eq!(g1.mark().max_series_id, 12);
 }
