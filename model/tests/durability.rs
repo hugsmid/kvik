@@ -518,3 +518,26 @@ fn s3_a_complete_flagged_batch_after_a_damaged_one_is_kept_and_the_damage_is_a_l
         && l.first == Some(damaged)
         && l.last == Some(damaged)));
 }
+
+#[test]
+fn s4_a_consumer_resuming_over_unsynced_flagged_batches_catches_them_up() {
+    let (mut m, fast, _) = levels_model();
+    let ps: Vec<Position> = (1..=2).map(|t| commit(&mut m, fast, t)).collect();
+    m.reconnect(C).unwrap();
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        m.catch_up(C, 8).unwrap();
+        got.extend(m.receive(C, usize::MAX).unwrap());
+    }
+    let facts: Vec<Position> = got
+        .iter()
+        .filter_map(|d| d.fact().map(|f| f.position))
+        .collect();
+    assert_eq!(facts, ps);
+    assert!(
+        got.iter()
+            .filter_map(Envelope::resync)
+            .all(|r| r.replaced.is_none()),
+        "no resync replaces them"
+    );
+}

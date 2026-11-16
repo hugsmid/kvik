@@ -3529,6 +3529,14 @@ impl Model {
                         .iter()
                         .map(|e| e.position),
                 );
+                // Catch-up reads on through the flagged batches written
+                // beyond the mark (§4 Overflow, §3 Commit).
+                let flagged = file
+                    .batches
+                    .iter()
+                    .enumerate()
+                    .filter(|(b, _)| self.disk.flagged.contains(&(f, *b)));
+                out.extend(flagged.flat_map(|(_, x)| x.iter().map(|e| e.position)));
             }
         }
         out
