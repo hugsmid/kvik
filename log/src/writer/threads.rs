@@ -7,20 +7,24 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
+use super::maint::{
+    AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest, describe_sealed,
+};
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Done, Fault, FaultOp, Halt, IngestQueue,
-    LogStats, LogWriter, Reason, Wait, create_segment, seal_segment,
+    LogStats, LogWriter, Reason, Wait, create_segment, seal_segment_described,
 };
+use crate::batch::SegmentIdentity;
 use crate::content::Item;
 use crate::fs::Fs;
-use crate::segment::SegmentDescription;
+use crate::segment::SealedFile;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -154,7 +158,9 @@ struct Maint {
     request: Option<SegmentRequest>,
     created: Option<Result<AheadSegment, CreateError>>,
     jobs: VecDeque<SealJob>,
-    results: Vec<(SealJob, Result<Option<SegmentDescription>, SealError>)>,
+    results: Vec<(SealJob, Result<SealedFile, SealError>)>,
+    describe: Option<(PathBuf, SegmentIdentity)>,
+    described: Option<Result<SealedFile, DescribeError>>,
     stop: bool,
 }
 
@@ -167,7 +173,7 @@ struct Info {
     progress: u64,
     /// The writer thread has ended.
     stopped: bool,
-    sealed: Vec<SegmentDescription>,
+    sealed: Vec<SealedFile>,
 }
 
 #[derive(Debug)]
@@ -414,7 +420,7 @@ impl Log {
 
     /// The descriptions of segments sealed, and of sealed segments no manifest record listed at the start, since the
     /// last call ([`LogWriter::take_sealed`]).
-    pub fn take_sealed(&self) -> Vec<SegmentDescription> {
+    pub fn take_sealed(&self) -> Vec<SealedFile> {
         std::mem::take(&mut lock(&self.shared.info).sealed)
     }
 
@@ -473,6 +479,9 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     for (job, r) in m.results.drain(..) {
         w.seal_done(job, r, now);
     }
+    if let Some(r) = m.described.take() {
+        w.unlisted_done(r);
+    }
     let mut work = false;
     if let Some(req) = w.segment_request(s.clock.wall()) {
         m.request = Some(req);
@@ -481,6 +490,10 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     let jobs = w.take_seal_jobs(now);
     work |= !jobs.is_empty();
     m.jobs.extend(jobs);
+    if let Some(id) = w.take_unlisted() {
+        m.describe = Some((w.log_dir().to_path_buf(), id));
+        work = true;
+    }
     drop(m);
     if work {
         s.maint_cv.notify_all();
@@ -651,13 +664,14 @@ fn maint_loop(s: &Shared) {
     let _guard = MaintGuard(s);
     loop {
         let mut m = lock(&s.maint);
-        while m.request.is_none() && m.jobs.is_empty() && !m.stop {
+        while m.request.is_none() && m.jobs.is_empty() && m.describe.is_none() && !m.stop {
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
         }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
             m.request = None;
             m.jobs.clear();
+            m.describe = None;
             if m.stop {
                 return;
             }
@@ -671,8 +685,14 @@ fn maint_loop(s: &Shared) {
             lock(&s.maint).created = Some(r);
         } else if let Some(job) = m.jobs.pop_front() {
             drop(m);
-            let r = seal_segment(&*s.fs, &job, &s.halt);
+            let r = seal_segment_described(&*s.fs, &job, &s.halt);
             lock(&s.maint).results.push((job, r));
+        } else if !m.stop
+            && let Some((dir, id)) = m.describe.take()
+        {
+            drop(m);
+            let r = describe_sealed(&*s.fs, &dir, &id);
+            lock(&s.maint).described = Some(r);
         } else {
             return;
         }

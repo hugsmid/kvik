@@ -40,43 +40,6 @@ pub struct SealSummary {
     pub batch_count: u64,
 }
 
-/// Bytes of a log segment's file description (`format.md` A.14): it names no inputs.
-pub const DESCRIPTION_LEN: usize = 80;
-
-/// A sealed log segment as a manifest record describes it (`format.md` A.14 file description, kind 1), and its size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SegmentDescription {
-    /// The generation of its header and of its positions.
-    pub generation: u32,
-    /// Its file id.
-    pub file_id: u64,
-    /// The trailer's `first_sequence`.
-    pub first_sequence: u64,
-    /// The trailer's `last_sequence`.
-    pub last_sequence: u64,
-    /// Its length in bytes.
-    pub size: u64,
-    /// SHA-256 of every byte of the sealed file (`format.md` A.9, Q-220).
-    pub sha256: [u8; 32],
-}
-
-impl SegmentDescription {
-    /// The A.14 file description: kind 1, class 0, positions present, no inputs. `size` is not part of it.
-    pub fn encode(&self) -> [u8; DESCRIPTION_LEN] {
-        let mut b = [0u8; DESCRIPTION_LEN];
-        b[0] = kind::LOG_SEGMENT;
-        b[2] = 1;
-        b[4..8].copy_from_slice(&self.generation.to_le_bytes());
-        b[8..16].copy_from_slice(&self.file_id.to_le_bytes());
-        b[16..20].copy_from_slice(&self.generation.to_le_bytes());
-        b[20..28].copy_from_slice(&self.first_sequence.to_le_bytes());
-        b[28..32].copy_from_slice(&self.generation.to_le_bytes());
-        b[32..40].copy_from_slice(&self.last_sequence.to_le_bytes());
-        b[40..72].copy_from_slice(&self.sha256);
-        b
-    }
-}
-
 /// The seal blocks (A.4 seal step 1): the segment index block, the trailer block and the end marker, to be written
 /// at `before.len()`, the offset just past the last complete batch. `before` is the file from offset 0 up to there;
 /// `file_crc32c` covers it and the index block.

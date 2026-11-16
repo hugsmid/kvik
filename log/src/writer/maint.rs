@@ -1,10 +1,9 @@
 //! The work of the `kvik-maint` thread for the log: creating a segment ahead of use, sealing one (`format.md` A.4),
-//! and describing a sealed one by its size and plaintext SHA-256 (`format.md` A.9, A.14). Each function only performs file operations; the writer decides when they run and what their
-//! results mean.
+//! and describing a sealed one by its length and plaintext SHA-256 (`format.md` A.9, A.14). Each function only
+//! performs file operations; the writer decides when they run and what their results mean.
 
 use std::io;
 use std::path::{Path, PathBuf};
-
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
@@ -19,7 +18,7 @@ use crate::crc::Crc32c;
 use crate::fs::{Fs, FsFile, OpenMode, is_sharing_error};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::name::SegmentName;
-use crate::segment::{SealSummary, SegmentDescription, encode_seal_streamed};
+use crate::segment::{SealSummary, SealedFile, encode_seal_streamed};
 
 use super::{Fault, FaultOp, Halt};
 
@@ -182,81 +181,31 @@ fn create_inner(
     })
 }
 
-/// Work for `kvik-maint` on a segment: seal it, or describe one already sealed that no manifest record lists.
-#[derive(Debug)]
-pub struct SealJob {
-    pub(crate) id: SegmentIdentity,
-    pub(crate) log_dir: PathBuf,
-    pub(crate) work: Work,
-}
-
-#[derive(Debug)]
-pub(crate) enum Work {
-    Seal(Box<SealWork>),
-    Describe,
-}
-
 /// A full or timed-out segment to seal; the next segment is in use and synced.
 #[derive(Debug)]
-pub(crate) struct SealWork {
-    file: Box<dyn FsFile>,
+pub struct SealJob {
+    pub(crate) file: Box<dyn FsFile>,
+    pub(crate) id: SegmentIdentity,
+    pub(crate) log_dir: PathBuf,
     /// Just past the last complete batch.
-    end: u64,
-    summary: SealSummary,
-    records: Vec<IndexRecord>,
-    has_entries: bool,
-    /// Kept across a blocked seal's retries, so the segment is read and hashed once per seal (Q-220).
-    prepared: OnceLock<Prepared>,
+    pub(crate) end: u64,
+    pub(crate) summary: SealSummary,
+    pub(crate) records: Vec<IndexRecord>,
+    pub(crate) has_entries: bool,
+    /// Kept across a blocked seal's retries, so the segment is read and hashed once per seal (Q-220 (c)).
+    pub(crate) prepared: OnceLock<Prepared>,
 }
 
 #[derive(Debug)]
-struct Prepared {
+pub(crate) struct Prepared {
     seal: Vec<u8>,
     sha256: [u8; 32],
 }
 
 impl SealJob {
-    /// Seals the segment from step 1: `end` is just past its last complete batch.
-    pub(crate) fn seal(
-        file: Box<dyn FsFile>,
-        id: SegmentIdentity,
-        log_dir: PathBuf,
-        end: u64,
-        summary: SealSummary,
-        records: Vec<IndexRecord>,
-        has_entries: bool,
-    ) -> Self {
-        Self {
-            id,
-            log_dir,
-            work: Work::Seal(Box::new(SealWork {
-                file,
-                end,
-                summary,
-                records,
-                has_entries,
-                prepared: OnceLock::new(),
-            })),
-        }
-    }
-
-    /// Describes the sealed segment `id`, which no manifest record lists (`spec.md` §7 Manifest, Q-221).
-    pub(crate) fn describe(id: SegmentIdentity, log_dir: PathBuf) -> Self {
-        Self {
-            id,
-            log_dir,
-            work: Work::Describe,
-        }
-    }
-
     /// The segment's file id.
     pub fn file_id(&self) -> u64 {
         self.id.file_id
-    }
-
-    /// Whether the job only describes a segment already sealed.
-    pub fn describes_only(&self) -> bool {
-        matches!(self.work, Work::Describe)
     }
 }
 
@@ -267,44 +216,37 @@ pub enum SealError {
     /// or the rename for lack of space: retried later; the segment stays a complete `.open` file and health is
     /// degraded (`SealBlocked`).
     Blocked(io::ErrorKind),
-    /// A write or sync failed: a write or sync failure on the log (`spec.md` §3).
+    /// A write, sync or read failed: a write or sync failure on the log (`spec.md` §3; a read, Q-221 (a)).
     Fault(Fault),
     /// Stopped before its next file operation because the store became read-only.
     Halted,
 }
 
-/// Runs a [`SealJob`] and returns the segment's description (`format.md` A.14), its hash taken in the same pass that
-/// computes `file_crc32c`, on this thread, never the commit thread (Q-220).
+/// Seals a segment (`format.md` A.4 Sealing) as [`seal_segment_described`] does, without handing out its description.
+pub fn seal_segment(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
+    seal_segment_described(fs, job, halt).map(drop)
+}
+
+/// Seals a segment (`format.md` A.4 Sealing) and returns its description, the hash taken in the pass that computes
+/// `file_crc32c`, on the calling thread (Q-220): (1) writes the segment index, the trailer and the end marker just
+/// past the last complete batch; (2) sets the length to the end marker's end; (3) `sync_all`; (4) renames `.open` to
+/// `.kvl`; (5) syncs the directory. Run again from step 1 after [`SealError::Blocked`]. `halt` is checked before
+/// every step and set on a failure, as for [`create_segment`].
 ///
-/// A seal (`format.md` A.4 Sealing): (1) writes the segment index, the trailer and the end marker just past the last
-/// complete batch; (2) sets the length to the end marker's end; (3) `sync_all`; (4) renames `.open` to `.kvl`; (5)
-/// syncs the directory. Run again from step 1 after [`SealError::Blocked`]. `halt` is checked before every step and
-/// set on a write or sync failure, as for [`create_segment`]. A failed length change is blocked only for a sharing
-/// error ([`crate::fs::is_sharing_error`]); a failed rename for a sharing error or lack of space. Any other failure of
-/// either is a write failure on the log. A rename that failed although the `.open` name is gone and the `.kvl` name
-/// exists took effect and then failed its flush (`StdFs` on Windows): a failed sync, never retried (`format.md`
-/// A.13).
-///
-/// A description only: `None` when the segment cannot be read whole or is not a valid sealed segment whose
-/// `file_crc32c` matches (Q-221); it touches nothing and sets no fault.
-pub fn seal_segment(
+/// A failed length change is blocked only for a sharing error ([`crate::fs::is_sharing_error`]); a failed rename
+/// for a sharing error or lack of space. Any other failure of either is a write failure on the log. A rename that
+/// failed although the `.open` name is gone and the `.kvl` name exists took effect and then failed its flush
+/// (`StdFs` on Windows): a failed sync, never retried (`format.md` A.13).
+pub fn seal_segment_described(
     fs: &dyn Fs,
     job: &SealJob,
     halt: &Halt,
-) -> Result<Option<SegmentDescription>, SealError> {
-    let r = match &job.work {
-        Work::Seal(w) => seal_inner(fs, job, w, halt).map(Some),
-        Work::Describe => describe(fs, job, halt),
-    };
+) -> Result<SealedFile, SealError> {
+    let r = seal_inner(fs, job, halt);
     if let Err(SealError::Fault(f)) = &r {
         halt.set(f.clone());
     }
     r
-}
-
-enum ReadError {
-    Halted,
-    Io(io::Error),
 }
 
 /// Reads `file` from 0 to `end`, `SEAL_READ` bytes at a time, so memory does not grow with `segment_size`
@@ -312,44 +254,48 @@ enum ReadError {
 fn read_through(
     file: &dyn FsFile,
     end: u64,
-    halt: &Halt,
+    halt: Option<&Halt>,
     mut each: impl FnMut(u64, &[u8]),
-) -> Result<(), ReadError> {
+) -> Result<(), Option<io::Error>> {
     let mut buf = vec![0u8; SEAL_READ.min(usize::try_from(end).unwrap_or(SEAL_READ))];
     let mut at = 0u64;
     while at < end {
-        if halt.is_set() {
-            return Err(ReadError::Halted);
+        if halt.is_some_and(|h| h.is_set()) {
+            return Err(None);
         }
-        let want = (end - at).min(buf.len() as u64) as usize;
+        let want = usize::try_from(end - at).map_or(buf.len(), |n| n.min(buf.len()));
         match file.read_at(&mut buf[..want], at) {
-            Ok(0) => return Err(ReadError::Io(io::ErrorKind::UnexpectedEof.into())),
+            Ok(0) => return Err(Some(io::ErrorKind::UnexpectedEof.into())),
             Ok(n) => {
                 each(at, &buf[..n]);
                 at += n as u64;
             }
-            Err(e) => return Err(ReadError::Io(e)),
+            Err(e) => return Err(Some(e)),
         }
     }
     Ok(())
 }
 
-fn prepare(w: &SealWork, path: &Path, halt: &Halt) -> Result<Prepared, SealError> {
+fn prepare(job: &SealJob, path: &Path, halt: &Halt) -> Result<Prepared, SealError> {
     let mut crc = Crc32c::new();
     let mut sha = Sha256::new();
-    read_through(&*w.file, w.end, halt, |_, b| {
+    read_through(&*job.file, job.end, Some(halt), |_, b| {
         crc.update(b);
         sha.update(b);
     })
     .map_err(|e| match e {
-        ReadError::Halted => SealError::Halted,
-        ReadError::Io(e) => SealError::Fault(fault(FaultOp::Seal, path, &e)),
+        None => SealError::Halted,
+        Some(e) => SealError::Fault(fault(FaultOp::Seal, path, &e)),
     })?;
     let index = SegmentIndex {
-        flags: if w.has_entries { INDEX_HAS_ENTRIES } else { 0 },
-        records: w.records.clone(),
+        flags: if job.has_entries {
+            INDEX_HAS_ENTRIES
+        } else {
+            0
+        },
+        records: job.records.clone(),
     };
-    let seal = encode_seal_streamed(crc, w.end, &w.summary, &index).map_err(|e| {
+    let seal = encode_seal_streamed(crc, job.end, &job.summary, &index).map_err(|e| {
         SealError::Fault(Fault {
             op: FaultOp::Seal,
             path: path.to_path_buf(),
@@ -364,12 +310,7 @@ fn prepare(w: &SealWork, path: &Path, halt: &Halt) -> Result<Prepared, SealError
     })
 }
 
-fn seal_inner(
-    fs: &dyn Fs,
-    job: &SealJob,
-    w: &SealWork,
-    halt: &Halt,
-) -> Result<SegmentDescription, SealError> {
+fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SealedFile, SealError> {
     let go = || {
         if halt.is_set() {
             Err(SealError::Halted)
@@ -380,21 +321,20 @@ fn seal_inner(
     go()?;
     let path = segment_path(&job.log_dir, &job.id, false);
     let f = |op, e: &io::Error| SealError::Fault(fault(op, &path, e));
-    let p = match w.prepared.get() {
+    let p = match job.prepared.get() {
         Some(p) => p,
         None => {
-            let p = prepare(w, &path, halt)?;
-            w.prepared.get_or_init(|| p)
+            let p = prepare(job, &path, halt)?;
+            job.prepared.get_or_init(|| p)
         }
     };
-    let seal = &p.seal;
     go()?;
-    w.file
-        .write_at(seal, w.end)
+    job.file
+        .write_at(&p.seal, job.end)
         .map_err(|e| f(FaultOp::Write, &e))?;
     go()?;
-    let size = w.end + seal.len() as u64;
-    w.file.set_len(size).map_err(|e| {
+    let len = job.end + p.seal.len() as u64;
+    job.file.set_len(len).map_err(|e| {
         if is_sharing_error(&e) {
             SealError::Blocked(e.kind())
         } else {
@@ -402,7 +342,7 @@ fn seal_inner(
         }
     })?;
     go()?;
-    w.file.sync_all().map_err(|e| f(FaultOp::Sync, &e))?;
+    job.file.sync_all().map_err(|e| f(FaultOp::Sync, &e))?;
     go()?;
     let sealed = segment_path(&job.log_dir, &job.id, true);
     if let Err(e) = fs.rename(&path, &sealed) {
@@ -418,105 +358,103 @@ fn seal_inner(
     go()?;
     fs.sync_dir(&job.log_dir)
         .map_err(|e| SealError::Fault(fault(FaultOp::Sync, &job.log_dir, &e)))?;
-    Ok(SegmentDescription {
-        generation: job.id.generation,
-        file_id: job.id.file_id,
-        first_sequence: w.summary.first_sequence,
-        last_sequence: w.summary.last_sequence,
-        size,
+    let s = &job.summary;
+    Ok(SealedFile {
+        id: job.id,
+        len,
         sha256: p.sha256,
+        sequences: (s.batch_count > 0).then_some((s.first_sequence, s.last_sequence)),
+        commit_times: (s.batch_count > 0).then_some((s.first_commit_time, s.last_commit_time)),
     })
+}
+
+/// Why [`describe_sealed`] gave no description (Q-221 (c)).
+#[derive(Debug, thiserror::Error)]
+pub enum DescribeError {
+    /// The file could not be opened or read whole.
+    #[error("the segment could not be read: {0}")]
+    Io(io::Error),
+    /// Its last bytes are not a valid trailer block and end marker naming the trailer's offset.
+    #[error("not a sealed segment")]
+    NotSealed,
+    /// It ends as a sealed segment but its header, trailer or `file_crc32c` does not agree.
+    #[error("invalid sealed segment: {0}")]
+    Invalid(&'static str),
 }
 
 /// The trailer block and the end marker: the last bytes of a sealed segment (A.9).
 const TAIL_LEN: usize = BLOCK_HEADER_LEN + TRAILER_LEN + END_MARKER_LEN;
 
-fn read_exact(file: &dyn FsFile, buf: &mut [u8], at: u64) -> Option<()> {
+fn read_exact(file: &dyn FsFile, buf: &mut [u8], at: u64) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
-        match file.read_at(&mut buf[done..], at + done as u64) {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => done += n,
+        match file.read_at(&mut buf[done..], at + done as u64)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => done += n,
         }
     }
-    Some(())
+    Ok(())
 }
 
-/// Describes a sealed segment from its own bytes (Q-221): its header must agree with its name, its last bytes must be
-/// a valid trailer and end marker, and `file_crc32c` must match, so a start never takes a damaged file's hash as the
-/// hash at seal.
-fn describe(
+/// Describes the sealed segment `id` in `log_dir` from its own bytes, for a start's segments that no record lists
+/// (`spec.md` §7 Manifest, Q-221): its header must agree with its name, its last bytes must be a valid trailer and end
+/// marker, and `file_crc32c` must match, so a damaged file's hash is never taken as the hash at seal.
+pub fn describe_sealed(
     fs: &dyn Fs,
-    job: &SealJob,
-    halt: &Halt,
-) -> Result<Option<SegmentDescription>, SealError> {
-    if halt.is_set() {
-        return Err(SealError::Halted);
-    }
-    let path = segment_path(&job.log_dir, &job.id, true);
-    let Ok(file) = fs.open(&path, OpenMode::Read) else {
-        return Ok(None);
-    };
-    let Ok(size) = file.len() else {
-        return Ok(None);
-    };
-    let Some(trailer_offset) = size
+    log_dir: &Path,
+    id: &SegmentIdentity,
+) -> Result<SealedFile, DescribeError> {
+    let path = segment_path(log_dir, id, true);
+    let file = fs.open(&path, OpenMode::Read).map_err(DescribeError::Io)?;
+    let len = file.len().map_err(DescribeError::Io)?;
+    let trailer_offset = len
         .checked_sub(TAIL_LEN as u64)
         .filter(|&o| o >= HEADER_LEN as u64)
-    else {
-        return Ok(None);
-    };
+        .ok_or(DescribeError::NotSealed)?;
     let mut head = [0u8; HEADER_LEN];
     let mut tail = [0u8; TAIL_LEN];
-    if read_exact(&*file, &mut head, 0)
-        .and_then(|()| read_exact(&*file, &mut tail, trailer_offset))
-        .is_none()
-    {
-        return Ok(None);
-    }
-    let header_agrees = FileHeader::decode(&head).is_some_and(|h| {
-        h.kind == kind::LOG_SEGMENT
-            && h.store_id == job.id.store_id
-            && h.generation == job.id.generation
-            && h.file_id == job.id.file_id
-    });
+    read_exact(&*file, &mut head, 0).map_err(DescribeError::Io)?;
+    read_exact(&*file, &mut tail, trailer_offset).map_err(DescribeError::Io)?;
     let marker_at = BLOCK_HEADER_LEN + TRAILER_LEN;
+    if decode_end_marker(&tail[marker_at..]) != Some(trailer_offset) {
+        return Err(DescribeError::NotSealed);
+    }
     let trailer = read_block(&tail, 0, marker_at as u64)
         .ok()
         .filter(|b| b.header.block_type == block_type::TRAILER)
         .and_then(|b| Trailer::decode(b.body).ok())
-        .filter(|t| t.first_sequence <= t.last_sequence);
-    let (true, Some(trailer), Some(true)) = (
-        header_agrees,
-        trailer,
-        decode_end_marker(&tail[marker_at..]).map(|o| o == trailer_offset),
-    ) else {
-        return Ok(None);
-    };
+        .ok_or(DescribeError::NotSealed)?;
+    let header_agrees = FileHeader::decode(&head).is_some_and(|h| {
+        h.kind == kind::LOG_SEGMENT
+            && h.store_id == id.store_id
+            && h.generation == id.generation
+            && h.file_id == id.file_id
+    });
+    if !header_agrees {
+        return Err(DescribeError::Invalid("header disagrees with the name"));
+    }
+    if trailer.batch_count == 0 || trailer.first_sequence > trailer.last_sequence {
+        return Err(DescribeError::Invalid("trailer names no batches"));
+    }
     let mut crc = Crc32c::new();
     let mut sha = Sha256::new();
-    let read = read_through(&*file, size, halt, |at, b| {
+    read_through(&*file, len, None, |at, b| {
         let below =
             usize::try_from(trailer_offset.saturating_sub(at)).map_or(b.len(), |n| n.min(b.len()));
         crc.update(&b[..below]);
         sha.update(b);
-    });
-    match read {
-        Err(ReadError::Halted) => return Err(SealError::Halted),
-        Err(ReadError::Io(_)) => return Ok(None),
-        Ok(()) => {}
-    }
+    })
+    .map_err(|e| DescribeError::Io(e.unwrap_or_else(|| io::ErrorKind::Interrupted.into())))?;
     if crc.finish() != trailer.file_crc32c {
-        return Ok(None);
+        return Err(DescribeError::Invalid("file_crc32c does not match"));
     }
-    Ok(Some(SegmentDescription {
-        generation: job.id.generation,
-        file_id: job.id.file_id,
-        first_sequence: trailer.first_sequence,
-        last_sequence: trailer.last_sequence,
-        size,
+    Ok(SealedFile {
+        id: *id,
+        len,
         sha256: sha.finalize().into(),
-    }))
+        sequences: Some((trailer.first_sequence, trailer.last_sequence)),
+        commit_times: Some((trailer.first_commit_time, trailer.last_commit_time)),
+    })
 }
 
 #[cfg(test)]
@@ -585,15 +523,16 @@ mod tests {
             last_commit_time: 0,
             batch_count: 1,
         };
-        let job = SealJob::seal(
-            Box::new(Small(ahead.file)),
+        let job = SealJob {
+            file: Box::new(Small(ahead.file)),
             id,
-            log_dir.clone(),
+            log_dir: log_dir.clone(),
             end,
             summary,
-            Vec::new(),
-            false,
-        );
+            records: Vec::new(),
+            has_entries: false,
+            prepared: Default::default(),
+        };
         seal_segment(&fs, &job, &halt).unwrap();
         let bytes = fs.read(&segment_path(&log_dir, &id, true)).unwrap();
         let seal = scan(&bytes, &id, ScanLimit::End).unwrap().seal.unwrap();

@@ -52,8 +52,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
-pub use maint::{create_segment, seal_segment};
+pub use maint::{AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest};
+pub use maint::{create_segment, describe_sealed, seal_segment, seal_segment_described};
 pub use options::{GenerationStart, SealListener, StartOptions};
 pub use queue::{CallSource, IngestQueue, QueueFull};
 pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
@@ -69,7 +69,7 @@ use crate::fs::{Fs, FsFile};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::lease::LeaseTable;
 use crate::mark::{MarkSlot, SLOT_OFFSETS};
-use crate::segment::{SealSummary, SegmentDescription};
+use crate::segment::{SealSummary, SealedFile};
 use crate::store::{LEASES_DIR, MARK, StoreDir, StoreError};
 
 const MIB: u64 = 1 << 20;
@@ -555,10 +555,10 @@ pub struct LogWriter {
     blocked: Vec<(SealJob, Duration)>,
     seal_blocked: BTreeSet<u64>,
     sealing: usize,
-    /// Sealed segments no manifest record listed at the start, described one at a time (Q-221).
+    /// Sealed segments no manifest record listed at the start, described one at a time (Q-221 (b)).
     unlisted: VecDeque<SegmentIdentity>,
     describing: bool,
-    described: Vec<SegmentDescription>,
+    described: Vec<SealedFile>,
     disk: Disk,
     waiting: Option<Wait>,
     stats: LogStats,
@@ -827,7 +827,7 @@ impl LogWriter {
     }
 
     /// Seal jobs ready to run: segments whose successor is in use and synced, and blocked seals whose retry time
-    /// has come; with none of those, one sealed segment that no manifest record listed at the start, to describe.
+    /// has come.
     pub fn take_seal_jobs(&mut self, now: Duration) -> Vec<SealJob> {
         self.sync_halt();
         if self.fault.is_some() {
@@ -840,38 +840,49 @@ impl LogWriter {
         self.blocked = wait;
         out.extend(due.into_iter().map(|(j, _)| j));
         self.sealing += out.len();
-        if out.is_empty()
-            && !self.describing
-            && let Some(id) = self.unlisted.pop_front()
-        {
-            self.describing = true;
-            out.push(SealJob::describe(id, self.log_dir.clone()));
-        }
         out
+    }
+
+    /// One sealed segment that no manifest record listed at the start, to describe with [`describe_sealed`] in
+    /// [`LogWriter::log_dir`]: only while no seal is ready or running, none is being described and the store is
+    /// writable (Q-221 (b)).
+    pub fn take_unlisted(&mut self) -> Option<SegmentIdentity> {
+        self.sync_halt();
+        if self.fault.is_some() || self.describing || self.seals_running() {
+            return None;
+        }
+        let id = self.unlisted.pop_front()?;
+        self.describing = true;
+        Some(id)
+    }
+
+    /// The result of describing a segment [`LogWriter::take_unlisted`] handed out; a segment that cannot be
+    /// described stays unlisted and sets no fault (Q-221 (c)).
+    pub fn unlisted_done(&mut self, result: Result<SealedFile, DescribeError>) {
+        self.describing = false;
+        if let Ok(f) = result {
+            self.described.push(f);
+        }
+    }
+
+    /// The log directory.
+    pub fn log_dir(&self) -> &Path {
+        &self.log_dir
     }
 
     /// The result of a seal job.
     pub fn seal_done(
         &mut self,
         job: SealJob,
-        result: Result<Option<SegmentDescription>, SealError>,
+        result: Result<SealedFile, SealError>,
         now: Duration,
     ) {
-        if job.describes_only() {
-            self.describing = false;
-            match result {
-                Ok(d) => self.described.extend(d),
-                Err(SealError::Fault(f)) => self.fail_with(f),
-                Err(_) => self.sync_halt(),
-            }
-            return;
-        }
         self.sealing = self.sealing.saturating_sub(1);
         match result {
-            Ok(d) => {
+            Ok(f) => {
                 self.seal_blocked.remove(&job.file_id());
                 self.stats.sealed_segments += 1;
-                self.described.extend(d);
+                self.described.push(f);
             }
             Err(SealError::Blocked(_)) => {
                 self.seal_blocked.insert(job.file_id());
@@ -883,13 +894,12 @@ impl LogWriter {
     }
 
     /// The descriptions of segments sealed, and of sealed segments no manifest record listed at the start, since the
-    /// last call, each once (`format.md` A.14, Q-220).
-    pub fn take_sealed(&mut self) -> Vec<SegmentDescription> {
+    /// last call, each once (Q-220 (d)). None leaves before the start's lost-range records are synced (Q-290).
+    pub fn take_sealed(&mut self) -> Vec<SealedFile> {
         std::mem::take(&mut self.described)
     }
 
-    /// Whether seal jobs are ready to run or running; blocked seals waiting for their retry and descriptions are not
-    /// counted.
+    /// Whether seal jobs are ready to run or running; blocked seals waiting for their retry are not counted.
     pub fn seals_running(&self) -> bool {
         !self.seals.is_empty() || self.sealing > 0
     }
@@ -1141,15 +1151,16 @@ impl LogWriter {
         if let Some(old) = self.open.replace(next)
             && let Some(summary) = old.summary
         {
-            self.seals.push(SealJob::seal(
-                old.file,
-                old.id,
-                self.log_dir.clone(),
-                old.write_offset,
+            self.seals.push(SealJob {
+                end: old.write_offset,
+                file: old.file,
+                id: old.id,
+                log_dir: self.log_dir.clone(),
                 summary,
-                old.index.into_values().collect(),
-                old.has_entries,
-            ));
+                records: old.index.into_values().collect(),
+                has_entries: old.has_entries,
+                prepared: Default::default(),
+            });
         }
     }
 

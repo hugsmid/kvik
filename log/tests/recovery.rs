@@ -20,7 +20,7 @@ use kvik_log::scan::{ScanLimit, Tail, scan};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
     Call, CallSource as _, IngestQueue, LogWriter, LossKind, MarkSync, StartReport, StartRule,
-    WriterConfig, create_segment, seal_segment,
+    WriterConfig, create_segment, seal_segment_described,
 };
 use proptest::prelude::*;
 
@@ -160,7 +160,7 @@ impl Rig {
                 w.segment_created(r);
             }
             for job in w.take_seal_jobs(self.now) {
-                let r = seal_segment(&fs, &job, &w.halt());
+                let r = seal_segment_described(&fs, &job, &w.halt());
                 w.seal_done(job, r, self.now);
             }
         }

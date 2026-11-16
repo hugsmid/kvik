@@ -840,7 +840,7 @@ pub(super) fn start(
     let listed = listed_segments(&manifest_bytes, &manifest);
     let unlisted: Vec<SegmentIdentity> = sealed
         .iter()
-        .filter(|(n, _)| !listed.contains(&n.file_id))
+        .filter(|(n, _)| !listed.contains(&(n.generation, n.file_id)))
         .map(|(n, _)| SegmentIdentity {
             store_id,
             file_id: n.file_id,
@@ -1716,15 +1716,16 @@ pub(super) fn start(
         let seg = open_segment(file, s.id, s.len, end, batches.into_iter(), &intervals, now);
         if let Some(summary) = seg.summary {
             report.to_seal.push(s.id.file_id);
-            seals.push(SealJob::seal(
-                seg.file,
-                seg.id,
-                log_dir.clone(),
+            seals.push(SealJob {
+                file: seg.file,
+                id: seg.id,
+                log_dir: log_dir.clone(),
                 end,
                 summary,
-                seg.index.into_values().collect(),
-                seg.has_entries,
-            ));
+                records: seg.index.into_values().collect(),
+                has_entries: seg.has_entries,
+                prepared: Default::default(),
+            });
         }
     }
     // A segment created ahead whose id is not above the one in use cannot be taken into use: removed.
