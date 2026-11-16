@@ -93,6 +93,10 @@ again; nothing after a gate starts before it is passed. Items that do not depend
 - [x] 8.2 Backup sink interface with an S3-compatible implementation, tested against a local fake
 - [ ] 8.3 Restore, partial restore and rebuild
 - [ ] 8.4 **Gate** — restore passes end to end
+- [ ] 8.5 Self-repair: a loss is restored from a verified copy, then offered to the application for re-sending, then
+  closed by a record, with health back to OK; manual acknowledgement as a setting; scheduled hash check of local files
+  (8.5a spec, format and model; 8.5b scrub, quarantine and fetch-verify-swap; 8.5c the store wired: loss states,
+  re-send requests, closing records, alerts; 8.5d the fault matrix against the model)
 
 ## 9. Query
 - [ ] 9.1 Table provider and tier selection by zoom level
