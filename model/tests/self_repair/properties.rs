@@ -140,8 +140,8 @@ impl World {
         d.hot.contains(&f) && !d.corrupt.contains(&f) && !d.quarantined.contains(&f)
     }
 
-    /// Checks that a step adding `judged` findings and `found` damaged files
-    /// adds exactly that many corruptions, each alerting (B1, M4).
+    /// Checks that a step finding `files` damaged or lost adds exactly that
+    /// many corruptions, each alerting (Q-240, Q-247).
     fn findings_added(&mut self, before: usize, files: &[FileId]) -> Result<(), TestCaseError> {
         prop_assert_eq!(self.m.corruptions().len(), before + files.len());
         for f in files {
@@ -312,7 +312,7 @@ impl World {
             .extend(sealed.iter().filter(|p| all.contains_key(p)));
         let losses = self.m.losses();
         // A position once readable and no longer readable lies in a loss that
-        // is open or closed otherwise than restored in full (B2).
+        // is open or closed otherwise than restored in full (§8 Self-repair stage 1).
         for p in &self.readable {
             let open = losses.iter().any(|l| covers(l, *p) && !restored(l.state));
             prop_assert!(
@@ -323,7 +323,7 @@ impl World {
             );
         }
         for l in &losses {
-            // A loss restored in full holds its facts again (M5).
+            // A loss restored in full holds its facts again.
             if restored(l.state) {
                 for p in sealed.iter().filter(|p| covers(l, **p)) {
                     prop_assert!(all.contains_key(p) || self.pending(*p), "{:?} hidden", p);
@@ -377,7 +377,7 @@ impl World {
         prop_assert_eq!(alerts.contains(&Alert::StorageSuspect(n)), suspect);
         prop_assert_eq!(h.reasons.contains(&Reason::StorageSuspect(n)), suspect);
         cover.suspect += usize::from(suspect);
-        // B3: a quarantined file is fatal only while a swap can still happen:
+        // A quarantined file is fatal only while a swap can still happen:
         // a copy is there to swap in, or the lost-object rule has not spoken.
         if !self.m.is_read_only() {
             for f in self.m.disk.quarantined.clone() {
