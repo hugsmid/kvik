@@ -4,9 +4,11 @@
 use std::io;
 use std::time::Duration;
 
+use kvik_log::content::Item;
 use kvik_log::cursor::{CursorState, append};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
 use kvik_log::mark::ResetStamp;
+use kvik_log::setaside::{RestoredEnd, SetAside};
 use kvik_log::writer::{
     GenerationStart, LossKind, MarkSync, Position, StartReport, StartRule, WriterConfig,
 };
@@ -174,6 +176,61 @@ fn a_generation_starting_above_1_loses_nothing_below_its_first_position_after_it
     r.submit(vec![fact(5, 0)]);
     r.drain();
     assert_eq!(r.acked, vec![at(1, 6)]);
+}
+
+/// `is_first_mark` compares the stamp: a first mark whose stamp is not the start's is read as a mark.
+#[test]
+fn a_first_mark_with_another_stamp_is_read_as_a_mark() {
+    let (mut r, end) = restored(cfg());
+    r.start = Some(GenerationStart {
+        stamp: ResetStamp {
+            sequence: 1,
+            nonce: 78,
+        },
+        ..generation_start(end)
+    });
+    let rep = r.open();
+    assert_ne!(rep.rule, StartRule::FirstStart);
+    assert!(rep.entry.is_some());
+    assert_ne!(r.mark().stamp, stamp());
+}
+
+/// Q-262: the first start takes the sealed log's id floor into its mark.
+#[test]
+fn the_first_start_writes_the_id_floor_in_its_mark() {
+    let (mut r, _) = restored(cfg());
+    assert_eq!(r.open().rule, StartRule::FirstStart);
+    assert_eq!(r.mark().max_series_id, 9);
+}
+
+/// Generation 0's log, a sealed segment defining series 5 and then `last` alone in a second one, restored to the end
+/// of the first, so that `last` is set aside.
+fn restored_with(last: Vec<Item>) -> Rig {
+    let mut r = Rig::on(MemFs::new(), cfg(), None);
+    r.open();
+    r.submit(vec![interval_series(5)]);
+    r.drain();
+    r.timed_seal();
+    let end = r.acked.last().unwrap().sequence;
+    r.submit(last);
+    r.drain();
+    r.timed_seal();
+    let start = GenerationStart {
+        set_aside: SetAside::new(vec![RestoredEnd {
+            generation: 1,
+            end: (0, end),
+        }]),
+        ..generation_start(end)
+    };
+    restored_from(&sealed_files(&r), start, cfg())
+}
+
+/// Q-262: a fact in a set-aside batch reserves its id, with no definition beside it.
+#[test]
+fn a_fact_in_a_set_aside_batch_reserves_its_id() {
+    let mut r = restored_with(vec![fact(20, 0)]);
+    assert_eq!(r.open().rule, StartRule::FirstStart);
+    assert_eq!(r.mark().max_series_id, 20);
 }
 
 /// The id floor a rule 1 recovery entry carries (an id held only by the batch it truncated) counts in the sealed

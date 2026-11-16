@@ -432,6 +432,16 @@ fn f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources() {
     let e = r.open().entry.unwrap();
     assert_eq!(e.sequence, 13, "F above the cursor of this generation only");
     assert_eq!(e.entry.consumers, vec!["kept".to_string()]);
+    let gap: Vec<_> = r
+        .lost_ranges()
+        .into_iter()
+        .map(|(g, l)| (g, l.first, l.last))
+        .collect();
+    assert_eq!(
+        gap,
+        vec![(1, (1, 2), (1, 12))],
+        "the entry's gap is in generation 1"
+    );
     r.kill();
     let lost = LostRange {
         identity: (1, 20),
