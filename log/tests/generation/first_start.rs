@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kvik_log::content::Item;
 use kvik_log::cursor::{CursorState, append};
+use kvik_log::entries::MarkState;
 use kvik_log::fs::{FaultOp, Fs, MemFs};
 use kvik_log::mark::{MarkSlot, ResetStamp, read_mark};
 use kvik_log::setaside::{RestoredEnd, SetAside};
@@ -75,10 +76,7 @@ fn losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generati
         let (rep, next, restamped) = lose_the_only_segment(restored(lazy()).0, 1, zeroed);
         let (rep0, next0, restamped0) =
             lose_the_only_segment(Rig::on(MemFs::new(), lazy(), None), 0, zeroed);
-        assert_eq!(
-            rep.rule,
-            StartRule::Reboot(kvik_log::entries::MarkState::Readable)
-        );
+        assert_eq!(rep.rule, StartRule::Reboot(MarkState::Readable));
         assert_eq!(rep.rule, rep0.rule, "zeroed {zeroed}");
         let e = rep.entry.as_ref().expect("a recovery entry");
         assert_eq!((e.entry.after, e.sequence), (0, 1), "zeroed {zeroed}");

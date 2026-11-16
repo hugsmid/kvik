@@ -1373,7 +1373,9 @@ generation's first position as lost (`plan`'s `kept_last`). Where no source name
 `log/tests/generation/first_start.rs`
 `losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`,
 `a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position`,
-`a_generation_starting_above_1_loses_nothing_below_its_first_position_after_its_first_start`.
+`a_generation_starting_above_1_loses_nothing_below_its_first_position_after_its_first_start`,
+`a_first_mark_with_another_stamp_is_read_as_a_mark` and, for a crash at each operation of `init_generation` and the
+first start, `a_crash_at_every_operation_of_init_generation_and_the_first_start`.
 ## Q-261 — Files of another generation at a start
 Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
 **Scenario.** A restored directory holds sealed segments of generation 0 and the writer runs in generation 1. Sorted
@@ -1416,7 +1418,8 @@ file's and the unsealed log's. The first start takes this floor into its mark. A
 Tests: `log/tests/generation/main.rs`
 `set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`,
 `f_and_the_id_floor_in_a_restored_generation_come_from_its_own_sources`; `log/tests/generation/first_start.rs`
-`a_recovery_entrys_id_floor_in_the_sealed_log_counts_at_the_first_start`.
+`a_recovery_entrys_id_floor_in_the_sealed_log_counts_at_the_first_start`,
+`the_first_start_writes_the_id_floor_in_its_mark`, `a_fact_in_a_set_aside_batch_reserves_its_id`.
 ## Q-263 — What is set aside: whole batches, by their first position
 Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
 **Scenario.** §8 Restore step 1 sets aside positions; the writer's and the reader's scans skip batches.
