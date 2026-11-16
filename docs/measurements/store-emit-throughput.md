@@ -111,3 +111,24 @@ replay).
 
 The start still reads the whole log once (Q-752): it keeps only the window, the revised keys met in it and the
 counters, so its memory is bounded; its time stays proportional to the log until tree checkpoints carry that state.
+
+## No hub work in `emit` while no consumer is registered (Q-706)
+With no consumer registered, `emit` neither runs the timers nor reads its batch back nor waits for wakes; the
+`kvik-deliver` thread takes the batch shortly after. Same harness and shapes (2,000 series, 1,500 calls per writer,
+`log.min_sync_interval = 0`, no consumer). Before is the tree just before the change, after is the tree with it; the
+builds alternated three times, each run started once the one-minute load average was under 2.0, on the same 4-core
+shared virtual machine. **Indicative.** Ranges are min–max of the three runs.
+
+| Shape | Build | Calls/s | Readings/s | Cores | CPU per reading |
+|---|---|---|---|---|---|
+| 1 writer × 2,000 readings per call | before | 196–202 | 392–405 k | 1.35–1.39 | 3.4–3.5 µs |
+| | after | 300–311 | 601–623 k | 1.93–1.96 | 3.1–3.2 µs |
+| 16 writers × 2 readings per call | before | 24,470–25,910 | 48.9–51.8 k | 1.62–1.66 | 31–34 µs |
+| | after | 31,220–32,780 | 62.4–65.6 k | 1.60–1.64 | 25–26 µs |
+
+- **One writer, 2,000 readings per call:** about 1.5× the readings per second (medians 395 k and 613 k). The store
+  now uses about two cores: the caller decides its next call while `kvik-deliver` reads the last batch back, where
+  before they took turns on the deliverer's lock. CPU per reading barely changes; the gain is wall time.
+- **16 writers, 2 readings per call:** about 1.3× the calls per second. The callers no longer queue on the
+  deliverer's lock for the timers and the read-back after each acknowledgement.
+- A store with a consumer registered behaves as before.
