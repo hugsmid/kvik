@@ -1,14 +1,15 @@
 //! Readings per second and CPU of `Store::emit` on the durable backend, with no consumer registered.
 //!
 //! ```sh
-//! cargo run --release -p kvik --example emit_throughput -- --dir <empty scratch dir> \
+//! cargo run --release -p kvik --example emit_throughput -- --dir <scratch dir> \
 //!     [--writers 1] [--per-call 2000] [--series 2000] [--calls 1500]
 //! ```
 //!
 //! Each writer thread holds its own `Store` clone and emits `--calls` calls of `--per-call` readings, each call at
 //! one new timestamp, series taken in turn from the writer's share (a gauge, every twentieth a boolean state;
 //! expected interval 1 s), with `log.min_sync_interval = 0`. Prints one line: calls/s, readings/s, cores used
-//! (process CPU over wall time, from `/proc/self/stat`; `-` elsewhere) and CPU per reading.
+//! (process CPU over wall time, from `/proc/self/stat`; `-` elsewhere) and CPU per reading. The store is created in
+//! `emit-throughput-store` under `--dir`, which must not exist yet, and only that is removed afterwards.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -74,6 +75,11 @@ fn args() -> Args {
     }
     assert!(!a.dir.as_os_str().is_empty(), "--dir is required");
     assert!(a.writers > 0 && a.per_call > 0 && a.series >= a.writers);
+    assert!(
+        a.per_call <= a.series / a.writers,
+        "--per-call is at most a writer's share of the series ({})",
+        a.series / a.writers
+    );
     a
 }
 
@@ -90,9 +96,14 @@ fn cpu_seconds() -> Option<f64> {
 
 fn main() {
     let a = args();
-    let _ = std::fs::remove_dir_all(&a.dir);
-    let mut config =
-        StoreConfig::new(a.dir.to_string_lossy().into_owned(), "Etc/UTC").create_if_missing(true);
+    let store_dir = a.dir.join("emit-throughput-store");
+    assert!(
+        !store_dir.exists(),
+        "{} exists: remove it or choose another --dir",
+        store_dir.display()
+    );
+    let mut config = StoreConfig::new(store_dir.to_string_lossy().into_owned(), "Etc/UTC")
+        .create_if_missing(true);
     config.log.min_sync_interval = Duration::ZERO;
     let store = block_on(Store::open(config)).expect("open");
     let mut ids = Vec::with_capacity(a.series);
@@ -133,7 +144,7 @@ fn main() {
                 for c in 0..calls {
                     let t = Timestamp(base + c as i64 * 1_000_000_000);
                     batch.clear();
-                    for _ in 0..per_call.min(mine.len()) {
+                    for _ in 0..per_call {
                         let (id, state) = mine[next % mine.len()];
                         next += 1;
                         let v = if state {
@@ -163,7 +174,7 @@ fn main() {
     let wall = t0.elapsed().as_secs_f64();
     let cpu = cpu_seconds().zip(cpu0).map(|(b, a)| b - a);
     let calls = (a.calls * a.writers) as f64;
-    let readings = calls * a.per_call.min(share) as f64;
+    let readings = calls * a.per_call as f64;
     let cores = cpu.map_or("-".into(), |c| format!("{:.2}", c / wall));
     let per_reading = cpu.map_or("-".into(), |c| format!("{:.2}", c / readings * 1e6));
     println!(
@@ -175,5 +186,5 @@ fn main() {
         readings / wall
     );
     block_on(store.shutdown()).expect("shutdown");
-    let _ = std::fs::remove_dir_all(&a.dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
 }
