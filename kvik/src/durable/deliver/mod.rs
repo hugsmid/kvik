@@ -36,7 +36,9 @@ use kvik_log::content::Item;
 use kvik_log::cursor::{self, Latch};
 use kvik_log::entries::Entry;
 use kvik_log::manifest::LossCause;
-use kvik_log::reader::{LogReader, ReadBatch, ReadEvent, ReaderConfig as LogReaderConfig};
+use kvik_log::reader::{
+    LogReader, ReadBatch, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError, Update,
+};
 use kvik_log::writer::{Position as LogPos, Watch};
 use kvik_model::condition::{ConditionState as MState, Runner};
 
@@ -65,6 +67,17 @@ fn before(p: LogPos) -> LogPos {
     LogPos {
         generation: p.generation,
         sequence: p.sequence.saturating_sub(1),
+    }
+}
+
+/// Refreshes `r`, unless it is at the writer's durable position, where a refresh would read nothing: only this
+/// process changes the log while it holds the store lock, and the manifest only at a start (Q-704). Then the lease
+/// is only kept alive.
+fn read_new(r: &mut LogReader, writer: Option<LogPos>) -> Result<Option<Update>, ReaderError> {
+    if writer.is_some_and(|w| r.state().durable >= w) {
+        r.keep_alive().map(|_| None)
+    } else {
+        r.refresh().map(Some)
     }
 }
 
@@ -374,8 +387,9 @@ impl Deliverer {
             return;
         };
         // A refresh that fails changes nothing the reader holds; the next one reads it again. It is counted.
-        match r.refresh() {
-            Ok(u) => self.take_events(u.events),
+        match read_new(r, ctx.watch.map(|w| w.stats().durable)) {
+            Ok(Some(u)) => self.take_events(u.events),
+            Ok(None) => {}
             Err(_) => self.stats.refresh_errors += 1,
         }
         let stats = ctx.watch.map(Watch::stats);
@@ -784,3 +798,6 @@ impl Deliverer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
