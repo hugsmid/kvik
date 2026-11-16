@@ -38,6 +38,7 @@
 //! log.shutdown().unwrap();
 //! ```
 
+mod generation;
 mod maint;
 mod options;
 mod queue;
@@ -52,6 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+pub use generation::init_generation;
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
 pub use maint::{create_segment, seal_segment};
 pub use options::{GenerationStart, SealListener, StartOptions};
@@ -584,14 +586,26 @@ impl LogWriter {
         now: Duration,
         wall: i64,
     ) -> Result<Self, OpenError> {
+        Self::open_with(store, cfg, boot_id, now, wall, StartOptions::default())
+    }
+
+    /// The start behind [`LogWriter::open_with`], once the options it does not act on yet are refused.
+    fn start(
+        store: StoreDir,
+        cfg: WriterConfig,
+        boot_id: Option<[u8; 16]>,
+        now: Duration,
+        wall: i64,
+        mut opts: StartOptions,
+    ) -> Result<Self, OpenError> {
         cfg.validate()?;
         let halt = Arc::new(Halt::default());
         let leases_dir = store.dir().join(LEASES_DIR);
-        let r = recovery::start(&store, &cfg, boot_id, now, wall, &halt)?;
+        let r = recovery::start(&store, &cfg, boot_id, now, wall, &halt, &mut opts)?;
         let fs = store.fs().clone();
         let log_dir = store.log_dir();
         let store_id = store.descriptor().store_id;
-        let generation = 0;
+        let generation = opts.generation.as_ref().map_or(0, |s| s.generation);
         let mark_mode = match (boot_id, cfg.mark_sync) {
             (None, _) => MarkSyncMode::EveryCommit {
                 reason: EveryCommitReason::NoBootId,

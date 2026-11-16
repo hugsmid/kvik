@@ -50,6 +50,15 @@ pub enum StoreError {
     /// A file operation failed.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The directory holds a mark or segment of another generation than the start was given (`spec.md` §8
+    /// Generations; Q-261).
+    #[error("the directory holds generation {found}; the start was given generation {start}")]
+    Generation {
+        /// The generation found.
+        found: u32,
+        /// The generation the start was given.
+        start: u32,
+    },
 }
 
 /// What a new store is created with (A.12).

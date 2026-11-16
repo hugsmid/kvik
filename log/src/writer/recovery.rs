@@ -30,8 +30,9 @@ use crate::scan::{HeaderState, ScanLimit, ScanReport, Tail, scan, scan_ignoring_
 use crate::segment::SealSummary;
 use crate::store::{LEASES_DIR, MANIFEST, MARK, StoreDir, StoreError};
 
+use super::generation::{Gen, scan_sealed};
 use super::maint::{AheadSegment, CreateError, SealJob, SegmentRequest, create_segment};
-use super::{Fault, FaultOp, Halt, OpenSegment, WriterConfig, reach};
+use super::{Fault, FaultOp, Halt, OpenSegment, StartOptions, WriterConfig, reach};
 
 /// Which rule a start applied (`spec.md` §3 Recovery).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -760,7 +761,10 @@ pub(super) fn start(
     now: Duration,
     wall: i64,
     halt: &Arc<Halt>,
+    opts: &mut StartOptions,
 ) -> Result<Resume, StoreError> {
+    let generation = Gen::of(opts.generation.as_ref())?;
+    let g = generation.g;
     let fs = store.fs().clone();
     let log_dir = store.log_dir();
     let store_id = store.descriptor().store_id;
@@ -793,7 +797,7 @@ pub(super) fn start(
     let registry = crate::registry::read_latest(&*fs, store.dir(), &store_id)
         .map_err(StoreError::Unsupported)?
         .map(|(_, f)| f)
-        .filter(|f| f.generation == 0);
+        .filter(|f| f.generation == g);
     let mark_path = log_dir.join(MARK);
     let mark_bytes = match store.read_file(&mark_path) {
         Ok(b) => Some(b),
@@ -807,6 +811,9 @@ pub(super) fn start(
             None => MarkRead::Unreadable,
         },
     };
+    if let MarkRead::Readable { slot, .. } = &mark {
+        generation.check(slot.generation, false)?;
+    }
     let mut segs = Vec::new();
     let mut sealed: Vec<(SegmentName, PathBuf)> = Vec::new();
     let mut max_id = 0u64;
@@ -814,6 +821,7 @@ pub(super) fn start(
         let Some(name) = SegmentName::parse(&e.name) else {
             continue;
         };
+        generation.check(name.generation, name.sealed)?;
         max_id = max_id.max(name.file_id);
         let path = log_dir.join(&e.name);
         if name.sealed {
@@ -838,8 +846,11 @@ pub(super) fn start(
     if let MarkRead::Readable { slot, .. } = &mark {
         max_id = max_id.max(slot.file_id);
     }
+    // Sealed segments of earlier generations take no part in this generation's chain (Q-261).
+    let own_sealed: Vec<&(SegmentName, PathBuf)> =
+        sealed.iter().filter(|(n, _)| n.generation == g).collect();
     // The last sealed segment's last position and commit time.
-    let sealed_last = match sealed.last() {
+    let sealed_last = match own_sealed.last() {
         Some((name, path)) => {
             let bytes = store.read_file(path)?;
             let id = SegmentIdentity {
@@ -865,7 +876,7 @@ pub(super) fn start(
         }
         None => None,
     };
-    let empty_log = segs.iter().all(|s| !s.in_use()) && sealed.is_empty();
+    let empty_log = segs.iter().all(|s| !s.in_use()) && own_sealed.is_empty();
     // Unused segments: the highest one of the configured size with a valid header is kept as created ahead.
     let unused: Vec<usize> = (0..segs.len()).filter(|&i| !segs[i].in_use()).collect();
     let keep = unused.iter().rev().copied().find(|&i| {
@@ -909,11 +920,21 @@ pub(super) fn start(
     let unused_written = unused
         .iter()
         .any(|&i| segs[i].last_nonzero > HEADER_LEN as u64);
-    if empty_log
-        && !unused_written
-        && !matches!(mark, MarkRead::Readable { .. })
-        && manifest.highest_sequence(0) == 0
-    {
+    // Routing changes, ids and intervals sealed above the registry file's `through` (Q-130), in earlier generations
+    // too, past what is set aside (Q-262). The file is written at a start, a clean shutdown and each routing change,
+    // so after a crash this reads every segment sealed since the last of those (possibly the whole previous run), and
+    // with no registry file of this generation every sealed segment; the cost is Q-116 (n).
+    let sealed_scan = scan_sealed(
+        store,
+        &sealed,
+        registry.as_ref().map(|f| (g, f.through)),
+        &generation,
+    );
+    let first_mark = match &mark {
+        MarkRead::Readable { slot, .. } => generation.is_first_mark(slot),
+        _ => true,
+    };
+    if empty_log && !unused_written && first_mark && manifest.highest_sequence(g) == 0 {
         for &i in &to_delete {
             if let Err(e) = fs.remove_file(&segs[i].path) {
                 return Ok(read_only(
@@ -924,17 +945,20 @@ pub(super) fn start(
             }
             report.deleted.push(segs[i].id.file_id);
         }
-        let slot = MarkSlot {
-            generation: 0,
-            store_id,
-            boot_id: boot,
-            counter: 1,
-            file_id: 0,
-            offset: 0,
-            last_sequence: 0,
-            max_series_id: 0,
-            stamp: ResetStamp::default(),
-        };
+        let mut intervals = HashMap::new();
+        let mut floor = sealed_scan.id_floor;
+        if let Some(f) = &registry {
+            floor = floor.max(f.floor());
+            for (_, _, e) in &f.entries {
+                if let Entry::Definition(d) = e
+                    && let Some(iv) = &d.interval
+                {
+                    intervals.insert(d.id, iv.clone());
+                }
+            }
+        }
+        intervals.extend(sealed_scan.intervals.iter().cloned());
+        let slot = generation.first_mark(store_id, boot, floor);
         let (file, created) = match mark_bytes {
             None => (fs.open(&mark_path, OpenMode::CreateNew)?, true),
             Some(_) => (fs.open(&mark_path, OpenMode::ReadWrite)?, false),
@@ -965,10 +989,10 @@ pub(super) fn start(
             ahead,
             seals: Vec::new(),
             next_file_id: max_id + 1,
-            last_sequence: 0,
+            last_sequence: slot.last_sequence,
             last_commit_time: i64::MIN,
-            max_series_id: 0,
-            intervals: HashMap::new(),
+            max_series_id: floor,
+            intervals,
             fault: None,
             report,
         });
@@ -993,59 +1017,30 @@ pub(super) fn start(
             consumers.insert(r.consumer.clone());
         }
     }
-    // Routing changes sealed above the registry file's `through` (Q-130). The file is written at a start, a clean
-    // shutdown and each routing change, so after a crash this reads every segment sealed since the last of those
-    // (possibly the whole previous run), and with no registry file every sealed segment; the cost is Q-116 (n).
-    let through = registry.as_ref().map_or(0, |f| f.through);
-    for (name, path) in sealed.iter().rev().filter(|(n, _)| n.generation == 0) {
-        let Ok(bytes) = store.read_file(path) else {
-            continue;
-        };
-        let id = SegmentIdentity {
-            store_id,
-            file_id: name.file_id,
-            generation: name.generation,
-        };
-        let Ok(r) = scan(&bytes, &id, ScanLimit::End) else {
-            continue;
-        };
-        for b in r
-            .batches
-            .iter()
-            .filter(|b| b.commit.last_sequence > through)
-        {
-            let Ok(content) = BatchContent::decode(b) else {
-                continue;
-            };
-            for i in &content.items {
-                if let Item::Entry(Entry::Routing(r)) = i {
-                    consumers.insert(r.consumer.clone());
-                }
-            }
-        }
-        if r.batches
-            .first()
-            .is_none_or(|b| b.commit.first_sequence <= through)
-        {
-            break;
-        }
-    }
+    consumers.extend(sealed_scan.consumers.iter().cloned());
     let sourced = super::sources::read_all(&super::sources::SourceContext {
         fs: &*fs,
         store_dir: store.dir(),
         store_id,
-        generation: 0,
+        generation: g,
         consumers: &consumers,
     })
     .map_err(StoreError::Unsupported)?;
-    let p = plan(
+    // F is at or above the generation's first position.
+    let mut p = plan(
         &segs,
         &mark,
         boot,
         sealed_last,
-        sealed.is_empty(),
-        manifest.highest_sequence(0).max(sourced.highest),
+        own_sealed.is_empty(),
+        manifest
+            .highest_sequence(g)
+            .max(sourced.highest)
+            .max(generation.first - 1),
     );
+    for l in &mut p.losses {
+        generation.place(l);
+    }
     report.rule = p.rule;
     // What was found is reported even if the start cannot record it.
     report.losses = p
@@ -1253,6 +1248,8 @@ pub(super) fn start(
             }
         }
     }
+    id_floor = id_floor.max(sealed_scan.id_floor);
+    intervals.extend(sealed_scan.intervals.iter().cloned());
     if matches!(p.rule, StartRule::Reboot(_)) {
         for s in &segs {
             id_floor = s.tail_ids.iter().copied().fold(id_floor, u32::max);
@@ -1443,7 +1440,7 @@ pub(super) fn start(
                             id: SegmentIdentity {
                                 store_id,
                                 file_id: next_file_id,
-                                generation: 0,
+                                generation: g,
                             },
                             log_dir: log_dir.clone(),
                             len: cfg.segment_size,
@@ -1570,7 +1567,7 @@ pub(super) fn start(
             }
         };
         mark_slot = MarkSlot {
-            generation: 0,
+            generation: g,
             store_id,
             boot_id: boot,
             counter,
@@ -1610,7 +1607,7 @@ pub(super) fn start(
         };
         // Then the entry's gap, if any, is recorded.
         if report.entry.as_ref().is_some_and(|e| !e.adopted) && f_seq > p.k + 1 {
-            let l = LostRange {
+            let mut l = LostRange {
                 id_floor,
                 stamp: Some(stamp),
                 ..lost(
@@ -1624,6 +1621,7 @@ pub(super) fn start(
                     (None, None),
                 )
             };
+            generation.place(&mut l);
             match record_loss(&*mfile, &manifest, &l, &mut epoch, wall, &manifest_path) {
                 Ok(r) => report.losses.push(found(&l, LossKind::DataLost, r)),
                 Err(f) => return ro(f, report),
@@ -1842,30 +1840,31 @@ fn record_loss(
     path: &std::path::Path,
 ) -> Result<bool, Fault> {
     let recorded: Vec<&LostRange> = m.lost_ranges().collect();
+    // Positions, not bare sequences: a restore records losses of earlier generations here (Q-261).
     let overlap = recorded
         .iter()
-        .find(|r| r.first.1 <= l.last.1 && l.first.1 <= r.last.1);
+        .find(|r| r.first <= l.last && l.first <= r.last);
     let mut rec = l.clone();
     if let Some(r) = overlap {
         // Recorded already, or extended under the recorded loss's identity.
         let lo = recorded
             .iter()
             .filter(|x| x.identity == r.identity)
-            .map(|x| x.first.1)
+            .map(|x| x.first)
             .min()
-            .unwrap_or(r.first.1);
+            .unwrap_or(r.first);
         let hi = recorded
             .iter()
             .filter(|x| x.identity == r.identity)
-            .map(|x| x.last.1)
+            .map(|x| x.last)
             .max()
-            .unwrap_or(r.last.1);
-        if l.first.1 >= lo && l.last.1 <= hi {
+            .unwrap_or(r.last);
+        if l.first >= lo && l.last <= hi {
             return Ok(true);
         }
         rec.identity = r.identity;
-        rec.first = (0, l.first.1.min(lo));
-        rec.last = (0, l.last.1.max(hi));
+        rec.first = l.first.min(lo);
+        rec.last = l.last.max(hi);
         rec.extends = true;
     }
     // A lease may name any epoch: with none left above it, the start stays read-only rather than wrapping.
@@ -1876,7 +1875,7 @@ fn record_loss(
             &io::Error::other("no manifest epoch is left above the manifest's and the leases'"),
         )
     })?;
-    let bytes = encode_record(RECORD_LOST_RANGE, *epoch, 0, wall, Some(&rec));
+    let bytes = encode_record(RECORD_LOST_RANGE, *epoch, rec.first.0, wall, Some(&rec));
     let at = f.len().map_err(|e| fault(FaultOp::Write, path, &e))?;
     f.write_at(&bytes, at)
         .and_then(|()| f.sync_data())

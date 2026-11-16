@@ -66,6 +66,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-260 | §8 Generations, Restore step 1; §3 Order of a start; §7 Readers | A restored generation's first mark and the first start in it |
+| Q-261 | §8 Generations, §3 Recovery; `format.md` A.10, A.12 | Files of another generation at a start |
+| Q-262 | §8 Restore step 1, §3 Recovery rule 3, §2.1 id floor | The writer's scans in a restored generation: set-aside batches and the id floor |
+| Q-263 | §8 Restore step 1, §7 Readers | What is set aside: whole batches, by their first position |
+| Q-264 | §3 Recovery rule 2, §8 Generations; Q-321 | Position 1 as the chain's start in a restored generation |
+| Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1330,6 +1336,82 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-260 — A restored generation's first mark and the first start in it
+Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+**Scenario.** A full restore installs its files and calls `init_generation`, which writes the generation's first mark:
+generation g, the restore record's reset stamp, no position (file 0, offset 0, last sequence one below the stamp's),
+and no boot identity, since the restore names none. The store then opens with `LogWriter::open_with`. Read as an
+ordinary mark of another boot, rule 3 would write a recovery entry at the generation's first position, so every full
+restore would put ingest one above it, and a reader would see a reset stamp change before anything was written.
+**Decided (8.3c).** The model's start (`model/src/engine/recovery.rs` `recover_tail`: "the first start of a store, or
+of a restored generation: no mark and nothing of the current generation in the log") and `design-interfaces` §5 (10)
+both take ingest at the first position. A start in generation g above 0 reads that first mark as no mark when nothing
+of generation g is in the log (no segment of g in use or sealed, no written unused segment, no lost range of g): it
+writes the first mark again with its own boot and the same stamp, writes no recovery entry, and the writer resumes at
+the stamp's sequence minus one. Generation 0 is unchanged (its first mark is written by its first start, with the
+boot). `init_generation` is idempotent: a mark of g with the same stamp is left alone, a torn one written again, a
+mark of another generation or stamp refused (`StoreError::Generation`). Safe because a segment that held an
+acknowledged batch of g cannot vanish whole by a crash (its creation syncs the directory before it is taken into
+use); damage to it is Q-264. Tests: `log/tests/generation.rs`
+`a_restored_generation_takes_ingest_at_its_first_position_with_the_restores_stamp`,
+`init_generation_writes_the_first_mark_once_and_refuses_another_generations`.
+**Needed.** The owner's acceptance, and §8 Restore step 1 to say the first mark is written without a boot and is
+read as no mark by the generation's first start.
+## Q-261 — Files of another generation at a start
+Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+**Scenario.** A restored directory holds sealed segments of generation 0 and the writer runs in generation 1. Sorted
+by name, the last sealed segment is generation 0's: taken as the chain's anchor it seeds the expected position and K
+from generation 0's sequences, makes the Q-116 (j) check see a sealed position above the mark at every start (a
+stale mark, a recovery entry each time), and the first start is never seen as one. A restore's `Lost` step records
+lost ranges of generation 0 in the manifest, which the start compared by bare sequence with its own.
+**Decided (8.3c).** The chain, the last sealed segment, an empty log and "no sealed segment" are of the start's own
+generation only; sealed segments of earlier generations are read only by the scan of Q-262. A mark of another
+generation, an unsealed segment of another generation, or a sealed segment of a later generation refuses the start
+(`StoreError::Generation { found, start }`): the caller passed the wrong generation, or the directory was not
+initialised (an unfinished restore is resumed with `restore` again, F4). Lost ranges are compared and extended by
+whole positions, and losses found are recorded in the start's generation, with the record keyed by it. Tests:
+`log/tests/generation.rs` `earlier_generations_sealed_segments_take_no_part_in_the_chain`,
+`a_start_refuses_a_mark_or_segment_of_another_generation`,
+`a_loss_in_a_restored_generation_is_recorded_in_it_beside_one_of_generation_0`.
+## Q-262 — The writer's scans in a restored generation: set-aside batches and the id floor
+Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+**Scenario.** The first mark carries no id floor and a restore installs no registry file, so the first start of a
+restored generation would take id floor 0 and let a new series take an id the restored log, or a set-aside definition
+(§8 Restore step 1: its id stays reserved), already holds. The routing changes and interval lengths the start takes
+from sealed segments above the registry file's `through` (Q-130, Q-115 (f)) were read from generation 0 only.
+**Decided (8.3c).** The start's sealed scan reads every sealed segment of its generation and earlier ones above the
+registry file of its own generation (`through` compared as a position), and with no such file every sealed segment
+(the cost of Q-116 (n)). A batch set aside (Q-263) counts toward the id floor, facts and definitions alike, and gives
+no consumer and no interval length; the rest give all three. Interval lengths apply in log order between the registry
+file's and the unsealed log's. The first start takes this floor into its mark. Tests: `log/tests/generation.rs`
+`set_aside_batches_reserve_their_ids_but_name_no_consumer_and_give_no_interval`.
+## Q-263 — What is set aside: whole batches, by their first position
+Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+**Scenario.** §8 Restore step 1 sets aside positions; the writer's and the reader's scans skip batches.
+**Decided (8.3c).** A batch is set aside when its first position is (`kvik_log::scan::set_aside`). A restored end lies
+between batches by construction (the end of a gap, of a segment, or of a carried end), so no batch straddles one; one
+that did would be served whole. Set-aside batches are skipped before a recovery entry in them is applied.
+**Open.** An invalid region inside a set-aside segment is still reported by a reader as corruption; whether such a
+report should be dropped (its positions are set aside) is for 8.3d with the health report of set-aside ranges.
+## Q-264 — Position 1 as the chain's start in a restored generation
+Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
+**Scenario.** Q-321 left "a restored generation, whose first position is not 1" to roadmap 8.3. A restore record's
+reset stamp is always at sequence 1 (`files/src/restore.rs` `RestoreRecord::check`; spec §8 Restore step 1:
+"Positions of the new generation start at sequence 1"), so that premise does not hold: in a restored generation with
+no sealed segment of its own, its lowest unsealed segment damaged, zeroed or removed leaves its positions gone with no
+`data_lost`, as in generation 0 before Q-321.
+**Built (8.3c), as briefed.** The rule stays limited to generation 0. Pinned: `log/tests/generation.rs`
+`the_position_one_start_rule_is_limited_to_generation_0`.
+**Needed.** The owner's ruling: extend the rule to a restored generation, starting at its stamp's sequence (a
+one-line change in `plan`), or keep it at generation 0 and say why in §3.
+## Q-267 — The start options 8.3c does not act on
+Recorded by roadmap 8.3c. To be settled by roadmap 6.3c.
+**Scenario.** `StartOptions` has three fields; `recorder` needs `FileRecorder` (6.3c) and `sealed` needs
+`seal_segment_described` (6.3b), neither on main.
+**Decided (8.3c).** `open_with` acts on `generation` and still refuses `recorder` and `sealed` with
+`OpenError::NotSupportedYet` rather than ignoring them; `recovery::start` takes `&mut StartOptions`, so 6.3c changes
+call sites only. Test: `log/tests/interfaces.rs`
+`open_with_refuses_the_recorder_and_the_seal_listener_until_their_providers_land`.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1410,6 +1492,12 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-260 | 8.3 | Decided by roadmap 8.3c after the model; for the owner's acceptance |
+| Q-261 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
+| Q-262 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
+| Q-263 | 8.3 | Decided by roadmap 8.3c; the corruption-report part open |
+| Q-264 | 8.3 | Owner's ruling needed: extend Q-321's rule to restored generations or keep it at generation 0 |
+| Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
