@@ -1,7 +1,7 @@
 //! Name patterns (spec §4 Funnel, Routing; Q-88): the three `/`-separated segments of a name, each a literal or `*`,
 //! which matches one whole segment. [`check`] is the grammar, applied when routes are compiled. [`matches`] and
-//! [`overlap`] are total over any string, so a pattern the grammar refuses that a log already holds is read the same
-//! way by both backends: each segment is then a literal, `*` alone the only wildcard.
+//! [`overlap`] are total over any string, so a pattern the grammar refuses that a log already holds is read as built:
+//! each segment a literal, `*` alone the only wildcard (`format.md` A.6 field 55, provisional: Q-670 (b)).
 
 use crate::error::RouteError;
 
@@ -110,6 +110,17 @@ mod tests {
         assert_eq!(p.len(), 255);
         assert_eq!(check(&p), Ok(()));
         let q = format!("{p}z");
+        assert_eq!(check(&q), Err(RouteError::TooLong { len: 256 }));
+    }
+
+    #[test]
+    fn the_length_limit_counts_bytes_not_characters() {
+        let e = |n: usize| "é".repeat(n);
+        let p = format!("{}/{}/{}x", e(42), e(42), e(42));
+        assert_eq!((p.len(), p.chars().count()), (255, 129));
+        assert_eq!(check(&p), Ok(()));
+        let q = format!("{}/{}/{}", e(42), e(42), e(43));
+        assert_eq!((q.len(), q.chars().count()), (256, 129));
         assert_eq!(check(&q), Err(RouteError::TooLong { len: 256 }));
     }
 

@@ -329,8 +329,8 @@ fn route_err(s: &str) -> Error {
 }
 
 /// The routing change that adds `funnel` as funnel `id` of `consumer`, with `emits` in force, checked against the
-/// registry as the model backend checks it, the pattern first (spec §4 Funnel). Operators are refused: they need
-/// windows over recent facts (roadmap 5.4).
+/// registry as the model backend checks it; the caller has checked a pattern against the grammar (spec §4 Funnel).
+/// Operators are refused: they need windows over recent facts (roadmap 5.4).
 pub(crate) fn add_change(
     registry: &Registry,
     consumer: &str,
@@ -338,9 +338,6 @@ pub(crate) fn add_change(
     funnel: &Funnel,
     emits: Selection,
 ) -> Result<Routing, Error> {
-    if let Select::Names(p) = &funnel.series {
-        pattern::check(p).map_err(Error::Pattern)?;
-    }
     if funnel.operator.is_some() {
         return Err(Error::NotSupportedYet(
             "a funnel with an operator on the durable backend (windowed operators come with roadmap 5.4)",

@@ -291,11 +291,12 @@ enum Live { Value(Fact), None, Unknown }
   funnels at every start, as the example does (Q-91 (c)).
 - A name pattern, in a funnel or in `emits`, has exactly the three `/`-separated segments of a name, each a literal
   or `*`, which matches one whole segment (spec §4 Funnel, Q-88). It is refused when routes are compiled, on both
-  backends, with `ConsumerError::Pattern` and a `RouteError`: `Segments { found }` (not three segments),
-  `EmptySegment`, `PartialWildcard` (a `*` inside a segment, such as `plant/line-*/power`) or `TooLong { len }`
-  (over 255 bytes). There is no escape: a name segment holding `*` is matched only by `*`. Two patterns overlap
-  when, segment by segment, they are equal or either is `*`; an id overlaps a pattern when any name of its series
-  matches it, aliases included.
+  backends, with `ConsumerError::Pattern` and a `RouteError`, checked in this order: `TooLong { len }` (over 255
+  bytes), `Segments { found }` (not three segments), `EmptySegment`, `PartialWildcard` (a `*` inside a segment, such
+  as `plant/line-*/power`). There is no escape: a name segment holding `*` is matched only by `*`. Two patterns
+  overlap when, segment by segment, they are equal or either is `*`; an id overlaps a pattern when any name of its
+  series matches it, aliases included. A funnel in force whose pattern the grammar refuses (one a log held before
+  it) is refused when routed again, not returned as the funnel in force (provisional, Q-670 (b)).
 ```rust
 #[non_exhaustive]
 pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySegment, PartialWildcard }
