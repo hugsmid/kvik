@@ -1391,7 +1391,7 @@ retried. Not reported: the restore goes on. Unanswered (transient or not): the r
 and never goes on, since going on could read an earlier state. (c) What no check finds is Q-614.
 **Owner.** (d) A drill on a live store, or a full restore while the source store still uploads (moving a store to
 another machine), can see the next record uploaded between its listing and the `stat`, and fail as
-`ListingIncomplete` where it passed before. The `stat` follows the listing directly to keep that window short. A
+`ListingIncomplete` where it passed before. The `stat` calls (at most eight, `TAIL_PROBES`) follow the listing directly to keep that window short. A
 retry passes only while the listing lags less than the time between two record uploads of the source store; on a
 bucket whose listings lag longer, a drill or restore of a live store never passes. The source records are read
 after the claim (`backup/src/restore/driver.rs` `fresh`), so each retry of a full restore takes a new generation
