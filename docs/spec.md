@@ -738,7 +738,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
    each fact under the name its own definition gives, and submits what is wanted through Re-ingest, where the
    duplicate rule drops what is already recorded. An id defined only in files that were never backed up, or uploaded
    by a superseded writer after the restore read its records, is in no file the store holds and can be assigned again.
-   Positions of the new generation start at sequence 1. A drill appends no recovery entry and writes no mark after
+   Positions of the new generation start at sequence 1. A full restore writes the generation's first mark without a
+   boot; only that mark is read as no mark, by the generation's first start, which writes it again with its boot
+   (Q-260). A drill appends no recovery entry and writes no mark after
    its first.
 2. The store serves queries, flagged `restoring`, and accepts ingest. Until the restore ends, detail held by a file
    the restore record lists that is not yet local counts as not local (Failures and end below). Window evaluations

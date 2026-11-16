@@ -17,6 +17,7 @@ use kvik_log::writer::{
     create_segment, init_generation,
 };
 
+mod first_start;
 mod rig;
 
 use rig::*;

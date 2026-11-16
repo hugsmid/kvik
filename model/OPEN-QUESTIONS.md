@@ -71,6 +71,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 | Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
+| Q-630 | §3 Recovery rule 2, Durable mark; §8 Restore step 1 | Acknowledged positions lost with the whole unsealed log when nothing names them |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1356,6 +1357,23 @@ use); damage to it is Q-264. Tests: `log/tests/generation/main.rs`
 `init_generation_writes_the_first_mark_once_and_refuses_another_generations`.
 **Settled (owner).** Accepted as decided, matching the model. For the spec text (§8 Restore step 1): the first mark is
 written without a boot and is read as no mark by the generation's first start.
+**Refined (owner's ruling: Q-125 prevails over this decision).** Scenario: generation 1 with a timed mark sync; the
+first start wrote the first mark again with its boot; batches were acknowledged at (1,1)..(1,3) while that mark stayed
+the durable one; a power loss; the generation's only segment missing or zeroed; a reboot. The start read that mark as
+no mark too (the boot was not compared), took the first start, wrote no recovery entry, skipped the cursor and
+registry files, and acknowledged (1,1) again under the restore's stamp; generation 0 writes a recovery entry with a
+new stamp there. Ruling: only the mark `init_generation` wrote, with no boot, is read as no mark. The mark the first
+start writes carries its boot and is read as any mark, so every later start follows generation 0's rules: a recovery
+entry with a new reset stamp, F from every source, a `data_lost` from the generation's first position up to what a
+source names (Q-264), and no position given again under the unchanged stamp. Reason: a consumer or reader that took a
+position must see a reset before that position is given again, and "the first mark counts as no mark" must not
+suppress the report Q-264 owes. Nothing is acknowledged while the boot-less mark is the durable one, since the first
+start syncs its own mark before it takes ingest. With no sealed segment of its own, a start counts nothing below the
+generation's first position as lost (`plan`'s `kept_last`). Where no source names a lost position, see Q-630. Tests:
+`log/tests/generation/first_start.rs`
+`losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`,
+`a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position`,
+`a_generation_starting_above_1_loses_nothing_below_its_first_position_after_its_first_start`.
 ## Q-261 — Files of another generation at a start
 Recorded by roadmap 8.3c. To be settled by roadmap 8.3.
 **Scenario.** A restored directory holds sealed segments of generation 0 and the writer runs in generation 1. Sorted
@@ -1421,6 +1439,15 @@ part (an anchor once sealed segments are evicted) applies to every generation. T
 same boot and after a reboot), `a_generation_starting_above_1_takes_ingest_at_its_stamps_sequence` (the anchor is
 the stamp's sequence, not 1); generation 0 stays pinned by `log/tests/recovery.rs`
 `the_lowest_unsealed_segment_damaged_zeroed_or_missing_is_a_recorded_loss`.
+**Refined (owner's ruling with Q-260's refinement).** Scenario: the only segment of a restored generation is missing
+or zeroed after a power loss that fell before the generation's mark first moved under a timed mark sync, so no chain
+remains and the mark names no position. This report is not suppressed by Q-260's first mark: the start writes a
+recovery entry with a new stamp, as in generation 0, and a source that names a lost position (a cursor file, the
+registry file, a lost range) makes the range from the generation's first position a recorded `data_lost`. Reason:
+Q-125's reset and this rule's report apply whatever mark the generation began with. With no such source nothing
+names the lost positions in either generation (Q-630). Tests: `log/tests/generation/first_start.rs`
+`losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`,
+`a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position`.
 ## Q-267 — The start options 8.3c does not act on
 Recorded by roadmap 8.3c. To be settled by roadmap 6.3c.
 **Scenario.** `StartOptions` has three fields; `recorder` needs `FileRecorder` (6.3c) and `sealed` needs
@@ -1468,6 +1495,22 @@ retries `prepare` on the same `Restorer` within one `Store::restore`; a durable 
 crash, is left for a later version. Tests: `backup/tests/restore_guards.rs`
 `a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation`,
 `a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more`.
+## Q-630 — Acknowledged positions lost with the whole unsealed log when nothing names them
+Recorded by roadmap 8.3c (fix round of its review). For the owner.
+**Scenario.** Any generation, with a timed mark sync (the default). The durable mark names no position of the
+generation yet (its first start's mark, not yet moved); batches are acknowledged at positions 1 to 3; a power loss;
+then the only unsealed segment is missing or zeroed, with no sealed segment of the generation and no cursor file,
+registry file or lost range naming a position above the mark. The start writes a recovery entry at position 1 with a
+new reset stamp and gives positions 2 and 3 again under it; no `data_lost` is reported, since nothing left names
+positions 1 to 3. Q-264 and Q-321 promise a `data_lost` from the anchor for a lowest segment damaged, zeroed or
+missing; that holds only where some source names a position at or above the lost ones.
+**Now.** Generation 0 and a restored generation behave alike (Q-260 as refined): readers and consumers reset on the
+new stamp, and health shows no `data_lost`. Pinned by `log/tests/generation/first_start.rs`
+`losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`.
+**Options.** (a) Accept, and say in §3 Recovery rule 2 that where nothing names the lost positions the reset is the
+only report. (b) Record a lost range of unknown extent above the mark: a new manifest record form. (c) Sync the mark at
+the first commit into each segment, so that a durable mark names a position in every segment holding acknowledged
+data: a new write on the commit path.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1553,6 +1596,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
+| Q-630 | 8.3 | Owner: whether a reset with no `data_lost` is the report when nothing names the lost positions (Q-264, Q-321) |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1799,7 +1843,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
-| Q-260 | A restored generation's first mark and the first start in it | §8 Generations, Restore step 1; §3 Order of a start (settled by the owner's acceptance of roadmap 8.3c's decision, matching the model: the first mark `init_generation` writes is read as no mark by the generation's first start, which writes no recovery entry and takes ingest at the first position; see the question) |
+| Q-260 | A restored generation's first mark and the first start in it | §8 Generations, Restore step 1; §3 Order of a start (settled by the owner's acceptance of roadmap 8.3c's decision, matching the model: the first mark `init_generation` writes is read as no mark by the generation's first start, which writes no recovery entry and takes ingest at the first position; refined by the owner's ruling that Q-125 prevails: only that boot-less mark is read so, and the mark the first start writes is read as any mark; see the question) |
 | Q-262 | The writer's scans in a restored generation: set-aside batches and the id floor | §8 Restore step 1, §3 Recovery rule 3, §2.1 (settled by the owner's acceptance of roadmap 8.3c's decision: set-aside batches reserve ids and give no consumer or interval; the three changes in generation 0 are listed in the question) |
 | Q-264 | Position 1 as the chain's start in a restored generation | §3 Recovery rule 2, §8 Generations (settled by the owner's ruling: with no sealed segment of its own, a generation's first position anchors the log start, so a lowest segment damaged, zeroed or missing is `data_lost` from it; see the question) |
 | Q-266 | A full restore retried after a failure past its claim | §8 Generations, Restore; `api.md` Backup and restore (settled by the owner's ruling for v1: in-memory claim reuse on the same driver; a crash burns a generation, which is safe; a durable note is a follow-up; see the question) |

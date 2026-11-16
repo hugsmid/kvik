@@ -69,10 +69,12 @@ impl Gen {
         }
     }
 
-    /// Whether `m` is a restored generation's first mark, which a start reads as no mark (Q-260).
+    /// Whether `m` is the first mark `init_generation` wrote, with no boot, which a start reads as no mark (Q-260).
+    /// The mark the generation's first start writes carries its boot and is read as any mark.
     pub(super) fn is_first_mark(&self, m: &MarkSlot) -> bool {
         self.g > 0
             && m.generation == self.g
+            && m.boot_id == [0; 16]
             && m.file_id == 0
             && m.offset == 0
             && m.last_sequence == self.first - 1

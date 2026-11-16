@@ -601,9 +601,11 @@ fn plan(
         }
         expect = Some(e);
     }
+    // Nothing below the generation's first position is this generation's to lose (Q-264).
     let kept_last = expect
         .map_or(0, |e| e - 1)
-        .max(sealed_last.map_or(0, |s| s.1));
+        .max(sealed_last.map_or(0, |s| s.1))
+        .max(log_first.map_or(0, |f| f - 1));
     // The tail below a valid mark of any boot: positions up to the mark's are lost (rule 2).
     let mut k = kept_last;
     if let Some(m) = mark_slot
