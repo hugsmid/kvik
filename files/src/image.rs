@@ -281,6 +281,9 @@ mod tests {
         for n in [500u64, 1_000, 2_000] {
             let f = nested_records(n);
             let len = f.len() as u64;
+            // Each candidate's body checksummed directly, as before the prefix table.
+            let direct: u64 = (0..n).map(|i| len - 88 - 16 * i).sum();
+            assert!(direct > 2 * len);
             let (img, stats) = read_with_stats(&f, &[9; 16]);
             let img = img.unwrap();
             assert!(img.records.is_empty() && img.torn);

@@ -131,6 +131,10 @@ fn nested_batch_images_checksum_at_most_twice_the_window() {
         let images: u64 = (0..n).map(|i| 80 * (n - i)).sum();
         assert!(old_stats.bytes_checksummed >= images - 16 * n);
         assert!(
+            !old_stats.within_bound(len),
+            "{old_stats:?} for {len} bytes"
+        );
+        assert!(
             stats.bytes_checksummed <= 2 * len,
             "{stats:?} for {n} nested images in {len} bytes"
         );
@@ -182,6 +186,10 @@ fn boundary_reads_along_one_chain_judge_each_block_once() {
         assert_eq!(new.unwrap().batches.len() as u64, k);
         // Each boundary read walked the rest of the chain: the construction reaches the old cost.
         assert!(old_stats.headers_visited >= k * k / 2);
+        assert!(
+            !old_stats.within_bound(len),
+            "{old_stats:?} for {len} bytes"
+        );
         assert!(
             stats.within_bound(len),
             "{stats:?} for {k} blocks in {len} bytes"

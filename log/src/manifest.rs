@@ -522,15 +522,16 @@ mod tests {
         for n in [500u64, 1_000, 2_000] {
             let f = nested_records(n);
             let len = f.len() as u64;
+            let bound = 2 * len + 12 * (len / 8);
+            // Each candidate's body checksummed directly, as before the prefix table.
+            let direct: u64 = (0..n).map(|i| len - 88 - 16 * i).sum();
+            assert!(direct > bound);
             crate::crc::BYTES_HASHED.with(|c| c.set(0));
             let r = read_manifest(&f, &[2; 16]).unwrap();
             let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
             assert!(r.records.is_empty() && r.torn);
             // Twice the file in bodies, and a 12-byte header checksum per 8-byte step.
-            assert!(
-                hashed <= 2 * len + 12 * (len / 8),
-                "{hashed} bytes hashed for {len}"
-            );
+            assert!(hashed <= bound, "{hashed} bytes hashed for {len}");
         }
     }
 }
