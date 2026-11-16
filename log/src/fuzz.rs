@@ -151,3 +151,42 @@ fn check(r: &ScanReport<'_>, limit: u64, to_end: bool) {
         (None, _) | (Some(_), false) => {}
     }
 }
+
+/// Feeds `data` to the derived-file decoders (`format.md` A.18), with the store id taken from where the header would
+/// hold it, and checks that whatever decodes encodes to bytes that decode to the same value. Panics only if a check
+/// fails; never for any input.
+pub fn decode_derived(data: &[u8]) {
+    use crate::directory::logdir::{Group, Root};
+    use crate::directory::series::SeriesDirectory;
+    use crate::directory::status::StatusFile;
+    let mut store_id = [0u8; 16];
+    if let Some(s) = data.get(40..56) {
+        store_id.copy_from_slice(s);
+    }
+    if let Ok((f, r)) = Root::decode(data, &store_id) {
+        let again = r.encode(f, store_id).expect("a decoded root encodes");
+        assert_eq!(Root::decode(&again, &store_id).expect("again"), (f, r));
+    }
+    if let Ok((f, (g, _))) = Group::decode(data, &store_id) {
+        let again = g.encode(f, store_id).expect("a decoded group encodes");
+        assert_eq!(Group::decode(&again, &store_id).expect("again").1.0, g);
+    }
+    if let Ok((f, d)) = SeriesDirectory::decode(data, &store_id) {
+        let again = d
+            .encode(f, store_id)
+            .expect("a decoded series directory encodes");
+        assert_eq!(
+            SeriesDirectory::decode(&again, &store_id).expect("again"),
+            (f, d)
+        );
+    }
+    if let Ok((f, s)) = StatusFile::decode(data, &store_id) {
+        let again = s
+            .encode(f, store_id)
+            .expect("a decoded status file encodes");
+        assert_eq!(
+            StatusFile::decode(&again, &store_id).expect("again"),
+            (f, s)
+        );
+    }
+}

@@ -218,7 +218,7 @@ pub(crate) fn records(
 ) -> Result<impl Iterator<Item = &[u8]>, DerivedError> {
     let size = usize::from(size);
     let count = usize::try_from(count).map_err(|_| DerivedError::Invalid("record count"))?;
-    if count > 0 && size < min {
+    if count > 0 && (size < min || size == 0) {
         return Err(DerivedError::Invalid("record size"));
     }
     let len = count
@@ -417,6 +417,14 @@ impl crate::writer::sources::PositionSource for DerivedSource {
 mod tests {
     use super::*;
     use crate::fs::MemFs;
+
+    #[test]
+    fn a_huge_count_of_empty_records_is_invalid_and_allocates_nothing() {
+        assert!(records(&[0; 8], 0, u32::MAX, 0, 0).is_err());
+        assert!(records(&[0; 8], 0, u32::MAX, 8, 8).is_err());
+        assert_eq!(records(&[0; 8], 0, 0, 0, 0).unwrap().count(), 0);
+        assert_eq!(records(&[0; 16], 0, 2, 8, 4).unwrap().count(), 2);
+    }
 
     #[test]
     fn names_round_trip_and_are_matched_exactly() {

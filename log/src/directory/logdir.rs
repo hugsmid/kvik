@@ -435,7 +435,10 @@ impl Root {
         if at != body.len() {
             return Err(DerivedError::Invalid("bytes after the records"));
         }
-        let ce = position_at(body, 56);
+        let ce = Position {
+            generation: u32_at(body, 56),
+            sequence: u64_at(body, 64),
+        };
         let root = Root {
             epoch: u64_at(body, 0),
             manifest_end: u64_at(body, 8),
@@ -445,10 +448,7 @@ impl Root {
             },
             segment_count: u64_at(body, 32),
             stamp: stamp_at(body, 40),
-            compacted_through: (ce.sequence != 0).then_some(Position {
-                generation: ce.generation,
-                sequence: u64_at(body, 64),
-            }),
+            compacted_through: (ce.sequence != 0).then_some(ce),
             groups,
             lost,
             quarantined,
