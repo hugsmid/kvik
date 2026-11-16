@@ -1335,7 +1335,7 @@ slot, valid or not, or writes both slots.
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
 `log.min_sync_interval` (spec §3 Group commit). With a floor of 2 ms a fast device waits about 2 ms instead of 10,
 and a store of 1,000 unbatched 1 Hz series on it runs up to 500 batch syncs a second instead of 100: at 4 KiB a
-sync, about 173 GiB of host writes a day against 35 GiB, roughly a decade of a 600 TBW drive if sustained. Spec §3
+sync, about 165 GiB of host writes a day against 33 GiB, roughly a decade of a 600 TBW drive if sustained. Spec §3
 states the bound as at most 1/`min_sync_interval` per second (100 at the default), §13 Sync rate and SSD wear names
 a longer `min_sync_interval` as the remedy, and `design.md` Budgets ties p50 ≤ 5 ms to about 100 synced batches a
 second.
