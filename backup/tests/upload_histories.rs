@@ -78,6 +78,10 @@ fn check_objects(h: &Harness) {
         };
         assert_eq!(v, want, "{k}");
     }
+    assert_eq!(
+        kvik_backup::plan::check_chain(&in_bucket(&h.sink.mem)),
+        Ok(())
+    );
     let log = lock(&h.sink.log);
     assert_eq!(log.violations, Vec::<String>::new());
 }

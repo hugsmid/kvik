@@ -5,43 +5,24 @@ mod upload_support;
 
 use std::time::Duration;
 
-use kvik_backup::envelope::Envelope;
-use kvik_backup::fake::TestEnvelope;
-use kvik_backup::keys::{Keys, ObjectName};
-use kvik_backup::uploaded::UploadedRecord;
+use kvik_backup::fake::block_on;
+use kvik_backup::keys::Keys;
+use kvik_backup::plan::check_chain;
+use kvik_backup::upload::BackupDriver;
 use kvik_files::record::Body;
 use upload_support::*;
 
-/// Every record object in the bucket, opened and decoded, in epoch order.
-fn in_bucket(h: &Harness) -> Vec<UploadedRecord> {
-    let (keys, env) = (Keys::new(ID), TestEnvelope::new(KEY));
-    let mut out: Vec<UploadedRecord> = h
-        .sink
-        .mem
-        .objects()
-        .iter()
-        .filter(|(k, _)| matches!(keys.parse(k), Some(ObjectName::Record { .. })))
-        .map(|(k, v)| UploadedRecord::decode(&env.open(k, v).unwrap()).unwrap())
-        .collect();
-    out.sort_by_key(|u| u.record.epoch);
-    out
-}
-
 /// (previous, epoch) of each record in the bucket.
 fn links(h: &Harness) -> Vec<(u64, u64)> {
-    in_bucket(h)
+    in_bucket(&h.sink.mem)
         .iter()
         .map(|u| (u.previous, u.record.epoch))
         .collect()
 }
 
-/// Each record names the one before it, the first none.
-fn assert_chained(links: &[(u64, u64)]) {
-    let mut before = 0;
-    for &(previous, epoch) in links {
-        assert_eq!(previous, before, "record {epoch} in {links:?}");
-        before = epoch;
-    }
+/// What a restore's check makes of the bucket: each record names the one listed before it (Q-611).
+fn assert_chained(h: &Harness) {
+    assert_eq!(check_chain(&in_bucket(&h.sink.mem)), Ok(()));
 }
 
 fn sealed(n: usize) -> Harness {
@@ -59,7 +40,7 @@ fn consecutive_uploaded_records_name_each_other_and_the_first_names_none() {
     let links = links(&h);
     assert_eq!(links.len(), h.records().len() - 1);
     assert_eq!(links[0], (0, 1));
-    assert_chained(&links);
+    assert_chained(&h);
     h.check_done();
 }
 
@@ -74,23 +55,19 @@ fn records_uploaded_after_a_restart_name_the_record_before_them_in_the_manifest(
     run_idle(&mut h.driver(), &mut Duration::default());
     let links = links(&h);
     assert!(links.len() > first_run + 1);
-    assert_chained(&links);
+    assert_chained(&h);
     h.check_done();
 }
 
 /// The rebuild record names none; the records before it and after it each name the one before them.
 fn assert_rebuilt_chain(h: &Harness) {
-    let all = in_bucket(h);
+    let all = in_bucket(&h.sink.mem);
     let r = all
         .iter()
         .position(|u| matches!(u.record.body, Body::Rebuild(_)) && u.record.old_epoch.is_none())
         .expect("a rebuild record uploaded");
     assert_eq!(all[r].previous, 0);
-    let link = |us: &[UploadedRecord]| -> Vec<(u64, u64)> {
-        us.iter().map(|u| (u.previous, u.record.epoch)).collect()
-    };
-    assert_chained(&link(&all[..r]));
-    assert_chained(&link(&all[r..]));
+    assert_chained(h);
     assert!(all.len() > r + 2, "the rebuilt manifest went up");
 }
 
@@ -112,6 +89,49 @@ fn a_driver_that_outlives_a_rebuild_names_none_at_its_rebuild_record() {
     run_idle(&mut d, &mut Duration::default());
     *lock(&h.app()) = rebuild_final(&h);
     run_idle(&mut d, &mut Duration::default());
+    assert_rebuilt_chain(&h);
+    h.check_done();
+}
+
+#[test]
+fn a_driver_that_outlives_a_rebuild_with_old_records_pending_uploads_a_chain_a_restore_accepts() {
+    let mut h = sealed(3);
+    let mut d = h.driver();
+    run_idle(&mut d, &mut Duration::default());
+    let before: Vec<u64> = links(&h).iter().map(|l| l.1).collect();
+    h.seal(20);
+    h.seal(20);
+    assert!(matches!(
+        block_on(d.step(Duration::ZERO)),
+        kvik_backup::upload::Step::Progress
+    ));
+    let old_last = h.records().last().unwrap().epoch;
+    *lock(&h.app()) = rebuild_final(&h);
+    run_idle(&mut d, &mut Duration::default());
+    assert_rebuilt_chain(&h);
+    assert!(
+        links(&h)
+            .iter()
+            .any(|&(_, e)| e <= old_last && !before.contains(&e)),
+        "an old record pending at the rebuild went up after it"
+    );
+    h.check_done();
+}
+
+#[test]
+fn a_restart_on_a_rebuilt_manifest_leaves_the_old_tail_unuploaded_and_the_chain_whole() {
+    let mut h = sealed(3);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    h.seal(20);
+    h.seal(20);
+    let tail: Vec<u64> = h.records().iter().rev().take(2).map(|r| r.epoch).collect();
+    h.close();
+    h.set_app(rebuild_final(&h));
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let keys = Keys::new(ID);
+    for e in tail {
+        assert!(!h.sink.mem.objects().contains_key(&keys.record(0, e)));
+    }
     assert_rebuilt_chain(&h);
     h.check_done();
 }

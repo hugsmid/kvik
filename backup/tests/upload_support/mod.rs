@@ -13,8 +13,10 @@ use kvik_backup::LocalStore;
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::{Keys, ObjectName};
+use kvik_backup::plan::check_chain;
 use kvik_backup::port::{ManifestPort, PortError};
 use kvik_backup::upload::{BackupDriver, Step, UploadConfig, Uploader};
+use kvik_backup::uploaded::UploadedRecord;
 use kvik_files::MANIFEST;
 use kvik_files::appender::{Appender, Opened, Settled};
 use kvik_files::catalogue::{Catalogue, Tier};
@@ -555,6 +557,7 @@ impl Harness {
                 );
             }
         }
+        assert_eq!(check_chain(&in_bucket(&self.sink.mem)), Ok(()));
         check_order(&log.events, &records, &|f| {
             snap.file(f).is_some_and(|e| e.is_live())
         });
@@ -571,6 +574,19 @@ pub fn uploaded_form(records: &[Record], i: usize) -> Vec<u8> {
         _ => 0,
     };
     [previous.to_le_bytes().as_slice(), &r.encode().unwrap()].concat()
+}
+
+/// Every record object of this store in `mem`, opened and decoded, in epoch order, as a restore lists them.
+pub fn in_bucket(mem: &MemSink) -> Vec<UploadedRecord> {
+    let (keys, env) = (Keys::new(ID), TestEnvelope::new(KEY));
+    let mut out: Vec<UploadedRecord> = mem
+        .objects()
+        .iter()
+        .filter(|(k, _)| matches!(keys.parse(k), Some(ObjectName::Record { .. })))
+        .map(|(k, v)| UploadedRecord::decode(&env.open(k, v).unwrap()).unwrap())
+        .collect();
+    out.sort_by_key(|u| u.record.epoch);
+    out
 }
 
 /// Copy-verified records of `f` written since the last rebuild record.
