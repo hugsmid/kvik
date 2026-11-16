@@ -111,11 +111,11 @@ fn a_start_describes_every_sealed_segment_no_record_names() {
     assert_eq!(files.len(), 3);
     // One description at a time, outside the seals a shutdown waits for and the seal count.
     assert!(r.w.take_seal_jobs(r.now).is_empty());
-    let id = r.w.take_unlisted().expect("an unlisted segment");
+    let id = r.w.take_unlisted(r.now).expect("an unlisted segment");
     assert!(!r.w.seals_running());
-    assert!(r.w.take_unlisted().is_none());
+    assert!(r.w.take_unlisted(r.now).is_none());
     let res = describe_sealed(&r.fs, r.w.log_dir(), &id);
-    r.w.unlisted_done(res);
+    r.w.unlisted_done(res, r.now);
     r.maint();
     assert_eq!(r.w.stats().sealed_segments, 0);
     let got = by_id(&r.described);
@@ -126,7 +126,7 @@ fn a_start_describes_every_sealed_segment_no_record_names() {
 }
 
 #[test]
-fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health_naming_it() {
+fn a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it() {
     let mut r = Rig::open(Watch::new());
     r.fill(3);
     r.maint();
@@ -135,7 +135,8 @@ fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health
     drop(r);
     let files = sealed_files(&fs.inner);
     let ids: Vec<u64> = files.keys().copied().collect();
-    // The first cannot be read; the second has a byte flipped inside a batch, which `file_crc32c` covers.
+    // The first cannot be read, which is retried and degrades nothing; the second has a byte flipped inside a batch,
+    // which `file_crc32c` covers.
     fs.fail_reads(&seg_path(ids[0], true).to_string_lossy());
     let at = 200;
     fs.inner
@@ -145,11 +146,11 @@ fn a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health
     assert!(r.w.fault().is_none());
     let got = by_id(&r.described);
     assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![ids[2]]);
-    assert_eq!(damaged(&r), vec![ids[0], ids[1]]);
+    assert_eq!(damaged(&r), vec![ids[1]]);
     r.fill(1);
     r.maint();
     assert!(r.w.fault().is_none());
-    assert_eq!(damaged(&r), vec![ids[0], ids[1]]);
+    assert_eq!(damaged(&r), vec![ids[1]]);
     r.w.shutdown(r.now).unwrap();
     drop(r);
     // The next start tries again: the readable one is described, the damaged one never.
@@ -229,7 +230,7 @@ fn a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing()
     let mut r = Rig::open_on_boot(fs, [2; 16]);
     assert!(r.w.fault().is_some());
     assert_eq!(lost_ranges(&r.fs.inner), 1);
-    assert!(r.w.take_unlisted().is_none());
+    assert!(r.w.take_unlisted(r.now).is_none());
     r.maint();
     assert!(r.described.is_empty());
 }
@@ -282,7 +283,7 @@ fn a_start_that_cannot_record_a_loss_is_read_only_and_describes_nothing() {
     let mut r = Rig::open(fs);
     assert!(r.w.fault().is_some());
     assert_eq!(lost_ranges(&r.fs.inner), 0);
-    assert!(r.w.take_unlisted().is_none());
+    assert!(r.w.take_unlisted(r.now).is_none());
     r.maint();
     assert!(r.described.is_empty());
 }
@@ -399,12 +400,12 @@ fn no_segment_is_described_while_a_seal_is_ready_or_running() {
     let mut r = Rig::open(fs);
     let jobs = r.w.take_seal_jobs(r.now);
     assert_eq!(jobs.len(), 1);
-    assert!(r.w.take_unlisted().is_none());
+    assert!(r.w.take_unlisted(r.now).is_none());
     for job in jobs {
         let res = kvik_log::writer::seal_segment_described(&r.fs, &job, &r.w.halt());
         r.w.seal_done(job, res, r.now);
     }
-    assert!(r.w.take_unlisted().is_some());
+    assert!(r.w.take_unlisted(r.now).is_some());
 }
 
 #[test]
@@ -414,7 +415,7 @@ fn no_segment_is_described_after_a_fault() {
     r.fs.fail_reads(".open");
     r.maint();
     assert!(r.w.fault().is_some());
-    assert!(r.w.take_unlisted().is_none());
+    assert!(r.w.take_unlisted(r.now).is_none());
     assert!(r.described.is_empty());
 }
 
@@ -501,4 +502,79 @@ fn a_shutdown_drops_a_description_in_flight_before_its_next_read() {
     let mut r = Rig::open(fs);
     r.maint();
     assert_eq!(by_id(&r.described).len(), 2);
+}
+
+fn unlisted(file_id: u64) -> SegmentIdentity {
+    SegmentIdentity {
+        store_id: STORE_ID,
+        file_id,
+        generation: 0,
+    }
+}
+
+#[test]
+fn a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears()
+{
+    use kvik_log::writer::DESCRIBE_RETRY_INTERVAL;
+
+    let fs = sealed_store(2);
+    let files = sealed_files(&fs.inner);
+    let ids: Vec<u64> = files.keys().copied().collect();
+    fs.fail_reads(&seg_path(ids[0], true).to_string_lossy());
+    let mut r = Rig::open(fs);
+    let failed_at = r.now;
+    r.maint();
+    assert_eq!(
+        by_id(&r.described).keys().copied().collect::<Vec<_>>(),
+        vec![ids[1]]
+    );
+    assert!(r.w.fault().is_none());
+    assert_eq!(r.w.reasons(), vec![]);
+    let due = failed_at + DESCRIBE_RETRY_INTERVAL;
+    let next = r.w.step(r.now, r.wall, &mut r.q).next;
+    assert!(next.is_some_and(|t| t <= due), "{next:?}");
+    r.now = due - seal_rig::MS;
+    assert!(r.w.take_unlisted(r.now).is_none());
+    r.fs.clear_failures();
+    r.now = due;
+    r.maint();
+    let got = by_id(&r.described);
+    assert_eq!(got[&ids[0]], expected(ids[0], &files[&ids[0]]));
+    assert_eq!(r.w.reasons(), vec![]);
+}
+
+#[test]
+fn a_description_that_never_opens_is_retried_with_doubling_waits_up_to_the_cap_and_never_degrades_health()
+ {
+    use kvik_log::writer::{DESCRIBE_RETRY_INTERVAL, DESCRIBE_RETRY_MAX};
+
+    let fs = sealed_store(1);
+    let id = *sealed_files(&fs.inner).keys().next().unwrap();
+    let mut r = Rig::open(fs);
+    r.fs.fail_opens(&seg_path(id, true).to_string_lossy());
+    let wait = |k: u32| (DESCRIBE_RETRY_INTERVAL * 2u32.pow(k)).min(DESCRIBE_RETRY_MAX);
+    for k in 0..9 {
+        if k > 0 {
+            r.now += wait(k - 1) - seal_rig::MS;
+            assert!(r.w.take_unlisted(r.now).is_none(), "try {k}");
+            r.now += seal_rig::MS;
+        }
+        // A timed seal comes due on the way; it goes first.
+        for job in r.w.take_seal_jobs(r.now) {
+            let res = kvik_log::writer::seal_segment_described(&r.fs, &job, &r.w.halt());
+            r.w.seal_done(job, res, r.now);
+            r.create();
+        }
+        assert_eq!(r.w.take_unlisted(r.now), Some(unlisted(id)), "try {k}");
+        let res = describe_sealed(&r.fs, r.w.log_dir(), &unlisted(id));
+        assert!(matches!(res, Err(DescribeError::Io(_))));
+        r.w.unlisted_done(res, r.now);
+        assert!(r.w.fault().is_none());
+        assert_eq!(r.w.reasons(), vec![]);
+        let due = r.now + wait(k);
+        let next = r.w.step(r.now, r.wall, &mut r.q).next;
+        assert!(next.is_some_and(|t| t <= due), "try {k}: {next:?}");
+    }
+    assert_eq!(wait(6), DESCRIBE_RETRY_MAX);
+    assert!(r.w.take_sealed().iter().all(|f| f.id.file_id != id));
 }

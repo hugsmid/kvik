@@ -486,7 +486,7 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
         w.seal_done(job, r, now);
     }
     if let Some(r) = m.described.take() {
-        w.unlisted_done(r);
+        w.unlisted_done(r, now);
     }
     let mut work = false;
     if let Some(req) = w.segment_request(s.clock.wall()) {
@@ -497,7 +497,7 @@ fn exchange(s: &Shared, w: &mut LogWriter) {
     work |= !jobs.is_empty();
     m.jobs.extend(jobs);
     if !s.stopping.load(Ordering::SeqCst)
-        && let Some(id) = w.take_unlisted()
+        && let Some(id) = w.take_unlisted(now)
     {
         m.describe = Some((w.log_dir().to_path_buf(), id));
         work = true;

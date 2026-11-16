@@ -412,8 +412,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   record or recovery entry. Losses that a rebuild lists under their first missing position because no valid record
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
   `SealBlocked` lasts until the seal succeeds. `SegmentDamaged` names a sealed segment that no manifest record lists
-  and that cannot be read whole or fails its checks (`format.md` A.9, Q-221): it lasts while the store runs and is
-  raised again at each start until the file is repaired. A mark synced at every commit (no boot identity, or configured) is
+  and that fails its checks (`format.md` A.9, Q-221 (c)): it lasts while the store runs and is raised again at each
+  start until the file is repaired. A failure to open or read such a segment is retried and degrades nothing (Q-640). A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per

@@ -371,7 +371,7 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SealedFile, Sea
 /// Why [`describe_sealed`] gave no description (Q-221 (c)).
 #[derive(Debug, thiserror::Error)]
 pub enum DescribeError {
-    /// The file could not be opened or read whole.
+    /// The file could not be opened or read whole; the writer tries again later (Q-221 (c)).
     #[error("the segment could not be read: {0}")]
     Io(io::Error),
     /// Its last bytes are not a valid trailer block and end marker naming the trailer's offset.

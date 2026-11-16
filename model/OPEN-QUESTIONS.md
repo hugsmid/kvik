@@ -68,6 +68,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-640 | §8 Corrupt block, §11 Health; `api.md` Health | A description that never stops failing to open or read its segment |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1378,18 +1379,26 @@ its next file operation (a read is at most 1 MiB), so neither a start nor a shut
 the read under way; one not described when the writer stops is found again at the next start (the owner's ruling at
 the review of roadmap 6.3b; scenario: a stop in the first minutes of a run, with every sealed segment still queued,
 waited for a whole segment's read). (c) No description
-(`DescribeError`): the segment stays unnamed, nothing is written, no fault is set, and the next start tries again; a
-damaged file's hash is never taken as the hash at seal. Health is degraded by `Reason::SegmentDamaged { file_id }`
-(`api.md` Health) while the writer runs, and raised again at each start until a description succeeds: an unreadable
-unlisted segment is damaged data, held degraded like a `data_lost` (Q-124 (a)) but ended by repair, not by an
-acknowledgement (the owner's ruling on (c), at the review of roadmap 6.3b). `log/tests/seal_hash.rs`:
+(`DescribeError`): the segment stays unnamed, nothing is written and no fault is set; a damaged file's hash is never
+taken as the hash at seal. A failure to open or read it (`DescribeError::Io`: a sharing violation, a descriptor limit,
+a permission, an I/O error that may clear) is retried within the run, 10 s after the first failure and then twice as
+long each time up to 10 minutes (`DESCRIBE_RETRY_INTERVAL`, `DESCRIBE_RETRY_MAX`), at the writer's timer, so never
+in a busy loop; meanwhile health is unchanged and the segment stays unlisted (Q-640). Only a failed check
+(`NotSealed`, `Invalid`: header, trailer, end marker, `file_crc32c`) is damage: health is degraded by
+`Reason::SegmentDamaged { file_id }` (`api.md` Health; `spec.md` §8 Corrupt block, §11) while the writer runs, and
+raised again at each start until a description succeeds: a damaged unlisted segment is damaged data, held degraded
+like a `data_lost` (Q-124 (a)) but ended by repair, not by an acknowledgement (the owner's rulings on (c), at the
+review of roadmap 6.3b; scenario for the retry: an open refused for a sharing error was reported as a damaged segment
+for the rest of the run, while the same error on a seal is `SealBlocked` and retried, A.13). `log/tests/seal_hash.rs`:
 `a_read_error_while_sealing_is_a_write_failure_on_the_log`; `log/tests/seal_describe.rs`:
 `a_start_describes_every_sealed_segment_no_record_names`,
 `a_start_skips_every_segment_a_record_lists_by_generation_and_id`,
 `no_segment_is_described_while_a_seal_is_ready_or_running`,
 `a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread`,
 `a_shutdown_drops_a_description_in_flight_before_its_next_read`,
-`a_start_leaves_a_segment_it_cannot_read_or_verify_unnamed_and_degrades_health_naming_it`,
+`a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it`,
+`a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears`,
+`a_description_that_never_opens_is_retried_with_doubling_waits_up_to_the_cap_and_never_degrades_health`,
 `describe_sealed_refuses_each_check_it_makes`,
 `a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
 the records `kvik-files` encodes,
@@ -1398,6 +1407,17 @@ the records `kvik-files` encodes,
 outside the crate; `kvik` maps those it knows and skips any other. Scenario (the review of roadmap 6.3b): a branch
 that matched every log reason stopped compiling once `SegmentDamaged` merged, with no textual conflict to warn of it.
 **Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
+
+## Q-640 — A description that never stops failing to open or read its segment
+Recorded at the review of roadmap 6.3b, with the retry of Q-221 (c).
+**Scenario.** An unlisted sealed segment's permissions change, or another program holds it open for the whole run.
+Every try of its description fails with `DescribeError::Io`; it is tried again every 10 minutes once the wait reaches
+its cap, health names nothing, and the segment is not listed, so it is not uploaded and a restore ends the restored
+log at its range (as for a damaged one) while the store reports itself healthy. A restart tries again from 10 s.
+**Needed.** Whether a failure that outlasts some bound (a number of tries, or a time) is reported, and how: a health
+reason (a new variant, or `SegmentDamaged` after the bound) or a statistic. Until decided, health is unchanged while
+it is retried (`log/tests/seal_describe.rs`
+`a_description_that_never_opens_is_retried_with_doubling_waits_up_to_the_cap_and_never_degrades_health`).
 
 ## Open at v0.2
 
@@ -1411,7 +1431,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1481,6 +1501,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-640 | 8.5a | A description failing to open or read for ever; recorded at the review of roadmap 6.3b; whether health reports it after a bound |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

@@ -81,6 +81,11 @@ pub const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 pub const UNKNOWN_SPACE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a blocked seal waits before it is tried again.
 pub const SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// The wait before a description that failed to open or read its segment is tried again; it doubles at each further
+/// failure up to [`DESCRIBE_RETRY_MAX`] (Q-221 (c)).
+pub const DESCRIBE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// The longest wait between tries of a description that fails to open or read its segment (Q-221 (c)).
+pub const DESCRIBE_RETRY_MAX: Duration = Duration::from_secs(600);
 /// The most entries in one call, whatever the queue's capacity (`api.md` Writing).
 pub const MAX_CALL_ENTRIES: usize = 65_536;
 const DAY_NS: i64 = 86_400_000_000_000;
@@ -414,7 +419,7 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
-    /// A sealed segment no manifest record lists cannot be read whole or fails its checks (Q-221 (c)).
+    /// A sealed segment no manifest record lists fails its checks (Q-221 (c)).
     SegmentDamaged {
         /// The segment.
         file_id: u64,
@@ -563,8 +568,11 @@ pub struct LogWriter {
     sealing: usize,
     /// Sealed segments no manifest record listed at the start, described one at a time (Q-221 (b)).
     unlisted: VecDeque<SegmentIdentity>,
-    describing: Option<u64>,
-    /// Unlisted segments that could not be described this run (Q-221 (c)).
+    /// The segment being described, with the wait that preceded this try (zero for the first).
+    describing: Option<(SegmentIdentity, Duration)>,
+    /// Unlisted segments whose description failed to open or read them: when each is tried again, and the wait.
+    describe_retry: Vec<(SegmentIdentity, Duration, Duration)>,
+    /// Unlisted segments that failed a check this run (Q-221 (c)).
     damaged: BTreeSet<u64>,
     described: Vec<SealedFile>,
     disk: Disk,
@@ -675,6 +683,7 @@ impl LogWriter {
             sealing: 0,
             unlisted: r.unlisted.into(),
             describing: None,
+            describe_retry: Vec::new(),
             damaged: BTreeSet::new(),
             described: Vec::new(),
             disk: Disk::default(),
@@ -859,28 +868,51 @@ impl LogWriter {
 
     /// One sealed segment that no manifest record listed at the start, to describe with [`describe_sealed`] in
     /// [`LogWriter::log_dir`]: only while no seal is ready or running, none is being described and the store is
-    /// writable (Q-221 (b)).
-    pub fn take_unlisted(&mut self) -> Option<SegmentIdentity> {
+    /// writable (Q-221 (b)). A segment whose retry time has come goes first.
+    pub fn take_unlisted(&mut self, now: Duration) -> Option<SegmentIdentity> {
         self.sync_halt();
         if self.fault.is_some() || self.describing.is_some() || self.seals_running() {
             return None;
         }
-        let id = self.unlisted.pop_front()?;
-        self.describing = Some(id.file_id);
+        let due = self
+            .describe_retry
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, at, _))| *at <= now)
+            .min_by_key(|(_, (_, at, _))| *at)
+            .map(|(i, _)| i);
+        let (id, waited) = match due {
+            Some(i) => {
+                let (id, _, waited) = self.describe_retry.swap_remove(i);
+                (id, waited)
+            }
+            None => (self.unlisted.pop_front()?, Duration::ZERO),
+        };
+        self.describing = Some((id, waited));
         Some(id)
     }
 
-    /// The result of describing a segment [`LogWriter::take_unlisted`] handed out. A segment that cannot be
-    /// described stays unlisted, sets no fault and degrades health as [`Reason::SegmentDamaged`] until the writer
-    /// stops; the next start tries it again (Q-221 (c)).
-    pub fn unlisted_done(&mut self, result: Result<SealedFile, DescribeError>) {
-        let Some(file_id) = self.describing.take() else {
+    /// The result of describing a segment [`LogWriter::take_unlisted`] handed out (Q-221 (c)). A failure to open or
+    /// read it is tried again after [`DESCRIBE_RETRY_INTERVAL`], doubled at each further failure up to
+    /// [`DESCRIBE_RETRY_MAX`], with health unchanged. A segment that fails its checks stays unlisted, sets no fault
+    /// and degrades health as [`Reason::SegmentDamaged`] until the writer stops; the next start tries it again.
+    pub fn unlisted_done(&mut self, result: Result<SealedFile, DescribeError>, now: Duration) {
+        let Some((id, waited)) = self.describing.take() else {
             return;
         };
         match result {
             Ok(f) => self.described.push(f),
-            Err(_) => {
-                self.damaged.insert(file_id);
+            Err(DescribeError::Io(_)) => {
+                let wait = if waited.is_zero() {
+                    DESCRIBE_RETRY_INTERVAL
+                } else {
+                    waited.saturating_mul(2).min(DESCRIBE_RETRY_MAX)
+                };
+                self.describe_retry
+                    .push((id, now.saturating_add(wait), wait));
+            }
+            Err(DescribeError::NotSealed | DescribeError::Invalid(_)) => {
+                self.damaged.insert(id.file_id);
             }
         }
     }
@@ -1040,6 +1072,9 @@ impl LogWriter {
             at(o.in_use_since + self.cfg.seal_interval);
         }
         if let Some(t) = self.blocked.iter().map(|(_, t)| *t).min() {
+            at(t);
+        }
+        if let Some(t) = self.describe_retry.iter().map(|(_, t, _)| *t).min() {
             at(t);
         }
         next

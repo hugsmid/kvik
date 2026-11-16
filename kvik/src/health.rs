@@ -55,8 +55,8 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
-    /// A sealed segment that no manifest record lists cannot be read whole or fails its checks, so it cannot be
-    /// listed or backed up; held while the store runs and raised again at each start until repaired (Q-221 (c)).
+    /// A sealed segment that no manifest record lists fails its checks, so it cannot be listed or backed up; held
+    /// while the store runs and raised again at each start until repaired (Q-221 (c)).
     SegmentDamaged {
         /// The segment.
         file_id: u64,

@@ -61,8 +61,8 @@ pub fn fact(series: u32, t: i64) -> Item {
     })
 }
 
-/// A file system over [`MemFs`] that counts the bytes read per path opened, fails reads of chosen paths, and can hold
-/// the first read made on `kvik-maint`.
+/// A file system over [`MemFs`] that counts the bytes read per path opened, fails opens or reads of chosen paths, and
+/// can hold the first read made on `kvik-maint`.
 #[derive(Clone, Debug)]
 pub struct Watch {
     pub inner: MemFs,
@@ -73,6 +73,7 @@ pub struct Watch {
 struct WatchState {
     read: HashMap<PathBuf, u64>,
     fail: Vec<String>,
+    fail_open: Vec<String>,
     hold: Option<(Sender<()>, Receiver<()>)>,
 }
 
@@ -105,8 +106,18 @@ impl Watch {
     pub fn fail_reads(&self, path_contains: &str) {
         self.state.lock().unwrap().fail.push(path_contains.into());
     }
+    /// Opens of matching paths fail as refused permission.
+    pub fn fail_opens(&self, path_contains: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .fail_open
+            .push(path_contains.into());
+    }
     pub fn clear_failures(&self) {
-        self.state.lock().unwrap().fail.clear();
+        let mut s = self.state.lock().unwrap();
+        s.fail.clear();
+        s.fail_open.clear();
     }
     /// Holds the next read on `kvik-maint`: `entered` is signalled, then the read waits for `release`.
     pub fn hold_next_maint_read(&self) -> (Receiver<()>, Sender<()>) {
@@ -119,6 +130,17 @@ impl Watch {
 
 impl Fs for Watch {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Box<dyn FsFile>> {
+        let name = path.to_string_lossy();
+        let refused = self
+            .state
+            .lock()
+            .unwrap()
+            .fail_open
+            .iter()
+            .any(|f| name.contains(f.as_str()));
+        if refused {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
         Ok(Box::new(WatchFile {
             inner: self.inner.open(path, mode)?,
             path: path.to_path_buf(),
@@ -251,7 +273,7 @@ impl Rig {
             self.create();
             let jobs = self.w.take_seal_jobs(self.now);
             let unlisted = if jobs.is_empty() {
-                self.w.take_unlisted()
+                self.w.take_unlisted(self.now)
             } else {
                 None
             };
@@ -264,7 +286,7 @@ impl Rig {
             }
             if let Some(id) = unlisted {
                 let r = describe_sealed(&self.fs, self.w.log_dir(), &id);
-                self.w.unlisted_done(r);
+                self.w.unlisted_done(r, self.now);
             }
         }
         self.create();

@@ -383,8 +383,9 @@ header to end marker. The trailer has no room for it (4 reserved bytes), so the 
 computes `file_crc32c`, off the commit thread, once per seal (a blocked seal's retry reuses it). After a start the
 writer computes it, one segment at a time and only while no seal is ready or running, for every sealed segment that
 no record names by generation and `file_id`, after checking the header against the name, the trailer, the end marker
-and `file_crc32c`; a segment that fails a check, or cannot be read whole, is left unnamed, degrades health
-(`SegmentDamaged`, `api.md` Health) and is tried again at the next start (Q-220, Q-221).
+and `file_crc32c`; a segment that fails a check is left unnamed, degrades health (`SegmentDamaged`, `api.md` Health)
+and is tried again at the next start, and one that cannot be opened or read whole is tried again in the run, after a
+wait that doubles from 10 s to 10 minutes (Q-220, Q-221).
 
 ## A.10 Durable mark (`log/MARK`, version 3)
 `log/MARK` is 4,224 bytes: two 128-byte slots at offsets 0 and 4,096 (separate sectors). It has no A.1 header. It is
