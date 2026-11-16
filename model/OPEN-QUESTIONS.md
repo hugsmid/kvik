@@ -1403,8 +1403,13 @@ for the rest of the run, while the same error on a seal is `SealBlocked` and ret
 the records `kvik-files` encodes,
 `listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`).
 (d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
-outside the crate; `kvik` maps those it knows and skips any other. Scenario (the review of roadmap 6.3b): a branch
-that matched every log reason stopped compiling once `SegmentDamaged` merged, with no textual conflict to warn of it.
+outside the crate. Scenario (the review of roadmap 6.3b): a branch that matched every log reason stopped compiling
+once `SegmentDamaged` merged, with no textual conflict to warn of it. `kvik` maps those it knows and reports any other
+as `kvik::Reason::Other { reason }`, its debug form, which degrades health: a reason never vanishes from health (the
+lead's ruling at the re-check of roadmap 6.3b; scenario: a reason added to the log but not to `kvik`'s mapping would
+otherwise be dropped silently). `kvik/src/durable/mod.rs`
+`a_log_reason_the_mapping_does_not_name_stays_in_health_with_its_name`, through the `kvik-log` feature
+`unmapped-reason`, which only `kvik`'s tests enable.
 **Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
 
 ## Q-640 — A description that never stops failing to open or read its segment

@@ -430,6 +430,10 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
+    /// Never raised: a reason no other crate maps (Q-221 (d)).
+    #[cfg(feature = "unmapped-reason")]
+    #[doc(hidden)]
+    Unmapped,
 }
 
 /// Why the mark is synced at every commit.

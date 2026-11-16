@@ -67,6 +67,11 @@ pub enum Reason {
         /// The segment.
         file_id: u64,
     },
+    /// A reason from the log that this version does not name, in its debug form; degraded (Q-221 (d)).
+    Other {
+        /// The log's reason.
+        reason: String,
+    },
     /// A corrupt manifest record was rebuilt from the local files, until
     /// acknowledged.
     ManifestRebuilt {
@@ -115,6 +120,7 @@ impl fmt::Display for Reason {
             Reason::SegmentUnreadable { file_id } => {
                 write!(f, "sealed segment {file_id} cannot be read")
             }
+            Reason::Other { reason } => write!(f, "log reason {reason}"),
             Reason::ManifestRebuilt { epoch, provisional } => {
                 let how = if *provisional { " provisionally" } else { "" };
                 write!(f, "manifest record of epoch {epoch} rebuilt{how}")
