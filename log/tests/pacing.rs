@@ -445,9 +445,15 @@ fn a_ceiling_near_the_largest_duration_schedules_without_overflow() {
         s.turn(START + MS, FAST);
         s
     };
+    let top = Duration::from_nanos(u64::MAX);
+    let open = Sim::new(Setup {
+        ceiling: Duration::MAX,
+        ..Setup::adaptive()
+    });
+    assert_eq!(open.w.stats().sync_interval, top);
     let fixed = run(false);
     assert_eq!(fixed.starts, [START]);
-    assert_eq!(fixed.w.sync_ready_at(), Duration::from_nanos(u64::MAX));
+    assert_eq!(fixed.w.sync_ready_at(), top);
     let adaptive = run(true);
     assert_eq!(adaptive.starts, [START, START + MS]);
     assert_eq!(adaptive.w.sync_interval(), FLOOR);

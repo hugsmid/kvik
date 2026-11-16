@@ -409,12 +409,10 @@ pub fn simulate(s: &mut Sim, h: &History) -> Schedule {
 /// The reference schedule: spec §3 Group commit with the interval of `pacing.rs`, driven as [`simulate`] drives the
 /// writer. With `clocked` false no sync is timed, so the interval stays at the ceiling.
 pub fn reference(h: &History, floor: Duration, ceiling: Duration, clocked: bool) -> Schedule {
-    let ns = |d: Duration| d.as_nanos() as u64;
+    let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
     let interval = |d: Option<u64>| {
-        d.map_or(ceiling, |d| {
-            let c = ns(ceiling);
-            Duration::from_nanos(d.saturating_mul(8).clamp(ns(floor).min(c), c))
-        })
+        let c = ns(ceiling);
+        Duration::from_nanos(d.map_or(c, |d| d.saturating_mul(8).clamp(ns(floor).min(c), c)))
     };
     let (mut d, mut due, mut last) = (None::<u64>, None::<Duration>, None::<Duration>);
     let ready = |d, due: Option<Duration>, last: Option<Duration>| {
