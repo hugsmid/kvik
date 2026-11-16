@@ -81,19 +81,21 @@ site=<site>/series=<series>/month=<YYYY-MM>/<view>.partial-<from_ns>_<to_ns>.par
 - A month wholly inside `range` is written as `<view>.parquet` and holds the whole month. A month that `range` cuts
   is written as `<view>.partial-<from_ns>_<to_ns>.parquet`, its bounds those of the clipped range (signed decimal
   nanoseconds, as `kvik.range_from_ns` and `kvik.range_to_ns` hold them), so a partial export never replaces a whole
-  month's file. A reader takes whole months by the exact name (`*/current.parquet`) and tells a partial file by
-  `.partial-` in its name or by its range keys. An export that should replace whole months passes a range of whole
+  month's file. A reader takes whole months by the exact name (`<root>/**/current.parquet`) and tells a partial file
+  by `.partial-` in its name or by its range keys. An export that should replace whole months passes a range of whole
   months.
 - One file per series per month. Only months with a fact in `range` get a file. `open` is called with each file's
   relative path, in month order.
 
-Reading the bucket: Hive-style readers add `site`, `series` and `month` columns and guess their types, so an
-all-digit escaped series name such as `0042` is read as the number 42. Declare the three as strings:
+Reading the bucket: a query reads one file name, here the whole months of the current view, since a folder can also
+hold other views and partial months whose rows would be counted again. Hive-style readers add `site`, `series` and
+`month` columns and guess their types, so an all-digit escaped series name such as `0042` is read as the number 42.
+Declare the three as strings:
 
 ```text
-DuckDB:  read_parquet('<root>/**/*.parquet', hive_partitioning = true, hive_types = {'site': VARCHAR, 'series': VARCHAR, 'month': VARCHAR})
-pyarrow: pyarrow.dataset.dataset(root, format="parquet", partitioning=pyarrow.dataset.partitioning(pyarrow.schema([("site", pyarrow.string()), ("series", pyarrow.string()), ("month", pyarrow.string())]), flavor="hive"))
-polars:  polars.scan_parquet(root + "/**/*.parquet", hive_partitioning=True, hive_schema={"site": polars.String, "series": polars.String, "month": polars.String})
+DuckDB:  read_parquet('<root>/**/current.parquet', hive_partitioning = true, hive_types = {'site': VARCHAR, 'series': VARCHAR, 'month': VARCHAR})
+pyarrow: pyarrow.dataset.dataset(glob.glob(root + "/**/current.parquet", recursive=True), format="parquet", partitioning=pyarrow.dataset.partitioning(pyarrow.schema([("site", pyarrow.string()), ("series", pyarrow.string()), ("month", pyarrow.string())]), flavor="hive"), partition_base_dir=root)
+polars:  polars.scan_parquet(root + "/**/current.parquet", hive_partitioning=True, hive_schema={"site": polars.String, "series": polars.String, "month": polars.String})
 ```
 
 Consistency and cost: one pass over `range` finds the months, then each month is read and written on its own. Each
