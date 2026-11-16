@@ -432,7 +432,12 @@ impl RWorld {
                     let after = self.m.losses();
                     // 27. Acknowledging changes only the state and health.
                     prop_assert_eq!(strip(&before), strip(&after));
-                    prop_assert!(after.iter().all(|l| !l.degrades()));
+                    // A loss whose copy is being brought back stays open
+                    // (Q-248); every other closes.
+                    for l in &after {
+                        let copying = l.state == Some(LossState::Copying);
+                        prop_assert_eq!(l.degrades(), copying, "{:?}", l);
+                    }
                     seen.acknowledged += after.iter().filter(|l| l.acknowledged).count();
                 }
             }
