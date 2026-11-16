@@ -72,7 +72,8 @@ pub struct CorruptionReport {
     pub at: Option<Nanos>,
 }
 
-/// What asks for a person (§8 Self-repair, Attention). None degrades health.
+/// What asks for a person (§8 Self-repair, Attention); only repeated corruption
+/// also degrades health (Q-247).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Alert {
     /// A corruption not yet seen, repaired or not (Q-240).
