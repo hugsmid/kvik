@@ -448,3 +448,19 @@ fn the_bound_holds_body_checks_and_failed_reads_per_window() {
     };
     assert!(!more_failed.within_bound(len));
 }
+
+#[test]
+fn failed_reads_are_counted_per_window_and_pass_the_rest_of_a_full_one() {
+    let mut f = FailedReads::new(64);
+    for o in (0..8 * FAILED_READS_PER_WINDOW).step_by(8) {
+        assert_eq!(f.next_from(o), o);
+        f.count(o);
+    }
+    assert_eq!(f.next_from(8), 64);
+    assert_eq!(f.next_from(64), 64);
+    f.count(64);
+    assert_eq!((f.next_from(72), f.peak()), (72, FAILED_READS_PER_WINDOW));
+    let mut z = FailedReads::new(0);
+    z.count(8);
+    assert_eq!(z.next_from(16), 16);
+}

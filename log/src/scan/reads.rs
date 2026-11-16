@@ -27,10 +27,10 @@ pub struct FailedReads {
 }
 
 impl FailedReads {
-    /// No failed read yet, in windows of `window` bytes.
+    /// No failed read yet, in windows of `window` bytes (at least 1).
     pub fn new(window: u64) -> Self {
         Self {
-            window,
+            window: window.max(1),
             current: 0,
             count: 0,
             peak: 0,
