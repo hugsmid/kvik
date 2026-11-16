@@ -740,6 +740,7 @@ dependencies = [
  "kvik-model",
  "proptest",
  "rustix",
+ "sha2",
  "thiserror",
 ]
 

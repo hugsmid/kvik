@@ -5,9 +5,14 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::batch::SegmentIdentity;
+use crate::block::BLOCK_HEADER_LEN;
 use crate::body::{INDEX_HAS_ENTRIES, IndexRecord, SegmentIndex};
+use crate::bytes::{u32_at, u64_at};
 use crate::crc::Crc32c;
+use crate::directory::logdir::SegmentRecord;
 use crate::fs::{Fs, FsFile, OpenMode, is_sharing_error};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::name::SegmentName;
@@ -217,6 +222,12 @@ pub enum SealError {
 /// failed although the `.open` name is gone and the `.kvl` name exists took effect and then failed its flush
 /// (`StdFs` on Windows): a failed sync, never retried (`format.md` A.13).
 pub fn seal_segment(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
+    seal_described(fs, job, halt).map(|_| ())
+}
+
+/// [`seal_segment`], returning the sealed segment's log directory record (`format.md` A.18), its SHA-256 computed
+/// in the same pass as `file_crc32c`.
+pub fn seal_described(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, SealError> {
     let r = seal_inner(fs, job, halt);
     if let Err(SealError::Fault(f)) = &r {
         halt.set(f.clone());
@@ -224,7 +235,7 @@ pub fn seal_segment(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealE
     r
 }
 
-fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
+fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, SealError> {
     let go = || {
         if halt.is_set() {
             Err(SealError::Halted)
@@ -238,6 +249,7 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
     // `file_crc32c` is computed over the segment up to its last batch, read `SEAL_READ` bytes at a time, so memory
     // at seal does not grow with `segment_size` (Q-115 (l)).
     let mut crc = Crc32c::new();
+    let mut sha = Sha256::new();
     let mut buf = vec![0u8; SEAL_READ.min(job.end as usize)];
     let mut at = 0u64;
     while at < job.end {
@@ -250,6 +262,7 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
             }
             Ok(n) => {
                 crc.update(&buf[..n]);
+                sha.update(&buf[..n]);
                 at += n as u64;
             }
             Err(e) => return Err(f(FaultOp::Seal, &e)),
@@ -272,6 +285,25 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
             message: e.to_string(),
         })
     })?;
+    sha.update(&seal);
+    let trailer_offset = u64_at(&seal, seal.len() - 16);
+    let file_crc32c = u32_at(
+        &seal,
+        (trailer_offset - job.end) as usize + BLOCK_HEADER_LEN + 56,
+    );
+    let record = SegmentRecord {
+        file_id: job.id.file_id,
+        generation: job.id.generation,
+        has_entries: job.has_entries,
+        first_sequence: job.summary.first_sequence,
+        last_sequence: job.summary.last_sequence,
+        first_commit_time: job.summary.first_commit_time,
+        last_commit_time: job.summary.last_commit_time,
+        fact_count: job.records.iter().map(|r| u64::from(r.fact_count)).sum(),
+        len: job.end + seal.len() as u64,
+        file_crc32c,
+        sha256: sha.finalize().into(),
+    };
     go()?;
     job.file
         .write_at(&seal, job.end)
@@ -301,7 +333,7 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> 
     go()?;
     fs.sync_dir(&job.log_dir)
         .map_err(|e| SealError::Fault(fault(FaultOp::Sync, &job.log_dir, &e)))?;
-    Ok(())
+    Ok(record)
 }
 
 #[cfg(test)]
@@ -379,10 +411,20 @@ mod tests {
             records: Vec::new(),
             has_entries: false,
         };
-        seal_segment(&fs, &job, &halt).unwrap();
+        let record = seal_described(&fs, &job, &halt).unwrap();
         let bytes = fs.read(&segment_path(&log_dir, &id, true)).unwrap();
         let seal = scan(&bytes, &id, ScanLimit::End).unwrap().seal.unwrap();
         assert_eq!(seal.start, end);
         assert!(seal.file_crc_matches(&bytes));
+        let described = SegmentRecord {
+            sha256: Sha256::digest(&bytes).into(),
+            len: bytes.len() as u64,
+            file_crc32c: seal.trailer.file_crc32c,
+            ..record.clone()
+        };
+        assert_eq!(
+            record, described,
+            "the record's hash and checksum are the file's"
+        );
     }
 }

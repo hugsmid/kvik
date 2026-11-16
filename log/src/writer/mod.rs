@@ -38,6 +38,7 @@
 //! log.shutdown().unwrap();
 //! ```
 
+mod directories;
 mod gather;
 mod maint;
 mod options;
@@ -54,8 +55,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+pub use directories::{
+    Directories, DirectoryOptions, DirectoryStart, DirectoryStats, SealHook, StatusContent,
+    writer_catalogue,
+};
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
-pub use maint::{create_segment, seal_segment};
+pub use maint::{create_segment, seal_described, seal_segment};
 pub use options::{GenerationStart, SealListener, StartOptions};
 pub use queue::{CallSource, IngestQueue, QueueFull};
 pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
@@ -701,6 +706,20 @@ impl LogWriter {
     /// The fault that made the store read-only, if any.
     pub fn fault(&self) -> Option<&Fault> {
         self.fault.as_ref()
+    }
+
+    /// What the derived files are checked and written against after this start (`format.md` A.18).
+    pub fn directory_start(&self) -> DirectoryStart {
+        let stamp = self.mark_slot.stamp;
+        DirectoryStart {
+            generation: self.generation,
+            stamp: (stamp.nonce != 0).then_some(stamp),
+            reset_after: self.report.entry.as_ref().map(|e| Position {
+                generation: self.generation,
+                sequence: e.entry.after,
+            }),
+            segment_size: self.cfg.segment_size,
+        }
     }
 
     /// The read-only flag to pass to [`create_segment`] and [`seal_segment`].

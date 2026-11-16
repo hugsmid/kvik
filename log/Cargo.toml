@@ -13,6 +13,8 @@ categories = ["database-implementations"]
 
 [dependencies]
 crc = "3.4"
+# The plaintext hash of a sealed segment in the log directory (`format.md` A.18), audited RustCrypto.
+sha2 = "0.11"
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]

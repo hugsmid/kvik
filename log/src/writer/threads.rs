@@ -13,10 +13,11 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
+use super::directories::{Directories, DirectoryOptions};
+use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest, seal_described};
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Done, Fault, FaultOp, Halt, IngestQueue,
-    LogStats, LogWriter, Reason, Wait, create_segment, seal_segment,
+    LogStats, LogWriter, Reason, Wait, create_segment,
 };
 use crate::content::Item;
 use crate::fs::Fs;
@@ -274,7 +275,27 @@ pub struct Log {
 
 impl Log {
     /// Starts `kvik-writer` and `kvik-maint` on an opened writer.
-    pub fn start(mut writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+    pub fn start(writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        Self::start_with(writer, clock, None)
+    }
+
+    /// [`Log::start`], with `kvik-maint` also writing the derived files (`format.md` A.18) as `dirs` says.
+    pub fn start_with(
+        mut writer: LogWriter,
+        clock: Arc<dyn Clock>,
+        dirs: Option<DirectoryOptions>,
+    ) -> io::Result<Self> {
+        let dirs = dirs.map(|opts| {
+            let start = writer.directory_start();
+            let store = writer.store();
+            Directories::new(
+                store.fs().clone(),
+                store.dir(),
+                store.descriptor().store_id,
+                start,
+                opts,
+            )
+        });
         writer.set_sync_clock(clock.clone());
         let cfg = writer.config().clone();
         let shared = Arc::new(Shared {
@@ -308,7 +329,7 @@ impl Log {
         let s = shared.clone();
         let maint = std::thread::Builder::new()
             .name("kvik-maint".into())
-            .spawn(move || maint_loop(&s))?;
+            .spawn(move || maint_loop(&s, dirs))?;
         let s = shared.clone();
         let w = std::thread::Builder::new()
             .name("kvik-writer".into())
@@ -650,12 +671,24 @@ impl Drop for MaintGuard<'_> {
     }
 }
 
-fn maint_loop(s: &Shared) {
+fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
     let _guard = MaintGuard(s);
+    let mut next: Option<Duration> = dirs.as_ref().map(|_| Duration::ZERO);
     loop {
         let mut m = lock(&s.maint);
         while m.request.is_none() && m.jobs.is_empty() && !m.stop {
-            m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
+            let now = s.clock.monotonic();
+            match next {
+                Some(t) if t <= now => break,
+                Some(t) => {
+                    m = s
+                        .maint_cv
+                        .wait_timeout(m, t - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+                None => m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner),
+            }
         }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
@@ -664,6 +697,7 @@ fn maint_loop(s: &Shared) {
             if m.stop {
                 return;
             }
+            next = None;
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
             drop(m);
             continue;
@@ -674,13 +708,42 @@ fn maint_loop(s: &Shared) {
             lock(&s.maint).created = Some(r);
         } else if let Some(job) = m.jobs.pop_front() {
             drop(m);
-            let r = seal_segment(&*s.fs, &job, &s.halt);
-            lock(&s.maint).results.push((job, r));
+            let r = seal_described(&*s.fs, &job, &s.halt);
+            if let (Some(d), Ok(rec)) = (dirs.as_mut(), &r) {
+                d.sealed(rec.clone());
+                next = Some(Duration::ZERO);
+            }
+            lock(&s.maint).results.push((job, r.map(|_| ())));
         } else {
-            return;
+            let stop = m.stop;
+            drop(m);
+            if let Some(d) = dirs.as_mut() {
+                next = run_directories(s, d, stop);
+            }
+            if stop {
+                return;
+            }
+            continue;
         }
         s.wake_writer();
     }
+}
+
+/// Runs the derived files' due work; asks the writer for a mark sync when a sealed segment waits for one (`spec.md`
+/// §3 Durable mark: a write that would name a position above the last synced mark forces the next mark sync).
+fn run_directories(s: &Shared, d: &mut Directories, stop: bool) -> Option<Duration> {
+    let synced = lock(&s.info).stats.mark_synced;
+    let now = s.clock.monotonic();
+    let after = d.run(synced, now, s.clock.wall());
+    if !stop && d.waits_for(synced) {
+        {
+            let mut f = lock(&s.front);
+            f.mark_sync = true;
+            f.wake = true;
+        }
+        s.writer_cv.notify_one();
+    }
+    after.map(|a| now + a)
 }
 
 #[cfg(test)]

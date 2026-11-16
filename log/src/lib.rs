@@ -22,6 +22,7 @@
 //! - [`reader`]: a reader process: the log up to the durable mark, tailed as the mark moves, without the lock
 //!   (`spec.md` §7 Readers).
 //! - [`lease`]: reader leases and the writer's view of them (A.15).
+//! - [`directory`]: the derived log directory, series directory and status file (A.18).
 //! - [`writer`]: the commit path: group commit, sync, the durable mark, positions, segment creation and sealing
 //!   (`spec.md` §3).
 //! - [`fs`]: the file-system seam every file operation goes through (A.13).
@@ -65,6 +66,7 @@ pub mod content;
 mod content_error;
 pub mod crc;
 pub mod cursor;
+pub mod directory;
 pub mod entries;
 mod error;
 pub mod facts;
