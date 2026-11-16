@@ -139,7 +139,7 @@ mod bounded {
         let env = Env::test(clock);
         let dir = "bounded-deliverer";
         let s = block_on(Store::open(
-            StoreConfig::new(dir, "Europe/London")
+            StoreConfig::new(dir, "Etc/UTC")
                 .create_if_missing(true)
                 .env(env.clone()),
         ))

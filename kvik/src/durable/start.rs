@@ -194,7 +194,7 @@ mod tests {
         let env = Env::test(ManualClock::new(Timestamp(T0 + 7_200 * S)));
         let dir = Path::new("start-bounded");
         let s = block_on(Store::open(
-            StoreConfig::new(dir, "Europe/London")
+            StoreConfig::new(dir, "Etc/UTC")
                 .create_if_missing(true)
                 .env(env.clone()),
         ))
