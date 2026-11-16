@@ -17,6 +17,7 @@
 mod clock;
 mod consumers;
 mod deliver;
+mod derived;
 mod history;
 mod index;
 mod ingest;
@@ -438,6 +439,7 @@ impl Writer {
                 start_fault = Some(registry_fault(&dir, &e));
             }
         }
+        let hook = derived::hook(&writer, &*env.fs, &dir, descriptor.store_id);
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
         let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let hub = match deliver::Deliverer::open(
@@ -447,6 +449,7 @@ impl Writer {
             descriptor.store_id,
             config.limits.consumer_queue,
             config.limits.max_consumers,
+            Some(hook.fold.clone()),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
@@ -457,10 +460,14 @@ impl Writer {
                 });
             }
         };
-        let log = Log::start(writer, clock).map_err(|source| OpenError::Io {
-            path: dir.clone(),
-            source,
-        })?;
+        let log =
+            Log::start_with(writer, clock, Some(derived::options(&hook))).map_err(|source| {
+                OpenError::Io {
+                    path: dir.clone(),
+                    source,
+                }
+            })?;
+        hook.fold.follow(log.watch());
         if let Some(h) = &hub {
             h.start(log.watch()).map_err(|source| OpenError::Io {
                 path: dir.clone(),
@@ -485,6 +492,7 @@ impl Writer {
             hub,
             env,
         });
+        let _ = hook.writer.set(Arc::downgrade(&w));
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
         // Opening). A release whose name is not a valid entry is left out.
         let release = tzdata_name(tz.version());

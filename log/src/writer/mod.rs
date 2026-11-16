@@ -56,8 +56,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 pub use directories::{
-    Directories, DirectoryOptions, DirectoryStart, DirectoryStats, SealHook, StatusContent,
-    writer_catalogue,
+    Directories, DirectoryOptions, DirectoryStart, DirectoryStats, STATUS_INTERVAL, SealHook,
+    StatusContent, writer_catalogue,
 };
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
 pub use maint::{create_segment, seal_described, seal_segment};

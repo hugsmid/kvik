@@ -50,6 +50,8 @@ pub(crate) struct Index {
     /// deliverer need the registry and the commit times, not the facts).
     no_facts: bool,
     first_fact: BTreeMap<u32, LogPos>,
+    /// Told of every batch taken and every void, for the series directory (`format.md` A.18).
+    fold: Option<std::sync::Arc<super::derived::SeriesFold>>,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -135,6 +137,11 @@ impl Index {
         }
     }
 
+    /// Hands every batch taken from now on, and every void, to `fold`.
+    pub(crate) fn set_fold(&mut self, fold: std::sync::Arc<super::derived::SeriesFold>) {
+        self.fold = Some(fold);
+    }
+
     /// Applies what a refresh found, in order.
     pub(crate) fn apply(&mut self, events: &[ReadEvent]) {
         for e in events {
@@ -183,10 +190,16 @@ impl Index {
             sequence += item.sequences();
         }
         self.commits.push((b.last, b.commit_time));
+        if let Some(f) = &self.fold {
+            f.batch(b);
+        }
     }
 
     /// Forgets everything above `above` and rebuilds the registry from what is left.
     fn void(&mut self, above: LogPos) {
+        if let Some(f) = &self.fold {
+            f.void(above);
+        }
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
         self.recoveries.retain(|p, _| keep(p));
