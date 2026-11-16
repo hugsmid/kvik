@@ -44,6 +44,8 @@ enum Piece {
     Image(u8),
     /// A facts block, then an unknown critical block.
     Critical,
+    /// A facts block, then this many skippable blocks.
+    Wide(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +63,7 @@ fn piece() -> impl Strategy<Value = Piece> {
         4 => Just(Piece::Entries),
         6 => (0u8..3).prop_map(Piece::Image),
         1 => Just(Piece::Critical),
+        3 => (2u8..5).prop_map(Piece::Wide),
     ]
 }
 
@@ -105,6 +108,14 @@ fn build(pieces: &[Piece], seal: Option<bool>, damage: &[Damage]) -> Vec<u8> {
             Piece::Critical => {
                 let mut b = facts(seq, 1);
                 b.push_unknown(0x30, 0, vec![7; 12]).unwrap();
+                b
+            }
+            Piece::Wide(k) => {
+                let mut b = facts(seq, 1);
+                for i in 0..*k {
+                    b.push_unknown(0x50, FLAG_SKIPPABLE, vec![i; 8 * usize::from(i) + 4])
+                        .unwrap();
+                }
                 b
             }
         };
