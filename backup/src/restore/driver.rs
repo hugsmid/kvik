@@ -38,6 +38,15 @@ pub struct Restorer<S, E> {
     nonce: Box<dyn FnMut() -> u64 + Send>,
     cfg: RestoreConfig,
     run: Option<Run<E>>,
+    /// The generation this restorer claimed, kept across failed `prepare` calls (Q-266).
+    claimed: Option<Claimed>,
+}
+
+#[derive(Clone, Copy)]
+struct Claimed {
+    store_id: [u8; 16],
+    generation: u32,
+    nonce: u64,
 }
 
 struct Pending {
@@ -392,6 +401,7 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             nonce,
             cfg,
             run: None,
+            claimed: None,
         }
     }
 
@@ -440,13 +450,32 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             probe::probe(&self.sink, &env, &keys, &mut *self.nonce).await?;
         }
         let highest = highest_claimed(&self.sink, &keys, 0).await?;
-        let nonce = (self.nonce)();
-        let generation = if self.drill() {
-            highest
-                .checked_add(1)
-                .ok_or(PlanError::GenerationsExhausted)?
-        } else {
-            claim(&self.sink, &keys, highest, nonce).await?
+        let mine = self
+            .claimed
+            .filter(|c| !self.drill() && c.store_id == store_id);
+        let (generation, nonce) = match mine {
+            // Q-266: a retry after a failure past the claim runs in the generation claimed, unless superseded.
+            Some(c) if highest > c.generation => {
+                return Err(RestoreError::Superseded { by: highest });
+            }
+            Some(c) => (c.generation, c.nonce),
+            None => {
+                let nonce = (self.nonce)();
+                let generation = if self.drill() {
+                    highest
+                        .checked_add(1)
+                        .ok_or(PlanError::GenerationsExhausted)?
+                } else {
+                    let generation = claim(&self.sink, &keys, highest, nonce).await?;
+                    self.claimed = Some(Claimed {
+                        store_id,
+                        generation,
+                        nonce,
+                    });
+                    generation
+                };
+                (generation, nonce)
+            }
         };
         let (source_generation, records) =
             source_records(&self.sink, &env, &keys, generation).await?;

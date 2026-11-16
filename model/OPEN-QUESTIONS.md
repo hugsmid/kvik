@@ -74,6 +74,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 | Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
+| Q-266 | §8 Generations, Restore; `api.md` Backup and restore | A full restore retried after a failure past its claim |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1435,6 +1436,19 @@ the same way without touching the bucket, also if the marker later reads as abse
 next record is due; they are in no later generation's records, as §8 accepts. The cost is one `stat` per record
 uploaded. Not done here: the store maps the failure to read-only and fatal health (8.1d), and nothing reads the
 claims while the driver is idle (an idle writer uploads nothing). Tests: `backup/tests/upload_superseded.rs`.
+## Q-266 — A full restore retried after a failure past its claim
+Recorded by roadmap 8.3c (review finding of 8.3b's fix round). To be settled by roadmap 8.3.
+**Scenario.** A full restore claims generation 1, then fails before its record is written (a transient fault reading
+the source records, a lagging listing, Q-304). `Store::restore` is called again and each retry claimed the next
+generation, so a bucket with a flaky listing walked the generations, each claim never withdrawn.
+**Decided (8.3c).** A `Restorer` keeps the store id, generation and nonce it claimed across failed `prepare` calls; a
+retry for the same store runs in that generation with that nonce (its marker's) and claims nothing, unless a higher
+generation is claimed meanwhile, when it fails with `RestoreError::Superseded { by }` and claims nothing more (the
+record would be superseded at once). A drill keeps nothing. Unchanged: a crash or a new process before the record
+starts again with the next generation (§8 Restore, row 28a, Q-39 (f)); keeping the claim across that would need a
+local note written before the claim, a new file. Tests: `backup/tests/restore_guards.rs`
+`a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation`,
+`a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more`.
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1523,6 +1537,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
+| Q-266 | 8.3 | Decided by roadmap 8.3c; a durable note of the claim, for a crash, would be a new file and a spec change: the owner's call |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
