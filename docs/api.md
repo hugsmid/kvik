@@ -376,7 +376,8 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
-    SetAside(SetAsideReport) }     // information, not degraded (Q-90)
+    SetAside(SetAsideReport),      // information, not degraded (Q-90)
+    StorageSuspect { corruptions: u32, within: Span } }   // repeated corruption (spec §8 Self-repair, Q-247)
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
     pub commit_time_first: Timestamp, pub commit_time_last: Timestamp }
@@ -404,7 +405,7 @@ pub struct CorruptionReport { pub id: CorruptionId, pub found_at: Timestamp, pub
 pub fn attention(&self) -> Vec<Alert>;                      // Store and Reader; empty: nobody needs to look
 pub async fn acknowledge_corruptions(&self, ids: &[CorruptionId]) -> Result<(), WriteError>;
 // LossState, Closed, ResendRequest, repairs, repair_done, Alert, CorruptionId, CorruptionReport, attention,
-// acknowledge_corruptions, LossReport.state and the repair.* keys are built with roadmap 8.5c.
+// acknowledge_corruptions, LossReport.state, Reason::StorageSuspect and the repair.* keys are built with roadmap 8.5c.
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
@@ -428,8 +429,9 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   Acknowledging a loss, §11 Health). `acknowledge_losses`, `acknowledge_corruptions` and `repair_done` are refused
   while read-only and in a drill; `repair_done` of a loss not awaiting re-send writes nothing. Re-sent readings go
   through `emit` and take new positions. `attention()` lists what needs a person (spec §8 Self-repair, Attention):
-  each corruption until it is seen, repaired or not, repeated corruption, a fault and a failed or stalled backup; it
-  never changes `Health`. `acknowledge_losses` also marks as seen the corruption each loss came from. A corrupt manifest record with
+  each corruption until it is seen, repaired or not, repeated corruption, a fault and a failed or stalled backup. A
+  corruption's alert never changes `Health`; repeated corruption is also `Reason::StorageSuspect`, degraded, while
+  `repair.suspect_after` is crossed (Q-247). `acknowledge_losses` does not close a loss in stage 1 (Q-248). `acknowledge_losses` also marks as seen the corruption each loss came from. A corrupt manifest record with
   no copy is rebuilt from the local files and reported as `ManifestRebuilt` until `acknowledge_manifest_rebuild`,
   which is refused while read-only and in a drill as `acknowledge_losses` is, and whose torn acknowledgement record is
   given again as for `acknowledge_losses` (spec §7 Manifest).

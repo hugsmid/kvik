@@ -1703,7 +1703,7 @@ impl Slot {
                 }
                 R::LowDisk => reasons.push(Reason::DiskLow { free }),
                 R::CriticalDisk => reasons.push(Reason::DiskCritical { free }),
-                R::UploadStalled => {}
+                R::UploadStalled | R::StorageSuspect(_) => {}
                 R::ClockSkew(s) => reasons.push(Reason::ClockSkew(sid(*s))),
                 R::DataLost(a, _) => {
                     if let Some(l) = losses.iter().find(|l| l.identity == pos(*a))

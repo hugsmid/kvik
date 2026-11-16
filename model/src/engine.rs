@@ -865,6 +865,9 @@ pub enum Reason {
     /// its first and last position. Read from the manifest, so it is reported
     /// after every start (see Q-34 (c)).
     DataLost(Position, Position),
+    /// Repeated corruption: this many corruptions within
+    /// `repair.suspect_within` (§8 Self-repair, Q-247).
+    StorageSuspect(u32),
 }
 
 /// Health report.
@@ -4472,6 +4475,9 @@ impl Model {
         for l in self.losses().into_iter().filter(Loss::degrades) {
             let (from, to) = (l.first.unwrap_or(l.identity), l.last.unwrap_or(l.identity));
             raise(Level::Degraded, Reason::DataLost(from, to), &mut reasons);
+        }
+        if let Some(n) = self.suspect_count() {
+            raise(Level::Degraded, Reason::StorageSuspect(n), &mut reasons);
         }
         let free = self.free_bytes();
         if free < self.config.critical_mark {

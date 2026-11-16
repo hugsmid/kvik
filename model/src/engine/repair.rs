@@ -445,24 +445,31 @@ impl Model {
             .collect()
     }
 
-    /// What asks for a person now (§8 Self-repair, Attention): each
-    /// corruption not yet seen, repeated corruption, a fault and a stalled
-    /// backup. It never changes [`Model::health`].
-    pub fn attention(&self) -> Vec<Alert> {
-        let corruptions = self.corruptions();
-        let mut out: Vec<Alert> = corruptions
-            .iter()
-            .filter(|c| !c.seen)
-            .map(|c| Alert::Corruption(c.id))
-            .collect();
+    /// The corruptions within `repair.suspect_within`, seen or not, when at
+    /// or above `repair.suspect_after` (§8 Self-repair, Q-247).
+    pub(super) fn suspect_count(&self) -> Option<u32> {
         let since = self.wall.saturating_sub(self.config.repair.suspect_within);
-        let recent = corruptions
+        let recent = self
+            .corruptions()
             .iter()
             .filter(|c| c.at.is_none_or(|at| at >= since))
             .count();
         let recent = u32::try_from(recent).unwrap_or(u32::MAX);
-        if recent >= self.config.repair.suspect_after {
-            out.push(Alert::StorageSuspect(recent));
+        (recent >= self.config.repair.suspect_after).then_some(recent)
+    }
+
+    /// What asks for a person now (§8 Self-repair, Attention): each
+    /// corruption not yet seen, repeated corruption, a fault and a stalled
+    /// backup. Only repeated corruption also degrades [`Model::health`].
+    pub fn attention(&self) -> Vec<Alert> {
+        let mut out: Vec<Alert> = self
+            .corruptions()
+            .iter()
+            .filter(|c| !c.seen)
+            .map(|c| Alert::Corruption(c.id))
+            .collect();
+        if let Some(n) = self.suspect_count() {
+            out.push(Alert::StorageSuspect(n));
         }
         if self.vol.as_ref().is_some_and(|v| v.sync_failed) {
             out.push(Alert::Fault);

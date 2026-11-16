@@ -561,7 +561,7 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   unsupported. Appended when a file is found damaged or judged lost, before a copy is fetched; it names a
   corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. Decoded strictly
   from roadmap 8.5b; until then it is read as a reserved type.
-- Corruption seen (the value of `0x24` field 5 and `0x25` field 12, 16 bytes): 0 kind `u8` (1 a file, by its
+- Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 16 bytes): 0 kind `u8` (1 a file, by its
   quarantine record; 2 a lost range, by its loss's identity; 3 a manifest record); 1 reserved (3 bytes); 4 for a
   file, its kind `u8`, 3 reserved and `file_id` `u64`, as an input entry of a file description; for a lost range, the
   identity (position); for a manifest record, its epoch `u64` then 4 reserved bytes. Naming a corruption seen twice
@@ -609,7 +609,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded; 11 repeated, the outcome of a carried acknowledged range closed otherwise than by an operator:
   identity (position), outcome `u8` (1 or 2), 3 reserved, positions restored `u64` (0 with outcome 2), in strictly
   ascending order of identity, each naming a field 7 range; 12 repeated, a corruption seen carried, as `0x24` field
-  5, in the order read (fields 11 and 12 are written from roadmap 8.5c, Q-241). In every range
+  5, in the order read; 13 repeated, a corruption not yet seen carried, as `0x24` field 5, in the order read, each
+  named once in fields 12 and 13 together (fields 11 to 13 are written from roadmap 8.5c, Q-241). In every range
   first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
   lost range, is a version refusal. A reader keeps a restore record's fields in the order read, as for a reserved
   type, so it is carried unchanged; canonical writing puts them in ascending id order. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000

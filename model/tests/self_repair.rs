@@ -266,8 +266,12 @@ fn s8_self_repair_repeated_corruption_makes_the_storage_suspect() {
     m.restore_file(g);
     m.acknowledge_corruptions(&[Corruption::File(g)]).unwrap();
     assert_eq!(m.attention(), vec![Alert::StorageSuspect(2)]);
+    let h = m.health();
+    assert_eq!(h.level, Level::Degraded, "seen or not");
+    assert_eq!(h.reasons, vec![Reason::StorageSuspect(2)]);
     m.advance(2 * DAY);
     assert!(m.attention().is_empty(), "the first is older than 30 days");
+    assert_eq!(m.health().level, Level::Ok);
 }
 
 #[test]

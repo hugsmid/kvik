@@ -13,7 +13,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-52 (b) | §7 Manifest, §3 Recovery rule 3, Order of a start steps 3 and 4 | Whether writing the last manifest record, or the last log batch, again in place makes the next sync write it |
 | Q-83 | §5.6, §5.2 holds, §2.1 parameters, invariants 5 and 8 | Node contents after a past-effective change of the staleness limit |
 | Q-84 | §2.3 Live state, §6 Conditions, §8 Restore step 3, invariant 16 | A condition or live state that stays unknown |
-| Q-85 | §8 Corrupt block, Self-repair, No deletion, invariant 10, §11 Health | A loss in the bucket found outside a restore |
 | Q-86 (b) | §3 Write or sync failure, Disk space | No space at a log write before any sync, checked on a file system that tracks pages |
 | Q-88 | §4 Funnel, Routing, `api.md` Consuming | The grammar of name patterns |
 | Q-90 | §8 Restore step 1, §8 Acknowledging a loss, §11 Health | Whether a restore record's set-aside report holds health degraded |
@@ -66,11 +65,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
-| Q-241 | §8 Self-repair, Generations; `format.md` A.14 `0x25` | What a restore carries of closing outcomes and corruptions |
 | Q-243 | §8 Self-repair; `api.md` `repair_done` | `repair_done` under manual acknowledgement, across a restart |
 | Q-244 | §8 Self-repair, §7 Manifest; `format.md` A.14 `0x26` | Corruptions after a manifest rebuild: alerts and the repeated-corruption count |
-| Q-247 | §8 Self-repair; `api.md` Configuration | The default of `repair.suspect_after` |
-| Q-248 | §8 Self-repair, Acknowledging a loss | `acknowledge_losses` on a loss whose copy is being brought back |
 | Q-249 | §8 Self-repair stage 3, §7 Manifest | A torn closing record of a loss restored in full |
 
 ## Q-16 — Which commits refresh live staleness
@@ -270,25 +266,6 @@ exception is never discharged.
 **Model.** Not modelled: nothing is unknown in the model (see the table below).
 **Needed.** What ends an unknown state whose fact never becomes local: a fetch on demand for it, a delivery when
 `restoring` ends, or a state that stays unknown (and what `resync` then carries).
-
-## Q-85 — A loss in the bucket found outside a restore
-**Scenario.** Fill pressure moved a sealed log segment off hot and cold once it was verified in deep (§8 Fill
-pressure, Eviction at 90 days), so deep holds its only copy. The scheduled hash check, or an on-demand fetch, then
-finds the object missing or corrupted in the bucket. §8 Corrupt block fetches another copy and otherwise compacts
-again from kept inputs, which are gone once the file is verified elsewhere (§7); the restore exception of Q-39 (e)
-does not apply, and No deletion says nothing of it.
-**Model.** Not modelled; the bucket never loses or corrupts a file.
-**Needed.** Whether such a loss is handled as Corrupt block with deep as the failed tier (compacted again from other
-files that hold its positions, the rest a lost range reported as `data_lost`), and how it is reported.
-**Applied by roadmap 8.5a, awaiting the owner's confirmation.** Under the owner's self-repair ruling (§8 Self-repair):
-the scheduled check judges an object with the restore's lost-object rule and the owner's thresholds (absent on 3
-lookups spanning at least 10 minutes while the store descriptor answers; transient faults never count; Q-82); a file
-so judged is uploaded again from a verified local copy where one exists, a corruption repaired with no loss;
-otherwise the positions no other file holds are a lost range of cause 3, lost in the bucket, reported as
-`data_lost`, and go to the re-send stage. Each such file is a corruption, named by a quarantine record (`0x26`
-reason 4), so it alerts until seen. This is a new `data_lost` path outside a restore (No deletion, invariant 10,
-§11 Health), which the owner confirms. The model has it as `Model::lose_object` and `Model::check_bucket`
-(`tests/self_repair.rs` `s8_self_repair_lost_object_…`).
 
 ## Q-86 (b) — No space at a log write before any sync
 Found by spike 2.2 (`docs/measurements/2.2-commit-latency.md`). To be settled by roadmap item 4.8 (moved from 4.5); moved again, to gate 4.9, by 4.8 (see the end of the question).
@@ -1345,21 +1322,6 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
-## Q-241 — What a restore carries of closing outcomes and corruptions
-Recorded by roadmap 8.5a.
-**Scenario.** A loss is closed by self-repair as "re-send ended" (`0x24` field 3 = 2). A restore then carries it in
-its restore record's field 7, "as `0x24` field 1": identity, first and last only. Read back, the outcome is absent,
-which means "by an operator", against invariant 27 (a loss closed by self-repair stays listed with its state). Two
-corruptions were found before the disaster: one seen, one not. The restore record carries lost ranges but no
-quarantine record and no "seen" mark, so after the restore the seen one alerts again and a file-named one that was
-not seen stops alerting.
-**Laid out.** `format.md` A.14 `0x25` field 11 carries the outcome of each field 7 range closed otherwise than by an
-operator, and field 12 carries each corruption seen. `files/` decodes `0x25` strictly and refuses both today; they
-are written and read from roadmap 8.5c.
-**Needed.** Whether an unseen corruption of the source generation keeps its alert in the restored generation.
-Proposed: yes; a range-named one does already (its lost range is carried); a file-named one is carried as a further
-field naming the file, kind 1 of a corruption seen, with "unseen" meaning not named by field 12.
-
 ## Q-243 — `repair_done` under manual acknowledgement, across a restart
 Recorded by roadmap 8.5a.
 **Scenario.** `repair.acknowledge = manual`. The application calls `repair_done(L)`: stage 2 ends and L awaits an
@@ -1382,26 +1344,11 @@ the records that name them, and a corruption that was seen and whose quarantine 
 the loss's lost-range record. The count may fall by the corruptions a rebuild could not reconstruct.
 **Needed.** Whether the rebuild record should carry a count of corruptions within the suspect window (a new `0x28`
 field), or whether a count low by at most the records of one corrupt span is accepted as is.
-
-## Q-247 — The default of `repair.suspect_after`
-Recorded by roadmap 8.5a.
-**Scenario.** The owner ruled an alert on every repaired corruption and the lost-object thresholds, but not the
-"repeated corruption" threshold. The design proposed 2 losses in 30 days; with every corruption already alerting
-until seen, the repeated-corruption alert says that the storage itself is suspect and should be replaced.
-**Now.** 2 corruptions (not losses: a repaired corruption counts) in 30 days, counted by the records that name them.
-**Needed.** The owner's default.
-
-## Q-248 — `acknowledge_losses` on a loss whose copy is being brought back
-Recorded by roadmap 8.5a.
-**Scenario.** A sealed segment is found damaged while the store cannot write; the next start records its loss, and
-the segment's copy in deep is being fetched (stage 1, state `Copying`). An operator calls `acknowledge_losses` for
-it. Closed "by an operator", the loss is closed for good, and Q-246 keeps a closed loss from being restored, so the
-copy is never swapped in and the quarantined file holds the Corrupt block error, with fatal health, for ever.
-**Model.** `acknowledge_losses` skips a loss in stage 1: it writes no closing record for it (it still names its
-corruption seen), and the loss closes as restored in full when the copy is swapped in
-(`tests/self_repair.rs` `s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming`).
-**Needed.** Whether the operator's call waits for stage 1 as the model has it, or closes the loss and lets the swap
-proceed with the positions left out of every view (the copy then ends only the error).
+**Recommendation (roadmap 8.5a, for the reviewer to confirm).** Carry it. Since Q-247 repeated corruption degrades
+health (`storage_suspect`), a count that a rebuild lowers could hide failing storage at the moment it is most likely
+(a corrupt manifest record is itself a corruption). Proposed: `0x28` field 8, repeated, each corruption the rebuild
+could not reconstruct that lay within the suspect window, as its record time `i64` and its kind `u8`; the count adds
+them until they leave the window. Cost: one field, written only by a rebuild.
 
 ## Q-249 — A torn closing record of a loss restored in full
 Recorded by roadmap 8.5a.
@@ -1435,7 +1382,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-52 (b) | 4.9 | Settled on Linux (ext4 and XFS) by the rewrite job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decision on the macOS and Windows wording |
 | Q-83 | 7.2 | Late and corrected data; recorded after the tag, from the Q-60 ruling |
 | Q-84 | 8.3 | Restore, with 5.3 (resync) |
-| Q-85 | 8.5b | Moved from 8.1 by roadmap 8.5a, which applied the self-repair ruling to it; the scrub of deep is built at 8.5b; the owner confirms the new `data_lost` path |
 | Q-86 (b) | 4.9 | Settled on Linux by the Btrfs job of the `fault-trials` workflow (`docs/measurements/4.9-fault-trials.md`); open only for the owner's decisions on the `chattr +C` sentence and the macOS and Windows wording |
 | Q-88 | 5.6 | Routing table; recorded after the tag, from the Q-78 ruling; implemented by roadmap 5.2 and accepted there as provisional; moved to the gate so that the grammar is ruled once both backends have used it |
 | Q-90 | 8.3 | Restore |
@@ -1493,11 +1439,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
-| Q-241 | 8.5c | Self-repair wired; recorded by roadmap 8.5a, which laid out `0x25` fields 11 and 12 |
 | Q-243 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
 | Q-244 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
-| Q-247 | 8.5c | The owner's default; recorded by roadmap 8.5a |
-| Q-248 | 8.5c | Self-repair wired; recorded by roadmap 8.5a |
 | Q-249 | 8.5d | The fault matrix with a kill loop; recorded by roadmap 8.5a |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
@@ -1745,10 +1688,14 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
-| Q-240 | An alert on every repaired corruption, and when it ends | §8 Self-repair, Attention; §11 Health; `api.md` `attention`, `acknowledge_corruptions` (settled by roadmap 8.5a under the owner's ruling that an alert is raised on every repaired corruption; how long it lasts was decided there). Scenario: a hot segment is found damaged and swapped for its copy from deep within seconds; health never leaves `Ok`, and a person who looks once a day would never learn that the disk corrupts data, if the alert ended with the repair or at a restart. Ruling: each corruption alerts from its finding until a manifest record names it as seen (`acknowledge_corruptions`, `acknowledge_losses` naming the loss it caused, `acknowledge_manifest_rebuild` for a manifest record); a restart, time, a read of health and the end of the repair never clear it, and an alert alone never degrades health, so that a repaired store is `Ok` and still asks for a person. A truncated tail and a `possible_loss` are not corruptions. `tests/self_repair.rs` `s8_self_repair_alerts_on_a_repaired_corruption_until_it_is_seen` |
+| Q-240 | An alert on every repaired corruption, and when it ends | §8 Self-repair, Attention; §11 Health; `api.md` `attention`, `acknowledge_corruptions` (settled by roadmap 8.5a under the owner's ruling that an alert is raised on every repaired corruption; how long it lasts was decided there). Scenario: a hot segment is found damaged and swapped for its copy from deep within seconds; health never leaves `Ok`, and a person who looks once a day would never learn that the disk corrupts data, if the alert ended with the repair or at a restart. Ruling: each corruption alerts from its finding until a manifest record names it as seen (`acknowledge_corruptions`, `acknowledge_losses` naming the loss it caused, `acknowledge_manifest_rebuild` for a manifest record); a restart, time, a read of health and the end of the repair never clear it, and a corruption's alert never degrades health, so that a repaired store is `Ok` and still asks for a person (repeated corruption does, Q-247). A truncated tail and a `possible_loss` are not corruptions. `tests/self_repair.rs` `s8_self_repair_alerts_on_a_repaired_corruption_until_it_is_seen` |
 | Q-242 | How the engine knows that nothing listens for re-send requests | §8 Self-repair stage 2; `api.md` `repair.resend_wait` (settled by roadmap 8.5a). Scenario: a start records a lost range before the application has called `repairs()`; a stream opened later still receives every open request, so the engine cannot tell an application that never listens from one that has not subscribed yet. Ruling: the application says it by `repair.resend_wait` 0, which ends stage 2 at once; otherwise the stage ends at `repair_done` or when the wait passes. `tests/self_repair.rs` `s8_self_repair_closes_at_once_when_nothing_listens` |
 | Q-245 | Delivery and queries while a quarantined file waits for its copy | §8 Self-repair stage 1, Corrupt block; §4 Resync (settled by roadmap 8.5a). Scenario: a consumer catching up reaches a sealed segment that was just quarantined and whose copy is being fetched from deep. Sending a `resync` there would make a reset point where nothing is lost; skipping the segment would break invariant 2. Ruling: the catch-up waits for the swap, its time behind measured; a query over the file returns the Corrupt block error until the swap, and while deep cannot be reached the store waits with a backup reason in health. Nothing is recorded, so no reset point arises |
 | Q-246 | A copy found after its loss was closed | §8 Self-repair stage 3 (settled by roadmap 8.5a). Scenario: a segment lost in the bucket is closed as "re-send ended" after 24 h; the sources re-sent what they still had, at new positions. On day 3 a lagging listing shows the object again. Swapping it in would put facts back at positions every consumer was told to forget, beside their re-sent copies at newer positions, and change history the application has already reconciled. Ruling: a closed loss is not opened again by a copy found later; the closing record stands and the list of losses keeps it. A loss whose range grows is open again, at stage 2. `tests/self_repair.rs` `s8_self_repair_a_closed_loss_stays_closed_when_its_copy_appears` |
+| Q-85 | A loss in the bucket found outside a restore | §8 Self-repair (Lost in the bucket), Corrupt block, No deletion, invariant 10, §11 Health (settled at roadmap 8.5a by the owner's ruling). Scenario: fill pressure moved a sealed segment off the local tiers once verified in deep; the scheduled check then finds the object gone, and no kept input can compact it again. Ruling: the object is judged by the owner's lookup rule, lost after 3 failed lookups spanning at least 10 minutes while the bucket answers (transient faults never count, Q-82); with a verified local copy it is uploaded again and is no loss; with none, the positions no other file holds are a lost range of cause 3, lost in the bucket, a `data_lost` that degrades health until closed (Q-124 (a)) and goes to the re-send stage; every case is a corruption, named by a quarantine record (`0x26` reason 4), and alerts until seen. An object that answers again while its loss is open restores it in full; once closed it stays closed (Q-246). `Model::lose_object`, `Model::check_bucket`; `tests/self_repair.rs` `s8_self_repair_lost_object_needs_three_lookups_over_ten_minutes_while_the_bucket_answers`, `s8_self_repair_a_lost_object_with_a_local_copy_is_uploaded_again`, `s8_self_repair_an_object_that_answers_again_restores_its_open_loss_in_full` |
+| Q-241 | What a restore carries of closing outcomes and corruptions | §8 Self-repair, Generations; `format.md` A.14 `0x25` fields 11 to 13 (settled at roadmap 8.5a by the owner's ruling). Scenario: a loss closed as "re-send ended" is carried in field 7 with identity, first and last only, and would read back as closed by an operator; quarantine records and "seen" marks are not carried, so a seen corruption would alert again and an unseen file-named one would stop. Ruling: a restore carries the repair outcomes and the corruptions not yet seen, so no alert is lost: field 11 the outcome of each carried range closed otherwise than by an operator, field 12 each corruption seen, field 13 each corruption not yet seen. `files/` decodes `0x25` strictly and refuses them until roadmap 8.5c writes and reads them; the model's restore carries no losses (Q-294) |
+| Q-247 | The default of `repair.suspect_after`, and what repeated corruption does | §8 Self-repair, Attention; §11 Health; `api.md` Configuration, `Reason::StorageSuspect` (settled at roadmap 8.5a by the owner's ruling). Scenario: every corruption alerts until seen, so a person who sees each one may not notice that the storage keeps corrupting data. Ruling: 2 corruptions in 30 days by default, configurable (`repair.suspect_after`); while the count of corruptions in the window, seen or not, is at or above it, health is degraded with the reason `storage_suspect` (`Reason::StorageSuspect`), as well as the alert, so failing storage stays visible; it ends when the window passes the older corruptions. `tests/self_repair.rs` `s8_self_repair_repeated_corruption_makes_the_storage_suspect` |
+| Q-248 | `acknowledge_losses` on a loss whose copy is being brought back | §8 Self-repair, Acknowledging a loss (settled at roadmap 8.5a by the owner's ruling, as the model had it). Scenario: an operator acknowledges a recorded loss in stage 1; closed by an operator, Q-246 would keep its copy from being swapped in and the quarantined file would hold fatal health for ever. Ruling: `acknowledge_losses` cannot close a loss while its repair copy is in progress; it writes no closing record for it (it still names its corruption seen), and the loss closes as restored in full when the copy is swapped in. `tests/self_repair.rs` `s8_self_repair_an_operator_does_not_close_a_loss_whose_copy_is_coming`; `tests/recovery_histories.rs` (the acknowledgement step) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
