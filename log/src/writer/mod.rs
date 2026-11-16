@@ -647,7 +647,8 @@ impl LogWriter {
                 syncs: 0,
                 mark_syncs: 0,
                 max_series_id: r.max_series_id,
-                sync_interval: cfg.min_sync_interval,
+                sync_interval: SyncPace::default()
+                    .interval(cfg.sync_interval_floor, cfg.min_sync_interval),
                 sync_time: None,
             },
             fs,
