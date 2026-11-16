@@ -1040,6 +1040,7 @@ impl Writer {
                     LogReason::DiskCritical { free } => Reason::DiskCritical { free },
                     LogReason::SealBlocked { file_id } => Reason::SealBlocked { file_id },
                     LogReason::SegmentDamaged { file_id } => Reason::SegmentDamaged { file_id },
+                    _ => continue,
                 });
             }
         }

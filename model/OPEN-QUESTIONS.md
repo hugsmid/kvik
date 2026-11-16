@@ -1386,6 +1386,9 @@ acknowledgement (the owner's ruling on (c), at the review of roadmap 6.3b). `log
 `describe_sealed_refuses_each_check_it_makes`,
 `a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
 the records `kvik-files` encodes). Not pinned by a test: that a shutdown drops a description not started.
+(d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
+outside the crate; `kvik` maps those it knows and skips any other. Scenario (the review of roadmap 6.3b): a branch
+that matched every log reason stopped compiling once `SegmentDamaged` merged, with no textual conflict to warn of it.
 **Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
 
 ## Open at v0.2

@@ -395,6 +395,7 @@ pub enum Wait {
 
 /// A health reason the log reports (`api.md` Health).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Reason {
     /// Ingest waits.
     IngestWaiting(Wait),
