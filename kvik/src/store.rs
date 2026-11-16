@@ -588,7 +588,7 @@ impl Reader {
     }
 
     /// The store's id (`format.md` A.1), as read at open: no file is read and
-    /// the lease is not renewed. The model backend generates one when the
+    /// the lease is not renewed. The model backend draws one when the
     /// store is created, from the environment's entropy.
     pub fn store_id(&self) -> [u8; 16] {
         match &self.inner {

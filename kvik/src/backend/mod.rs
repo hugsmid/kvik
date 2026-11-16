@@ -189,7 +189,7 @@ pub(crate) struct Slot {
     /// Waits by reason.
     waits: BTreeMap<Wait, u64>,
     batches: u64,
-    /// Generated at creation from the environment's entropy, as the durable backend's is; kept across restarts in
+    /// Drawn from the environment's entropy at creation, as the durable backend's is; kept across restarts in
     /// this process.
     store_id: [u8; 16],
     clock_jumps: u64,

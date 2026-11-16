@@ -311,7 +311,7 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
   epoch on its next call. There is no background task. `store_id` is the exception: an additive item (Q-196), it
   returns the store id (`format.md` A.1) read with the descriptor at open and reads nothing. On the model backend it
-  is generated at creation from the environment's entropy and kept while the process lives.
+  is drawn from the environment's entropy at creation and kept while the process lives.
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
   (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
   reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
