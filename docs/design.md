@@ -74,8 +74,9 @@ confirms the format against Parquet.
 one pass of direct checksums (Q-231). A file crafted by a process with write access to the store is not held to it,
 but its cost is bounded by `format.md` A, common rules (scan bound; Q-110): about 2L bytes checksummed and 16 block
 headers per 8 bytes for a file of L bytes, and at most 8 failed full reads per window (8 MiB in a segment, 16 MiB in
-the manifest), past which the rest of the window is passed as damaged and reported. A crafted segment costs at most
-about 6 s at 64 MiB and 1.6 s at 16 MiB, a crafted manifest about 0.3 s per 16 MiB (Q-230).
+the manifest), past which the rest of the window is passed as damaged and reported with the damage around it. A
+crafted segment costs at most about 6 s at 64 MiB and 1.6 s at 16 MiB, a crafted manifest about 0.3 s per 16 MiB
+(Q-230).
 
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).

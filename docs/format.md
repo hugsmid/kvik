@@ -48,11 +48,11 @@ specified here before the roadmap item that writes it.
   batch (A.2), or a manifest record whose checksum holds and whose fields are rejected (A.14). The file is divided into
   **windows** of w bytes from offset 0: w = 8 MiB (a batch) in a log segment, 16 MiB (a body) in the manifest. After
   8 failed reads in one window, no other candidate in it is read in full: the rest of the window is passed as damaged
-  and reported with the invalid region, corrupt record or torn tail it falls in (Q-110). Files the engine wrote,
-  damaged or not, never reach 8: a failed read needs intact headers, framing and `batch_crc32c` around a body that
-  fails its checks, and damage gives a handful at most. Body checks therefore total at most 2L, the direct read that
-  found damage, and two batches per failed read (16 batches per window): about 1.1 GiB of bodies for a 64 MiB
-  segment and 300 MiB for a 16 MiB one. A facts row takes at least 20 bytes of body and decodes in about 100 ns at
+  and reported with the invalid region, corrupt record or torn tail it falls in (Q-110). Damage to a file the engine
+  wrote gives a handful of failed reads in a window at most, as each needs intact headers, framing and
+  `batch_crc32c` around a body that fails its checks. In a segment, body checks therefore total at most 2L, the direct
+  read that found damage, and two batches per failed read (16 batches per window): about 1.1 GiB of bodies for a
+  64 MiB segment and 300 MiB for a 16 MiB one. A facts row takes at least 20 bytes of body and decodes in about 100 ns at
   most (a 255-byte text value, release build), so a crafted segment costs at most about 6 s at 64 MiB and 1.6 s at
   16 MiB, against 29 to 170 ms for an undamaged one; a crafted manifest at most about 0.3 s per 16 MiB (Q-230). An
   undamaged segment is read in one pass of direct checksums; the bounded reading starts at the first boundary read
