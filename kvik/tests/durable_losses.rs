@@ -395,3 +395,37 @@ fn damage_below_a_found_loss_grows_it_downward_under_its_first_identity() {
     );
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn acknowledging_an_identity_that_has_no_loss_covers_no_later_loss_under_it() {
+    let w = World::new("ack-none");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let three = emit_notes(&s, id, &["NONE-ONE", "NONE-TWO", "NONE-THREE"])[2];
+    assert!(s.losses().is_empty());
+    block_on(s.acknowledge_losses(&[three])).unwrap();
+
+    damage(&w, b"NONE-THREE");
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(three, Some(three), Some(three), false)]
+    );
+    assert!(!s.losses()[0].acknowledged);
+    assert!(degraded_by(&s.health(), three), "{:?}", s.health());
+
+    let four = block_on(s.emit(&[note(id, 3, "NONE-FOUR")]))
+        .unwrap()
+        .first()
+        .unwrap();
+    damage(&w, b"NONE-FOUR");
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(three, Some(three), Some(four), false)]
+    );
+    assert!(!s.losses()[0].acknowledged);
+    assert!(degraded_by(&s.health(), three), "{:?}", s.health());
+
+    block_on(s.acknowledge_losses(&[three])).unwrap();
+    assert!(matches!(s.health(), Health::Ok), "{:?}", s.health());
+    block_on(s.shutdown()).unwrap();
+}

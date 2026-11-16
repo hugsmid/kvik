@@ -193,9 +193,9 @@ pub(crate) struct Writer {
     decider: Mutex<Decider>,
     counters: Mutex<Counters>,
     reader: Mutex<Option<Arc<DurableReader>>>,
-    /// Acknowledged loss identities, each with the range it had then; `None` for one no report held (spec §8
-    /// Acknowledging a loss: a range that grows needs a new acknowledgement).
-    acknowledged: Mutex<BTreeMap<Position, Option<LossRange>>>,
+    /// Acknowledged `data_lost` identities, each with the range it had then (spec §8 Acknowledging a loss: a range
+    /// that grows needs a new acknowledgement, and acknowledging none writes nothing).
+    acknowledged: Mutex<BTreeMap<Position, LossRange>>,
     /// Calls queued and not yet known to be acknowledged, by call number (Q-123 (b)).
     inflight: Mutex<BTreeMap<u64, Arc<Completion>>>,
     next_call: AtomicU64,
