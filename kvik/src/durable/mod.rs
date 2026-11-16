@@ -177,6 +177,9 @@ struct Counters {
     max_latency: Duration,
 }
 
+/// A loss's first and last positions.
+type LossRange = (Option<Position>, Option<Position>);
+
 /// The writer of a durable store, shared by the clones of its `Store`.
 #[derive(Debug)]
 pub(crate) struct Writer {
@@ -192,7 +195,7 @@ pub(crate) struct Writer {
     reader: Mutex<Option<Arc<DurableReader>>>,
     /// Acknowledged loss identities, each with the range it had then; `None` for one no report held (spec §8
     /// Acknowledging a loss: a range that grows needs a new acknowledgement).
-    acknowledged: Mutex<BTreeMap<Position, Option<(Option<Position>, Option<Position>)>>>,
+    acknowledged: Mutex<BTreeMap<Position, Option<LossRange>>>,
     /// Calls queued and not yet known to be acknowledged, by call number (Q-123 (b)).
     inflight: Mutex<BTreeMap<u64, Arc<Completion>>>,
     next_call: AtomicU64,
