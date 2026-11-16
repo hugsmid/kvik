@@ -560,9 +560,10 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   epochs continue above every epoch named by the last valid record and by any lease file. A corrupt record is
   fetched from deep (by generation and epoch) or from the mirror path, verified, written again in place over the
   corrupt bytes and synced; where that cannot be done, the manifest is rewritten to a new file and renamed while no
-  handle holds the old one open (§3 Sync primitive). Every file is self-describing: its header and trailer carry everything a publish record says
-  about it (`format.md` A.14; a log segment's plaintext hash is computed from its bytes, A.9). **If no copy exists** (the mirror path holds none and deep has answered that it holds
-  none, or none is configured), the writer **rebuilds the manifest** from the local files by itself, with the
+  handle holds the old one open (§3 Sync primitive). Every file is self-describing: its header and trailer carry
+  everything a publish record says about it (`format.md` A.14; a log segment's plaintext hash is computed from its
+  bytes, A.9). **If no copy exists** (the mirror path holds none and deep has answered that it holds none, or
+  none is configured), the writer **rebuilds the manifest** from the local files by itself, with the
   procedure of the operator call `rebuild_manifest` (roadmap 6.3), and continues; the files are kept, so no fact is
   lost. Only the corrupt record is lost; every valid record, before and after it, is still readable. The rebuilt
   manifest holds, in order: the rebuild record; every valid record of the old manifest, before and after the corrupt
@@ -712,8 +713,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
    files that are not set aside. The **restored end** is its last position before the first gap that is not a recorded
    lost range (§3) and is not followed directly by a recovery entry whose `after` is the position before the gap. Such
    a gap is recorded as a lost range by the start that wrote the entry or the next one that can write (§3 Order of a
-   start, steps 4 and 6), before that segment can be sealed; with the sealed-segment record appended after that
-   start (roadmap 6.3b), the end follows from the records alone, before any file is downloaded (Q-290). The
+   start, steps 4 and 6), before that segment can be sealed; as the sealed-segment record is appended after that
+   start (`format.md` A.14), the end follows from the records alone, before any file is downloaded (Q-290). The
    scan for that gap covers only the generation whose records are read, from its sequence 1; if
    that generation holds no position, the restored end is that of the restore record read. Positions of earlier
    generations at or below a recorded restored end were settled by that restore, and a file missing there is a failure
