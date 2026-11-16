@@ -367,6 +367,26 @@ fn s8_self_repair_a_closed_loss_stays_closed_when_its_copy_appears() {
 }
 
 #[test]
+fn s8_self_repair_a_closed_loss_is_not_restored_from_a_copy_found_later() {
+    let (mut m, s) = store(RepairConfig::default());
+    let (f, p) = sealed_facts(&mut m, s);
+    m.upload();
+    m.lose_object(f);
+    m.corrupt_hot(f);
+    m.scrub();
+    assert_eq!(only_loss(&m).cause, LossCause::Corruption, "no copy to try");
+    m.advance(DAY);
+    assert_eq!(m.repair(), Ok(1));
+    m.find_object(f);
+    assert!(!m.restore_file(f), "Q-246");
+    assert!(!held(&m, &p));
+    assert_eq!(
+        only_loss(&m).state,
+        Some(LossState::Closed(Outcome::ResendEnded))
+    );
+}
+
+#[test]
 fn s8_self_repair_calls_are_refused_while_read_only() {
     let (mut m, _, p) = lost_without_copy(RepairConfig::default());
     m.disk.drill = true;

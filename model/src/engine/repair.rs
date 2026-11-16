@@ -194,14 +194,12 @@ impl Model {
 
     /// The engine's self-repair step (§8 Self-repair stage 3): under
     /// automatic acknowledgement, every recorded `data_lost` whose stage 2
-    /// has ended gets its closing record. Returns how many were closed.
+    /// has ended gets its closing record; under manual acknowledgement such a
+    /// loss awaits an operator instead (`loss_stage`). Returns how many were closed.
     /// Refused while read-only.
     pub fn repair(&mut self) -> Result<usize, Error> {
         if self.vol()?.read_only {
             return Err(Error::ReadOnly);
-        }
-        if self.config.repair.manual {
-            return Ok(0);
         }
         let due: Vec<Loss> = self
             .losses()
