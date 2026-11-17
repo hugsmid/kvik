@@ -371,7 +371,8 @@ A failed sync in any step leaves the engine read-only (§3 Write or sync failure
 - Memory holds only open nodes per series, a node cache, and a **recent window** of raw facts per series
   (default 15 minutes, at most 1 024 facts, and for an interval series at least its interval length, for a calendar
   length at least its latest two intervals) for the newest
-  window edge and the duplicate fast path.
+  window edge and the duplicate fast path. Over all series the windows are bounded in bytes too
+  (`limits.window_memory`, Q-751): beyond it the oldest keys leave memory and are read from the log (§2.4).
 - Tree files record the position up to which they are complete (the **checkpoint**, written at most every 60 s and
   on clean shutdown). On start the engine loads them and replays log entries after the checkpoint. Tree files are
   derived and are backed up as such (§8).
