@@ -105,6 +105,11 @@ impl Fs for Counting {
     }
 }
 
+/// Whether the store opened its own reader, which holds every fact it reads.
+fn read_whole(s: &Store) -> bool {
+    s.writer().is_some_and(|w| super::lock(&w.reader).is_some())
+}
+
 /// A store of four gauges with `calls` calls of 50 readings of each, and its segment reads.
 fn store(dir: &str, calls: i64) -> (Store, Env, Arc<Io>) {
     let mut env = Env::test(ManualClock::new(Timestamp(T0 + calls * 50 * S)));
@@ -191,6 +196,7 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
     let named = s.series("a/s1/w").unwrap();
     let losses = s.losses();
     let read = io.take();
+    assert!(!read_whole(&s));
     assert!(read < 16 << 10, "{read} bytes of segments read");
     let full: Vec<_> = (1..=5)
         .map(|id| {
@@ -406,6 +412,10 @@ fn a_store_whose_load_meets_a_void_in_a_later_part_answers_as_a_full_read() {
             assert_eq!(latest, full.ok().map(|i| i.latest_t), "series {id}");
         }
     }
+    assert!(
+        !read_whole(&s),
+        "the summaries are rebuilt, not the store's reader opened"
+    );
     let one = s.series(SeriesId(1)).unwrap();
     assert_eq!(one.latest_t, Some(Timestamp(T0 + 700 * S)));
     assert_eq!(one.lateness_reference, Some(Timestamp(T0 + 500 * S)));
