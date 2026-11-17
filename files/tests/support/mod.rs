@@ -400,24 +400,28 @@ pub fn body() -> impl Strategy<Value = Body> {
         (
             any::<(u64, u64, u64, u32, u32)>(),
             proptest::collection::btree_map(1u8..15, any::<u64>(), 0..4),
-            proptest::collection::btree_set(any::<u64>(), 0..6),
+            proptest::collection::btree_set(1..u64::MAX, 0..6),
+            any::<bool>(),
         )
-            .prop_map(|((a, b, c, d, e), floors, ends)| Body::Rebuild(Rebuild {
-                presumed_epoch: a,
-                last_valid_before: b,
-                files_found: c,
-                losses_restated: d,
-                floors: floors.into_iter().collect(),
-                identities_rebuilt: e,
-                gaps: ends
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|w| (w[0], w[1]))
-                    .collect(),
-            })),
+            .prop_map(
+                |((a, b, c, d, e), floors, ends, open)| Body::Rebuild(Rebuild {
+                    presumed_epoch: a,
+                    last_valid_before: b,
+                    files_found: c,
+                    losses_restated: d,
+                    floors: floors.into_iter().collect(),
+                    identities_rebuilt: e,
+                    gaps: ends
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|w| (w[0], Some(w[1])))
+                        .chain(open.then_some((u64::MAX, None)))
+                        .collect(),
+                })
+            ),
         (
             prop_oneof![Just(0x26u8), 0x29u8..0x7F],
             proptest::collection::vec(
@@ -785,4 +789,50 @@ pub fn corrupt_record(bytes: &mut [u8], records: &[Record], index: usize) {
 
 pub fn read_all(fs: &MemFs, p: &Path) -> Vec<u8> {
     fs.read(p).unwrap()
+}
+
+/// Appends a damaged word, then `m` lost-range records sharing one list of `g` ignorable empty fields, each with a
+/// valid checksum, an epoch above `min` and no field 1: failed reads that use a window's budget (Q-650).
+pub fn crafted_tail(f: &mut Vec<u8>, min: u64, m: u64, g: u64) {
+    use kvik_log::block::BlockHeader;
+    use kvik_log::crc::{crc32c, crc32c_shift};
+    let put = |f: &mut Vec<u8>, at: u64, b: &[u8]| {
+        f[at as usize..at as usize + b.len()].copy_from_slice(b);
+    };
+    let field = 0x8001u16;
+    f.extend_from_slice(&[0xFF; 8]);
+    let base = f.len() as u64;
+    let e = (base + 48 * m + 4 * g).div_ceil(8) * 8;
+    f.resize(e as usize, 0);
+    let shared = base + 48 * m - 8;
+    for i in 0..(e - shared) / 4 {
+        put(f, shared + 4 * i, &field.to_le_bytes());
+    }
+    let mut inner: Option<u32> = None;
+    for k in (0..m).rev() {
+        let p = base + 48 * k;
+        let body = p + 16;
+        put(f, body, &(min + 1 + k).to_le_bytes());
+        if k > 0 {
+            put(f, p - 8, &field.to_le_bytes());
+            put(f, p - 6, &44u16.to_le_bytes());
+        }
+        let crc = match inner {
+            None => crc32c(&f[body as usize..e as usize]),
+            Some(c) => {
+                crc32c_shift(
+                    crc32c(&f[body as usize..(body + 48) as usize]),
+                    e - body - 48,
+                ) ^ c
+            }
+        };
+        inner = Some(crc);
+        let h = BlockHeader {
+            block_type: kvik_files::record::record_type::LOST_RANGE,
+            flags: 0,
+            body_len: (e - body) as u32,
+            body_crc32c: crc,
+        };
+        put(f, p, &h.encode());
+    }
 }

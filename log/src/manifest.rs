@@ -130,7 +130,8 @@ pub enum ManifestError {
     /// No valid header, or one of another kind or store.
     #[error("the manifest's header is invalid")]
     Header,
-    /// An invalid record followed by a valid one: it was synced, so it is corrupt. Fetching it again or
+    /// An invalid record followed by a valid one: it was synced, so it is corrupt. Also a search that passed part of a
+    /// window under the scan bound's window rule and found no valid record after (Q-650). Fetching it again or
     /// rebuilding the manifest is roadmap 6.3 (Q-116 (a)).
     #[error("the manifest record at offset {0} is corrupt")]
     Corrupt(u64),
@@ -327,9 +328,11 @@ fn read_all(
     // bound).
     let min = records.last().map_or(0, |r| r.epoch);
     let mut probe = valid_end + 8;
+    let mut passed = false;
     while probe + (BLOCK_HEADER_LEN as u64) <= bytes.len() as u64 {
         let next = search.failed.next_from(probe);
         if next != probe {
+            passed = true;
             probe = next;
             continue;
         }
@@ -337,6 +340,10 @@ fn read_all(
             return Err(ManifestError::Corrupt(valid_end));
         }
         probe += 8;
+    }
+    // Bytes the search did not look at are not known to be a torn record: corrupt, with no later record (Q-650).
+    if passed {
+        return Err(ManifestError::Corrupt(valid_end));
     }
     Ok(ManifestRead {
         valid_end,

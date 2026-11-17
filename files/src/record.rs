@@ -90,9 +90,10 @@ pub struct Rebuild {
     /// Field 6: losses listed under their first missing position because no valid record names their identity.
     pub identities_rebuilt: u32,
     /// Field 7, repeated: every corrupt span the rebuild stood in for, as the epochs of the valid records around it in
-    /// the manifest it rebuilt (`after`, `before`; 0 for no record before), in ascending order. A start asks the copy
-    /// sources about each of them again while the rebuild is unacknowledged.
-    pub gaps: Vec<(u64, u64)>,
+    /// the manifest it rebuilt (`after`, `before`; 0 for no record before, `None` written as 0 for no record after,
+    /// the last span only, Q-650), in ascending order. A start asks the copy sources about each of them again while
+    /// the rebuild is unacknowledged.
+    pub gaps: Vec<(u64, Option<u64>)>,
 }
 
 /// What a record says.
@@ -267,7 +268,7 @@ impl Record {
                 list.push((6, r.identities_rebuilt.to_le_bytes().to_vec()));
                 for (a, b) in &r.gaps {
                     let mut v = a.to_le_bytes().to_vec();
-                    v.extend_from_slice(&b.to_le_bytes());
+                    v.extend_from_slice(&b.unwrap_or(0).to_le_bytes());
                     list.push((7, v));
                 }
             }
@@ -586,7 +587,8 @@ fn decode_rebuild(own: &[(u16, &[u8])]) -> Result<Rebuild, RecordError> {
                 if v.len() != 16 {
                     return Err(bad("a corrupt span not 16 bytes"));
                 }
-                Ok((fields::u64_at(v, 0), fields::u64_at(v, 8)))
+                let before = fields::u64_at(v, 8);
+                Ok((fields::u64_at(v, 0), (before != 0).then_some(before)))
             })
             .collect::<Result<Vec<_>, _>>()?,
     })
@@ -659,7 +661,12 @@ fn check_rebuild(r: &Rebuild) -> Result<(), &'static str> {
     if !r.floors.windows(2).all(|w| w[0].0 < w[1].0) {
         return Err("file id floors not in strictly ascending order of kind");
     }
-    if r.gaps.iter().any(|(a, b)| a >= b) || !r.gaps.windows(2).all(|w| w[0].1 <= w[1].0) {
+    if r.gaps.iter().any(|(a, b)| b.is_some_and(|b| *a >= b))
+        || !r
+            .gaps
+            .windows(2)
+            .all(|w| w[0].1.is_some_and(|b| b <= w[1].0))
+    {
         return Err("corrupt spans out of order");
     }
     Ok(())

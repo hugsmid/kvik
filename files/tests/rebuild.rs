@@ -29,7 +29,7 @@ proptest! {
         let rb = p.rebuild_record().unwrap();
         // Counted only where the span's epochs leave room for more than one record (Q-174).
         let s = img.corrupt[0];
-        if s.before_epoch - s.after_epoch <= 2 {
+        if s.before_epoch.is_some_and(|b| b - s.after_epoch <= 2) {
             prop_assert_eq!(rb.identities_rebuilt, 0);
         }
         prop_assert!(p.undescribed.is_empty());

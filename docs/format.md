@@ -567,7 +567,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
   missing position because no valid record names their identity, `u32`; 7 repeated, each corrupt span the rebuild
   stood in for, as the epochs of the valid records around it in the manifest it rebuilt: after `u64` (0 for none),
-  before `u64`, in ascending order and not overlapping), the first record of a rebuilt manifest.
+  before `u64` (0 for none: a span with no later record, Q-650, only the last), in ascending order and not
+  overlapping), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
   record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore and `0x27` copy verified are laid out below. Reserved for its roadmap item:
@@ -633,7 +634,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
   synced. Once failed reads starting in one 16 MiB window of the file have checked 16 MiB of body (common rules:
   scan bound), the search passes the rest of that window: a valid record beyond it makes the passed bytes part of the
-  corrupt span; with none, they are part of the torn tail (provisional, Q-650).
+  corrupt span; with none, the passed bytes and everything after them are a corrupt span with no later record, kept
+  and never truncated, and repaired by a copy or a rebuild like any corrupt record (Q-650). Damage does not reach the
+  window rule, so a torn tail is never reported this way.
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
   with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator
@@ -645,9 +648,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   acknowledgement record names is provisional at a start, also one that was final before it: the store holds uploads, evictions, removals and
   retirements, and refuses to append an acknowledgement of it, until the mirror path and deep have answered in that
   run for every corrupt span its field 7 names (`spec.md` §7 Deep unreachable); a copy is a valid record whose epoch
-  lies strictly between the span's two epochs. Field 6 counts restated losses no
+  lies strictly between the span's two epochs, or above the first for a span with no later record. Field 6 counts restated losses no
   valid record names where the old manifest held two corrupt spans, or one whose next valid epoch is more than 2
-  above the last valid one before it.
+  above the last valid one before it, or one with no later record.
 
 ## A.15 Cursor file and lease file
 - **Cursor**, `cursors/<name>.cur`, kind 4: an A.1 header then blocks of type `0x30`, **appended**, one per cursor

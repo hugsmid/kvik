@@ -59,8 +59,9 @@ impl Irreversible {
 pub struct Gap {
     /// The epoch of the last valid record before it, 0 for none.
     pub after: u64,
-    /// The next valid record's epoch (the rebuild record's field 7 keeps it across a restart).
-    pub before: u64,
+    /// The next valid record's epoch (the rebuild record's field 7 keeps it across a restart); `None` for a span
+    /// with no later record (Q-650).
+    pub before: Option<u64>,
 }
 
 /// Why an irreversible act on a record must wait.
@@ -222,7 +223,7 @@ fn gaps_of(image: &Image, epoch: u64, r: &crate::record::Rebuild) -> Vec<Gap> {
         .unwrap_or(r.presumed_epoch.saturating_add(1));
     vec![Gap {
         after: r.last_valid_before,
-        before,
+        before: Some(before),
     }]
 }
 

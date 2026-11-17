@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use kvik_files::appender::{AcknowledgeError, Appender, Gap, Held, Opened, RebuildState};
 use kvik_files::catalogue::Catalogue;
-use kvik_files::image::{Image, read};
+use kvik_files::image::{CorruptSpan, Image, read};
 use kvik_files::rebuild::{
     Answer, CorruptStart, Decision, Finality, RebuildWait, rebuild_manifest, repair_with_copy,
     resolve,
 };
-use kvik_files::record::Body;
+use kvik_files::record::{Body, Record};
 use kvik_log::fs::{FaultOp, MemFs};
 use kvik_log::manifest::LossCause;
 use support::rebuild::*;
@@ -369,7 +369,7 @@ fn q171_a_rebuild_no_acknowledgement_names_stays_provisional_across_a_restart() 
     let rb = app.catalogue().rebuild(e).unwrap().record.clone();
     let g = Gap {
         after: rb.last_valid_before,
-        before: rb.presumed_epoch + 1,
+        before: Some(rb.presumed_epoch + 1),
     };
     assert_eq!(app.pending(), &[g]);
     assert_eq!(g.after, img.corrupt[0].after_epoch);
@@ -675,7 +675,7 @@ fn q171_after_a_restart_a_corrupt_record_whose_epoch_jumped_is_still_taken_from_
         g,
         Gap {
             after: 2,
-            before: 7
+            before: Some(7)
         }
     );
     drop(app);
@@ -757,5 +757,70 @@ fn q171_every_corrupt_record_is_asked_for_again_after_a_restart() {
     assert_eq!(
         app.catalogue().loss(identity).unwrap().record.cause,
         LossCause::Corruption
+    );
+}
+
+#[test]
+fn q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span() {
+    let h = store();
+    let mut bytes = manifest_bytes(&h.records);
+    let last = h.records.last().unwrap().epoch;
+    let valid_end = bytes.len() as u64;
+    crafted_tail(&mut bytes, last, 2_000, 100_000);
+    let img = read(&bytes, &STORE_ID).unwrap();
+    assert_eq!(img.records.len(), h.records.len());
+    assert!(!img.torn);
+    assert_eq!(
+        img.corrupt,
+        [CorruptSpan {
+            offset: valid_end,
+            end: bytes.len() as u64,
+            after_epoch: last,
+            before_epoch: None,
+        }]
+    );
+    let fs = fs_with(&bytes);
+    assert!(matches!(
+        Appender::open(&fs, &dir(), STORE_ID, 0).unwrap(),
+        Opened::Corrupt(_)
+    ));
+    assert_eq!(
+        fs.read(&dir().join("MANIFEST")).unwrap(),
+        bytes,
+        "kept, not truncated as a torn tail"
+    );
+    let (app, p) = rebuild_manifest(
+        &fs,
+        &dir(),
+        STORE_ID,
+        state(&h),
+        &FakeVerifier::default(),
+        Finality::Provisional,
+        NOW,
+    )
+    .unwrap();
+    let rb = p.rebuild_record().unwrap();
+    assert_eq!(rb.gaps, [(last, None)]);
+    assert_eq!(rb.presumed_epoch, last + 1);
+    let g = Gap {
+        after: last,
+        before: None,
+    };
+    assert_eq!(app.pending(), &[g]);
+    // After a restart the open span comes back from field 7.
+    drop(app);
+    let Opened::Ready(mut app) = Appender::open(&fs, &dir(), STORE_ID, 0).unwrap() else {
+        panic!("the rebuilt manifest reads")
+    };
+    assert_eq!(app.pending(), &[g]);
+    // A copy of the corrupt record is any valid record above the last valid epoch.
+    let below = Record::new(last, 0, T0, Body::Empty).encode().unwrap();
+    assert!(resolve(&mut app, g, &Answer::HoldsNone, &Answer::Holds(below)).is_err());
+    let copy = Record::new(last + 1, 0, T0, Body::Empty).encode().unwrap();
+    assert_eq!(
+        resolve(&mut app, g, &Answer::HoldsNone, &Answer::Holds(copy)).unwrap(),
+        RebuildState::Final {
+            epoch: p.rebuild_epoch
+        }
     );
 }

@@ -288,9 +288,9 @@ fn a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_i
     let (r, stats) = read_manifest_with_stats(&f, &[9; 16]);
     assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
     assert!(stats.within_bound(f.len() as u64), "{stats:?}");
-    // The record in the passed part of the window is not found: the file reads as a torn tail (Q-650).
-    let r = r.unwrap();
-    assert!(r.records.is_empty() && r.torn);
+    // The record in the passed part of the window is not found, and nothing after it: the passed bytes are reported
+    // corrupt, not dropped as a torn tail (Q-650).
+    assert_eq!(r, Err(ManifestError::Corrupt(HEADER_LEN as u64)));
     // A record in the next window is found, so the damaged record and the window are reported corrupt.
     f.resize(MW as usize, 0);
     f.extend(encode_record(RECORD_EMPTY, 1 << 41, 0, 0, None));
@@ -307,7 +307,7 @@ fn a_full_crafted_manifest_window_stays_within_the_budget_and_a_smoke_ceiling() 
     let t = Instant::now();
     let (r, stats) = read_manifest_with_stats(&f, &[9; 16]);
     let elapsed = t.elapsed();
-    assert!(r.unwrap().torn);
+    assert_eq!(r, Err(ManifestError::Corrupt(HEADER_LEN as u64)));
     assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
     assert!(elapsed < CEILING, "{elapsed:?} for {len} bytes");

@@ -348,7 +348,7 @@ fn every_record() -> Vec<Record> {
                     (kind::COMPACTED, 5 + (1 << 32)),
                 ],
                 identities_rebuilt: 0,
-                gaps: vec![(2, 4)],
+                gaps: vec![(2, Some(4))],
             }),
         ),
         carried,
@@ -400,7 +400,7 @@ fn golden_files_are_what_the_generator_writes_and_read_as_they_show() {
     assert_eq!(img.records.len(), records.len() - 1);
     assert_eq!(img.corrupt.len(), 1);
     assert_eq!(img.corrupt[0].presumed_epoch(), 3);
-    assert_eq!(img.corrupt[0].before_epoch, 4);
+    assert_eq!(img.corrupt[0].before_epoch, Some(4));
 }
 
 fn copy_verified() -> impl Strategy<Value = CopyVerified> {
@@ -548,4 +548,39 @@ proptest! {
         prop_assert!(is_canonical(&b));
         prop_assert_eq!(kvik_files::restore::RestoreRecord::from_body(&back.body), Some(Ok(r)));
     }
+}
+
+#[test]
+fn q650_field_7_writes_a_span_with_no_later_record_as_0_and_only_as_the_last() {
+    let rebuild = |gaps: Vec<(u64, Option<u64>)>| {
+        Record::new(
+            9,
+            0,
+            T0,
+            Body::Rebuild(Rebuild {
+                presumed_epoch: 3,
+                last_valid_before: 2,
+                files_found: 0,
+                losses_restated: 0,
+                floors: Vec::new(),
+                identities_rebuilt: 0,
+                gaps,
+            }),
+        )
+    };
+    let decode = |r: &Record| {
+        let b = r.encode().unwrap();
+        let len = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        Record::decode(b[0], false, &b[16..16 + len])
+    };
+    let open = rebuild(vec![(1, Some(2)), (2, None)]);
+    let b = open.encode().unwrap();
+    assert!(
+        b.windows(16)
+            .any(|w| w == [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    );
+    assert_eq!(decode(&open).unwrap(), open);
+    // Only the last span may have no later record; the check is the decoder's too.
+    assert!(rebuild(vec![(2, None), (3, Some(4))]).encode().is_err());
+    assert!(rebuild(vec![(2, None), (3, None)]).encode().is_err());
 }

@@ -27,7 +27,7 @@ pub fn decode_all(data: &[u8]) {
         for p in &img.records {
             if let Some(s) = spans.next_if(|s| s.end == p.offset) {
                 assert!(s.offset == at && s.offset < s.end && s.after_epoch == last);
-                assert_eq!(s.before_epoch, p.record.epoch);
+                assert_eq!(s.before_epoch, Some(p.record.epoch));
                 at = s.end;
             }
             assert_eq!(p.offset, at, "records and spans tile the file");
@@ -42,9 +42,16 @@ pub fn decode_all(data: &[u8]) {
                 assert_eq!(&data[p.offset as usize..end], &b[..]);
             }
         }
+        // A span with no later record holds the rest of the file (Q-650).
+        let open = spans.next();
+        if let Some(s) = open {
+            assert!(
+                s.before_epoch.is_none() && s.offset == at && s.end == len && s.after_epoch == last
+            );
+        }
         assert!(spans.next().is_none());
         assert_eq!(img.valid_end, at.min(len));
-        assert_eq!(img.torn, len > img.valid_end);
+        assert_eq!(img.torn, open.is_none() && len > img.valid_end);
     }
     for t in [
         record_type::EMPTY,

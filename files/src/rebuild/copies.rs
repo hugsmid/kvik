@@ -113,7 +113,11 @@ pub enum CopyError {
 /// The record in `copy` if it is one valid record whose epoch lies inside `gap`.
 fn check_copy(copy: &[u8], gap: Gap) -> Result<Record, CopyError> {
     match record_at(copy, 0, gap.after) {
-        Ok(Some(p)) if p.end as usize == copy.len() && p.record.epoch < gap.before => Ok(p.record),
+        Ok(Some(p))
+            if p.end as usize == copy.len() && gap.before.is_none_or(|b| p.record.epoch < b) =>
+        {
+            Ok(p.record)
+        }
         _ => Err(CopyError::NotTheRecord),
     }
 }

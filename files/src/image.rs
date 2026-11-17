@@ -25,17 +25,19 @@ pub struct Placed {
     pub record: Record,
 }
 
-/// The bytes between two valid records that hold no valid record: one or more corrupt records.
+/// The bytes between two valid records that hold no valid record: one or more corrupt records. A span with no
+/// later record is the rest of the file after a search that passed part of a window under the scan bound's window
+/// rule and found no valid record (Q-650): kept and repaired as any corrupt record, never dropped as a torn tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorruptSpan {
     /// Where the first invalid byte starts (the end of the last valid record before it, or of the header).
     pub offset: u64,
-    /// Where the next valid record starts.
+    /// Where the next valid record starts; the file's end for a span with no later record.
     pub end: u64,
     /// The epoch of the last valid record before it, 0 for none.
     pub after_epoch: u64,
-    /// The epoch of the next valid record.
-    pub before_epoch: u64,
+    /// The epoch of the next valid record; `None` for a span with no later record, always the last span.
+    pub before_epoch: Option<u64>,
 }
 
 impl CorruptSpan {
@@ -57,7 +59,7 @@ pub struct Image {
     pub corrupt: Vec<CorruptSpan>,
     /// Just past the last valid record (the header's end when there is none).
     pub valid_end: u64,
-    /// Whether any byte follows the last valid record: a torn tail to drop.
+    /// Whether any byte follows the last valid record and no corrupt span holds it: a torn tail to drop.
     pub torn: bool,
 }
 
@@ -208,9 +210,11 @@ fn read_all(
         // budget of a window, the rest of it is passed as damaged (`format.md` A, common rules: scan bound).
         let mut probe = at + 8;
         let mut found = None;
+        let mut passed = false;
         while probe + (BLOCK_HEADER_LEN as u64) <= len {
             let next = search.failed.next_from(probe);
             if next != probe {
+                passed = true;
                 probe = next;
                 continue;
             }
@@ -229,21 +233,32 @@ fn read_all(
                     offset: at,
                     end: p.offset,
                     after_epoch: min,
-                    before_epoch: p.record.epoch,
+                    before_epoch: Some(p.record.epoch),
                 });
                 at = p.end;
                 records.push(p);
+            }
+            // Bytes the search did not look at are not known to be a torn record (Q-650).
+            None if passed => {
+                corrupt.push(CorruptSpan {
+                    offset: at,
+                    end: len,
+                    after_epoch: min,
+                    before_epoch: None,
+                });
+                break;
             }
             None => break,
         }
     }
     let valid_end = at.min(len);
+    let open = corrupt.last().is_some_and(|s| s.before_epoch.is_none());
     Ok(Image {
         header,
         records,
         corrupt,
         valid_end,
-        torn: len > valid_end,
+        torn: !open && len > valid_end,
     })
 }
 
@@ -378,9 +393,20 @@ mod tests {
         assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
         assert!(stats.within_bound(f.len() as u64), "{stats:?}");
         assert!(stats.bytes_body_checked >= BUDGET, "{stats:?}");
-        // The record in the passed part of the window is not found: the file reads as a torn tail.
+        // The record in the passed part of the window is not found, and nothing after it: the passed bytes are a
+        // corrupt span with no later record, kept rather than dropped (Q-650).
         let img = img.unwrap();
-        assert!(img.records.is_empty() && img.corrupt.is_empty() && img.torn);
+        assert!(img.records.is_empty() && !img.torn);
+        assert_eq!(
+            img.corrupt,
+            [CorruptSpan {
+                offset: HEADER_LEN as u64,
+                end: f.len() as u64,
+                after_epoch: 0,
+                before_epoch: None,
+            }]
+        );
+        assert!(img.is_corrupt());
         // A record in the next window is found: the damaged record and the window form one corrupt span.
         let window = u64::from(MAX_BODY_LEN);
         f.resize(window as usize, 0);
@@ -393,7 +419,7 @@ mod tests {
                 offset: HEADER_LEN as u64,
                 end: window,
                 after_epoch: 0,
-                before_epoch: 1 << 41,
+                before_epoch: Some(1 << 41),
             }]
         );
     }
@@ -406,7 +432,7 @@ mod tests {
         let t = std::time::Instant::now();
         let (img, stats) = read_with_stats(&f, &[9; 16]);
         let elapsed = t.elapsed();
-        assert!(img.unwrap().torn);
+        assert_eq!(img.unwrap().corrupt[0].before_epoch, None);
         assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
         assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
         // A smoke ceiling for a slow shared machine; the pin is the budget.
@@ -433,7 +459,7 @@ mod tests {
                 offset: third,
                 end: fourth,
                 after_epoch: 2,
-                before_epoch: 4,
+                before_epoch: Some(4),
             }]
         );
         assert!(!img.torn);
