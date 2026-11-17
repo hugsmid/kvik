@@ -409,6 +409,17 @@ impl LogReader {
         &self.lost
     }
 
+    /// Bytes kept between refreshes: those of the segment followed, up to the mark (module documentation).
+    pub fn kept_bytes(&self) -> usize {
+        self.scratch.bytes.capacity()
+    }
+
+    /// Frees the bytes kept between refreshes, for a reader that will look facts up rather than refresh; a later
+    /// refresh reads its segment again from the point reached.
+    pub fn release_bytes(&mut self) {
+        self.scratch = Scratch::default();
+    }
+
     /// The lease file's path.
     pub fn lease_path(&self) -> &Path {
         &self.lease_path

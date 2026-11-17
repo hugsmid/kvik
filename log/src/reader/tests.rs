@@ -771,4 +771,28 @@ mod parts_and_lookup {
             "{hashed} bytes hashed for {log_bytes} bytes of log and {remembered} remembered"
         );
     }
+
+    #[test]
+    fn a_reader_that_released_its_bytes_reads_on_as_one_that_kept_them() {
+        let (fs, log) = store(30);
+        let mut kept = reader(&fs, 48);
+        let mut freed = reader(&fs, 49);
+        kept.refresh().unwrap();
+        freed.refresh().unwrap();
+        assert!(freed.kept_bytes() > 0);
+        freed.release_bytes();
+        assert_eq!(freed.kept_bytes(), 0);
+        for k in 30..40 {
+            log.submit((0..20).map(|i| fact(i, k, k as u64)).collect())
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        log.shutdown().unwrap();
+        let a = kept.refresh().unwrap();
+        let b = freed.refresh().unwrap();
+        assert!(!a.events.is_empty());
+        assert_eq!(a.events, b.events);
+        assert_eq!(a.state.durable, b.state.durable);
+    }
 }

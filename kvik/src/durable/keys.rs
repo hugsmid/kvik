@@ -30,6 +30,11 @@ pub(crate) trait LocalFacts: Send + std::fmt::Debug {
     /// Every local fact of a series with `t` from `from` to `to`, both inclusive, in position order; `None` when
     /// some place that may hold one could not be read.
     fn between(&mut self, series: u32, from: i64, to: i64) -> Option<Vec<FoundFact>>;
+    /// Bytes its reader keeps between refreshes.
+    #[cfg(test)]
+    fn kept_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// The invalid regions a reader passed over, by segment: their positions are lost (spec §3 Recovery rule 2). A region
@@ -151,6 +156,11 @@ impl LocalFacts for LogFacts {
 
     fn between(&mut self, series: u32, from: i64, to: i64) -> Option<Vec<FoundFact>> {
         self.on().between(series, from, to)
+    }
+
+    #[cfg(test)]
+    fn kept_bytes(&self) -> usize {
+        self.reader.kept_bytes()
     }
 }
 

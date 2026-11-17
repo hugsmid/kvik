@@ -129,6 +129,7 @@ pub(crate) fn read_kept(
     }
     decider.registry = index.registry().clone();
     let unrecorded = lost.unrecorded(reader.lost_ranges());
+    reader.release_bytes();
     Ok(Kept {
         index,
         decider,
@@ -159,6 +160,7 @@ pub(crate) fn read_whole(mut reader: LogReader, budget: usize) -> Result<Kept, R
     }
     let decider = Decider::from_index(&index, budget);
     let unrecorded = lost.unrecorded(reader.lost_ranges());
+    reader.release_bytes();
     Ok(Kept {
         index,
         decider,
@@ -251,6 +253,7 @@ mod tests {
         assert_eq!(kept.index.fact_series().count(), 0);
         assert_eq!(kept.index.registry().len(), 4);
         assert!(kept.counters.values().all(|c| c.recorded == 7_200));
+        assert_eq!(kept.local.kept_bytes(), 0);
     }
 
     #[test]
@@ -293,5 +296,6 @@ mod tests {
         assert_eq!(parts.counters, whole.counters);
         assert_eq!(parts.decider.history.held(), whole.decider.history.held());
         assert_eq!(parts.index.registry().len(), whole.index.registry().len());
+        assert_eq!((parts.local.kept_bytes(), whole.local.kept_bytes()), (0, 0));
     }
 }
