@@ -203,7 +203,7 @@ fn a_reading_is_late_against_an_earlier_reading_of_its_series_in_the_same_call()
             .collect()
     };
     let earlier = reading(4, wall - 60 * S, 1.0, None);
-    assert_eq!(late(&[earlier.clone()]), [false]);
+    assert_eq!(late(std::slice::from_ref(&earlier)), [false]);
     let call = [
         reading(4, wall - 5 * S, 1.0, None),
         reading(1, wall - 60 * S, 1.0, None),
