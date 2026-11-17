@@ -43,11 +43,12 @@ mod maint;
 mod options;
 mod pacing;
 mod queue;
+mod seg_index;
 pub mod recovery;
 pub mod sources;
 mod threads;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,7 +64,7 @@ pub use threads::{Clock, Log, Pending, SubmitError, SystemClock, Watch};
 
 use crate::batch::SegmentIdentity;
 use crate::block::{BLOCK_HEADER_LEN, block_type};
-use crate::body::{COMMIT_LEN, IndexRecord};
+use crate::body::COMMIT_LEN;
 use crate::content::{BatchContent, Item, ItemRef};
 use crate::entries::{Entry, IntervalLength};
 use crate::error::EncodeError;
@@ -512,7 +513,7 @@ struct OpenSegment {
     write_offset: u64,
     summary: Option<SealSummary>,
     has_entries: bool,
-    index: BTreeMap<u32, IndexRecord>,
+    index: seg_index::SegIndex,
     in_use_since: Duration,
 }
 
@@ -1134,7 +1135,7 @@ impl LogWriter {
             write_offset: HEADER_LEN as u64,
             summary: None,
             has_entries: false,
-            index: BTreeMap::new(),
+            index: seg_index::SegIndex::default(),
             in_use_since: now,
         })
     }
@@ -1151,7 +1152,7 @@ impl LogWriter {
                 id: old.id,
                 log_dir: self.log_dir.clone(),
                 summary,
-                records: old.index.into_values().collect(),
+                records: old.index.into_records(),
                 has_entries: old.has_entries,
             });
         }
@@ -1297,15 +1298,7 @@ impl LogWriter {
             match item.view() {
                 ItemRef::Fact(r) => {
                     let reach = reach(r.t, intervals.get(&r.series_id));
-                    let rec = seg.index.entry(r.series_id).or_insert(IndexRecord {
-                        series_id: r.series_id,
-                        fact_count: 0,
-                        min_t: r.t,
-                        max_t: reach,
-                    });
-                    rec.fact_count += 1;
-                    rec.min_t = rec.min_t.min(r.t);
-                    rec.max_t = rec.max_t.max(reach);
+                    seg.index.note(r.series_id, r.t, reach);
                 }
                 ItemRef::Entry(Entry::Definition(d)) => {
                     *max_series_id = (*max_series_id).max(d.id);

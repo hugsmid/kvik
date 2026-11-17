@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::batch::{BatchBuilder, SegmentIdentity};
-use crate::body::IndexRecord;
 use crate::content::{BatchContent, Item, ItemRef};
 use crate::entries::{Entry, IntervalLength, MarkState, Recovery};
 use crate::fs::{FsFile, OpenMode};
@@ -1710,7 +1709,7 @@ pub(super) fn start(
                 log_dir: log_dir.clone(),
                 end,
                 summary,
-                records: seg.index.into_values().collect(),
+                records: seg.index.into_records(),
                 has_entries: seg.has_entries,
             });
         }
@@ -1770,7 +1769,7 @@ fn open_segment<'a>(
     now: Duration,
 ) -> OpenSegment {
     let mut summary: Option<SealSummary> = None;
-    let mut index: BTreeMap<u32, IndexRecord> = BTreeMap::new();
+    let mut index = super::seg_index::SegIndex::default();
     let mut has_entries = false;
     for (c, t, first) in batches {
         let last = c.last_sequence();
@@ -1795,15 +1794,7 @@ fn open_segment<'a>(
             match item {
                 Item::Fact(r) => {
                     let reach = reach(r.t, intervals.get(&r.series_id));
-                    let rec = index.entry(r.series_id).or_insert(IndexRecord {
-                        series_id: r.series_id,
-                        fact_count: 0,
-                        min_t: r.t,
-                        max_t: reach,
-                    });
-                    rec.fact_count += 1;
-                    rec.min_t = rec.min_t.min(r.t);
-                    rec.max_t = rec.max_t.max(reach);
+                    index.note(r.series_id, r.t, reach);
                 }
                 Item::Entry(_) => has_entries = true,
             }
