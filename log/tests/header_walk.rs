@@ -199,6 +199,32 @@ fn skippable_batches(mut f: Vec<u8>, len: usize, n: usize) -> Vec<u8> {
     f
 }
 
+/// From `s`, kept batches of one entries block each, a definition of 65,536 state names of two 4-byte characters: the
+/// dearest body to check by the byte (Q-870), read after damage.
+fn dearest_entries_batches(mut f: Vec<u8>, len: usize) -> Vec<u8> {
+    for id in 1u32.. {
+        let mut d = definition(id, "s", "");
+        d.1[3].1 = vec![3];
+        let at = d.1.iter().position(|(f, _)| *f == 14).unwrap();
+        let names = (0..65_536u32).map(|k| {
+            let c = char::from_u32(0x10000 + k).unwrap();
+            (13u16, format!("{c}{c}").into_bytes())
+        });
+        d.1.splice(at..at, names);
+        let at = f.len().next_multiple_of(8);
+        let bytes = entries_batch(u64::from(id), T0, &[d])
+            .encode(&ID, at as u64, T0)
+            .unwrap();
+        if at + bytes.len() > len {
+            break;
+        }
+        f.resize(at, 0);
+        f.extend_from_slice(&bytes);
+    }
+    f.resize(len, 0);
+    f
+}
+
 fn damaged_start() -> Vec<u8> {
     let mut f = vec![0u8; HEADER_LEN + 8];
     f[HEADER_LEN..].fill(0xFF);
@@ -303,6 +329,11 @@ fn crafted_header_walks_timed() {
         let f = headers_everywhere(damaged_start(), len, t);
         timed(&format!("segment, a header every 8 bytes, {what}"), &f);
     }
+    let f = dearest_entries_batches(damaged_start(), 64 << 20);
+    timed(
+        "segment, kept batches of the dearest entries body after damage",
+        &f,
+    );
     for n in [1_000, 500_000] {
         let f = skippable_batches(damaged_start(), 64 << 20, n);
         timed(

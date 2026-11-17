@@ -6,6 +6,7 @@ use crate::block::{
     read_body,
 };
 use crate::body::{COMMIT_LEN, DataPrefix};
+use crate::bytes::{slice, u32_at};
 use crate::content::check_block;
 use crate::content_error::BodyError;
 use crate::crc::{PrefixCrc, crc32c};
@@ -112,6 +113,52 @@ impl ScanStats {
     }
 }
 
+/// The starts whose block header the chain ends read and found valid, a bit each in a ring indexed by offset (Q-873):
+/// a header read there again is taken without its checksum.
+#[derive(Clone, Debug)]
+pub(crate) struct Valid {
+    bits: Vec<u64>,
+    base: u64,
+    mask: u64,
+}
+
+impl Valid {
+    /// A ring of `mask + 1` starts, a power of two.
+    pub(crate) fn new(mask: u64) -> Self {
+        Self {
+            bits: vec![0; (mask as usize + 1).div_ceil(64)],
+            base: 0,
+            mask,
+        }
+    }
+
+    fn index(&self, p: u64) -> Option<usize> {
+        (p >= self.base && (p - self.base) / 8 <= self.mask)
+            .then_some(((p >> 3) & self.mask) as usize)
+    }
+
+    pub(crate) fn mark(&mut self, p: u64) {
+        if let Some(i) = self.index(p) {
+            self.bits[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    fn holds(&self, p: u64) -> bool {
+        self.index(p)
+            .is_some_and(|i| self.bits[i / 64] & (1 << (i % 64)) != 0)
+    }
+
+    /// Forgets the starts below `o`.
+    pub(crate) fn move_to(&mut self, o: u64) {
+        let n = (o.saturating_sub(self.base) / 8).min(self.mask + 1);
+        for k in 0..n {
+            let i = (((self.base >> 3) + k) & self.mask) as usize;
+            self.bits[i / 64] &= !(1 << (i % 64));
+        }
+        self.base = self.base.max(o);
+    }
+}
+
 /// Reads blocks of one file, taking body checksums from a prefix table, or directly for the reference scan.
 #[derive(Clone, Debug)]
 pub(crate) struct Reads<'a> {
@@ -124,6 +171,7 @@ pub(crate) struct Reads<'a> {
     /// The last two valid headers read, with their offsets: a candidate's framing and its read in full ask for the
     /// same headers in turn.
     recent: [Option<(u64, BlockHeader, [u8; BLOCK_HEADER_LEN])>; 2],
+    pub(crate) valid: Option<Valid>,
 }
 
 impl<'a> Reads<'a> {
@@ -137,6 +185,7 @@ impl<'a> Reads<'a> {
             body: 0,
             failed: FailedReads::new(MAX_BATCH_DATA),
             recent: [None; 2],
+            valid: None,
         }
     }
 
@@ -194,13 +243,27 @@ impl<'a> Reads<'a> {
         })
     }
 
+    /// A header read again: one of the last two, or one the chain ends found valid, taken without its checksum.
     fn recent_at(&self, offset: u64, limit: u64) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
-        let fits = offset.checked_add(BLOCK_HEADER_LEN as u64)? <= limit;
-        self.recent
-            .iter()
-            .flatten()
-            .find(|r| r.0 == offset && fits)
-            .map(|r| (r.1, r.2))
+        if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
+            return None;
+        }
+        if let Some(r) = self.recent.iter().flatten().find(|r| r.0 == offset) {
+            return Some((r.1, r.2));
+        }
+        if !self.valid.as_ref().is_some_and(|v| v.holds(offset)) {
+            return None;
+        }
+        let raw: [u8; BLOCK_HEADER_LEN] = slice(self.bytes, offset, BLOCK_HEADER_LEN as u64)?
+            .try_into()
+            .ok()?;
+        let header = BlockHeader {
+            block_type: raw[0],
+            flags: raw[1],
+            body_len: u32_at(&raw, 4),
+            body_crc32c: u32_at(&raw, 8),
+        };
+        Some((header, raw))
     }
 
     pub(crate) fn block(&mut self, offset: u64, limit: u64) -> Result<RawBlock<'a>, BlockFault> {

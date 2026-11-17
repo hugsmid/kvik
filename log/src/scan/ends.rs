@@ -13,6 +13,7 @@ use crate::body::COMMIT_LEN;
 use crate::bytes::{slice, u64_at};
 
 use super::Reads;
+use super::reads::Valid;
 
 /// Bytes of starts whose ends are found in one pass.
 pub(crate) const SPAN: u64 = MAX_BATCH_DATA / 2;
@@ -112,13 +113,15 @@ impl Ends {
             self.slots = vec![0; (self.mask + 1) as usize];
             self.commits = vec![0; (self.mask as usize + 1).div_ceil(64)];
         }
+        let mut valid = reads.valid.take().unwrap_or_else(|| Valid::new(self.mask));
+        valid.move_to(self.base);
         while self.ahead < want {
             let start = self.ahead.max(o).next_multiple_of(8);
             let end = start.saturating_add(self.span).min(limit);
             let mut p = end.next_multiple_of(8);
             while p > start {
                 p -= 8;
-                let w = self.read(reads, p, end, limit);
+                let w = self.read(reads, p, end, limit, &mut valid);
                 let i = self.index(p);
                 self.slots[i] = w;
             }
@@ -138,10 +141,18 @@ impl Ends {
             }
             self.ahead = end.max(start);
         }
+        reads.valid = Some(valid);
     }
 
     /// The entry of the start `p` in the block that ends at `end`, its successors in the block having theirs.
-    fn read(&mut self, reads: &mut Reads<'_>, p: u64, end: u64, limit: u64) -> u32 {
+    fn read(
+        &mut self,
+        reads: &mut Reads<'_>,
+        p: u64,
+        end: u64,
+        limit: u64,
+        valid: &mut Valid,
+    ) -> u32 {
         // A start that no header there could make part of a batch is passed before its checksum is computed.
         let plausible = slice(reads.bytes, p, 8).is_some_and(|w| {
             let len = u64::from(u32::from_le_bytes([w[4], w[5], w[6], w[7]]));
@@ -155,6 +166,7 @@ impl Ends {
         let Some(h) = header else {
             return NONE;
         };
+        valid.mark(p);
         match h.block_type {
             block_type::COMMIT
                 if h.body_len as usize == COMMIT_LEN
