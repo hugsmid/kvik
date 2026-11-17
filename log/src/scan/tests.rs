@@ -246,3 +246,48 @@ fn a_scan_to_the_end_searches_for_the_last_non_zero_byte_once() {
     let r = scan(&clean, &id, ScanLimit::End).unwrap();
     assert_eq!(r.tail, Some(Tail::Clean { offset: 64 }));
 }
+
+#[test]
+fn a_recovery_entry_not_alone_is_passed_over_whether_or_not_content_is_kept() {
+    let (mut bytes, id) = chain(0);
+    bytes.truncate(64);
+    let batch = |first: u64, at: u64, entries: Vec<crate::entries::Entry>| {
+        let body = crate::entries::EntriesBlock {
+            first_sequence: first,
+            received_at: 0,
+            entries,
+        };
+        let mut builder = crate::batch::BatchBuilder::new();
+        builder
+            .push(block_type::ENTRIES, body.encode().unwrap())
+            .unwrap();
+        builder.encode(&id, at, 0).unwrap()
+    };
+    let alias = || crate::entries::Entry::Alias {
+        id: 1,
+        name: "a".into(),
+    };
+    let recovery = crate::entries::Entry::Recovery(crate::entries::Recovery {
+        after: 0,
+        stamp: None,
+        boot_id: [0; 16],
+        tail_bytes: 0,
+        readable_commits: 0,
+        mark_state: crate::entries::MarkState::Readable,
+        id_floor: 0,
+        consumers: Vec::new(),
+    });
+    bytes.extend_from_slice(&batch(1, 64, vec![recovery, alias()]));
+    let at = bytes.len() as u64;
+    bytes.extend_from_slice(&batch(3, at, vec![alias()]));
+    let limit = ScanLimit::Mark(bytes.len() as u64);
+    let plain: Vec<_> = Scanner::new(&bytes, &id, limit).unwrap().collect();
+    let kept: Vec<_> = Scanner::new(&bytes, &id, limit)
+        .unwrap()
+        .keeping_content()
+        .collect();
+    assert_eq!(plain, kept);
+    assert!(
+        matches!(&plain[..], [Ok(Found::Region(r)), Ok(Found::Batch(b))] if r.cause == LossCause::InvalidContent && b.offset == at)
+    );
+}
