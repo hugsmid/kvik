@@ -479,7 +479,10 @@ only, boxed `Send` futures):
   store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a
   generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304). So is a record missing
   from the listing that a later record names, or that lies within a few epochs after the last listed or the last
-  read, when `stat` reports it (Q-611, Q-612). `BrokenChain`: a record of the generation read names a predecessor the bucket does not report,
+  read, when `stat` reports it (Q-611, Q-612). A drill of a live store, or a full restore while the source store
+  still uploads, can see a record uploaded after its listing and is retried the same way; on a bucket whose listings
+  lag longer than the time between two record uploads it never passes, so there a drill runs from a paused copy, a
+  copy of the store's objects made while the store uploads nothing (spec §8 Restore drill, Q-612 (d)). `BrokenChain`: a record of the generation read names a predecessor the bucket does not report,
   or one no listing could hide (`format.md` A.17 Uploaded forms; `RestoreError::BrokenChain`, Q-611); a retry gives
   the same answer.
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and

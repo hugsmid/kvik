@@ -67,7 +67,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-610 | §8 Generations; `format.md` A.17 Uploaded forms | The chain of epochs in uploaded manifest records: the field and where it starts |
 | Q-611 | §8 Generations, Restore step 1; `api.md` Backup and restore | What a broken chain of uploaded records is, and what a restore does with one |
-| Q-612 | §8 Generations, Restore step 1; `api.md` Backup and restore | The tail check: a record after the last listed, found, not found or unanswered |
 | Q-613 | §8 Generations, Restore step 1 | Files of the generation read that no record names |
 | Q-614 | §8 Generations, Restore step 1; `format.md` A.17 | A restore that reads an earlier state with nothing found: what no check of 8.3g sees |
 | Q-615 | §8 Generations, Restore step 1 | The source records are read after the claim |
@@ -1377,29 +1376,6 @@ chain of every record list it builds passes.
 **Tests.** `backup/tests/restore_chain.rs` (each break, both modes, a break before and after the records read);
 `backup/tests/restore_chain_properties.rs`.
 
-## Q-612 — The tail check: records after the last listed, found, not found or unanswered
-Recorded and decided by roadmap 8.3g. **Owner** for (d).
-**Scenario.** A listing that hides the newest records, or records uploaded after it, leave nothing for the chain
-(Q-611) to name: the restore reads an earlier state and, when it is full, claims a generation over it.
-**Decision.** (a) Right after the listing, before any record is fetched, the restore asks `stat` for the
-`TAIL_PROBES` (8) epochs after the last listed (`plan::after_last`); after the chain check, where the records read
-end before the listing (a rebuilt manifest not yet whole follows), for the epochs after the last read and below the
-next listed, at most 8 (`plan::read_tail`); and where nothing is read (the listing starts with such a manifest),
-for epoch 1, the generation's first record, which a listing then hides if the bucket holds it. The bound of 8 lets a
-hidden record behind skipped epochs (format A.14) still be found (Q-614). (b) Reported: `ListingIncomplete`,
-retried. Not reported: the restore goes on. Unanswered (transient or not): the restore fails with the sink's error
-and never goes on, since going on could read an earlier state. (c) What no check finds is Q-614.
-**Owner.** (d) A drill on a live store, or a full restore while the source store still uploads (moving a store to
-another machine), can see the next record uploaded between its listing and the `stat`, and fail as
-`ListingIncomplete` where it passed before. The `stat` calls (at most eight, `TAIL_PROBES`) follow the listing directly to keep that window short. A
-retry passes only while the listing lags less than the time between two record uploads of the source store; on a
-bucket whose listings lag longer, a drill or restore of a live store never passes. The source records are read
-after the claim (`backup/src/restore/driver.rs` `fresh`), so each retry of a full restore takes a new generation
-(Q-615). Built as described; for the owner to accept.
-**Model.** Not modelled.
-**Tests.** `backup/tests/restore_chain.rs` (`q612_*`: found, not found and unanswered, after the last listed and
-after the last read; the `stat` before the first fetch; `q614_*` for the bound and for nothing read).
-
 ## Q-613 — Files of the generation read that no record names
 Recorded and decided by roadmap 8.3g. To be settled by roadmap 8.3d (how `Store::restore` reports them).
 **Scenario.** A file is uploaded before the records that name it (spec §8 Continuous backup), so a disaster between
@@ -1466,7 +1442,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1535,7 +1511,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-610 | 8.3 | The chain of epochs in uploaded manifest records; decided by roadmap 8.3g; what it cannot show is Q-614 |
 | Q-611 | 8.3 | A broken chain of uploaded records; decided by roadmap 8.3g; owner: one record object lost makes every restore and drill of the store fail for good, with no way out once the store is gone |
-| Q-612 | 8.3 | The tail check after the listing and after the records read; decided by roadmap 8.3g; owner: a store still uploading, or a listing that lags longer than its uploads, can make a restore retry, a full one taking a generation each time (Q-615) |
 | Q-613 | 8.3d | Files of the generation read that no record names; reported by roadmap 8.3g in `Prepared::unnamed`; surfaced by `Store::restore` at 8.3d |
 | Q-614 | 8.3 | Silent restore of an earlier state (a lost last record, a hidden one behind more than 8 skipped epochs, the last old record before an unfinished rebuilt manifest) and the uploaded form's missing version marker; recorded by the review of 8.3g; owner decision pending |
 | Q-615 | 8.3d | The source records read after the claim, so each retry takes a generation; recorded by the review of 8.3g |
@@ -1786,6 +1761,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-612 | The tail check: records after the last listed, found, not found or unanswered | §8 Generations, Restore drill; `api.md` Backup and restore, Restore (decided by roadmap 8.3g; (d) settled by the owner's ruling, accepted as built). Scenario: a listing that hides the newest records, or records uploaded after it, leave nothing for the chain (Q-611) to name: the restore reads an earlier state and, when it is full, claims a generation over it. Decision: (a) right after the listing, before any record is fetched, the restore asks `stat` for the `TAIL_PROBES` (8) epochs after the last listed (`plan::after_last`); after the chain check, where the records read end before the listing (a rebuilt manifest not yet whole follows), for the epochs after the last read and below the next listed, at most 8 (`plan::read_tail`); and where nothing is read, for epoch 1. The bound of 8 lets a hidden record behind skipped epochs (format A.14) still be found. (b) Reported: `ListingIncomplete`, retried. Not reported: the restore goes on. Unanswered (transient or not): the restore fails with the sink's error and never goes on, since going on could read an earlier state. (c) What no check finds is Q-614. (d) A drill of a live store, or a full restore while the source store still uploads, can see the next record uploaded between its listing and the `stat` (at most eight, right after the listing) and fail as `ListingIncomplete` where it passed before. Ruling: accepted; such a drill is retried, and on a bucket whose listings lag longer than the time between two record uploads it never passes, so there a drill runs from a paused copy, a copy of the store's objects made while the store uploads nothing (spec §8 Restore drill, `api.md` Restore). Each retry of a full restore takes a new generation (Q-615). `backup/tests/restore_chain.rs` (`q612_*`: found, not found and unanswered, after the last listed and after the last read; the `stat` before the first fetch) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a
