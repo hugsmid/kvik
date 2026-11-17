@@ -75,7 +75,7 @@ impl Writer {
         let wall = self.env.clock.wall().0;
         kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file).map_err(
             |e| {
-                let f = super::registry_fault(&self.dir, &e);
+                let f = super::open::registry_fault(&self.dir, &e);
                 *lock(&self.own_fault) = Some(f);
                 Error::ReadOnly(e.to_string())
             },
@@ -85,7 +85,7 @@ impl Writer {
 
     /// Commits a routing change and writes the registry file after it.
     fn commit_routing(&self, d: &mut super::ingest::Decider, change: Routing) -> Result<(), Error> {
-        self.commit_entry(d, Entry::Routing(Box::new(change)))?;
+        self.commit_entry_held(d, Entry::Routing(Box::new(change)))?;
         self.write_registry_file()
     }
 

@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod durable;
 pub mod world;
 
 use std::future::Future;

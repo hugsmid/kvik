@@ -213,9 +213,9 @@ demand for fact reads, never for windows or consumer catch-up. The engine never 
 
 ### Planned interface
 *Subject to change: an outline from [`docs/api.md`](docs/api.md). The [`kvik`](kvik/) crate implements it on the
-durable log (series, writing, facts; consumers, live state and windows to come) and on the in-memory reference model,
-which is not durable; decimal value types, calendar-length intervals, backup and restore are among what neither
-supports yet ([coverage](kvik/README.md#coverage)).*
+durable log (series, writing, facts, live state, windows, buckets, calendar results and consumers) and on the
+in-memory reference model, which is not durable; decimal value types, calendar-length intervals, backup and
+restore are among what neither supports yet ([coverage](kvik/README.md#coverage)).*
 
 ```rust
 let store = Store::open(config).await?;   // StoreConfig: directory, time zone, limits, tiers, ...

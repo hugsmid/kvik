@@ -1,6 +1,6 @@
 //! The durable backend: what reaches the log survives crashes and power losses, a reader in another handle sees
-//! what is committed, the series registry is recovered at every start, ids are never assigned twice, and the
-//! durable backend decides every outcome as the model backend does.
+//! what is committed, the series registry is recovered at every start, ids are never assigned twice, and calls
+//! waiting for room in the ingest queue hold up no other call.
 
 mod common;
 
@@ -9,108 +9,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use common::{at, block_on, start};
-use kvik::env::{Env, FixedBootId, ManualClock, MemFs};
+use common::durable::{World, gauge, history, note, num};
+use common::{at, block_on};
 use kvik::{
-    Backend, ChangedAtKind, DefineError, Fact, Intent, IntervalLength, Kind, LogConfig, LossKind,
-    Outcome, Position, Quality, Reader, ReaderConfig, Reading, Refusal, RetentionClass, SeriesId,
-    SeriesSpec, StateValues, Store, StoreConfig, Timestamp, Value, ValueType, View, ZoneName,
+    ChangedAtKind, DefineError, IntervalLength, Kind, LogConfig, LossKind, Outcome, Position,
+    Reader, ReaderConfig, Reading, Refusal, RetentionClass, SeriesId, SeriesSpec, StateValues,
+    Store, StoreConfig, Timestamp, Value, ValueType, View, ZoneName,
 };
-use proptest::prelude::*;
-use proptest::test_runner::TestRunner;
-
-/// A durable store's world: its in-memory file system, boot identity and clock.
-struct World {
-    dir: String,
-    fs: Arc<MemFs>,
-    boot: Arc<FixedBootId>,
-    clock: ManualClock,
-    boot_count: u8,
-}
-
-impl World {
-    fn new(name: &str) -> Self {
-        World {
-            dir: format!("durable/{name}"),
-            fs: Arc::new(MemFs::new()),
-            boot: Arc::new(FixedBootId::new(Some([1; 16]))),
-            clock: ManualClock::new(start()),
-            boot_count: 1,
-        }
-    }
-
-    fn env(&self) -> Env {
-        let mut env = Env::test(self.clock.clone());
-        env.fs = self.fs.clone();
-        env.boot = self.boot.clone();
-        env
-    }
-
-    fn config(&self) -> StoreConfig {
-        let mut log = LogConfig::default();
-        log.segment_size = 16 << 20;
-        StoreConfig::new(&self.dir, "Europe/London")
-            .create_if_missing(true)
-            .env(self.env())
-            .log(log)
-    }
-
-    fn open(&self) -> Store {
-        block_on(Store::open(self.config())).unwrap()
-    }
-
-    fn reader(&self) -> Reader {
-        Reader::open(ReaderConfig::new(&self.dir).env(self.env())).unwrap()
-    }
-
-    /// The process stops (every later file operation fails), the store's handles are dropped, then the power
-    /// goes: every file returns to what was synced. The machine boots again with a new boot identity.
-    fn power_loss(&mut self, store: Store) {
-        self.fs.crash_after(0);
-        drop(store);
-        self.fs.power_loss();
-        self.boot_count += 1;
-        self.boot.set(Some([self.boot_count; 16]));
-    }
-
-    /// The bytes of the open segments, with their paths.
-    fn segments(&self) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        self.fs
-            .paths()
-            .into_iter()
-            .filter(|p| {
-                p.starts_with(Path::new(&self.dir).join("log"))
-                    && p.extension().is_some_and(|e| e == "open" || e == "kvl")
-            })
-            .map(|p| {
-                let b = self.fs.read(&p).unwrap();
-                (p, b)
-            })
-            .collect()
-    }
-}
-
-fn gauge(name: &str) -> SeriesSpec {
-    SeriesSpec::new(
-        name,
-        Kind::Gauge {
-            value: ValueType::F64,
-        },
-        "W",
-    )
-    .expected_interval(Duration::from_secs(1))
-}
-
-fn num(id: SeriesId, secs: i64, v: f64) -> Reading {
-    Reading::new(id, at(secs), Value::F64(v))
-}
-
-fn history(r: &Reader, id: SeriesId) -> Vec<Fact> {
-    r.facts(id, at(-1_000_000)..at(1_000_000), View::History)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
-}
 
 #[test]
 fn acknowledged_readings_survive_a_power_loss() {
@@ -480,6 +385,30 @@ fn the_registry_file_carries_the_id_floor_when_the_mark_is_lost() {
 }
 
 #[test]
+fn a_clean_shutdown_writes_the_registry_file_under_the_stores_lock() {
+    use kvik::env::{Fs, OpenMode};
+    use std::sync::Mutex;
+    let w = World::new("shutdown-lock");
+    let s = w.open();
+    block_on(s.define_series(gauge("a/b/c"))).unwrap();
+    let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let (fs, lock_path, seen2) = (w.fs.clone(), Path::new(&w.dir).join("LOCK"), seen.clone());
+    w.fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        if p.components().any(|c| c.as_os_str() == "registry") {
+            let f = fs.open(&lock_path, OpenMode::ReadWrite).unwrap();
+            seen2.lock().unwrap().push(!f.try_lock_exclusive().unwrap());
+        }
+    })));
+    block_on(s.shutdown()).unwrap();
+    w.fs.set_sync_hook(None);
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|held| *held),
+        "{seen:?}"
+    );
+}
+
+#[test]
 fn orphaned_facts_stay_out_of_views_and_are_exported() {
     let w = World::new("orphaned");
     let s = w.open();
@@ -593,383 +522,86 @@ fn writers_on_several_threads() {
     block_on(s.shutdown()).unwrap();
 }
 
-// ----- the same outcomes as the model backend -----
-
-/// One step of a generated history.
-#[derive(Clone, Debug)]
-enum Step {
-    /// A call of readings, each (series index, seconds, value code, quality code, `changed_at`, host-stamped), with
-    /// revise intent or not.
-    Emit(Vec<(usize, i64, u8, u8, Option<u64>, bool)>, bool),
-    Retire(usize, i64),
-    /// An alias: a name from a small set shared by every series, so that names collide.
-    Alias(usize, usize),
-    /// The series defined again (a new series once it is retired).
-    Define(usize),
-    Retention(usize, bool),
-    SiteZone(usize, i64),
-    /// The clock moves on by this many seconds.
-    Advance(u64),
-    /// The clock is reported synchronised or not (spec §2.5).
-    Synced(bool),
-}
-
-fn specs() -> Vec<SeriesSpec> {
-    vec![
-        gauge("h/g/power"),
-        SeriesSpec::new(
-            "h/c/energy",
-            Kind::Counter {
-                value: ValueType::F64,
-            },
-            "Wh",
-        ),
-        SeriesSpec::new(
-            "h/s/mode",
-            Kind::State {
-                values: StateValues::Named(vec!["a".into(), "b".into()]),
-            },
-            "",
-        ),
-        SeriesSpec::new("h/t/note", Kind::Text, ""),
-        gauge("h/v/price").versioned(ChangedAtKind::Version),
-        SeriesSpec::new(
-            "h/i/energy",
-            Kind::Interval {
-                value: ValueType::F64,
-                length: IntervalLength::Fixed {
-                    d: Duration::from_secs(4),
-                    phase: Duration::from_secs(1),
-                },
-            },
-            "kWh",
-        ),
-        SeriesSpec::new(
-            "h/b/door",
-            Kind::State {
-                values: StateValues::Bool,
-            },
-            "",
-        ),
-    ]
-}
-
-const ALIASES: [&str; 3] = ["h/g/power", "h/x/shared", "h/y/other"];
-const ZONES: [&str; 3] = ["Europe/London", "Europe/Oslo", "Not/AZone"];
-
-fn value(code: u8) -> Value {
-    match code % 12 {
-        0 => Value::F64(1.0),
-        1 => Value::F64(2.0),
-        2 => Value::F64(-1.0),
-        3 => Value::F64(f64::NAN),
-        4 => Value::F64(-0.0),
-        5 => Value::Absent,
-        6 => Value::State(0),
-        7 => Value::State(5),
-        8 => Value::Text("x".into()),
-        9 => Value::Text("é".repeat(200)),
-        10 => Value::Bool(true),
-        _ => Value::Decimal { units: 1, scale: 1 },
-    }
-}
-
-fn quality(code: u8) -> Quality {
-    [
-        Quality::Good,
-        Quality::Estimated,
-        Quality::Suspect,
-        Quality::Bad,
-    ][usize::from(code % 4)]
-}
-
-fn steps() -> impl Strategy<Value = Vec<Step>> {
-    let reading = (
-        0usize..8,
-        -400i64..200,
-        any::<u8>(),
-        any::<u8>(),
-        prop_oneof![Just(None), (0u64..3).prop_map(Some)],
-        prop::bool::weighted(0.15),
-    );
-    let step = prop_oneof![
-        10 => (prop::collection::vec(reading, 1..6), any::<bool>())
-            .prop_map(|(r, rev)| Step::Emit(r, rev)),
-        1 => (0usize..7, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
-        1 => (0usize..7, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
-        1 => (0usize..7).prop_map(Step::Define),
-        1 => (0usize..7, any::<bool>()).prop_map(|(i, d)| Step::Retention(i, d)),
-        1 => (0usize..ZONES.len(), -100i64..100).prop_map(|(z, t)| Step::SiteZone(z, t)),
-        2 => (0u64..400).prop_map(Step::Advance),
-        1 => prop::bool::weighted(0.7).prop_map(Step::Synced),
-    ];
-    prop::collection::vec(step, 1..16)
-}
-
-/// What a history gives on one backend: every result in a comparable form, and per series its facts in each view.
-struct Run {
-    out: Vec<String>,
-    facts: Vec<Vec<Vec<Fact>>>,
-    infos: Vec<String>,
-}
-
-/// Runs a history on a store. Positions differ between the backends only by entries that are not facts (the model
-/// writes no recovery or tzdata entry); facts are compared without them, and the as-of views at the positions each
-/// backend gave the same readings.
-fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
-    let mut out = Vec::new();
-    let mut ids: Vec<SeriesId> = specs()
-        .into_iter()
-        .map(|spec| block_on(s.define_series(spec)).unwrap())
-        .collect();
-    let mut all = ids.clone();
-    let mut recorded: Vec<Position> = Vec::new();
-    let mut times = Vec::new();
-    let id = |ids: &[SeriesId], i: usize| ids.get(i).copied().unwrap_or(SeriesId(999));
-    for step in history {
-        match step {
-            Step::Emit(rs, revise) => {
-                let readings: Vec<_> = rs
-                    .iter()
-                    .map(|(i, t, v, q, c, host)| {
-                        let mut r =
-                            Reading::new(id(&ids, *i), at(*t), value(*v)).with_quality(quality(*q));
-                        r.changed_at = *c;
-                        if *host {
-                            r = r.host_stamped();
-                        }
-                        r
-                    })
-                    .collect();
-                let intent = if *revise {
-                    Intent::Revise
-                } else {
-                    Intent::Normal
-                };
-                // Host-stamped readings wait for a synchronised clock: asked without waiting.
-                let waits = rs.iter().any(|r| r.5);
-                let ack = if waits {
-                    match s.try_emit(&readings) {
-                        Ok(p) => block_on(p),
-                        Err(e) => {
-                            out.push(format!("emit {e:?}"));
-                            continue;
-                        }
-                    }
-                } else {
-                    block_on(s.emit_with(&readings, intent))
-                }
-                .unwrap();
-                let outcomes: Vec<String> = ack
-                    .outcomes
-                    .iter()
-                    .map(|o| match o {
-                        Outcome::Recorded {
-                            outranked,
-                            position,
-                            ..
-                        } => {
-                            recorded.push(*position);
-                            format!("recorded outranked={outranked}")
-                        }
-                        other => format!("{other:?}"),
-                    })
-                    .collect();
-                out.push(format!("emit {outcomes:?}"));
-            }
-            Step::Retire(i, t) => out.push(format!(
-                "retire {:?}",
-                block_on(s.retire(id(&ids, *i), at(*t))).map_err(|e| e.to_string())
-            )),
-            Step::Alias(i, n) => out.push(format!(
-                "alias {:?}",
-                block_on(s.alias(id(&ids, *i), ALIASES[*n])).map_err(|e| e.to_string())
-            )),
-            Step::Define(i) => {
-                let r = block_on(s.define_series(specs()[*i].clone()));
-                if let Ok(new) = &r {
-                    if !all.contains(new) {
-                        all.push(*new);
-                    }
-                    ids[*i] = *new;
-                }
-                out.push(format!(
-                    "define {:?}",
-                    r.map(|_| ()).map_err(|e| e.to_string())
-                ));
-            }
-            Step::Retention(i, diagnostic) => {
-                let class = if *diagnostic {
-                    RetentionClass::Diagnostic {
-                        period: Duration::from_secs(3_600),
-                    }
-                } else {
-                    RetentionClass::LongTerm
-                };
-                let change = kvik::ParameterChange::default().retention(class);
-                out.push(format!(
-                    "retention {:?}",
-                    block_on(s.set_parameters(id(&ids, *i), at(0), change))
-                        .map_err(|e| e.to_string())
-                ));
-            }
-            Step::SiteZone(z, t) => out.push(format!(
-                "zone {:?}",
-                block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)))
-                    .map_err(|e| e.to_string())
-            )),
-            Step::Advance(secs) => {
-                clock.advance(Duration::from_secs(*secs));
-                times.push(clock.wall());
-            }
-            Step::Synced(on) => clock.set_synchronised(*on),
-        }
-    }
-    clock.set_synchronised(true);
-    let r = s.reader();
-    let range = at(-1_000_000)..at(1_000_000);
-    let mut views = vec![View::History, View::Current];
-    views.extend(
-        [recorded.len() / 3, recorded.len() / 2]
-            .iter()
-            .filter_map(|k| recorded.get(*k))
-            .map(|p| View::AsOf(*p)),
-    );
-    views.extend(times.iter().take(2).map(|t| View::AsOfTime(*t)));
-    let facts = all
-        .iter()
-        .map(|id| {
-            views
-                .iter()
-                .map(|v| {
-                    r.facts(*id, range.clone(), *v)
-                        .unwrap()
-                        .map(|f| {
-                            let mut f = f.unwrap();
-                            f.position = Position::ORIGIN;
-                            f
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
-    let infos = all
-        .iter()
-        .map(|id| {
-            let i = s.series(*id).unwrap();
-            format!(
-                "{} {:?} {:?} {:?} {:?} {:?}",
-                i.name, i.names, i.retired_at, i.latest_t, i.lateness_reference, i.spec.retention
-            )
-        })
-        .collect();
-    Run { out, facts, infos }
-}
-
-/// `late` as spec §2.2 defines it, for the facts of one series in position order: the first clause against the
-/// lateness reference, which leaves out facts flagged `future` or `unsynced_clock`. The model still uses the latest
-/// recorded `t` there (Q-74, invariant 24, not yet modelled), so the two backends are compared without the flag and
-/// the durable backend's flag against this.
-fn check_late(info: &kvik::SeriesInfo, facts: &[Fact]) {
-    let s = info.staleness.map(|d| d.as_nanos() as i64);
-    let bound = info.spec.lateness_bound.unwrap().as_nanos() as i64;
-    let observed = info.spec.timing == kvik::Timing::Observed;
-    let d = match &info.spec.kind {
-        Kind::Interval {
-            length: IntervalLength::Fixed { d, .. },
-            ..
-        } if observed => d.as_nanos() as i64,
-        _ => 0,
-    };
-    let mut reference: Option<i64> = None;
-    for f in facts {
-        let synced = !f.flags.unsynced_clock;
-        let reach = f.t.0 + d;
-        let out_of_order = match (reference, s) {
-            (Some(r), Some(s)) => observed && !f.flags.future && f.t.0 < r - 2 * s,
-            _ => false,
-        };
-        let late = synced && (out_of_order || f.received_at.0 - reach > bound);
-        assert_eq!(f.flags.late, late, "{f:?}");
-        if !f.flags.future && !f.flags.unsynced_clock {
-            reference = reference.max(Some(f.t.0));
-        }
-    }
-}
-
-fn without_late(facts: &[Vec<Vec<Fact>>]) -> Vec<Vec<Vec<Fact>>> {
-    facts
-        .iter()
-        .map(|views| {
-            views
-                .iter()
-                .map(|fs| {
-                    fs.iter()
-                        .map(|f| {
-                            let mut f = f.clone();
-                            f.flags.late = false;
-                            f
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect()
+/// Runs `f` on another thread; whether it returned within `limit`.
+fn returns_within(limit: Duration, f: impl FnOnce() + Send + 'static) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
 }
 
 #[test]
-fn the_durable_backend_decides_as_the_model_does() {
-    // Each case opens a durable store; a quarter of the configured cases keeps the deep run in bounds.
-    let cases = (ProptestConfig::default().cases / 4).max(16);
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    });
-    runner
-        .run(&steps(), |history| {
-            let m_clock = ManualClock::new(start());
-            let model = block_on(Store::open(
-                StoreConfig::new(
-                    format!("kvik-test/differential/{}", next()),
-                    "Europe/London",
-                )
-                .create_if_missing(true)
-                .backend(Backend::Model)
-                .env(Env::test(m_clock.clone())),
-            ))
-            .unwrap();
-            let w = World::new("differential");
-            let mut config = w.config();
-            config.log.min_sync_interval = Duration::ZERO;
-            let durable = block_on(Store::open(config)).unwrap();
-            let m = run(&model, &m_clock, &history);
-            let d = run(&durable, &w.clock, &history);
-            prop_assert_eq!(&m.out, &d.out);
-            prop_assert_eq!(&m.infos, &d.infos);
-            prop_assert_eq!(without_late(&m.facts), without_late(&d.facts));
-            let r = durable.reader();
-            for id in (1..=d.facts.len() as u32).map(SeriesId) {
-                let info = durable.series(id).unwrap();
-                let fs: Vec<Fact> = r
-                    .facts(id, at(-1_000_000)..at(1_000_000), View::History)
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .collect();
-                let mut by_position = fs.clone();
-                by_position.sort_by_key(|f| f.position);
-                check_late(&info, &by_position);
-            }
-            block_on(durable.shutdown()).unwrap();
-            block_on(model.shutdown()).unwrap();
-            Ok(())
-        })
-        .unwrap();
-}
+fn with_the_queue_full_try_emit_is_busy_at_once_while_other_calls_wait_for_room() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let w = World::new("queue-full");
+    let mut limits = kvik::Limits::default();
+    limits.ingest_queue = 1024;
+    let s = block_on(Store::open(w.config().limits(limits))).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    // The next log sync is held, so nothing leaves the queue.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    let armed = Arc::new(AtomicBool::new(true));
+    let a = armed.clone();
+    w.fs.set_sync_hook(Some(Arc::new(move |_: &Path| {
+        if thread::current().name() == Some("kvik-writer") && a.swap(false, Ordering::SeqCst) {
+            gate.lock().unwrap().recv().unwrap();
+        }
+    })));
+    let batch = |n: i64| -> Vec<Reading> {
+        (0..256)
+            .map(|k| note(id, n * 1_000 + k, &format!("v{n}-{k}")))
+            .collect()
+    };
+    let mut queued = Vec::new();
+    let mut n = 0;
+    let full = loop {
+        match s.try_emit(&batch(n)) {
+            Ok(p) => queued.push(p),
+            Err(e) => break e,
+        }
+        n += 1;
+        assert!(n < 100, "the queue never filled");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        matches!(full, kvik::EmitError::Busy(kvik::Wait::QueueFull)),
+        "{full:?}"
+    );
 
-fn next() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::SeqCst)
+    // A waiting emit and a definition wait for room without holding up other calls.
+    let s2 = s.clone();
+    let waiting = thread::spawn(move || block_on(s2.emit(&[note(id, 900_000, "w")])).map(|_| ()));
+    let s3 = s.clone();
+    let defining =
+        thread::spawn(move || block_on(s3.define_series(gauge("a/b/later"))).map(|_| ()));
+    thread::sleep(Duration::from_millis(200));
+    let s4 = s.clone();
+    assert!(returns_within(Duration::from_secs(1), move || {
+        let r = s4.try_emit(&[note(id, 900_001, "t")]);
+        assert!(
+            matches!(r, Err(kvik::EmitError::Busy(kvik::Wait::QueueFull))),
+            "{:?}",
+            r.map(|_| ())
+        );
+    }));
+    let s5 = s.clone();
+    assert!(returns_within(Duration::from_secs(1), move || {
+        s5.series_stats(id).unwrap();
+        s5.health();
+        s5.stats();
+    }));
+    assert!(!waiting.is_finished() && !defining.is_finished());
+
+    release.send(()).unwrap();
+    waiting.join().unwrap().unwrap();
+    defining.join().unwrap().unwrap();
+    for p in queued {
+        block_on(p).unwrap();
+    }
+    w.fs.set_sync_hook(None);
+    block_on(s.shutdown()).unwrap();
 }

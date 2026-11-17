@@ -272,12 +272,49 @@ impl Watch {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Wait,
+    Try,
+    Offer,
+}
+
+/// Waits for room in a log's ingest queue ([`Log::room`]).
+#[derive(Debug, Clone)]
+pub struct Room {
+    shared: Arc<Shared>,
+}
+
+impl Room {
+    /// Blocks until a call of `len` entries would be queued, or the log turns read-only or shuts down. Room found
+    /// here may be taken by another caller before this one queues.
+    pub fn wait(&self, len: usize) -> Result<(), SubmitError> {
+        let mut f = lock(&self.shared.front);
+        loop {
+            if f.read_only {
+                return Err(SubmitError::ReadOnly);
+            }
+            if f.shutdown {
+                return Err(SubmitError::ShutDown);
+            }
+            if f.queue.has_room(len) {
+                return Ok(());
+            }
+            f = self
+                .shared
+                .room_cv
+                .wait(f)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 /// The log writer on its threads. See the module documentation of [`crate::writer`].
 #[derive(Debug)]
 pub struct Log {
     shared: Arc<Shared>,
     call_limit: usize,
-    writer: Option<JoinHandle<Result<(), Fault>>>,
+    writer: Option<JoinHandle<(Result<(), Fault>, LogWriter)>>,
     maint: Option<JoinHandle<()>>,
 }
 
@@ -338,7 +375,7 @@ impl Log {
         })
     }
 
-    fn enqueue(&self, items: Vec<Item>, wait: bool) -> Result<Pending, SubmitError> {
+    fn enqueue(&self, items: Vec<Item>, mode: Mode) -> Result<Pending, SubmitError> {
         let call = Call::new(items, self.call_limit)?;
         let mut f = lock(&self.shared.front);
         loop {
@@ -348,13 +385,15 @@ impl Log {
             if f.shutdown {
                 return Err(SubmitError::ShutDown);
             }
-            if !wait && let Some(w) = f.waiting {
+            if mode == Mode::Try
+                && let Some(w) = f.waiting
+            {
                 return Err(SubmitError::Busy(w));
             }
             if f.queue.has_room(call.len()) {
                 break;
             }
-            if !wait {
+            if mode != Mode::Wait {
                 return Err(SubmitError::Busy(Wait::QueueFull));
             }
             f = self
@@ -377,12 +416,26 @@ impl Log {
 
     /// Queues a call, waiting while the queue is full (back-pressure).
     pub fn submit(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
-        self.enqueue(items, true)
+        self.enqueue(items, Mode::Wait)
     }
 
     /// Queues a call without waiting: [`SubmitError::Busy`] names the reason ingest would wait.
     pub fn try_submit(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
-        self.enqueue(items, false)
+        self.enqueue(items, Mode::Try)
+    }
+
+    /// Queues a call if the queue has room for it now, as [`Log::submit`] would without waiting, whatever else
+    /// ingest waits on; [`SubmitError::Busy`] with [`Wait::QueueFull`] otherwise. With [`Log::room`], a caller
+    /// that must not wait while it holds a lock queues as `submit` does.
+    pub fn offer(&self, items: Vec<Item>) -> Result<Pending, SubmitError> {
+        self.enqueue(items, Mode::Offer)
+    }
+
+    /// A handle that waits for room in the queue without borrowing the log.
+    pub fn room(&self) -> Room {
+        Room {
+            shared: self.shared.clone(),
+        }
     }
 
     /// The writer's statistics, as of its last turn.
@@ -438,10 +491,21 @@ impl Log {
     /// (Q-221 (b)), syncs the mark and joins both threads. Calls that cannot be committed (ingest waiting on the disk) fail with
     /// [`CommitError::ShutDown`]. Returns the fault if the store became read-only.
     pub fn shutdown(mut self) -> Result<(), Fault> {
-        self.stop()
+        self.stop().0
     }
 
-    fn stop(&mut self) -> Result<(), Fault> {
+    /// [`Log::shutdown`], then, if the store did not become read-only, `then` on the stopped writer before the
+    /// writer, and with it the store's lock, is dropped: for work that must finish under the single-writer lock
+    /// after the clean shutdown's mark sync (`spec.md` §3 Single writer).
+    pub fn shutdown_then<R>(mut self, then: impl FnOnce(&LogWriter) -> R) -> Result<R, Fault> {
+        let (r, writer) = self.stop();
+        r?;
+        Ok(then(
+            writer.as_ref().expect("a writer after a clean shutdown"),
+        ))
+    }
+
+    fn stop(&mut self) -> (Result<(), Fault>, Option<LogWriter>) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         {
             lock(&self.shared.front).shutdown = true;
@@ -456,9 +520,9 @@ impl Log {
         let m = self.maint.take().map(JoinHandle::join);
         // Both threads are joined before a panic of either is passed on.
         let r = match w {
-            Some(Ok(r)) => r,
+            Some(Ok((r, writer))) => (r, Some(writer)),
             Some(Err(p)) => std::panic::resume_unwind(p),
-            None => Ok(()),
+            None => (Ok(()), None),
         };
         if let Some(Err(p)) = m {
             std::panic::resume_unwind(p);
@@ -576,7 +640,7 @@ impl Drop for PanicGuard<'_> {
     }
 }
 
-fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
+fn writer_loop(s: &Shared, mut w: LogWriter) -> (Result<(), Fault>, LogWriter) {
     let _guard = PanicGuard(s);
     loop {
         let sync_now = {
@@ -647,7 +711,7 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
     publish(s, &mut w);
     lock(&s.info).stopped = true;
     s.progress_cv.notify_all();
-    r
+    (r, w)
 }
 
 /// If `kvik-maint` panics: the store turns read-only and the writer is woken, so that it stops writing and its

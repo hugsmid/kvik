@@ -1722,6 +1722,9 @@ struct Volatile {
     entries: BTreeMap<Position, Entry>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
+    /// The lateness reference of each series (§2.2, Q-74): the greatest `t` of its facts flagged neither `future`
+    /// nor `unsynced_clock`.
+    reference: BTreeMap<SeriesId, Nanos>,
     /// Every recorded fact's identity per key, for the duplicate rule.
     history: History,
     /// The version index (§2.4), exact also while a restore brings detail
@@ -1772,6 +1775,9 @@ struct Derived {
     routes: BTreeMap<Position, RouteChange>,
     current: BTreeMap<(SeriesId, Nanos), Fact>,
     newest_t: BTreeMap<SeriesId, Nanos>,
+    /// The lateness reference of each series (§2.2, Q-74): the greatest `t` of its facts flagged neither `future`
+    /// nor `unsynced_clock`.
+    reference: BTreeMap<SeriesId, Nanos>,
     history: History,
     versions: Versions,
     cp_versions: Option<(Position, Versions)>,
@@ -2098,6 +2104,7 @@ impl Model {
             entries: d.entries,
             current: d.current,
             newest_t: d.newest_t,
+            reference: d.reference,
             history: d.history,
             versions: d.versions,
             cp_versions: d.cp_versions,
@@ -2169,6 +2176,9 @@ impl Model {
                 .filter(|f| f.changed_at.is_none_or(|c| c >= versions[&(f.series, f.t)])),
         );
         let mut newest_t = restoring.map_or_else(BTreeMap::new, |r| r.latest_t.clone());
+        // While restoring, the checkpoint's latest recorded `t` stands in for its lateness reference, which a
+        // checkpoint does not carry yet.
+        let mut reference = newest_t.clone();
         let mut history: History = BTreeMap::new();
         for f in &facts {
             history
@@ -2177,6 +2187,10 @@ impl Model {
                 .push(Known::of(f));
             let n = newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
+            if !f.flags.future && !f.flags.unsynced_clock {
+                let n = reference.entry(f.series).or_insert(f.t);
+                *n = (*n).max(f.t);
+            }
         }
         // While restoring, the checkpoint's revised-key index, so a replay of
         // an earlier value of a revised key is dropped before the current
@@ -2225,6 +2239,7 @@ impl Model {
             routes,
             current,
             newest_t,
+            reference,
             history,
             versions,
             cp_versions,
@@ -2245,6 +2260,7 @@ impl Model {
             v.routes = d.routes;
             v.current = d.current;
             v.newest_t = d.newest_t;
+            v.reference = d.reference;
             v.history = d.history;
             v.versions = d.versions;
             v.cp_versions = d.cp_versions;
@@ -2625,7 +2641,7 @@ impl Model {
         let mut batch_history: History = BTreeMap::new();
         let mut batch_versions: Versions = BTreeMap::new();
         let mut outranked: BTreeSet<Position> = BTreeSet::new();
-        let mut batch_newest: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
+        let mut batch_reference: BTreeMap<SeriesId, Nanos> = BTreeMap::new();
         let mut duplicates = 0;
         let mut unchecked = 0;
         let mut non_finite = 0;
@@ -2754,17 +2770,18 @@ impl Model {
             {
                 unchecked += 1;
             }
-            // The latest recorded `t`: earlier batches and this one.
-            let newest = batch_newest
+            // The lateness reference (Q-74): earlier batches and this one.
+            let reference = batch_reference
                 .get(&r.series)
                 .copied()
-                .max(v.newest_t.get(&r.series).copied());
-            // `late` (§2.2): on an observed series, earlier than the latest
-            // recorded `t` by more than 2 × S; on any series, older than the
-            // lateness bound. Neither before the clock is synchronised (§2.5).
+                .max(v.reference.get(&r.series).copied());
+            // `late` (§2.2): on an observed series, a fact not flagged `future`
+            // earlier than the lateness reference by more than 2 × S; on any
+            // series, older than the lateness bound. Neither before the clock
+            // is synchronised (§2.5).
             let def = v.registry.get(r.series).expect("checked above");
-            let out_of_order = match (newest, def.staleness) {
-                (Some(n), Some(s)) => observed && r.t < n.saturating_sub(2 * s),
+            let out_of_order = match (reference, def.staleness) {
+                (Some(n), Some(s)) => observed && !future && r.t < n.saturating_sub(2 * s),
                 _ => false,
             };
             let bound = def.options.lateness_bound.unwrap_or(cfg.lateness_bound);
@@ -2788,8 +2805,10 @@ impl Model {
                 },
             };
             next = next.next();
-            let n = batch_newest.entry(r.series).or_insert(r.t);
-            *n = (*n).max(r.t);
+            if !future && synced {
+                let n = batch_reference.entry(r.series).or_insert(r.t);
+                *n = (*n).max(r.t);
+            }
             batch_history.entry(key).or_default().push(Known::of(&fact));
             if let Some(c) = fact.changed_at {
                 if top.is_some_and(|top| c < top) {
@@ -2994,6 +3013,10 @@ impl Model {
             }
             let n = v.newest_t.entry(f.series).or_insert(f.t);
             *n = (*n).max(f.t);
+            if !f.flags.future && !f.flags.unsynced_clock {
+                let n = v.reference.entry(f.series).or_insert(f.t);
+                *n = (*n).max(f.t);
+            }
             // An outranked fact changes no current fact and no node (§2.3,
             // §5.6).
             if !outranked.contains(&e.position) {

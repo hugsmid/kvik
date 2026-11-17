@@ -680,11 +680,11 @@ fn q73_record_on_change_series_records_every_reading() {
     assert_eq!(m.ingest(polls).unwrap().positions.len(), 10);
 }
 
-/// Q-74: the first clause of `late` compares with the series' latest
-/// recorded `t`, which a `future`-flagged reading a day ahead raises; every
-/// later on-time reading is then flagged `late`.
+/// Q-74: the first clause of `late` compares with the lateness reference,
+/// which leaves out a `future`-flagged reading a day ahead, so later on-time
+/// readings are not `late`.
 #[test]
-fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
+fn q74_a_far_future_reading_leaves_later_on_time_readings_on_time() {
     let mut m = Model::new(Config::default(), vec![], T0 + HOUR);
     let s = m
         .define(
@@ -717,9 +717,9 @@ fn q74_one_far_future_reading_makes_later_on_time_readings_late() {
         vec![
             (false, false),
             (true, false),
-            (false, true),
-            (false, true),
-            (false, true)
+            (false, false),
+            (false, false),
+            (false, false)
         ]
     );
 }

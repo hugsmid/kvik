@@ -1,0 +1,304 @@
+//! Opening and shutting down the durable store (`docs/api.md` Opening, `spec.md` §3 Order of a start).
+
+use super::*;
+
+impl Writer {
+    /// Opens the store (`docs/api.md` Opening).
+    pub(crate) fn open(config: &StoreConfig) -> Result<Arc<Writer>, OpenError> {
+        config.validate()?;
+        let dir = config.dir.clone();
+        let env = config.env.clone();
+        jiff::tz::TimeZone::get(&config.time_zone).map_err(|_| OpenError::UnknownZone)?;
+        let wall = env.clock.wall().0;
+        let new = config.create_if_missing.then(|| {
+            let mut store_id = [0u8; 16];
+            env.entropy.fill(&mut store_id);
+            NewStore {
+                store_id,
+                created_at: wall,
+                site_zone: config.time_zone.clone(),
+                tzdata: tzdata_name(env.tz.current().version()),
+                software: format!("kvik {}", env!("CARGO_PKG_VERSION")),
+            }
+        });
+        let store =
+            StoreDir::open(env.fs.clone(), &dir, new.as_ref()).map_err(|e| store_error(&dir, e))?;
+        let descriptor = store.descriptor().clone();
+        let clock = Arc::new(LogClock::new(env.clock.clone()));
+        let wcfg = writer_config(config);
+        let writer = LogWriter::open(
+            store,
+            wcfg,
+            env.boot.current(),
+            kvik_log::writer::Clock::monotonic(&*clock),
+            wall,
+        )
+        .map_err(|e| match e {
+            LogOpenError::Store(e) => store_error(&dir, e),
+            LogOpenError::Config(c) => OpenError::Config {
+                key: "log",
+                reason: c.0.into(),
+            },
+            other => OpenError::Io {
+                path: dir.clone(),
+                source: io::Error::other(other.to_string()),
+            },
+        })?;
+        let start_fault = writer.fault().cloned();
+        let start_losses = start_losses(&writer, env.boot.current());
+        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
+        let latch = Arc::new(Latch::default());
+        // The kept log, read once by the reader this process keeps: the registry and the history of every key.
+        let reader =
+            DurableReader::open_with(&dir, &env, READER_LEASE, clocks.clone(), latch.clone())?;
+        let index = reader
+            .with(|i, _| Ok(i.clone()))
+            .map_err(|e| OpenError::Io {
+                path: dir.clone(),
+                source: io::Error::other(e.to_string()),
+            })?;
+        // The site zone in force must be the configured one (`docs/api.md` Opening).
+        let tz = env.tz.current();
+        let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
+        let in_force = index
+            .registry()
+            .site_zone(&descriptor.site_zone)
+            .to_string();
+        if canonical(&in_force) != canonical(&config.time_zone) {
+            return Err(OpenError::SiteZoneMismatch {
+                configured: config.time_zone.clone(),
+                in_force,
+            });
+        }
+        let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
+        let mut counters = Counters::default();
+        // Orphaned facts belong to no series (spec §2.1).
+        for id in index
+            .fact_series()
+            .filter(|id| index.registry().get(*id).is_some())
+        {
+            let st = counters.series.entry(id).or_default();
+            for f in index.series_facts(id) {
+                st.recorded += 1;
+                st.late += u64::from(f.row.flags.late);
+                st.future += u64::from(f.row.flags.future);
+            }
+        }
+        // Q-33: the file must equal the kept log up to the last synced mark, with the writer's id floor.
+        let mut start_fault = start_fault;
+        if start_fault.is_none() {
+            let stats = writer.stats();
+            let expected = index.registry_file(stats.mark_synced, stats.max_series_id);
+            let current = kvik_log::registry::read_latest(&*env.fs, &dir, &descriptor.store_id)
+                .ok()
+                .flatten();
+            if current.is_none_or(|(_, f)| f != expected)
+                && let Err(e) =
+                    kvik_log::registry::write(&*env.fs, &dir, descriptor.store_id, wall, &expected)
+            {
+                start_fault = Some(registry_fault(&dir, &e));
+            }
+        }
+        // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
+        let hub = match deliver::Deliverer::open(
+            &dir,
+            &env,
+            &clocks,
+            descriptor.store_id,
+            config.limits.consumer_queue,
+            config.limits.max_consumers,
+        ) {
+            Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
+            Err(_) if start_fault.is_some() => None,
+            Err(source) => {
+                return Err(OpenError::Io {
+                    path: dir.clone(),
+                    source,
+                });
+            }
+        };
+        let log = Log::start(writer, clock).map_err(|source| OpenError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        if let Some(h) = &hub {
+            h.start(log.watch()).map_err(|source| OpenError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+        }
+        let w = Arc::new(Writer {
+            dir,
+            limits: config.limits.clone(),
+            log: RwLock::new(Some(log)),
+            own_fault: Mutex::new(start_fault),
+            store_id: descriptor.store_id,
+            decider: Mutex::new(Decider::from_index(&index)),
+            counters: Mutex::new(counters),
+            reader: Mutex::new(Some(Arc::new(reader))),
+            acknowledged: Mutex::new(BTreeMap::new()),
+            inflight: Mutex::new(BTreeMap::new()),
+            next_call: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            clocks,
+            hub,
+            latch,
+            start_losses,
+            env,
+        });
+        // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
+        // Opening). A release whose name is not a valid entry is left out.
+        let release = tzdata_name(tz.version());
+        if w.fault().is_none() && release != tzdata_in_force && !release.is_empty() {
+            w.commit_entry(|_| {
+                Ok(Decided::Entry(
+                    Entry::Tzdata {
+                        version: release.clone(),
+                    },
+                    (),
+                ))
+            })
+            .map_err(|e| OpenError::Io {
+                path: w.dir.clone(),
+                source: io::Error::other(e.to_string()),
+            })?;
+        }
+        Ok(w)
+    }
+
+    /// Clean shutdown: final commit and mark sync, threads joined, lock released.
+    pub(crate) fn shutdown(&self) -> Result<(), WriteError> {
+        self.closed.store(true, Ordering::SeqCst);
+        let log = self
+            .log
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(log) = log else {
+            return Ok(());
+        };
+        let hub_fault = || self.hub.as_ref().and_then(|h| lock(&h.fault).clone());
+        // The registry file again, up to the mark the clean shutdown synced, while the store's lock is held.
+        let shut = log.shutdown_then(|w| {
+            if lock(&self.own_fault).is_some() || hub_fault().is_some() {
+                return Ok(());
+            }
+            let floor = w.stats().max_series_id;
+            let file = self.reader().ok().and_then(|r| {
+                r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
+                    .ok()
+            });
+            match file {
+                Some(file) => kvik_log::registry::write(
+                    &*self.env.fs,
+                    &self.dir,
+                    self.store_id,
+                    self.env.clock.wall().0,
+                    &file,
+                )
+                .map(|_| ()),
+                None => Ok(()),
+            }
+        });
+        // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
+        if let Some(h) = &self.hub {
+            h.closed.store(true, Ordering::SeqCst);
+            if shut.is_ok()
+                && let Err(e) = h.run(|d, c| {
+                    let r = d.flush_all(c);
+                    d.close();
+                    r
+                })
+            {
+                h.failed(&e);
+            }
+            h.run(|_, _| ());
+        }
+        let written = shut.map_err(|f| WriteError::ReadOnly(fault_out(&f)))?;
+        if let Some(f) = hub_fault() {
+            return Err(WriteError::ReadOnly(fault_out(&f)));
+        }
+        if let Err(e) = written {
+            *lock(&self.own_fault) = Some(registry_fault(&self.dir, &e));
+        }
+        match lock(&self.own_fault).as_ref() {
+            Some(f) => Err(WriteError::ReadOnly(fault_out(f))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The losses a start found and did not record, as reports (`spec.md` §3 Order of a start, step 3).
+fn start_losses(w: &LogWriter, boot_id: Option<[u8; 16]>) -> Vec<LossReport> {
+    let report = w.start_report();
+    let g = w.stats().durable.generation;
+    let mark_state = match report.rule {
+        kvik_log::writer::StartRule::Reboot(m) => mark_state_out(m),
+        _ => crate::health::MarkState::Readable,
+    };
+    report
+        .losses
+        .iter()
+        .filter(|l| !l.recorded)
+        .map(|l| LossReport {
+            identity: Position::new(g, l.identity),
+            kind: match l.kind {
+                kvik_log::writer::LossKind::DataLost => LossKind::DataLost,
+                kvik_log::writer::LossKind::PossibleLoss => LossKind::PossibleLoss,
+            },
+            cause: cause_out(l.cause),
+            first: l.first.map(|s| Position::new(g, s)),
+            last: l.last.map(|s| Position::new(g, s)),
+            file_id: Some(l.file_id),
+            bytes: l.bytes,
+            readable_commit_blocks: l.readable_commits,
+            mark_state,
+            boot_id,
+            commit_time_before: None,
+            commit_time_after: None,
+            cursors_missing: Vec::new(),
+            recorded: false,
+            acknowledged: false,
+        })
+        .collect()
+}
+
+/// The fault of a failed registry file write.
+pub(super) fn registry_fault(dir: &Path, e: &io::Error) -> LogFault {
+    LogFault {
+        op: FaultOp::Write,
+        path: dir.join(kvik_log::registry::REGISTRY_DIR),
+        kind: e.kind(),
+        message: e.to_string(),
+    }
+}
+
+/// The ASCII release name of at most 15 bytes a tzdata entry and the store descriptor carry; anything else is
+/// left out.
+fn tzdata_name(v: &str) -> String {
+    if v.is_empty() || v.len() > 15 || !v.is_ascii() {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+fn writer_config(config: &StoreConfig) -> WriterConfig {
+    let l = &config.log;
+    let lim = &config.limits;
+    WriterConfig {
+        segment_size: l.segment_size,
+        seal_interval: l.seal_interval,
+        min_sync_interval: l.min_sync_interval,
+        max_batch_bytes: l.max_batch_bytes,
+        mark_sync: match l.mark_sync {
+            MarkSync::Interval(d) => LogMarkSync::Interval(d),
+            MarkSync::EveryCommit => LogMarkSync::EveryCommit,
+        },
+        ingest_queue: lim.ingest_queue,
+        disk_low_percent: (lim.disk_low.fraction * 100.0).round() as u8,
+        disk_low_bytes: lim.disk_low.bytes,
+        disk_critical: lim.disk_critical,
+        ..WriterConfig::default()
+    }
+}

@@ -45,6 +45,7 @@ log-scan-bound  log   scan_bound
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-restore-plan kvik restore_plan_model
+kvik-durable    kvik  durable_differential
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
 files-records   files records

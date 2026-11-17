@@ -1473,17 +1473,26 @@ fn dup_generator_coverage() {
 /// within the lateness bound in the past and reach days ahead, in any order.
 fn arb_timed_readings() -> impl Strategy<Value = Vec<(usize, Nanos, i32, Nanos)>> {
     proptest::collection::vec(
-        (
-            0usize..3,
-            prop_oneof![
-                -(4 * MINUTE)..(2 * MINUTE),
-                (2 * MINUTE)..(3 * kvik_model::types::DAY),
-            ],
-            -5i32..5,
-            prop_oneof![Just(0), 0..(10 * MINUTE)],
-        ),
+        prop_oneof![
+            6 => (
+                0usize..3,
+                prop_oneof![
+                    -(4 * MINUTE)..(2 * MINUTE),
+                    (2 * MINUTE)..(3 * kvik_model::types::DAY),
+                ],
+                -5i32..5,
+                prop_oneof![Just(0), 0..(10 * MINUTE)],
+            ),
+            // An observed reading more than 2 × S behind: `late` (§2.2).
+            1 => (Just(2usize), -(40 * MINUTE)..-(21 * MINUTE), -5i32..5, Just(0)),
+        ],
         1..40,
     )
+}
+
+/// Per reading of [`arb_timed_readings`], whether the clock is unsynchronised when it is taken.
+fn arb_unsynced() -> impl Strategy<Value = Vec<bool>> {
+    proptest::collection::vec(proptest::bool::weighted(0.2), 40)
 }
 
 /// A store with a scheduled gauge, a forecast gauge (versioned, kind
@@ -1520,8 +1529,19 @@ fn emit_timed(
     ids: [kvik_model::types::SeriesId; 3],
     readings: &[(usize, Nanos, i32, Nanos)],
 ) {
+    emit_timed_clocked(m, ids, readings, &[]);
+}
+
+/// As [`emit_timed`], with the clock unsynchronised for the k-th reading where `unsynced[k]` holds.
+fn emit_timed_clocked(
+    m: &mut kvik_model::engine::Model,
+    ids: [kvik_model::types::SeriesId; 3],
+    readings: &[(usize, Nanos, i32, Nanos)],
+    unsynced: &[bool],
+) {
     use kvik_model::types::Reading;
-    for (i, off, v, adv) in readings {
+    for (k, (i, off, v, adv)) in readings.iter().enumerate() {
+        m.clock_synchronised = !unsynced.get(k).copied().unwrap_or(false);
         m.advance(*adv);
         let t = m.wall + off;
         let r = if *i == 1 {
@@ -1531,6 +1551,7 @@ fn emit_timed(
         };
         m.ingest(vec![r]).unwrap();
     }
+    m.clock_synchronised = true;
 }
 
 proptest! {
@@ -1600,6 +1621,29 @@ proptest! {
                 prop_assert!(!f.flags.future && !f.flags.late, "{:?}", f);
             } else {
                 prop_assert_eq!(f.flags.future, f.t > f.received_at + 60 * SECOND);
+            }
+        }
+    }
+
+    /// 24. On the observed series (S = 10 minutes, lateness bound 5
+    /// minutes) `late` holds exactly where its clauses say, the first against
+    /// the lateness reference, which no `future` and no `unsynced_clock` fact
+    /// raises (Q-74); nothing is late while the clock is unsynchronised (§2.5).
+    #[test]
+    fn inv24_late_against_the_lateness_reference(
+        (readings, unsynced) in (arb_timed_readings(), arb_unsynced()),
+    ) {
+        let (mut m, ids) = timed_machine();
+        emit_timed_clocked(&mut m, ids, &readings, &unsynced);
+        let mut facts = m.facts().unwrap();
+        facts.sort_by_key(|f| f.position);
+        let mut reference: Option<Nanos> = None;
+        for f in facts.iter().filter(|f| f.series == ids[2]) {
+            let first = !f.flags.future && reference.is_some_and(|r| f.t < r - 20 * MINUTE);
+            let second = f.received_at - f.t > 5 * MINUTE;
+            prop_assert_eq!(f.flags.late, !f.flags.unsynced_clock && (first || second), "{:?}", f);
+            if !f.flags.future && !f.flags.unsynced_clock {
+                reference = reference.max(Some(f.t));
             }
         }
     }
@@ -2003,7 +2047,8 @@ proptest! {
 /// and forecast facts must arrive more than 60 s ahead (where an observed
 /// fact is `future`) and more than 2 × S behind their series' latest `t`
 /// (where an observed fact is `late` by the first clause), and the observed
-/// series must get both flags.
+/// series must get both flags, `late` from readings well behind its lateness
+/// reference (Q-74).
 #[test]
 fn timed_generator_coverage() {
     use proptest::strategy::ValueTree;
@@ -2032,6 +2077,46 @@ fn timed_generator_coverage() {
     }
     eprintln!("ahead {ahead} behind {behind} observed-future {future} observed-late {late}");
     assert!(ahead > 500 && behind > 200 && future > 100 && late > 50);
+}
+
+/// Guards the inputs of invariant 24 with the clock unsynchronised: facts
+/// taken unsynchronised far ahead of the lateness reference, and synchronised
+/// facts after them that such a fact would have made late.
+#[test]
+fn timed_unsynced_generator_coverage() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strat = (arb_timed_readings(), arb_unsynced());
+    let (mut ahead, mut shadowed) = (0usize, 0usize);
+    for _ in 0..300 {
+        let (readings, unsynced) = strat.new_tree(&mut runner).unwrap().current();
+        let (mut m, ids) = timed_machine();
+        emit_timed_clocked(&mut m, ids, &readings, &unsynced);
+        let mut facts = m.facts().unwrap();
+        facts.sort_by_key(|f| f.position);
+        let (mut reference, mut raised): (Option<Nanos>, Option<Nanos>) = (None, None);
+        for f in facts.iter().filter(|f| f.series == ids[2]) {
+            if f.flags.unsynced_clock {
+                if reference.is_none_or(|r| f.t > r + 20 * MINUTE) {
+                    ahead += 1;
+                }
+                raised = raised.max(Some(f.t));
+            } else {
+                let by_reference = reference.is_some_and(|r| f.t < r - 20 * MINUTE);
+                shadowed += usize::from(
+                    !f.flags.future
+                        && !by_reference
+                        && raised.is_some_and(|r| f.t < r - 20 * MINUTE),
+                );
+                if !f.flags.future {
+                    reference = reference.max(Some(f.t));
+                }
+            }
+        }
+    }
+    eprintln!("unsynced-ahead {ahead} shadowed {shadowed}");
+    assert!(ahead > 100 && shadowed > 50);
 }
 
 /// Guards the interval generators, the inputs of invariants 5, 18 and 22:

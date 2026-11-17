@@ -139,10 +139,9 @@ jobs:
     # invariants file is split by invariant number into 8 shards, each other
     # property-test file of the model, and the property, fuzz-input, batch,
     # model-differential, model-histories, writer, recovery and reader tests of kvik-log, the property and
-    # fuzz-input tests of kvik-chunk, the windows differential of kvik, the record, manifest, rebuild and
-    # fuzz-input tests of kvik-files, the property and fuzz-input tests of kvik-tree, and the envelope, fuzz-input
-    # and key tests of kvik-backup, is one shard
-    # (.github/deep-shards.sh).
+    # fuzz-input tests of kvik-chunk, the windows and durable-backend differentials of kvik, the record,
+    # manifest, rebuild and fuzz-input tests of kvik-files, the property and fuzz-input tests of kvik-tree, and
+    # the envelope, fuzz-input and key tests of kvik-backup, is one shard (.github/deep-shards.sh).
     # Each job first checks that the shards of its file select every test exactly once.
     #
     # Durations. Measured on the runner: invariants as one job at 10,000
@@ -175,6 +174,9 @@ jobs:
     #     both backends: 625 histories took 343 s locally in release mode at
     #     low priority, so about 9 minutes at 10,000 and at 40,000, plus the
     #     build.
+    #   - The durable-backend differential of kvik (kvik-durable) runs a
+    #     quarter of the cases, each a history on both backends: 1,250
+    #     histories took 6 s locally in release mode at low priority.
     name: deep (${{ matrix.shard }})
     needs: deep-shards
     runs-on: ubuntu-latest
