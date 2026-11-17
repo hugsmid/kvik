@@ -60,6 +60,8 @@ struct Counters {
     writes: AtomicU64,
     /// Bytes read from the manifest.
     manifest: AtomicU64,
+    /// Files report no identity, as on a platform without one.
+    no_identity: std::sync::atomic::AtomicBool,
 }
 
 impl Counters {
@@ -126,6 +128,9 @@ impl FsFile for CountFile {
     }
     fn identity(&self) -> std::io::Result<Option<kvik_log::fs::FileIdentity>> {
         self.n.call();
+        if self.n.no_identity.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         self.inner.identity()
     }
     fn try_lock_exclusive(&self) -> std::io::Result<bool> {
@@ -469,6 +474,24 @@ fn an_unchanged_manifest_is_read_at_its_last_record_a_longer_one_past_it_and_a_r
     r.reader.refresh().unwrap();
     assert_eq!(r.reader.state().epoch, epoch + 5);
     assert!(r.n.manifest.swap(0, Ordering::SeqCst) >= (len + rebuilt.len()) as u64);
+    // The same bytes renamed into place: another file, read whole where the platform tells files apart.
+    let same = r.fs.read(&path).unwrap();
+    let replace = |bytes: &[u8]| {
+        let f = r.fs.open(&tmp, OpenMode::CreateNew).unwrap();
+        f.write_at(bytes, 0).unwrap();
+        r.fs.rename(&tmp, &path).unwrap();
+    };
+    replace(&same);
+    r.reader.refresh().unwrap();
+    assert!(r.n.manifest.swap(0, Ordering::SeqCst) >= same.len() as u64);
+    // Without file identities, the last record's bytes alone tell a replaced manifest of the same length.
+    r.n.no_identity.store(true, Ordering::SeqCst);
+    let mut other = same[..len].to_vec();
+    other.extend(encode_record(RECORD_EMPTY, epoch + 9, 0, T0, None));
+    assert_eq!(other.len(), same.len());
+    replace(&other);
+    r.reader.refresh().unwrap();
+    assert_eq!(r.reader.state().epoch, epoch + 9);
 }
 
 #[test]
