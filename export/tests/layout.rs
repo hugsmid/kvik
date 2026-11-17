@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use common::{BACKENDS, bits, block_on, export_to_vec, f64_series, open, read_back, store_on};
 use kvik::{
-    IntervalLength, Kind, Position, Reader, Reading, SeriesId, SeriesSpec, TimeRange, Timestamp,
-    Value, ValueType, View,
+    DefineError, IntervalLength, Kind, Position, Reader, Reading, SeriesId, SeriesSpec, TimeRange,
+    Timestamp, Value, ValueType, View,
 };
 use kvik_export::{
     ExportError, ExportOptions, ExportRow, MAX_SITE_LEN, Month, check_site, escape_segment,
@@ -684,17 +684,18 @@ fn a_partitioned_export_needs_a_valid_site_and_reports_a_file_it_cannot_open() {
 }
 
 #[test]
-fn a_partitioned_export_refuses_a_name_without_three_non_empty_segments_and_opens_nothing_on_both_backends()
+fn a_name_without_three_non_empty_segments_is_refused_at_definition_and_by_the_partitioned_layout_on_both_backends()
  {
+    let names = [
+        "power",
+        "line-1/power",
+        "plant/line-1/power/peak",
+        "plant//power",
+        "plant/line-1/",
+    ];
     for backend in BACKENDS {
         let (store, _clock) = store_on(backend, "partitioned-shape");
-        for name in [
-            "power",
-            "line-1/power",
-            "plant/line-1/power/peak",
-            "plant//power",
-            "plant/line-1/",
-        ] {
+        for name in names {
             let spec = SeriesSpec::new(
                 name,
                 Kind::Gauge {
@@ -702,45 +703,26 @@ fn a_partitioned_export_refuses_a_name_without_three_non_empty_segments_and_open
                 },
                 "W",
             );
-            let id = block_on(store.define_series(spec)).unwrap();
-            block_on(store.emit(&[Reading::new(
-                id,
-                ts("2026-01-05T12:00:00Z"),
-                Value::F64(1.0),
-            )]))
-            .unwrap();
-            let r = store.reader();
-            let opened = Arc::new(Mutex::new(Vec::<String>::new()));
-            let seen = opened.clone();
-            let err = export_partitioned(
-                &r,
-                id,
-                &ExportOptions::default().site("s"),
-                move |path: &str| -> io::Result<Vec<u8>> {
-                    seen.lock().unwrap().push(path.to_string());
-                    Ok(Vec::new())
-                },
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, ExportError::UnsupportedSeries { .. }),
-                "{backend:?} {name:?}: {err}"
-            );
-            assert!(
-                err.to_string().contains("three non-empty segments"),
-                "{err}"
-            );
-            assert!(opened.lock().unwrap().is_empty(), "{backend:?} {name:?}");
-            let none = ExportOptions::default()
-                .site("s")
-                .range(Timestamp(0)..Timestamp(1));
             assert!(
                 matches!(
-                    partitioned(&r, id, &none),
-                    Err(ExportError::UnsupportedSeries { .. })
+                    block_on(store.define_series(spec)),
+                    Err(DefineError::Invalid { field: "name", .. })
                 ),
                 "{backend:?} {name:?}"
             );
         }
+    }
+    // A log written before Q-670 (a) may still hold such a name; the layout refuses it before any file is named.
+    let month = Month::of(ts("2026-01-05T12:00:00Z"));
+    for name in names {
+        let err = partition_dir("s", name, month).unwrap_err();
+        assert!(
+            matches!(err, ExportError::UnsupportedSeries { .. }),
+            "{name:?}: {err}"
+        );
+        assert!(
+            err.to_string().contains("three non-empty segments"),
+            "{err}"
+        );
     }
 }
