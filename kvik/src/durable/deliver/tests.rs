@@ -159,8 +159,8 @@ mod bounded {
         }
     }
 
-    /// A call that waits for the deliverer while the clock moves acts at the time after its wait (the delivery
-    /// differential's flake: a condition runner created with a time from before the wait).
+    /// A call that waits for the deliverer while the clock moves acts at the time after its wait: a condition runner
+    /// created with a time from before the wait would fire early.
     #[test]
     fn a_call_that_waits_for_the_deliverer_acts_at_the_time_after_its_wait() {
         let (mut env, dir) = store();
