@@ -174,6 +174,17 @@ fn q614_a_lost_last_old_record_before_an_unfinished_rebuilt_manifest_fails_as_th
 }
 
 #[test]
+fn q614_a_lost_last_record_of_an_unfinished_rebuilt_manifest_fails_as_the_marker_unreached() {
+    let (src, s1, s2) = segments();
+    let chain = unfinished(&s1, &s2, 3, 1);
+    let last = chain.last().unwrap().record.epoch;
+    let sink = bucket(src, &chain);
+    sink.set(&key(last), Some(Fault::Lose));
+    both(&sink, unreached(6, last));
+    nothing_recorded(&sink);
+}
+
+#[test]
 fn q614_the_last_old_record_hidden_behind_skipped_epochs_beyond_the_bound_before_an_unfinished_rebuilt_manifest_is_a_lagging_listing()
  {
     let (src, s1, s2) = segments();
