@@ -462,12 +462,12 @@ impl<'a> Scanner<'a> {
         self.tail = Some(tail);
     }
 
-    /// Just past the last non-zero byte in `[from, area_end)`, or `from` if there is none.
+    /// Just past the last non-zero byte from `from` to the end of the file, or `from` if there is none: asked only by
+    /// an unbounded scan, which reads to the end of the file and so has found [`nonzero_end`].
     fn nonzero_from(&self, from: u64) -> u64 {
-        match self.nonzero {
-            Some(nz) if nz <= self.area_end => nz.max(from),
-            _ => last_non_zero_end(self.bytes, from, self.area_end),
-        }
+        self.nonzero
+            .unwrap_or_else(|| nonzero_end(self.bytes))
+            .max(from)
     }
 
     fn keep(&mut self, b: Batch<'a>, bodies: Vec<DataBody>) -> Found<'a> {
@@ -756,17 +756,6 @@ fn find_seal(bytes: &[u8], nonzero: u64) -> Option<Seal> {
         end,
         state,
     })
-}
-
-/// Just past the last non-zero byte in `[from, to)`, or `from` if there is none.
-fn last_non_zero_end(bytes: &[u8], from: u64, to: u64) -> u64 {
-    let to = to.min(bytes.len() as u64);
-    if from >= to {
-        return from;
-    }
-    slice(bytes, from, to - from)
-        .and_then(|b| b.iter().rposition(|&x| x != 0))
-        .map_or(from, |i| from + i as u64 + 1)
 }
 
 /// Checksum-valid commit blocks starting at 8-byte steps in `[from, to)` and ending below `limit`.

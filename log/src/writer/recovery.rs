@@ -228,6 +228,7 @@ fn scan_segment(
         scan_to_end(&bytes, &id, last_nonzero).map_err(StoreError::Unsupported)?;
     let mut sealed = r.seal.is_some();
     if sealed && (ignore_seal || !seal_holds(&r)) {
+        drop(std::mem::take(&mut contents));
         (r, contents) =
             scan_ignoring_seal(&bytes, &id, last_nonzero).map_err(StoreError::Unsupported)?;
         sealed = false;
