@@ -190,6 +190,8 @@ struct Rt {
     /// Reading stopped at a reset point until its resync is confirmed and its cursor file synced.
     paused: bool,
     runners: BTreeMap<u32, Runner>,
+    /// A void changed the funnels in force: the runners are synced at the next evaluation.
+    stale_runners: bool,
     emitted: BTreeMap<u32, MState>,
     /// The `now` of each condition funnel's last evaluation, to tell whether its timer is due.
     evaluated: BTreeMap<u32, i64>,
@@ -558,6 +560,9 @@ impl Deliverer {
             view.apply(*p, e);
         }
         self.view = view;
+        for rt in self.consumers.values_mut() {
+            rt.stale_runners = true;
+        }
     }
 
     fn take_batch(

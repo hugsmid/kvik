@@ -658,3 +658,31 @@ fn path_with_matches_whole_trailing_components_with_the_platform_separator() {
     assert_eq!(w.path_with(Path::new("cursors").join("x.cur")), Some(real));
     assert_eq!(w.path_with(Path::new("cursors").join("y.cur")), None);
 }
+
+#[test]
+fn a_condition_routed_between_polls_is_evaluated_at_the_next() {
+    let w = World::new("route-between-polls");
+    let s = w.open();
+    let g = block_on(s.define_series(gauge("plant/a/power"))).unwrap();
+    let mut c = new_consumer(&s, "late-route", Select::None);
+    block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    block_on(s.emit(&[num(g, 0, 5.0)])).unwrap();
+    assert_eq!(drain(&mut c).len(), 1);
+    let cond = block_on(c.route(Funnel {
+        series: Select::Ids(vec![g]),
+        operator: None,
+        condition: Some(Condition::above(10.0)),
+    }))
+    .unwrap();
+    w.clock.advance(Duration::from_secs(1));
+    block_on(s.emit(&[num(g, 1, 20.0)])).unwrap();
+    let triggers: Vec<_> = drain(&mut c)
+        .into_iter()
+        .filter_map(|d| match d.kind {
+            DeliveryKind::Trigger(t) => Some((t.funnel, t.state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(triggers, vec![(cond, ConditionState::True)]);
+    block_on(s.shutdown()).unwrap();
+}

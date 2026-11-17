@@ -161,17 +161,22 @@ impl Deliverer {
     /// timer, those whose timer is due (held for, stale for, or a value that may have come into force since the
     /// funnel was last evaluated), which is every evaluation that can change a state. Replayed facts never reach a
     /// condition (`spec.md` §4 Replay).
+    ///
+    /// The runners are those of the condition funnels in force: every change of the funnels (a routing entry taken, a
+    /// take, a resync, and a void before the next evaluation) syncs them, so a consumer without one has nothing to
+    /// evaluate.
     pub(super) fn evaluate(&mut self, name: &str, batch: Option<&[u32]>, ctx: &Ctx<'_>) {
-        match self.consumers.get(name) {
-            Some(rt) if rt.resume.is_none() && !rt.dormant => {}
-            _ => return,
+        if let Some(rt) = self.consumers.get_mut(name)
+            && std::mem::take(&mut rt.stale_runners)
+        {
+            self.sync_runners(name, ctx.mono);
         }
-        self.sync_runners(name, ctx.mono);
-        let evaluated = self
-            .consumers
-            .get(name)
-            .map(|rt| rt.evaluated.clone())
-            .unwrap_or_default();
+        let evaluated = match self.consumers.get(name) {
+            Some(rt) if rt.resume.is_none() && !rt.dormant && !rt.runners.is_empty() => {
+                &rt.evaluated
+            }
+            _ => return,
+        };
         let mut work = Vec::new();
         for (id, f) in self.view.funnels(name) {
             let (Some(c), Some(s)) = (&f.condition, f.condition_series()) else {
