@@ -310,6 +310,23 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q-872: an open span's ceiling is the higher of the last valid epoch and the named one, plus the records of 40
+    /// bytes its length could hold; a closed span's is its later epoch.
+    #[test]
+    fn an_open_spans_epoch_ceiling_adds_its_room_to_the_higher_of_the_last_valid_and_the_named_epoch()
+     {
+        let span = |named, before| CorruptSpan {
+            offset: 64,
+            end: 64 + 400,
+            after_epoch: 100,
+            before_epoch: before,
+            named_epoch: named,
+        };
+        assert_eq!(span(0, None).epoch_ceiling(), 110);
+        assert_eq!(span(500, None).epoch_ceiling(), 510);
+        assert_eq!(span(500, Some(103)).epoch_ceiling(), 103);
+    }
     use kvik_log::block::FLAG_SKIPPABLE;
 
     /// `n` block headers 16 bytes apart after a damaged word, each claiming a body that runs to the end of the file

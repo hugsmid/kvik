@@ -1450,7 +1450,8 @@ say so. Tests: `files/tests/open_span.rs` `q872_a_rebuild_takes_no_epoch_of_a_va
 review's probe), `q872_a_hidden_record_far_above_the_spans_length_still_bounds_the_rebuilds_epochs`,
 `q872_a_damaged_record_after_a_jumped_one_is_below_the_rebuilds_epochs` and
 `q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span` (the length bound);
-`files/src/image.rs` `a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`.
+`files/src/image.rs` `a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget` and
+`an_open_spans_epoch_ceiling_adds_its_room_to_the_higher_of_the_last_valid_and_the_named_epoch`.
 
 ## Q-873 — The time of the header walk on a crafted file
 Recorded at the re-check of the Q-651 ruling; older than it (the same at `524a5cb`). A technical decision: the
