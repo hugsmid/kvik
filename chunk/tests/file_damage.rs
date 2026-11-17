@@ -426,3 +426,22 @@ fn a_chunk_index_object_with_any_bit_flipped_is_invalid() {
         );
     }
 }
+
+#[test]
+fn an_undefined_directory_flag_is_refused_where_the_index_bit_is_defined() {
+    let mut c = sample(1);
+    c.tweaks.chunk_flags = BIT_1;
+    let bytes = c.write().0;
+    let f = open(&bytes);
+    let e = f.series(1).unwrap()[0];
+    assert!(e.has_nan(), "bit 1 is the index's has_nan");
+    match f.read_chunk(&e) {
+        Err(FileError::Unsupported { element, .. }) => {
+            assert_eq!(element, FileElement::DirectoryFlags(BIT_1))
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// Undefined in a directory, `has_nan` in an index entry.
+const BIT_1: u16 = 1 << 1;
