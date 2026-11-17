@@ -146,6 +146,22 @@ pub(crate) fn mwait(b: Wait) -> km::engine::Wait {
     }
 }
 
+/// A name without three non-empty `/`-separated segments, at `define_series` or `alias` (spec §2.1 `name`, Q-670).
+pub(crate) fn name_shape(name: &str) -> Result<(), Error> {
+    if km::registry::name_has_three_segments(name) {
+        Ok(())
+    } else {
+        Err(name_refused())
+    }
+}
+
+fn name_refused() -> Error {
+    Error::Invalid {
+        field: "name",
+        reason: "three non-empty segments separated by '/'".into(),
+    }
+}
+
 /// A model error as an interface error.
 pub(crate) fn error(e: km::engine::Error) -> Error {
     use km::engine::Error as E;
@@ -158,6 +174,7 @@ pub(crate) fn error(e: km::engine::Error) -> Error {
         E::Registry(R::NameInUse(n)) => Error::NameInUse(n),
         E::Registry(R::Unknown(s)) => Error::UnknownSeries(sid(s).to_string()),
         E::Registry(R::Retired(s)) => Error::Retired(sid(s)),
+        E::Registry(R::BadName(_)) => name_refused(),
         E::Registry(other) => Error::Invalid {
             field: "definition",
             reason: other.to_string(),

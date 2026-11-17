@@ -262,6 +262,16 @@ pub enum RegistryError {
     /// (§5.5: `wrap_at` positive, `reset_ceiling` between 0 and 1).
     #[error("counter rules apply to counters only, with wrap_at > 0 and 0 <= reset_ceiling <= 1")]
     BadCounterRules,
+    /// A name, defined or given as an alias, without three non-empty
+    /// segments (§2.1 `name`, Q-670).
+    #[error("name {0:?} does not have three non-empty segments separated by '/'")]
+    BadName(String),
+}
+
+/// Whether `name` has exactly three `/`-separated segments, none empty
+/// (§2.1 `name`, Q-670).
+pub fn name_has_three_segments(name: &str) -> bool {
+    name.split('/').count() == 3 && name.split('/').all(|s| !s.is_empty())
 }
 
 /// The registry.
@@ -380,6 +390,9 @@ impl Registry {
         options: SeriesOptions,
         ceiling: usize,
     ) -> Result<Result<RegistryEvent, SeriesId>, RegistryError> {
+        if !name_has_three_segments(name) {
+            return Err(RegistryError::BadName(name.to_string()));
+        }
         if !kind.accepts(value_type) {
             return Err(RegistryError::BadType(kind, value_type));
         }

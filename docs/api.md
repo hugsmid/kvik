@@ -168,7 +168,10 @@ let info = store.series(id)?;                 // also by name
 ```
 These calls, and route changes, resolve only after the durable mark has been synced past their entry (spec §3
 Commit). The writer forces that mark sync at once rather than waiting for the timed interval, so each call waits for
-one mark sync, not for up to the interval. Defining a series that already exists with the same specification
+one mark sync, not for up to the interval. A name has exactly three `/`-separated segments, none empty (spec §2.1
+`name`): `define_series` and `alias` refuse a name of another shape with `DefineError::Invalid { field: "name", .. }`,
+on both backends (Q-670). A store whose log holds such a name from before the rule opens; the series stays readable
+and writable by id, and an alias of the right shape gives it a name patterns can select. Defining a series that already exists with the same specification
 returns its id. A different kind, value type or unit, or a lower scale, under the same name is an error; the caller
 retires and defines anew. A higher scale is set with `raise_scale`, which appends a scale raise entry (spec §2.1
 `decimal scale`); it fails with `ScaleNotRaised` unless the new scale is higher, and with `ScaleOverflow` if the
@@ -296,7 +299,8 @@ enum Live { Value(Fact), None, Unknown }
   as `plant/line-*/power`). There is no escape: a name segment holding `*` is matched only by `*`. Two patterns
   overlap when, segment by segment, they are equal or either is `*`; an id overlaps a pattern when any name of its
   series matches it, aliases included. A funnel in force whose pattern the grammar refuses (one a log held before
-  it) is refused when routed again, not returned as the funnel in force (provisional, Q-670 (b)).
+  it) is read as built, each segment a literal and `*` alone a wildcard, and is refused when routed again, not
+  returned as the funnel in force; a stored `emits` so refused is refused when declared again (Q-670 (b)).
 ```rust
 #[non_exhaustive]
 pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySegment, PartialWildcard }

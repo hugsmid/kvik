@@ -227,7 +227,7 @@ proptest! {
     ) {
         let mut m = Model::new(Config::default(), vec![], T0);
         let s = m
-            .define_with("a/b", Kind::Gauge, ValueType::Number, "1", 10 * SECOND, SeriesOptions::expected(SECOND))
+            .define_with("a/b/c", Kind::Gauge, ValueType::Number, "1", 10 * SECOND, SeriesOptions::expected(SECOND))
             .unwrap();
         let mut run = Run { m, s, t: T0 };
         // At least one segment is backed up: the model refuses an empty bucket (Q-294).

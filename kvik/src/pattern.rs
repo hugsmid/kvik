@@ -1,7 +1,7 @@
 //! Name patterns (spec §4 Funnel, Routing; Q-88): the three `/`-separated segments of a name, each a literal or `*`,
 //! which matches one whole segment. [`check`] is the grammar, applied when routes are compiled. [`matches`] and
 //! [`overlap`] are total over any string, so a pattern the grammar refuses that a log already holds is read as built:
-//! each segment a literal, `*` alone the only wildcard (`format.md` A.6 field 55, provisional: Q-670 (b)).
+//! each segment a literal, `*` alone the only wildcard (`format.md` A.6 field 55, Q-670 (b)).
 
 use crate::error::RouteError;
 

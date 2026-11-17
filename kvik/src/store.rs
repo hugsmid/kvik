@@ -128,8 +128,10 @@ impl Store {
 
     /// Defines a series, or returns the id of a live series defined the same
     /// way. A different definition under a live name is
-    /// [`DefineError::Conflict`]: retire and define anew. Resolves after the
-    /// mark sync that covers the definition (durable backend).
+    /// [`DefineError::Conflict`]: retire and define anew. A name without
+    /// three non-empty `/`-separated segments is [`DefineError::Invalid`]
+    /// (spec §2.1 `name`). Resolves after the mark sync that covers the
+    /// definition (durable backend).
     pub async fn define_series(&self, spec: SeriesSpec) -> Result<SeriesId, DefineError> {
         let dir = self.dir_path();
         by_backend!(self,
@@ -195,7 +197,9 @@ impl Store {
             d => d.set_site_zone(zone, effective_from).map_err(|e| e.define(dir)))
     }
 
-    /// Adds a name for a series (a rename); the id is unchanged.
+    /// Adds a name for a series (a rename); the id is unchanged. A name
+    /// without three non-empty `/`-separated segments is
+    /// [`DefineError::Invalid`] (spec §2.1 `name`).
     pub async fn alias(&self, id: SeriesId, name: &str) -> Result<(), DefineError> {
         let dir = self.dir_path();
         by_backend!(self,

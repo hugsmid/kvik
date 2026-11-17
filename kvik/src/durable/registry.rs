@@ -461,4 +461,100 @@ mod tests {
         assert_eq!(difference(&b, &a), Some("expected_interval"));
         assert_eq!(difference(&a, &a), None);
     }
+
+    #[test]
+    fn a_definition_refuses_a_name_without_three_non_empty_segments() {
+        for name in ["plant", "plant/power", "a/b/c/d", "a//c", "/b/c", "a/b/"] {
+            let spec = SeriesSpec {
+                name: name.into(),
+                ..gauge()
+            };
+            assert!(
+                matches!(
+                    definition_of(&spec, 1, Duration::from_secs(300)),
+                    Err(Error::Invalid { field: "name", .. })
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// Q-670: a log written before the three-segment rule opens with a name of another shape; the series stays
+    /// readable and writable by id, and only an alias of the right shape can be added to it.
+    #[test]
+    fn a_logged_name_of_another_shape_opens_and_stays_readable_by_id() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Waker};
+
+        use super::super::{Emitted, Writer, facts, lock};
+        use crate::config::StoreConfig;
+        use crate::env::{Env, ManualClock, MemFs};
+        use crate::read::View;
+        use crate::series::SeriesKey;
+        use crate::time::Timestamp;
+        use crate::types::{Intent, Reading, Value};
+
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        env.background_timers = false;
+        let config = StoreConfig::new(PathBuf::from("durable-unit/old-name"), "UTC")
+            .create_if_missing(true)
+            .env(env);
+        let old = "plant/power";
+        let w = Writer::open(&config).unwrap();
+        let line = w.define(&gauge()).unwrap();
+        let mut def = definition_of(&gauge(), line.0 + 1, Duration::from_secs(300)).unwrap();
+        def.name = old.into();
+        let id = crate::types::SeriesId(def.id);
+        w.commit_entry(&mut lock(&w.decider), Entry::Definition(Box::new(def)))
+            .unwrap();
+        w.shutdown().unwrap();
+        drop(w);
+
+        let w = Writer::open(&config).unwrap();
+        assert_eq!(w.series(&SeriesKey::Id(id)).unwrap().name, old);
+        assert_eq!(w.series(&SeriesKey::Name(old.into())).unwrap().id, id);
+        let t = clock.wall();
+        let r = [Reading::new(id, t, Value::F64(1.0))];
+        if let Emitted::Queued(mut q) = w.emit(&r, Intent::Normal, true).unwrap() {
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(r) = q.poll(&mut cx) {
+                    q.finish(r).unwrap();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        w.shutdown().unwrap();
+        drop(w);
+
+        let w = Writer::open(&config).unwrap();
+        let range = t..Timestamp(t.0 + 1);
+        let got: Vec<_> = facts(&w.reader().unwrap(), id, range.into(), View::Current)
+            .unwrap()
+            .collect();
+        assert_eq!(got.len(), 1, "readable by id");
+        let again = SeriesSpec {
+            name: old.into(),
+            ..gauge()
+        };
+        assert!(matches!(
+            w.define(&again),
+            Err(Error::Invalid { field: "name", .. })
+        ));
+        assert!(matches!(
+            w.alias(id, "plant/power-2"),
+            Err(Error::Invalid { field: "name", .. })
+        ));
+        w.alias(id, "plant/line-2/power").unwrap();
+        let info = w.series(&SeriesKey::Id(id)).unwrap();
+        assert_eq!(
+            info.names,
+            vec![old.to_string(), "plant/line-2/power".into()]
+        );
+        w.shutdown().unwrap();
+    }
 }

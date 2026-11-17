@@ -1,5 +1,6 @@
 //! Name patterns (spec §4 Funnel, Routing; Q-88): the grammar's refusals on both backends, overlap in the cycle
-//! check against a brute-force oracle, and the two backends compared on compiling and routing patterns.
+//! check against a brute-force oracle, and the two backends compared on compiling and routing patterns; and the
+//! three-segment rule for series names (spec §2.1 `name`, Q-670) on both backends.
 
 mod common;
 
@@ -10,8 +11,8 @@ use common::world::{World, drain, gauge, num};
 use common::{block_on, start};
 use kvik::env::{Env, ManualClock};
 use kvik::{
-    Backend, ConsumerError, DeliveryKind, Funnel, RouteError, Select, SeriesId, Start, Store,
-    StoreConfig,
+    Backend, ConsumerError, DefineError, DeliveryKind, Funnel, RouteError, Select, SeriesId, Start,
+    Store, StoreConfig,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -81,6 +82,41 @@ fn a_funnel_pattern_outside_the_grammar_is_refused_on_both_backends() {
             "{backend:?}: nothing routed"
         );
         block_on(c.route(names("plant/*/power"))).unwrap();
+    }
+}
+
+fn name_refused<T>(r: Result<T, DefineError>) -> bool {
+    matches!(r, Err(DefineError::Invalid { field: "name", .. }))
+}
+
+#[test]
+fn a_name_without_three_non_empty_segments_is_refused_on_both_backends() {
+    let refused = [
+        "",
+        "plant",
+        "plant/power",
+        "a/b/c/d",
+        "a//c",
+        "/b/c",
+        "a/b/",
+    ];
+    for backend in [Backend::Model, Backend::Durable] {
+        let s = store_on(backend);
+        for name in refused {
+            let r = block_on(s.define_series(gauge(name)));
+            assert!(name_refused(r), "{backend:?} define {name:?}");
+        }
+        let id = block_on(s.define_series(gauge("plant/line-1/power"))).unwrap();
+        for name in refused {
+            let r = block_on(s.alias(id, name));
+            assert!(name_refused(r), "{backend:?} alias {name:?}");
+        }
+        block_on(s.alias(id, "plant/line-1/watts")).unwrap();
+        assert_eq!(
+            s.series(id).unwrap().names,
+            ["plant/line-1/power", "plant/line-1/watts"],
+            "{backend:?}"
+        );
     }
 }
 
@@ -226,12 +262,9 @@ fn any_pattern() -> impl Strategy<Value = String> {
         .prop_map(|s| s.join("/"))
 }
 
+/// A name of the three non-empty segments spec §2.1 requires; a segment may hold `*` (Q-88).
 fn name() -> impl Strategy<Value = String> {
-    let count = prop_oneof![8 => Just(3usize), 1 => Just(2usize), 1 => Just(4usize)];
-    count
-        .prop_flat_map(|n| {
-            prop::collection::vec(prop::sample::select(&["a", "b", "c", "*"][..]), n)
-        })
+    prop::collection::vec(prop::sample::select(&["a", "b", "c", "*"][..]), 3)
         .prop_map(|s| s.join("/"))
 }
 

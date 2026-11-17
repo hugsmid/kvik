@@ -2458,6 +2458,9 @@ impl Model {
         if d.retired {
             return Err(RegistryError::Retired(id).into());
         }
+        if !crate::registry::name_has_three_segments(new_name) {
+            return Err(RegistryError::BadName(new_name.to_string()).into());
+        }
         if r.resolve(new_name).is_some_and(|o| o.id != id) {
             return Err(RegistryError::NameInUse(new_name.to_string()).into());
         }
