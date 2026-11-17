@@ -220,6 +220,11 @@ pub(crate) struct Deliverer {
     incomplete: Cell<bool>,
     /// Deliveries decided without every fact they rest on (Q-750).
     unchecked: u64,
+    /// Condition evaluations made without every fact they rest on (Q-750).
+    evaluations_unchecked: u64,
+    /// Damaged regions a consumer's read of the log met beyond those passed over at the open (Q-750).
+    unread: std::cell::RefCell<crate::durable::keys::Lost>,
+    regions_unread: Cell<u64>,
     /// The kept log by position, from `items_from` up (the lowest cursor); below it, a consumer that needs older
     /// records has them read from the log again ([`Deliverer::restore_items`]).
     items: BTreeMap<LogPos, Rec>,
@@ -290,6 +295,9 @@ impl Deliverer {
             slow: Cell::new(0),
             incomplete: Cell::new(false),
             unchecked: 0,
+            evaluations_unchecked: 0,
+            unread: std::cell::RefCell::new(crate::durable::keys::Lost::default()),
+            regions_unread: Cell::new(0),
             items: BTreeMap::new(),
             items_from: LogPos::default(),
             entries: BTreeMap::new(),
@@ -409,6 +417,8 @@ impl Deliverer {
         DeliveryStats {
             slow_path: self.slow.get(),
             unchecked: self.unchecked,
+            evaluations_unchecked: self.evaluations_unchecked,
+            regions_unread: self.regions_unread.get(),
             ..self.stats.clone()
         }
     }

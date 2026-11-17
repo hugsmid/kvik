@@ -258,7 +258,12 @@ impl History {
         }
         if t >= s.floor {
             self.bytes += window_bytes(&known);
-            let at = s.window.partition_point(|(u, _)| *u <= t);
+            // In-order data goes at the end; only a late fact searches.
+            let at = if s.window.back().is_none_or(|(u, _)| *u <= t) {
+                s.window.len()
+            } else {
+                s.window.partition_point(|(u, _)| *u <= t)
+            };
             // At the cap the fact is inserted before the eviction: room for one more, not a doubled queue.
             if s.window.len() >= self.cap && s.window.len() == s.window.capacity() {
                 s.window.reserve_exact(1);
@@ -419,6 +424,7 @@ impl History {
         Held {
             bytes: self.bytes,
             window: self.series.values().map(|s| s.window.len()).sum(),
+            capacity: self.series.values().map(|s| s.window.capacity()).sum(),
             series: self.series.len(),
             revised_keys: self.revised.len(),
             revised_facts: self.revised.values().map(Vec::len).sum(),
@@ -433,6 +439,7 @@ impl History {
 pub(crate) struct Held {
     pub(crate) bytes: usize,
     pub(crate) window: usize,
+    pub(crate) capacity: usize,
     pub(crate) series: usize,
     pub(crate) revised_keys: usize,
     pub(crate) revised_facts: usize,

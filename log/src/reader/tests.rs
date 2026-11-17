@@ -553,6 +553,9 @@ mod parts_and_lookup {
             let got = found(r.lookup(&wanted, &|_, _, _| false).unwrap());
             assert_eq!(got, want, "round {round}");
             assert!(r.caches.bytes() <= 600, "{}", r.caches.bytes());
+            // Trimmed after each segment: never more than the bound and the entry just added.
+            let (peak, entry) = r.caches.peak();
+            assert!(peak <= 600 + entry, "{peak} with entries up to {entry}");
         }
         // Damage in a small part is still never read as absence.
         log.shutdown().unwrap();

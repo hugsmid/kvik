@@ -343,35 +343,44 @@ fn runner() -> TestRunner {
 
 /// Timers run only when the store is called, on both backends, so that both see the same evaluations; condition
 /// sequences start at 1 at every start on both (spec §4 Order).
+/// Half the histories, chosen with each history, run with windows of a few dozen facts (Q-751).
 #[test]
 fn deliveries_follow_the_model_over_restarts() {
+    let smalls = AtomicU64::new(0);
     runner()
-        .run(&steps(false), |history| {
-            let m_clock = ManualClock::new(start());
-            let dir = format!("kvik-test/consumers-differential/{}", next_id());
-            let mut env = Env::test(m_clock.clone());
-            env.background_timers = false;
-            let m_config = StoreConfig::new(&dir, "Europe/London")
-                .create_if_missing(true)
-                .backend(Backend::Model)
-                .env(env);
-            let model = block_on(Store::open(m_config.clone())).unwrap();
-            let m = run(
-                model,
-                &|| block_on(Store::open(m_config.clone())).unwrap(),
-                &m_clock,
-                &history,
-            );
-            let mut w = World::quiet(&format!("differential-{}", next_id()));
-            // Every other history with windows of a few dozen facts (Q-751).
-            if next_id().is_multiple_of(2) {
-                w.window_memory = Some(8 << 10);
-            }
-            let d = run(w.open(), &|| w.open(), &w.clock, &history);
-            prop_assert_eq!(m, d);
-            Ok(())
-        })
+        .run(
+            &(steps(false), prop::bool::weighted(0.5)),
+            |(history, small)| {
+                let m_clock = ManualClock::new(start());
+                let dir = format!("kvik-test/consumers-differential/{}", next_id());
+                let mut env = Env::test(m_clock.clone());
+                env.background_timers = false;
+                let m_config = StoreConfig::new(&dir, "Europe/London")
+                    .create_if_missing(true)
+                    .backend(Backend::Model)
+                    .env(env);
+                let model = block_on(Store::open(m_config.clone())).unwrap();
+                let m = run(
+                    model,
+                    &|| block_on(Store::open(m_config.clone())).unwrap(),
+                    &m_clock,
+                    &history,
+                );
+                let mut w = World::quiet(&format!("differential-{}", next_id()));
+                if small {
+                    w.window_memory = Some(8 << 10);
+                    smalls.fetch_add(1, Ordering::Relaxed);
+                }
+                let d = run(w.open(), &|| w.open(), &w.clock, &history);
+                prop_assert_eq!(m, d);
+                Ok(())
+            },
+        )
         .unwrap();
+    assert!(
+        smalls.into_inner() > 0,
+        "some history runs with small windows"
+    );
     assert!(
         SLOW.load(Ordering::Relaxed) > 0,
         "some history reads facts outside the deliverer's recent window"

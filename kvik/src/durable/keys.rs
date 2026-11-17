@@ -42,6 +42,22 @@ impl Lost {
         self.0.entry(file_id).or_default().push((start, end));
     }
 
+    /// The regions not recorded as lost by any of `recorded` (the manifest's lost ranges, by segment and bytes).
+    pub(crate) fn unrecorded(&self, recorded: &[kvik_log::manifest::LostRange]) -> u64 {
+        let mut n = 0;
+        for (file_id, rs) in &self.0 {
+            for (a, z) in rs {
+                let inside = recorded.iter().any(|l| {
+                    l.file_id == *file_id
+                        && l.offset <= *a
+                        && *z <= l.offset.saturating_add(l.length)
+                });
+                n += u64::from(!inside);
+            }
+        }
+        n
+    }
+
     pub(crate) fn covers(&self, file_id: u64, start: u64, end: u64) -> bool {
         self.0
             .get(&file_id)
@@ -151,6 +167,36 @@ mod tests {
         assert!(!lost.covers(3, 64, 401), "lengthened by damage found later");
         assert!(!lost.covers(3, 32, 400));
         assert!(!lost.covers(4, 64, 400));
+    }
+
+    #[test]
+    fn a_region_is_recorded_only_inside_a_lost_range_of_its_segment() {
+        let range = |file_id, offset, length| kvik_log::manifest::LostRange {
+            identity: (0, 1),
+            first: (0, 1),
+            last: (0, 2),
+            file_id,
+            offset,
+            length,
+            cause: kvik_log::manifest::LossCause::Corruption,
+            boot_id: [0; 16],
+            id_floor: 0,
+            time_before: None,
+            time_after: None,
+            extends: false,
+            stamp: None,
+        };
+        let mut lost = Lost::default();
+        lost.insert(3, 64, 400);
+        assert_eq!(lost.unrecorded(&[]), 1);
+        assert_eq!(lost.unrecorded(&[range(3, 64, 336)]), 0);
+        assert_eq!(
+            lost.unrecorded(&[range(3, 64, 335)]),
+            1,
+            "ends short of the region"
+        );
+        assert_eq!(lost.unrecorded(&[range(3, 72, 400)]), 1, "starts after it");
+        assert_eq!(lost.unrecorded(&[range(4, 64, 336)]), 1, "another segment");
     }
 
     #[test]

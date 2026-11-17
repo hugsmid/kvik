@@ -16,14 +16,16 @@ use kvik::{
 };
 use kvik_log::fs::FaultOp;
 
-/// The reason `LocalDataUnreadable` in a store's health, if present.
-fn unreadable(s: &Store) -> Option<(u64, u64)> {
+/// The reason `LocalDataUnreadable` in a store's health, if present: readings, deliveries, evaluations, regions.
+fn unreadable(s: &Store) -> Option<(u64, u64, u64, u64)> {
     match s.health() {
         Health::Degraded { reasons } => reasons.into_iter().find_map(|r| match r {
             Reason::LocalDataUnreadable {
                 readings,
                 deliveries,
-            } => Some((readings, deliveries)),
+                evaluations,
+                regions,
+            } => Some((readings, deliveries, evaluations, regions)),
             _ => None,
         }),
         _ => None,
@@ -116,7 +118,7 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
         ack.outcomes
     );
     assert_eq!(s.series_stats(g).unwrap().duplicates_unchecked, 1);
-    assert_eq!(unreadable(&s), Some((1, 0)));
+    assert_eq!(unreadable(&s), Some((1, 0, 0, 0)));
     // The unchecked reading is in the log now: a repeat is a duplicate of it.
     let ack = block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
     assert!(matches!(ack.outcomes[0], Outcome::Duplicate));
@@ -124,8 +126,9 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
     drop(s);
 
     // A start passes over the damaged region as lost (spec §3 Recovery rule 2): its facts are out of the log.
+    // It passes over the damaged region, which no lost range records: health stays degraded (Q-755).
     let s = open();
-    assert_eq!(unreadable(&s), None);
+    assert_eq!(unreadable(&s), Some((0, 0, 0, 1)));
     let ack = block_on(s.emit(&[num(g, 1, 2.0)])).unwrap();
     assert!(
         matches!(
@@ -270,7 +273,7 @@ fn a_fact_whose_earlier_facts_cannot_be_read_is_delivered_unchecked() {
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].flags.unchecked && !delivered[0].flags.outranked);
     assert_eq!(s.stats().delivery.unchecked, 1);
-    assert_eq!(unreadable(&s), Some((1, 1)));
+    assert_eq!(unreadable(&s), Some((1, 1, 0, 0)));
     block_on(s.shutdown()).unwrap();
 }
 
@@ -309,5 +312,78 @@ fn a_restart_across_several_parts_of_the_log_decides_as_before() {
         .collect();
     assert_eq!(got, [true, true, true, false, false]);
     assert_eq!(s.stats().ingest.slow_path, 3);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn an_evaluation_without_its_facts_is_counted_although_it_delivers_nothing() {
+    let w = World::new("evaluation-unchecked");
+    let mut config = w.config();
+    config.log.seal_interval = Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel {
+        series: Select::Ids(vec![g]),
+        operator: None,
+        condition: Some(kvik::Condition::above(10.0)),
+    }))
+    .unwrap();
+    sealed(&w, 1);
+    block_on(s.emit(&[num(g, 0, 20.0)])).unwrap();
+    let facts = sealed(&w, 2)
+        .into_iter()
+        .max_by_key(|p| file_id(p))
+        .unwrap();
+    drain(&mut c);
+    // An hour on, a reading without a value: the live-state fact is the first, before the window.
+    w.clock.advance(Duration::from_secs(3_600));
+    block_on(s.emit(&[num(g, 3_600, f64::NAN)])).unwrap();
+    sealed(&w, 3);
+    drain(&mut c);
+    assert_eq!(s.stats().delivery.evaluations_unchecked, 0);
+    let bytes = w.fs.read(&facts).unwrap();
+    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    block_on(s.emit(&[num(g, 3_601, f64::NAN)])).unwrap();
+    let ds = drain(&mut c);
+    assert!(
+        ds.iter()
+            .all(|d| !matches!(d.kind, DeliveryKind::Trigger(_))),
+        "{ds:?}"
+    );
+    assert!(s.stats().delivery.evaluations_unchecked >= 1);
+    assert!(unreadable(&s).is_some_and(|(_, _, e, _)| e >= 1));
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_region_a_consumers_read_meets_after_the_open_is_counted() {
+    let w = World::new("reread-region");
+    let mut config = w.config();
+    config.log.seal_interval = Duration::from_millis(20);
+    let open = || block_on(Store::open(config.clone())).unwrap();
+    let s = open();
+    let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    drain(&mut c);
+    sealed(&w, 1);
+    block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 2.0)])).unwrap();
+    let facts = sealed(&w, 2)
+        .into_iter()
+        .max_by_key(|p| file_id(p))
+        .unwrap();
+    block_on(s.emit(&[num(g, 2, 3.0)])).unwrap();
+    block_on(s.shutdown()).unwrap();
+    drop((c, s));
+    let s = open();
+    assert_eq!(unreadable(&s), None);
+    // Damage after the open, in records the consumer has still to be sent: its read of the log passes over it.
+    let bytes = w.fs.read(&facts).unwrap();
+    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    drain(&mut c);
+    assert_eq!(s.stats().delivery.regions_unread, 1);
+    assert!(unreadable(&s).is_some_and(|(_, _, _, r)| r >= 1));
     block_on(s.shutdown()).unwrap();
 }

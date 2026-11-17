@@ -101,7 +101,12 @@ impl Recent {
         if t < w.floor {
             return;
         }
-        let at = w.facts.partition_point(|f| tp(f) <= tp(rec));
+        // In-order data goes at the end; only a late fact searches.
+        let at = if w.facts.back().is_none_or(|f| tp(f) <= tp(rec)) {
+            w.facts.len()
+        } else {
+            w.facts.partition_point(|f| tp(f) <= tp(rec))
+        };
         if w.facts.len() >= self.cap && w.facts.len() == w.facts.capacity() {
             w.facts.reserve_exact(1);
         }
@@ -201,6 +206,12 @@ impl Recent {
     #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Slots allocated, over all series.
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.series.values().map(|w| w.facts.capacity()).sum()
     }
 }
 
@@ -350,7 +361,16 @@ impl Deliverer {
     ) -> Option<Vec<(Stored, bool, bool)>> {
         self.slow.set(self.slow.get() + 1);
         let mut reader = crate::durable::start::log_reader(ctx.dir, ctx.env).ok()?;
-        let read = read_positions(&mut reader, at, to);
+        let read = read_positions(&mut reader, at, to, &mut |file_id, start, end| {
+            // A region the open did not pass over: the consumer misses what it held (Q-750).
+            if !self.damaged.covers(file_id, start, end) {
+                let mut unread = self.unread.borrow_mut();
+                if !unread.covers(file_id, start, end) {
+                    unread.insert(file_id, start, end);
+                    self.regions_unread.set(self.regions_unread.get() + 1);
+                }
+            }
+        });
         let _ = reader.close();
         let out = read?;
         let mut keys: Vec<Key> = out
@@ -383,12 +403,13 @@ impl Deliverer {
     }
 }
 
-/// The facts with positions from `at` up to `to` (not included); `None` if a part of the log could not be read
-/// before `to` was reached.
+/// The facts with positions from `at` up to `to` (not included), each invalid region met given to `region`; `None`
+/// if a part of the log could not be read before `to` was reached.
 fn read_positions(
     reader: &mut kvik_log::reader::LogReader,
     at: LogPos,
     to: LogPos,
+    region: &mut dyn FnMut(u64, u64, u64),
 ) -> Option<Vec<Stored>> {
     let mut out: Vec<Stored> = Vec::new();
     loop {
@@ -422,7 +443,7 @@ fn read_positions(
                     }
                 }
                 ReadEvent::Void { above, .. } => out.retain(|s| s.position <= above),
-                ReadEvent::Corruption { .. } => {}
+                ReadEvent::Corruption { file_id, region: r } => region(file_id, r.start, r.end),
             }
         }
         if !more {
@@ -499,22 +520,51 @@ mod tests {
     }
 
     #[test]
+    fn a_window_at_its_cap_allocates_one_slot_more_not_twice_as_many() {
+        let mut r = Recent::with_limits(64, usize::MAX);
+        for k in 0..200 {
+            r.note(&rec(1, k * S, k as u64 + 1), || i64::MAX, i64::MAX);
+        }
+        assert_eq!(r.held(), 64);
+        assert!(r.capacity() <= 65, "{}", r.capacity());
+    }
+
+    #[test]
+    fn a_late_fact_takes_its_place_in_the_window_and_one_in_order_goes_at_the_end() {
+        let mut r = Recent::with_limits(1_000, usize::MAX);
+        for (k, t) in [0, 1, 3, 2, 4].into_iter().enumerate() {
+            r.note(&rec(1, t * S, k as u64 + 1), || i64::MAX, i64::MAX);
+        }
+        for t in 0..5 {
+            assert_eq!(r.key((1, t * S)).map(|v| v.len()), Some(1), "t = {t}");
+        }
+        let order: Vec<i64> = r.newest_first(1, i64::MAX).map(|s| s.row.t / S).collect();
+        assert_eq!(order, [4, 3, 2, 1, 0]);
+    }
+
+    #[test]
     fn the_windows_stay_within_their_byte_budget() {
         let one = fact_bytes(&rec(1, 0, 1));
         let mut r = Recent::with_limits(1_000, 50 * one);
+        // A span longer than the data: only the budget takes facts out.
         for k in 0..400u64 {
             r.note(
                 &rec((k % 20) as u32, (k / 20) as i64 * S, k + 1),
-                || SPAN,
+                || i64::MAX,
                 i64::MAX,
             );
             assert!(r.bytes() <= 50 * one);
         }
         assert_eq!(r.held(), 50);
-        // Each series keeps its newest facts; what left is below its floor.
+        // Each series keeps its newest facts, all of them from its floor up; what left is below the floor.
         for s in 0..20 {
+            let floor = r.floor(s);
+            assert!(floor > 0 && floor <= 19 * S, "{floor}");
+            assert!(r.key((s, floor - 1)).is_none());
             assert!(r.key((s, 0)).is_none());
-            assert_eq!(r.key((s, 19 * S)).map(|v| v.len()), Some(1));
+            for t in (0..20).map(|k| k * S).filter(|t| *t >= floor) {
+                assert_eq!(r.key((s, t)).map(|v| v.len()), Some(1));
+            }
         }
     }
 }

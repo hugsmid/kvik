@@ -167,6 +167,10 @@ struct Counters {
     series: BTreeMap<u32, SeriesStats>,
     /// The start read the kept log whole into memory (Q-752).
     start_whole: bool,
+    /// Damaged regions the start passed over that no lost range records (Q-755).
+    start_regions: u64,
+    /// Readings recorded unchecked because local data could not be read (Q-750).
+    unchecked_readings: u64,
     waits: BTreeMap<Wait, u64>,
     waited: Duration,
     slow_path: u64,
@@ -271,6 +275,7 @@ impl Writer {
             counters: series_counters,
             local,
             read_whole,
+            unrecorded,
         } = kept;
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
@@ -289,6 +294,7 @@ impl Writer {
         let counters = Counters {
             series: series_counters,
             start_whole: read_whole,
+            start_regions: unrecorded,
             ..Counters::default()
         };
         // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
@@ -878,6 +884,7 @@ impl Writer {
     fn count(&self, readings: &[Reading], plan: &ingest::Plan) {
         let mut c = lock(&self.counters);
         c.slow_path += plan.slow;
+        let mut c_unchecked = 0;
         for (r, d) in readings.iter().zip(&plan.decisions) {
             let st = c.series.entry(r.series.0).or_default();
             match d {
@@ -893,6 +900,7 @@ impl Writer {
                 } => {
                     st.recorded += 1;
                     st.duplicates_unchecked += u64::from(*unchecked);
+                    c_unchecked += u64::from(*unchecked);
                     st.outranked_on_arrival += u64::from(*outranked);
                     st.absent_supplied += u64::from(*absent);
                     st.late += u64::from(*late);
@@ -900,6 +908,7 @@ impl Writer {
                 }
             }
         }
+        c.unchecked_readings += c_unchecked;
     }
 
     // ----- health and statistics -----
@@ -950,20 +959,24 @@ impl Writer {
                 .filter(|l| l.kind == LossKind::DataLost && !l.acknowledged)
                 .map(Reason::DataLost),
         );
-        // Q-750: decisions made without data that could not be read hold health degraded until a restart.
-        let readings: u64 = lock(&self.counters)
-            .series
-            .values()
-            .map(|s| s.duplicates_unchecked)
-            .sum();
-        let deliveries = self
+        // Q-750, Q-755: decisions made this run without data that could not be read, and damaged regions no lost
+        // range records, from their own counts (not `duplicates_unchecked`, which a fact on no local tier also raises).
+        let (readings, start_regions) = {
+            let c = lock(&self.counters);
+            (c.unchecked_readings, c.start_regions)
+        };
+        let delivery = self
             .hub
             .as_ref()
-            .map_or(0, |h| h.run_quiet(|d, _| d.delivery_stats().unchecked));
-        if readings > 0 || deliveries > 0 {
+            .map(|h| h.run_quiet(|d, _| d.delivery_stats()))
+            .unwrap_or_default();
+        let regions = start_regions + delivery.regions_unread;
+        if readings + delivery.unchecked + delivery.evaluations_unchecked + regions > 0 {
             reasons.push(Reason::LocalDataUnreadable {
                 readings,
-                deliveries,
+                deliveries: delivery.unchecked,
+                evaluations: delivery.evaluations_unchecked,
+                regions,
             });
         }
         match (self.fault(), reasons.is_empty()) {
@@ -1262,6 +1275,15 @@ mod tests {
     use crate::types::{Intent, Reading, Value};
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    #[test]
+    fn each_side_gets_half_of_window_memory() {
+        let limits = crate::config::Limits {
+            window_memory: 64 << 20,
+            ..crate::config::Limits::default()
+        };
+        assert_eq!(super::window_budget(&limits), 32 << 20);
+    }
 
     /// A pause point right after a call's decision, for the store in the given directory.
     static AFTER_DECISION: Mutex<Option<(PathBuf, Hook)>> = Mutex::new(None);

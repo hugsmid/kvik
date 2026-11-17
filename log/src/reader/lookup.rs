@@ -8,8 +8,8 @@
 //! and every invalid region met in such a segment is one the caller knows to be lost.
 //!
 //! Memory: sealed segments' indexes and the maps of segments' batches are kept least recently used within
-//! [`LOOKUP_CACHE_BYTES`]; a segment is read a part of [`PIECE`] bytes at a time (more only for a batch longer than
-//! that), and a batch read again alone.
+//! [`LOOKUP_CACHE_BYTES`], also during one lookup; a segment is read a part of [`PIECE`] bytes at a time (more only
+//! for a batch longer than that), and batches read again touch at most about a part before their buffer is freed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -120,6 +120,9 @@ pub(super) struct Caches {
     /// [`LOOKUP_CACHE_BYTES`] and [`PIECE`]; other values in tests only.
     cap: usize,
     piece: u64,
+    /// The most bytes held at any time, and the largest entry.
+    #[cfg(test)]
+    peak: (usize, usize),
 }
 
 impl Default for Caches {
@@ -131,6 +134,8 @@ impl Default for Caches {
             bytes: 0,
             cap: LOOKUP_CACHE_BYTES,
             piece: PIECE,
+            #[cfg(test)]
+            peak: (0, 0),
         }
     }
 }
@@ -188,6 +193,10 @@ impl Caches {
         self.tick += 1;
         let bytes = value.bytes();
         self.bytes += bytes;
+        #[cfg(test)]
+        {
+            self.peak = (self.peak.0.max(self.bytes), self.peak.1.max(bytes));
+        }
         self.maps.insert(
             file_id,
             Cached {
@@ -226,6 +235,11 @@ impl Caches {
     #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn peak(&self) -> (usize, usize) {
+        self.peak
     }
 
     #[cfg(test)]
@@ -414,8 +428,9 @@ impl LogReader {
                     out.complete[i] = false;
                 }
             }
+            // After each segment, so that a lookup over many segments holds at most the bound too.
+            self.caches.trim();
         }
-        self.caches.trim();
         Ok(out)
     }
 
@@ -454,15 +469,23 @@ impl LogReader {
             map = SegmentMap::default();
         }
         let mut stale = false;
-        // One buffer for the batches read again: allocated once, touched only where they lie.
+        // One buffer for the batches read again, touched only where they lie, allocated afresh once a part's worth
+        // of it has been touched.
         let mut again: Option<Vec<u8>> = None;
+        let mut touched = 0;
+        let piece = self.caches.piece;
         for s in map.batches.iter().filter(|s| query.may_hold(s)) {
             if s.generation == query.generation && s.last > query.last_sequence {
                 break;
             }
+            if touched > piece {
+                again = None;
+            }
             if again.is_none() {
                 again = part(&*f, len, 0, 0);
+                touched = 0;
             }
+            touched += s.end - s.offset;
             let Some(buf) = again.as_mut() else {
                 stale = true;
                 break;
@@ -605,7 +628,8 @@ fn scan_new(
                         return Some(());
                     }
                     let Ok(content) = BatchContent::decode(&b) else {
-                        // Kept as a region, so that every later lookup of the segment is incomplete too.
+                        // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region,
+                        // so that every later lookup of the segment is incomplete too.
                         map.regions.push((b.offset, b.end()));
                         map.resume = Some(before[k + 1]);
                         continue;

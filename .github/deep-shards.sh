@@ -44,7 +44,8 @@ log-pacing      log   pacing
 log-directories log   directories
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
-kvik-differential kvik differential
+kvik-differential kvik differential the_durable_backend_decides_
+kvik-differential-small kvik differential small_windows_decide_
 kvik-fold       kvik  lib         durable::derived::tests::
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
