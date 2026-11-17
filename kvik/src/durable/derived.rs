@@ -207,13 +207,6 @@ impl State {
             o.is_some_and(|o| o.t == k.t && k.rank(versioned) > o.rank(versioned))
         };
         let same = |o: Option<Kept>| o.is_some_and(|o| o.t == k.t);
-        // A fact ahead continued from a file has no `changed_at` to rank a later version of it by.
-        let unranked = |o: Option<Kept>| o.is_some_and(|o| o.t == k.t && o.changed_at.is_none());
-        if versioned && (unranked(self.pending) || unranked(self.last_ahead)) {
-            self.ahead_lost = true;
-            self.pending_more = true;
-            return;
-        }
         if !good {
             // A kept fact corrected to bad: what lies ahead is no longer bounded.
             if outranks(self.pending) || outranks(self.last_ahead) {
