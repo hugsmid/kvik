@@ -1,9 +1,10 @@
-//! The start's work for the derived files, in bounded steps (`format.md` A.18 Crash and rebuild): each call of
-//! [`Directories::start_step`] reads at most [`TRAILERS_PER_STEP`] trailers, or reuses at most
-//! [`REUSED_PER_STEP`] group records, or hashes at most [`DESCRIBE_STEP`] bytes of one segment no valid group lists,
-//! so `kvik-maint` creates and seals segments between steps and a shutdown never waits for the rest. The whole
-//! costs two small reads per sealed segment and one read of each segment that must be described again; the
-//! groups and root are written as they fill and at the end.
+//! The start's work for the derived files, in bounded steps (`format.md` A.18 Crash and rebuild). Each call of
+//! [`Directories::start_step`] does one of: the listing of `derived/` with the manifest, the root and the series
+//! directory read; at most [`GROUPS_PER_STEP`] group files read; the listing of `log/`; at most
+//! [`TRAILERS_PER_STEP`] trailers read; at most [`REUSED_PER_STEP`] group records reused, or at most
+//! [`DESCRIBE_STEP`] bytes hashed of one segment no valid group lists. So `kvik-maint` creates and seals segments
+//! between steps and a shutdown never waits for the rest. The whole costs two small reads per sealed segment and one
+//! read of each segment that must be described again; the groups and root are written as they fill and at the end.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,8 @@ use crate::manifest::read_manifest;
 use crate::name::SegmentName;
 use crate::store::{LOG_DIR, MANIFEST, read_all};
 
+/// Group files read per step.
+pub const GROUPS_PER_STEP: usize = 8;
 /// Trailers read per step.
 pub const TRAILERS_PER_STEP: usize = 8;
 /// Group records reused per step.
@@ -25,6 +28,8 @@ pub const REUSED_PER_STEP: usize = 256;
 enum Stage {
     #[default]
     Begin,
+    Groups,
+    Listing,
     Trailers,
     Describe,
 }
@@ -43,6 +48,7 @@ struct Seen {
 #[derive(Debug, Default)]
 pub(super) struct Start {
     stage: Stage,
+    groups: Vec<(u32, u64, std::path::PathBuf)>,
     names: Vec<(u64, u32)>,
     next: usize,
     seen: Vec<Seen>,
@@ -65,9 +71,25 @@ impl Directories {
                     false
                 } else {
                     self.backoff.remove(&Work::Start);
-                    s.stage = Stage::Trailers;
+                    s.stage = Stage::Groups;
                     false
                 }
+            }
+            Stage::Groups => {
+                self.groups(&mut s);
+                false
+            }
+            Stage::Listing => {
+                if !self.backing_off(Work::Start, now) {
+                    match self.listing(&mut s) {
+                        Ok(()) => {
+                            self.backoff.remove(&Work::Start);
+                            s.stage = Stage::Trailers;
+                        }
+                        Err(_) => self.failed(Work::Start, now),
+                    }
+                }
+                false
             }
             Stage::Trailers => {
                 self.trailers(&mut s);
@@ -85,9 +107,12 @@ impl Directories {
         let fs = self.fs.clone();
         let fs = &*fs;
         directory::remove_temporaries(fs, &self.dir)?;
-        for (family, id, _) in directory::list(fs, &self.dir)? {
+        for (family, id, path) in directory::list(fs, &self.dir)? {
             let next = self.next_id.entry(family).or_insert(1);
             *next = (*next).max(id + 1);
+            if let Family::Group(number) = family {
+                s.groups.push((number, id, path));
+            }
         }
         let bytes = read_all(fs, &self.dir.join(MANIFEST)).ok();
         let manifest = bytes
@@ -121,11 +146,27 @@ impl Directories {
                 self.refused.insert(Family::Root);
             }
         }
-        for (family, id, path) in directory::list(fs, &self.dir)? {
-            let Family::Group(number) = family else {
-                continue;
-            };
-            let Ok(b) = read_all(fs, &path) else {
+        match kept_series(fs, &self.dir, &self.store_id, &self.start) {
+            Some((_, d)) => self.series_through = Some(d.through),
+            None => {
+                let refused = directory::read_latest(fs, &self.dir, Family::Series, |b| {
+                    crate::directory::series::SeriesDirectory::decode(b, &self.store_id)
+                })
+                .is_err();
+                if refused {
+                    self.refused.insert(Family::Series);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the next group files: their records are reused where they still describe a segment.
+    fn groups(&mut self, s: &mut Start) {
+        let fs = self.fs.clone();
+        let n = GROUPS_PER_STEP.min(s.groups.len());
+        for (number, id, path) in s.groups.drain(..n) {
+            let Ok(b) = read_all(&*fs, &path) else {
                 continue;
             };
             match Group::decode(&b, &self.store_id) {
@@ -145,18 +186,13 @@ impl Directories {
                 }
             }
         }
-        match kept_series(fs, &self.dir, &self.store_id, &self.start) {
-            Some((_, d)) => self.series_through = Some(d.through),
-            None => {
-                let refused = directory::read_latest(fs, &self.dir, Family::Series, |b| {
-                    crate::directory::series::SeriesDirectory::decode(b, &self.store_id)
-                })
-                .is_err();
-                if refused {
-                    self.refused.insert(Family::Series);
-                }
-            }
+        if s.groups.is_empty() {
+            s.stage = Stage::Listing;
         }
+    }
+
+    fn listing(&mut self, s: &mut Start) -> std::io::Result<()> {
+        let fs = self.fs.clone();
         let mut names: Vec<(u64, u32)> = fs
             .read_dir(&self.dir.join(LOG_DIR))?
             .into_iter()

@@ -12,6 +12,8 @@
 
 mod start;
 
+pub use start::{GROUPS_PER_STEP, REUSED_PER_STEP, TRAILERS_PER_STEP};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};

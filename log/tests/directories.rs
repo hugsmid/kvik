@@ -322,6 +322,8 @@ fn entries_a_hook_gives_above_the_synced_mark_are_not_written() {
     r.settle();
     assert_eq!(r.series(), None);
     *r.hook.overshoot.lock().unwrap() = 0;
+    // The series write backs off alone, up to a minute (A.18 Crash and rebuild).
+    r.clock.advance(Duration::from_secs(61));
     ingest(&mut r, 100, 10_000_000);
     r.settle();
     assert!(r.series().is_some());
@@ -458,9 +460,10 @@ fn failed_writes_leave_no_temporary_file_and_back_off() {
         d.run(synced, r.clock.monotonic(), r.clock.wall());
     }
     assert_eq!(tmp(&r), 0, "a failed write removes its temporary file");
+    // The log directory, the series directory and the status file each back off alone: at most 12 tries each.
     let failed = r.dirs.as_ref().unwrap().stats().failed;
     assert!(
-        (3..=12).contains(&failed),
+        (3..=36).contains(&failed),
         "failed writes tried {failed} times"
     );
     // Once the device accepts writes again (the planned faults cleared), the next try after the wait catches up.
