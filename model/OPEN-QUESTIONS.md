@@ -1371,7 +1371,9 @@ about 0.6 s, 16 MiB about 0.2 s, and a crafted manifest at most about 0.09 s per
 refresh: inside the 1 s budget. Definitions holding many short state names stay above it (about 5 ns a byte, 1.5 s at
 64 MiB): Q-870. `format.md` A common rules (scan bound), `design.md` Budgets and `SECURITY.md` state the figures.
 Natural damage is unchanged: the verdicts are the same and the window rule is untouched. Tests:
-`log/tests/body_check.rs` (each check against its decoder, and the text table against `std::str::from_utf8`),
+`log/tests/body_check.rs` (each check against its decoder, the text table against `std::str::from_utf8`, and
+`state_names_at_the_limit_are_told_distinct_and_past_it_refused`), `log/tests/batches.rs`
+`after_damage_a_recovery_entry_not_alone_is_still_invalid_content`,
 `log/tests/crafted_files.rs` `after_damage_each_kept_body_is_checked_once` and the crafted tests of Q-110 at the
 tighter budget, `log/tests/scan_bound.rs` (the differential property against the reference scan at the new bound),
 `log/src/scan/tests.rs` `the_bound_holds_body_checks_and_the_failed_read_budget_per_window`, `files/tests/records.rs`
