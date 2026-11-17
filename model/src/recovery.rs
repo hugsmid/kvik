@@ -82,6 +82,10 @@ pub struct RecoveryEntry {
     pub id_floor: u32,
     /// The consumers whose cursor file was missing or unreadable.
     pub cursors_missing: Vec<ConsumerId>,
+    /// A series was at the `written` level in the registry at `after`, so
+    /// flagged batches may have vanished without a byte (`format.md` A.6
+    /// field 48, Q-251).
+    pub written_level: bool,
 }
 
 impl RecoveryEntry {
@@ -93,12 +97,14 @@ impl RecoveryEntry {
     }
 
     /// Whether the entry is a `possible_loss` (§11 Health): it names a
-    /// non-empty tail, a mark that was not readable or stale, or a missing or
-    /// unreadable cursor file. Its gap, if any, is a `data_lost` (Q-124 (a)).
+    /// non-empty tail, a mark that was not readable or stale, a missing or
+    /// unreadable cursor file, or a series at the `written` level in force
+    /// (Q-251). Its gap, if any, is a `data_lost` (Q-124 (a)).
     pub fn possible_loss(&self) -> bool {
         !self.tail.is_empty()
             || self.mark_state != MarkState::Readable
             || !self.cursors_missing.is_empty()
+            || self.written_level
     }
 }
 
@@ -519,6 +525,7 @@ mod tests {
             mark_state: MarkState::Readable,
             id_floor: 0,
             cursors_missing: Vec::new(),
+            written_level: false,
         };
         assert_eq!(e.gap(p(7)), Some((p(5), p(6))));
         assert!(!e.possible_loss(), "a gap alone is a `data_lost`");

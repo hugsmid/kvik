@@ -61,9 +61,10 @@ again; nothing after a gate starts before it is passed. Items that do not depend
 - [ ] 5.3 Catch-up, resync and replay flags; the saved-point check (`Reader::check`, `Start::Position`, row 7b)
 - [ ] 5.4 Live state and windowed operators over recent facts
 - [ ] 5.5 Differential tests against the model; routing and delivery benchmarks
-- [ ] 5.5a Durability levels chosen per source: acknowledged once written or after the sync (Q-170); for the faster
-  level, §3 Recovery rule 1, principle 3 and invariant 2 rewritten to keep checksum-valid complete batches beyond the
-  mark (Q-125)
+- [ ] 5.5a Durability levels chosen per source (Q-170): spec text and model; for the faster level, §3 Recovery
+  rule 1, principle 3 and invariants 2 and 11 rewritten to keep complete flagged batches beyond the mark (Q-125)
+- [ ] 5.5b Durability levels: log writer acknowledges at write; commit-block flag; recovery keeps flagged batches
+- [ ] 5.5c Durability levels: definition parameter, `Outcome`, durable-up-to watermark
 - [ ] 5.6 **Gate** — delivery looked at as a whole
 
 ## 6. Compacted segments

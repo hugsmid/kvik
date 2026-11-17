@@ -163,13 +163,14 @@ proptest! {
         prop_assert_eq!(r.disk.generation, 1);
     }
 
-    /// 2. Every delivered position is durable; every durable position is
-    /// eventually delivered to each matching consumer, or superseded by a
-    /// `resync` delivered to it in place of the replay of that position
-    /// because its cursor was older than the oldest local log segment.
+    /// 2. Every delivered position is durable or was a flagged batch's, lost
+    /// behind a reset point; every durable position is eventually delivered
+    /// to each matching consumer, or superseded by a `resync` delivered to it
+    /// in place of the replay of that position because its cursor was older
+    /// than the oldest local log segment.
     #[test]
-    fn inv02_delivered_iff_durable(ops in proptest::collection::vec(arb_op(), 1..80)) {
-        let (mut m, ids) = machine();
+    fn inv02_delivered_iff_durable(ops in proptest::collection::vec(arb_op(), 1..80), written in 0u8..16) {
+        let (mut m, ids) = machine_written(written);
         let mut basis = ResyncBasis::new();
         for op in &ops {
             track_resyncs(&mut m, &mut basis, |m| apply(m, &ids, op)).map_err(TestCaseError::fail)?;
@@ -177,11 +178,17 @@ proptest! {
         track_resyncs(&mut m, &mut basis, settle);
         track_resyncs(&mut m, &mut basis, |m| m.drain()).unwrap();
         let dur = durable(&m);
+        let entries = m.recovery_entries();
         for (c, sel) in [(0u32, None), (1u32, Some(ids[0]))] {
             let seen = observed_positions(&m, c);
             let replaced = resync_replaced_justified(&m, &basis, c);
+            // A flagged batch delivered once written and then lost is the
+            // loss invariant 10 allows, behind a recovery entry (§3 Recovery
+            // rule 3); a default-level batch is never lost here (the mark is
+            // synced at every commit).
+            let reset_below = |p: &kvik_model::types::Position| written != 0 && entries.values().any(|e| e.after < *p);
             for p in &seen {
-                prop_assert!(dur.contains_key(p), "consumer {} saw non-durable {}", c, p);
+                prop_assert!(dur.contains_key(p) || reset_below(p), "consumer {} saw non-durable {}", c, p);
             }
             for (p, f) in &dur {
                 if sel.is_none_or(|s| s == f.series) {
@@ -541,13 +548,15 @@ proptest! {
         }
     }
 
-    /// 11. No reader or consumer observes a position beyond the durable mark,
-    /// whether the writer is up or down: a reader gets exactly the listed
-    /// files' content up to the mark.
+    /// 11. No reader observes a position beyond the durable mark, whether the
+    /// writer is up or down: a reader gets exactly the listed files' content
+    /// up to the mark. No consumer does either, except a position of a
+    /// flagged batch already written (§3 Commit).
     #[test]
-    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_op(), 1..80)) {
-        let (mut m, ids) = machine();
+    fn inv11_nothing_observed_beyond_mark(ops in proptest::collection::vec(arb_op(), 1..80), written in 0u8..16) {
+        let (mut m, ids) = machine_written(written);
         for op in &ops {
+            let seen_before: BTreeMap<ConsumerId, usize> = m.observed.iter().map(|(c, o)| (*c, o.len())).collect();
             apply(&mut m, &ids, op).map_err(TestCaseError::fail)?;
             let last = m.disk.mark.map_or(kvik_model::types::Position::ORIGIN, |k| k.last);
             let r = m.open_reader();
@@ -560,8 +569,10 @@ proptest! {
                 .flat_map(|f| m.disk.files[f].entries().filter_map(|e| e.fact().map(|x| x.position)))
                 .collect();
             prop_assert_eq!(&got, &raw.iter().copied().filter(|p| *p <= last).collect::<BTreeSet<_>>());
-            for obs in m.observed.values() {
-                prop_assert!(obs.iter().all(|o| o.position <= last));
+            let written = written_beyond_mark(&m);
+            for (c, obs) in &m.observed {
+                let new = &obs[seen_before.get(c).copied().unwrap_or(0)..];
+                prop_assert!(new.iter().all(|o| o.position <= last || written.contains_key(&o.position)));
             }
         }
     }

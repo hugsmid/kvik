@@ -32,7 +32,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-161 | §8 Generations; `api.md` Backup and restore | Telling a restore's own claim marker from another restore's |
 | Q-163 | §8 Generations, Restore step 1 | Reading the claims again on a bucket whose listings lag |
 | Q-164 | §8 Retention class, Restore; `api.md` Reading, Backup and restore | Interface points deferred to 8.2 that need tiers or restore |
-| Q-170 | §1 principles, §2.1, §3 Commit, §6, §11; `api.md` Writing, Series | Durability levels chosen per source: acknowledged once written, before the sync |
 | Q-173 | §7 Manifest, `api.md` | The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records |
 | Q-175 | §7 Manifest (rebuild step 2) | An intermediate output no record and no local file describes |
 | Q-190 | §11; `docs/export.md` | The Parquet export schema as a user contract: columns, types, version |
@@ -51,6 +50,16 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
 | Q-220 | §8 Hashes, §7 Manifest; `format.md` A.9, A.14 | Where a log segment's plaintext hash lives, what it covers, and when it is computed |
 | Q-221 | §3 Write or sync failure, §7 Manifest, §8 Corrupt block; `format.md` A.9 | A read that fails while hashing, and sealed segments no record names |
+| Q-250 | §1 principle 5, §3 Recovery rule 1, invariant 10 | Unsynced faster-level batches that a remount within the boot removes |
+| Q-251 | §3 Recovery rule 3, Adoption, §11 Health; `format.md` A.6 field 48 | Which recovery entries report a `possible_loss` for the faster level |
+| Q-252 | §2.1 `durability`; `api.md` Writing, Configuration | A per-call wait for the sync on a faster-level series, and the `max_unsynced` default |
+| Q-253 | `format.md` A.7 `flags`, A.3 | The commit-block flag in formerly reserved bytes, which earlier builds read as nothing |
+| Q-254 | §1 principles 3 and 5, §2.1 `durability`, §3 Write or sync failure, Recovery rule 1, rows 7 and 12, invariant 10; `api.md` Series | Acknowledged faster-level batches evicted after a failed write-back, then a restart on the same boot |
+| Q-255 | §2.1 `durability`, §3 Batches, Commit, Group commit; `api.md` Writing | How calls of two levels are cut into batches and acknowledged |
+| Q-256 | §2.1 `durability`; `api.md` Series | The level changed at run time by `set_durability` |
+| Q-257 | §2.1 `durability`, §3 Recovery rule 2, invariant 10 | Faster-level readings lost out of order reported as `data_lost` |
+| Q-258 | §3 Recovery rule 1, invariant 10 | Default-level batches after flagged ones truncated by a remount where they were kept before |
+| Q-259 | §1 principle 3, invariants 2 and 11 | What sees a faster-level reading before it is durable |
 | Q-270 | §8 Encryption; `format.md` A.17 Reading | Envelope damage that `EnvelopeError` has no variant for |
 | Q-280 | §7 Manifest (rebuild), §8 Continuous backup, Hashes | How a rebuilt manifest queues files for upload again |
 | Q-281 | §8 Hashes; `format.md` A.14 | The copy-verified record (`0x27`): layout and fold |
@@ -66,9 +75,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-303 | §8 Generations, §7 Readers; `format.md` A.1 kind 12 | The local restore record file |
 | Q-304 | §8 Generations, Restore step 1 | A manifest record object the bucket has lost or a listing does not show |
 | Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
+| Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
-| Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-680 | `api.md` Writing, Health | `Outcome::Recorded` carrying the level and `LogStats.acknowledged` |
+| Q-681 | §2.1 `durability`, §3 Commit, invariant 10; `api.md` Configuration | What `max_unsynced` bounds |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -689,6 +700,48 @@ override (wait for the sync on a faster-level series) is offered; and, since rul
 mark on the same boot (Q-125), rule 1, principle 3 and invariant 2 rewritten for the faster level so that a process
 crash keeps checksum-valid complete batches beyond the mark.
 
+**Settled at roadmap 5.5a** (the owner's decision above; the design below; open parts in Q-250 to Q-253).
+- *Parameter.* `durability`, `synced` (default) or `written`, a definition field (`format.md` A.6 field 28),
+  changed by a parameter change that takes effect at its position, like the retention class: it changes no fact
+  and recovery reads the level from each batch, never from the registry (`spec.md` §2.1). The model fixes it for the
+  life of a series, as it fixes every option (Q-60).
+- *Batches.* A batch holds one level; a flagged batch (commit block `flags` bit 0, A.7) holds only facts of
+  `written` series. A call mixing levels is one unflagged batch, acknowledged at the default level: an
+  acknowledgement is per call, and the stricter level never weakens a promise. Definitions, routing and every other
+  entry that is not a fact are unflagged and force the mark sync as before (`spec.md` §3 Batches, Commit).
+- *Writer order.* A batch is written only after the previous unflagged batch's sync has returned; flagged batches
+  need none between them. So beyond a current same-boot mark lie flagged batches and at most one unflagged batch,
+  the last; a faster-level reading arriving during a default-level sync waits for it, which keeps delivery in
+  position order (invariant 3). Reason: rules 1 to 3 all derive what can lie beyond the mark from this order.
+- *Bound.* `max_unsynced`, default 1 s, at most the mark-sync interval (the owner's example); also a sync before a
+  seal or roll, at clean shutdown and before a write naming a position above the mark.
+- *Acknowledgement and delivery.* A flagged batch is acknowledged, put in live state and delivered once written
+  (principle 3 rewritten; invariants 2 and 11 allow it); readers still see only the durable mark. `Outcome::Recorded`
+  carries the level; `LogStats` gains `acknowledged` beside `durable` ("durable up to").
+- *Rule 1 (Q-125 kept).* On the same boot every complete flagged batch beyond the mark is kept: written again in
+  place (a sync vouches only for bytes the start writes, Q-117), synced, then the mark moves past it. Whatever lies
+  after the last kept batch is truncated, and a complete batch or any non-zero byte there is still a reset point and
+  `possible_loss` (Q-125, Q-320), with K the last kept position. The stale-mark test counts unflagged batches only: a
+  complete unflagged batch beyond the mark followed by any complete batch. A process crash therefore loses no
+  acknowledged faster-level reading the page cache still holds and costs no reset point (a remount, Q-250, or pages
+  evicted after a failed write-back, Q-254, can remove them unreported)
+  (`tests/durability.rs` `s3_process_crash_keeps_flagged_batches_beyond_the_mark_with_no_reset_point`,
+  `s3_process_crash_keeps_flagged_batches_and_resets_after_an_unflagged_one`,
+  `s3_flagged_batches_do_not_make_a_same_boot_mark_stale`).
+- *Rule 2.* An invalid region followed by a complete batch stays corruption: flagged batches written with no sync
+  between them can reach the disk in any order, and either way the region may have been acknowledged, so a lost
+  range (`data_lost`, positions not reused) is right. Not modelled (the model injects no damage beyond the mark);
+  the engine's kill loop at 5.5b.
+- *Rule 3.* Another boot, or the mark lost or stale: complete batches kept as before; a flagged batch lost by a power
+  loss is in the torn tail or left no byte, and the recovery entry is a reset point (`forget_above` K) for consumers
+  that acted on it; its `possible_loss` is Q-251. The "last batch written again" rule covers the flagged batches
+  directly before the last complete batch, back to the nearest unflagged one
+  (`s3_power_loss_removing_flagged_batches_is_a_reset_point_and_possible_loss`; the recovery histories of invariants
+  25–27 commit flagged batches, sync the log, keep flagged batches on a same-boot start and lose them in power
+  losses, guarded by `recovery_generator_coverage`).
+- *Not offered yet:* a per-call wait for the sync (Q-252).
+
+
 ## Q-173 — The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records
 Found while building the manifest rebuild (roadmap 6.3a, `kvik-files` `rebuild::rebuild_manifest`).
 **Scenario.** (a) §7 names `rebuild_manifest` as the way out for a process that restarts more often than the wait, but
@@ -960,6 +1013,235 @@ can never be used for the file (no overwrite, no delete), and the restore derive
 and health asks for attention (`BackupStalled` naming the key); the queue continues with other files, but no
 manifest record that names the file is uploaded while it is not backed up.
 
+## Q-220 — Where a log segment's plaintext hash lives, what it covers, and when it is computed
+Recorded by roadmap 6.3b, while computing the plaintext SHA-256 at seal (`kvik-log` `writer::seal_segment_described`).
+**Scenario.** §8 Hashes and the A.14 file description need a log segment's plaintext SHA-256, and A.14 says a file's
+header and trailer carry everything a record says about it. The A.9 trailer has 4 reserved bytes, and no hash can sit
+inside the bytes it covers. A blocked seal (A.13) runs again from step 1. A seal on `kvik-maint` would still hold up
+an acknowledgement if the commit thread waited for it. Restore (Q-290) needs every sealed-segment record to follow the
+lost-range records of the start before its seal.
+**Decided.** (a) The hash is over every byte of the sealed file, header to end marker, and only the file description
+holds it: the trailer is unchanged, so no version rule applies, and a rebuild computes the hash from the file
+(`format.md` A.9, A.14; `spec.md` §7 Manifest). (b) It is computed in the pass that computes `file_crc32c`, on
+`kvik-maint`; the commit thread never waits for it. (c) Once per seal: a blocked seal's retry reuses the seal blocks
+and hash of its first pass. (d) Each `SealedFile` is handed over once (`LogWriter::take_sealed`, `Log::take_sealed`),
+after the `.kvl` name and the directory are synced, with the segment's length, which A.14 does not hold. (e) The
+sealed-segment record is appended after the seal from that description, and the seal does not wait for it. No
+description leaves the writer before the start that preceded it has synced its lost-range records, and a start that
+cannot write one is read-only and hands out none, so a record appended from a description has an epoch above them
+(`format.md` A.14). `log/tests/seal_hash.rs`: `the_hash_is_sha256_of_the_sealed_files_bytes`,
+`a_blocked_seal_reads_and_hashes_its_segment_once`, `the_commit_thread_acknowledges_while_a_seal_is_hashing`;
+`log/tests/seal_describe.rs`: `no_description_leaves_the_writer_before_the_starts_lost_range_records`,
+`a_start_that_cannot_record_a_loss_is_read_only_and_describes_nothing` (step 4),
+`no_description_leaves_the_writer_before_the_gap_below_a_recovery_entry_is_recorded`,
+`a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing` (step 6),
+`no_segment_is_described_after_a_fault`.
+**Needed.** Roadmap 6.3c appends the record from the descriptions (through `StartOptions::sealed`, which still
+refuses until then) with an epoch above the manifest's last, which keeps (e); `From<&SealedFile>` for the `kvik-files`
+file description is 6.3c's.
+
+## Q-221 — A read that fails while hashing, and sealed segments no record names
+Recorded by roadmap 6.3b with Q-220. The spec names write and sync failures (§3) but no read failure outside them.
+**Scenario.** (a) A read of the segment fails during the seal's pass. (b) A start finds sealed segments that no record
+names (§7 Manifest: an unlisted sealed log segment is listed again); until records are appended at seal that is
+every sealed segment, at every start. (c) Such a segment cannot be read whole, its header disagrees with its name,
+its trailer or end marker is not valid, or its `file_crc32c` does not match.
+**Decided (the conservative choice in each case).** (a) As before the hash: the seal fails as a write failure on the
+log (read-only, fatal health; the next start seals it again from step 1), so no segment takes its `.kvl` name
+without a hash. (b) The start does not read them; a segment is named by generation and `file_id`, so a record of
+another generation does not list it. A sealed-segment, a publish-and-retire and a restore record list segments (the
+restore's field 9, set-aside segments included), so a segment a restore placed is not described and listed again in
+the new generation (scenario from the review of roadmap 6.3b: after a restore, earlier generations' segments are named
+only by the `0x25`). The writer hands them out one at a time (`LogWriter::take_unlisted`, run by
+`writer::describe_sealed` on `kvik-maint`), only while no seal is ready or running and the store is writable, outside
+`seals_running` and `sealed_segments`. Once a shutdown begins none is handed out, and one in flight is dropped before
+its next file operation (a read is at most 1 MiB), so neither a start nor a shutdown waits for a description beyond
+the read under way; one not described when the writer stops is found again at the next start (the owner's ruling at
+the review of roadmap 6.3b; scenario: a stop in the first minutes of a run, with every sealed segment still queued,
+waited for a whole segment's read). (c) No description
+(`DescribeError`): the segment stays unnamed, nothing is written and no fault is set; a damaged file's hash is never
+taken as the hash at seal. A failure to open or read it (`DescribeError::Io`: a sharing violation, a descriptor limit,
+a permission, an I/O error that may clear) is retried within the run, 10 s after the first failure and then twice as
+long each time up to 10 minutes (`DESCRIBE_RETRY_INTERVAL`, `DESCRIBE_RETRY_MAX`), at the writer's timer, so never
+in a busy loop: a retry time counts for the writer's next turn only while it could be handed out (none in flight, no
+seal ready or running), and what closes that gate wakes the writer when it ends (scenario from the re-check of
+roadmap 6.3b: a retry due while another description was reading spun the writer loop); the segment stays unlisted meanwhile, and health names it once the wait reaches its cap (Q-640). Only a failed check
+(`NotSealed`, `Invalid`: header, trailer, end marker, `file_crc32c`) is damage: health is degraded by
+`Reason::SegmentDamaged { file_id }` (`api.md` Health; `spec.md` §8 Corrupt block, §11) while the writer runs, and
+raised again at each start until a description succeeds: a damaged unlisted segment is damaged data, held degraded
+like a `data_lost` (Q-124 (a)) but ended by repair, not by an acknowledgement (the owner's rulings on (c), at the
+review of roadmap 6.3b; scenario for the retry: an open refused for a sharing error was reported as a damaged segment
+for the rest of the run, while the same error on a seal is `SealBlocked` and retried, A.13). `log/tests/seal_hash.rs`:
+`a_read_error_while_sealing_is_a_write_failure_on_the_log`; `log/tests/seal_describe.rs`:
+`a_start_describes_every_sealed_segment_no_record_names`,
+`a_start_skips_every_segment_a_record_lists_by_generation_and_id`,
+`no_segment_is_described_while_a_seal_is_ready_or_running`,
+`a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread`,
+`a_shutdown_drops_a_description_in_flight_before_its_next_read`,
+`a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow`,
+`a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it`,
+`a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears`,
+`a_due_retry_that_cannot_be_handed_out_does_not_wake_the_writer_at_once`,
+`a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
+`describe_sealed_refuses_each_check_it_makes`,
+`a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
+the records `kvik-files` encodes,
+`listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`).
+(d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
+outside the crate. Scenario (the review of roadmap 6.3b): a branch that matched every log reason stopped compiling
+once `SegmentDamaged` merged, with no textual conflict to warn of it. `kvik` maps those it knows and reports any other
+as `kvik::Reason::Other { reason }`, its debug form, which degrades health: a reason never vanishes from health (the
+lead's ruling at the re-check of roadmap 6.3b; scenario: a reason added to the log but not to `kvik`'s mapping would
+otherwise be dropped silently). `kvik/src/durable/mod.rs`
+`a_log_reason_the_mapping_does_not_name_stays_in_health_with_its_name`, through the `kvik-log` feature
+`unmapped-reason`, which only `kvik`'s tests enable.
+**Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
+
+## Q-250 — Unsynced faster-level batches that a remount within the boot removes
+Recorded by roadmap 5.5a. **Needs the owner's ruling** (it changes what the faster level promises).
+**Scenario.** A price series is at the `written` level. The writer syncs at 10:00:00.000 and the mark moves to
+position 100. Batches 101 to 140 are written, acknowledged and delivered within the next 400 ms, and a consumer acts
+on 120. The store's file system is unmounted and mounted again within the boot (a USB disk unplugged, a container
+volume detached): the page cache is gone and none of 101 to 140 reached the disk. The next start has the same boot id
+and a readable mark at 100 with nothing beyond it: rule 1 sees a clean process crash, writes no recovery entry, and
+gives 101 onwards to new readings. The consumer that acted on 120 receives no reset point and no `possible_loss` is
+listed: a silent loss and a reused position, which principle 5 forbids. Syncing the mark at every commit, the
+existing advice for remountable media (Q-125), does not help: the batches were never synced at all. (b) Partial
+write-back: before the remount the cache wrote back 101 to 110 and none of 111 to 140. Rule 1 keeps 101 to 110 as
+acknowledged flagged batches and finds nothing after them, so 111 onwards are given again, also with no report.
+**Now.** Stated as open in principle 5, rule 1's accepted limit and invariant 10; no rule invented. The model pins
+the gap (`tests/open_questions.rs` `q250_a_remount_removing_unsynced_flagged_batches_gives_their_positions_again`,
+`q250_a_remount_keeping_part_of_the_flagged_batches_gives_the_rest_again`), and the reuse property of the recovery
+histories excludes only remounts that lose a flagged batch. Q-254 is the same failure with no remount.
+**Options.** (a) Accept and document: the `written` level is not for media that may be remounted within a boot, and
+opening such a store with a `written` series is the operator's choice. (b) Before acknowledging the first flagged
+batch after a sync, sync a mark update that says flagged batches may follow (one sync per `max_unsynced` window, not
+per batch); a same-boot start that finds the flag and nothing beyond the mark writes a reset point with a
+`possible_loss`. This costs one mark sync of latency for the first faster-level reading of each window. (c) Refuse
+the `written` level unless `log.mark_sync` is `EveryCommit` (does not close the gap; listed to rule it out).
+Proposed: (b) if the latency is acceptable, else (a). (b) also closes Q-254; (a) does not.
+
+## Q-251 — Which recovery entries report a `possible_loss` for the faster level
+Recorded by roadmap 5.5a. To be settled by 5.5b. **OWNER**: (b) and (c) change what health promises.
+**Scenario.** (a) A store has a `written` series. A power cut removes flagged batches 101 to 140 entirely (zeros on
+disk). After the reboot rule 3 keeps up to 100 and writes an entry with an empty tail and a readable mark, which by
+§11 before 5.5a was no `possible_loss`: consumers got a reset point but health listed nothing. (b) The same store
+shuts down cleanly and the machine reboots: the entry is the same, though nothing was lost. (c) With the mark's
+current slot damaged after a completed rule 3 start, an older slot is read that does not cover that start's entry;
+the writer had resumed and acknowledged flagged batches that left no byte, and the entry is adopted.
+**Decided at 5.5a (provisional).** A recovery entry written while a series is at the `written` level in the
+registry at its `after` (K) is a `possible_loss` whatever its tail (`format.md` A.6 field 48; `spec.md` §3 Recovery rule 3, §11), so
+(a) is reported, at the price of (b) being reported too. With the mark missing or unreadable and such a series
+in force, an entry is never adopted (a doubtful case costs a second report). Reason: honest without a new mechanism;
+the definitions and parameter changes that make a series `written` are synced with the mark before they are
+acknowledged, so the registry at K after a reboot always holds them. The model, whose levels are fixed for life,
+reads the definitions (`tests/durability.rs`
+`s3_a_reboot_entry_is_a_possible_loss_while_a_written_series_is_defined`).
+**Open.** (b) A clean-shutdown bit in the mark's reserved bytes, written by the final mark update and cleared by
+the next, would let a start after a clean shutdown report nothing. (c) is not covered: a damaged current slot is
+not detectable from the slot read; proposed with Q-322's numbering change.
+**As built.** Every start after a reboot lists a `possible_loss` while any series is at the `written` level, a
+clean shutdown included; (c) is unreported. **Proposed to the owner:** accept (b) until the clean-shutdown bit
+removes the false reports; settle (c) with Q-322, until then an accepted limit.
+
+## Q-252 — A per-call wait for the sync on a faster-level series, and the `max_unsynced` default
+Recorded by roadmap 5.5a. **Needs the owner's ruling**; to be settled by 5.5c.
+**Scenario.** An adapter for a `written` series emits a reading it must not lose (a meter reading at the end of a
+billing period). It can only change the series' level (a parameter change, synced) or wait for `LogStats.durable` to
+pass the position, which it must poll.
+**Now.** No per-call override (Q-170 asked whether to offer one). `max_unsynced` is 1 s, the owner's example in
+Q-170, at most the mark-sync interval.
+**Proposed.** `Store::sync() -> Result<Position, WriteError>`: resolves once every position acknowledged before the
+call is durable, forcing a sync if one is not due; no per-reading flag. And confirmation of the 1 s default.
+
+## Q-253 — The commit-block flag in formerly reserved bytes
+Recorded by roadmap 5.5a. To be settled by 5.5b.
+**Scenario.** The 5.5a design note asked for "a format change, version bump of A.7". The flag is bit 0 of `flags`,
+bytes 44 to 48 of the commit block, which v1 reserved and readers do not test (common rules). A build from before
+5.5b that opens a store holding flagged batches reads them as unflagged: on the same boot it would truncate them as
+a reset point with a `possible_loss` (reported, never silent) and its stale-mark test may misjudge the mark (rule 3,
+which keeps complete batches). A set bit other than bit 0 is critical, like a fact flag bit.
+**Decided at 5.5a.** The reserved field, with no major version: no release predates it, every batch written before
+holds zero (unflagged), and the golden files stay valid. If a released build must refuse such a store, the
+alternative is a new non-skippable commit block type (`0x0E`, same body), which an earlier reader refuses as an
+unknown critical block; 5.5b chooses when it writes the flag.
+**OWNER.** As built: a build from before 5.5b reads a flagged batch as unflagged, and `format.md` A.3's "readers do
+not test reserved bytes" has this exception. Proposed: accept while no release predates the flag.
+
+## Q-254 — Acknowledged faster-level batches evicted after a failed write-back, then a restart on the same boot
+Recorded at the review of roadmap 5.5a. **OWNER** (it decides what the faster level promises across a failed sync).
+**Scenario.** A price series is at the `written` level; the mark is at 100. Batches 101 and 102 are written,
+acknowledged and delivered, and a consumer acts on 101. The `max_unsynced` sync, or the next default-level batch's,
+fails: the engine goes read-only (§3 Write or sync failure). On Linux the failed write-back leaves the pages of 101
+and 102 clean (§3 Recovery rule 3, Last batch written again; the 4.9 fault trial saw exactly this), so the kernel
+may reclaim them at any time, and a file system that drops them at the error loses them at once. The operator
+restarts the process on the same boot. The bytes beyond the mark read back as zeros: rule 1 finds nothing beyond
+the mark, writes no recovery entry and gives 101 onwards to new readings. The consumer that acted on 101 gets no
+reset point and nothing is listed: a silent loss and a reused position, against principle 5. For a default-level
+batch the same eviction is harmless, as it was never acknowledged.
+**Why Q-250 (a) does not cover it.** No remount is involved, and every medium can fail a sync: refusing the level on
+remountable media leaves the case open. Q-250 (b), a synced marker before the first flagged acknowledgement of each
+window, does cover it: the start finds the marker and nothing beyond the mark and writes a reset point.
+**Now.** Stated as open wherever the text promised that a process restart loses no faster-level reading (principles
+3 and 5, §2.1, §3 Write or sync failure, rule 1, rows 7 and 12, invariant 10, `api.md`); no rule invented. The
+model injects the eviction (`Model::evict_failed_write_back`) and pins the gap (`tests/open_questions.rs`
+`q254_a_failed_sync_then_eviction_and_a_same_boot_restart_gives_flagged_positions_again`).
+**Options.** (a) Q-250 (b): the synced marker per `max_unsynced` window. (b) After a failed sync with flagged batches
+beyond the mark, the writer, now read-only, records the failure durably (a mark slot flag written and synced on
+another handle, or a small file) before anything else; the next start that finds it writes a reset point with a
+`possible_loss` for the range beyond the mark, and a `data_lost` for any of it found missing before a complete
+batch. A failed device may refuse that write too, so (b) narrows the case rather than closing it. (c) Refuse the
+`written` level on platforms where a failed write-back drops or cleans the pages (Linux today), which leaves it to
+development platforms. (d) Accept and document as a limit of the level.
+**Proposed.** (a) if Q-250 (b) is chosen; otherwise (b), and (d) for what (b) cannot reach.
+
+## Q-255 — How calls of two levels are cut into batches and acknowledged
+Recorded at the review of roadmap 5.5a. **OWNER** (Q-170's note said each reading is acknowledged at its own level).
+**Scenario.** (a) One call holds a reading of a `written` series and one of a `synced` series. (b) Calls W1, S1, W2
+(W of `written` series only, S otherwise) queue behind a default-level sync. (c) In a store mixing levels under load,
+a `written` reading arrives while a default-level batch's sync is in flight.
+**As built (spec §3 Batches, Commit; `api.md` Writing).** (a) The call is acknowledged whole at the default level:
+an acknowledgement is per call and the stricter level never weakens a promise. (b) The queue is cut by call into runs
+of one class: W1, S1 and W2 are three batches, W2 acknowledged after S1's sync, and calls share a batch only within
+a class, so default-level calls still group. (c) The `written` reading waits for that sync, so its latency is the
+sync's, not a write's; writing flagged batches during a sync would change what rules 1 to 3 can find beyond the mark.
+The model commits the queue as one batch, flagged only when every reading is at the `written` level.
+**Proposed.** Accept (a) and (b); accept (c) for now and measure the mixed-load latency at 5.5b.
+
+## Q-256 — The level changed at run time by `set_durability`
+Recorded at the review of roadmap 5.5a. **OWNER** (the owner's request said "per series definition").
+**As built (spec §2.1 `durability`; `api.md` Series).** `set_durability` appends a parameter change that takes effect
+at its position, like a change of retention class; it changes no fact and is always synced with the mark before it
+is acknowledged. The model fixes the level for the life of a series (Q-60).
+**Proposed.** Accept.
+
+## Q-257 — Faster-level readings lost out of order reported as `data_lost`
+Recorded at the review of roadmap 5.5a. **OWNER** (it decides which report a known loss of delivered readings gets).
+**Scenario.** Flagged batches 101 to 103 are written with no sync between them; a power loss leaves 101 and 103 on
+disk and 102 as zeros.
+**As built (spec §3 Recovery rule 2).** 102 is a lost range: `data_lost`, health degraded until acknowledged,
+positions not reused, a reset point for cursors below it. Not modelled (the model writes back in order); the engine's
+kill loop at 5.5b covers it on the same boot and after a reboot.
+**Proposed.** Accept: it is a known loss of delivered readings. Alternative: report a range holding only flagged
+batches as `possible_loss`.
+
+## Q-258 — Default-level batches after flagged ones truncated by a remount where they were kept before
+Recorded at the review of roadmap 5.5a. **OWNER.**
+**Scenario.** Under the timed mark sync, flagged batches then one default-level batch are committed after the last
+mark sync, and the file system is remounted within the boot. Before 5.5a two batches beyond a same-boot mark made it
+stale and rule 3 kept both; now flagged batches do not count, so the default-level batch is the one complete
+unflagged batch beyond the kept ones and rule 1 truncates it as a reset point (reported, the accepted limit of
+invariant 10). The wording "one batch" still holds; it happens more often in a store mixing levels.
+**Proposed.** Accept; `log.mark_sync = EveryCommit` avoids it, as today.
+
+## Q-259 — What sees a faster-level reading before it is durable
+Recorded at the review of roadmap 5.5a. **OWNER.**
+**As built (principle 3, renamed "React after acknowledgement"; invariants 2 and 11 relaxed).** Consumers,
+conditions, live state, the tree and the writer's own queries see a `written` reading once its batch is written;
+reader processes, cursor files and derived files see it only once synced. A consumer that sends commands on such a
+series can have its reason withdrawn by a reset point, or silently (Q-250, Q-254).
+**Proposed.** Confirm.
+
 ## Q-270 — Envelope damage that `EnvelopeError` has no variant for
 
 Recorded by roadmap 8.1b, which implements the envelope (`backup/src/envelope.rs`, `ChunkedXChaCha`). Decided
@@ -1134,6 +1416,7 @@ bucket with no manifest records, and the plan restores an empty log, restored en
 **Needed.** (a) The model's restored end to skip recorded lost ranges, as the plan does. (b) Whether a restore whose
 records list no copied file is refused (the model's rule, stated in the text) or restores an empty generation (the
 text as written). Suggested for (b): refuse, with a named error, since nothing would be restored.
+
 ## Q-301 — The files a resumed restore fetches
 Recorded by roadmap 8.3b.
 **Scenario.** A plan returns the restore record and the files to fetch; only the record is durable. A restore killed
@@ -1245,38 +1528,7 @@ to the call source, for one batch after a quiet period.
 after a late start, saturation with late wakes and stalls, a burst after a quiet period, a stray call at and just
 below the bound. macOS before and after:
 `docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
-## Q-341 — The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore
-Recorded when roadmap 8.3b was stacked on 8.1c. To be settled by roadmap 8.1d.
-**Scenario.** (a) `format.md` A.17 Probe has `attach_backup` put the checksum probe, with a wrong SHA-256, to a fresh
-`<sid>/probe/<nonce>`; the attach probe (`backup/src/upload/probe.rs`, Q-283) puts it to `<sid>/probe`, the
-conditional-write probe's key, and never builds `Keys::checksum_probe`. That is the folding Q-213 warned of: a bucket
-that does not check stores the wrong-hash object at `<sid>/probe` and is refused; at the next attach the key is
-present, the wrong-hash `put` fails with `Exists`, which cannot be told from a checked hash, and only the later
-checks of the reported hash stand between the refused bucket and its acceptance. The restore's probe
-(`backup/src/restore/probe.rs`) follows A.17. (b) A full restore's probe leaves at `<sid>/probe` an envelope of 16
-random bytes, for ever. The restored store then attaches to the bucket it was restored from: the attach probe puts
-its own fixed probe to that key with the right hash, the sink refuses it with `Exists`, and the attach fails with
-`Refused::Sink(Exists)`. This is the normal path of every restored store. The other order passes: a restore's probe
-accepts the object an earlier attach left.
-**Model.** Not modelled.
-**Needed.** One probe for both callers: the attach probe moved to A.17's form (the shared code in
-`restore/probe.rs`: an existing `<sid>/probe` must fail a second put and be reported unchanged, then the checksum
-probe under a fresh `<sid>/probe/<nonce>`), with tests of a second attach to a bucket refused once for
-`NoChecksums` and of an attach after a full restore; or A.17 amended to the attach probe's form with the reason.
-Neither path is reachable before 8.1d: `Store::attach_backup` and `Store::restore` return `NotSupportedYet`.
 
-## Q-342 — `backed_up_through` in a restored generation
-Recorded when roadmap 8.3b was stacked on 8.1c. To be settled by roadmap 8.1d.
-**Scenario.** A full restore installs segments 1 to 3 of generation 0 and writes its restore record, whose fold
-gives each file a deep copy and the verified mark (8.3a), so the upload queue skips them. The upload cursor counts a
-file as copied only from a fresh copy-verified record (`backup/src/upload/driver.rs` `fresh_copy`, `copied_at`;
-Q-280), and none is written for a file the queue skips. After the restore record and two later records of
-generation 1 are uploaded, the driver reports `backed_up_through: None` with nothing queued, and the figure stays
-there until a rebuild carries the restore record and the files are verified again. It under-reports, so nothing is
-evicted early.
-**Model.** Not modelled.
-**Needed.** Suggested: the cursor takes the files a fresh (uncarried) restore record lists as copied at its epoch,
-with a test of the figure after a restore; with `BackupStats` (8.1d), which reports it.
 ## Q-320 — Which bytes beyond a same-boot mark make a reset point
 
 **Scenario.** Three inputs the kill loop found, rare enough that a default run fails only now and then, as each run
@@ -1359,89 +1611,38 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
-## Q-220 — Where a log segment's plaintext hash lives, what it covers, and when it is computed
-Recorded by roadmap 6.3b, while computing the plaintext SHA-256 at seal (`kvik-log` `writer::seal_segment_described`).
-**Scenario.** §8 Hashes and the A.14 file description need a log segment's plaintext SHA-256, and A.14 says a file's
-header and trailer carry everything a record says about it. The A.9 trailer has 4 reserved bytes, and no hash can sit
-inside the bytes it covers. A blocked seal (A.13) runs again from step 1. A seal on `kvik-maint` would still hold up
-an acknowledgement if the commit thread waited for it. Restore (Q-290) needs every sealed-segment record to follow the
-lost-range records of the start before its seal.
-**Decided.** (a) The hash is over every byte of the sealed file, header to end marker, and only the file description
-holds it: the trailer is unchanged, so no version rule applies, and a rebuild computes the hash from the file
-(`format.md` A.9, A.14; `spec.md` §7 Manifest). (b) It is computed in the pass that computes `file_crc32c`, on
-`kvik-maint`; the commit thread never waits for it. (c) Once per seal: a blocked seal's retry reuses the seal blocks
-and hash of its first pass. (d) Each `SealedFile` is handed over once (`LogWriter::take_sealed`, `Log::take_sealed`),
-after the `.kvl` name and the directory are synced, with the segment's length, which A.14 does not hold. (e) The
-sealed-segment record is appended after the seal from that description, and the seal does not wait for it. No
-description leaves the writer before the start that preceded it has synced its lost-range records, and a start that
-cannot write one is read-only and hands out none, so a record appended from a description has an epoch above them
-(`format.md` A.14). `log/tests/seal_hash.rs`: `the_hash_is_sha256_of_the_sealed_files_bytes`,
-`a_blocked_seal_reads_and_hashes_its_segment_once`, `the_commit_thread_acknowledges_while_a_seal_is_hashing`;
-`log/tests/seal_describe.rs`: `no_description_leaves_the_writer_before_the_starts_lost_range_records`,
-`a_start_that_cannot_record_a_loss_is_read_only_and_describes_nothing` (step 4),
-`no_description_leaves_the_writer_before_the_gap_below_a_recovery_entry_is_recorded`,
-`a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing` (step 6),
-`no_segment_is_described_after_a_fault`.
-**Needed.** Roadmap 6.3c appends the record from the descriptions (through `StartOptions::sealed`, which still
-refuses until then) with an epoch above the manifest's last, which keeps (e); `From<&SealedFile>` for the `kvik-files`
-file description is 6.3c's.
+## Q-341 — The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore
+Recorded when roadmap 8.3b was stacked on 8.1c. To be settled by roadmap 8.1d.
+**Scenario.** (a) `format.md` A.17 Probe has `attach_backup` put the checksum probe, with a wrong SHA-256, to a fresh
+`<sid>/probe/<nonce>`; the attach probe (`backup/src/upload/probe.rs`, Q-283) puts it to `<sid>/probe`, the
+conditional-write probe's key, and never builds `Keys::checksum_probe`. That is the folding Q-213 warned of: a bucket
+that does not check stores the wrong-hash object at `<sid>/probe` and is refused; at the next attach the key is
+present, the wrong-hash `put` fails with `Exists`, which cannot be told from a checked hash, and only the later
+checks of the reported hash stand between the refused bucket and its acceptance. The restore's probe
+(`backup/src/restore/probe.rs`) follows A.17. (b) A full restore's probe leaves at `<sid>/probe` an envelope of 16
+random bytes, for ever. The restored store then attaches to the bucket it was restored from: the attach probe puts
+its own fixed probe to that key with the right hash, the sink refuses it with `Exists`, and the attach fails with
+`Refused::Sink(Exists)`. This is the normal path of every restored store. The other order passes: a restore's probe
+accepts the object an earlier attach left.
+**Model.** Not modelled.
+**Needed.** One probe for both callers: the attach probe moved to A.17's form (the shared code in
+`restore/probe.rs`: an existing `<sid>/probe` must fail a second put and be reported unchanged, then the checksum
+probe under a fresh `<sid>/probe/<nonce>`), with tests of a second attach to a bucket refused once for
+`NoChecksums` and of an attach after a full restore; or A.17 amended to the attach probe's form with the reason.
+Neither path is reachable before 8.1d: `Store::attach_backup` and `Store::restore` return `NotSupportedYet`.
 
-## Q-221 — A read that fails while hashing, and sealed segments no record names
-Recorded by roadmap 6.3b with Q-220. The spec names write and sync failures (§3) but no read failure outside them.
-**Scenario.** (a) A read of the segment fails during the seal's pass. (b) A start finds sealed segments that no record
-names (§7 Manifest: an unlisted sealed log segment is listed again); until records are appended at seal that is
-every sealed segment, at every start. (c) Such a segment cannot be read whole, its header disagrees with its name,
-its trailer or end marker is not valid, or its `file_crc32c` does not match.
-**Decided (the conservative choice in each case).** (a) As before the hash: the seal fails as a write failure on the
-log (read-only, fatal health; the next start seals it again from step 1), so no segment takes its `.kvl` name
-without a hash. (b) The start does not read them; a segment is named by generation and `file_id`, so a record of
-another generation does not list it. A sealed-segment, a publish-and-retire and a restore record list segments (the
-restore's field 9, set-aside segments included), so a segment a restore placed is not described and listed again in
-the new generation (scenario from the review of roadmap 6.3b: after a restore, earlier generations' segments are named
-only by the `0x25`). The writer hands them out one at a time (`LogWriter::take_unlisted`, run by
-`writer::describe_sealed` on `kvik-maint`), only while no seal is ready or running and the store is writable, outside
-`seals_running` and `sealed_segments`. Once a shutdown begins none is handed out, and one in flight is dropped before
-its next file operation (a read is at most 1 MiB), so neither a start nor a shutdown waits for a description beyond
-the read under way; one not described when the writer stops is found again at the next start (the owner's ruling at
-the review of roadmap 6.3b; scenario: a stop in the first minutes of a run, with every sealed segment still queued,
-waited for a whole segment's read). (c) No description
-(`DescribeError`): the segment stays unnamed, nothing is written and no fault is set; a damaged file's hash is never
-taken as the hash at seal. A failure to open or read it (`DescribeError::Io`: a sharing violation, a descriptor limit,
-a permission, an I/O error that may clear) is retried within the run, 10 s after the first failure and then twice as
-long each time up to 10 minutes (`DESCRIBE_RETRY_INTERVAL`, `DESCRIBE_RETRY_MAX`), at the writer's timer, so never
-in a busy loop: a retry time counts for the writer's next turn only while it could be handed out (none in flight, no
-seal ready or running), and what closes that gate wakes the writer when it ends (scenario from the re-check of
-roadmap 6.3b: a retry due while another description was reading spun the writer loop); the segment stays unlisted meanwhile, and health names it once the wait reaches its cap (Q-640). Only a failed check
-(`NotSealed`, `Invalid`: header, trailer, end marker, `file_crc32c`) is damage: health is degraded by
-`Reason::SegmentDamaged { file_id }` (`api.md` Health; `spec.md` §8 Corrupt block, §11) while the writer runs, and
-raised again at each start until a description succeeds: a damaged unlisted segment is damaged data, held degraded
-like a `data_lost` (Q-124 (a)) but ended by repair, not by an acknowledgement (the owner's rulings on (c), at the
-review of roadmap 6.3b; scenario for the retry: an open refused for a sharing error was reported as a damaged segment
-for the rest of the run, while the same error on a seal is `SealBlocked` and retried, A.13). `log/tests/seal_hash.rs`:
-`a_read_error_while_sealing_is_a_write_failure_on_the_log`; `log/tests/seal_describe.rs`:
-`a_start_describes_every_sealed_segment_no_record_names`,
-`a_start_skips_every_segment_a_record_lists_by_generation_and_id`,
-`no_segment_is_described_while_a_seal_is_ready_or_running`,
-`a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread`,
-`a_shutdown_drops_a_description_in_flight_before_its_next_read`,
-`a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow`,
-`a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it`,
-`a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears`,
-`a_due_retry_that_cannot_be_handed_out_does_not_wake_the_writer_at_once`,
-`a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
-`describe_sealed_refuses_each_check_it_makes`,
-`a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
-the records `kvik-files` encodes,
-`listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`).
-(d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
-outside the crate. Scenario (the review of roadmap 6.3b): a branch that matched every log reason stopped compiling
-once `SegmentDamaged` merged, with no textual conflict to warn of it. `kvik` maps those it knows and reports any other
-as `kvik::Reason::Other { reason }`, its debug form, which degrades health: a reason never vanishes from health (the
-lead's ruling at the re-check of roadmap 6.3b; scenario: a reason added to the log but not to `kvik`'s mapping would
-otherwise be dropped silently). `kvik/src/durable/mod.rs`
-`a_log_reason_the_mapping_does_not_name_stays_in_health_with_its_name`, through the `kvik-log` feature
-`unmapped-reason`, which only `kvik`'s tests enable.
-**Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
+## Q-342 — `backed_up_through` in a restored generation
+Recorded when roadmap 8.3b was stacked on 8.1c. To be settled by roadmap 8.1d.
+**Scenario.** A full restore installs segments 1 to 3 of generation 0 and writes its restore record, whose fold
+gives each file a deep copy and the verified mark (8.3a), so the upload queue skips them. The upload cursor counts a
+file as copied only from a fresh copy-verified record (`backup/src/upload/driver.rs` `fresh_copy`, `copied_at`;
+Q-280), and none is written for a file the queue skips. After the restore record and two later records of
+generation 1 are uploaded, the driver reports `backed_up_through: None` with nothing queued, and the figure stays
+there until a rebuild carries the restore record and the files are verified again. It under-reports, so nothing is
+evicted early.
+**Model.** Not modelled.
+**Needed.** Suggested: the cursor takes the files a fresh (uncarried) restore record lists as copied at its epoch,
+with a test of the figure after a restore; with `BackupStats` (8.1d), which reports it.
 
 ## Q-640 — A description that never stops failing to open or read its segment
 Recorded at the review of roadmap 6.3b, with the retry of Q-221 (c); settled by the lead's ruling at its re-check.
@@ -1484,6 +1685,21 @@ crafted files to be bounded rather than placed outside the budget. The failed-re
 **Needed.** The owner's choice: amend the published promise (crafted files bounded at about 2 s per 64 MiB, outside
 the 1 s budget), or tighten the bound by other means (a cheaper body check, or each kept body checked once).
 
+## Q-680 — `Outcome::Recorded` carrying the level and `LogStats.acknowledged`
+Recorded at the review of roadmap 5.5a. **OWNER** (public interface).
+**As built (`api.md` Writing, Health).** `Outcome::Recorded` gains `durability`, the level the reading was
+acknowledged at; `LogStats` gains `acknowledged` beside `durable` ("durable up to"). Not in the model.
+**Proposed.** Accept.
+
+## Q-681 — What `max_unsynced` bounds
+Recorded at the review of roadmap 5.5a. **OWNER** only if a hard bound is wanted.
+**Scenario.** The writer starts the log sync 1 s after the first flagged batch, and the device takes 3 s to complete
+it while flagged batches keep arriving; a power loss then removes about 4 s of acknowledged readings.
+**As built.** The text says what holds: an event removes what was written since the last log sync that returned,
+and the writer starts that sync at the latest `max_unsynced` after the first flagged batch (spec §2.1, invariant 10;
+`api.md` Configuration). **Proposed.** Keep the wording; a hard bound would make ingest of `written` series wait
+while a sync overruns.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1496,7 +1712,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1529,7 +1745,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-161 | 8.3 | Restore's own claim marker; recorded by roadmap 8.2; the marker's layout, with the nonce, is in `format.md` A.17 (roadmap 8.1a) |
 | Q-163 | 8.3 | Reading the claims on a lagging bucket; recorded by roadmap 8.2 |
 | Q-164 | 8.1, 8.3 | Interface points deferred to 8.2: (a) and (b) with 8.1, (c) with 8.3; recorded by roadmap 8.2 |
-| Q-170 | 5.5a | Durability levels per source; decided by the owner, design and spec text at 5.5a |
 | Q-173 | 6.3b | The operator call `rebuild_manifest`; recorded by roadmap 6.3a; its signature and finality come with the call in `api.md`, which 6.3b adds |
 | Q-175 | 6.3b | An intermediate output no record and no local file describes; recorded at the review of roadmap 6.3a; needs two corrupt merges, so it arises only once 6.3b publishes compaction outputs |
 | Q-190 | 6.4 | Parquet export schema; recorded by roadmap 6.4a; owner decision pending |
@@ -1569,6 +1784,18 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-650 | 6.3b | OWNER. A manifest search past a window with no later record: torn (built, provisional) or corrupt (proposed, safer, needs a new span form); recorded by the fix round of roadmap 4.9d |
 | Q-651 | 4.9 | OWNER. Gate; the crafted-file worst case (about 2 s per 64 MiB segment) against the 1 s restart budget; recorded at the re-check of roadmap 4.9d |
+| Q-250 | 5.5b | Unsynced faster-level batches lost to a remount; recorded by roadmap 5.5a; owner decision pending |
+| Q-251 | 5.5b | `possible_loss` for the faster level; recorded by roadmap 5.5a; decided provisionally, the clean-shutdown refinement open; owner confirmation pending |
+| Q-252 | 5.5c | A per-call sync and the `max_unsynced` default; recorded by roadmap 5.5a; owner decision pending |
+| Q-253 | 5.5b | The commit-block flag in reserved bytes; recorded and decided by roadmap 5.5a, the block type left to 5.5b; owner confirmation pending |
+| Q-254 | 5.5b | Faster-level batches evicted after a failed write-back; recorded at the review of 5.5a; owner decision pending |
+| Q-255 | 5.5b | Cutting calls of two levels into batches; recorded at the review of 5.5a; owner confirmation pending |
+| Q-256 | 5.5b | `set_durability` at run time; recorded at the review of 5.5a; owner confirmation pending |
+| Q-257 | 5.5b | Out-of-order loss as `data_lost`; recorded at the review of 5.5a; owner confirmation pending |
+| Q-258 | 5.5b | Default-level batches truncated after flagged ones on a remount; recorded at the review of 5.5a; owner confirmation pending |
+| Q-259 | 5.5b | Visibility before durability; recorded at the review of 5.5a; owner confirmation pending |
+| Q-680 | 5.5b | `Outcome` level and `LogStats.acknowledged`; recorded at the review of 5.5a; owner confirmation pending |
+| Q-681 | 5.5b | What `max_unsynced` bounds; recorded at the review of 5.5a; owner decision only for a hard bound |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1787,7 +2014,8 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-150 | Canonical bytes of the zstd-compressed XOR fallback | `format-chunk.md` C.8 and C.10 (settled at the review of roadmap 6.1 by option (2): encodings 4 and 5 are one canonical class, compared by the XOR stream they hold; the class is the canonical choice when the XOR payload is strictly shorter than every other candidate, never by a compressed length, and an encoding 5 payload is canonical only when shorter than its stream; cost over 2,000 rows, in bytes of XOR / best other / compressed XOR / in the class: a °F→°C walk changing every row 9,767 / 12,141 / 3,591 / yes, a two-level flicker 6,284 / 9,045 / 1,057 / yes, a cycle of five ninths 13,255 / 13,146 / 191 / no, so written in delta; rejected: the class winning within 1/16 of the best other candidate, which recovers such cycles but makes blocks up to about 1.5 % larger on common data where zstd finds nothing (a sine: 16,243 against 16,000), and common data matters more than that shape; the payload is exactly one frame, no dictionary, no checksum, no skippable frame; no level or library is pinned; `chunk/src/block/tests.rs` `xor_class_membership_ignores_compressed_length`, `xor_class_is_canonical_in_either_encoding_and_any_frame`); roadmap 6.5 measures a pure-Rust codec |
 | Q-121 | Series id 0 against an id floor of 0 | §2.1 `id`, `format.md` A.6 field 46 and A.10 `max_series_id` (settled by roadmap 5.1, which assigns ids: ids start at 1 and 0 names no series, so a highest id assigned or an id floor of 0 means none; the model's registry assigns from 1). Scenario: the model assigned ids from 0, so the mark's `max_series_id` and a recovery entry's id floor were 0 both in a store that had assigned no id and in one whose only series was id 0; read literally, "above every id floor" then forbade id 0 after a power loss in an empty store, and no reader of the floor could tell id 0 from none. Decoders do not refuse id 0, so files written before stay readable (`kvik/tests/durable.rs`, `ids_start_at_one_and_never_reuse_a_floor`) |
 | Q-124 | Loss reports of recovery entries, and the order of lost ranges against saved points | §3 Recovery rule 3, Order of a start step 4, §7 Readers, §11 Health, invariant 10, rows 7, 7a and 12a, `format.md` A.14 field 13 (settled after roadmap 5.1a: (a) by the owner's ruling, (b)–(d) at its review). (a) The gap of a recovery entry (positions between K and F) is a `data_lost` with cause truncated tail, which holds health degraded until acknowledged; a `possible_loss` is one per recovery entry that names a non-empty tail, a mark not readable or stale, or a missing or unreadable cursor file. (b) A `possible_loss` has its entry's position, F, as identity; identities are unique within a kind. (c) A lost-range record carries the reset stamp in force when it is written; with none known it counts as later than every reset the start found. (d) A loss reported as found by a start that could not write is not lost when a later start finds the damaged batch as a torn tail: this adds a behaviour, that start keeps reporting it as a `data_lost` under the same identity, the entry's gap (positions named above K), now recorded. Scenario: §11 listed the gap as a `possible_loss` while the engine reported it as a `data_lost`; the engine named a `possible_loss` by K + 1, which two entries can share (an entry at K + 1 lost with the mark, the next written at K + 2 with `after` = K); a lost range found later below an entry could not be told from one recorded before it, so a saved point could not be checked against it; and a found loss could vanish from the list, against invariant 27 (`tests/rules.rs` `s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry`, `s7_saved_point_and_a_lost_range_recorded_with_the_mark_lost`, `s7_saved_points_across_a_gap_and_its_lost_entry`, `s11_a_found_loss_stays_reported_after_the_mark_is_lost`; `log/tests/model_histories.rs`) |
-| Q-125 | Bytes damaged beyond a same-boot mark | §3 Recovery rule 1, Order of a start steps 5 and 6, row 7, invariant 10 (settled after roadmap 5.1a by the owner's ruling: a complete batch or any non-zero byte beyond the mark is a reset point, with a recovery entry, a new reset stamp and a `possible_loss`; damaged batches beyond the mark go into that entry's tail, so one entry at K + 1 describes them). This amends the Q-118 (e) ruling: "whenever it truncates a complete batch" becomes "whenever it truncates a complete batch or any non-zero byte beyond the mark"; a write cut short on the same boot now also costs a recovery entry and a report. Scenario: with a timed mark sync, a batch was acknowledged and delivered, the file system was remounted within the boot, and that batch, now beyond the mark, was then damaged; it looked like the garbage of a write cut short, so rule 1 truncated it with no recovery entry, no loss and no reset point, and its positions were given again (`tests/rules.rs` `s3_damaged_bytes_beyond_a_same_boot_mark_are_a_reset_point`, `s3_damaged_and_complete_batches_beyond_a_same_boot_mark_are_one_reset`; `log/tests/recovery.rs` `damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point`, which fails on the earlier rule). See Q-170: its faster durability level (acknowledged once written) promises that a reading survives a crash of the process, but rule 1 truncates everything beyond the mark on the same boot; for that level rule 1, principle 3 and invariant 2 must be rewritten to keep checksum-valid complete batches beyond the mark (roadmap 5.5a) |
+| Q-125 | Bytes damaged beyond a same-boot mark | §3 Recovery rule 1, Order of a start steps 5 and 6, row 7, invariant 10 (settled after roadmap 5.1a by the owner's ruling: a complete batch or any non-zero byte beyond the mark is a reset point, with a recovery entry, a new reset stamp and a `possible_loss`; damaged batches beyond the mark go into that entry's tail, so one entry at K + 1 describes them). This amends the Q-118 (e) ruling: "whenever it truncates a complete batch" becomes "whenever it truncates a complete batch or any non-zero byte beyond the mark"; a write cut short on the same boot now also costs a recovery entry and a report. Scenario: with a timed mark sync, a batch was acknowledged and delivered, the file system was remounted within the boot, and that batch, now beyond the mark, was then damaged; it looked like the garbage of a write cut short, so rule 1 truncated it with no recovery entry, no loss and no reset point, and its positions were given again (`tests/rules.rs` `s3_damaged_bytes_beyond_a_same_boot_mark_are_a_reset_point`, `s3_damaged_and_complete_batches_beyond_a_same_boot_mark_are_one_reset`; `log/tests/recovery.rs` `damaged_bytes_beyond_the_mark_after_a_remount_are_a_reset_point`, which fails on the earlier rule). See Q-170: its faster durability level (acknowledged once written) promises that a reading survives a crash of the process, but rule 1 truncates everything beyond the mark on the same boot; rule 1, principle 3 and invariants 2 and 11 were rewritten for that level at roadmap 5.5a, keeping complete flagged batches beyond the mark while this ruling still governs what lies after them |
+| Q-170 | Durability levels chosen per source | `spec.md` §1 principles 3 and 5, §2.1 `durability`, §3 Batches, Commit, Group commit, Recovery rules 1–3, Order of a start steps 2 and 3, §4 Overflow, §9 rows 7, 7a and 12, invariants 2, 10 and 11, §11; `format.md` A.6 fields 28 and 48, A.7 `flags`, A.10; `api.md` Series, Writing, Configuration, Health (settled at roadmap 5.5a from the owner's decision; open parts Q-250 to Q-253) |
 | Q-171 | A provisional manifest rebuild across a restart | `spec.md` §7 Deep unreachable, `format.md` A.14 (decided at the review of roadmap 6.3a, the restart point decided by the owner: at open, a rebuild record that no acknowledgement record names is provisional, so the holds survive a restart, until the mirror path and deep answer in that run for every corrupt span it stands for, or are not configured; a provisional rebuild's acknowledgement is refused, also at append; after a restart with deep unreachable, a rebuild that was final but not yet acknowledged is provisional again, and health stays degraded until deep answers). The format change is rebuild record field 7 in `format.md` A.14, an optional repeated field; a rebuild record without it still reads. The residual found at that review, that after a restart only the first corrupt record (fields 1 and 2) was known, so a later span whose loss only deep's copy holds could be dropped once the first answered, is closed by rebuild record field 7 (`format.md` A.14), which lists every corrupt span with the epochs around it and is read at every start (a rebuild record without it falls back to fields 1 and 2, bounded above by the first record it carried past them). `q171_every_corrupt_record_is_asked_for_again_after_a_restart`, `q171_after_a_restart_a_corrupt_record_whose_epoch_jumped_is_still_taken_from_deep`, `files/tests/rebuild_copies.rs`, `q171_a_rebuild_no_acknowledgement_names_stays_provisional_across_a_restart`, `q171_a_final_rebuild_not_yet_acknowledged_holds_again_after_a_restart`, `q171_a_final_unacknowledged_rebuild_restarted_with_deep_unreachable_is_provisional_until_deep_answers`, `q171_a_rebuild_of_two_corrupt_records_is_final_only_once_both_have_their_answers` |
 | Q-174 | Adjacent corrupt records read as one | `spec.md` §7 Deep unreachable, `format.md` A.14 field 6 (decided at the review of roadmap 6.3a: a corrupt span whose next valid epoch is more than 2 above the last valid one before it counts as two corrupt records for the field-6 count, accepting a count that may include a loss whose identity is right after a legitimate epoch jump) |
 | Q-91 | Funnel identity across configuration, run-time routes and restarts | `api.md` Consuming (a funnel equal to one in force is that funnel), §4 Funnel, Routing, §6 Latch, row 16 (owner's rulings at the review of roadmap 5.2 and its audit: a funnel is identified by its consumer's name and its funnel id, both in the routing change; a new funnel's id is one above the highest any routing change of the consumer named, removed funnels included, so an id is never given again; the routing table is rebuilt from the log at every start; a latch belongs to the incarnation that wrote it, the position of the routing change that added the funnel, and is dropped with the funnel. (c) `Consumer::route` with a funnel equal to one in force adds nothing: it returns that funnel's id, writes no routing change and keeps the latch, so an application may route its funnels at every start, as `api.md`'s example does; on both backends. (a) and (b) do not arise while the interface declares no funnels in configuration; the item that adds them records them again). Scenario: an application routes `above 10` at every start; the value rises to 20 while it is down; after the restart its route returns the same id, the funnel is not doubled, and the resync that ends the resume reports the condition true as a transition, once; at the next start, routing again, it is no transition (`kvik/tests/consumers.rs` `routing_again_at_every_start_keeps_the_funnel_and_delivers_a_change_once`) |
@@ -1917,6 +2145,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Rule | Specification | Model now | Test (`tests/model.rs` unless stated) |
 |---|---|---|---|
 | Commit time and as-of time | §2.2, §2.3 | As-of by `received_at` | — |
+| Durability levels | §2.1 `durability`, §3 Batches, Commit, Recovery rules 1–3 | The level is fixed for the life of a series (no parameter change, Q-60, Q-256), so the registry at K is read from the definitions; the queue commits as one batch, flagged only when every reading is at the `written` level (the engine cuts the queue by call into runs of one class, Q-255); `max_unsynced` is the caller's `sync_log`; batches reach the disk in order, so an invalid region before a complete flagged batch (rule 2, Q-257) and writing kept batches again are not modelled; adoption is not modelled; `Outcome`'s level and `LogStats.acknowledged` are not modelled (Q-680); a failed sync keeps its flagged batches on the same boot unless `evict_failed_write_back` drops them (Q-254); `remount_keeping` says how many unsynced flagged batches reached the disk (Q-250) | `tests/durability.rs` |
 | Effective-dated parameters | §2.1, §5.1 | Every parameter (staleness limit, expected interval, counter rules, lateness bound) is fixed for the life of a series, so neither a later change of the expected interval, which leaves the stored levels as they are (§5.1), nor a past-effective change of a parameter a node depends on (Q-83) arises | `calendar_depends_on_zone_utc_levels_do_not` |
 | Zones compared by canonical name | §5.7: "after resolving IANA links" | The bundled database has no link table, so a zone's identity is a fingerprint of its bundled rules (initial offset and abbreviation, every transition to 2200), which a link shares; two zones with identical rules would count as one. Europe/Amsterdam is a link to Europe/Brussels there | `tests/rules.rs` `s5_7_named_zone_compared_after_resolving_links` |
 | tzdata version | §5.7: recorded per calendar file | The bundled database is labelled `bundled`; a later release is the bundled data with one zone's rules replaced (`Tzdb::with_rules`) | `tests/edge_cases.rs` `row_21_tzdata_change_rebuilds_the_affected_days` |

@@ -69,6 +69,7 @@ The keys roadmap section 4 needs; all may change between opens.
 | `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact force a mark sync at once either way |
+| `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |
 | `limits.ingest_queue` | `usize` readings | 65,536 | ≥ 1,024; a call is at most `min(65,536, ingest_queue)` readings |
 | `limits.series_ceiling` | `u32` | 100,000 | |
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
@@ -156,11 +157,13 @@ let id: SeriesId = store.define_series(
                     Kind::Gauge { value: ValueType::Decimal { scale: 1 } },   // ValueType::decimal() declares scale 4
                     "°C")
         .expected_interval(Duration::from_secs(1))
-        .excess_precision(ExcessPrecision::Round),   // default; or Refuse, or AutoRaise { max_scale }
+        .excess_precision(ExcessPrecision::Round)    // default; or Refuse, or AutoRaise { max_scale }
+        .durability(Durability::Synced),             // default; or Written (spec §2.1 `durability`)
 ).await?;
 store.set_parameters(id, effective_from, ParameterChange::default().staleness(s)).await?;
 store.raise_scale(id, 3).await?;              // from this entry's position on; never lowered
 store.set_excess_precision(id, ExcessPrecision::AutoRaise { max_scale: 6 }).await?;   // from this entry's position on
+store.set_durability(id, Durability::Written).await?;                             // from this entry's position on
 store.alias(id, "plant/line-1/temp").await?;
 store.retire(id, t_r).await?;
 let info = store.series(id)?;                 // also by name
@@ -174,7 +177,14 @@ retires and defines anew. A higher scale is set with `raise_scale`, which append
 largest magnitude stored so far would overflow `i64` at it. Earlier facts keep their scale and are returned rescaled
 exactly to the current one. `set_excess_precision(id, policy) -> Result<(), DefineError>` appends a parameter change
 that takes effect at its position (spec §2.1 `excess precision`); a maximum scale below the current scale is
-`DefineError::Invalid`.
+`DefineError::Invalid`. `set_durability(id, level) -> Result<(), DefineError>` appends a parameter change that takes
+effect at its position (spec §2.1 `durability`); `enum Durability { Synced, Written }`, `Synced` by default.
+`Written` acknowledges and delivers a reading once its batch is written, before its sync (after any default-level
+sync already in flight, Q-255). A crash or restart of the process keeps it while the page cache holds it. A power
+loss or a kernel crash before its sync returns can remove it: a later start reports `PossibleLoss` with a reset point,
+or `DataLost` when a later batch reached the disk and it did not (Q-257). Two removals go unreported (open): a
+remount within the boot (Q-250), and a failed sync whose pages are evicted before a restart on the same boot (Q-254).
+Every call in this section is synced whatever the level, and a change of level takes effect at its position (Q-256).
 
 An interval series (spec §2.1) has a fixed length or a calendar length, a local day or month in a zone fixed for the
 series; a day may start at a declared local time instead of midnight:
@@ -194,7 +204,7 @@ pub async fn emit(&self, readings: &[Reading]) -> Result<Ack, EmitError>;       
 pub fn try_emit(&self, readings: &[Reading]) -> Result<Pending, EmitError>;         // never waits; Err(Busy(w))
 pub struct Pending;  /* impl Future<Output = Result<Ack, EmitError>> */              // may be dropped
 pub struct Ack { pub outcomes: Vec<Outcome> }                                        // one per reading, by index
-pub enum Outcome { Recorded { position: Position, outranked: bool, unchecked: bool, rounded: bool, out_of_range: bool },
+pub enum Outcome { Recorded { position: Position, durability: Durability, outranked: bool, unchecked: bool, rounded: bool, out_of_range: bool },
                    Duplicate, Refused(Refusal) }
 impl Ack { pub fn first(&self) -> Option<Position>; pub fn last(&self) -> Option<Position>;
            pub fn duplicates_dropped(&self) -> u32; pub fn refused(&self) -> impl Iterator<Item = (usize, Refusal)>; }
@@ -205,11 +215,16 @@ store.emit_with(&readings, Intent::Revise).await?;
 - **One call is one batch unit:** its readings are committed in one batch or not at all, in order. A call is at
   most `min(65,536, limits.ingest_queue)` readings and 8 MiB plain-encoded (`EmitError::TooLarge` otherwise; the
   caller splits). Several calls may share a batch. Calls from different tasks are ordered by commit.
-- Outcomes are decided at commit (a retirement committed while a reading waits refuses it). `emit` and `Pending`
+- Outcomes are decided at commit (a retirement committed while a reading waits refuses it). Calls share a batch only
+  with calls of the same class (spec §3 Batches, Q-255): a call all of whose readings are of series at
+  `Durability::Written` goes into a flagged batch, and `emit` and `Pending` resolve once it is written, after any
+  default-level sync already in flight; every `Recorded` outcome carries the level it was acknowledged at, here
+  `Written`. Any other call resolves at the default level, its outcomes say `Synced`: `emit` and `Pending`
   resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
   the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
   a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
-- **An acknowledgement means durable**, for every outcome. A call none of whose readings is recorded writes no
+- **An acknowledgement means durable at its level**, for every outcome: after the sync for `Synced`, in the
+  operating system's cache for `Written` (`LogStats.durable` says how far the sync has reached). A call none of whose readings is recorded writes no
   batch; if one of them is a duplicate of a reading queued by an earlier call that is not yet acknowledged, the call
   resolves only when that earlier call does, with its result: its outcomes if that call is acknowledged, its error
   (`OutcomeUnknown`, `ReadOnly` or `Closed`) if not. A call with readings to record resolves with its own batch,
@@ -386,7 +401,7 @@ pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), Write
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
 pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
-// LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
+// LogStats { acknowledged: Position, durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
@@ -419,6 +434,9 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   `LossCause::Unknown` is the cause of a loss that a manifest rebuild found again with no cause given by a valid
   record or recovery entry. Losses that a rebuild lists under their first missing position because no valid record
   names their identity are counted in `LogStats.loss_identities_rebuilt` (and in the rebuild record).
+  `acknowledged` is the last position acknowledged at either level and `durable` the last synced one ("durable up
+  to"); they differ only while flagged batches wait for their sync (spec §3 Commit). A recovery entry written while
+  a series is at `Durability::Written` is a `PossibleLoss` (spec §3 Recovery rule 3; Q-251).
   `SealBlocked` lasts until the seal succeeds. `SegmentDamaged` names a sealed segment that no manifest record lists
   and that fails its checks (`format.md` A.9, Q-221 (c)): it lasts while the store runs and is raised again at each
   start until the file is repaired. A failure to open or read such a segment is retried; once the wait

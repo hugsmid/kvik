@@ -11,12 +11,12 @@
 in one library, with no database service.**
 
 kvik is designed to sit inside the application that talks to the devices. Readings go into a checksummed, append-only
-log and are synced to disk before anything reacts to them; the same library then delivers them to in-process
-consumers, keeps per-series summaries for drill-down from years to seconds, and moves old files to cheaper storage
-and an off-site bucket; the engine itself never deletes a fact. Typical uses are home and building automation, energy
-monitoring, small industrial or laboratory installations and edge devices: places where per-second data from many
-sources must be acted on quickly, kept for years and restored to a known, recorded point after a failure
-([who it is for](#who-it-is-for)).
+log and are synced to disk before anything reacts to them (a series may opt for acknowledgement once written); the
+same library then delivers them to in-process consumers, keeps per-series summaries for drill-down from years to
+seconds, and moves old files to cheaper storage and an off-site bucket; the engine itself never deletes a fact.
+Typical uses are home and building automation, energy monitoring, small industrial or laboratory installations and
+edge devices: places where per-second data from many sources must be acted on quickly, kept for years and restored to
+a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 
 > [!IMPORTANT]
 > **Status: design stage. The engine does not exist yet.**
@@ -39,14 +39,14 @@ sources must be acted on quickly, kept for years and restored to a known, record
 > | 2. Measurements before building | 3 of 3 done; gate 2.3 passed |
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, on macOS and the Linux NVMe target) |
-> | 5. Delivery | 2 of 8 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c)) |
+> | 5. Delivery | 2 of 10 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.5a, durability levels in the specification and the model, is written and waits for the owner's ruling on Q-250, Q-252 and Q-254 and confirmation of Q-251, Q-253, Q-255 to Q-259, Q-680 and Q-681) |
 > | 6. Compacted segments | 2 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
 > | 7. Summary tree | 1 of 5 done (7.1a, summary nodes: the fold, merge and byte layout) |
 > | 8. Tiers and backup | 1 of 4 done (8.2, the backup sink interface) |
 > | 9. Query | not started |
 > | 10. Scale | not started |
 >
-> 28 of 52 roadmap items are done, including 3 of 9 gates.
+> 28 of 54 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -77,7 +77,9 @@ sources must be acted on quickly, kept for years and restored to a known, record
 From [spec §1, §2.4 and §8](docs/spec.md#1-principles):
 
 - **Durable before anything reacts.** A batch of readings is synced and the durable mark moved before adapters are
-  acknowledged, summaries are updated or any consumer or reader process sees it.
+  acknowledged, summaries are updated or any consumer or reader process sees it; a series at the faster durability
+  level is acknowledged once written, its sync starting within `max_unsynced`, and reader processes still see it
+  only once synced.
 - **Late and corrected data are recorded.** A reading is never edited in place; a correction is a new fact and the
   old one stays as a revision. Sources that revise what they have published declare a *versioned series*, so a
   replay cannot undo a correction that carries a higher `changed_at`.

@@ -4,7 +4,8 @@
 //! take and confirm deliveries, crash, lose power (losing acknowledged
 //! batches above the last synced mark), remount, lose the mark or a cursor
 //! file, damage a batch, fail a start's sync, acknowledge losses, compact,
-//! upload, move files off the local tiers and let time pass.
+//! upload, move files off the local tiers and let time pass. A second series
+//! is at the `written` level: its batches are flagged (§3 Batches, Q-170).
 
 mod common;
 
@@ -33,6 +34,12 @@ fn cases(n: u32) -> ProptestConfig {
 enum ROp {
     /// Readings committed in one batch, with a fault or none.
     Ingest(u8, Option<kvik_model::engine::Fault>),
+    /// The same on the series at the `written` level: a flagged batch.
+    IngestWritten(u8, Option<kvik_model::engine::Fault>),
+    /// The log sync that `max_unsynced` bounds (§3 Commit).
+    SyncLog,
+    /// A power loss keeping this many flagged batches not yet synced.
+    PowerLossKeeping(usize),
     /// A definition: a batch that is not only facts forces a mark sync.
     Define,
     /// The timed mark sync fires.
@@ -54,7 +61,9 @@ enum ROp {
     /// A power loss losing up to this many acknowledged batches above the
     /// last synced mark.
     PowerLoss(usize),
-    Remount,
+    /// A remount after which this many flagged batches not yet synced
+    /// reached the disk (Q-250).
+    Remount(usize),
     LoseMark(bool),
     /// The mark is lost, then a power loss loses up to this many batches,
     /// below positions a cursor or a derived file may name.
@@ -95,7 +104,10 @@ fn arb_rop() -> impl Strategy<Value = ROp> {
         outcome.prop_map(Fault::SyncError),
     ];
     prop_oneof![
-        8 => (1u8..4, proptest::option::weighted(0.15, fault)).prop_map(|(n, f)| ROp::Ingest(n, f)),
+        8 => (1u8..4, proptest::option::weighted(0.15, fault.clone())).prop_map(|(n, f)| ROp::Ingest(n, f)),
+        4 => (1u8..4, proptest::option::weighted(0.15, fault)).prop_map(|(n, f)| ROp::IngestWritten(n, f)),
+        1 => Just(ROp::SyncLog),
+        1 => (0usize..3).prop_map(ROp::PowerLossKeeping),
         1 => Just(ROp::Define),
         1 => Just(ROp::SyncMark),
         12 => (0usize..2, 4usize..16).prop_map(|(c, n)| ROp::Take { c, n }),
@@ -104,7 +116,7 @@ fn arb_rop() -> impl Strategy<Value = ROp> {
         1 => (0usize..2).prop_map(|c| ROp::Reconnect { c }),
         1 => Just(ROp::Crash),
         2 => (0usize..4).prop_map(ROp::PowerLoss),
-        2 => Just(ROp::Remount),
+        2 => (0usize..3).prop_map(ROp::Remount),
         1 => any::<bool>().prop_map(ROp::LoseMark),
         1 => (1usize..4).prop_map(ROp::LoseMarkAndBatches),
         1 => (0usize..2).prop_map(|c| ROp::LoseCursor { c }),
@@ -129,13 +141,24 @@ struct Seen {
     /// Every fact each consumer received, by position: a different fact at
     /// a position received before is a reassigned position.
     facts: BTreeMap<(usize, kvik_model::types::Position), kvik_model::types::Fact>,
+    /// The facts each consumer received that no `resync` since has told it
+    /// to forget (`forget_above` below their position).
+    known: BTreeMap<(usize, kvik_model::types::Position), kvik_model::types::Fact>,
     reassigned: usize,
+    /// Reassigned positions that held a fact of the `written` series.
+    flagged_reassigned: usize,
+    /// Remounts with flagged batches not yet synced.
+    flagged_remounts: usize,
     forget_resyncs: usize,
     behind_resyncs: usize,
     forced_syncs: usize,
     stale: usize,
     gaps: usize,
     rule_1_resets: usize,
+    /// Starts on the same boot that kept flagged batches beyond the mark.
+    flagged_kept: usize,
+    /// Entries that are a `possible_loss` only for the `written` level.
+    written_resets: usize,
     acknowledged: usize,
     possible: usize,
     data_lost: usize,
@@ -156,17 +179,29 @@ struct Checks {
     inv25: bool,
     inv26: bool,
     inv27: bool,
+    /// §4 Resync, principle 5: a position is given again only after a
+    /// `resync` whose `forget_above` lies below it.
+    reuse: bool,
 }
+
+const NONE: Checks = Checks {
+    inv25: false,
+    inv26: false,
+    inv27: false,
+    reuse: false,
+};
 
 const ALL: Checks = Checks {
     inv25: true,
     inv26: true,
     inv27: true,
+    reuse: true,
 };
 
 struct RWorld {
     m: kvik_model::engine::Model,
     s: kvik_model::types::SeriesId,
+    fast: kvik_model::types::SeriesId,
     t: Nanos,
     defs: usize,
     last: [Option<kvik_model::engine::DeliveryId>; 2],
@@ -199,9 +234,22 @@ impl RWorld {
                 5 * SECOND,
             )
             .unwrap();
+        let fast = m
+            .define_with(
+                "market/feed/price",
+                Kind::Gauge,
+                kvik_model::types::ValueType::Number,
+                "1",
+                5 * SECOND,
+                kvik_model::registry::SeriesOptions::durability(
+                    kvik_model::registry::Durability::Written,
+                ),
+            )
+            .unwrap();
         RWorld {
             m,
             s,
+            fast,
             t: T0,
             defs: 0,
             last: [None, None],
@@ -221,6 +269,7 @@ impl RWorld {
         use kvik_model::recovery::MarkState;
         let entries = self.m.recovery_entries().len();
         let mark_boot = self.m.disk.mark.map(|m| m.boot);
+        let pending = self.pending_flagged();
         // A step that needs the engine starts it first, so histories spend
         // most of their time up.
         let needs_up = !matches!(
@@ -230,7 +279,9 @@ impl RWorld {
                 | ROp::Advance(_)
                 | ROp::Crash
                 | ROp::PowerLoss(_)
-                | ROp::Remount
+                | ROp::PowerLossKeeping(_)
+                | ROp::SyncLog
+                | ROp::Remount(_)
                 | ROp::LoseMark(_)
                 | ROp::LoseMarkAndBatches(_)
                 | ROp::LoseCursor { .. }
@@ -252,6 +303,21 @@ impl RWorld {
                 }
                 let _ = self.m.commit(*fault);
             }
+            ROp::IngestWritten(n, fault) if up => {
+                for _ in 0..*n {
+                    self.t += SECOND;
+                    let _ = self
+                        .m
+                        .emit(kvik_model::types::Reading::num(self.fast, self.t, 1.0));
+                }
+                let _ = self.m.commit(*fault);
+            }
+            ROp::SyncLog => self.m.sync_log(),
+            ROp::PowerLossKeeping(k) => {
+                if self.m.is_up() {
+                    self.m.power_loss_keeping(*k);
+                }
+            }
             ROp::Define if up => {
                 self.defs += 1;
                 let _ = self.m.define(
@@ -270,6 +336,9 @@ impl RWorld {
                 let cursor = self.m.disk.cursors.get(&RC[*c]).copied();
                 let points = self.m.reset_points();
                 for d in &got {
+                    if let Some(x) = d.resync().and_then(|r| r.forget_above) {
+                        seen.known.retain(|(k, p), _| *k != *c || *p <= x);
+                    }
                     if let Some(r) = d.resync()
                         && r.forget_above.is_some()
                     {
@@ -296,10 +365,21 @@ impl RWorld {
                             cursor
                         );
                     }
+                    if let Some(old) = seen.known.insert((*c, f.position), f.clone()) {
+                        prop_assert!(
+                            !self.checks.reuse || old == *f,
+                            "{:?} given again to {:?} with no forget_above below it: {:?}, then {:?}",
+                            f.position,
+                            RC[*c],
+                            old,
+                            f
+                        );
+                    }
                     if let Some(old) = seen.facts.insert((*c, f.position), f.clone())
                         && old != *f
                     {
                         seen.reassigned += 1;
+                        seen.flagged_reassigned += usize::from(old.series == self.fast);
                     }
                 }
                 if let Some(d) = got.last() {
@@ -324,7 +404,19 @@ impl RWorld {
             ROp::PowerLoss(n) => {
                 self.m.power_loss_losing(*n);
             }
-            ROp::Remount => self.m.remount(),
+            ROp::Remount(keep) => {
+                let unsynced = self.unsynced_flagged();
+                seen.flagged_remounts += usize::from(unsynced > 0);
+                // A remount that loses an acknowledged flagged batch is
+                // Q-250's open case, excluded from the reuse property: there
+                // every unsynced batch reached the disk.
+                let keep = if self.checks.reuse && unsynced > *keep {
+                    usize::MAX
+                } else {
+                    *keep
+                };
+                self.m.remount_keeping(keep);
+            }
             ROp::LoseMark(missing) => {
                 self.down();
                 let state = if *missing {
@@ -396,7 +488,23 @@ impl RWorld {
         if !matches!(op, ROp::Take { .. }) {
             self.last = self.last.map(|l| l.filter(|_| self.m.is_up()));
         }
+        if let Some(last) = pending
+            && self.m.is_up()
+            && self
+                .m
+                .disk
+                .mark
+                .is_some_and(|m| Some(m.boot) == mark_boot && m.last >= last)
+        {
+            seen.flagged_kept += 1;
+        }
         for (p, e) in self.m.recovery_entries().into_iter().skip(entries) {
+            seen.written_resets += usize::from(
+                e.written_level
+                    && e.tail.is_empty()
+                    && e.mark_state == MarkState::Readable
+                    && e.cursors_missing.is_empty(),
+            );
             seen.stale += usize::from(e.mark_state == MarkState::Stale);
             seen.gaps += usize::from(e.gap(p).is_some());
             seen.rule_1_resets +=
@@ -405,8 +513,58 @@ impl RWorld {
         self.check(seen)
     }
 
+    /// Flagged batches beyond the page cache's mark: written, not yet synced
+    /// (§3 Commit).
+    fn unsynced_flagged(&self) -> usize {
+        let d = &self.m.disk;
+        let (Some(f), false) = (d.active, d.cache_lost) else {
+            return 0;
+        };
+        let floor = d
+            .mark
+            .map_or(0, |m| if m.file == f { m.batches } else { 0 });
+        d.flagged
+            .iter()
+            .filter(|(g, b)| *g == f && *b >= floor)
+            .count()
+    }
+
+    /// The last position of the flagged batches beyond the mark while the
+    /// engine is down on the boot that wrote them, which a start keeps (§3
+    /// Recovery rule 1).
+    fn pending_flagged(&self) -> Option<kvik_model::types::Position> {
+        let d = &self.m.disk;
+        let (f, mark) = (d.active?, d.mark?);
+        if self.m.is_up() || mark.boot != self.m.boot {
+            return None;
+        }
+        let floor = if mark.file == f { mark.batches } else { 0 };
+        let batches = &d.files[&f].batches;
+        let run = (floor..batches.len()).take_while(|b| d.flagged.contains(&(f, *b)));
+        run.last()
+            .and_then(|b| batches[b].last())
+            .map(|e| e.position)
+    }
+
     fn check(&self, seen: &mut Seen) -> Result<(), TestCaseError> {
         let m = &self.m;
+        // §3 Batches: a flagged batch holds only facts of a series at the
+        // `written` level (none once damaged), so no flag outlives the batch
+        // it was written for.
+        for (f, b) in &m.disk.flagged {
+            let batch = m.disk.files.get(f).and_then(|x| x.batches.get(*b));
+            let facts_of_fast = batch.is_some_and(|x| {
+                x.iter()
+                    .all(|e| e.fact().is_some_and(|ft| ft.series == self.fast))
+            });
+            prop_assert!(
+                facts_of_fast,
+                "flag on {:?} batch {} that holds {:?}",
+                f,
+                b,
+                batch
+            );
+        }
         if !m.is_up() {
             return Ok(());
         }
@@ -541,7 +699,7 @@ proptest! {
     fn inv25_nothing_above_forget_above_before_the_reset_point_is_confirmed(
         ops in proptest::collection::vec(arb_rop(), 1..120)
     ) {
-        run_recovery(&ops, &mut Seen::default(), Checks { inv25: true, inv26: false, inv27: false })?;
+        run_recovery(&ops, &mut Seen::default(), Checks { inv25: true, ..NONE })?;
     }
 
     /// 26. No cursor file or derived file is written naming a position above
@@ -552,7 +710,7 @@ proptest! {
     fn inv26_nothing_names_a_position_above_the_last_synced_mark(
         ops in proptest::collection::vec(arb_rop(), 1..120)
     ) {
-        run_recovery(&ops, &mut Seen::default(), Checks { inv25: false, inv26: true, inv27: false })?;
+        run_recovery(&ops, &mut Seen::default(), Checks { inv26: true, ..NONE })?;
     }
 
     /// 27. The list of losses never loses a loss across restarts, each loss
@@ -562,14 +720,33 @@ proptest! {
     fn inv27_losses_are_never_lost_and_acknowledging_changes_only_health(
         ops in proptest::collection::vec(arb_rop(), 1..120)
     ) {
-        run_recovery(&ops, &mut Seen::default(), Checks { inv25: false, inv26: false, inv27: true })?;
+        run_recovery(&ops, &mut Seen::default(), Checks { inv27: true, ..NONE })?;
     }
 }
 
-/// Guards the recovery-history properties (invariants 25–27): positions
-/// delivered and then assigned again after a reset, `resync`s carrying
-/// `forget_above`, confirmations that forced a mark sync, stale marks, gaps,
-/// rule 1 resets, acknowledged losses and both kinds of loss.
+proptest! {
+    #![proptest_config(cases(256))]
+
+    /// Principle 5 and §4 Resync: a consumer never receives a different fact
+    /// at a position it received before unless a `resync` whose
+    /// `forget_above` lies below that position came between, across crashes,
+    /// power losses and remounts over flagged batches not yet synced, except
+    /// a remount that loses one (Q-250, excluded).
+    #[test]
+    fn s4_a_position_is_given_again_only_after_a_forget_above_below_it(
+        ops in proptest::collection::vec(arb_rop(), 1..120)
+    ) {
+        run_recovery(&ops, &mut Seen::default(), Checks { reuse: true, ..NONE })?;
+    }
+}
+
+/// Guards the recovery-history properties (invariants 25–27 and reuse):
+/// positions delivered and then assigned again after a reset (flagged ones
+/// among them), `resync`s carrying `forget_above`, confirmations that forced
+/// a mark sync, stale marks, gaps, rule 1 resets, flagged batches kept by a
+/// same-boot start, remounts over flagged batches not yet synced, entries
+/// reported only for the `written` level, acknowledged losses and both kinds
+/// of loss.
 #[test]
 fn recovery_generator_coverage() {
     use proptest::strategy::ValueTree;
@@ -589,12 +766,16 @@ fn recovery_generator_coverage() {
         seen.stale += s.stale;
         seen.gaps += s.gaps;
         seen.rule_1_resets += s.rule_1_resets;
+        seen.flagged_kept += s.flagged_kept;
+        seen.flagged_reassigned += s.flagged_reassigned;
+        seen.flagged_remounts += s.flagged_remounts;
+        seen.written_resets += s.written_resets;
         seen.acknowledged += s.acknowledged;
         possible += usize::from(s.possible > 0);
         data_lost += usize::from(s.data_lost > 0);
     }
     eprintln!(
-        "reassigned {} forget-resyncs {} behind-resyncs {} forced-syncs {} stale {} gaps {} rule-1 {} acknowledged {} possible {possible} data-lost {data_lost}",
+        "reassigned {} forget-resyncs {} behind-resyncs {} forced-syncs {} stale {} gaps {} rule-1 {} flagged-kept {} written-resets {} flagged-reassigned {} flagged-remounts {} acknowledged {} possible {possible} data-lost {data_lost}",
         seen.reassigned,
         seen.forget_resyncs,
         seen.behind_resyncs,
@@ -602,10 +783,16 @@ fn recovery_generator_coverage() {
         seen.stale,
         seen.gaps,
         seen.rule_1_resets,
+        seen.flagged_kept,
+        seen.written_resets,
+        seen.flagged_reassigned,
+        seen.flagged_remounts,
         seen.acknowledged
     );
     assert!(seen.reassigned > 5 && seen.forget_resyncs > 100 && seen.forced_syncs > 20);
     assert!(seen.behind_resyncs > 20);
     assert!(seen.stale > 20 && seen.gaps > 5 && seen.rule_1_resets > 20);
+    assert!(seen.flagged_kept > 20 && seen.written_resets > 20);
+    assert!(seen.flagged_reassigned > 0 && seen.flagged_remounts > 20);
     assert!(seen.acknowledged > 50 && possible > 100 && data_lost > 50);
 }
