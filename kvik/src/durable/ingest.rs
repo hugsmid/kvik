@@ -254,9 +254,12 @@ impl Decider {
                 (*k, facts)
             })
             .collect();
-        let mut batch: HashMap<Key, Vec<Known>> = HashMap::with_capacity(readings.len());
+        // The call's own facts and lateness reference matter only to a later reading of the same key or series.
+        let (key_repeats, series_repeats) = repeats(readings);
+        let mut batch: HashMap<Key, Vec<Known>> = HashMap::new();
         let mut batch_reference: HashMap<u32, i64> = HashMap::new();
-        for r in readings {
+        for (k, r) in readings.iter().enumerate() {
+            let (in_batch, series_in_batch) = (key_repeats[k], series_repeats[k]);
             let value = match self.refusal(r, revise) {
                 Ok(v) => v,
                 Err(x) => {
@@ -302,7 +305,7 @@ impl Decider {
                 state
                     .iter()
                     .copied()
-                    .chain(batch.get(&key).into_iter().flatten())
+                    .chain(batch.get(&key).filter(|_| in_batch).into_iter().flatten())
             };
             let top = r
                 .changed_at
@@ -330,10 +333,12 @@ impl Decider {
             // `late` (§2.2): on an observed series, a fact not flagged `future` earlier than the lateness
             // reference by more than 2 × S; on any series, older than the lateness bound. Neither before the clock
             // is synchronised (§2.5).
-            let reference = self
-                .history
-                .reference(r.series.0)
-                .max(batch_reference.get(&r.series.0).copied());
+            let reference = self.history.reference(r.series.0).max(
+                batch_reference
+                    .get(&r.series.0)
+                    .filter(|_| series_in_batch)
+                    .copied(),
+            );
             let out_of_order = match (reference, d.staleness) {
                 (Some(rf), Some(st)) => {
                     observed && !future && r.t.0 < rf.saturating_sub(st.saturating_mul(2))
@@ -359,9 +364,11 @@ impl Decider {
             };
             let outranked = r.changed_at.is_some_and(|c| top.is_some_and(|top| c < top));
             let known = Known::of(&row, call);
-            batch.entry(key).or_default().push(known.clone());
+            if in_batch {
+                batch.entry(key).or_default().push(known.clone());
+            }
             let raises = !future && clock.synced;
-            if raises {
+            if raises && series_in_batch {
                 let v = batch_reference.entry(r.series.0).or_insert(r.t.0);
                 *v = (*v).max(r.t.0);
             }
@@ -386,6 +393,26 @@ impl Decider {
             .collect();
         plan
     }
+}
+
+/// Per reading, whether another reading of the call has its key, and whether one has its series.
+fn repeats(readings: &[Reading]) -> (Vec<bool>, Vec<bool>) {
+    let mut key = vec![false; readings.len()];
+    let mut series = vec![false; readings.len()];
+    let mut order: Vec<usize> = (0..readings.len()).collect();
+    order.sort_unstable_by_key(|&i| (readings[i].series.0, readings[i].t.0));
+    for w in order.windows(2) {
+        let (a, b) = (&readings[w[0]], &readings[w[1]]);
+        if a.series == b.series {
+            series[w[0]] = true;
+            series[w[1]] = true;
+            if a.t == b.t {
+                key[w[0]] = true;
+                key[w[1]] = true;
+            }
+        }
+    }
+    (key, series)
 }
 
 #[cfg(test)]

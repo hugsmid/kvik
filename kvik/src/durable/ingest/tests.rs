@@ -182,6 +182,51 @@ fn a_call_mixing_versioned_and_unversioned_series_decides_duplicates_and_outrank
 }
 
 #[test]
+fn a_reading_is_late_against_an_earlier_reading_of_its_series_in_the_same_call() {
+    let mut d = decider(History::default());
+    let gauge = SeriesSpec::new(
+        "a/b/d",
+        Kind::Gauge {
+            value: ValueType::F64,
+        },
+        "W",
+    )
+    .expected_interval(Duration::from_secs(1));
+    let def = definition_of(&gauge, 4, Duration::from_secs(300)).unwrap();
+    d.registry.apply(&Entry::Definition(Box::new(def)));
+    let wall = CLOCK.wall;
+    let late = |readings: &[Reading]| -> Vec<bool> {
+        d.plan(readings, Intent::Normal, CLOCK, 1, &mut Never)
+            .decisions
+            .iter()
+            .map(|x| matches!(x, Decision::Record { late: true, .. }))
+            .collect()
+    };
+    let earlier = reading(4, wall - 60 * S, 1.0, None);
+    assert_eq!(late(&[earlier.clone()]), [false]);
+    let call = [
+        reading(4, wall - 5 * S, 1.0, None),
+        reading(1, wall - 60 * S, 1.0, None),
+        earlier,
+    ];
+    assert_eq!(late(&call), [false, false, true]);
+}
+
+#[test]
+fn repeats_mark_the_readings_sharing_a_key_or_a_series() {
+    let readings = [
+        reading(1, T0, 1.0, None),
+        reading(2, T0, 1.0, None),
+        reading(1, T0 + S, 1.0, None),
+        reading(3, T0, 1.0, None),
+        reading(1, T0, 2.0, None),
+    ];
+    let (key, series) = repeats(&readings);
+    assert_eq!(key, [true, false, false, false, true]);
+    assert_eq!(series, [true, false, true, false, true]);
+}
+
+#[test]
 fn a_key_below_the_window_is_read_once_per_call_and_enters_the_revised_key_index() {
     let (mut d, mut mem) = left_behind();
     mem.readable_below = 3;
