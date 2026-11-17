@@ -2,6 +2,7 @@
 
 use super::decode::Parsed;
 use super::*;
+use crate::bytes::u32_at;
 
 pub(super) fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
     let kind = match p.u8_in(3, 5)? {
@@ -29,25 +30,15 @@ pub(super) fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
         p.none(11)?;
         None
     };
-    let state_names: Vec<&str> = p
-        .all(13)
-        .map(|v| p.text(13, v, 1, 63))
-        .collect::<Result<_, _>>()?;
     // Distinct, so a state's index and its name count the same transitions (Q-182). Past the limit the verdict is the
-    // same either way, so the names are not looked at; a set rather than a sort keeps the cost linear (Q-651).
-    let distinct = state_names.len() > MAX_STATE_NAMES || {
-        let mut seen = std::collections::HashSet::with_capacity(state_names.len());
-        state_names.iter().all(|s| seen.insert(*s))
-    };
-    if (value_type == ValueType::State) == state_names.is_empty()
-        || state_names.len() > MAX_STATE_NAMES
-        || !distinct
-    {
-        return Err(if state_names.len() > MAX_STATE_NAMES || !distinct {
-            p.bad(13)
-        } else {
-            p.presence(13)
-        });
+    // same either way, so the names are not looked at.
+    let names = p.with(13);
+    if names.len() > MAX_STATE_NAMES || !p.names.borrow_mut().valid(names) {
+        return Err(p.bad(13));
+    }
+    let carried = !names.is_empty();
+    if (value_type == ValueType::State) != carried {
+        return Err(p.presence(13));
     }
     let interval = if kind == Kind::Interval {
         Some(match p.u8_in(16, 2)? {
@@ -118,7 +109,14 @@ pub(super) fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
         record_on_change: p.u8_in(9, 1)? == 1,
         counter,
         lateness_bound: p.i64(12)?,
-        state_names: state_names.iter().map(|s| p.own(s)).collect(),
+        state_names: if p.keep {
+            names
+                .iter()
+                .map(|f| String::from_utf8_lossy(f.1).into_owned())
+                .collect()
+        } else {
+            Vec::new()
+        },
         versioning: match p.u8_in(14, 2)? {
             0 => Versioning::None,
             1 => Versioning::Time,
@@ -134,4 +132,157 @@ pub(super) fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
         excess_precision,
         staleness_set: p.u8_in(27, 1)? == 1,
     })
+}
+
+/// A state name: 1 to 63 bytes of UTF-8 (A.6 field 13).
+fn name_ok(v: &[u8]) -> bool {
+    (1..=63).contains(&v.len()) && (v.is_ascii() || std::str::from_utf8(v).is_ok())
+}
+
+/// Checks a definition's state names and tells them distinct in time linear in their count (Q-651, Q-870),
+/// reusing its memory across the definitions of a body.
+#[derive(Default)]
+pub(super) struct Names {
+    keys: Vec<u64>,
+    /// Open addressing over keys; 0 is an empty slot, and no key is 0.
+    table: Vec<u64>,
+    random: Option<Random>,
+}
+
+/// Per-process random keys, so that no input is slow on purpose, only by chance.
+struct Random {
+    seed: u64,
+    mul: u64,
+    long: std::hash::RandomState,
+}
+
+/// Up to this many names are compared pairwise.
+const PAIRWISE: usize = 8;
+/// A probe run longer than this ends the table's attempt; the names are then sorted, so the worst case stays
+/// `n log n` whatever the keys.
+const RUN: usize = 128;
+/// The top byte of a hashed key; a packed key's top byte is its length, at most 7.
+const HASHED: u64 = 0xFF << 56;
+
+impl Names {
+    /// Whether the names, the values of `fields`, are each 1 to 63 bytes of UTF-8 (A.6 field 13) and distinct.
+    pub(super) fn valid(&mut self, fields: &[(u16, &[u8])]) -> bool {
+        self.valid_with(fields, RUN)
+    }
+
+    /// [`Names::valid`], sorting once a probe run exceeds `run_limit`.
+    fn valid_with(&mut self, fields: &[(u16, &[u8])], run_limit: usize) -> bool {
+        let n = fields.len();
+        if n <= PAIRWISE {
+            return fields.iter().all(|f| name_ok(f.1))
+                && (1..n).all(|i| (0..i).all(|j| fields[i].1 != fields[j].1));
+        }
+        let random = self.random.get_or_insert_with(|| {
+            use std::hash::{BuildHasher, Hasher};
+            let long = std::hash::RandomState::new();
+            let mut h = long.build_hasher();
+            let seed = h.finish();
+            h.write_u64(seed);
+            Random {
+                seed,
+                mul: h.finish() | 1,
+                long,
+            }
+        });
+        self.keys.clear();
+        for f in fields {
+            match key(f.1, &random.long) {
+                Some(k) => self.keys.push(k),
+                None => return false,
+            }
+        }
+        let bits = (2 * n).next_power_of_two().trailing_zeros();
+        let mask = (1usize << bits) - 1;
+        self.table.clear();
+        self.table.resize(mask + 1, 0);
+        for &key in &self.keys {
+            let mut i = (spread(key, random) >> (64 - bits)) as usize;
+            let mut run = 0;
+            loop {
+                let slot = &mut self.table[i];
+                if *slot == 0 {
+                    *slot = key;
+                    break;
+                }
+                if *slot == key {
+                    // Equal packed keys are equal names; equal hashed keys are decided by the sort.
+                    if key & HASHED != HASHED {
+                        return false;
+                    }
+                    return sorted_distinct(fields);
+                }
+                run += 1;
+                if run > run_limit {
+                    return sorted_distinct(fields);
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        true
+    }
+}
+
+/// A keyed mix of a key whose top bits pick its home slot.
+fn spread(key: u64, r: &Random) -> u64 {
+    let mut x = key ^ r.seed;
+    x = (x ^ (x >> 32)).wrapping_mul(r.mul);
+    x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^ (x >> 32)
+}
+
+fn sorted_distinct(fields: &[(u16, &[u8])]) -> bool {
+    let mut sorted: Vec<&[u8]> = fields.iter().map(|f| f.1).collect();
+    sorted.sort_unstable();
+    sorted.windows(2).all(|w| w[0] != w[1])
+}
+
+/// A valid name as a key: one of 1 to 7 bytes as one word, its length in the top byte, so equal keys mean equal
+/// names; a longer one by a keyed hash with `HASHED` as its top byte. `None` for an invalid name.
+fn key(v: &[u8], long: &std::hash::RandomState) -> Option<u64> {
+    use std::hash::BuildHasher;
+    let n = v.len();
+    let w = match n {
+        1..=3 => {
+            u64::from(v[0])
+                | u64::from(v[n / 2]) << (8 * (n / 2))
+                | u64::from(v[n - 1]) << (8 * (n - 1))
+        }
+        4..=7 => u64::from(u32_at(v, 0)) | u64::from(u32_at(v, n - 4)) << (8 * (n - 4)),
+        _ => return name_ok(v).then(|| long.hash_one(v) | HASHED),
+    };
+    (w & 0x0080_8080_8080_8080 == 0 || name_ok(v)).then_some(w | (n as u64) << 56)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields(names: &[Vec<u8>]) -> Vec<(u16, &[u8])> {
+        names.iter().map(|n| (13, n.as_slice())).collect()
+    }
+
+    /// The sort that ends a long probe run, and the one that settles equal hashed keys, give the table's verdict.
+    #[test]
+    fn the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict() {
+        for len in [3, 12] {
+            // Enough names that some share a home slot, so a run limit of 0 always ends in the sort.
+            let mut names: Vec<Vec<u8>> = (0..200u8)
+                .map(|k| [b'a' + k % 26, b'a' + k / 26].repeat(len / 2 + 1))
+                .collect();
+            let all = fields(&names);
+            for run in [0, RUN] {
+                assert!(Names::default().valid_with(&all, run), "{len} {run}");
+            }
+            names[199] = names[3].clone();
+            let repeated = fields(&names);
+            for run in [0, RUN] {
+                assert!(!Names::default().valid_with(&repeated, run), "{len} {run}");
+            }
+        }
+    }
 }

@@ -56,16 +56,17 @@ specified here before the roadmap item that writes it.
   boundary read's verdicts are not checked again when its batch is read), so in a segment body checks total at most
   L, the direct read that found damage, and per window the budget and the read that reached it (a batch): about
   264 MiB of bodies for a 64 MiB segment and 72 MiB for a 16 MiB one. The checks keep no row or entry and copy no
-  text; text values that many rows name are checked at a cost linear in their heap, fields are found by binary search
-  and state names told distinct with a set, and a manifest record's fields are read in one pass that keeps none of a
-  rejected record's (Q-651). Measured (release build, one shared 4-core cloud machine): at most about 2 ns a byte
-  for every body except a definition holding many short state names, about 5 ns a byte for that, and about 0.5 ns a
-  byte for facts, so a crafted segment costs at most about 0.6 s at 64 MiB and 0.2 s at 16 MiB, or about 1.5 s and
-  0.4 s where its bodies are such definitions (Q-870), against 29 to 170 ms for an undamaged one. A crafted manifest
-  costs at most about 0.09 s per 16 MiB for the start's reader and 0.15 s for the whole-file reader (Q-651). An
-  undamaged segment is read in one pass of direct checksums; the bounded reading
-  starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231). Apart from
-  the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
+  text; text values that many rows name are checked at a cost linear in their heap, an entry's fields are split once
+  and found by their id, state names are told distinct by a table of their keys under a per-process random hash (with
+  a sort once a probe run grows long, so no input costs more than `n log n`), and a manifest record's fields are read
+  in one pass that keeps none of a rejected record's (Q-651, Q-870). Measured (release build, one shared 4-core cloud
+  machine, the best of three runs, every entry type small and large): at most about 2.3 ns a byte, for definitions of
+  65,536 state names of 3 bytes, about 1 ns for small definitions, at most about 1.3 ns for every other entry and
+  about 0.5 ns for facts, so a crafted segment costs at most about 0.6 s at 64 MiB and 0.17 s at 16 MiB, against 29 to
+  170 ms for an undamaged one. A crafted manifest costs at most about 0.09 s per 16 MiB for the start's reader and
+  0.15 s for the whole-file reader (Q-651). An undamaged segment is read in one pass of direct checksums; the bounded
+  reading starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231).
+  Apart from the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |

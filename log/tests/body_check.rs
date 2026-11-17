@@ -1,11 +1,12 @@
 //! The body checks that keep no row or entry (Q-651) against the decoders, the same verdict on every body, and the
-//! facts check's text table against `std::str::from_utf8`.
+//! facts check's text table against `std::str::from_utf8`, and the state-name check against a plain reference.
 
 mod support;
 
 use kvik_log::entries::EntriesBlock;
 use kvik_log::facts::{FactFlags, FactRow, FactsBlock, Quality, Value, ValueType};
 use kvik_log::utf8::HeapText;
+use kvik_log::{BodyError, ContentError};
 use proptest::prelude::*;
 use support::*;
 
@@ -213,5 +214,55 @@ fn state_names_at_the_limit_are_told_distinct_and_past_it_refused() {
     assert!(EntriesBlock::check(&over).is_err());
     for b in [&distinct, &repeated, &over] {
         assert_eq!(EntriesBlock::check(b), EntriesBlock::decode(b).map(|_| ()));
+    }
+}
+
+/// A state name for the reference property: short and long names from a small alphabet, so that some repeat, and
+/// names that are invalid by length or UTF-8.
+fn state_name() -> impl Strategy<Value = Vec<u8>> {
+    let from = |len: std::ops::Range<usize>| {
+        prop::collection::vec(prop::sample::select(b"ab".to_vec()), len)
+    };
+    prop_oneof![
+        4 => from(1..4),
+        2 => from(7..10),
+        1 => from(12..20),
+        1 => Just("é".as_bytes().to_vec()),
+        1 => Just(vec![0xC3]),
+        1 => Just(b"ab\xFFab\xFF".to_vec()),
+        1 => Just(Vec::new()),
+        1 => Just(vec![b'a'; 63]),
+        1 => Just(vec![b'a'; 64]),
+        1 => prop::collection::vec(any::<u8>(), 1..10),
+    ]
+}
+
+proptest! {
+    /// Q-651, Q-870: the state names of a definition are accepted exactly when each is 1 to 63 bytes of UTF-8 and no
+    /// two are equal, as a sort finds them, on both sides of the pairwise limit.
+    #[test]
+    fn state_names_are_checked_as_a_plain_reference_checks_them(
+        mut names in prop::collection::vec(state_name(), 0..48),
+        copy in prop::option::of((any::<prop::sample::Index>(), any::<prop::sample::Index>())),
+    ) {
+        if let (Some((from, to)), false) = (copy, names.is_empty()) {
+            let v = names[from.index(names.len())].clone();
+            let at = to.index(names.len());
+            names[at] = v;
+        }
+        let valid = names
+            .iter()
+            .all(|n| (1..=63).contains(&n.len()) && std::str::from_utf8(n).is_ok());
+        let distinct = names.iter().collect::<std::collections::BTreeSet<_>>().len() == names.len();
+        let expected = if names.is_empty() {
+            Err(BodyError::Invalid(ContentError::FieldPresence { entry: 0, field: 13 }))
+        } else if valid && distinct {
+            Ok(())
+        } else {
+            Err(BodyError::Invalid(ContentError::Field { entry: 0, field: 13 }))
+        };
+        let body = states(names.into_iter());
+        prop_assert_eq!(EntriesBlock::check(&body), expected);
+        prop_assert_eq!(EntriesBlock::decode(&body).map(|_| ()), expected);
     }
 }

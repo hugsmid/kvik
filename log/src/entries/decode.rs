@@ -1,10 +1,12 @@
 //! The decoder of entries bodies, with every check of `format.md` A.6.
 
-use super::definition::definition;
+use std::cell::RefCell;
+
+use super::definition::{Names, definition};
 use super::*;
 
 /// The fields an entry type allows, the ones a parameter change forbids, and the repeated ones.
-fn allowed(t: u8, id: u16) -> Allowed {
+const fn allowed(t: u8, id: u16) -> Allowed {
     use Allowed::*;
     let ok = match t {
         entry_type::DEFINITION => matches!(id, 1..=19 | 22..=27),
@@ -37,7 +39,29 @@ enum Allowed {
     Unknown,
 }
 
-fn repeated(t: u8, id: u16) -> bool {
+/// For each known entry type and each id below `IDS`: `ALLOWED` if the type allows it, and `REPEATED` if it repeats it.
+const FLAGS: [[u8; IDS]; 10] = {
+    let mut m = [[0u8; IDS]; 10];
+    let mut t = 1;
+    while t < 10 {
+        let mut id = 0;
+        while id < IDS {
+            if let Allowed::Yes = allowed(t as u8, id as u16) {
+                m[t][id] |= ALLOWED;
+            }
+            if repeated(t as u8, id as u16) {
+                m[t][id] |= REPEATED;
+            }
+            id += 1;
+        }
+        t += 1;
+    }
+    m
+};
+const ALLOWED: u8 = 1;
+const REPEATED: u8 = 2;
+
+const fn repeated(t: u8, id: u16) -> bool {
     matches!(
         (t, id),
         (entry_type::DEFINITION, 13)
@@ -47,19 +71,39 @@ fn repeated(t: u8, id: u16) -> bool {
     )
 }
 
+/// One past the largest id a known entry type allows.
+const IDS: usize = 67;
+
 /// The fields of one entry, framing and order checked. Without `keep`, text is checked but not copied (Q-651).
 pub(super) struct Parsed<'a> {
-    entry: u32,
+    pub(super) entry: u32,
     fields: Vec<(u16, &'a [u8])>,
-    keep: bool,
+    /// Where the fields with each id lie in `fields`, which [`Parsed::split`] keeps in ascending order of id; only
+    /// the ids of the present entry are set (Q-651).
+    index: [(u32, u32); IDS],
+    pub(super) keep: bool,
+    pub(super) names: RefCell<Names>,
 }
 
 impl<'a> Parsed<'a> {
-    /// The fields with `id`; [`fields`] keeps them in ascending order of id, so this is a binary search (Q-651).
+    fn new(keep: bool) -> Self {
+        Parsed {
+            entry: 0,
+            fields: Vec::new(),
+            index: [(0, 0); IDS],
+            keep,
+            names: RefCell::default(),
+        }
+    }
     pub(super) fn with(&self, id: u16) -> &[(u16, &'a [u8])] {
-        let from = self.fields.partition_point(|f| f.0 < id);
-        let to = self.fields.partition_point(|f| f.0 <= id);
-        &self.fields[from..to]
+        let (from, to) = self.index.get(usize::from(id)).copied().unwrap_or_default();
+        let run = &self.fields[from as usize..to as usize];
+        debug_assert!(
+            run.iter().all(|f| f.0 == id)
+                && run.len() == self.fields.iter().filter(|f| f.0 == id).count(),
+            "the index agrees with a linear search"
+        );
+        run
     }
     pub(super) fn get(&self, id: u16) -> Option<&'a [u8]> {
         self.with(id).first().map(|f| f.1)
@@ -163,25 +207,21 @@ impl<'a> Parsed<'a> {
 }
 
 pub(super) fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
-    let mut entries: Vec<Entry> = Vec::new();
-    let p = walk(body, true, |e| match (entries.last_mut(), e) {
-        // Consecutive ignored entries are counted, not stored one by one.
-        (Some(Entry::Ignored { count }), Entry::Ignored { count: n }) => *count += n,
-        (_, e) => entries.push(e),
-    })?;
+    let mut sink = Collect(Vec::new());
+    let p = walk(body, true, &mut sink)?;
     Ok(EntriesBlock {
         first_sequence: p.first_sequence,
         received_at: p.received_at,
-        entries,
+        entries: sink.0,
     })
 }
 
 /// Applies every check of A.6 to a body without keeping its entries: its prefix, and whether it holds a recovery
 /// entry. This is what a reader runs on every entries block it accepts; it copies no text (Q-651).
 pub(crate) fn check(body: &[u8]) -> Result<(DataPrefix, bool), BodyError> {
-    let mut recovery = false;
-    let p = walk(body, false, |e| recovery |= e.is_recovery())?;
-    Ok((p, recovery))
+    let mut sink = Check { recovery: false };
+    let p = walk(body, false, &mut sink)?;
+    Ok((p, sink.recovery))
 }
 
 /// Whether a body that passed [`check`] holds a recovery entry, read from the entry headers alone.
@@ -206,11 +246,52 @@ pub(crate) fn holds_recovery(body: &[u8]) -> bool {
     false
 }
 
-/// Decodes the entries of a body one at a time, handing each to `sink`; without `keep` their text is left empty.
-fn walk(body: &[u8], keep: bool, mut sink: impl FnMut(Entry)) -> Result<DataPrefix, BodyError> {
+/// What a walk does with each entry it has read.
+trait Sink {
+    fn entry(&mut self, t: u8, p: &Parsed<'_>) -> Result<(), BodyError>;
+    fn ignored(&mut self);
+}
+
+struct Collect(Vec<Entry>);
+
+impl Sink for Collect {
+    fn entry(&mut self, t: u8, p: &Parsed<'_>) -> Result<(), BodyError> {
+        self.0.push(entry(t, p)?);
+        Ok(())
+    }
+    fn ignored(&mut self) {
+        // Consecutive ignored entries are counted, not stored one by one.
+        match self.0.last_mut() {
+            Some(Entry::Ignored { count }) => *count += 1,
+            _ => self.0.push(Entry::Ignored { count: 1 }),
+        }
+    }
+}
+
+/// The verdict alone, building no entry that needs memory (Q-651).
+struct Check {
+    recovery: bool,
+}
+
+impl Sink for Check {
+    fn entry(&mut self, t: u8, p: &Parsed<'_>) -> Result<(), BodyError> {
+        match t {
+            entry_type::DEFINITION => definition(p).map(drop),
+            entry_type::ROUTING => routing(p).map(drop),
+            _ => {
+                self.recovery |= t == entry_type::RECOVERY;
+                entry(t, p).map(drop)
+            }
+        }
+    }
+    fn ignored(&mut self) {}
+}
+
+/// Reads the entries of a body one at a time, handing each to `sink`; without `keep` their text is left empty.
+fn walk(body: &[u8], keep: bool, sink: &mut impl Sink) -> Result<DataPrefix, BodyError> {
     let p = DataPrefix::decode(block_type::ENTRIES, body).map_err(|_| ContentError::Prefix)?;
     let mut at = DATA_PREFIX_LEN;
-    let mut buf = Vec::new();
+    let mut parsed = Parsed::new(keep);
     for i in 0..p.count {
         let overrun = BodyError::from(ContentError::EntryOverrun { entry: i });
         let head = body.get(at..at + 8).ok_or(overrun)?;
@@ -221,75 +302,84 @@ fn walk(body: &[u8], keep: bool, mut sink: impl FnMut(Entry)) -> Result<DataPref
             .and_then(|end| body.get(fields_at..end))
             .ok_or(overrun)?;
         at = (fields_at + len).div_ceil(8) * 8;
+        parsed.entry = i;
         let known = matches!(t, 1..=9);
         if !known {
             if t >= 0x80 {
-                fields(raw, i, t, false, &mut buf)?;
-                sink(Entry::Ignored { count: 1 });
+                parsed.split(raw, t, false)?;
+                sink.ignored();
                 continue;
             }
             return Err(BodyError::Unsupported(Element::EntryType(t)));
         }
-        fields(raw, i, t, true, &mut buf)?;
-        let parsed = Parsed {
-            entry: i,
-            fields: std::mem::take(&mut buf),
-            keep,
-        };
-        sink(entry(t, &parsed)?);
-        buf = parsed.fields;
+        parsed.split(raw, t, true)?;
+        sink.entry(t, &parsed)?;
     }
     // Bytes after the last entry are not checked here (Q-106 (a)); the canonical decoder rejects them.
     Ok(p)
 }
 
-/// Splits a field list into `out`, checking framing and, for a known type, order and allowed ids.
-fn fields<'a>(
-    raw: &'a [u8],
-    entry: u32,
-    t: u8,
-    known: bool,
-    out: &mut Vec<(u16, &'a [u8])>,
-) -> Result<(), BodyError> {
-    out.clear();
-    let mut at = 0;
-    let mut prev: Option<u16> = None;
-    while at < raw.len() {
-        let overrun = BodyError::from(ContentError::EntryOverrun { entry });
-        let h = raw.get(at..at + 4).ok_or(overrun)?;
-        let (id, len) = (u16_at(h, 0), usize::from(u16_at(h, 2)));
-        let v = raw.get(at + 4..at + 4 + len).ok_or(overrun)?;
-        // The field's padding to 4 is part of the entry's `length`.
-        at = (at + 4 + len).div_ceil(4) * 4;
-        if at > raw.len() {
-            return Err(overrun);
+impl<'a> Parsed<'a> {
+    /// Splits a field list, checking framing and, for a known type, order and allowed ids.
+    fn split(&mut self, raw: &'a [u8], t: u8, known: bool) -> Result<(), BodyError> {
+        for &(id, _) in &self.fields {
+            self.index[usize::from(id)] = (0, 0);
         }
-        if !known {
-            continue;
-        }
-        // A version refusal wins over invalid content: unknown ids are classified before order is tested.
-        let kind = allowed(t, id);
-        match kind {
-            Allowed::Unknown => {
-                return Err(BodyError::Unsupported(Element::Field {
-                    entry_type: t,
-                    field: id,
-                }));
+        self.fields.clear();
+        let entry = self.entry;
+        let flags: &[u8] = FLAGS.get(usize::from(t)).map_or(&[], |f| f);
+        let mut at = 0;
+        // The largest id so far, `-1` before the first.
+        let mut prev = -1i32;
+        while at < raw.len() {
+            let h = raw.get(at..at + 4).ok_or_else(|| overrun(entry))?;
+            let (id, len) = (u16_at(h, 0), usize::from(u16_at(h, 2)));
+            let v = raw
+                .get(at + 4..at + 4 + len)
+                .ok_or_else(|| overrun(entry))?;
+            // The field's padding to 4 is part of the entry's `length`.
+            at = (at + 4 + len).div_ceil(4) * 4;
+            if at > raw.len() {
+                return Err(overrun(entry));
             }
-            Allowed::Forbidden => {
-                return Err(ContentError::FieldNotAllowed { entry, field: id }.into());
+            if !known {
+                continue;
             }
-            Allowed::Yes | Allowed::Ignorable => {}
+            let f = flags.get(usize::from(id)).copied().unwrap_or(0);
+            let allowed_here = f & ALLOWED != 0;
+            // A version refusal wins over invalid content: unknown ids are classified before order is tested.
+            if !allowed_here && id < 0x8000 {
+                return Err(match allowed(t, id) {
+                    Allowed::Forbidden => ContentError::FieldNotAllowed { entry, field: id }.into(),
+                    _ => BodyError::Unsupported(Element::Field {
+                        entry_type: t,
+                        field: id,
+                    }),
+                });
+            }
+            let id32 = i32::from(id);
+            if id < 0x8000 && (id32 < prev || (id32 == prev && f & REPEATED == 0)) {
+                return Err(ContentError::FieldOrder { entry, field: id }.into());
+            }
+            prev = prev.max(id32);
+            if allowed_here {
+                // An allowed id is below `IDS` and comes in ascending order, so its fields are one run.
+                let n = self.fields.len() as u32;
+                let slot = &mut self.index[usize::from(id)];
+                if slot.1 == 0 {
+                    slot.0 = n;
+                }
+                slot.1 = n + 1;
+                self.fields.push((id, v));
+            }
         }
-        if id < 0x8000 && prev.is_some_and(|p| id < p || (id == p && !repeated(t, id))) {
-            return Err(ContentError::FieldOrder { entry, field: id }.into());
-        }
-        prev = Some(prev.map_or(id, |p| p.max(id)));
-        if let Allowed::Yes = kind {
-            out.push((id, v));
-        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[cold]
+fn overrun(entry: u32) -> BodyError {
+    ContentError::EntryOverrun { entry }.into()
 }
 
 fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
@@ -332,13 +422,17 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
                     _ => return Err(p.bad(41)),
                 },
             };
-            let consumers = p
-                .all(47)
-                .map(|v| match std::str::from_utf8(v) {
-                    Ok(s) if consumer_name_ok(s) => Ok(p.own(s)),
-                    _ => Err(p.bad(47)),
-                })
-                .collect::<Result<_, _>>()?;
+            let mut consumers = Vec::new();
+            for v in p.all(47) {
+                match std::str::from_utf8(v) {
+                    Ok(s) if consumer_name_ok(s) => {
+                        if p.keep {
+                            consumers.push(s.to_owned());
+                        }
+                    }
+                    _ => return Err(p.bad(47)),
+                }
+            }
             Entry::Recovery(Recovery {
                 after: p.u64(40)?,
                 stamp,
@@ -359,19 +453,20 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
 
 /// A selection whose kind is field `kind` (53 or 60); ids for a pattern only when `resolved_ok`.
 fn read_selection(p: &Parsed<'_>, kind: u16, resolved_ok: bool) -> Result<Selection, BodyError> {
-    let ids = p
-        .all(kind + 1)
-        .map(|v| {
-            if v.len() == 4 {
-                Ok(u32_at(v, 0))
-            } else {
-                Err(p.bad(kind + 1))
-            }
-        })
-        .collect::<Result<Vec<u32>, _>>()?;
+    let mut ids = Vec::new();
+    let mut any = false;
+    for v in p.all(kind + 1) {
+        if v.len() != 4 {
+            return Err(p.bad(kind + 1));
+        }
+        any = true;
+        if p.keep {
+            ids.push(u32_at(v, 0));
+        }
+    }
     Ok(match p.u8_in(kind, 3)? {
         0 | 3 => {
-            if !ids.is_empty() {
+            if any {
                 return Err(p.presence(kind + 1));
             }
             p.none(kind + 2)?;
@@ -386,7 +481,7 @@ fn read_selection(p: &Parsed<'_>, kind: u16, resolved_ok: bool) -> Result<Select
             Selection::Ids(ids)
         }
         _ => {
-            if !resolved_ok && !ids.is_empty() {
+            if !resolved_ok && any {
                 return Err(p.presence(kind + 1));
             }
             Selection::Pattern {
