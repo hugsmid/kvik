@@ -36,9 +36,10 @@ fn series_dir(w: &World) -> Option<SeriesDirectory> {
     .map(|(_, d)| d)
 }
 
-/// Waits (in real time: seals run on the log's own clock) until the series directory covers `seq`.
+/// Waits until the series directory covers `seq`: seals run on the log's own monotonic clock (`LogClock`), which
+/// the test's manual clock does not drive, so this polls with a generous deadline and asserts nothing about timing.
 fn wait_for(w: &World, seq: u64) -> SeriesDirectory {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(d) = series_dir(w).filter(|d| d.through.sequence >= seq) {
             return d;
@@ -47,6 +48,21 @@ fn wait_for(w: &World, seq: u64) -> SeriesDirectory {
             Instant::now() < deadline,
             "no series directory through {seq}"
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits until at least `n` segments are sealed.
+fn wait_sealed(w: &World, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let sealed = || {
+        w.fs.paths()
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "kvl"))
+            .count()
+    };
+    while sealed() < n {
+        assert!(Instant::now() < deadline, "fewer than {n} sealed segments");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -110,7 +126,7 @@ fn the_series_directory_agrees_with_the_store_and_continues_after_a_reopen() {
         }
         // A seal by time; the first is followed by the series directory, later small ones wait for the cadence
         // (A.18): whichever file there is agrees with the store as of its position.
-        std::thread::sleep(Duration::from_millis(400));
+        wait_sealed(&w, round as usize + 1);
         let d = wait_for(&w, 1);
         check(&s, &d, &ids);
     }
@@ -126,7 +142,7 @@ fn the_series_directory_agrees_with_the_store_and_continues_after_a_reopen() {
     let (_, st) = read_latest(&*w.fs, dir, Family::Status, |b| StatusFile::decode(b, &id))
         .unwrap()
         .unwrap();
-    assert_eq!(st.health, health::OK);
+    assert_eq!(st.flags, kvik_log::directory::status::flag::PARTIAL);
     assert!(st.counter(counter::BATCHES).is_some());
     // A reopened store continues from the file it finds and agrees again after more seals.
     let before = series_dir(&w).unwrap();
@@ -134,9 +150,32 @@ fn the_series_directory_agrees_with_the_store_and_continues_after_a_reopen() {
     for k in 0..10 {
         emit(&s, &[num(ids[2], 1_000 + k, 1.0)]);
     }
-    std::thread::sleep(Duration::from_millis(400));
     // The reopened writer has not written one yet, so the next seal is due.
     let d = wait_for(&w, before.through.sequence + 1);
     check(&s, &d, &ids);
     block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn an_idle_store_gets_a_status_file() {
+    for k in 0..3 {
+        let w = World::new(&format!("derived-idle-{k}"));
+        let s = open(&w);
+        let id = store_id(&w);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let st = loop {
+            let st = read_latest(&*w.fs, Path::new(&w.dir), Family::Status, |b| {
+                StatusFile::decode(b, &id)
+            })
+            .unwrap();
+            if let Some(st) = st {
+                break st.1;
+            }
+            assert!(Instant::now() < deadline, "no status file on an idle store");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(st.health, health::OK);
+        assert_eq!(st.flags, kvik_log::directory::status::flag::PARTIAL);
+        block_on(s.shutdown()).unwrap();
+    }
 }
