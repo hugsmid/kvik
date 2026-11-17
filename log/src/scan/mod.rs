@@ -8,6 +8,7 @@ use crate::crc::crc32c;
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 
+mod ends;
 #[doc(hidden)]
 pub mod legacy;
 mod reads;
@@ -236,7 +237,7 @@ fn collect<'a>(
     let stats = s.stats();
     let report = ScanReport {
         header: s.header,
-        tail: s.tail().cloned(),
+        tail: s.tail().is_some().then(|| s.tail.take()).flatten(),
         seal: s.seal,
         batches,
         regions,

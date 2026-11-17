@@ -3,10 +3,11 @@
 
 mod support;
 
+use kvik_log::FormatError;
 use kvik_log::batch::BatchBuilder;
 use kvik_log::block::FLAG_SKIPPABLE;
 use kvik_log::crc::{PrefixCrc, crc32c, crc32c_shift};
-use kvik_log::scan::{ScanLimit, legacy, scan_with_stats};
+use kvik_log::scan::{ScanLimit, ScanReport, legacy, scan_with_stats};
 use kvik_log::segment::SegmentImage;
 use proptest::prelude::*;
 use support::*;
@@ -33,6 +34,28 @@ proptest! {
             prop_assert_eq!(t.range((8 * s) as u64, len as u64), direct);
         }
     }
+}
+
+/// The scan with chain ends read ahead (Q-873), at its own block and at blocks small enough for these files to cross,
+/// gives `scan`'s report, and so does the scan as before Q-873, which walks each candidate's chain.
+fn ends_agree(
+    f: &[u8],
+    limit: ScanLimit,
+    scan: &Result<ScanReport<'_>, FormatError>,
+) -> Result<(), TestCaseError> {
+    let (walked, _) = legacy::scan_with_walked_links(f, &ID, limit);
+    prop_assert_eq!(&walked, scan, "walked, {:?}", limit);
+    // Each block read passes over the starts up to a batch back, so small blocks are kept to small files.
+    let len = f.len() as u64;
+    for span in [8, 24, 64, 1_024, 65_536, 1 << 20] {
+        if (len / span) * (len.min(9 << 20) / 8) > 1 << 25 {
+            continue;
+        }
+        let (ends, stats) = legacy::scan_with_span(f, &ID, limit, span);
+        prop_assert_eq!(&ends, scan, "span {}, {:?}", span, limit);
+        prop_assert!(stats.within_bound(f.len() as u64), "{:?}", stats);
+    }
+    Ok(())
 }
 
 /// One batch of a generated segment.
@@ -172,8 +195,9 @@ fn agree_at(f: &[u8], mark: u64) -> Result<(), TestCaseError> {
     for limit in [ScanLimit::End, ScanLimit::Mark(mark)] {
         let (new, stats) = scan_with_stats(f, &ID, limit);
         let (old, _) = legacy::scan(f, &ID, limit);
-        prop_assert_eq!(new, old, "{:?}", limit);
+        prop_assert_eq!(&new, &old, "{:?}", limit);
         prop_assert!(stats.within_bound(len), "{:?} for {} bytes", stats, len);
+        ends_agree(f, limit, &new)?;
     }
     let (new, stats) = legacy::scan_ignoring_seal(f, &ID, false);
     let (old, _) = legacy::scan_ignoring_seal(f, &ID, true);
@@ -392,4 +416,230 @@ fn stale_complete_batches_ahead_of_kept_data_stay_under_the_budget() {
         stats.failed_bytes_peak < kvik_log::scan::FAILED_READ_BUDGET,
         "{stats:?}"
     );
+}
+
+/// One block header of a crafted run (Q-873).
+#[derive(Clone, Debug)]
+enum Head {
+    /// A data header of type `kind` (an index into [`DATA_TYPES`]) whose block is `steps` 8-byte steps long, its body
+    /// `short` bytes short of that, and its checksum wrong.
+    Data {
+        kind: u8,
+        steps: u16,
+        short: u8,
+    },
+    /// A data header claiming a block longer than a batch, or about one.
+    Long(i8),
+    /// A data header whose block ends where the next header of the run starts.
+    Link(u8),
+    /// A commit block, of the commit length or not; `named` picks a start whose chain ends here, if any, else
+    /// `batch_bytes` is `back` 8-byte steps, 0 included, or past a batch when `back` is 1,000 or more; a byte more if
+    /// `odd`.
+    Commit {
+        exact: bool,
+        named: prop::sample::Index,
+        back: u16,
+        odd: bool,
+    },
+    /// Bytes that are no header.
+    Junk(u64),
+    Zero,
+}
+
+const DATA_TYPES: [u8; 6] = [
+    kvik_log::block::block_type::FACTS,
+    kvik_log::block::block_type::ENTRIES,
+    0x50,
+    0x30,
+    kvik_log::block::block_type::SEGMENT_INDEX,
+    kvik_log::block::block_type::TRAILER,
+];
+
+fn head() -> impl Strategy<Value = Head> {
+    prop_oneof![
+        8 => (0u8..6, 2u16..200, 0u8..8).prop_map(|(kind, steps, short)| Head::Data { kind, steps, short }),
+        1 => (-2i8..3).prop_map(Head::Long),
+        8 => (0u8..4).prop_map(Head::Link),
+        4 => (prop::bool::weighted(0.9), any::<prop::sample::Index>(), 0u16..1_010, prop::bool::weighted(0.1))
+            .prop_map(|(exact, named, back, odd)| Head::Commit { exact, named, back, odd }),
+        2 => any::<u64>().prop_map(Head::Junk),
+        1 => Just(Head::Zero),
+    ]
+}
+
+/// Whether resynchronisation reads the start `o` further, below `limit`, by a plain walk of the chain of block headers
+/// from it: it ends, within a batch, in a commit block of the commit length that fits and whose `batch_bytes` is the
+/// distance from `o` (`format.md` A.2).
+fn named_by_its_chain(f: &[u8], o: usize, limit: usize) -> bool {
+    use kvik_log::batch::MAX_BATCH_DATA;
+    use kvik_log::block::{BlockHeader, block_type};
+    let mut p = o;
+    while p - o <= MAX_BATCH_DATA as usize && p + 16 <= limit {
+        let Some(h) = BlockHeader::decode(f[p..p + 16].try_into().unwrap()) else {
+            return false;
+        };
+        match h.block_type {
+            0 | block_type::SEGMENT_INDEX | block_type::TRAILER => return false,
+            block_type::COMMIT => {
+                return h.body_len == 48
+                    && p + 64 <= limit
+                    && p > o
+                    && u64::from_le_bytes(f[p + 48..p + 56].try_into().unwrap()) == (p - o) as u64;
+            }
+            _ if h.block_len() > MAX_BATCH_DATA => return false,
+            _ => p += h.block_len() as usize,
+        }
+    }
+    false
+}
+
+/// Where the chain of headers from `p` ends: a commit block of the commit length that fits, by a plain walk.
+fn chain_end(f: &[u8], mut p: usize) -> Option<usize> {
+    use kvik_log::block::{BlockHeader, block_type};
+    while p + 64 <= f.len() {
+        let h = BlockHeader::decode(f[p..p + 16].try_into().unwrap())?;
+        match h.block_type {
+            0 => return None,
+            block_type::COMMIT => return (h.body_len == 48).then_some(p),
+            block_type::SEGMENT_INDEX | block_type::TRAILER => return None,
+            _ if h.block_len() > kvik_log::batch::MAX_BATCH_DATA => return None,
+            _ => p += h.block_len() as usize,
+        }
+    }
+    None
+}
+
+/// A segment whose data are crafted block headers at 8-byte steps, each claiming a body that runs over the headers
+/// after it, and commit blocks naming starts whose chains end in them: the candidates of resynchronisation.
+fn header_run(heads: &[Head], gaps: &[u8], valid_header: bool) -> Vec<u8> {
+    use kvik_log::block::{BlockHeader, block_type};
+    let mut f = if valid_header {
+        build(&[Piece::Facts(1)], None, &[])
+    } else {
+        let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
+        f.extend_from_slice(&[0xFF; 8]);
+        f
+    };
+    f.truncate(f.len().next_multiple_of(8));
+    f.extend_from_slice(&[0xEE; 8]);
+    let mut commits = Vec::new();
+    let mut links: Vec<(usize, u8)> = Vec::new();
+    let mut starts = Vec::new();
+    for (i, h) in heads.iter().enumerate() {
+        let p = f.len();
+        starts.push(p);
+        let header = |block_type, body_len| {
+            BlockHeader {
+                block_type,
+                flags: 1,
+                body_len,
+                body_crc32c: 0xDEAD_BEEF,
+            }
+            .encode()
+        };
+        match h {
+            Head::Data { kind, steps, short } => {
+                let len = (8 * u32::from(*steps)).saturating_sub(16 + u32::from(*short));
+                f.extend_from_slice(&header(DATA_TYPES[usize::from(*kind)], len));
+            }
+            Head::Long(d) => {
+                let len = (kvik_log::batch::MAX_BATCH_DATA as i64 - 16 + 8 * i64::from(*d)) as u32;
+                f.extend_from_slice(&header(block_type::FACTS, len));
+            }
+            Head::Commit {
+                exact,
+                named,
+                back,
+                odd,
+            } => {
+                f.extend_from_slice(&header(block_type::COMMIT, if *exact { 48 } else { 40 }));
+                f.extend_from_slice(&[0x11; 48]);
+                commits.push((p, *named, *back, *odd));
+            }
+            Head::Link(kind) => {
+                links.push((i, *kind));
+                f.extend_from_slice(&[0; 16]);
+            }
+            Head::Junk(w) => f.extend_from_slice(&w.to_le_bytes()),
+            Head::Zero => f.extend_from_slice(&[0; 8]),
+        }
+        f.resize(
+            f.len() + 8 * usize::from(gaps.get(i).copied().unwrap_or(0) % 3),
+            0x5A,
+        );
+    }
+    f.resize(f.len() + 256, 0);
+    for (i, kind) in links {
+        let (p, next) = (
+            starts[i],
+            starts.get(i + 1).copied().unwrap_or(f.len() - 64),
+        );
+        let h = BlockHeader {
+            block_type: DATA_TYPES[usize::from(kind)],
+            flags: 1,
+            body_len: (next - p - 16) as u32,
+            body_crc32c: 0xDEAD_BEEF,
+        };
+        f[p..p + 16].copy_from_slice(&h.encode());
+    }
+    let from = f.len().min(kvik_log::header::HEADER_LEN + 8);
+    for (c, named, back, odd) in commits {
+        let ending: Vec<usize> = (from..c)
+            .step_by(8)
+            .filter(|&s| chain_end(&f, s) == Some(c))
+            .collect();
+        let bb = if back >= 1_000 {
+            kvik_log::batch::MAX_BATCH_DATA + 8 * u64::from(back - 1_000) - 32
+        } else if ending.is_empty() || back < 100 {
+            8 * u64::from(back)
+        } else {
+            (c - ending[named.index(ending.len())]) as u64
+        } + u64::from(odd);
+        f[c + 48..c + 56].copy_from_slice(&bb.to_le_bytes());
+    }
+    f
+}
+
+proptest! {
+    #[test]
+    fn crafted_header_runs_give_the_reports_the_walked_chains_give(
+        heads in prop::collection::vec(head(), 1..160),
+        gaps in prop::collection::vec(any::<u8>(), 0..160),
+        valid_header in any::<bool>(),
+        mark in any::<prop::sample::Index>(),
+        damage in prop::collection::vec(damage(), 0..3),
+    ) {
+        let mut f = header_run(&heads, &gaps, valid_header);
+        apply(&mut f, &damage);
+        let mark = (mark.index(f.len() + 1) as u64) & !7;
+        for limit in [ScanLimit::End, ScanLimit::Mark(mark)] {
+            let (scan, stats) = scan_with_stats(&f, &ID, limit);
+            prop_assert!(stats.within_bound(f.len() as u64), "{:?}", stats);
+            ends_agree(&f, limit, &scan)?;
+        }
+    }
+}
+
+proptest! {
+    #[test]
+    fn chain_ends_find_the_candidates_a_plain_walk_finds(
+        heads in prop::collection::vec(head(), 1..160),
+        gaps in prop::collection::vec(any::<u8>(), 0..160),
+        damage in prop::collection::vec(damage(), 0..3),
+        cut in any::<prop::sample::Index>(),
+        span in prop::sample::select(vec![8u64, 16, 40, 128, 1_024, 4 << 20]),
+    ) {
+        let mut f = header_run(&heads, &gaps, false);
+        apply(&mut f, &damage);
+        let limit = cut.index(f.len() + 1);
+        let from = kvik_log::header::HEADER_LEN;
+        let want: Vec<u64> = (from..limit.saturating_sub(80) + 1)
+            .step_by(8)
+            .filter(|&o| named_by_its_chain(&f, o, limit))
+            .map(|o| o as u64)
+            .collect();
+        let to = (limit.saturating_sub(80) + 1).max(from) as u64;
+        let got = legacy::chain_candidates(&f, from as u64, to, limit as u64, span);
+        prop_assert_eq!(got, want);
+    }
 }

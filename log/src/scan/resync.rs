@@ -10,6 +10,7 @@ use crate::body::{COMMIT_LEN, Commit};
 use crate::bytes::{slice, u64_at};
 use crate::error::FormatError;
 
+use super::ends::{Ends, SPAN};
 use super::{ReadableCommit, Reads};
 
 /// Where a chain of block headers ends in a commit block: its offset and the `batch_bytes` it claims.
@@ -30,14 +31,26 @@ enum Link {
 
 /// The chains of the block starts walked so far, from the current position on; kept across the regions of a
 /// scan, so each block start is walked once per scan (Q-110).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct Chains {
     links: BTreeMap<u64, Link>,
     pruned: u64,
     /// The reference scan's walks run to the chain's end, as before the scan bound.
     reference: bool,
+    /// The bounded scan's chain ends, read ahead (Q-873); `None` for the reference scan and for walks remembered in
+    /// `links`, as before Q-873 (`legacy::scan_with_walked_links`).
+    ends: Option<Ends>,
     #[cfg(test)]
     pub(crate) peak: usize,
+}
+
+impl Default for Chains {
+    fn default() -> Self {
+        Self {
+            ends: Some(Ends::new(SPAN)),
+            ..Self::walked()
+        }
+    }
 }
 
 /// The readable commit blocks of a tail (`spec.md` §3 Recovery rule 3), collected alongside the candidates so the
@@ -59,11 +72,15 @@ impl CommitSearch {
         }
     }
 
-    /// Visits every step below `to`.
-    fn advance(&mut self, reads: &mut Reads<'_>, to: u64, limit: u64) {
+    /// Visits every step below `to`, passing those whose header the chain ends read and found no commit block.
+    #[inline]
+    fn advance(&mut self, reads: &mut Reads<'_>, to: u64, limit: u64, ends: Option<&Ends>) {
         let to = to.min(self.end);
         while self.next < to && self.next + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
-            self.next = commit_step(reads, self.next, limit, &mut self.found);
+            self.next = match ends.and_then(|e| e.commit_at(self.next)) {
+                Some(false) => self.next + 8,
+                _ => commit_step(reads, self.next, limit, &mut self.found),
+            };
         }
     }
 
@@ -109,7 +126,27 @@ impl Chains {
     pub(crate) fn reference() -> Self {
         Self {
             reference: true,
-            ..Self::default()
+            ..Self::walked()
+        }
+    }
+
+    /// The bounded scan's chain ends found `span` bytes of starts at a time.
+    pub(crate) fn ends(span: u64) -> Self {
+        Self {
+            ends: Some(Ends::new(span)),
+            ..Self::walked()
+        }
+    }
+
+    /// The bounded scan's chains walked from each candidate and remembered in an ordered map, as before Q-873.
+    pub(crate) fn walked() -> Self {
+        Self {
+            links: BTreeMap::new(),
+            pruned: 0,
+            reference: false,
+            ends: None,
+            #[cfg(test)]
+            peak: 0,
         }
     }
 
@@ -135,11 +172,14 @@ impl Chains {
         let mut o = start + 8;
         while o + (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
             if let Some(c) = commits.as_deref_mut() {
-                c.advance(reads, o, limit);
+                c.advance(reads, o, limit, self.ends.as_ref());
             }
             // Block starts below `o`, and table entries below the commit search, are never asked about again.
             if o.saturating_sub(self.pruned) >= 1 << 16 {
                 self.links = self.links.split_off(&o);
+                if let Some(e) = &mut self.ends {
+                    e.move_to(o);
+                }
                 self.pruned = o;
                 reads.forget_below(commits.as_deref().map_or(o, |c| c.next.min(o)));
             }
@@ -152,15 +192,29 @@ impl Chains {
             }
             // A zero word cannot start a block header (type 0 is never valid), and a header that fails its
             // checksum cannot start a batch: both are passed without reading further.
-            if slice(reads.bytes, o, 8).is_none_or(|w| u64_at(w, 0) == 0)
-                || reads.peek(o, limit).is_none()
-            {
+            if slice(reads.bytes, o, 8).is_none_or(|w| u64_at(w, 0) == 0) {
                 o += 8;
                 continue;
             }
-            let candidate = self.chain_end(reads, o, limit).is_some_and(|c| {
-                c.at > o && c.batch_bytes == c.at - o && c.at - o <= MAX_BATCH_DATA
-            });
+            let candidate = match &mut self.ends {
+                // The starts up to the next point the loop looks at again are passed in one run (Q-873).
+                Some(e) => {
+                    let last = limit - (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64;
+                    let p =
+                        e.next_candidate(reads, o, (self.pruned + (1 << 16)).min(last + 1), limit);
+                    if p != o {
+                        o = p;
+                        continue;
+                    }
+                    true
+                }
+                None => {
+                    reads.peek(o, limit).is_some()
+                        && self.chain_end(reads, o, limit).is_some_and(|c| {
+                            c.at > o && c.batch_bytes == c.at - o && c.at - o <= MAX_BATCH_DATA
+                        })
+                }
+            };
             if candidate && framing_holds(reads, id, o, limit) {
                 let before = reads.body_checked();
                 match read_batch(reads, id, o, limit, min_first, Refusal::IfBatchVerifies) {
@@ -175,7 +229,7 @@ impl Chains {
             o += 8;
         }
         if let Some(c) = commits {
-            c.advance(reads, limit, limit);
+            c.advance(reads, limit, limit, self.ends.as_ref());
         }
         Ok(None)
     }

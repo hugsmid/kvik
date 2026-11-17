@@ -52,8 +52,11 @@ impl FailedReads {
     /// Where the search goes on from `offset`: `offset` itself, or the end of its window once failed reads starting
     /// in it have checked [`FAILED_READ_BUDGET`] bytes of body.
     pub fn next_from(&self, offset: u64) -> u64 {
+        if self.charged < FAILED_READ_BUDGET {
+            return offset;
+        }
         let w = offset / self.window;
-        if w == self.current && self.charged >= FAILED_READ_BUDGET {
+        if w == self.current {
             (w + 1).saturating_mul(self.window)
         } else {
             offset

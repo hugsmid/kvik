@@ -2,8 +2,6 @@
 //!
 //! All checksums go through this module, so the implementation can be swapped in one place.
 
-use std::collections::VecDeque;
-
 use crc::{CRC_32_ISCSI, Crc, Digest, Table};
 
 static CASTAGNOLI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI);
@@ -234,8 +232,11 @@ fn step8(reg: u32, word: [u8; 8]) -> u32 {
 #[derive(Clone)]
 pub struct PrefixCrc<'a> {
     bytes: &'a [u8],
+    /// The offset of `sums[front]`.
     base: u64,
-    sums: VecDeque<u32>,
+    sums: Vec<u32>,
+    /// Entries forgotten at the front of `sums`, dropped once they are half of it.
+    front: usize,
     reg: u32,
     checksummed: u64,
 }
@@ -244,7 +245,7 @@ impl std::fmt::Debug for PrefixCrc<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixCrc")
             .field("base", &self.base)
-            .field("entries", &self.sums.len())
+            .field("entries", &(self.sums.len() - self.front))
             .field("checksummed", &self.checksummed)
             .finish()
     }
@@ -256,7 +257,8 @@ impl<'a> PrefixCrc<'a> {
         Self {
             bytes,
             base: 0,
-            sums: VecDeque::new(),
+            sums: Vec::new(),
+            front: 0,
             reg: !0,
             checksummed: 0,
         }
@@ -269,14 +271,18 @@ impl<'a> PrefixCrc<'a> {
 
     /// Drops the table below `offset`; ranges starting below it cost their whole length again.
     pub fn forget_below(&mut self, offset: u64) {
-        while self.sums.len() > 1 && self.base < offset {
-            self.sums.pop_front();
-            self.base += 8;
+        let live = (self.sums.len() - self.front) as u64;
+        let k = (offset.saturating_sub(self.base).div_ceil(8)).min(live.saturating_sub(1));
+        self.front += k as usize;
+        self.base += 8 * k;
+        if self.front > 4_096 && 2 * self.front > self.sums.len() {
+            self.sums.drain(..self.front);
+            self.front = 0;
         }
     }
 
     fn top(&self) -> u64 {
-        self.base + 8 * (self.sums.len() as u64).saturating_sub(1)
+        self.base + 8 * ((self.sums.len() - self.front) as u64).saturating_sub(1)
     }
 
     /// CRC32C of the `len` bytes at `start`, or `None` if they do not lie in the file.
@@ -290,22 +296,28 @@ impl<'a> PrefixCrc<'a> {
             return Some(crc32c(crate::bytes::slice(self.bytes, start, len)?));
         }
         let aligned = start + (len & !7);
-        if self.sums.is_empty() || start < self.base {
+        if self.sums.len() == self.front || start < self.base {
             self.base = start;
             self.sums.clear();
-            self.sums.push_back(0);
+            self.front = 0;
+            self.sums.push(0);
             self.reg = !0;
         }
-        while self.top() < aligned {
-            let at = self.top();
-            let word = crate::bytes::slice(self.bytes, at, 8)?;
-            self.reg = step8(self.reg, word.try_into().ok()?);
-            self.sums.push_back(!self.reg);
-            self.checksummed += 8;
+        let top = self.top();
+        if top < aligned {
+            let words = crate::bytes::slice(self.bytes, top, aligned - top)?;
+            self.sums.reserve(words.len() / 8);
+            let mut reg = self.reg;
+            for &word in words.as_chunks::<8>().0 {
+                reg = step8(reg, word);
+                self.sums.push(!reg);
+            }
+            self.reg = reg;
+            self.checksummed += aligned - top;
             #[cfg(test)]
-            BYTES_HASHED.with(|c| c.set(c.get() + 8));
+            BYTES_HASHED.with(|c| c.set(c.get() + aligned - top));
         }
-        let index = |o: u64| ((o - self.base) / 8) as usize;
+        let index = |o: u64| self.front + ((o - self.base) / 8) as usize;
         let head =
             self.sums[index(aligned)] ^ crc32c_shift(self.sums[index(start)], aligned - start);
         let tail = end - aligned;

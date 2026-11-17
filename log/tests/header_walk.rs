@@ -1,0 +1,213 @@
+//! Crafted block headers against the time of the header walk (`format.md` A, common rules: scan bound; Q-873): a valid
+//! header at every 8 bytes whose body checksum does not hold, and commit blocks naming such headers as batch starts.
+
+mod support;
+
+use std::time::Instant;
+
+use kvik_log::block::block_type;
+use kvik_log::body::COMMIT_LEN;
+use kvik_log::crc::crc32c;
+use kvik_log::header::{FileHeader, HEADER_LEN, kind};
+use kvik_log::manifest::read_manifest_with_stats;
+use kvik_log::scan::{ScanLimit, ScanStats, legacy, scan_with_stats};
+use support::*;
+
+/// 8 MiB: a batch's data and a segment window.
+const W: u64 = 8 << 20;
+
+/// A generator of the free bytes of each header.
+struct Lcg(u32);
+
+impl Lcg {
+    fn next(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.0
+    }
+}
+
+/// The low word of the header at `p`, whose first 8 bytes are set, chosen so that the header checksum, which is the
+/// next header's `body_len`, lies in `lens`: with `t`, the next header's type is `t`.
+fn chain_word(f: &mut [u8], p: usize, t: Option<u8>, lens: (u32, u32), x: &mut Lcg) -> u32 {
+    loop {
+        let mut w = (x.next() >> 8).to_le_bytes();
+        if let Some(t) = t {
+            w = [t, 0, w[0], w[1]];
+        }
+        f[p + 8..p + 12].copy_from_slice(&w);
+        let c = crc32c(&f[p..p + 12]);
+        if f[p + 8] != 0 && (lens.0..=lens.1).contains(&c) {
+            f[p + 12..p + 16].copy_from_slice(&c.to_le_bytes());
+            return c;
+        }
+    }
+}
+
+/// The re-check's shape: from `s`, a valid block header at every 8 bytes up to 2 MiB before the end, each claiming a
+/// body of at least 4 KiB that fits and whose checksum does not hold; every type `t` if given, else any.
+fn headers_everywhere(mut f: Vec<u8>, len: usize, t: Option<u8>) -> Vec<u8> {
+    let s = f.len().next_multiple_of(8);
+    f.resize(len, 0);
+    f[s] = t.unwrap_or(block_type::FACTS);
+    f[s + 4..s + 8].copy_from_slice(&4096u32.to_le_bytes());
+    let mut x = Lcg(1);
+    let mut p = s;
+    while p + (2 << 20) < len {
+        let room = ((len - p - 24) as u32).min(W as u32);
+        chain_word(&mut f, p, t, (4096, room), &mut x);
+        p += 8;
+    }
+    f
+}
+
+/// From `s`, periods of 64 bytes: a commit block header at 8, whose `batch_bytes` (at 56) names the start of a data
+/// header up to a batch before it; data headers at 16 to 40, each claiming a body that runs anywhere up to a batch on;
+/// a data header with an empty body at 56, which leads to the next commit; and bytes that are no header at 0 and 48.
+/// Every start a commit names is a data header whose chain leaves its block, so each candidate follows its chain.
+fn named_walks(mut f: Vec<u8>, len: usize) -> Vec<u8> {
+    let s = f.len().next_multiple_of(64);
+    f.resize(len, 0);
+    let mut x = Lcg(7);
+    let mut b = s;
+    let lens = (16, W as u32 - 32);
+    while b + 256 < len {
+        let commit = b + 8;
+        f[commit] = block_type::COMMIT;
+        f[commit + 4..commit + 8].copy_from_slice(&(COMMIT_LEN as u32).to_le_bytes());
+        for p in [commit, b + 16, b + 24, b + 32] {
+            chain_word(&mut f, p, Some(block_type::FACTS), lens, &mut x);
+        }
+        // The data header at 40 is valid; its checksum is the length of the header at 48, which is not one.
+        f[b + 48..b + 52].copy_from_slice(&x.next().to_le_bytes());
+        let c = crc32c(&f[b + 40..b + 52]);
+        f[b + 52..b + 56].copy_from_slice(&c.to_le_bytes());
+        // A start in an earlier period, at most a batch back, whose distance gives the header at 56 a data type.
+        let periods = ((b - s) as u64 / 64).min((W - 128) / 64);
+        let named = (0..64).find_map(|_| {
+            let back = 64 * (1 + u64::from(x.next()) % periods.max(1));
+            let o = (commit as u64 - back) + 8 * (1 + u64::from(x.next() % 4));
+            let bb = commit as u64 - o;
+            (periods > 0 && (1..=0x7F).contains(&(bb & 0xFF))).then_some(o)
+        });
+        let named = named.unwrap_or(commit as u64 - 0x48);
+        f[b + 56..b + 64].copy_from_slice(&(commit as u64 - named).to_le_bytes());
+        // The header at 56 has an empty body: its checksum is the next period's first 4 bytes after 4 free ones.
+        f[b + 64..b + 68].copy_from_slice(&x.next().to_le_bytes());
+        let c = crc32c(&f[b + 56..b + 68]);
+        f[b + 68..b + 72].copy_from_slice(&c.to_le_bytes());
+        b += 64;
+    }
+    f
+}
+
+fn damaged_start() -> Vec<u8> {
+    let mut f = vec![0u8; HEADER_LEN + 8];
+    f[HEADER_LEN..].fill(0xFF);
+    f
+}
+
+/// CPU seconds this thread has used, where the system reports them.
+fn cpu() -> f64 {
+    std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()
+        .and_then(|s| {
+            let f: Vec<&str> = s.rsplit(')').next()?.split_whitespace().collect();
+            Some((f.get(11)?.parse::<f64>().ok()? + f.get(12)?.parse::<f64>().ok()?) / 100.0)
+        })
+        .unwrap_or(0.0)
+}
+
+fn timed(name: &str, f: &[u8]) -> ScanStats {
+    let (mut best, mut best_cpu, mut stats) = (f64::INFINITY, f64::INFINITY, ScanStats::default());
+    for _ in 0..5 {
+        let (t, c) = (Instant::now(), cpu());
+        let (r, s) = scan_with_stats(f, &ID, ScanLimit::End);
+        best = best.min(t.elapsed().as_secs_f64());
+        best_cpu = best_cpu.min(cpu() - c);
+        r.unwrap();
+        stats = s;
+    }
+    assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+    println!(
+        "{name}, {} MiB: {best:.3} s ({best_cpu:.2} s of CPU), {stats:?}",
+        f.len() >> 20
+    );
+    stats
+}
+
+/// The scan agrees with the scan as before Q-873, which walks each candidate's chain, and reads each step's header
+/// once ahead of the candidates and once more where it starts a commit block, for the tail's commit search.
+fn agrees_and_reads_each_header_once(f: &[u8], commits: u64) {
+    let len = f.len() as u64;
+    for limit in [ScanLimit::End, ScanLimit::Mark(len & !7)] {
+        let (r, stats) = scan_with_stats(f, &ID, limit);
+        let (walked, _) = legacy::scan_with_walked_links(f, &ID, limit);
+        assert_eq!(r, walked, "{limit:?}");
+        assert!(stats.within_bound(len), "{stats:?}");
+        assert!(
+            stats.headers_visited <= len / 8 + 2 * commits + 64,
+            "{limit:?}: {stats:?} for {len} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_header_at_every_step_has_each_header_read_once() {
+    for t in [None, Some(block_type::FACTS), Some(block_type::COMMIT)] {
+        let f = headers_everywhere(damaged_start(), 2 << 20, t);
+        agrees_and_reads_each_header_once(&f, 0);
+    }
+}
+
+#[test]
+fn commits_naming_data_headers_have_each_header_read_once() {
+    let f = named_walks(damaged_start(), 2 << 20);
+    agrees_and_reads_each_header_once(&f, f.len() as u64 / 64);
+}
+
+fn timed_manifest(name: &str, m: &[u8]) {
+    let (mut best, mut stats) = (f64::INFINITY, ScanStats::default());
+    for _ in 0..5 {
+        let t = Instant::now();
+        let (_, s) = read_manifest_with_stats(m, &STORE);
+        best = best.min(t.elapsed().as_secs_f64());
+        stats = s;
+    }
+    assert!(stats.within_manifest_bound(m.len() as u64), "{stats:?}");
+    println!(
+        "{name}, {} MiB, start's reader: {best:.3} s, {stats:?}",
+        m.len() >> 20
+    );
+}
+
+/// The crafted header walks against the restart budget, timed (Q-873): the best of five, and the CPU time. Run in a
+/// release build, one at a time: `cargo test --release -p kvik-log --test header_walk -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn crafted_header_walks_timed() {
+    for (what, t, len) in [
+        ("any type", None, 16usize << 20),
+        ("facts type", Some(block_type::FACTS), 16 << 20),
+        ("commit type", Some(block_type::COMMIT), 16 << 20),
+        ("any type", None, 64 << 20),
+    ] {
+        let f = headers_everywhere(damaged_start(), len, t);
+        timed(&format!("segment, a header every 8 bytes, {what}"), &f);
+    }
+    let f = named_walks(damaged_start(), 64 << 20);
+    timed("segment, commits naming data headers", &f);
+    let t = Instant::now();
+    let (r, _) = legacy::scan_with_walked_links(&f, &ID, ScanLimit::End);
+    r.unwrap();
+    println!(
+        "  the same, chains walked and remembered as before Q-873: {:.3} s",
+        t.elapsed().as_secs_f64()
+    );
+    let header = FileHeader::new(kind::MANIFEST, 0, 1, 0, STORE)
+        .encode()
+        .to_vec();
+    for t in [None, Some(kvik_log::manifest::RECORD_LOST_RANGE)] {
+        let m = headers_everywhere(header.clone(), 16 << 20, t);
+        timed_manifest(&format!("manifest, a header every 8 bytes, type {t:?}"), &m);
+    }
+}

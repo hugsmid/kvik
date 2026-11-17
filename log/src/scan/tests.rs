@@ -269,7 +269,7 @@ fn a_resumed_scan_continues_where_the_last_stopped() {
 }
 
 #[test]
-fn resynchronising_over_a_chain_longer_than_a_batch_remembers_at_most_a_batch_of_block_starts() {
+fn walked_chains_longer_than_a_batch_remember_at_most_a_batch_of_block_starts() {
     let (mut bytes, id) = chain(0);
     bytes.truncate(HEADER_LEN);
     bytes.extend_from_slice(&[0xFF; 8]);
@@ -280,7 +280,7 @@ fn resynchronising_over_a_chain_longer_than_a_batch_remembers_at_most_a_batch_of
     let len = bytes.len() as u64;
     let mut reads = Reads::new(&bytes);
     reads.use_table();
-    let mut chains = Chains::default();
+    let mut chains = Chains::walked();
     let found = chains
         .resync(&mut reads, &id, HEADER_LEN as u64, len, 1, None)
         .unwrap();
