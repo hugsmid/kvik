@@ -294,3 +294,23 @@ fn q960_a_latest_marker_of_a_later_version_stops_uploads_and_is_not_followed() {
     );
     assert_eq!(marker(&h, n + 1), None);
 }
+
+#[test]
+fn q614_a_catch_up_over_a_record_the_bucket_lost_puts_its_marker_instead_of_retrying() {
+    let mut h = Harness::new();
+    h.seal(10);
+    h.seal(10);
+    run_idle(&mut h.driver(), &mut Duration::default());
+    let keys = Keys::new(ID);
+    for m in all_markers(&h) {
+        h.sink.mem.remove(&keys.marker(0, m.sequence));
+    }
+    h.sink.mem.remove(&keys.record(0, 2));
+    let (_, mut d) = hiding(&h, &[]);
+    let step = run(&mut d, &mut Duration::default(), 1_000);
+    assert!(matches!(step, Step::Idle), "{step:?}");
+    assert_eq!(
+        marker(&h, 1).unwrap().summary.epoch,
+        in_bucket(&h.sink.mem).last().unwrap().record.epoch
+    );
+}
