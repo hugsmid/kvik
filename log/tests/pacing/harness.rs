@@ -622,6 +622,7 @@ pub fn saturated(setup: Setup, n: usize, sync: impl Fn(usize) -> Duration) -> Si
     let mut at = START;
     s.push();
     while s.starts.len() < n {
+        assert!(s.turns.len() < 10 * n + 100, "the writer stopped syncing");
         s.arrive(at + Duration::from_nanos(1));
         let (next, busy) = s.turn(at, sync(s.starts.len()));
         at = timed(next, at + busy, 50 * US).unwrap();

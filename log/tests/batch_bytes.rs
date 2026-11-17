@@ -18,8 +18,8 @@ use kvik_log::name::SegmentName;
 use kvik_log::scan::{ScanLimit, scan};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
-    Ack, Call, CallSource, CommitError, IngestQueue, LogWriter, Wait, WriterConfig, create_segment,
-    seal_segment_described,
+    Ack, Call, CallSource, CommitError, DEFAULT_SYNC_INTERVAL_FLOOR, IngestQueue, LogWriter, Wait,
+    WriterConfig, create_segment, seal_segment_described,
 };
 
 const STORE_ID: [u8; 16] = [7; 16];
@@ -128,6 +128,10 @@ struct H {
 
 impl H {
     fn new() -> Self {
+        Self::with_min_sync(Duration::ZERO)
+    }
+
+    fn with_min_sync(min_sync_interval: Duration) -> Self {
         let fs = MemFs::new();
         let new = NewStore {
             store_id: STORE_ID,
@@ -139,7 +143,7 @@ impl H {
         let store = StoreDir::open(Arc::new(fs.clone()), Path::new("store"), Some(&new)).unwrap();
         let cfg = WriterConfig {
             segment_size: 12 << 20,
-            min_sync_interval: Duration::ZERO,
+            min_sync_interval,
             disk_critical: 0,
             disk_low_bytes: 0,
             relaxed_limits: true,
@@ -318,6 +322,40 @@ fn fnv(bytes: &[u8], mut h: u64) -> u64 {
         h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+#[test]
+fn calls_put_back_keep_the_floor_and_a_turn_that_commits_nothing_leaves_it_as_it_was() {
+    let mut h = H::with_min_sync(Duration::from_millis(10));
+    let mut g = h.greedy(vec![
+        facts(1, T0, 3, 0),
+        vec![recovery()],
+        facts(2, T0, 2, 9),
+    ]);
+    assert_eq!(h.step(&mut g), 1);
+    assert_eq!(
+        h.w.sync_ready_at(),
+        h.now + DEFAULT_SYNC_INTERVAL_FLOOR,
+        "calls put back were waiting as the sync returned (Q-982)"
+    );
+    while !g.is_empty() {
+        h.step(&mut g);
+    }
+    assert_eq!(h.w.sync_ready_at(), Duration::ZERO);
+    h.maint = false;
+    for series in 3.. {
+        assert!(series < 12, "a roll found no segment ahead");
+        let mut big = h.greedy(vec![facts(series, T0, BIG, 255)]);
+        if h.step(&mut big) == 0 {
+            break;
+        }
+    }
+    assert_eq!(h.w.waiting(), Some(Wait::NoSegment));
+    assert_eq!(
+        h.w.sync_ready_at(),
+        Duration::ZERO,
+        "a turn that commits nothing leaves the spacing as it was"
+    );
 }
 
 #[test]
