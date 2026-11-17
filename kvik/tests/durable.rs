@@ -431,6 +431,7 @@ fn orphaned_facts_stay_out_of_views_and_are_exported() {
     let s = w.open();
     // Kept in the log, outside views (spec §2.1): the id is unknown to every call.
     assert!(matches!(s.series(b), Err(kvik::QueryError::UnknownSeries)));
+    assert_eq!(s.series_stats(b).map_or(0, |st| st.recorded), 0);
     let r = s.reader();
     assert!(matches!(
         r.facts(b, at(0)..at(2), View::Current),

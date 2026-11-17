@@ -407,6 +407,9 @@ fn a_loss_latched_while_a_call_waits_for_room_is_taken_in_when_it_plans_again() 
     let id = w
         .define(&SeriesSpec::new("a/b/note", Kind::Text, ""))
         .unwrap();
+    let other = w
+        .define(&SeriesSpec::new("a/b/other", Kind::Text, ""))
+        .unwrap();
     let note = move |t: i64, text: &str| Reading::new(id, Timestamp(t), Value::Text(text.into()));
     wait(w.emit(&[note(0, "I2-LOST")], Intent::Normal, true).unwrap());
     assert!(w.losses().is_empty());
@@ -429,7 +432,10 @@ fn a_loss_latched_while_a_call_waits_for_room_is_taken_in_when_it_plans_again() 
         })
     };
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let fill: Vec<Reading> = (0..1_024).map(|k| note(100 + k, "I2-FILL")).collect();
+    // Another series, so that the lost fact stays in its window and the call first plans it as a duplicate.
+    let fill: Vec<Reading> = (0..1_024)
+        .map(|k| Reading::new(other, Timestamp(100 + k), Value::Text("I2-FILL".into())))
+        .collect();
     let filled = match w.emit(&fill, Intent::Normal, false) {
         Ok(Emitted::Queued(q)) => q,
         other => panic!("the queue takes the call: {:?}", other.map(|_| ()).err()),

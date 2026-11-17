@@ -402,7 +402,7 @@ fn a_region_a_consumers_read_meets_after_the_open_is_counted() {
 }
 
 /// Q-929: a region a consumer's read met counts until a scanning reader of the process reports it; then the damage is
-/// `DataLost` alone.
+/// `DataLost`, not `LocalDataUnreadable`.
 #[test]
 fn a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_it() {
     let w = World::new("consumer-first");
@@ -436,8 +436,11 @@ fn a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_i
         .unwrap()
         .count();
     assert_eq!(unreadable(&s), None);
+    // The log's own check of the sealed segment may name it as well (`SegmentDamaged`).
+    let health = s.health();
     assert!(
-        matches!(s.health(), Health::Degraded { reasons } if matches!(&reasons[..], [Reason::DataLost(_)]))
+        matches!(&health, Health::Degraded { reasons } if reasons.iter().all(|r| matches!(r, Reason::DataLost(_) | Reason::SegmentDamaged { .. })) && reasons.iter().any(|r| matches!(r, Reason::DataLost(_)))),
+        "{health:?}"
     );
     block_on(s.shutdown()).unwrap();
 }
