@@ -61,12 +61,6 @@ impl Deliverer {
     ) -> Result<io::Result<()>, Error> {
         self.bound(name)?;
         self.writable()?;
-        let funnels: BTreeMap<u32, LogPos> = self
-            .view
-            .funnels(name)
-            .filter(|(_, f)| f.condition.is_some())
-            .map(|(id, f)| (id, f.incarnation))
-            .collect();
         let rt = self.consumers.get_mut(name).expect("bound above");
         if let DeliveryId::Resync { part } = id {
             if rt.gate != Some(part) {
@@ -81,6 +75,16 @@ impl Deliverer {
             .ok_or(Error::BadConfirm)?
             + 1;
         let done: Vec<Out> = rt.unconfirmed.drain(..n).collect();
+        // The condition funnels in force, only when a confirmed delivery carries a condition state.
+        let funnels: BTreeMap<u32, LogPos> = if done.iter().any(|o| !o.latches.is_empty()) {
+            self.view
+                .funnels(name)
+                .filter(|(_, f)| f.condition.is_some())
+                .map(|(id, f)| (id, f.incarnation))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         let mut forced = false;
         let mut latch_changed = false;
         for o in &done {
@@ -129,11 +133,6 @@ impl Deliverer {
         if self.failed {
             return Err(io::Error::other("a cursor file write failed before"));
         }
-        let funnels: BTreeMap<u32, LogPos> = self
-            .view
-            .funnels(name)
-            .map(|(id, f)| (id, f.incarnation))
-            .collect();
         let Some(rt) = self.consumers.get_mut(name) else {
             return Ok(false);
         };
@@ -143,6 +142,11 @@ impl Deliverer {
         if due == Due::Timed && rt.last_write.is_some_and(|t| ctx.mono - t < SECOND) {
             return Ok(false);
         }
+        let funnels: BTreeMap<u32, LogPos> = self
+            .view
+            .funnels(name)
+            .map(|(id, f)| (id, f.incarnation))
+            .collect();
         let state = CursorState {
             consumer: name.to_string(),
             position: rt.cursor,
