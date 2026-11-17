@@ -146,10 +146,23 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
 
 #[test]
 fn a_reading_that_leaves_the_window_before_its_call_is_acknowledged_is_still_found() {
+    // At the adaptive batch-sync interval's floor and with the interval fixed at its ceiling (invariant I1: a call seen
+    // acknowledged is shown by a lookup, whatever the interval).
+    for (name, floor) in [
+        ("left-before-acknowledged", Duration::from_millis(1)),
+        ("left-before-acknowledged-ceiling", Duration::from_secs(1)),
+    ] {
+        left_before_acknowledged(name, floor);
+    }
+}
+
+fn left_before_acknowledged(name: &str, floor: Duration) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    let w = World::new("left-before-acknowledged");
-    let s = w.open();
+    let w = World::new(name);
+    let mut config = w.config();
+    config.log.sync_interval_floor = floor;
+    let s = block_on(kvik::Store::open(config)).unwrap();
     let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
     let armed = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered) = mpsc::channel::<()>();
@@ -385,5 +398,46 @@ fn a_region_a_consumers_read_meets_after_the_open_is_counted() {
     drain(&mut c);
     assert_eq!(s.stats().delivery.regions_unread, 1);
     assert!(unreadable(&s).is_some_and(|(_, _, _, r)| r >= 1));
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-929: a region a consumer's read met counts until a scanning reader of the process reports it; then the damage is
+/// `DataLost` alone.
+#[test]
+fn a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_it() {
+    let w = World::new("consumer-first");
+    let mut config = w.config();
+    config.log.seal_interval = Duration::from_millis(20);
+    let open = || block_on(Store::open(config.clone())).unwrap();
+    let s = open();
+    let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![g])))).unwrap();
+    drain(&mut c);
+    sealed(&w, 1);
+    block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 2.0)])).unwrap();
+    let facts = sealed(&w, 2)
+        .into_iter()
+        .max_by_key(|p| file_id(p))
+        .unwrap();
+    block_on(s.emit(&[num(g, 2, 3.0)])).unwrap();
+    block_on(s.shutdown()).unwrap();
+    drop((c, s));
+    let s = open();
+    let bytes = w.fs.read(&facts).unwrap();
+    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    drain(&mut c);
+    assert!(unreadable(&s).is_some_and(|(_, _, _, r)| r >= 1));
+    // The store's own reader reads the kept log at its first query and finds the region (Q-928).
+    let _ = s
+        .reader()
+        .facts(g, common::at(-10)..common::at(10), kvik::View::History)
+        .unwrap()
+        .count();
+    assert_eq!(unreadable(&s), None);
+    assert!(
+        matches!(s.health(), Health::Degraded { reasons } if matches!(&reasons[..], [Reason::DataLost(_)]))
+    );
     block_on(s.shutdown()).unwrap();
 }

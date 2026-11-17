@@ -71,6 +71,8 @@ impl Writer {
                 Ok(p) => break (d, call, plan, refreshes, Some(p)),
                 Err(SubmitError::Busy(LogWait::QueueFull)) if wait => {
                     drop(d);
+                    #[cfg(test)]
+                    pause::at(&self.dir, pause::Point::WaitingForRoom);
                     match self.wait_room(len) {
                         Ok(()) => continue,
                         Err(e) => e,

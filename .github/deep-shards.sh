@@ -52,6 +52,7 @@ kvik-consumers  kvik  consumer_properties
 kvik-patterns   kvik  patterns
 kvik-differential kvik durable_differential --rest
 kvik-differential-small kvik durable_differential small_windows_decide_
+kvik-loss-open  kvik  durable_losses_open
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs

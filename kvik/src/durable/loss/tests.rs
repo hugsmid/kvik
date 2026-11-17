@@ -17,7 +17,7 @@ use crate::env::{Env, ManualClock, MemFs};
 use crate::health::LossKind;
 use crate::series::{Kind, SeriesSpec};
 use crate::time::Timestamp;
-use crate::types::{Intent, Position, Reading, Value};
+use crate::types::{Intent, Outcome, Position, Reading, Value};
 
 const MARK: LogPos = LogPos {
     generation: 0,
@@ -383,4 +383,86 @@ fn a_region_inside_a_report_held_too_wide_still_reaches_the_latch_with_its_close
         vec![true, true]
     );
     assert!(f.apply(&[tail], at(7)).is_empty(), "met again, nothing new");
+}
+
+/// Invariant I2 (design §2.2): a plan never outlives a forgetting. A call that waits for room plans again, so a loss
+/// latched during the wait is taken in: the replay of the lost fact, a duplicate when first planned, is recorded.
+#[test]
+fn a_loss_latched_while_a_call_waits_for_room_is_taken_in_when_it_plans_again() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    use crate::durable::pause::{Gate, Point};
+
+    let fs = MemFs::new();
+    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+    let mut env = Env::test(clock.clone());
+    env.fs = Arc::new(fs.clone());
+    let dir = PathBuf::from("durable-unit/plan-again");
+    let mut config = StoreConfig::new(&dir, "Etc/UTC")
+        .create_if_missing(true)
+        .env(env);
+    config.limits.ingest_queue = 1_024;
+    let w = Writer::open(&config).unwrap();
+    let id = w
+        .define(&SeriesSpec::new("a/b/note", Kind::Text, ""))
+        .unwrap();
+    let note = move |t: i64, text: &str| Reading::new(id, Timestamp(t), Value::Text(text.into()));
+    wait(w.emit(&[note(0, "I2-LOST")], Intent::Normal, true).unwrap());
+    assert!(w.losses().is_empty());
+    // The next batch sync is held, so the queue fills behind it.
+    let (entered_tx, entered) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let armed = Arc::new(AtomicBool::new(true));
+    let hook_armed = armed.clone();
+    fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        if p.extension().is_some_and(|e| e == "open") && hook_armed.swap(false, Ordering::SeqCst) {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    })));
+    let held = {
+        let w = w.clone();
+        std::thread::spawn(move || {
+            wait(w.emit(&[note(1, "I2-HELD")], Intent::Normal, true).unwrap())
+        })
+    };
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let fill: Vec<Reading> = (0..1_024).map(|k| note(100 + k, "I2-FILL")).collect();
+    let filled = match w.emit(&fill, Intent::Normal, false) {
+        Ok(Emitted::Queued(q)) => q,
+        other => panic!("the queue takes the call: {:?}", other.map(|_| ()).err()),
+    };
+    let gate = Gate::new(&dir, Point::WaitingForRoom);
+    let replay = {
+        let w = w.clone();
+        std::thread::spawn(move || {
+            wait(
+                w.emit(
+                    &[note(0, "I2-LOST"), note(5_000, "I2-NEW")],
+                    Intent::Normal,
+                    true,
+                )
+                .unwrap(),
+            )
+        })
+    };
+    gate.reached();
+    damage(&fs, &dir, b"I2-LOST");
+    assert_eq!(w.losses().len(), 1);
+    release.send(()).unwrap();
+    gate.release();
+    let ack = replay.join().unwrap();
+    assert!(
+        matches!(
+            ack.outcomes[..],
+            [Outcome::Recorded { .. }, Outcome::Recorded { .. }]
+        ),
+        "{:?}",
+        ack.outcomes
+    );
+    held.join().unwrap();
+    wait(Emitted::Queued(filled));
+    fs.set_sync_hook(None);
 }

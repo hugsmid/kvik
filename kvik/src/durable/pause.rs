@@ -11,6 +11,8 @@ pub(crate) enum Point {
     AfterDecision,
     /// After a call's acknowledgement, before its delivery step.
     AfterAck,
+    /// A call that met a full ingest queue, with the decision lock dropped, before it waits for room.
+    WaitingForRoom,
     /// In `take_consumer`, under the deliverer's lock, before the pump that sets the consumer up.
     SetUpPump,
     /// In `take_consumer`, once the consumer is set up.
