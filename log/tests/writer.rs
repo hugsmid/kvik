@@ -71,14 +71,14 @@ fn fact(series: u32, t: i64, text: usize) -> Item {
 }
 
 fn alias(id: u32) -> Item {
-    Item::Entry(Entry::Alias {
+    Item::from(Entry::Alias {
         id,
         name: format!("a{id}"),
     })
 }
 
 fn definition(id: u32, interval: Option<IntervalLength>) -> Item {
-    Item::Entry(Entry::Definition(Box::new(Definition {
+    Item::from(Entry::Definition(Box::new(Definition {
         id,
         name: format!("s{id}"),
         kind: if interval.is_some() {
@@ -1148,7 +1148,7 @@ fn commit_time_never_decreases_when_the_wall_clock_steps_back() {
 }
 
 fn recovery() -> Item {
-    Item::Entry(Entry::Recovery(Recovery {
+    Item::from(Entry::Recovery(Recovery {
         after: 0,
         stamp: None,
         boot_id: BOOT,

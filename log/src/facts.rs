@@ -422,7 +422,15 @@ struct Col<'a> {
     payload: &'a [u8],
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Facts block bodies decoded on this thread.
+    pub(crate) static FACTS_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
+    #[cfg(test)]
+    FACTS_DECODES.with(|c| c.set(c.get() + 1));
     use ContentError as E;
     let p = DataPrefix::decode(block_type::FACTS, body).map_err(|_| {
         if body.len() < DATA_PREFIX_LEN {

@@ -10,7 +10,35 @@ use crate::facts::FactsBlock;
 use crate::header::{FileHeader, HEADER_LEN};
 use crate::lease::LeaseSlot;
 use crate::mark::read_mark;
-use crate::scan::{ScanLimit, ScanReport, Tail, scan_with_stats};
+use crate::scan::{Found, ScanLimit, ScanReport, Scanner, Tail, scan_with_stats};
+
+/// A scan that keeps the content its checks decoded finds what one that does not finds, and that content is what
+/// [`BatchContent::decode`] gives.
+fn same_with_kept_content(data: &[u8], id: &SegmentIdentity, limit: ScanLimit) {
+    let (Ok(plain), Ok(kept)) = (
+        Scanner::new(data, id, limit),
+        Scanner::new(data, id, limit).map(Scanner::keeping_content),
+    ) else {
+        return;
+    };
+    let plain: Vec<_> = plain.collect();
+    let mut kept_scanner = kept;
+    let mut found = Vec::new();
+    while let Some(f) = kept_scanner.next() {
+        if let Ok(Found::Batch(b)) = &f {
+            let content = kept_scanner.take_content();
+            assert_eq!(
+                content.as_ref().ok_or(()),
+                BatchContent::decode(b).as_ref().map_err(|_| ())
+            );
+        }
+        found.push(f);
+    }
+    assert_eq!(
+        plain, found,
+        "a scan keeping content finds what one without does"
+    );
+}
 
 /// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file, a registry file and each
 /// body type, and
@@ -76,6 +104,9 @@ pub fn decode_all(data: &[u8]) {
     // As a manifest (A.14), read by the start's reader for the store its header names.
     let (_, stats) = crate::manifest::read_manifest_with_stats(data, &id.store_id);
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+    for limit in [ScanLimit::End, ScanLimit::Mark(marks[0])] {
+        same_with_kept_content(data, &id, limit);
+    }
     let _ = FileHeader::decode(data);
     let _ = read_mark(data, &id.store_id);
     // As a mark file: the store id where slot 0 holds it.

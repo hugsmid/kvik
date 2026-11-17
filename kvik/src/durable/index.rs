@@ -241,8 +241,9 @@ impl Index {
                         },
                     );
                 }
-                Item::Entry(Entry::Ignored { .. }) => {}
+                Item::Entry(e) if matches!(**e, Entry::Ignored { .. }) => {}
                 Item::Entry(e) => {
+                    let e: &Entry = e;
                     self.registry.apply(e);
                     if let Entry::Recovery(r) = e {
                         self.recoveries.insert(p, r.clone());
@@ -606,11 +607,11 @@ mod tests {
         let mut i = Index::default();
         i.apply(
             &[
-                batch(1, vec![Item::Entry(Entry::Definition(Box::new(def)))]),
+                batch(1, vec![Item::from(Entry::Definition(Box::new(def)))]),
                 batch(2, vec![fact(10, 1.0), fact(20, 2.0)]),
                 batch(
                     4,
-                    vec![Item::Entry(Entry::Alias {
+                    vec![Item::from(Entry::Alias {
                         id: 1,
                         name: "a/b/d".into(),
                     })],

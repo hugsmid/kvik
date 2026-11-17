@@ -17,7 +17,9 @@ pub fn scan<'a>(
         offset: HEADER_LEN as u64,
         last_sequence: None,
     };
-    collect(Scanner::resume_inner(bytes, id, limit, from, true, true))
+    collect(Scanner::resume_inner(
+        bytes, id, limit, from, true, true, None,
+    ))
 }
 
 /// The scan recovery runs on a segment whose seal it ignores: by the reference scan when `legacy`, else as recovery

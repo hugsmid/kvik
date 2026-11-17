@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kvik_log::batch::SegmentIdentity;
-use kvik_log::content::{BatchContent, Item};
+use kvik_log::content::{BatchContent, Item, ItemRef};
 use kvik_log::entries::{Entry, MarkState};
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{FaultOp, Fs, MemFs};
@@ -69,7 +69,7 @@ fn fact(series: u32, t: i64) -> Item {
 }
 
 fn alias(id: u32) -> Item {
-    Item::Entry(Entry::Alias {
+    Item::from(Entry::Alias {
         id,
         name: format!("a{id}"),
     })
@@ -391,7 +391,7 @@ impl Rig {
         assert_eq!(m.boot_id, self.boot_id());
         let mut next = 1;
         for c in self.batches() {
-            if let [Item::Entry(Entry::Recovery(r))] = c.items.as_slice() {
+            if let Some(r) = c.recovery() {
                 // `after` is the last kept position: the previous batch's, or the end of a lost range.
                 assert!(r.after + 1 >= next);
                 assert!(c.first_sequence >= next);
@@ -556,7 +556,9 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
             assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
             let p = r.positions();
             assert_eq!(p.len(), 2);
-            assert!(matches!(p.get(&2), Some(Item::Entry(Entry::Recovery(e))) if e.after == 1));
+            assert!(
+                matches!(p.get(&2).map(Item::view), Some(ItemRef::Entry(Entry::Recovery(e))) if e.after == 1)
+            );
         }
     }
 }
@@ -797,7 +799,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
     let mut r = Rig::new(cfg());
     // Routing changes name three consumers; one of them never writes a cursor file.
     for c in ["alarms", "broken", "silent"] {
-        r.submit(vec![Item::Entry(Entry::Routing(Box::new(Routing {
+        r.submit(vec![Item::from(Entry::Routing(Box::new(Routing {
             consumer: c.into(),
             op: RouteOp::Emits,
             funnel: None,
@@ -846,7 +848,7 @@ fn cursor_files_raise_f_and_missing_or_unreadable_ones_are_named() {
 fn a_routing_change_sealed_above_the_registry_file_names_its_consumer() {
     use kvik_log::entries::{RouteOp, Routing, Selection};
     let mut r = Rig::new(cfg());
-    r.submit(vec![Item::Entry(Entry::Routing(Box::new(Routing {
+    r.submit(vec![Item::from(Entry::Routing(Box::new(Routing {
         consumer: "sealed".into(),
         op: RouteOp::Emits,
         funnel: None,
@@ -868,7 +870,7 @@ fn a_routing_change_sealed_above_the_registry_file_names_its_consumer() {
         bs.iter().any(|b| {
             b.items
                 .iter()
-                .any(|i| matches!(i, Item::Entry(Entry::Routing(_))))
+                .any(|i| matches!(i.view(), ItemRef::Entry(Entry::Routing(_))))
         })
     };
     assert!(routing(r.sealed_batches()), "the routing change is sealed");
@@ -911,10 +913,7 @@ fn a_crash_between_the_entry_and_the_mark_adopts_the_entry() {
         let entries: Vec<_> = r
             .batches()
             .into_iter()
-            .filter_map(|c| match c.items.as_slice() {
-                [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
-                _ => None,
-            })
+            .filter_map(|c| c.recovery().cloned())
             .collect();
         assert_eq!(entries.len(), 1, "crash after {n} operations");
         assert_eq!(entries[0].tail_bytes, 40, "crash after {n} operations");
@@ -1552,17 +1551,11 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
             if let Some((k, batch, stale)) = owed {
                 let now = r.batches();
                 let kept = now.contains(batch);
-                let entry = now.iter().any(|b| {
-                    matches!(
-                        b.items.as_slice(),
-                        [Item::Entry(Entry::Recovery(e))] if e.after == *k
-                    )
-                });
+                let entry = now
+                    .iter()
+                    .any(|b| b.recovery().is_some_and(|e| e.after == *k));
                 // The batch beyond the mark may itself be that entry, written by a start whose mark was lost: adopted.
-                let is_entry = matches!(
-                    batch.items.as_slice(),
-                    [Item::Entry(Entry::Recovery(e))] if e.after == *k
-                );
+                let is_entry = batch.recovery().is_some_and(|e| e.after == *k);
                 assert!(
                     (entry && (!kept || is_entry)) || (kept && *stale),
                     "a complete batch above position {k}: kept {kept}, entry {entry}, stale {stale}"
@@ -1647,7 +1640,7 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
         );
         let mut next = 1;
         for b in r.batches() {
-            if let [Item::Entry(Entry::Recovery(e))] = b.items.as_slice() {
+            if let Some(e) = b.recovery() {
                 assert_eq!(e.after, next - 1);
             }
             next = b.last_sequence() + 1;
@@ -1685,10 +1678,7 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
                     Some(e) if e.adopted => {
                         let is_entry = |b: &BatchContent| {
                             b.first_sequence == e.sequence
-                                && matches!(
-                                    b.items.as_slice(),
-                                    [Item::Entry(Entry::Recovery(x))] if x.after == e.entry.after
-                                )
+                                && b.recovery().is_some_and(|x| x.after == e.entry.after)
                         };
                         assert!(before.iter().any(is_entry), "the adopted entry was on disk");
                         before
@@ -2312,10 +2302,7 @@ fn a_rule_1_entry_written_before_a_stop_is_adopted() {
     let first = r
         .batches()
         .into_iter()
-        .find_map(|b| match b.items.as_slice() {
-            [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
-            _ => None,
-        })
+        .find_map(|b| b.recovery().cloned())
         .expect("the entry the stopped start wrote");
     let rep = r.open().expect("the next start finishes");
     assert_eq!(rep.rule, StartRule::SameBoot);
@@ -2329,7 +2316,7 @@ fn a_rule_1_entry_written_before_a_stop_is_adopted() {
     let entries = r
         .batches()
         .iter()
-        .filter(|b| matches!(b.items.as_slice(), [Item::Entry(Entry::Recovery(_))]))
+        .filter(|b| b.recovery().is_some())
         .count();
     assert_eq!(entries, 1);
     r.check_started();
@@ -2367,7 +2354,7 @@ fn a_rule_1_reset_into_a_new_segment_cut_at_every_operation() {
         let c = BatchContent {
             first_sequence: 2,
             received_at: T0,
-            items: vec![Item::Entry(Entry::Recovery(e))],
+            items: vec![Item::from(Entry::Recovery(e))],
         };
         c.encode(&id, 64, T0).unwrap().len() as u64
     };
@@ -2447,13 +2434,7 @@ fn cut_everywhere(setup: &dyn Fn() -> (Rig, MarkSlot, BatchContent)) {
             !now.contains(&beyond),
             "cut at {n}: the truncated batch is gone"
         );
-        let entries: Vec<_> = now
-            .iter()
-            .filter_map(|b| match b.items.as_slice() {
-                [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
-                _ => None,
-            })
-            .collect();
+        let entries: Vec<_> = now.iter().filter_map(|b| b.recovery().cloned()).collect();
         assert_eq!(entries.len(), 1, "cut at {n}: one entry, reported once");
         assert_eq!(entries[0].after, m.last_sequence, "cut at {n}");
         assert!(
@@ -2763,10 +2744,7 @@ fn torn_batch_in_an_unused_segment() -> Rig {
 fn recovery_entries(r: &Rig) -> Vec<kvik_log::entries::Recovery> {
     r.batches()
         .into_iter()
-        .filter_map(|b| match b.items.as_slice() {
-            [Item::Entry(Entry::Recovery(e))] => Some(e.clone()),
-            _ => None,
-        })
+        .filter_map(|b| b.recovery().cloned())
         .collect()
 }
 
@@ -3347,7 +3325,7 @@ fn damaged_bytes_beyond_the_mark_before_a_header_only_segment_are_a_reset() {
 /// A definition entry of a gauge.
 fn definition(id: u32) -> Item {
     use kvik_log::entries::{Definition, Kind, Retention, Timing, Versioning};
-    Item::Entry(Entry::Definition(Box::new(Definition {
+    Item::from(Entry::Definition(Box::new(Definition {
         id,
         name: format!("s{id}"),
         kind: Kind::Gauge,

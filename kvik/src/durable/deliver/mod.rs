@@ -518,8 +518,9 @@ impl Deliverer {
                     }
                     self.items.insert(p, Rec::Fact(rec));
                 }
-                Item::Entry(Entry::Ignored { .. }) => {}
+                Item::Entry(e) if matches!(*e, Entry::Ignored { .. }) => {}
                 Item::Entry(e) => {
+                    let e = *e;
                     self.view.apply(p, &e);
                     if let Entry::Recovery(r) = &e {
                         let after = LogPos {

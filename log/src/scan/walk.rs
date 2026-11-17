@@ -79,7 +79,7 @@ fn judge(reads: &mut Reads<'_>, p: u64, o: u64, limit: u64) -> Judged {
     let t = b.header.block_type;
     match t {
         block_type::COMMIT => stop(Stop::Commit(Commit::decode(b.body).ok())),
-        block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body) {
+        block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body, false) {
             Ok(_) => Judged::Pass(b.next_offset()),
             Err(BodyError::Unsupported(element)) => stop(Stop::Refuse(element)),
             Err(_) => stop(Stop::Fault(BatchFault::Content)),
@@ -102,9 +102,10 @@ impl Walks {
         o: u64,
         limit: u64,
         min_first: u64,
+        keep: bool,
     ) -> BatchRead<'a> {
         let before = reads.body_checked();
-        let r = self.walk(reads, id, o, limit, min_first);
+        let r = self.walk(reads, id, o, limit, min_first, keep);
         if matches!(r, BatchRead::Incomplete { .. }) && reads.body_checked() > before {
             reads.failed.charge(o, reads.body_checked() - before);
         }
@@ -118,6 +119,7 @@ impl Walks {
         o: u64,
         limit: u64,
         min_first: u64,
+        keep: bool,
     ) -> BatchRead<'a> {
         if o - self.pruned >= 1 << 16 {
             self.links = self.links.split_off(&o);
@@ -167,7 +169,7 @@ impl Walks {
             }
             Stop::Commit(None) => incomplete(BatchFault::Content),
             Stop::Commit(Some(c)) if c.batch_bytes == p - o => {
-                read_batch(reads, id, o, limit, min_first, Refusal::AtOnce)
+                read_batch(reads, id, o, limit, min_first, Refusal::AtOnce, keep)
             }
             Stop::Commit(Some(_)) => incomplete(BatchFault::Disagreement),
         }

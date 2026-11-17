@@ -8,6 +8,7 @@ use crate::batch::{
 use crate::block::{BLOCK_HEADER_LEN, block_type};
 use crate::body::{COMMIT_LEN, Commit};
 use crate::bytes::{slice, u64_at};
+use crate::content::DataBody;
 use crate::error::FormatError;
 
 use super::{ReadableCommit, Reads};
@@ -123,6 +124,7 @@ impl Chains {
     /// `batch_crc32c` are checked on headers ([`framing_holds`]); only a candidate that passes is read in full,
     /// its body checksums taken from the prefix table (Q-110). Once failed reads in a window have checked
     /// [`super::FAILED_READ_BUDGET`] bytes of body, the rest of the window is not read (Q-110).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resync<'a>(
         &mut self,
         reads: &mut Reads<'a>,
@@ -131,7 +133,8 @@ impl Chains {
         limit: u64,
         min_first: u64,
         mut commits: Option<&mut CommitSearch>,
-    ) -> Result<Option<Batch<'a>>, FormatError> {
+        keep: bool,
+    ) -> Result<Option<(Batch<'a>, Vec<DataBody>)>, FormatError> {
         let mut o = start + 8;
         while o + (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
             if let Some(c) = commits.as_deref_mut() {
@@ -163,8 +166,16 @@ impl Chains {
             });
             if candidate && framing_holds(reads, id, o, limit) {
                 let before = reads.body_checked();
-                match read_batch(reads, id, o, limit, min_first, Refusal::IfBatchVerifies) {
-                    BatchRead::Complete(b) => return Ok(Some(b)),
+                match read_batch(
+                    reads,
+                    id,
+                    o,
+                    limit,
+                    min_first,
+                    Refusal::IfBatchVerifies,
+                    keep,
+                ) {
+                    BatchRead::Complete(b, bodies) => return Ok(Some((b, bodies))),
                     BatchRead::Refused(e) => return Err(e),
                     BatchRead::Incomplete { .. } if reads.body_checked() > before => {
                         reads.failed.charge(o, reads.body_checked() - before);

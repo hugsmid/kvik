@@ -92,7 +92,7 @@ fn concurrent_callers_get_dense_positions_and_every_batch_is_on_disk() {
                 for i in 0..150i64 {
                     let mut items: Vec<Item> = (0..1 + i % 3).map(|k| fact(t, i * 4 + k)).collect();
                     if i % 37 == 0 {
-                        items.push(Item::Entry(Entry::Alias {
+                        items.push(Item::from(Entry::Alias {
                             id: t,
                             name: format!("t{t}-{i}"),
                         }));
@@ -292,9 +292,17 @@ fn a_maintenance_fault_during_a_commit_stops_the_writer_before_its_next_operatio
         0,
         std::io::ErrorKind::Other,
     );
+    let store =
+        StoreDir::open(Arc::new(fs.clone()), Path::new("store"), Some(&new_store())).unwrap();
+    let cfg = WriterConfig {
+        min_sync_interval: Duration::ZERO,
+        max_batch_bytes: 7_000,
+        ..cfg()
+    };
+    let w = LogWriter::open(store, cfg, Some([5; 16]), Duration::ZERO, T0).unwrap();
     let writer_syncs = Arc::new(Mutex::new(0usize));
     let in_sync = Arc::new(AtomicBool::new(false));
-    let (f2, n2, s2) = (fs.clone(), writer_syncs.clone(), in_sync.clone());
+    let (halt, n2, s2) = (w.halt(), writer_syncs.clone(), in_sync.clone());
     fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
         let name = p.to_string_lossy();
         match std::thread::current().name() {
@@ -302,9 +310,9 @@ fn a_maintenance_fault_during_a_commit_stops_the_writer_before_its_next_operatio
                 let mut n = n2.lock().unwrap();
                 *n += 1;
                 if *n == 4 {
-                    // The fourth batch's sync is in flight until the maintenance fault has happened.
+                    // The fourth batch's sync is in flight until the maintenance fault has halted the store.
                     s2.store(true, Ordering::SeqCst);
-                    assert!(wait_for(|| f2.ops().iter().any(|o| !o.ok)));
+                    assert!(wait_for(|| halt.is_set()));
                 }
             }
             Some("kvik-maint") if name.contains("0000000000000003") => {
@@ -313,15 +321,7 @@ fn a_maintenance_fault_during_a_commit_stops_the_writer_before_its_next_operatio
             _ => {}
         }
     })));
-    let log = start(
-        Arc::new(fs.clone()),
-        Path::new("store"),
-        WriterConfig {
-            min_sync_interval: Duration::ZERO,
-            max_batch_bytes: 7_000,
-            ..cfg()
-        },
-    );
+    let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
     for i in 0..3 {
         log.submit(big(i)).unwrap().wait().unwrap();
     }
@@ -398,7 +398,7 @@ fn smoke_on_the_real_file_system() {
     for i in 0..400i64 {
         let mut items = vec![fact(1, i), fact(2, i)];
         if i % 100 == 0 {
-            items.push(Item::Entry(Entry::Alias {
+            items.push(Item::from(Entry::Alias {
                 id: 1,
                 name: format!("n{i}"),
             }));

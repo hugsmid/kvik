@@ -24,6 +24,10 @@
 //!   (`spec.md` §7 Readers). [`ReaderState::stamp`] with `durable` is the saved point a later holder keeps; its
 //!   check against the resets since is built with roadmap 5.3.
 //!
+//! Between refreshes a reader keeps the bytes of the segment it follows up to the mark, so that a refresh reads only
+//! what is new: at most one segment's bytes per reader handle while it follows a segment. A whole-file read of an
+//! earlier segment is freed when the refresh ends, and the kept bytes are freed when another segment is followed.
+//!
 //! The reader names in its lease (`format.md` A.15) the manifest epoch it took: it writes the lease at open,
 //! renews it at every [`LogReader::refresh`], which takes the manifest's current epoch, and through
 //! [`LogReader::keep_alive`] once half of `lease_refresh` has passed. Renewal opens the lease by path, so a lease
@@ -51,7 +55,7 @@
 //! let store = StoreDir::open(fs.clone(), Path::new("store"), Some(&new)).unwrap();
 //! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO, 0).unwrap();
 //! let log = Log::start(writer, Arc::new(SystemClock::default())).unwrap();
-//! let alias = Item::Entry(Entry::Alias { id: 1, name: "hall".into() });
+//! let alias = Item::from(Entry::Alias { id: 1, name: "hall".into() });
 //! log.submit(vec![alias.clone()]).unwrap().wait().unwrap();
 //!
 //! // Another handle on the same files: no lock, no thread.
@@ -70,21 +74,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::batch::SegmentIdentity;
-use crate::content::{BatchContent, Item};
+use crate::content::BatchContent;
 use crate::content_error::BodyError;
 use crate::crc::crc32c;
-use crate::entries::Entry;
 use crate::error::FormatError;
-use crate::fs::{Fs, FsFile, OpenMode};
-use crate::header::{FileHeader, HEADER_LEN, kind};
-use crate::lease::{LEASE_EXPIRY, LEASE_REFRESH, LeaseSlot, SLOT_OFFSET, lease_name};
-use crate::manifest::{LostRange, ManifestError, read_manifest};
-use crate::mark::{MARK_LEN, MarkSlot, ResetStamp, read_mark};
-use crate::name::SegmentName;
+use crate::fs::Fs;
+use crate::header::HEADER_LEN;
+use crate::lease::{LEASE_EXPIRY, LEASE_REFRESH, LeaseSlot, lease_name};
+use crate::manifest::{LostRange, ManifestError};
+use crate::mark::{MarkSlot, ResetStamp};
 use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner, set_aside};
 use crate::setaside::SetAside;
-use crate::store::{LEASES_DIR, LOG_DIR, MANIFEST, MARK, StoreError, read_all, read_descriptor};
+use crate::store::{LEASES_DIR, LOG_DIR, StoreError, read_descriptor};
 use crate::writer::{Clock, Position};
+use files::read_part;
 
 /// How many times a reader reads the mark again when neither slot is valid (`format.md` A.10).
 pub const MARK_RETRIES: u32 = 8;
@@ -233,10 +236,7 @@ pub struct ReadBatch {
 impl ReadBatch {
     /// The recovery entry this batch holds, if it is one (`spec.md` §3 Recovery rule 3).
     pub fn recovery(&self) -> Option<&crate::entries::Recovery> {
-        match self.content.items.as_slice() {
-            [Item::Entry(Entry::Recovery(r))] => Some(r),
-            _ => None,
-        }
+        self.content.recovery()
     }
 }
 
@@ -296,8 +296,9 @@ struct Fingerprint {
     /// The batch's offset and end.
     offset: u64,
     end: u64,
-    /// CRC32C over the batch's bytes, commit block included.
-    crc: u32,
+    /// CRC32C over the batch's bytes, commit block included; computed when the pass that returned it ends, for the
+    /// [`RECENT`] batches still remembered then.
+    crc: Option<u32>,
     first: Position,
     last: Position,
 }
@@ -315,8 +316,21 @@ struct View {
     regions: BTreeSet<(u64, u64, u64)>,
 }
 
-/// A segment opened by name, under the extension it was found with.
-type OpenSegment = (SegmentName, Box<dyn FsFile>);
+/// The bytes of the segment followed up to the mark, kept between refreshes so that a refresh reads and zeroes only
+/// what is new; empty after a whole-file read and when another segment is followed.
+#[derive(Default)]
+struct Scratch {
+    file_id: Option<u64>,
+    bytes: Vec<u8>,
+    /// The bytes are the whole of this earlier segment, kept because a bounded refresh stopped inside it.
+    whole: Option<u64>,
+}
+
+impl std::fmt::Debug for Scratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Scratch({:?}, {} bytes)", self.file_id, self.bytes.len())
+    }
+}
 
 /// A reader of the log. See the module documentation.
 #[derive(Debug)]
@@ -330,6 +344,9 @@ pub struct LogReader {
     state: ReaderState,
     view: View,
     lost: Vec<LostRange>,
+    scratch: Scratch,
+    /// What [`LogReader::lookup`] keeps of sealed segments' indexes and of segments' batches.
+    caches: lookup::Caches,
     closed: bool,
 }
 
@@ -365,6 +382,8 @@ impl LogReader {
             },
             view: View::default(),
             lost: Vec::new(),
+            scratch: Scratch::default(),
+            caches: lookup::Caches::default(),
             closed: false,
             cfg,
         };
@@ -392,6 +411,17 @@ impl LogReader {
         &self.lost
     }
 
+    /// Bytes kept between refreshes: those of the segment followed, up to the mark (module documentation).
+    pub fn kept_bytes(&self) -> usize {
+        self.scratch.bytes.capacity()
+    }
+
+    /// Frees the bytes kept between refreshes, for a reader that will look facts up rather than refresh; a later
+    /// refresh reads its segment again from the point reached.
+    pub fn release_bytes(&mut self) {
+        self.scratch = Scratch::default();
+    }
+
     /// The lease file's path.
     pub fn lease_path(&self) -> &Path {
         &self.lease_path
@@ -401,39 +431,69 @@ impl LogReader {
     /// renews the lease naming the manifest's current epoch (`api.md` `refresh`). On an error nothing the reader
     /// holds changes and nothing it found is lost: the next refresh finds it again.
     pub fn refresh(&mut self) -> Result<Update, ReaderError> {
+        self.refresh_inner(None).map(|(u, _)| u)
+    }
+
+    /// [`LogReader::refresh`] that stops after the batch that brings the items it returns to `max_items` or more,
+    /// so that a reader taking a long log holds one part of it at a time. Returns whether more may follow; until a
+    /// call returns `false`, [`ReaderState::durable`] is the last position returned rather than the mark's.
+    pub fn refresh_some(&mut self, max_items: usize) -> Result<(Update, bool), ReaderError> {
+        self.refresh_inner(Some(max_items.max(1)))
+    }
+
+    fn refresh_inner(&mut self, budget: Option<usize>) -> Result<(Update, bool), ReaderError> {
         let mark = self.read_mark()?;
         let (epoch, lost) = self.read_manifest()?;
         // The lease names the epoch before any file is read under it (`spec.md` §7 Readers).
         let renewed = self.renew_slot(epoch, mark.generation)?;
         let mut view = self.view.clone();
         let mut events = Vec::new();
-        let read = self.read_log(&mut view, &mark, &mut events);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let read = self.read_log(&mut view, &mark, &mut events, &mut scratch, budget);
+        if scratch.file_id.is_none() && scratch.whole.is_none() {
+            scratch.bytes = Vec::new();
+        }
+        self.scratch = scratch;
         // The lease was written whatever the log held: keep its state.
         self.commit_lease(renewed);
-        read?;
+        let more = read?;
         // A mark with another reset stamp, or one that moved backwards, while the files were read: a start may have
         // rewritten what was read under the first one. Discard the pass; the next refresh checks what it holds and
         // reads again.
         if let Ok(again) = self.read_mark()
             && behind(&again, &mark)
         {
-            return Ok(Update {
-                state: self.state,
-                events: Vec::new(),
-            });
+            if self.scratch.whole.take().is_some() {
+                self.scratch.bytes = Vec::new();
+            }
+            // Nothing was taken: more may follow, so a caller reading in parts reads again.
+            return Ok((
+                Update {
+                    state: self.state,
+                    events: Vec::new(),
+                },
+                true,
+            ));
         }
         self.view = view;
         self.lost = lost;
-        self.state.durable = Position {
-            generation: mark.generation,
-            sequence: mark.last_sequence,
+        self.state.durable = if more {
+            self.view.taken
+        } else {
+            Position {
+                generation: mark.generation,
+                sequence: mark.last_sequence,
+            }
         };
         self.state.generation = mark.generation;
         self.state.stamp = mark.stamp;
-        Ok(Update {
-            state: self.state,
-            events,
-        })
+        Ok((
+            Update {
+                state: self.state,
+                events,
+            },
+            more,
+        ))
     }
 
     /// Renews the lease if half of `lease_refresh` has passed since it was written, keeping its epoch, or, once
@@ -463,135 +523,15 @@ impl LogReader {
         }
     }
 
-    fn read_mark(&self) -> Result<MarkSlot, ReaderError> {
-        let path = self.log_dir.join(MARK);
-        for _ in 0..=MARK_RETRIES {
-            let bytes = match self.cfg.fs.open(&path, OpenMode::Read) {
-                Ok(f) => read_upto(&*f, MARK_LEN).map_err(io_err(&path))?,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-                Err(e) => return Err(io_err(&path)(e)),
-            };
-            match read_mark(&bytes, &self.store_id) {
-                Ok(Some((_, m))) => return Ok(m),
-                Ok(None) => std::thread::yield_now(),
-                Err(error) => return Err(ReaderError::Unsupported { path, error }),
-            }
-        }
-        Err(ReaderError::MarkUnreadable)
-    }
-
-    fn read_manifest(&self) -> Result<(u64, Vec<LostRange>), ReaderError> {
-        let path = self.cfg.dir.join(MANIFEST);
-        let bytes = read_all(&*self.cfg.fs, &path).map_err(io_err(&path))?;
-        let m = read_manifest(&bytes, &self.store_id).map_err(ReaderError::Manifest)?;
-        Ok((m.last_epoch(), m.lost_ranges().cloned().collect()))
-    }
-
-    fn renew(&mut self, epoch: u64, generation: u32) -> Result<(), ReaderError> {
-        let s = self.renew_slot(epoch, generation)?;
-        self.commit_lease(s);
-        Ok(())
-    }
-
-    /// Writes the lease with the next counter, by path; creates it again if the writer deleted it.
-    fn renew_slot(&self, epoch: u64, generation: u32) -> Result<LeaseSlot, ReaderError> {
-        let slot = LeaseSlot {
-            epoch,
-            refresh_counter: self.lease.refresh_counter + 1,
-            ..self.lease
-        };
-        let fs = &*self.cfg.fs;
-        let path = &self.lease_path;
-        match fs.open(path, OpenMode::ReadWrite) {
-            // The slot alone, in place, when the header is the lease's own; else the whole file.
-            Ok(f) => {
-                let mut h = [0u8; HEADER_LEN];
-                let ok = read_at_full(&*f, &mut h, 0).is_ok_and(|n| n == HEADER_LEN)
-                    && FileHeader::decode(&h)
-                        .is_some_and(|h| h.kind == kind::LEASE && h.store_id == self.store_id);
-                if ok {
-                    f.write_at(&slot.encode(), SLOT_OFFSET as u64)
-                } else {
-                    f.write_at(&slot.encode_file(self.store_id, generation), 0)
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs
-                .open(path, OpenMode::CreateNew)
-                .and_then(|f| f.write_at(&slot.encode_file(self.store_id, generation), 0)),
-            Err(e) => Err(e),
-        }
-        .map_err(io_err(path))?;
-        Ok(slot)
-    }
-
-    fn commit_lease(&mut self, slot: LeaseSlot) {
-        self.lease = slot;
-        self.renewed_at = self.cfg.clock.monotonic();
-        self.state.lease_renewed_at = self.cfg.clock.wall();
-        self.state.epoch = slot.epoch;
-    }
-
-    /// The segments of the log by file id, under either extension; none for a missing directory.
-    fn segments(&self) -> Result<Vec<SegmentName>, ReaderError> {
-        let mut v: Vec<SegmentName> = match self.cfg.fs.read_dir(&self.log_dir) {
-            Ok(v) => v
-                .into_iter()
-                .filter_map(|e| SegmentName::parse(&e.name))
-                .collect(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(io_err(&self.log_dir)(e)),
-        };
-        v.sort_by_key(|n| (n.file_id, n.sealed));
-        v.dedup_by_key(|n| n.file_id);
-        Ok(v)
-    }
-
-    /// Opens a segment by name; if it is not found, lists the directory and tries the other extension once
-    /// (`format.md` A.13). `None` if it is gone.
-    fn open_segment(&self, name: SegmentName) -> Result<Option<OpenSegment>, ReaderError> {
-        for n in [
-            name,
-            SegmentName {
-                sealed: !name.sealed,
-                ..name
-            },
-        ] {
-            let path = self.log_dir.join(n.to_string());
-            match self.cfg.fs.open(&path, OpenMode::Read) {
-                Ok(f) => return Ok(Some((n, f))),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io_err(&path)(e)),
-            }
-        }
-        Ok(None)
-    }
-
-    fn find_segment(&self, file_id: u64) -> Result<Option<SegmentName>, ReaderError> {
-        Ok(self.segments()?.into_iter().find(|n| n.file_id == file_id))
-    }
-
-    /// Whether the batch at `fp` still reads the same: the same bytes at the same place.
-    fn still_reads(&self, fp: &Fingerprint) -> Result<bool, ReaderError> {
-        let Some(name) = self.find_segment(fp.file_id)? else {
-            return Ok(false);
-        };
-        let Some((n, f)) = self.open_segment(name)? else {
-            return Ok(false);
-        };
-        let path = self.log_dir.join(n.to_string());
-        let len =
-            usize::try_from(fp.end - fp.offset).map_err(|e| io_err(&path)(io::Error::other(e)))?;
-        let mut b = vec![0u8; len];
-        let got = read_at_full(&*f, &mut b, fp.offset).map_err(io_err(&path))?;
-        Ok(got == len && crc32c(&b) == fp.crc)
-    }
-
     fn read_log(
         &self,
         view: &mut View,
         mark: &MarkSlot,
         events: &mut Vec<ReadEvent>,
-    ) -> Result<(), ReaderError> {
+        scratch: &mut Scratch,
+        budget: Option<usize>,
+    ) -> Result<bool, ReaderError> {
+        let mut items = 0usize;
         // A new generation: everything taken is void and the log is read again from its start (Q-118 (c)).
         match view.generation {
             Some(g) if g != mark.generation => {
@@ -638,20 +578,22 @@ impl LogReader {
             } else {
                 ScanLimit::End
             };
-            let from = if file_id == view.file_id {
+            let resumed = if file_id == view.file_id {
                 view.resume
             } else {
                 None
             };
-            let from = from.unwrap_or(Resume {
+            let from = resumed.unwrap_or(Resume {
                 offset: HEADER_LEN as u64,
                 last_sequence: None,
             });
-            if let ScanLimit::Mark(m) = limit
-                && from.offset > m.max(HEADER_LEN as u64)
-            {
-                // The mark is behind the point reached in its segment: nothing new is below it.
-                break;
+            if let ScanLimit::Mark(m) = limit {
+                let m = m.max(HEADER_LEN as u64);
+                // The mark is behind the point reached in its segment, or at it: nothing new is below it. At it, the
+                // pass that reached that point checked the header.
+                if from.offset > m || (resumed.is_some() && from.offset == m) {
+                    break;
+                }
             }
             // An earlier segment that is gone would leave its positions unread: an error, as for the mark's.
             let Some((n, f)) = self.open_segment(name)? else {
@@ -665,7 +607,19 @@ impl LogReader {
             if len > MAX_SEGMENT_FILE {
                 return Err(ReaderError::TooLong { path, len });
             }
-            let bytes = read_part(&*f, from.offset, len).map_err(io_err(&path))?;
+            let whole = matches!(limit, ScanLimit::End);
+            let follows = (!whole).then_some(file_id);
+            let kept = whole && resumed.is_some() && scratch.whole == Some(file_id);
+            scratch.whole = None;
+            if !kept {
+                if scratch.file_id != follows {
+                    scratch.bytes = Vec::new();
+                }
+                scratch.file_id = follows;
+                read_part(&mut scratch.bytes, &*f, from.offset, len, whole)
+                    .map_err(io_err(&path))?;
+            }
+            let bytes = &scratch.bytes[..];
             let id = SegmentIdentity {
                 store_id: self.store_id,
                 file_id,
@@ -675,7 +629,9 @@ impl LogReader {
                 path: path.clone(),
                 error,
             };
-            let mut s = Scanner::resume(&bytes, &id, limit, from).map_err(refused)?;
+            let mut s = Scanner::resume(bytes, &id, limit, from)
+                .map_err(refused)?
+                .keeping_content();
             view.file_id = file_id;
             view.resume = Some(from);
             loop {
@@ -697,15 +653,19 @@ impl LogReader {
                         // Never above the mark's last position, from any segment.
                         if g == mark.generation && last.sequence > mark.last_sequence {
                             view.resume = Some(before);
-                            return Ok(());
+                            fingerprint(&mut view.recent, bytes);
+                            return Ok(false);
                         }
-                        let content =
-                            BatchContent::decode(&b).map_err(|error| ReaderError::Content {
-                                path: path.clone(),
-                                offset: b.offset,
-                                error,
-                            })?;
-                        let crc = crc32c(&bytes[b.offset as usize..b.end() as usize]);
+                        let content = match s.take_content() {
+                            Some(c) => c,
+                            None => {
+                                BatchContent::decode(&b).map_err(|error| ReaderError::Content {
+                                    path: path.clone(),
+                                    offset: b.offset,
+                                    error,
+                                })?
+                            }
+                        };
                         let rb = ReadBatch {
                             file_id,
                             offset: b.offset,
@@ -740,21 +700,30 @@ impl LogReader {
                                 file_id,
                                 offset: b.offset,
                                 end: b.end(),
-                                crc,
+                                crc: None,
                                 first: rb.first,
                                 last,
                             });
                             if view.recent.len() > RECENT {
                                 view.recent.pop_front();
                             }
+                            items += rb.content.items.len();
                             events.push(ReadEvent::Batch(rb));
                         }
                     }
                 }
                 view.resume = Some(s.resume_point());
+                if budget.is_some_and(|b| items >= b) {
+                    fingerprint(&mut view.recent, bytes);
+                    if whole {
+                        scratch.whole = Some(file_id);
+                    }
+                    return Ok(true);
+                }
             }
+            fingerprint(&mut view.recent, bytes);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Checks that the last batch returned still reads the same. If not, voids what was taken above the last
@@ -821,6 +790,13 @@ impl Drop for LogReader {
     }
 }
 
+/// Computes the checksum of the remembered batches that have none, all of them read from `bytes` in this pass.
+fn fingerprint(recent: &mut VecDeque<Fingerprint>, bytes: &[u8]) {
+    for fp in recent.iter_mut().rev().take_while(|fp| fp.crc.is_none()) {
+        fp.crc = Some(crc32c(&bytes[fp.offset as usize..fp.end as usize]));
+    }
+}
+
 /// Whether mark `b` is not a later state of mark `a`: another generation or reset stamp, a lower last position, or
 /// an earlier place.
 fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
@@ -830,37 +806,9 @@ fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
         || (b.file_id, b.offset) < (a.file_id, a.offset)
 }
 
-/// Reads up to `n` bytes from the start of `f`.
-fn read_upto(f: &dyn FsFile, n: usize) -> io::Result<Vec<u8>> {
-    let mut b = vec![0u8; n];
-    let got = read_at_full(f, &mut b, 0)?;
-    b.truncate(got);
-    Ok(b)
-}
+mod files;
+mod lookup;
+#[cfg(test)]
+mod tests;
 
-/// Fills `buf` from `offset` until the end of the file; returns the bytes read.
-fn read_at_full(f: &dyn FsFile, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    let mut at = 0;
-    while at < buf.len() {
-        let n = f.read_at(&mut buf[at..], offset + at as u64)?;
-        if n == 0 {
-            break;
-        }
-        at += n;
-    }
-    Ok(at)
-}
-
-/// A buffer of `len` bytes holding the file's header and its bytes from `from` to `len`; the bytes between are
-/// zero and never looked at (a scan resumed at `from` reads only forward). Bytes past the end of the file are zero.
-fn read_part(f: &dyn FsFile, from: u64, len: u64) -> io::Result<Vec<u8>> {
-    let len = usize::try_from(len).map_err(io::Error::other)?;
-    let mut b = vec![0u8; len];
-    let head = len.min(HEADER_LEN);
-    read_at_full(f, &mut b[..head], 0)?;
-    let from = usize::try_from(from).map_err(io::Error::other)?.min(len);
-    if from < len {
-        read_at_full(f, &mut b[from..], from as u64)?;
-    }
-    Ok(b)
-}
+pub use lookup::{FoundFact, LOOKUP_CACHE_BYTES, Lookup, PIECE, Wanted};

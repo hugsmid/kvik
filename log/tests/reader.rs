@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kvik_log::batch::SegmentIdentity;
-use kvik_log::content::{BatchContent, Item};
+use kvik_log::content::{BatchContent, Item, ItemRef};
 use kvik_log::entries::Entry;
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{Fs, MemFs, OpenMode, StdFs};
@@ -74,7 +74,7 @@ fn fact(series: u32, t: i64) -> Item {
 }
 
 fn alias(id: u32) -> Item {
-    Item::Entry(Entry::Alias {
+    Item::from(Entry::Alias {
         id,
         name: format!("a{id}"),
     })
@@ -510,7 +510,10 @@ fn a_returned_batch_truncated_after_a_page_cache_loss_on_the_same_boot_is_voided
     assert_eq!(stamp.sequence, 2);
     assert_ne!(stamp.nonce, 0);
     assert_eq!(u.state.stamp, stamp);
-    assert!(matches!(r.held.items[&2], Item::Entry(Entry::Recovery(_))));
+    assert!(matches!(
+        r.held.items[&2].view(),
+        ItemRef::Entry(Entry::Recovery(_))
+    ));
     r.check_held();
     r.check_caught_up();
 }
@@ -568,7 +571,10 @@ fn long_truncation(from: u64) {
     }
     r.refresh().unwrap();
     assert_eq!(r.held.items.len(), 90);
-    assert!(matches!(r.held.items[&1], Item::Entry(Entry::Recovery(_))));
+    assert!(matches!(
+        r.held.items[&1].view(),
+        ItemRef::Entry(Entry::Recovery(_))
+    ));
     // Every batch from position `from` on is damaged and the mark is lost: the start truncates them all.
     r.kill();
     let m = r.mark().unwrap();
@@ -1209,6 +1215,240 @@ fn hooked_rig() -> (Rig, Arc<HookFs>) {
     r.reader = Some(LogReader::open(c).unwrap());
     r.held = Held::default();
     (r, fs)
+}
+
+/// The in-memory file system counting the bytes read from each file, by name.
+#[derive(Debug)]
+struct CountFs {
+    inner: MemFs,
+    read: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+#[derive(Debug)]
+struct CountFile {
+    inner: Box<dyn kvik_log::fs::FsFile>,
+    name: String,
+    read: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl kvik_log::fs::FsFile for CountFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let n = self.inner.read_at(buf, offset)?;
+        *self
+            .read
+            .lock()
+            .unwrap()
+            .entry(self.name.clone())
+            .or_insert(0) += n as u64;
+        Ok(n)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        self.inner.write_at(buf, offset)
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+    fn try_lock_exclusive(&self) -> std::io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
+}
+
+impl Fs for CountFs {
+    fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<Box<dyn kvik_log::fs::FsFile>> {
+        Ok(Box::new(CountFile {
+            inner: self.inner.open(path, mode)?,
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            read: self.read.clone(),
+        }))
+    }
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<kvik_log::fs::DirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_dir(path)
+    }
+    fn free_space(&self, path: &Path) -> std::io::Result<u64> {
+        self.inner.free_space(path)
+    }
+}
+
+/// The bytes read from log segments since the last call, and the number of segments read.
+fn segment_reads(read: &Mutex<BTreeMap<String, u64>>) -> (u64, usize) {
+    let taken = std::mem::take(&mut *read.lock().unwrap());
+    let segs: Vec<u64> = taken
+        .into_iter()
+        .filter(|(n, _)| SegmentName::parse(n).is_some())
+        .map(|(_, b)| b)
+        .collect();
+    (segs.iter().sum(), segs.len())
+}
+
+#[test]
+fn a_refresh_reads_of_its_segment_only_the_header_the_new_bytes_and_the_last_batch_again() {
+    let mut r = Rig::new(WriterConfig {
+        segment_size: 1 << 20,
+        ..cfg()
+    });
+    let read = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut c = r.reader_cfg();
+    c.fs = Arc::new(CountFs {
+        inner: r.fs.clone(),
+        read: read.clone(),
+    });
+    r.reader = Some(LogReader::open(c).unwrap());
+    r.held = Held::default();
+    let mut ends = Vec::new();
+    for k in 0..150 {
+        r.submit(items(20, k * 100));
+        r.drain();
+        ends.push(r.mark().unwrap().offset);
+    }
+    r.refresh().unwrap();
+    let (before_last, last) = (ends[ends.len() - 2], ends[ends.len() - 1]);
+    assert!(last > 64 << 10, "a high offset in the segment: {last}");
+    segment_reads(&read);
+    r.submit(items(20, 9_000));
+    r.drain();
+    let new = r.mark().unwrap().offset;
+    r.refresh().unwrap();
+    let header = kvik_log::header::HEADER_LEN as u64;
+    assert_eq!(
+        segment_reads(&read),
+        (header + (new - last) + (last - before_last), 1)
+    );
+    // Nothing new: only the check of the last batch reads the segment.
+    let u = r.refresh().unwrap();
+    assert!(u.events.is_empty());
+    assert_eq!(segment_reads(&read), (new - last, 1));
+    r.check_caught_up();
+}
+
+#[test]
+fn a_mark_at_the_header_end_of_a_segment_not_read_before_still_has_its_header_checked() {
+    let mut r = Rig::new(cfg());
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    let m = r.mark().unwrap();
+    assert_eq!(m.file_id, 1);
+    let first =
+        r.fs.read(&log_path("00000000-0000000000000001.open"))
+            .unwrap();
+    let f =
+        r.fs.open(
+            &log_path("00000000-0000000000000002.open"),
+            OpenMode::ReadWrite,
+        )
+        .unwrap();
+    // The segment created ahead, with the first segment's header: the wrong file id.
+    f.write_at(&first[..kvik_log::header::HEADER_LEN], 0)
+        .unwrap();
+    let at_header_end = MarkSlot {
+        counter: m.counter + 1,
+        file_id: 2,
+        offset: kvik_log::header::HEADER_LEN as u64,
+        ..m
+    };
+    r.fs.poke(
+        &log_path("MARK"),
+        0,
+        &encode_mark_file([Some(at_header_end), None]),
+    );
+    assert!(matches!(r.refresh(), Err(ReaderError::Unsupported { .. })));
+}
+
+/// Four batches of two read, then the segment cut to `len` without a start (damage): what was kept from earlier
+/// reads must not stand in for the missing bytes.
+fn truncated_below_the_mark(len: impl Fn(&[u64]) -> u64) -> Update {
+    let mut r = Rig::new(cfg());
+    let mut ends = Vec::new();
+    for k in 0..4 {
+        r.submit(items(2, k * 10));
+        r.drain();
+        ends.push(r.mark().unwrap().offset);
+    }
+    r.refresh().unwrap();
+    assert_eq!(r.held.items.len(), 8);
+    let f =
+        r.fs.open(
+            &log_path("00000000-0000000000000001.open"),
+            OpenMode::ReadWrite,
+        )
+        .unwrap();
+    f.set_len(len(&ends)).unwrap();
+    r.refresh().unwrap()
+}
+
+#[test]
+fn a_segment_truncated_below_the_mark_is_read_as_zeros_not_as_the_bytes_kept_from_before() {
+    let u = truncated_below_the_mark(|ends| ends[1]);
+    assert!(matches!(u.events[0], ReadEvent::Void { above, .. } if above.sequence == 4));
+    assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
+    assert!(
+        u.events
+            .iter()
+            .any(|e| matches!(e, ReadEvent::Corruption { .. }))
+    );
+}
+
+#[test]
+fn a_segment_truncated_inside_its_header_voids_everything_and_reports_corruption() {
+    let u = truncated_below_the_mark(|_| 40);
+    assert!(matches!(u.events[0], ReadEvent::Void { above, .. } if above.sequence == 0));
+    assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
+    assert!(
+        u.events
+            .iter()
+            .any(|e| matches!(e, ReadEvent::Corruption { .. }))
+    );
+}
+
+/// A file breaking the rule that a file id is never reused: the kept header of the earlier file must not stand in for
+/// its missing one.
+#[test]
+fn an_empty_segment_of_a_new_generation_under_a_read_file_id_is_read_with_a_zeroed_header_not_the_kept_one()
+ {
+    let mut r = Rig::new(cfg());
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    r.kill();
+    r.fs.remove_file(&log_path("00000000-0000000000000001.open"))
+        .unwrap();
+    r.fs.open(
+        &log_path("00000001-0000000000000001.open"),
+        OpenMode::CreateNew,
+    )
+    .unwrap();
+    let mut m = r.mark().unwrap();
+    m.generation = 1;
+    m.counter += 1;
+    r.fs.poke(&log_path("MARK"), 0, &encode_mark_file([Some(m), None]));
+    let u = r.refresh().unwrap();
+    assert!(u.events.iter().all(|e| !matches!(e, ReadEvent::Batch(_))));
+    assert!(
+        u.events
+            .iter()
+            .any(|e| matches!(e, ReadEvent::Corruption { .. }))
+    );
 }
 
 #[test]

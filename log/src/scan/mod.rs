@@ -4,6 +4,7 @@ use crate::batch::{Batch, BatchFault, BatchRead, Refusal, SegmentIdentity, read_
 use crate::block::{BLOCK_HEADER_LEN, block_type};
 use crate::body::{Commit, END_MARKER_LEN, SegmentIndex, TRAILER_LEN, Trailer, decode_end_marker};
 use crate::bytes::slice;
+use crate::content::{BatchContent, DataBody};
 use crate::crc::crc32c;
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
@@ -187,11 +188,38 @@ pub fn scan_with_stats<'a>(
     id: &SegmentIdentity,
     limit: ScanLimit,
 ) -> (Result<ScanReport<'a>, FormatError>, ScanStats) {
-    let from = Resume {
-        offset: HEADER_LEN as u64,
-        last_sequence: None,
-    };
-    collect(Scanner::resume_inner(bytes, id, limit, from, true, false))
+    collect(Scanner::resume_inner(
+        bytes,
+        id,
+        limit,
+        FROM_HEADER,
+        true,
+        false,
+        None,
+    ))
+}
+
+const FROM_HEADER: Resume = Resume {
+    offset: HEADER_LEN as u64,
+    last_sequence: None,
+};
+
+/// [`scan`] to the end, with `nonzero` the file's [`nonzero_end`], found by the caller, and each batch's content as
+/// its checks decoded it.
+pub(crate) fn scan_to_end<'a>(
+    bytes: &'a [u8],
+    id: &SegmentIdentity,
+    nonzero: u64,
+) -> Result<Scanned<'a>, FormatError> {
+    collect_content(Scanner::resume_inner(
+        bytes,
+        id,
+        ScanLimit::End,
+        FROM_HEADER,
+        true,
+        false,
+        Some(nonzero),
+    ))
 }
 
 /// [`scan`] to the end with any seal blocks ignored: their bytes are read as whatever precedes them (a torn batch or
@@ -201,8 +229,17 @@ pub fn scan_with_stats<'a>(
 pub(crate) fn scan_ignoring_seal<'a>(
     bytes: &'a [u8],
     id: &SegmentIdentity,
-) -> Result<ScanReport<'a>, FormatError> {
-    ignoring_seal(bytes, id, false).0
+    nonzero: u64,
+) -> Result<Scanned<'a>, FormatError> {
+    collect_content(Scanner::resume_inner(
+        bytes,
+        id,
+        ScanLimit::End,
+        FROM_HEADER,
+        false,
+        false,
+        Some(nonzero),
+    ))
 }
 
 fn ignoring_seal<'a>(
@@ -210,22 +247,70 @@ fn ignoring_seal<'a>(
     id: &SegmentIdentity,
     legacy: bool,
 ) -> (Result<ScanReport<'a>, FormatError>, ScanStats) {
-    let from = Resume {
-        offset: HEADER_LEN as u64,
-        last_sequence: None,
-    };
     collect(Scanner::resume_inner(
         bytes,
         id,
         ScanLimit::End,
-        from,
+        FROM_HEADER,
         false,
         legacy,
+        None,
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Searches of a whole file for its last non-zero byte on this thread.
+    pub(crate) static ZERO_SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Just past the last non-zero byte of `bytes`, or 0: compared 64 bytes at a time from the end.
+pub(crate) fn nonzero_end(bytes: &[u8]) -> u64 {
+    #[cfg(test)]
+    ZERO_SEARCHES.with(|c| c.set(c.get() + 1));
+    const CHUNK: usize = 64;
+    let mut end = bytes.len();
+    let mut chunks = bytes.rchunks_exact(CHUNK);
+    for c in &mut chunks {
+        if c.iter().fold(0u8, |a, &b| a | b) != 0 {
+            let i = c.iter().rposition(|&b| b != 0).unwrap_or(0);
+            return (end - CHUNK + i + 1) as u64;
+        }
+        end -= CHUNK;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |i| i as u64 + 1)
 }
 
 fn collect<'a>(
     s: Result<Scanner<'a>, (FormatError, ScanStats)>,
+) -> (Result<ScanReport<'a>, FormatError>, ScanStats) {
+    collect_inner(s, &mut |_| {})
+}
+
+/// [`collect`] with each batch's content; `None` for one that does not decode.
+fn collect_content<'a>(
+    s: Result<Scanner<'a>, (FormatError, ScanStats)>,
+) -> Result<Scanned<'a>, FormatError> {
+    let mut contents = Vec::new();
+    let r = collect_inner(s.map(Scanner::keeping_content), &mut |c| contents.push(c)).0?;
+    for (b, c) in r.batches.iter().zip(contents.iter_mut()) {
+        if c.is_none() {
+            *c = BatchContent::decode(b).ok();
+        }
+    }
+    Ok((r, contents))
+}
+
+/// A scan and the content of each of its batches.
+pub(crate) type Scanned<'a> = (ScanReport<'a>, Vec<Option<BatchContent>>);
+
+fn collect_inner<'a>(
+    s: Result<Scanner<'a>, (FormatError, ScanStats)>,
+    content: &mut dyn FnMut(Option<BatchContent>),
 ) -> (Result<ScanReport<'a>, FormatError>, ScanStats) {
     let mut s = match s {
         Ok(s) => s,
@@ -233,9 +318,12 @@ fn collect<'a>(
     };
     let mut batches = Vec::new();
     let mut regions = Vec::new();
-    for found in &mut s {
+    while let Some(found) = s.next() {
         match found {
-            Ok(Found::Batch(b)) => batches.push(b),
+            Ok(Found::Batch(b)) => {
+                batches.push(b);
+                content(s.take_content());
+            }
             Ok(Found::Region(r)) => regions.push(r),
             Err(e) => return (Err(e), s.stats()),
         }
@@ -282,8 +370,11 @@ pub struct Scanner<'a> {
     base: u64,
     pos: u64,
     last: Option<u64>,
-    pending: Option<Batch<'a>>,
+    pending: Option<(Batch<'a>, Vec<DataBody>)>,
     tail: Option<Tail>,
+    /// Batches keep the content their checks decoded ([`Scanner::keeping_content`]).
+    keep: bool,
+    content: Option<BatchContent>,
     done: bool,
     reads: Reads<'a>,
     chains: Chains,
@@ -323,9 +414,10 @@ impl<'a> Scanner<'a> {
         limit: ScanLimit,
         from: Resume,
     ) -> Result<Self, FormatError> {
-        Self::resume_inner(bytes, id, limit, from, true, false).map_err(|(e, _)| e)
+        Self::resume_inner(bytes, id, limit, from, true, false, None).map_err(|(e, _)| e)
     }
 
+    /// `nonzero`: the file's [`nonzero_end`], when the caller has found it.
     fn resume_inner(
         bytes: &'a [u8],
         id: &SegmentIdentity,
@@ -333,6 +425,7 @@ impl<'a> Scanner<'a> {
         from: Resume,
         find_seals: bool,
         legacy: bool,
+        nonzero: Option<u64>,
     ) -> Result<Self, (FormatError, ScanStats)> {
         let mut reads = Reads::new(bytes);
         let fail = |e, r: &Reads<'_>| Err((e, r.stats()));
@@ -349,9 +442,17 @@ impl<'a> Scanner<'a> {
             HeaderState::Valid(h) => h.base_sequence,
             HeaderState::Invalid => 0,
         };
+        let nonzero = match limit {
+            ScanLimit::Mark(_) => None,
+            ScanLimit::End if find_seals => Some(nonzero.unwrap_or_else(|| nonzero_end(bytes))),
+            ScanLimit::End => nonzero,
+        };
         let (area_end, seal) = match limit {
             ScanLimit::Mark(m) => (m, None),
-            ScanLimit::End => match find_seals.then(|| find_seal(&mut reads)).flatten() {
+            ScanLimit::End => match nonzero
+                .filter(|_| find_seals)
+                .and_then(|nz| find_seal(&mut reads, nz))
+            {
                 Some(s) => (s.start, Some(s)),
                 None => (bytes.len() as u64, None),
             },
@@ -383,14 +484,29 @@ impl<'a> Scanner<'a> {
             last: from.last_sequence,
             pending: None,
             tail: None,
+            keep: false,
+            content: None,
             done: false,
             reads,
             chains: Chains::default(),
             walks: Walks::default(),
             legacy,
             damaged: false,
-            nonzero_end: None,
+            // The file's last non-zero byte is the area's when nothing past the area is left out.
+            nonzero_end: nonzero.filter(|_| area_end == bytes.len() as u64),
         })
+    }
+
+    /// A scan whose batches keep the content their body checks decoded, taken with [`Scanner::take_content`], so
+    /// that a batch is decoded once.
+    pub fn keeping_content(mut self) -> Self {
+        self.keep = true;
+        self
+    }
+
+    /// The content of the batch the last [`Iterator::next`] returned, once, when [`Scanner::keeping_content`].
+    pub fn take_content(&mut self) -> Option<BatchContent> {
+        self.content.take()
     }
 
     /// The work done so far.
@@ -440,9 +556,14 @@ impl<'a> Scanner<'a> {
         end.max(pos)
     }
 
-    fn keep(&mut self, b: Batch<'a>) -> Found<'a> {
+    fn keep(&mut self, b: Batch<'a>, bodies: Vec<DataBody>) -> Found<'a> {
         self.pos = b.end();
         self.last = Some(b.commit.last_sequence);
+        // The checks decoded every body: the content's own check (a recovery entry alone) is the batch's.
+        self.content = self
+            .keep
+            .then(|| BatchContent::from_bodies(b.commit.first_sequence, bodies).ok())
+            .flatten();
         Found::Batch(b)
     }
 }
@@ -451,13 +572,14 @@ impl<'a> Iterator for Scanner<'a> {
     type Item = Result<Found<'a>, FormatError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(b) = self.pending.take() {
-            return Some(Ok(self.keep(b)));
+        self.content = None;
+        if let Some((b, bodies)) = self.pending.take() {
+            return Some(Ok(self.keep(b, bodies)));
         }
         if self.done {
             return None;
         }
-        let (bytes, pos, area_end) = (self.bytes, self.pos, self.area_end);
+        let (pos, area_end) = (self.pos, self.area_end);
         if pos >= area_end {
             self.finish(Tail::Clean { offset: area_end });
             return None;
@@ -473,13 +595,20 @@ impl<'a> Iterator for Scanner<'a> {
                 area_end,
                 min_first,
                 Refusal::AtOnce,
+                self.keep,
             )
         } else {
-            self.walks
-                .read(&mut self.reads, &self.id, pos, area_end, min_first)
+            self.walks.read(
+                &mut self.reads,
+                &self.id,
+                pos,
+                area_end,
+                min_first,
+                self.keep,
+            )
         };
         let fault = match read {
-            BatchRead::Complete(b) => return Some(Ok(self.keep(b))),
+            BatchRead::Complete(b, bodies) => return Some(Ok(self.keep(b, bodies))),
             BatchRead::Refused(e) => {
                 self.done = true;
                 return Some(Err(e));
@@ -488,7 +617,7 @@ impl<'a> Iterator for Scanner<'a> {
         };
         // Sixteen zero bytes at a block boundary are the end of data only if nothing but zeros follows up to the
         // limit; below the mark or the seal blocks they are never the end (Q-105 (a)).
-        if !self.bounded && all_zero(bytes, pos, area_end) {
+        if !self.bounded && self.nonzero_end(pos) == pos {
             self.finish(Tail::Clean { offset: pos });
             return None;
         }
@@ -514,13 +643,14 @@ impl<'a> Iterator for Scanner<'a> {
             area_end,
             min_first,
             search.as_mut(),
+            self.keep,
         );
         match found {
             Err(e) => {
                 self.done = true;
                 Some(Err(e))
             }
-            Ok(Some(b)) => {
+            Ok(Some((b, bodies))) => {
                 let region = InvalidRegion {
                     start: pos,
                     end: b.offset,
@@ -529,7 +659,7 @@ impl<'a> Iterator for Scanner<'a> {
                     cause,
                 };
                 self.pos = b.offset;
-                self.pending = Some(b);
+                self.pending = Some((b, bodies));
                 Some(Ok(Found::Region(region)))
             }
             Ok(None) if self.bounded => {
@@ -560,7 +690,7 @@ impl<'a> Iterator for Scanner<'a> {
     }
 }
 
-fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, FormatError> {
+pub(crate) fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, FormatError> {
     let Some(h) = FileHeader::decode(bytes) else {
         return Ok(HeaderState::Invalid);
     };
@@ -596,13 +726,16 @@ fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, Format
     Ok(HeaderState::Valid(h))
 }
 
-/// The seal blocks, if the last non-zero bytes of the file are a valid trailer block and end marker (A.4, A.9).
-fn find_seal(reads: &mut Reads<'_>) -> Option<Seal> {
+/// The seal blocks, if the last non-zero bytes of the file, which end at `nonzero` ([`nonzero_end`]), are a valid
+/// trailer block and end marker (A.4, A.9).
+fn find_seal(reads: &mut Reads<'_>, nonzero: u64) -> Option<Seal> {
     let bytes = reads.bytes;
     let len = bytes.len() as u64;
-    let last = bytes.iter().rposition(|&b| b != 0)? as u64;
+    if nonzero == 0 {
+        return None;
+    }
     // The end marker ends in one zero byte and its end is a multiple of 8.
-    let end = (last + 1).div_ceil(8) * 8;
+    let end = nonzero.div_ceil(8) * 8;
     let marker_start = end.checked_sub(END_MARKER_LEN as u64)?;
     let trailer_offset = decode_end_marker(slice(bytes, marker_start, END_MARKER_LEN as u64)?)?;
     if trailer_offset < HEADER_LEN as u64
@@ -640,11 +773,6 @@ fn find_seal(reads: &mut Reads<'_>) -> Option<Seal> {
         end,
         state,
     })
-}
-
-fn all_zero(bytes: &[u8], from: u64, to: u64) -> bool {
-    let to = to.min(bytes.len() as u64);
-    from >= to || slice(bytes, from, to - from).is_some_and(|b| b.iter().all(|&x| x == 0))
 }
 
 /// Just past the last non-zero byte in `[from, to)`, or `from` if there is none.

@@ -282,7 +282,7 @@ fn resynchronising_over_a_chain_longer_than_a_batch_remembers_at_most_a_batch_of
     reads.use_table();
     let mut chains = Chains::default();
     let found = chains
-        .resync(&mut reads, &id, HEADER_LEN as u64, len, 1, None)
+        .resync(&mut reads, &id, HEADER_LEN as u64, len, 1, None, false)
         .unwrap();
     assert!(found.is_none());
     let bound = ((crate::batch::MAX_BATCH_DATA + (1 << 16)) / 128 + 16) as usize;
@@ -464,4 +464,84 @@ fn failed_reads_are_charged_per_window_and_pass_the_rest_of_one_past_its_budget(
     let mut z = FailedReads::new(0);
     z.charge(8, FAILED_READ_BUDGET);
     assert_eq!(z.next_from(16), 16);
+}
+
+proptest::proptest! {
+    #[test]
+    fn nonzero_end_finds_the_last_non_zero_byte(
+        len in 0usize..600,
+        marks in proptest::collection::vec((0usize..600, 1u8..=255), 0..4),
+    ) {
+        let mut b = vec![0u8; len];
+        for (at, v) in marks {
+            if at < len {
+                b[at] = v;
+            }
+        }
+        let bytewise = b.iter().rposition(|&x| x != 0).map_or(0, |i| i as u64 + 1);
+        proptest::prop_assert_eq!(nonzero_end(&b), bytewise);
+    }
+}
+
+#[test]
+fn a_scan_to_the_end_searches_for_the_last_non_zero_byte_once() {
+    let (mut bytes, id) = chain(3);
+    bytes.resize(bytes.len() + (1 << 16), 0);
+    ZERO_SEARCHES.with(|c| c.set(0));
+    let r = scan(&bytes, &id, ScanLimit::End).unwrap();
+    assert_eq!(ZERO_SEARCHES.with(|c| c.get()), 1);
+    let end = HEADER_LEN as u64 + 3 * BLOCK_HEADER_LEN as u64;
+    assert!(matches!(r.tail, Some(Tail::Torn { start: 64, end: e, .. }) if e == end));
+    ZERO_SEARCHES.with(|c| c.set(0));
+    let again = scan_ignoring_seal(&bytes, &id, nonzero_end(&bytes)).unwrap();
+    assert_eq!(ZERO_SEARCHES.with(|c| c.get()), 1);
+    assert_eq!(again.0, r);
+    let clean = chain(0).0;
+    let r = scan(&clean, &id, ScanLimit::End).unwrap();
+    assert_eq!(r.tail, Some(Tail::Clean { offset: 64 }));
+}
+
+#[test]
+fn a_recovery_entry_not_alone_is_passed_over_whether_or_not_content_is_kept() {
+    let (mut bytes, id) = chain(0);
+    bytes.truncate(64);
+    let batch = |first: u64, at: u64, entries: Vec<crate::entries::Entry>| {
+        let body = crate::entries::EntriesBlock {
+            first_sequence: first,
+            received_at: 0,
+            entries,
+        };
+        let mut builder = crate::batch::BatchBuilder::new();
+        builder
+            .push(block_type::ENTRIES, body.encode().unwrap())
+            .unwrap();
+        builder.encode(&id, at, 0).unwrap()
+    };
+    let alias = || crate::entries::Entry::Alias {
+        id: 1,
+        name: "a".into(),
+    };
+    let recovery = crate::entries::Entry::Recovery(crate::entries::Recovery {
+        after: 0,
+        stamp: None,
+        boot_id: [0; 16],
+        tail_bytes: 0,
+        readable_commits: 0,
+        mark_state: crate::entries::MarkState::Readable,
+        id_floor: 0,
+        consumers: Vec::new(),
+    });
+    bytes.extend_from_slice(&batch(1, 64, vec![recovery, alias()]));
+    let at = bytes.len() as u64;
+    bytes.extend_from_slice(&batch(3, at, vec![alias()]));
+    let limit = ScanLimit::Mark(bytes.len() as u64);
+    let plain: Vec<_> = Scanner::new(&bytes, &id, limit).unwrap().collect();
+    let kept: Vec<_> = Scanner::new(&bytes, &id, limit)
+        .unwrap()
+        .keeping_content()
+        .collect();
+    assert_eq!(plain, kept);
+    assert!(
+        matches!(&plain[..], [Ok(Found::Region(r)), Ok(Found::Batch(b))] if r.cause == LossCause::InvalidContent && b.offset == at)
+    );
 }

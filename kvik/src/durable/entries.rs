@@ -26,7 +26,7 @@ impl Writer {
             let r = {
                 let log = self.log();
                 let log = log.as_ref().ok_or(Error::Closed)?;
-                log.offer(vec![Item::Entry(entry.clone())])
+                log.offer(vec![Item::from(entry.clone())])
             };
             let pending = match r {
                 Ok(p) => p,
@@ -49,7 +49,7 @@ impl Writer {
         let pending = {
             let log = self.log();
             let log = log.as_ref().ok_or(Error::Closed)?;
-            log.submit(vec![Item::Entry(entry.clone())])
+            log.submit(vec![Item::from(entry.clone())])
                 .map_err(|e| self.submit_error(e))?
         };
         self.entry_acknowledged(d, &entry, pending)

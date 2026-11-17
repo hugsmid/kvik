@@ -89,7 +89,7 @@ fn a_full_restore_opens_in_its_generation_at_its_first_position_and_reads_its_re
     assert!(w.fault().is_none(), "{:?}", w.fault());
     assert_eq!(w.start_report().rule, StartRule::FirstStart);
     let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
-    let alias = Item::Entry(Entry::Alias {
+    let alias = Item::from(Entry::Alias {
         id: 1,
         name: "hall".into(),
     });

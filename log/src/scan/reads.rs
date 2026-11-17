@@ -5,7 +5,7 @@ use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, peek_raw, read_block_with,
 };
 use crate::body::{COMMIT_LEN, DataPrefix};
-use crate::content::check_block;
+use crate::content::{DataBody, check_block};
 use crate::content_error::BodyError;
 use crate::crc::{PrefixCrc, crc32c};
 
@@ -143,13 +143,15 @@ impl<'a> Reads<'a> {
     }
 
     /// The checks of a facts or entries body (A.5, A.6), counted.
+    /// With `keep`, also the body as the checks decoded it.
     pub(crate) fn check_body(
         &mut self,
         t: u8,
         body: &[u8],
-    ) -> Result<(DataPrefix, bool), BodyError> {
+        keep: bool,
+    ) -> Result<(DataPrefix, bool, Option<DataBody>), BodyError> {
         self.body += body.len() as u64;
-        check_block(t, body)
+        check_block(t, body, keep)
     }
 
     pub(crate) fn forget_below(&mut self, offset: u64) {

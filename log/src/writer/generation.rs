@@ -7,7 +7,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::batch::SegmentIdentity;
-use crate::content::{BatchContent, Item};
+use crate::content::{BatchContent, ItemRef};
 use crate::entries::{Entry, IntervalLength};
 use crate::fs::OpenMode;
 use crate::manifest::{LostRange, RecordPosition};
@@ -152,18 +152,20 @@ pub(super) fn scan_sealed(
             let aside = set_aside(b, &generation.set_aside);
             let at = (b.commit.generation, b.commit.first_sequence);
             for i in &content.items {
-                match i {
-                    Item::Fact(f) => out.id_floor = out.id_floor.max(f.series_id),
-                    Item::Entry(Entry::Definition(d)) => {
+                match i.view() {
+                    ItemRef::Fact(f) => out.id_floor = out.id_floor.max(f.series_id),
+                    ItemRef::Entry(Entry::Definition(d)) => {
                         out.id_floor = out.id_floor.max(d.id);
                         if !aside && let Some(iv) = &d.interval {
                             found.push((at, d.id, iv.clone()));
                         }
                     }
-                    Item::Entry(Entry::Routing(rc)) if !aside => {
+                    ItemRef::Entry(Entry::Routing(rc)) if !aside => {
                         out.consumers.insert(rc.consumer.clone());
                     }
-                    Item::Entry(Entry::Recovery(r)) => out.id_floor = out.id_floor.max(r.id_floor),
+                    ItemRef::Entry(Entry::Recovery(r)) => {
+                        out.id_floor = out.id_floor.max(r.id_floor)
+                    }
                     _ => {}
                 }
             }

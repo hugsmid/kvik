@@ -5,11 +5,13 @@
 //! cargo run --release --locked -p kvik-log --example commit_latency -- <dir> [options]
 //!
 //!   --short        about 2 minutes instead of about 8 (the CI run)
-//!   --only <load>  run only the loads whose name contains <load>
+//!   --only <load>  run only the load named <load>, or else the loads whose name starts with it
 //!   --repeat <n>   run the whole matrix n times
 //!   --any-fs       also run on a file system whose sync does nothing (tmpfs, ramfs)
 //!   --keep         keep the stores
 //!   --disk <text>  describe the disk where it cannot be found out (a class, never a model or serial)
+//!   --setup <text> run only the writer setting labelled <text>, or else those whose label starts with it
+//!   --sync-delay <ms>  sleep this long in every `sync_data`, standing in for a slow device
 //! ```
 //!
 //! The run works in a `kvik-commit-latency` subdirectory of `<dir>`, removed at the end, and prints Markdown: the
@@ -17,8 +19,8 @@
 //! every acknowledged call, throughput and syncs per load, and the time to open the store again. Latency runs from
 //! the submit call to the acknowledgement, stamped on the writer thread as it completes the call.
 //!
-//! Nothing here changes the writer: the stores run [`WriterConfig::default`] except for `min_sync_interval` and
-//! the mark sync, on [`StdFs`] wrapped to time each sync.
+//! Nothing here changes the writer: the stores run [`WriterConfig::default`] except for `min_sync_interval`,
+//! `sync_interval_floor` and the mark sync, on [`StdFs`] wrapped to time each sync.
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +29,6 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
@@ -41,6 +42,11 @@ use kvik_log::writer::{
     Ack, CommitError, Log, LogWriter, MarkSync, MarkSyncMode, Pending, SubmitError, SystemClock,
     WriterConfig,
 };
+
+#[path = "commit_latency/environment.rs"]
+mod environment;
+
+use environment::{load_average, os_version, storage, sync_primitive};
 
 const STORE_ID: [u8; 16] = [0x4b; 16];
 const BOOT: [u8; 16] = [0x01; 16];
@@ -86,6 +92,7 @@ impl SyncLog {
 #[derive(Debug)]
 struct TimingFs {
     log: Arc<SyncLog>,
+    delay: Duration,
 }
 
 #[derive(Debug)]
@@ -94,6 +101,7 @@ struct TimingFile {
     data: SyncKind,
     all: SyncKind,
     log: Arc<SyncLog>,
+    delay: Duration,
 }
 
 impl Fs for TimingFs {
@@ -112,6 +120,7 @@ impl Fs for TimingFs {
             data,
             all,
             log: self.log.clone(),
+            delay: self.delay,
         }))
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -146,6 +155,9 @@ impl FsFile for TimingFile {
     }
     fn sync_data(&self) -> io::Result<()> {
         let t = Instant::now();
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         let r = self.inner.sync_data();
         self.log.record(self.data, t);
         r
@@ -315,8 +327,15 @@ enum Load {
     Steady { series: u32 },
     /// Every `every_ms`, `calls` calls of one reading submitted back to back.
     Burst { calls: u32, every_ms: u64 },
-    /// One writer, one reading per call, each call submitted when the previous one is acknowledged.
-    BackToBack,
+    /// `writers` writers at `per_sec` calls a second in all, each periodic at its own pseudo-random phase, with
+    /// `readings` readings per call (open loop).
+    Paced {
+        writers: u32,
+        per_sec: u32,
+        readings: u32,
+    },
+    /// One writer, `readings` readings per call, each call submitted when the previous one is acknowledged.
+    BackToBack { readings: u32 },
     /// `threads` writers submitting calls of `readings` readings as fast as back-pressure allows.
     Saturation { threads: u32, readings: u32 },
 }
@@ -327,7 +346,13 @@ impl Load {
             Load::Quiet { min_ms, max_ms } => format!("quiet ({min_ms}–{max_ms} ms apart)"),
             Load::Steady { series } => format!("steady {series} × 1 Hz"),
             Load::Burst { calls, every_ms } => format!("burst {calls} every {every_ms} ms"),
-            Load::BackToBack => "back to back, 1 writer".into(),
+            Load::Paced {
+                writers,
+                per_sec,
+                readings,
+            } => format!("{writers} writers, {per_sec} calls/s × {readings}"),
+            Load::BackToBack { readings: 1 } => "back to back, 1 writer".into(),
+            Load::BackToBack { readings } => format!("back to back, 1 writer × {readings}/call"),
             Load::Saturation { threads, readings } => {
                 format!("saturation {threads} × {readings}/call")
             }
@@ -356,11 +381,27 @@ fn loads(short: bool) -> Vec<(Load, u64)> {
             },
             d(20, 4),
         ),
-        (Load::BackToBack, d(10, 3)),
+        (
+            Load::Paced {
+                writers: 16,
+                per_sec: 200,
+                readings: 10,
+            },
+            d(20, 5),
+        ),
+        (Load::BackToBack { readings: 1 }, d(10, 3)),
+        (Load::BackToBack { readings: 2000 }, d(10, 3)),
         (
             Load::Saturation {
                 threads: 4,
                 readings: 100,
+            },
+            d(5, 2),
+        ),
+        (
+            Load::Saturation {
+                threads: 16,
+                readings: 10,
             },
             d(5, 2),
         ),
@@ -371,26 +412,47 @@ fn loads(short: bool) -> Vec<(Load, u64)> {
 #[derive(Clone, Copy, Debug)]
 struct Setup {
     min_sync: Duration,
+    floor: Duration,
     every_commit: bool,
 }
 
 impl Setup {
-    const ALL: [Setup; 3] = [
+    const ALL: [Setup; 4] = [
         Setup {
             min_sync: Duration::ZERO,
+            floor: Duration::ZERO,
             every_commit: false,
         },
         Setup {
             min_sync: Duration::from_millis(10),
+            floor: Duration::from_millis(10),
             every_commit: false,
         },
         Setup {
             min_sync: Duration::from_millis(10),
+            floor: Duration::from_millis(2),
+            every_commit: false,
+        },
+        Setup {
+            min_sync: Duration::from_millis(10),
+            floor: Duration::from_millis(10),
             every_commit: true,
         },
     ];
+    /// `min_sync_interval`, with the floor where the interval adapts.
     fn interval(&self) -> String {
-        format!("{} ms", self.min_sync.as_millis())
+        if self.floor >= self.min_sync {
+            format!("{} ms", self.min_sync.as_millis())
+        } else {
+            format!(
+                "adaptive {}–{} ms",
+                self.floor.as_millis(),
+                self.min_sync.as_millis()
+            )
+        }
+    }
+    fn label(&self) -> String {
+        format!("{}, {}", self.interval(), self.mark())
     }
     fn mark(&self) -> &'static str {
         if self.every_commit {
@@ -402,6 +464,7 @@ impl Setup {
     fn config(&self) -> WriterConfig {
         WriterConfig {
             min_sync_interval: self.min_sync,
+            sync_interval_floor: self.floor,
             mark_sync: if self.every_commit {
                 MarkSync::EveryCommit
             } else {
@@ -477,8 +540,9 @@ impl Lcg {
     }
 }
 
-/// The open-loop schedule of a paced load: offsets from the start, with the series of each call.
-fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
+/// The open-loop schedule of a paced load: offsets from the start, with the first series and the number of
+/// readings of each call.
+fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32, u32)> {
     let end = Duration::from_secs(secs);
     let mut out = Vec::new();
     match load {
@@ -486,7 +550,7 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
             let mut rng = Lcg(0x9e37_79b9_7f4a_7c15);
             let mut t = Duration::ZERO;
             while t < end {
-                out.push((t, 1));
+                out.push((t, 1, 1));
                 t += Duration::from_millis(min_ms + rng.next() % (max_ms - min_ms + 1));
             }
         }
@@ -495,7 +559,7 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
             let mut t = Duration::ZERO;
             let mut i = 0;
             while t < end {
-                out.push((t, 1 + i % series));
+                out.push((t, 1 + i % series, 1));
                 i += 1;
                 t = step * i;
             }
@@ -503,13 +567,33 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32)> {
         Load::Burst { calls, every_ms } => {
             let mut t = Duration::ZERO;
             while t < end {
-                out.extend((0..calls).map(|c| (t, 1 + c)));
+                out.extend((0..calls).map(|c| (t, 1 + c, 1)));
                 t += Duration::from_millis(every_ms);
             }
         }
-        Load::BackToBack | Load::Saturation { .. } => {}
+        Load::Paced {
+            writers,
+            per_sec,
+            readings,
+        } => {
+            let mut rng = Lcg(0x2545_f491_4f6c_dd1d);
+            let period = Duration::from_secs(1) * writers / per_sec;
+            for w in 0..writers {
+                let mut t = period.mul_f64((rng.next() % 1000) as f64 / 1000.0);
+                while t < end {
+                    out.push((t, 1 + w * readings, readings));
+                    t += period;
+                }
+            }
+            out.sort_unstable();
+        }
+        Load::BackToBack { .. } | Load::Saturation { .. } => {}
     }
     out
+}
+
+fn readings(first: u32, count: u32, n: u64) -> Vec<Item> {
+    (first..first + count).map(|s| reading(s, n)).collect()
 }
 
 /// What one load under one setup measured.
@@ -527,6 +611,8 @@ struct Run {
     mark_syncs: u64,
     batches: u64,
     sealed: u64,
+    sync_interval: Duration,
+    sync_time: Option<Duration>,
     sync_samples: Vec<(SyncKind, u64)>,
 }
 
@@ -539,11 +625,11 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
     let mut lag = Vec::new();
     let mut busy = 0;
     let mut calls = 0u64;
-    let mut readings = 0u64;
+    let mut total = 0u64;
     match load {
-        Load::Quiet { .. } | Load::Steady { .. } | Load::Burst { .. } => {
+        Load::Quiet { .. } | Load::Steady { .. } | Load::Burst { .. } | Load::Paced { .. } => {
             let mut prev = None;
-            for (off, series) in schedule(load, secs) {
+            for (off, series, count) in schedule(load, secs) {
                 let due = start + off;
                 wait_until(due);
                 if prev != Some(off) {
@@ -551,11 +637,11 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                 }
                 prev = Some(off);
                 let t0 = Instant::now();
-                let p = match log.try_submit(vec![reading(series, calls)]) {
+                let p = match log.try_submit(readings(series, count, calls)) {
                     Ok(p) => p,
                     Err(SubmitError::Busy(_)) => {
                         busy += 1;
-                        log.submit(vec![reading(series, calls)])
+                        log.submit(readings(series, count, calls))
                             .expect("submit after back-pressure")
                     }
                     Err(e) => panic!("submit failed: {e}"),
@@ -565,15 +651,15 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                     break;
                 }
                 calls += 1;
-                readings += 1;
+                total += u64::from(count);
             }
         }
-        Load::BackToBack => {
+        Load::BackToBack { readings: count } => {
             let end = start + Duration::from_secs(secs);
             while Instant::now() < end {
                 let t0 = Instant::now();
                 let p = log
-                    .submit(vec![reading(1, calls)])
+                    .submit(readings(1, count, calls))
                     .expect("submit back to back");
                 let mut s = track(t0, p);
                 if let Outcome::Pending(p) = s.outcome {
@@ -583,7 +669,7 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                     break;
                 }
                 calls += 1;
-                readings += 1;
+                total += u64::from(count);
             }
         }
         Load::Saturation {
@@ -615,7 +701,7 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
             for h in handles {
                 let n = h.join().expect("a saturation writer");
                 calls += n;
-                readings += n * u64::from(per_call);
+                total += n * u64::from(per_call);
             }
         }
     }
@@ -632,12 +718,14 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
         busy,
         failed,
         calls,
-        readings,
+        readings: total,
         secs,
         syncs: after.syncs - before.syncs,
         mark_syncs: after.mark_syncs - before.mark_syncs,
         batches: after.batches - before.batches,
         sealed: after.sealed_segments - before.sealed_segments,
+        sync_interval: after.sync_interval,
+        sync_time: after.sync_time,
         sync_samples: sync_log.take(),
     }
 }
@@ -788,200 +876,17 @@ fn sync_calls(dir: &Path, short: bool) -> io::Result<Vec<CallRow>> {
     Ok(rows)
 }
 
-// ----- the environment -----
-
-fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn read_trim(p: impl AsRef<Path>) -> Option<String> {
-    std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned())
-}
-
-fn os_version() -> String {
-    let v = match std::env::consts::OS {
-        "linux" => read_trim("/proc/sys/kernel/osrelease").map(|k| format!("kernel {k}")),
-        "macos" => run_cmd("sw_vers", &["-productVersion"]).map(|s| s.trim().to_owned()),
-        "windows" => run_cmd("cmd", &["/C", "ver"]).map(|s| s.trim().to_owned()),
-        _ => None,
-    };
-    v.unwrap_or_else(|| "unknown".into())
-}
-
-fn sync_primitive() -> &'static str {
-    match std::env::consts::OS {
-        "linux" => {
-            "batch and mark: `fdatasync` (`File::sync_data`); creation and seal: `fsync`; directory: `fsync`"
-        }
-        "macos" => {
-            "batch and mark: `fcntl(F_FULLFSYNC)` (`File::sync_data`); creation, seal and directory: the same"
-        }
-        "windows" => {
-            "batch and mark: `FlushFileBuffers` (`File::sync_data`); no directory sync: a created or renamed file is flushed"
-        }
-        _ => "`File::sync_data` and `File::sync_all`",
-    }
-}
-
-/// The file system and the class of disk under `dir`, without names, serials or paths.
-fn storage(dir: &Path) -> (String, String) {
-    let unknown = || "unknown".to_owned();
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
-    match std::env::consts::OS {
-        "linux" => linux_storage(&dir).unwrap_or_else(|| (unknown(), unknown())),
-        "macos" => macos_storage(&dir).unwrap_or_else(|| (unknown(), unknown())),
-        "windows" => windows_storage(&dir).unwrap_or_else(|| (unknown(), unknown())),
-        _ => (unknown(), unknown()),
-    }
-}
-
-fn linux_storage(dir: &Path) -> Option<(String, String)> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let d = dir.to_string_lossy();
-    let mut best: Option<(usize, String, String)> = None;
-    for line in info.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        let Some(sep) = f.iter().position(|x| *x == "-") else {
-            continue;
-        };
-        if f.len() < 5 || f.len() <= sep + 1 {
-            continue;
-        }
-        let mp = f[4].replace("\\040", " ");
-        let under = mp == "/" || d == mp.as_str() || d.starts_with(&format!("{mp}/"));
-        if under && best.as_ref().is_none_or(|(l, _, _)| mp.len() >= *l) {
-            best = Some((mp.len(), f[sep + 1].to_owned(), f[2].to_owned()));
-        }
-    }
-    let (_, fstype, majmin) = best?;
-    let dev = Path::new("/sys/dev/block")
-        .join(&majmin)
-        .canonicalize()
-        .ok();
-    let disk = dev.map(|d| {
-        if d.join("partition").exists() {
-            d.parent().map(Path::to_path_buf).unwrap_or(d)
-        } else {
-            d
-        }
-    });
-    let disk = match disk {
-        Some(d) => {
-            let name = d
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let class = [
-                ("nvme", "NVMe"),
-                ("sd", "SCSI or SATA"),
-                ("vd", "virtio"),
-                ("xvd", "Xen virtual"),
-                ("dm-", "device mapper"),
-                ("md", "software RAID"),
-                ("loop", "loop device"),
-                ("mmcblk", "MMC/SD card"),
-            ]
-            .iter()
-            .find(|(p, _)| name.starts_with(p))
-            .map_or("other", |(_, c)| c);
-            let q = d.join("queue");
-            let rot = match read_trim(q.join("rotational")).as_deref() {
-                Some("0") => "solid state",
-                Some("1") => "rotational",
-                _ => "rotational unknown",
-            };
-            let cache = read_trim(q.join("write_cache")).unwrap_or_else(|| "unknown".into());
-            let fua = match read_trim(q.join("fua")).as_deref() {
-                Some("1") => ", FUA",
-                Some("0") => ", no FUA",
-                _ => "",
-            };
-            format!("{class}, {rot}, write cache {cache}{fua}")
-        }
-        None => "unknown".into(),
-    };
-    Some((fstype, disk))
-}
-
-fn macos_storage(dir: &Path) -> Option<(String, String)> {
-    let df = run_cmd("df", &["-P", &dir.to_string_lossy()])?;
-    let device = df.lines().nth(1)?.split_whitespace().next()?.to_owned();
-    let mounts = run_cmd("mount", &[]).unwrap_or_default();
-    let fstype = mounts
-        .lines()
-        .find(|l| l.starts_with(&format!("{device} on ")))
-        .and_then(|l| l.split_once(" ("))
-        .and_then(|(_, rest)| rest.split([',', ')']).next())
-        .map_or_else(|| "unknown".into(), |s| s.trim().to_owned());
-    let disk = run_cmd("diskutil", &["info", &device]).map(|info| {
-        let field = |key: &str| {
-            info.lines()
-                .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_owned()))
-        };
-        let proto = field("Protocol:").unwrap_or_default();
-        let class = if proto.contains("USB") {
-            "USB"
-        } else if proto.contains("SATA") {
-            "SATA"
-        } else if proto.contains("PCI") || proto.contains("NVMe") || proto.contains("Fabric") {
-            "NVMe"
-        } else {
-            "other"
-        };
-        let ssd = match field("Solid State:").as_deref() {
-            Some("Yes") => "solid state",
-            Some("No") => "rotational",
-            _ => "solid state unknown",
-        };
-        let loc = field("Device Location:").map_or("location unknown".into(), |l| l.to_lowercase());
-        format!("{class}, {ssd}, {loc}")
-    });
-    Some((fstype, disk.unwrap_or_else(|| "unknown".into())))
-}
-
-fn windows_storage(dir: &Path) -> Option<(String, String)> {
-    let s = dir.to_string_lossy();
-    let letter = s
-        .char_indices()
-        .find(|&(i, c)| c.is_ascii_alphabetic() && s[i + 1..].starts_with(':'))?
-        .1;
-    let script = format!(
-        "$v = Get-Volume -DriveLetter {letter}; $d = Get-Partition -DriveLetter {letter} | Get-Disk; \
-         $p = Get-PhysicalDisk | Where-Object DeviceId -eq $d.Number; \
-         Write-Output $v.FileSystemType; Write-Output $d.BusType; Write-Output $p.MediaType"
-    );
-    let out = run_cmd("powershell", &["-NoProfile", "-Command", &script])?;
-    let mut lines = out.lines().map(str::trim);
-    let fstype = lines.next().filter(|s| !s.is_empty())?.to_owned();
-    let bus = lines.next().unwrap_or("unknown").to_owned();
-    let media = lines.next().unwrap_or("unknown").to_owned();
-    Some((fstype, format!("bus {bus}, media {media}")))
-}
-
-fn load_average() -> String {
-    let v = match std::env::consts::OS {
-        "linux" => read_trim("/proc/loadavg")
-            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" ")),
-        "macos" => run_cmd("sysctl", &["-n", "vm.loadavg"])
-            .map(|s| s.trim().trim_matches(['{', '}']).trim().to_owned())
-            .or_else(|| {
-                let up = run_cmd("uptime", &[])?;
-                let (_, avg) = up.split_once("load average")?;
-                Some(
-                    avg.trim_start_matches(['s', ':', ' '])
-                        .trim()
-                        .replace(',', ""),
-                )
-            }),
-        _ => None,
-    };
-    v.unwrap_or_else(|| "not available".into())
-}
-
 // ----- the report -----
+
+/// Whether a `--only` or `--setup` filter selects `name`: the name equal to it if there is one, else every name that
+/// starts with it.
+fn selects(filter: Option<&str>, name: &str, all: &[String]) -> bool {
+    match filter {
+        None => true,
+        Some(f) if all.iter().any(|n| n == f) => name == f,
+        Some(f) => name.starts_with(f),
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -992,6 +897,8 @@ fn main() {
     let mut only: Option<String> = None;
     let mut repeat = 1u32;
     let mut disk_note: Option<String> = None;
+    let mut setup_filter: Option<String> = None;
+    let mut sync_delay = Duration::ZERO;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--short" => short = true,
@@ -999,6 +906,17 @@ fn main() {
             "--any-fs" => any_fs = true,
             "--only" => only = args.next(),
             "--disk" => disk_note = args.next(),
+            "--setup" => setup_filter = args.next(),
+            "--sync-delay" => {
+                let ms = args.next().and_then(|n| n.parse::<f64>().ok());
+                match ms.and_then(|ms| Duration::try_from_secs_f64(ms / 1e3).ok()) {
+                    Some(d) => sync_delay = d,
+                    None => {
+                        eprintln!("--sync-delay takes a number of milliseconds, zero or more");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--repeat" => {
                 repeat = args
                     .next()
@@ -1013,7 +931,8 @@ fn main() {
     }
     let Some(base) = dir else {
         eprintln!(
-            "usage: commit_latency <dir> [--short] [--only <load>] [--repeat <n>] [--any-fs] [--keep] [--disk <text>]"
+            "usage: commit_latency <dir> [--short] [--only <load>] [--repeat <n>] [--any-fs] [--keep] [--disk <text>] \
+             [--setup <text>] [--sync-delay <ms>]"
         );
         std::process::exit(2);
     };
@@ -1037,13 +956,19 @@ fn main() {
         w,
         "## Environment\n\n| Item | Value |\n|---|---|\n\
          | Run | {} |\n| Platform | {} {}, {} |\n| CPUs | {} |\n| File system | {fstype} |\n| Disk | {disk} |\n\
-         | Sync primitive | {} |\n| Timer slack | {} |\n| Build | {} |\n| Load average at start | {} |",
+         | Sync primitive | {} |\n| Sync delay added | {} |\n| Timer slack | {} |\n| Build | {} |\n\
+         | Load average at start | {} |",
         if short { "short" } else { "full" },
         std::env::consts::OS,
         std::env::consts::ARCH,
         os_version(),
         std::thread::available_parallelism().map_or(0, |n| n.get()),
         sync_primitive(),
+        if sync_delay.is_zero() {
+            "none".to_owned()
+        } else {
+            format!("{} ms in every `sync_data`", ms(nanos(sync_delay)))
+        },
         timer_slack(),
         if cfg!(debug_assertions) {
             "debug (not a valid measurement)"
@@ -1080,10 +1005,15 @@ fn main() {
     let mut restarts = Vec::new();
     for rep in 0..repeat {
         for (si, setup) in Setup::ALL.iter().copied().enumerate() {
+            let labels: Vec<_> = Setup::ALL.iter().map(Setup::label).collect();
+            if !selects(setup_filter.as_deref(), &setup.label(), &labels) {
+                continue;
+            }
             let dir = root.join(format!("store-{rep}-{si}"));
             let sync_log = Arc::new(SyncLog::default());
             let fs: Arc<dyn Fs> = Arc::new(TimingFs {
                 log: sync_log.clone(),
+                delay: sync_delay,
             });
             let new = NewStore {
                 store_id: STORE_ID,
@@ -1114,11 +1044,9 @@ fn main() {
                 .wait()
                 .expect("warm-up acknowledged");
             std::thread::sleep(Duration::from_millis(500));
+            let names: Vec<_> = loads(short).iter().map(|(l, _)| l.name()).collect();
             for (load, secs) in loads(short) {
-                if only
-                    .as_ref()
-                    .is_some_and(|o| !load.name().contains(o.as_str()))
-                {
+                if !selects(only.as_deref(), &load.name(), &names) {
                     continue;
                 }
                 let r = run_load(&log, &sync_log, load, secs, setup);
@@ -1158,13 +1086,14 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Commit latency per acknowledged call, ms\n\n\
-         | Load | `min_sync_interval` | Mark sync |{rh} Calls | p50 | p90 | p99 | p99.9 | max | Lag p99 | Lag max | Busy |\n\
+         | Load | Interval | Mark sync |{rh} Calls | p50 | p90 | p99 | p99.9 | max | Lag p99 | Lag max | Busy |\n\
          |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for (rep, r) in &runs {
         // How late the generator sent, for the open-loop loads: latency counts from the submit call, so lateness
         // would not show in it (coordinated omission) but would bunch arrivals.
-        let (lag, lag_max) = if matches!(r.load, Load::BackToBack | Load::Saturation { .. }) {
+        let (lag, lag_max) = if matches!(r.load, Load::BackToBack { .. } | Load::Saturation { .. })
+        {
             ("–".into(), "–".into())
         } else {
             (pct(&r.lag, 99.0), ms(r.lag.last().copied().unwrap_or(0)))
@@ -1190,9 +1119,10 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Throughput and syncs\n\n\
-         | Load | `min_sync_interval` | Mark sync |{rh} Seconds | Calls/s | Readings/s | Log syncs/s | Readings per batch | \
-         Mark syncs | Sealed | Batch sync p50 | p99 | max | Mark sync p50 | max |\n\
-         |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+         | Load | Interval | Mark sync |{rh} Seconds | Calls/s | Readings/s | Log syncs/s | Readings per batch | \
+         Calls per batch | Interval at end | Sync time at end | Mark syncs | Sealed | Batch sync p50 | p99 | max | \
+         Mark sync p50 | max |\n\
+         |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for (rep, r) in &runs {
         let kind = |k: SyncKind| {
@@ -1216,7 +1146,7 @@ fn main() {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} |{} {:.1} | {:.0} | {:.0} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} |{} {:.1} | {:.0} | {:.0} | {:.0} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.load.name(),
             r.setup.interval(),
             r.setup.mark(),
@@ -1226,6 +1156,9 @@ fn main() {
             r.readings as f64 / secs,
             r.syncs as f64 / secs,
             r.readings as f64 / r.batches.max(1) as f64,
+            r.calls as f64 / r.batches.max(1) as f64,
+            ms(nanos(r.sync_interval)),
+            r.sync_time.map_or("–".into(), |t| ms(nanos(t))),
             r.mark_syncs,
             r.sealed,
             m(&seg, 50.0),
@@ -1238,7 +1171,7 @@ fn main() {
     let _ = writeln!(
         out,
         "\n## Opening the store again after the run (clean shutdown, warm page cache)\n\n\
-         | `min_sync_interval` | Mark sync |{rh} Segments | MiB | Same boot ms | Rule | Another boot ms | Rule |\n\
+         | Interval | Mark sync |{rh} Segments | MiB | Same boot ms | Rule | Another boot ms | Rule |\n\
          |---|---|{rs}---:|---:|---:|---|---:|---|"
     );
     for (rep, r) in &restarts {
@@ -1290,6 +1223,21 @@ mod tests {
             before.elapsed() < STAMP_TIMEOUT / 2,
             "the wake notifies the waiter"
         );
+    }
+
+    #[test]
+    fn a_filter_selects_the_name_equal_to_it_else_every_name_it_starts() {
+        let all: Vec<String> = [
+            "back to back, 1 writer",
+            "back to back, 1 writer × 2000/call",
+        ]
+        .map(String::from)
+        .into();
+        assert!(selects(Some("back to back, 1 writer"), &all[0], &all));
+        assert!(!selects(Some("back to back, 1 writer"), &all[1], &all));
+        assert!(selects(Some("back to back"), &all[1], &all));
+        assert!(!selects(Some("1 writer"), &all[0], &all));
+        assert!(selects(None, &all[1], &all));
     }
 
     #[test]

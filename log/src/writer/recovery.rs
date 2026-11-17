@@ -13,8 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::batch::{BatchBuilder, SegmentIdentity};
-use crate::body::IndexRecord;
-use crate::content::{BatchContent, Item};
+use crate::content::{BatchContent, Item, ItemRef};
 use crate::entries::{Entry, IntervalLength, MarkState, Recovery};
 use crate::fs::{FsFile, OpenMode};
 use crate::header::{FileHeader, HEADER_LEN, kind};
@@ -26,7 +25,9 @@ use crate::mark::{
     MARK_LEN, MarkSlot, ResetStamp, SLOT_OFFSETS, encode_mark_file, read_mark, read_slots,
 };
 use crate::name::SegmentName;
-use crate::scan::{HeaderState, ScanLimit, ScanReport, Tail, scan, scan_ignoring_seal};
+use crate::scan::{
+    HeaderState, ScanLimit, ScanReport, Tail, nonzero_end, scan, scan_ignoring_seal, scan_to_end,
+};
 use crate::segment::SealSummary;
 use crate::store::{LEASES_DIR, MANIFEST, MARK, StoreDir, StoreError};
 
@@ -142,10 +143,7 @@ struct B {
 
 impl B {
     fn recovery(&self) -> Option<&Recovery> {
-        match self.content.items.as_slice() {
-            [Item::Entry(Entry::Recovery(r))] => Some(r),
-            _ => None,
-        }
+        self.content.recovery()
     }
 }
 
@@ -228,15 +226,19 @@ fn scan_segment(
         file_id: name.file_id,
         generation: name.generation,
     };
-    let mut r = scan(&bytes, &id, ScanLimit::End).map_err(StoreError::Unsupported)?;
+    let last_nonzero = nonzero_end(&bytes);
+    let (mut r, mut contents) =
+        scan_to_end(&bytes, &id, last_nonzero).map_err(StoreError::Unsupported)?;
     let mut sealed = r.seal.is_some();
     if sealed && (ignore_seal || !seal_holds(&r)) {
-        r = scan_ignoring_seal(&bytes, &id).map_err(StoreError::Unsupported)?;
+        drop(std::mem::take(&mut contents));
+        (r, contents) =
+            scan_ignoring_seal(&bytes, &id, last_nonzero).map_err(StoreError::Unsupported)?;
         sealed = false;
     }
     let mut batches = Vec::new();
-    for b in &r.batches {
-        let content = BatchContent::decode(b).map_err(|_| StoreError::Corrupt("batch content"))?;
+    for (b, content) in r.batches.iter().zip(contents) {
+        let content = content.ok_or(StoreError::Corrupt("batch content"))?;
         batches.push(B {
             offset: b.offset,
             end: b.end(),
@@ -279,7 +281,6 @@ fn scan_segment(
         HeaderState::Valid(h) => Some(h),
         HeaderState::Invalid => None,
     };
-    let last_nonzero = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1) as u64;
     Ok(Seg {
         id,
         path,
@@ -1019,7 +1020,7 @@ pub(super) fn start(
         .chain(segs.iter().flat_map(|s| {
             s.batches.iter().flat_map(|b| {
                 b.content.items.iter().filter_map(|i| match i {
-                    Item::Entry(e) => Some(e),
+                    Item::Entry(e) => Some(&**e),
                     Item::Fact(_) => None,
                 })
             })
@@ -1270,9 +1271,9 @@ pub(super) fn start(
     // A batch superseded by a stopped reset's entry may have been acknowledged too.
     for &(i, j) in &p.superseded {
         for item in &segs[i].batches[j].content.items {
-            match item {
-                Item::Fact(r) => id_floor = id_floor.max(r.series_id),
-                Item::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
+            match item.view() {
+                ItemRef::Fact(r) => id_floor = id_floor.max(r.series_id),
+                ItemRef::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
                 _ => {}
             }
         }
@@ -1282,9 +1283,9 @@ pub(super) fn start(
         for &i in &in_use_idx {
             for b in segs[i].batches.iter().skip(p.kept[i]) {
                 for item in &b.content.items {
-                    match item {
-                        Item::Fact(r) => id_floor = id_floor.max(r.series_id),
-                        Item::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
+                    match item.view() {
+                        ItemRef::Fact(r) => id_floor = id_floor.max(r.series_id),
+                        ItemRef::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
                         _ => {}
                     }
                 }
@@ -1294,15 +1295,15 @@ pub(super) fn start(
     for &i in &in_use_idx {
         for b in segs[i].batches.iter().take(p.kept[i]) {
             for item in &b.content.items {
-                match item {
-                    Item::Fact(r) => id_floor = id_floor.max(r.series_id),
-                    Item::Entry(Entry::Definition(d)) => {
+                match item.view() {
+                    ItemRef::Fact(r) => id_floor = id_floor.max(r.series_id),
+                    ItemRef::Entry(Entry::Definition(d)) => {
                         id_floor = id_floor.max(d.id);
                         if let Some(iv) = &d.interval {
                             intervals.insert(d.id, iv.clone());
                         }
                     }
-                    Item::Entry(Entry::Recovery(r)) => id_floor = id_floor.max(r.id_floor),
+                    ItemRef::Entry(Entry::Recovery(r)) => id_floor = id_floor.max(r.id_floor),
                     _ => {}
                 }
             }
@@ -1421,7 +1422,7 @@ pub(super) fn start(
             let content = BatchContent {
                 first_sequence: f_seq,
                 received_at: commit_time,
-                items: vec![Item::Entry(Entry::Recovery(entry.clone()))],
+                items: vec![Item::from(Entry::Recovery(entry.clone()))],
             };
             let builder: BatchBuilder = content.builder().expect("a recovery entry encodes");
             let need = builder.data_len() + 64;
@@ -1719,7 +1720,7 @@ pub(super) fn start(
                 log_dir: log_dir.clone(),
                 end,
                 summary,
-                records: seg.index.into_values().collect(),
+                records: seg.index.into_records(),
                 has_entries: seg.has_entries,
                 prepared: Default::default(),
             });
@@ -1781,7 +1782,7 @@ fn open_segment<'a>(
     now: Duration,
 ) -> OpenSegment {
     let mut summary: Option<SealSummary> = None;
-    let mut index: BTreeMap<u32, IndexRecord> = BTreeMap::new();
+    let mut index = super::seg_index::SegIndex::default();
     let mut has_entries = false;
     for (c, t, first) in batches {
         let last = c.last_sequence();
@@ -1806,15 +1807,7 @@ fn open_segment<'a>(
             match item {
                 Item::Fact(r) => {
                     let reach = reach(r.t, intervals.get(&r.series_id));
-                    let rec = index.entry(r.series_id).or_insert(IndexRecord {
-                        series_id: r.series_id,
-                        fact_count: 0,
-                        min_t: r.t,
-                        max_t: reach,
-                    });
-                    rec.fact_count += 1;
-                    rec.min_t = rec.min_t.min(r.t);
-                    rec.max_t = rec.max_t.max(reach);
+                    index.note(r.series_id, r.t, reach);
                 }
                 Item::Entry(_) => has_entries = true,
             }

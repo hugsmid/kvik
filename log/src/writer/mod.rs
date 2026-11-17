@@ -31,22 +31,25 @@
 //! let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("store"), Some(&new)).unwrap();
 //! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO, 0).unwrap();
 //! let log = Log::start(writer, Arc::new(SystemClock::default())).unwrap();
-//! let alias = Item::Entry(Entry::Alias { id: 1, name: "hall".into() });
+//! let alias = Item::from(Entry::Alias { id: 1, name: "hall".into() });
 //! // Acknowledged after the batch's sync and, as it holds an entry that is not a fact, the mark's sync.
 //! let ack = log.submit(vec![alias]).unwrap().wait().unwrap();
 //! assert_eq!(ack.first.sequence, 1);
 //! log.shutdown().unwrap();
 //! ```
 
+mod gather;
 mod generation;
 mod maint;
 mod options;
+mod pacing;
 mod queue;
 pub mod recovery;
+mod seg_index;
 pub mod sources;
 mod threads;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,8 +66,8 @@ pub use threads::{Clock, Log, Pending, Room, SubmitError, SystemClock, Watch};
 
 use crate::batch::SegmentIdentity;
 use crate::block::{BLOCK_HEADER_LEN, block_type};
-use crate::body::{COMMIT_LEN, IndexRecord};
-use crate::content::{BatchContent, Item};
+use crate::body::COMMIT_LEN;
+use crate::content::{BatchContent, Item, ItemRef};
 use crate::entries::{Entry, IntervalLength};
 use crate::error::EncodeError;
 use crate::fs::{Fs, FsFile};
@@ -73,6 +76,7 @@ use crate::lease::LeaseTable;
 use crate::mark::{MarkSlot, SLOT_OFFSETS};
 use crate::segment::{SealSummary, SealedFile};
 use crate::store::{LEASES_DIR, MARK, StoreDir, StoreError};
+use pacing::SyncPace;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -91,6 +95,8 @@ pub const DESCRIBE_RETRY_MAX: Duration = Duration::from_secs(600);
 /// The most entries in one call, whatever the queue's capacity (`api.md` Writing).
 pub const MAX_CALL_ENTRIES: usize = 65_536;
 const DAY_NS: i64 = 86_400_000_000_000;
+/// The default `log.sync_interval_floor` (Q-710).
+pub const DEFAULT_SYNC_INTERVAL_FLOOR: Duration = Duration::from_millis(2);
 
 /// When the mark file is synced (`api.md` `log.mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,9 +115,12 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// `log.seal_interval`: a segment in use this long is sealed, if it holds a batch.
     pub seal_interval: Duration,
-    /// `log.min_sync_interval`: batch syncs are due at least this far apart (spec §3 Group commit, Q-310); zero
-    /// disables the bound.
+    /// `log.min_sync_interval`: the ceiling of the batch-sync interval, and the interval before the first sample
+    /// (spec §3 Group commit, Q-310); zero disables the bound.
     pub min_sync_interval: Duration,
+    /// `log.sync_interval_floor`: the least batch-sync interval; at or above `min_sync_interval` the interval is
+    /// fixed (spec §3 Group commit, Q-710).
+    pub sync_interval_floor: Duration,
     /// `log.max_batch_bytes`: 64 KiB to 8 MiB.
     pub max_batch_bytes: u64,
     /// `log.mark_sync`.
@@ -137,6 +146,7 @@ impl Default for WriterConfig {
             segment_size: 64 * MIB,
             seal_interval: Duration::from_secs(300),
             min_sync_interval: Duration::from_millis(10),
+            sync_interval_floor: DEFAULT_SYNC_INTERVAL_FLOOR,
             max_batch_bytes: MIB,
             mark_sync: MarkSync::Interval(Duration::from_secs(1)),
             ingest_queue: 65_536,
@@ -483,6 +493,10 @@ pub struct LogStats {
     pub mark_syncs: u64,
     /// The highest series id assigned.
     pub max_series_id: u32,
+    /// The batch-sync interval in force (spec §3 Group commit).
+    pub sync_interval: Duration,
+    /// The smoothed duration of a batch sync; `None` before the first sample.
+    pub sync_time: Option<Duration>,
 }
 
 /// A finished call: its id and its result.
@@ -523,7 +537,7 @@ struct OpenSegment {
     write_offset: u64,
     summary: Option<SealSummary>,
     has_entries: bool,
-    index: BTreeMap<u32, IndexRecord>,
+    index: seg_index::SegIndex,
     in_use_since: Duration,
 }
 
@@ -573,6 +587,9 @@ pub struct LogWriter {
     last_batch_due: Option<Duration>,
     /// When the previous log sync started, a timed seal's included.
     last_sync_start: Option<Duration>,
+    /// Times batch syncs for the pace; with none, the interval stays at `min_sync_interval`.
+    sync_clock: Option<Arc<dyn Clock>>,
+    pace: SyncPace,
     fault: Option<Fault>,
     halt: Arc<Halt>,
     seals: Vec<SealJob>,
@@ -595,6 +612,9 @@ pub struct LogWriter {
     stats: LogStats,
     report: StartReport,
     leases: LeaseTable,
+    /// The last batch's entries and calls, kept until the calls are acknowledged ([`LogWriter::release_batch`]).
+    batch: Vec<Item>,
+    batch_calls: Vec<Call>,
 }
 
 fn reach(t: i64, interval: Option<&IntervalLength>) -> i64 {
@@ -675,6 +695,9 @@ impl LogWriter {
                 syncs: 0,
                 mark_syncs: 0,
                 max_series_id: r.max_series_id,
+                sync_interval: SyncPace::default()
+                    .interval(cfg.sync_interval_floor, cfg.min_sync_interval),
+                sync_time: None,
             },
             fs,
             store,
@@ -702,6 +725,8 @@ impl LogWriter {
             intervals: r.intervals,
             last_batch_due: None,
             last_sync_start: None,
+            sync_clock: None,
+            pace: SyncPace::default(),
             fault: r.fault,
             halt,
             seals: r.seals,
@@ -717,6 +742,8 @@ impl LogWriter {
             disk: Disk::default(),
             waiting: None,
             report: r.report,
+            batch: Vec::new(),
+            batch_calls: Vec::new(),
         })
     }
 
@@ -793,18 +820,30 @@ impl LogWriter {
         r
     }
 
-    /// The earliest time the next batch sync may start: `min_sync_interval` after the previous batch sync was due
-    /// and half of it after the previous log sync started (spec §3 Group commit, Q-310).
+    /// Times each batch sync on `clock`, so that the interval adapts to the device (spec §3 Group commit);
+    /// [`Log::start`] passes its clock.
+    pub fn set_sync_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.sync_clock = Some(clock);
+    }
+
+    /// The batch-sync interval in force: `min_sync_interval` before the first sample.
+    pub fn sync_interval(&self) -> Duration {
+        self.pace
+            .interval(self.cfg.sync_interval_floor, self.cfg.min_sync_interval)
+    }
+
+    /// The earliest time the next batch sync may start: the interval after the previous batch sync was due and half
+    /// of it after the previous log sync started (spec §3 Group commit, Q-310).
     pub fn sync_ready_at(&self) -> Duration {
         let spaced = self
             .last_sync_start
-            .map_or(Duration::ZERO, |s| s + self.cfg.min_sync_interval / 2);
+            .map_or(Duration::ZERO, |s| s + self.sync_interval() / 2);
         self.grid_ready_at().max(spaced)
     }
 
     fn grid_ready_at(&self) -> Duration {
         self.last_batch_due
-            .map_or(Duration::ZERO, |d| d + self.cfg.min_sync_interval)
+            .map_or(Duration::ZERO, |d| d + self.sync_interval())
     }
 
     /// When a batch sync starting at `now` was due: when the previous one's due time let it start, but at most one
@@ -812,7 +851,7 @@ impl LogWriter {
     /// only while the load stays at the bound (Q-310).
     fn batch_sync_due(&self, now: Duration) -> Duration {
         self.grid_ready_at()
-            .max(now.saturating_sub(self.cfg.min_sync_interval))
+            .max(now.saturating_sub(self.sync_interval()))
     }
 
     fn fail(&mut self, op: FaultOp, path: &Path, e: &io::Error) {
@@ -1031,8 +1070,10 @@ impl LogWriter {
 
     /// One turn of the writer thread at monotonic time `now` and wall clock `wall`: checks free space, syncs the
     /// mark when its timer is due, seals a segment by time, and commits one batch from `source` if a log sync may
-    /// start. After a fault, every call in `source` fails with [`CommitError::ReadOnly`].
+    /// start. After a fault, every call in `source` fails with [`CommitError::ReadOnly`]. The previous turn's
+    /// batch is freed first.
     pub fn step(&mut self, now: Duration, wall: i64, source: &mut dyn CallSource) -> Step {
+        self.release_batch();
         let mut step = Step::default();
         self.sync_halt();
         if self.fault.is_none() {
@@ -1241,7 +1282,7 @@ impl LogWriter {
             write_offset: HEADER_LEN as u64,
             summary: None,
             has_entries: false,
-            index: BTreeMap::new(),
+            index: seg_index::SegIndex::default(),
             in_use_since: now,
         })
     }
@@ -1258,7 +1299,7 @@ impl LogWriter {
                 id: old.id,
                 log_dir: self.log_dir.clone(),
                 summary,
-                records: old.index.into_values().collect(),
+                records: old.index.into_records(),
                 has_entries: old.has_entries,
                 prepared: Default::default(),
             });
@@ -1275,21 +1316,40 @@ impl LogWriter {
         wall: i64,
         back: &mut Vec<Call>,
     ) -> Option<Vec<Done>> {
-        let first = self.last_sequence + 1;
-        let commit_time = wall.max(self.last_commit_time);
+        let mut items = Vec::with_capacity(calls.iter().map(Call::len).sum());
+        let counts = gather::gather(&mut calls, &mut items);
         let mut content = BatchContent {
-            first_sequence: first,
-            received_at: commit_time,
-            items: calls.iter().flat_map(|c| c.items.iter().cloned()).collect(),
+            first_sequence: self.last_sequence + 1,
+            received_at: wall.max(self.last_commit_time),
+            items,
         };
+        let done = self.commit_content(&mut calls, counts, &mut content, now, back);
+        self.batch = content.items;
+        self.batch_calls = calls;
+        done
+    }
+
+    /// [`LogWriter::commit`] of `content`, the entries of `calls` (`counts` of each) moved into it; a call put back
+    /// gets its entries back.
+    fn commit_content(
+        &mut self,
+        calls: &mut Vec<Call>,
+        mut counts: Vec<usize>,
+        content: &mut BatchContent,
+        now: Duration,
+        back: &mut Vec<Call>,
+    ) -> Option<Vec<Done>> {
+        let first = content.first_sequence;
+        let commit_time = content.received_at;
         // Calls that encode alone may still not encode together (merged blocks that pass 8 MiB, or a recovery entry
         // that must be alone in its batch): the batch then takes the first call only. A lone call encodes as it did
         // when it was made, whatever its first sequence.
         let builder = match content.builder() {
             Ok(b) => b,
             Err(_) if calls.len() > 1 => {
-                back.extend(calls.split_off(1));
-                content.items = calls[0].items.clone();
+                gather::give_back(&mut calls[1..], &counts[1..], &mut content.items);
+                back.extend(calls.drain(1..));
+                counts.truncate(1);
                 content.builder().expect("a valid call encodes alone")
             }
             Err(_) => unreachable!("a valid call encodes alone"),
@@ -1302,22 +1362,23 @@ impl LogWriter {
         let mut next = None;
         if !fits {
             if self.ahead.is_none() {
+                gather::give_back(calls, &counts, &mut content.items);
                 let rest = std::mem::take(back);
-                back.extend(calls);
+                back.append(calls);
                 back.extend(rest);
                 return None;
             }
             if self.halted() {
-                return Some(Self::finished(&calls, CommitError::ReadOnly));
+                return Some(Self::finished(calls, CommitError::ReadOnly));
             }
             next = self.take_into_use(first, now);
             if next.is_none() {
-                return Some(Self::unknown(&calls));
+                return Some(Self::unknown(calls));
             }
         }
         // Nothing of this batch is written yet: a fault known now leaves it unstored.
         if self.halted() {
-            return Some(Self::finished(&calls, CommitError::ReadOnly));
+            return Some(Self::finished(calls, CommitError::ReadOnly));
         }
         let seg = next
             .as_ref()
@@ -1330,10 +1391,10 @@ impl LogWriter {
         let path = maint::segment_path(&self.log_dir, &seg.id, false);
         if let Err(e) = seg.file.write_at(&bytes, at) {
             self.fail(FaultOp::Write, &path, &e);
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         if self.halted() {
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         self.last_batch_due = Some(self.batch_sync_due(now));
         self.last_sync_start = Some(now);
@@ -1342,9 +1403,16 @@ impl LogWriter {
             .as_ref()
             .or(self.open.as_ref())
             .expect("a segment in use");
+        let before = self.sync_clock.as_ref().map(|c| c.monotonic());
         if let Err(e) = seg.file.sync_data() {
             self.fail(FaultOp::Sync, &path, &e);
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
+        }
+        if let (Some(c), Some(b)) = (&self.sync_clock, before) {
+            self.pace
+                .sample(pacing::nanos(c.monotonic().saturating_sub(b)));
+            self.stats.sync_interval = self.sync_interval();
+            self.stats.sync_time = self.pace.estimate();
         }
         let last = content.last_sequence();
         // The batch is on stable storage: account for it in the segment's summary and index.
@@ -1377,26 +1445,18 @@ impl LogWriter {
         seg.has_entries |= builder.block_types().any(|t| t == block_type::ENTRIES);
         let (file_id, offset) = (seg.id.file_id, seg.write_offset);
         for item in &content.items {
-            match item {
-                Item::Fact(r) => {
+            match item.view() {
+                ItemRef::Fact(r) => {
                     let reach = reach(r.t, intervals.get(&r.series_id));
-                    let rec = seg.index.entry(r.series_id).or_insert(IndexRecord {
-                        series_id: r.series_id,
-                        fact_count: 0,
-                        min_t: r.t,
-                        max_t: reach,
-                    });
-                    rec.fact_count += 1;
-                    rec.min_t = rec.min_t.min(r.t);
-                    rec.max_t = rec.max_t.max(reach);
+                    seg.index.note(r.series_id, r.t, reach);
                 }
-                Item::Entry(Entry::Definition(d)) => {
+                ItemRef::Entry(Entry::Definition(d)) => {
                     *max_series_id = (*max_series_id).max(d.id);
                     if let Some(i) = &d.interval {
                         intervals.insert(d.id, i.clone());
                     }
                 }
-                Item::Entry(_) => {}
+                ItemRef::Entry(_) => {}
             }
         }
         if let Some(n) = next {
@@ -1420,7 +1480,7 @@ impl LogWriter {
         };
         let mp = self.mark_path.clone();
         if self.halted() {
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         let written = match self.mark.as_ref() {
             Some(m) => m.write_at(&slot.encode(), SLOT_OFFSETS[self.mark_next_slot] as u64),
@@ -1428,7 +1488,7 @@ impl LogWriter {
         };
         if let Err(e) = written {
             self.fail(FaultOp::MarkWrite, &mp, &e);
-            return Some(Self::unknown(&calls));
+            return Some(Self::unknown(calls));
         }
         self.mark_slot = slot;
         self.mark_written = true;
@@ -1439,7 +1499,7 @@ impl LogWriter {
         if forced {
             self.sync_mark(now);
             if self.fault.is_some() {
-                return Some(Self::unknown(&calls));
+                return Some(Self::unknown(calls));
             }
         }
         self.stats.durable = Position {
@@ -1466,6 +1526,19 @@ impl LogWriter {
                 })
                 .collect(),
         )
+    }
+
+    /// Frees the last batch's entries and calls: the writer thread does so once the calls are acknowledged, off
+    /// the path to their acknowledgement; [`LogWriter::step`] does so at its start.
+    pub(crate) fn release_batch(&mut self) {
+        self.batch = Vec::new();
+        self.batch_calls = Vec::new();
+    }
+
+    /// Entries and calls of the last batch still held.
+    #[cfg(test)]
+    pub(crate) fn batch_held(&self) -> usize {
+        self.batch.len() + self.batch_calls.len()
     }
 
     fn unknown(calls: &[Call]) -> Vec<Done> {

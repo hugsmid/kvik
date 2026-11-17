@@ -72,7 +72,7 @@ pub fn fact(series: u32, t: i64) -> Item {
 }
 
 pub fn interval_series(id: u32) -> Item {
-    Item::Entry(Entry::Definition(Box::new(Definition {
+    Item::from(Entry::Definition(Box::new(Definition {
         id,
         name: format!("a/b/energy{id}"),
         kind: Kind::Interval,
@@ -98,7 +98,7 @@ pub fn interval_series(id: u32) -> Item {
 }
 
 pub fn routing(consumer: &str) -> Item {
-    Item::Entry(Entry::Routing(Box::new(Routing {
+    Item::from(Entry::Routing(Box::new(Routing {
         consumer: consumer.into(),
         op: RouteOp::Emits,
         funnel: None,

@@ -192,6 +192,9 @@ struct Shared {
     halt: Arc<Halt>,
     fs: Arc<dyn Fs>,
     clock: Arc<dyn Clock>,
+    /// The writer's held batch entries and calls as the last acknowledgements were delivered, and just after.
+    #[cfg(test)]
+    held: Mutex<Option<(usize, usize)>>,
 }
 
 impl Shared {
@@ -320,7 +323,8 @@ pub struct Log {
 
 impl Log {
     /// Starts `kvik-writer` and `kvik-maint` on an opened writer.
-    pub fn start(writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+    pub fn start(mut writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        writer.set_sync_clock(clock.clone());
         let cfg = writer.config().clone();
         let shared = Arc::new(Shared {
             front: Mutex::new(Front {
@@ -349,6 +353,8 @@ impl Log {
             halt: writer.halt(),
             fs: writer.store().fs().clone(),
             clock,
+            #[cfg(test)]
+            held: Mutex::new(None),
         });
         let s = shared.clone();
         let maint = std::thread::Builder::new()
@@ -657,8 +663,15 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> (Result<(), Fault>, LogWriter) {
         // published before any call of this step completes, so a caller that holds its acknowledgement sees them.
         exchange(s, &mut w);
         publish(s, &mut w);
+        #[cfg(test)]
+        let at_acks = (!step.done.is_empty()).then(|| w.batch_held());
         complete(s, step.done);
         s.room_cv.notify_all();
+        w.release_batch();
+        #[cfg(test)]
+        if let Some(at) = at_acks {
+            *lock(&s.held) = Some((at, w.batch_held()));
+        }
         let mut f = lock(&s.front);
         if f.shutdown {
             let stuck = f
@@ -776,5 +789,65 @@ fn maint_loop(s: &Shared) {
             return;
         }
         s.wake_writer();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::content::Item;
+    use crate::entries::Entry;
+    use crate::fs::MemFs;
+    use crate::store::{NewStore, StoreDir};
+    use crate::writer::WriterConfig;
+
+    #[test]
+    fn the_batch_is_held_while_its_calls_are_acknowledged_and_freed_just_after() {
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("s"), Some(&new)).unwrap();
+        let w = LogWriter::open(
+            store,
+            WriterConfig::default(),
+            Some([2; 16]),
+            Duration::ZERO,
+            0,
+        )
+        .unwrap();
+        let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+        let alias = |id| {
+            Item::from(Entry::Alias {
+                id,
+                name: format!("a{id}"),
+            })
+        };
+        log.submit(vec![alias(1), alias(2)])
+            .unwrap()
+            .wait()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let held = loop {
+            if let Some(h) = *lock(&log.shared.held) {
+                break h;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "no batch acknowledged"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        log.shutdown().unwrap();
+        assert_eq!(
+            held,
+            (3, 0),
+            "two entries and one call held at the acknowledgement, none after"
+        );
     }
 }
