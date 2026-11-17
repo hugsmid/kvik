@@ -254,6 +254,8 @@ impl Directories {
             return false;
         }
         s.known.clear();
+        // The root is written at the end of the start, also with nothing sealed, so that it names the manifest.
+        self.root_dirty = true;
         true
     }
 }
