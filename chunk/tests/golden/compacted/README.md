@@ -4,7 +4,8 @@ Whole files (`docs/format-compacted.md`) that guard the layout against accidenta
 are hand-built, deterministically, by [`../../file_golden.rs`](../../file_golden.rs) from synthetic facts (no
 recorded data). The test checks that each canonical file is byte for byte what the writer writes now, reads back to
 the content it was built from (facts with positions and batch times, entries, statistics, batch rows, layout), passes
-the canonical checks and extracts to a chunk index object that reads back. Regenerate only after a deliberate format
+the canonical checks and extracts to a chunk index object that reads back. Every file carries its positions per
+generation (description field 10) and is marked complete (field 13). Regenerate only after a deliberate format
 change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-chunk --test file_golden`.
 
 | File | Shows |
@@ -28,9 +29,9 @@ change: `KVIK_BLESS_GOLDEN=1 cargo test -p kvik-chunk --test file_golden`.
 | `many-chunks.kvc` | 1,025 chunks: two index blocks |
 | `many-batches.kvc` | 4,097 batches: two commit-times blocks |
 | `xor-zstd.kvc` | An `f64` chunk in compressed XOR (encoding 5): compared by what it reads back to and by the canonical checks, since compressed bytes are a writer's choice (`docs/format-chunk.md` C.8) |
-| `longer-trailer.kvc` | A trailer with 8 bytes beyond v1's: read, not canonical |
-| `unknown-ignorable.kvc` | An ignorable description field `0x8001`, commit-times column `0x90` and data column `0x90`: read, not canonical |
+| `longer-trailer.kvc` | A trailer with 8 bytes beyond v1's: read, reported as skipped, not judged canonical |
+| `unknown-ignorable.kvc` | An ignorable description field `0x8001`, commit-times column `0x90` and data column `0x90`: read, reported as skipped, not judged canonical |
 | `unknown-critical-data.kvc` | A critical data column `0x12`: a version refusal |
 | `unknown-critical-times.kvc` | A critical commit-times column `0x05`: a version refusal |
-| `unknown-critical-description.kvc` | A critical description field 13: a version refusal at open |
+| `unknown-critical-description.kvc` | A critical description field 14: a version refusal at open |
 | `undefined-flag.kvc` | Chunk flag bit 4 in the directory and index entry: a version refusal |

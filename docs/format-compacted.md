@@ -32,14 +32,21 @@ A field list (A.6 framing), fields in ascending id order: 1 class `u8` (1 curren
 0, their sum inside `i64`); 5 run id `u64` (the lowest `file_id` among the outputs published together; a replacement
 keeps the run id and count of the file it replaces) and 6 the number of those outputs `u32`, at least 1; 7 the
 inputs, 12 bytes each as in A.14's file description (kind `u8`, 1 or 2, 3 reserved, `file_id` `u64`), strictly
-ascending, at least 1 and at most 1,024, never the file itself; 8 and 9 the first and last series name of a split
-part, UTF-8 of 1 to 255 bytes, the first at or below the last as bytes (both absent when the period is one file);
-11 present, with no value, when the file holds entries (current files only); 12 present, with no value, when it holds
-set-aside chunks (revision files only). Fields 1 to 7 are mandatory. An unknown class or level, like an unknown field
-below `0x8000`, is a version refusal; a field at or above `0x8000` is skipped. Together with the header and trailer
-this is the file's self-description (A.14): kind, class, `file_id`, generation, position range and inputs. The
-plaintext SHA-256 is over every byte of the file, header to end marker, and is held by the manifest's file
-description and by the file's chunk index object (B.2), not by the file itself.
+ascending by kind, then `file_id`, at least 1 and at most 1,024, never the file itself; 8 and 9 the first and last
+series name of a split part, UTF-8 of 1 to 255 bytes, the first at or below the last as bytes (both absent when the
+period is one file); 10 the positions held per generation, 16 bytes each (`generation: u32`, reserved `u32`, `count:
+u64`), generations strictly ascending, each count at least 1 (Q-810); 11 present when the file holds entries
+(current files only); 12 present when it holds set-aside chunks (revision files only); 13 present when every element
+of every input was known and carried (`complete`, Q-809, Q-810). Fields 1 to 7 and 10 are mandatory. Fields 11 to 13
+are flags: present with no value means set, an exception to A.6's reading of a zero-length field as "none". The
+writer takes field 10 from its caller, since the description is the first block, and refuses at the end a file
+whose positions per generation differ from it. A merge's output is `complete` only when every input is and no
+reader skipped an element of any (`Ignored`, below). An unknown class or level, like an unknown field below `0x8000`,
+is a version refusal, judged before any other check of the field list; a field at or above `0x8000` is skipped.
+Together with the header and trailer this is the file's self-description (A.14): kind, class, `file_id`,
+generation, position range and inputs. The plaintext SHA-256 is over every byte of the file, header to end marker,
+and is held by the manifest's file description and by the file's chunk index object (B.2), not by the file
+itself.
 
 ### Chunk
 
@@ -77,7 +84,8 @@ that the file holds, in position order, grouped as A.16's canonical writing grou
 sequences, a recovery entry alone, at most 16 MiB a body). An entries block's `received_at` is its batch's. Entries are
 in current files only. A file with entries and no chunk is valid. The section is read whole: it is bound to the
 trailer by a CRC32C over its bytes, from the first marker's header to the first commit-times block's (padding
-included), and holds exactly `entry_count − fact_count` positions.
+included), and holds exactly `entry_count − fact_count` positions. A writer and a reader hold the section in
+memory whole, and count it against the maintenance memory cap.
 
 ### Commit times (`0x32`)
 
@@ -86,7 +94,8 @@ directory, the payloads) with one row per batch and four columns: 1 `first_seque
 `last_sequence − first_sequence` (`u64`; 0, 2), 3 `received_at` (`i64`; 0, 2), 4 `commit_time − received_at` (`i64`,
 never negative; 0, 1, 2). Ids ascend; an unknown id below `0x80` is critical, at or above it ignorable. Encodings are
 chosen as C.9 chooses them: columns 1 to 3 delta when its payload is shorter than plain's, else plain; column 4 the
-shortest of plain, run-length and delta, a tie going to the lower encoding id. A batch has a row exactly when the
+shortest of plain, run-length and delta, a tie going to the lower encoding id. An unknown critical id is judged
+before any other check of the block. A batch has a row exactly when the
 file holds at least one of its positions; the row gives the batch's whole range as its commit block did (A.7). Rows
 ascend by generation, then `first_sequence`, and do not overlap; within a generation commit times do not decrease
 (A.7 by construction; here a reader's check). A block holds one generation and every block but the last of a
@@ -201,16 +210,20 @@ must be that one, so a valid block image from another offset or an older file is
 
 1. **At open.** The header: magic and checksum, `kind` 2 (else refused), `format_major` (a newer one is a version
    refusal), `store_id`, and the `file_id` and generation of the name (else refused, A.12). The end marker, its
-   `trailer_offset` at or above 64; the trailer block ending exactly at the end marker. The trailer: `fact_count` at
+   `trailer_offset` at or above 64; the trailer block ending exactly at the end marker. The trailer: `times_offset`,
+   `times_dir_offset` and `index_root_offset` not 0; `fact_count` at
    most `entry_count`, positions and commit times ordered, `chunk_count` at most `fact_count`, no fact exactly when no
    chunk and exactly when `index_offset` is 0, `min_t` and `max_reach` 0 with no fact, at least one commit-times
    block, `entries_crc32c` 0 with no entries, and the non-zero section offsets strictly rising, multiples of 8 and
    below the trailer. The description at offset 64, bound by the trailer; field 11 present exactly when
-   `entries_offset` is not 0. The commit-time directory, bound by the trailer: as many records as the trailer
+   `entries_offset` is not 0; field 10's first and last generation those of the trailer's range and its counts
+   summing to `entry_count`. The commit-time directory, bound by the trailer: as many records as the trailer
    counts, the first at `times_offset`, every one below the directory, ascending and not overlapping, commit times
    not decreasing within a generation, their least and greatest commit time the trailer's, their range covering the
    trailer's positions. The root, bound by the trailer: each record naming 1 to 1,024 entries, records in index order
-   with rising offsets, the first at offset 0, every one below the root, the entry counts summing to `chunk_count`.
+   with rising offsets, the first at offset 0, every one below the root, the entry counts summing to `chunk_count`,
+   and `chunk_count` entries of 96 bytes fitting between `index_offset` and the root, so that no count is trusted
+   before it is bounded by the file.
 2. **The manifest's layout** (provisional, Q-810). Where the opener has the layout the manifest records for
    the file, the trailer's counts, ranges and commit times and the description's fields must equal it; a difference
    is refused, naming the field. This ties the trailer to the file it is found in.
@@ -218,7 +231,8 @@ must be that one, so a valid block image from another offset or an older file is
    and first `min_t` the record's, entries in index order. Each entry: an undefined flag bit refused; `min_t` at most
    `max_t`; the least position at most the greatest; `row_count` at least 1 and at most `fact_count`; `has_bounds`
    exactly when `value_type` is not 0; `value_type` at most 4; `scale` 0 but for decimal bounds and at most 18;
-   `dir_len` below `chunk_len`; the chunk inside the chunk section, `chunk_offset` and `dir_len` multiples of 8; its
+   `dir_len` below `chunk_len`; `reach` at least `max_t`; `has_nan` only with `f64` bounds or none; `min_value` at
+   most `max_value` in the bounds' order; the chunk inside the chunk section, `chunk_offset` and `dir_len` multiples of 8; its
    positions inside the trailer's range, `min_t` at or above the trailer's, `reach` at or below `max_reach`;
    `set_aside` only in a revision file.
 4. **A chunk directory**, bound by its index entry's `dir_crc32c`, its block exactly `dir_len` bytes: an undefined
@@ -238,19 +252,28 @@ must be that one, so a valid block image from another offset or an older file is
    positions rising strictly through the section and inside the trailer's range, each inside a batch row whose
    `received_at` its block carries; as many positions as `entry_count − fact_count`.
 
-Damage stays inside what it hits: a damaged chunk fails the reads of that chunk, a damaged commit-times block the
-reads of positions in it, a damaged entries section the read of entries; only a damaged description, commit-time
-directory, root or trailer fails the open.
+Damage stays inside what it hits: a damaged chunk fails the reads of that chunk, a damaged index block the reads
+of the series in its range, a damaged commit-times block the reads of positions in it, a damaged entries section
+the read of entries; only a damaged description, commit-time directory, root or trailer fails the open. A position
+whose generation and sequence no directory record holds is refused without reading a commit-times block.
+
+**What a reader skipped.** A reader records each ignorable element it passes over: a longer trailer, a longer
+record of a directory, index, root or commit-time directory, a description field at or above `0x8000`, an
+ignorable column of a data or commit-times block, an ignorable entry or field (`Ignored`). A file holding any is
+read, but the canonical checks do not judge it (a newer minor version wrote it) and a merge of it is not
+`complete`.
 
 ### Canonical checks
 
 The writer's read-back, golden files and the scrub read the whole file through the reader's checks, with the
-registry state of the file's greatest position, and require: every position held once and no ignored entry; and the
+registry state of the file's greatest position. A file in which the reader skipped an element is reported as such
+and not judged. Otherwise they require: every position held once; and the
 file written again from what it holds (description, header identity and `created_at`, facts by series and set-aside
 chunk, entries, batch rows) equal byte for byte, a data block in the XOR class keeping the file's own compressed
 payload where that is a canonical body of the same rows (C.10). This covers block order, every block reached by a
 pointer, the trailer's counts, the index's order and statistics, data blocks canonical and passing C.11, commit-time
-rows ascending and not overlapping, rows only for held batches, and `file_crc32c`.
+rows ascending and not overlapping, rows only for held batches, and `file_crc32c`, which no reader function checks
+otherwise. The comparison runs as the file is written again and holds no second copy.
 
 ## B.2 Chunk index object (`kind = 14`)
 
@@ -271,8 +294,8 @@ the segment's data leaves the hot tier; a segment on hot is read through its own
 
 **Checks.** The header as B.1's, of kind 14 and the segment's identity; the end marker and trailer; `file_crc32c`,
 at every open (the file is small). The description, its `body_crc32c` the segment trailer's; the `0x38` block right
-after it, its trailer body passing B.1's trailer checks, field 11 consistent with its `entries_offset`, its
-`index_root_offset` below the segment's length; the commit-time directory right after `0x38`, at `times_dir_offset`,
+after it, its trailer body passing B.1's trailer checks, fields 10 and 11 consistent with it, its
+`index_root_offset` below the segment's length; no input naming the segment itself; the commit-time directory right after `0x38`, at `times_dir_offset`,
 bound by the segment trailer and passing B.1's directory checks; the first index block right after it; the root,
 bound by both trailers, and index blocks as in B.1 against the segment's trailer.
 

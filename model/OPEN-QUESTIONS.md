@@ -73,7 +73,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
 | Q-753 | §2.3 Live state, §4 Outranked facts, §5.1, §6 Restart and resume | What the deliverer keeps in memory and reads from the log |
 | Q-754 | §7 Readers | The lookup's batch maps in a reader of another process across a reset stamp or generation |
-| Q-810 | §7 compaction, Manifest; `format-compacted.md` B.1 | What the manifest's layout of a compacted file may repeat from the file |
 | Q-811 | `format-compacted.md` B.1, B.2 | Format details settled while writing the compacted segment's layout |
 
 ## Q-16 — Which commits refresh live staleness
@@ -1557,22 +1556,26 @@ accepted is refused, and the schedule's additions stay far inside `Duration`
 `a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample`).
 
 ## Q-810 — What the manifest's layout of a compacted file may repeat from the file
-Recorded by roadmap 6.2a1. **Open** (the lead or the owner, before roadmap 6.3e lays out the layout field).
+Recorded by roadmap 6.2a1. **Settled by the lead** at its review.
 **Scenario.** The compaction track's plan gives the publish record's layout (field 3 of `0x21`; the owner accepted
 the manifest additions inside version 1) as the file's class, level, period, run, `min_t`, `max_reach`, commit
-times, `fact_count`, **the entry count per generation**, flags including **`complete`** (every input element known
-and carried), and the name range, and says a rebuild restates it "from the file or its kind 14 object". Two of these
-are not in the file. The count per generation is in neither the description nor the trailer (`format-compacted.md`
-B.1), so it is restatable only by reading every chunk and the entries, and not at all from a chunk index object,
-which a restore reads for a file that is not local. `complete` is a fact about the run, not the file. A layout
-restated without them leaves release's rule 5 and precondition 4 undecidable for that file.
-**As built.** The reader compares a recorded layout with the file (`kvik_chunk::file::Layout`, everything the
-description and trailer hold) and refuses a difference naming the field; the type lives in `kvik-chunk`, since the
-reader takes it and `kvik-chunk` does not depend on the manifest crate, and is provisional until this is settled.
-**Proposal.** Add both to the file while no file exists: description field 10, repeated, the count of positions per
-generation (`generation: u32`, reserved `u32`, `count: u64`), and field 13, present when the run was complete. A
-writer that cannot say `complete` writes no field 13, so release holds. Alternative: the layout keeps them and a
-restated layout marks them unknown, holding release for that file until it is compacted again.
+times, `fact_count`, the entry count per generation, flags including `complete` (every input element known and
+carried), and the name range, and says a rebuild restates it from the file or its kind 14 object. The first
+layout held neither the count per generation nor `complete`, so a layout restated after a restore could not decide
+release's rule 5 or precondition 4, nor rule 3 of a merge with a restated input.
+**Ruling.** Both are in the file's description, and so in its chunk index object: field 10, the positions held per
+generation (16 bytes each, generations strictly ascending, counts at least 1), and field 13, present when the file
+is complete. The caller supplies field 10 because the description is the first block; the writer refuses at the end
+a file whose positions per generation differ from it, and the reader checks at open that its first and last
+generation are those of the trailer's range and that its counts sum to `entry_count`. A merge's output is complete
+only when every input is and the reader skipped no element of any (`Ignored`). Fields 11 to 13 are flags present
+with no value, an exception to A.6's reading of a zero-length field. Both join `Layout` and its comparison. The
+layout type stays in `kvik-chunk`: the manifest rebuild in `kvik-files` must open chunk index objects, so
+`kvik-files` will depend on `kvik-chunk` whatever holds the type.
+**Pinned by.** `open_refuses_positions_per_generation_that_disagree_with_the_trailer` (`chunk/tests/file_checks.rs`),
+`the_writer_refuses_series_out_of_order_two_facts_of_a_key_and_flags_or_counts_that_disagree`,
+`a_file_that_disagrees_with_its_recorded_layout_is_refused_naming_the_field` (`chunk/tests/file_damage.rs`), the
+golden files.
 
 ## Q-811 — Format details settled while writing `format-compacted.md`
 Recorded by roadmap 6.2a1. **Decided by the implementer**, for the review; each is in
@@ -1603,6 +1606,16 @@ chooses a value column; columns 1 to 3 take delta when shorter than plain, as C.
 its blocks follow each other in a fixed order.
 (i) The description's flags 11 and 12 are fields with no value; field 7 never names the file itself; a period of
 length 0 or one whose end leaves `i64`, a run count of 0, or names out of order are invalid.
+(j) The reader records the ignorable elements it skips (`Ignored`), and the canonical checks do not judge a file
+holding any, so a scrub by an older binary does not call a newer minor version's file damaged.
+**Accepted** at the review of roadmap 6.2a1. **Owed by roadmap 6.2a2**, before its memory gate:
+- the writer takes a series' facts whole and the canonical check holds every fact of the file as decoded rows (80
+  bytes a fact; about 175 MB for 2,000,000 facts). Section 4's caps (32 MiB minimal, 256 MiB desktop) need a writer
+  that takes a series' rows in order a block at a time and a canonical check that reads from a `ReadAt` and compares
+  series by series, one chunk at a time;
+- `FileWriter::new` refuses batches whose commit times decrease within a generation (e), which A.7 has by
+  construction but a start that found no sealed segment readable can break after the clock steps back: the run
+  stalls at such a batch, named in `compaction_behind`, or is cut there.
 **Pinned by.** `chunk/tests/file_damage.rs`, `chunk/tests/file_golden.rs`, the unit tests of `chunk/src/file/`.
 
 ## Open at v0.2
@@ -1619,7 +1632,7 @@ of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
 
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-754; the owner settled Q-750 at its review. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-754; the owner settled Q-750 at its review. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1698,8 +1711,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
 | Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the sweep kept 8; awaiting the owner's acceptance |
-| Q-810 | 6.3e | The layout's entry count per generation and `complete` flag, which the file does not hold; recorded by roadmap 6.2a1 |
-| Q-811 | 6.2 | Format details of `format-compacted.md`; decided by roadmap 6.2a1, awaiting its review |
+| Q-811 | 6.2a2 | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; open for the two obligations it names for 6.2a2 (memory of the writer and the canonical check; the stall on decreasing commit times) |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1948,6 +1960,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
 | Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
 | Q-750 | The duplicate rule's slow path on damage found during a run | `kvik/src/durable/ingest.rs`, `deliver/recent.rs`, `health.rs` (settled by the owner's ruling at the review of roadmap 11.0: recorded and delivered flagged unchecked, counted, health degraded until the next start; ingest never stops) |
+| Q-810 | What the manifest's layout of a compacted file may repeat from the file | `docs/format-compacted.md` B.1 Description (settled by the lead at the review of roadmap 6.2a1: description field 10, positions per generation, verified by the writer and checked by the reader at open; field 13, `complete`; both in `Layout`) |
 | Q-797 | The layout of a compacted segment | `docs/format-compacted.md` B.1, B.2 (decided by the lead for the compaction track, applied by roadmap 6.2a1: a chunk's directory follows its blocks; at most 64 blocks a chunk; the chunk index at the file's tail; the chunk index object an extraction carrying the segment's length and hash, with the ranged read of the segment's tail as fall-back. Reason: the writer streams, and one local file per segment halves small files, syncs and crash states on a card) |
 | Q-802 | A chunk's value bounds | `docs/format-compacted.md` B.1 Bounds (decided by the lead for the compaction track, applied by roadmap 6.2a1: IEEE 754 total order without NaN and a `has_nan` flag; decimals at the chunk's highest stored scale; no bounds rather than saturated ones. `chunk/src/file/stats.rs`) |
 | Q-803 | The chunk summary | `docs/format-compacted.md` B.1 Chunk directory (decided by the lead for the compaction track, applied by roadmap 6.2a1: defined and not written in v1; its safe use depends on conditions only the summary tree's item can state and test) |

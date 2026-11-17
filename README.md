@@ -271,7 +271,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Plan for comparative benchmarks against other tools; not yet run |
 | [`model/`](model/) | `kvik-model`: a slow, exact, in-memory reference model of the specification, with property tests |
 | [`log/`](log/) | `kvik-log`: the on-disk log format (segment container, checksums, the reader up to the durable mark, the mark's slots, typed arrival batches), with golden files, property tests, a differential test against the model and a fuzz target |
-| [`chunk/`](chunk/) | `kvik-chunk`: the column encodings and block bodies of compacted chunks (delta bit-packing, scaled decimals with exceptions, XOR with a compressed fallback, run-length), with golden files, property tests and a fuzz target |
+| [`chunk/`](chunk/) | `kvik-chunk`: the column encodings and block bodies of compacted chunks (delta bit-packing, scaled decimals with exceptions, XOR with a compressed fallback, run-length), and the compacted segment and chunk index object around them (writer, positional reader, canonical checks), with golden files, property tests and fuzz targets |
 | [`files/`](files/) | `kvik-files`: the manifest's records, the catalogue of files replayed from them, and the rebuild of a manifest with a corrupt record from the local files, with golden files, property tests and a fuzz target |
 | [`export/`](export/) | `kvik-export`: Parquet export of a series' facts; the schema is provisional ([`docs/export.md`](docs/export.md)) |
 | [`sinkapi/`](sinkapi/) | `kvik-sink-api`: the backup sink trait and its types, a leaf crate shared by the store, the sinks and the backup driver; `kvik` re-exports it |
