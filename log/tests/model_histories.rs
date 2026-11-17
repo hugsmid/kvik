@@ -953,7 +953,7 @@ impl World {
             interval,
         };
         self.names += 1;
-        let name = format!("line/s{}", self.names);
+        let name = format!("line/s{}/value", self.names);
         let unit = ["", "W", "%"][usize::from(s.unit)];
         let ev = self.registry_or_read_only(|m| {
             let _ = m.define_with(&name, kind, value_type, unit, Some(3 * e), options);
@@ -1556,7 +1556,7 @@ impl World {
             Op::Rename(pick) => {
                 if let Some(s) = self.pick(*pick) {
                     self.names += 1;
-                    let name = format!("alias/a{}", self.names);
+                    let name = format!("alias/a{}/value", self.names);
                     self.registry_or_read_only(|m| {
                         let _ = m.rename(s.id, &name);
                     });
