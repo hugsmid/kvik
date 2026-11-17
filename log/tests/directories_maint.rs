@@ -193,6 +193,7 @@ fn a_log_dropped_on_its_own_maintenance_thread_does_not_wait_for_itself() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(watch.fault(), None, "no panic on the maintenance thread");
+    assert!(!hook.0.is_poisoned(), "the drop panicked inside the hook");
 }
 
 /// A hook that panics in every call.
