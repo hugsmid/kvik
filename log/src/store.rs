@@ -50,6 +50,15 @@ pub enum StoreError {
     /// A file operation failed.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The directory holds a mark or segment of another generation than the start was given (`spec.md` §8
+    /// Generations; Q-261).
+    #[error("the directory holds generation {found}; the start was given generation {start}")]
+    Generation {
+        /// The generation found.
+        found: u32,
+        /// The generation the start was given.
+        start: u32,
+    },
 }
 
 /// What a new store is created with (A.12).
@@ -230,6 +239,9 @@ impl StoreDir {
         let top = names(&*fs, dir)?;
         if top.iter().any(|n| n == STORE) {
             let lock = take_lock(&*fs, dir)?;
+            // A creation cut short between its rename and the directory sync may have left `STORE` in the page
+            // cache only (`format.md` A.12 Open).
+            fs.sync_dir(dir)?;
             let descriptor = StoreDescriptor::decode(&read_all(&*fs, &dir.join(STORE))?)?;
             if top.iter().any(|n| n == MANIFEST_NEW) {
                 fs.remove_file(&dir.join(MANIFEST_NEW))?;

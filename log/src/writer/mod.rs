@@ -38,6 +38,7 @@
 //! log.shutdown().unwrap();
 //! ```
 
+mod generation;
 mod maint;
 mod options;
 mod queue;
@@ -52,6 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+pub use generation::init_generation;
 pub use maint::{AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest};
 pub use maint::{create_segment, describe_sealed, seal_segment, seal_segment_described};
 pub use options::{GenerationStart, SealListener, StartOptions};
@@ -93,7 +95,8 @@ const DAY_NS: i64 = 86_400_000_000_000;
 /// When the mark file is synced (`api.md` `log.mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkSync {
-    /// On a timer, `mark_sync_interval` (default 1 s), and at once after a batch holding an entry that is not a fact.
+    /// On a timer, `mark_sync_interval` (default 1 s), and at once after a batch holding an entry that is not a fact
+    /// or the first batch in a segment (Q-630).
     Interval(Duration),
     /// After every mark update, before the batch is acknowledged.
     EveryCommit,
@@ -448,7 +451,7 @@ pub enum EveryCommitReason {
 /// How the mark is synced (`api.md` `LogStats::mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkSyncMode {
-    /// On the timer, and at once after a batch holding an entry that is not a fact.
+    /// On the timer, and at once after a batch holding an entry that is not a fact or the first batch in a segment.
     Interval(Duration),
     /// At every commit.
     EveryCommit {
@@ -616,14 +619,26 @@ impl LogWriter {
         now: Duration,
         wall: i64,
     ) -> Result<Self, OpenError> {
+        Self::open_with(store, cfg, boot_id, now, wall, StartOptions::default())
+    }
+
+    /// The start behind [`LogWriter::open_with`], once the options it does not act on yet are refused.
+    fn start(
+        store: StoreDir,
+        cfg: WriterConfig,
+        boot_id: Option<[u8; 16]>,
+        now: Duration,
+        wall: i64,
+        mut opts: StartOptions,
+    ) -> Result<Self, OpenError> {
         cfg.validate()?;
         let halt = Arc::new(Halt::default());
         let leases_dir = store.dir().join(LEASES_DIR);
-        let r = recovery::start(&store, &cfg, boot_id, now, wall, &halt)?;
+        let r = recovery::start(&store, &cfg, boot_id, now, wall, &halt, &mut opts)?;
         let fs = store.fs().clone();
         let log_dir = store.log_dir();
         let store_id = store.descriptor().store_id;
-        let generation = 0;
+        let generation = opts.generation.as_ref().map_or(0, |s| s.generation);
         let mark_mode = match (boot_id, cfg.mark_sync) {
             (None, _) => MarkSyncMode::EveryCommit {
                 reason: EveryCommitReason::NoBootId,
@@ -1339,6 +1354,8 @@ impl LogWriter {
             .as_mut()
             .or(self.open.as_mut())
             .expect("a segment in use");
+        // Q-630: the first batch in a segment is acknowledged only once a synced mark names it.
+        let first_in_segment = seg.summary.is_none();
         seg.write_offset += bytes.len() as u64;
         seg.summary = Some(match seg.summary {
             None => SealSummary {
@@ -1417,6 +1434,7 @@ impl LogWriter {
         self.mark_written = true;
         self.mark_dirty = true;
         let forced = matches!(self.mark_mode, MarkSyncMode::EveryCommit { .. })
+            || first_in_segment
             || calls.iter().any(Call::has_non_fact);
         if forced {
             self.sync_mark(now);

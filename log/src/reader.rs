@@ -81,7 +81,8 @@ use crate::lease::{LEASE_EXPIRY, LEASE_REFRESH, LeaseSlot, SLOT_OFFSET, lease_na
 use crate::manifest::{LostRange, ManifestError, read_manifest};
 use crate::mark::{MARK_LEN, MarkSlot, ResetStamp, read_mark};
 use crate::name::SegmentName;
-use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner};
+use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner, set_aside};
+use crate::setaside::SetAside;
 use crate::store::{LEASES_DIR, LOG_DIR, MANIFEST, MARK, StoreError, read_all, read_descriptor};
 use crate::writer::{Clock, Position};
 
@@ -109,6 +110,9 @@ pub struct ReaderConfig {
     /// The longest time between renewals of the lease; at most 30 minutes (`spec.md` §7 Readers): a longer value
     /// is taken as 30 minutes.
     pub lease_refresh: Duration,
+    /// The restored ends in force, from the latest restore record: set-aside batches are skipped (`spec.md` §8
+    /// Restore step 1).
+    pub set_aside: SetAside,
 }
 
 impl ReaderConfig {
@@ -127,6 +131,7 @@ impl ReaderConfig {
             boot_id,
             reader_id,
             lease_refresh: LEASE_REFRESH,
+            set_aside: SetAside::default(),
         }
     }
 }
@@ -606,7 +611,12 @@ impl LogReader {
         view.generation = Some(mark.generation);
         self.check_recent(view, events)?;
         let mut names = self.segments()?;
-        names.retain(|n| n.file_id > 0 && n.file_id >= view.file_id && n.file_id <= mark.file_id);
+        // Segments of earlier generations are sealed and read whole, whichever segment the mark names (Q-268).
+        names.retain(|n| {
+            n.file_id > 0
+                && n.file_id >= view.file_id
+                && (n.file_id <= mark.file_id || n.generation < mark.generation)
+        });
         if mark.file_id > 0
             && mark.file_id >= view.file_id
             && names.last().is_none_or(|n| n.file_id != mark.file_id)
@@ -677,6 +687,7 @@ impl LogReader {
                             events.push(ReadEvent::Corruption { file_id, region });
                         }
                     }
+                    Found::Batch(b) if set_aside(&b, &self.cfg.set_aside) => {}
                     Found::Batch(b) => {
                         let g = b.commit.generation;
                         let last = Position {

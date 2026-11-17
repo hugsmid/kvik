@@ -300,3 +300,48 @@ fn a_plan_whose_record_has_the_other_mode_is_refused_before_the_record_is_writte
         assert!(fs.paths().is_empty(), "{mode:?}");
     }
 }
+
+#[test]
+fn a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let keys = Keys::new(ID);
+    sink.set(&keys.record(0, 1), Some(Fault::Delay(1)));
+    let fs = MemFs::new();
+    let mut r = restorer(sink.clone(), &fs, PlanMode::Full, KEY);
+    let first = block_on(r.prepare(1));
+    assert!(matches!(first, Err(RestoreError::Sink(_))), "{first:?}");
+    assert_eq!(claims(&sink.inner.objects(), ID), [keys.claim(1)]);
+    let (p, _) = restore(&mut r).unwrap();
+    assert_eq!(p.record.generation, 1);
+    assert_eq!(claims(&sink.inner.objects(), ID), [keys.claim(1)]);
+    let mine = ClaimMarker::decode(&sink.inner.objects()[&keys.claim(1)]).unwrap();
+    assert_eq!(mine.nonce, p.record.stamp.nonce);
+}
+
+#[test]
+fn a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more() {
+    let mut src = source(ID, 2, false);
+    let sink = Arc::new(FaultSink::new(mem_with(&bucket(&mut src))));
+    let keys = Keys::new(ID);
+    sink.set(&keys.record(0, 1), Some(Fault::Delay(1)));
+    let fs = MemFs::new();
+    let mut r = restorer(sink.clone(), &fs, PlanMode::Full, KEY);
+    assert!(block_on(r.prepare(1)).is_err());
+    let other = ClaimMarker {
+        generation: 2,
+        nonce: 99,
+    }
+    .encode();
+    sink.inner.set(&keys.claim(2), &other);
+    let again = block_on(r.prepare(1));
+    assert!(
+        matches!(again, Err(RestoreError::Superseded { by: 2 })),
+        "{again:?}"
+    );
+    assert_eq!(
+        claims(&sink.inner.objects(), ID),
+        [keys.claim(1), keys.claim(2)]
+    );
+    assert!(fs.paths().is_empty());
+}

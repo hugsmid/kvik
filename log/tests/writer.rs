@@ -486,6 +486,30 @@ fn store_creation_layout_and_open_rules() {
     ));
 }
 
+/// format A.12 Open: a creation whose last directory sync failed leaves `STORE` renamed in the page cache only; the
+/// next open syncs the directory, so a later power loss never leaves the store's files without `STORE`.
+#[test]
+fn opening_a_store_makes_a_creations_rename_durable() {
+    for seed in 0..64 {
+        let fs = MemFs::new();
+        let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+        // The fifth directory sync of a creation is the one after the rename.
+        fs.fail_nth(MemOp::SyncDir, "store", 4, io::ErrorKind::Other);
+        assert!(StoreDir::open(afs.clone(), &dir(), Some(&new_store())).is_err());
+        fs.restart();
+        let store = StoreDir::open(afs.clone(), &dir(), Some(&new_store())).unwrap();
+        let mut w = LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO, T0).unwrap();
+        w.shutdown(Duration::ZERO).unwrap();
+        drop(w);
+        fs.power_loss_partial(seed);
+        fs.restart();
+        assert!(
+            StoreDir::open(afs, &dir(), Some(&new_store())).is_ok(),
+            "seed {seed}"
+        );
+    }
+}
+
 #[test]
 fn group_commit_coalesces_under_load_and_adds_no_delay_after_a_quiet_period() {
     let mut h = H::new(cfg());
@@ -571,21 +595,30 @@ fn calls_arriving_during_a_sync_form_the_next_batch() {
 #[test]
 fn a_batch_with_an_entry_that_is_not_a_fact_forces_the_mark_sync() {
     let mut h = H::new(cfg());
+    let first = h.submit(vec![fact(1, T0, 0)]);
+    h.step();
+    assert!(h.done[&first].is_ok());
+    assert_eq!(
+        durable_mark(&h.fs).last_sequence,
+        1,
+        "the segment's first batch forces it (Q-630)"
+    );
+    h.advance(Duration::from_millis(20));
     let a = h.submit(vec![fact(1, T0, 0)]);
     h.step();
     assert!(h.done[&a].is_ok());
     assert_eq!(
         durable_mark(&h.fs).last_sequence,
-        0,
+        1,
         "facts wait for the timer"
     );
-    assert_eq!(h.w.mark().last_sequence, 1);
+    assert_eq!(h.w.mark().last_sequence, 2);
     h.advance(Duration::from_millis(20));
     h.fs.clear_ops();
     let b = h.submit(vec![alias(1)]);
     h.step();
     assert!(h.done[&b].is_ok());
-    assert_eq!(durable_mark(&h.fs).last_sequence, 2);
+    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
     let ops: Vec<_> =
         h.fs.ops()
             .into_iter()
@@ -606,19 +639,19 @@ fn a_batch_with_an_entry_that_is_not_a_fact_forces_the_mark_sync() {
     let c = h.submit(vec![fact(1, T0, 0)]);
     let next = h.step();
     assert!(h.done[&c].is_ok());
-    assert_eq!(durable_mark(&h.fs).last_sequence, 2);
-    assert_eq!(next, Some(Duration::from_millis(1_020)));
+    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
+    assert_eq!(next, Some(Duration::from_millis(1_040)));
     h.advance(next.unwrap() - h.now);
     h.step();
-    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
-    assert_eq!(h.w.stats().mark_synced.sequence, 3);
+    assert_eq!(durable_mark(&h.fs).last_sequence, 4);
+    assert_eq!(h.w.stats().mark_synced.sequence, 4);
     // Clean shutdown syncs the mark.
     h.advance(MS);
     h.submit(vec![fact(1, T0, 0)]);
     h.step();
-    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
-    h.w.shutdown(h.now).unwrap();
     assert_eq!(durable_mark(&h.fs).last_sequence, 4);
+    h.w.shutdown(h.now).unwrap();
+    assert_eq!(durable_mark(&h.fs).last_sequence, 5);
     check(&h);
 }
 

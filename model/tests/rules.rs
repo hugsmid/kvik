@@ -1129,6 +1129,29 @@ fn s3_timed_mark_sync_forced_by_a_definition_and_a_cursor() {
     assert!(m.disk.synced_mark.unwrap().last >= m.disk.cursors[&C]);
 }
 
+/// §3 Commit, Q-630: under the timed sync the first batch in a segment is
+/// acknowledged only once the mark naming it is synced, so a power loss keeps
+/// it; the batches after it in the segment wait for the timer.
+#[test]
+fn s3_the_first_batch_in_a_segment_syncs_the_mark() {
+    let (mut m, s) = timed_consumer_model();
+    m.seal_active();
+    let first = m.ingest(vec![Reading::num(s, T0, 1.0)]).unwrap().positions[0];
+    assert_eq!(m.disk.synced_mark.unwrap().last, first);
+    assert_eq!(Some(m.disk.synced_mark.unwrap().file), m.disk.active);
+    for i in 1..3 {
+        m.ingest(vec![Reading::num(s, T0 + i * SECOND, 1.0)])
+            .unwrap();
+    }
+    assert_eq!(m.disk.synced_mark.unwrap().last, first);
+    m.crash();
+    assert_eq!(
+        m.power_loss_losing(3),
+        2,
+        "the segment's first batch is kept"
+    );
+}
+
 /// §3 Recovery rule 1, accepted limit: a remount within the boot loses the
 /// mark's updates since its last sync; with exactly one complete batch beyond
 /// the synced mark, recovery truncates it, though it was acknowledged and

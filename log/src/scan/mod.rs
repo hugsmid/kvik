@@ -7,6 +7,7 @@ use crate::bytes::slice;
 use crate::crc::crc32c;
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
+use crate::setaside::SetAside;
 
 #[doc(hidden)]
 pub mod legacy;
@@ -159,6 +160,12 @@ impl ScanReport<'_> {
     pub fn last_sequence(&self) -> Option<u64> {
         self.batches.last().map(|b| b.commit.last_sequence)
     }
+}
+
+/// Whether `batch` is set aside: its first position is (`spec.md` §8 Restore step 1; Q-263). The writer's and the
+/// reader's scans skip it.
+pub fn set_aside(batch: &Batch<'_>, s: &SetAside) -> bool {
+    s.holds((batch.commit.generation, batch.commit.first_sequence))
 }
 
 /// Reads the log segment in `bytes`, checking its batches against `id`: [`Scanner`] run to its end.

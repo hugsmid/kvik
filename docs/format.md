@@ -178,7 +178,8 @@ of the segment it resumes in again, in place, before its first sync (`spec.md` �
 segment being sealed is never the last in use: (1) at the offset just past S's last complete batch, write the
 segment index block, the trailer block and the 16-byte end marker; (2) set the file length to the end of the end
 marker (the file may grow or shrink); (3) `sync_all`; (4) rename `.open` to `.kvl`; (5) sync the directory. The mark
-does not move at sealing: it keeps naming S until the first commit in the next segment. An empty segment is never
+does not move at sealing: it keeps naming S until the first commit in the next segment, whose batch is acknowledged
+only once the mark naming it is synced (`spec.md` §3 Commit, Q-630). An empty segment is never
 sealed.
 
 **States recovery may find**, handled in `file_id` order. `spec.md` §3 Recovery rules 1 and 3 (truncation, torn
@@ -201,8 +202,9 @@ value); the file falls under the other rows. In the last segment in use a seal i
 A `.kvl` file is sealed and is not scanned by recovery. Whether a segment that is not the last in use lost data is
 decided only by the gap between its last sequence and the next segment's `base_sequence` (`spec.md` §3 Recovery
 rule 2), never by the bytes after its last batch. A start checks the gap rule for unsealed segments and against the
-last sealed one or, with no sealed segment, against position 1 of generation 0, so that a lowest segment damaged,
-zeroed or missing leaves a recorded gap (Q-321); gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
+last sealed one of the current generation or, with none, against the generation's first position (1 in generation
+0, the restore record's in a restored generation), so that a lowest segment damaged, zeroed or missing leaves a
+recorded gap (Q-321, Q-264); gaps between sealed segments are checked by the scrub. At most one segment is unused; any number
 may be awaiting a seal.
 
 **Truncation is zero-filling.** Recovery never shortens an unsealed segment. It overwrites with zeros from the
@@ -423,9 +425,9 @@ wait that doubles from 10 s to 10 minutes, and degrades health (`SegmentUnreadab
 ## A.10 Durable mark (`log/MARK`, version 3)
 `log/MARK` is 4,224 bytes: two 128-byte slots at offsets 0 and 4,096 (separate sectors). It has no A.1 header. It is
 read and written by positional I/O and never mapped; it is synced on the timer (`mark_sync_interval`, on the writer
-thread, also when idle), at once after a batch holding an entry that is not a fact (`spec.md` §3 Commit), at clean
-shutdown and by recovery. It is updated in place and never replaced while it
-exists; a new file is created only when none exists.
+thread, also when idle), at once after a batch holding an entry that is not a fact or an unflagged first batch in a
+segment (`spec.md` §3 Commit, Q-630), at clean shutdown and by recovery. It is updated in place and never replaced
+while it exists; a new file is created only when none exists.
 
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
@@ -523,7 +525,8 @@ exists; a new file is created only when none exists.
   lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and the
   directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
   store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
-- **Open.** `STORE` valid: open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
+- **Open.** `STORE` valid: sync the directory (a creation cut short between the rename and that sync may have left
+  `STORE` in the page cache only), then open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
   `STORE.tmp`, and the directories `log/`, `cursors/` and `leases/`, empty): a creation that did not finish; remove
   what it left and create again. No `STORE` and any other name, a file under `log/` included: `NotAStore` (never
   created over; a directory part-way

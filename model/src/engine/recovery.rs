@@ -413,7 +413,8 @@ impl Model {
 
     /// Moves the durable mark (in the page cache) to the end of the active
     /// segment, stamped with the current boot id, after a successful sync; the
-    /// mark file is synced too when [`Config::mark_sync`] is every commit.
+    /// mark file is synced too when [`Config::mark_sync`] is every commit, or
+    /// when the batch is the first in its segment (§3 Commit, Q-630).
     pub(super) fn sync_mark(&mut self) {
         let Some(active) = self.disk.active else {
             return;
@@ -446,7 +447,7 @@ impl Model {
                 max_series_id: prev.map(|m| m.max_series_id).max(defined).unwrap_or(0),
                 stamp: self.stamp(),
             });
-            if self.config.mark_sync == MarkSync::EveryCommit {
+            if self.config.mark_sync == MarkSync::EveryCommit || file.batches.len() == 1 {
                 self.disk.synced_mark = self.disk.mark;
             }
         }
