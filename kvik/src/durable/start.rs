@@ -15,6 +15,7 @@ use kvik_log::content::Item;
 use kvik_log::reader::{LogReader, ReadEvent, ReaderConfig as LogReaderConfig, ReaderError};
 
 use super::LogClock;
+use super::by_id::ById;
 use super::history::{Key, span_of};
 use super::index::Index;
 use super::ingest::Decider;
@@ -82,8 +83,8 @@ pub(crate) fn log_reader(dir: &Path, env: &Env) -> Result<LogReader, ReaderError
     LogReader::open(cfg)
 }
 
-fn count(counters: &mut BTreeMap<u32, SeriesStats>, row: &kvik_log::facts::FactRow) {
-    let st = counters.entry(row.series_id).or_default();
+fn count(counters: &mut ById<SeriesStats>, row: &kvik_log::facts::FactRow) {
+    let st = counters.get_or_insert_with(row.series_id, SeriesStats::default);
     st.recorded += 1;
     st.late += u64::from(row.flags.late);
     st.future += u64::from(row.flags.future);
@@ -99,7 +100,7 @@ pub(crate) fn read_kept(
 ) -> Result<Kept, ReaderError> {
     let mut index = Index::without_facts();
     let mut decider = Decider::with_budget(budget);
-    let mut counters = BTreeMap::new();
+    let mut counters = ById::default();
     let mut lost = Lost::default();
     loop {
         let (u, more) = reader.refresh_some(part)?;
@@ -133,7 +134,7 @@ pub(crate) fn read_kept(
     Ok(Kept {
         index,
         decider,
-        counters,
+        counters: counters.into_iter().collect(),
         local: Box::new(LogFacts::new(reader, lost)),
         read_whole: false,
         unrecorded,
@@ -152,7 +153,7 @@ pub(crate) fn read_whole(mut reader: LogReader, budget: usize) -> Result<Kept, R
         }
     }
     drop(events);
-    let mut counters = BTreeMap::new();
+    let mut counters = ById::default();
     for id in index.fact_series() {
         for f in index.series_facts(id) {
             count(&mut counters, &f.row);
@@ -164,7 +165,7 @@ pub(crate) fn read_whole(mut reader: LogReader, budget: usize) -> Result<Kept, R
     Ok(Kept {
         index,
         decider,
-        counters,
+        counters: counters.into_iter().collect(),
         local: Box::new(LogFacts::new(reader, lost)),
         read_whole: true,
         unrecorded,

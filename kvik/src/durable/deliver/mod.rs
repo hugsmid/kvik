@@ -234,7 +234,7 @@ pub(crate) struct Deliverer {
     /// Batches read and not yet taken.
     pending: VecDeque<ReadBatch>,
     /// Per series, the receive time of its last fact that was not outranked (`spec.md` §6 Restart and resume).
-    last_arrival: BTreeMap<u32, i64>,
+    last_arrival: crate::durable::by_id::ById<i64>,
     view: View,
     head: LogPos,
     /// Reset points by id: their `forget_above` (`spec.md` §4 Resync).
@@ -303,7 +303,7 @@ impl Deliverer {
             items_from: LogPos::default(),
             entries: BTreeMap::new(),
             pending: VecDeque::new(),
-            last_arrival: BTreeMap::new(),
+            last_arrival: crate::durable::by_id::ById::default(),
             view: View::default(),
             head: LogPos::default(),
             resets: BTreeMap::new(),

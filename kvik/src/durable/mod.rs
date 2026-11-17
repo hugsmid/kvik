@@ -17,6 +17,7 @@
 mod clock;
 mod completion;
 mod consumers;
+mod by_id;
 mod deliver;
 #[cfg(test)]
 mod held_state;

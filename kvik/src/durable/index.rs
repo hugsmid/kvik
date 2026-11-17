@@ -14,6 +14,7 @@ use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::registry::RegistryFile;
 use kvik_log::writer::Position as LogPos;
 
+use super::by_id::ById;
 use super::registry::{Registry, Series};
 use crate::backend::Error;
 use crate::health::{LossCause, LossKind, LossReport, MarkState};
@@ -49,7 +50,7 @@ pub(crate) struct Index {
     /// Facts are not kept, only each series' first fact position (roadmap 11.0: the writer's start and the
     /// deliverer need the registry and the commit times, not the facts).
     no_facts: bool,
-    first_fact: BTreeMap<u32, LogPos>,
+    first_fact: ById<LogPos>,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -158,7 +159,7 @@ impl Index {
             match item {
                 Item::Fact(row) if self.no_facts => {
                     self.registry.note_fact(row.series_id);
-                    self.first_fact.entry(row.series_id).or_insert(p);
+                    self.first_fact.get_or_insert_with(row.series_id, || p);
                 }
                 Item::Fact(row) => {
                     self.registry.note_fact(row.series_id);
@@ -201,8 +202,8 @@ impl Index {
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
-        for id in self.facts.keys().chain(self.first_fact.keys()) {
-            self.registry.note_fact(*id);
+        for id in self.facts.keys().copied().chain(self.first_fact.iter().map(|(id, _)| id)) {
+            self.registry.note_fact(id);
         }
     }
 

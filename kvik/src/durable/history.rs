@@ -269,11 +269,13 @@ impl History {
                 s.window.reserve_exact(1);
             }
             s.window.insert(at, (t, known));
-            if s.latest.is_none_or(|l| t > l) {
+            let rises = s.latest.is_none_or(|l| t > l);
+            if rises {
                 s.latest = Some(t);
-                self.evict(id);
-            } else if s.window.len() > self.cap {
-                self.evict(id);
+            }
+            if rises || s.window.len() > self.cap {
+                let (freed, out) = evict_series(s, self.cap, self.readable_below);
+                self.evicted(id, freed, out);
             }
         } else if let Some(h) = self.revised.get_mut(&key) {
             self.bytes += revised_fact_bytes(&known);
@@ -314,38 +316,8 @@ impl History {
         self.pending.entry(key).or_default().push(k);
     }
 
-    /// Raises a series' floor to its latest `t` less its span, then while the window holds more than `cap` facts,
-    /// past its lowest key; keys that leave go to the revised-key index (more than one fact) or the overlay.
-    fn evict(&mut self, id: u32) {
-        let cap = self.cap;
-        let readable = self.readable_below;
-        let Some(s) = self.series.get_mut(&id) else {
-            return;
-        };
-        let Some(latest) = s.latest else { return };
-        s.floor = s.floor.max(latest.saturating_sub(s.span));
-        let mut out: Vec<(i64, Vec<Known>)> = Vec::new();
-        let mut freed = 0;
-        while let Some(&(t, _)) = s.window.front() {
-            if t >= s.floor {
-                if s.window.len() <= cap {
-                    break;
-                }
-                s.floor = t.saturating_add(1);
-            }
-            let (_, k) = s.window.pop_front().expect("looked at above");
-            freed += window_bytes(&k);
-            let alone = s.window.front().is_none_or(|(u, _)| *u != t)
-                && out.last().is_none_or(|(u, _)| *u != t);
-            // The common case, a key of one fact the log already shows, leaves without a trace.
-            if alone && (k.call == 0 || k.call < readable) {
-                continue;
-            }
-            match out.last_mut() {
-                Some((u, facts)) if *u == t => facts.push(k),
-                _ => out.push((t, vec![k])),
-            }
-        }
+    /// Takes in what [`evict_series`] removed from series `id`'s window.
+    fn evicted(&mut self, id: u32, freed: usize, out: Vec<(i64, Vec<Known>)>) {
         self.bytes -= freed;
         for (t, facts) in out {
             if facts.len() > 1 {
@@ -431,6 +403,39 @@ impl History {
             overlay: self.pending.values().map(Vec::len).sum(),
         }
     }
+}
+
+/// Raises a series' floor to its latest `t` less its span, then while the window holds more than `cap` facts, past
+/// its lowest key. Returns the bytes freed and the keys that leave with facts to keep: those of more than one fact go
+/// to the revised-key index, the others to the overlay ([`History::evicted`]).
+fn evict_series(s: &mut Series, cap: usize, readable: u64) -> (usize, Vec<(i64, Vec<Known>)>) {
+    let mut out: Vec<(i64, Vec<Known>)> = Vec::new();
+    let mut freed = 0;
+    let Some(latest) = s.latest else {
+        return (freed, out);
+    };
+    s.floor = s.floor.max(latest.saturating_sub(s.span));
+    while let Some(&(t, _)) = s.window.front() {
+        if t >= s.floor {
+            if s.window.len() <= cap {
+                break;
+            }
+            s.floor = t.saturating_add(1);
+        }
+        let (_, k) = s.window.pop_front().expect("looked at above");
+        freed += window_bytes(&k);
+        let alone = s.window.front().is_none_or(|(u, _)| *u != t)
+            && out.last().is_none_or(|(u, _)| *u != t);
+        // The common case, a key of one fact the log already shows, leaves without a trace.
+        if alone && (k.call == 0 || k.call < readable) {
+            continue;
+        }
+        match out.last_mut() {
+            Some((u, facts)) if *u == t => facts.push(k),
+            _ => out.push((t, vec![k])),
+        }
+    }
+    (freed, out)
 }
 
 /// Sizes of a [`History`].
