@@ -1797,13 +1797,12 @@ interleavings, a dev-dependency on the stable toolchain. The workspace had none.
 nor link it (it is in `Cargo.lock`, as every target-specific dependency is). Under `--cfg kvik_loom` the flight's mutex
 and condition variable are loom's, and only `durable::read::flight::loom_tests` run so, in their own CI job
 (`model-check`, release build, the cfg in `RUSTFLAGS`), with at most three preemptions unless loom's environment sets
-another bound; the test of a failed round's error runs four calls, so that a wake that reaches one waiter of three
-fails it. loom rather than shuttle: it explores every interleaving within the bound instead of a random sample,
+another bound; two tests run four calls, so that a round's end that wakes one waiter of three fails them. loom rather than shuttle: it explores every interleaving within the bound instead of a random sample,
 which a wait-and-wake protocol needs; shuttle's randomised search is the fallback if the state space outgrows it. The
 flight is generic over its view, so the checked code is the code the reader runs. 0.7.3 was nine days old when this
 was built and is not taken.
 **Pinned by.** `every_call_gets_a_view_read_after_it_began_and_refreshes_never_overlap`,
-`only_the_leader_of_a_failed_round_reports_its_error`, `a_follower_reports_an_error_only_after_two_failed_rounds`
+`four_calls_all_end_with_a_view_read_after_they_began`, `only_the_leader_of_a_failed_round_reports_its_error`, `a_follower_reports_an_error_only_after_two_failed_rounds`
 (`kvik/src/durable/read/flight.rs`, under `--cfg kvik_loom`).
 
 ## Q-902 — The single-flight refresh: rounds, followers and a leader's error

@@ -382,6 +382,16 @@ mod loom_tests {
     }
 
     #[test]
+    fn four_calls_all_end_with_a_view_read_after_they_began() {
+        model(|| {
+            // Three may wait on one round: its end must wake them all.
+            for (seen, _, r, _) in calls(4, |_| false) {
+                assert!(r.unwrap() >= seen);
+            }
+        });
+    }
+
+    #[test]
     fn only_the_leader_of_a_failed_round_reports_its_error() {
         model(|| {
             // Run 0 is the first round, which no call can follow; run 1 can have followers.
