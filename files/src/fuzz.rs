@@ -1,7 +1,7 @@
 //! The entry point of the fuzz target (`files/fuzz`), also run over generated inputs by the stable test suite.
 
 use crate::desc::FileDescription;
-use crate::image::read;
+use crate::image::read_with_stats;
 use crate::record::{Record, is_canonical, record_type};
 
 /// Feeds `data` to the manifest reader and to each record decoder, and checks what they report. Panics only if a
@@ -13,7 +13,13 @@ pub fn decode_all(data: &[u8]) {
     if let Some(s) = data.get(40..56) {
         store_id.copy_from_slice(s);
     }
-    if let Ok(img) = read(data, &store_id) {
+    let (img, stats) = read_with_stats(data, &store_id);
+    assert!(
+        stats.within_bound(data.len() as u64),
+        "{stats:?} for {} bytes",
+        data.len()
+    );
+    if let Ok(img) = img {
         let len = data.len() as u64;
         let mut at = 64u64;
         let mut last = 0u64;

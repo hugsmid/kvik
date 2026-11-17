@@ -48,7 +48,7 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   (`model/OPEN-QUESTIONS.md`). The owner's run on the Linux NVMe target is recorded
   (`docs/measurements/4.8-commit-latency.md`). Remaining: (1) a run on the target confirming the fix for Q-310
   (p50 above 5 ms at exactly 100 × 1 Hz) and a cold start on the target for Q-116 (n) (warm: 0.39–0.74 s); (2) the owner's decisions
-  on Q-110 (trust boundary), Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and
+  on Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and
   (n) (a byte bound on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k) (full disk after a power
   loss), the Q-52 (b) macOS and Windows wording and the Q-86 (b) `chattr +C` sentence
 

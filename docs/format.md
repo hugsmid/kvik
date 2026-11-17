@@ -38,6 +38,29 @@ specified here before the roadmap item that writes it.
   region, a torn tail or a lost range, and recovery never truncates or overwrites it: a writer that meets one in an unsealed segment, the manifest, a cursor file or the mark
   refuses to open; a reader process returns the error for that file only.
 - **Sizes.** `body_len ≤ 16 MiB`; an entry ≤ 8 MiB; a batch ≤ 8 MiB of data blocks plus its commit block (A.4).
+- **Scan bound.** A reader's work on a file of L bytes is bounded whatever its bytes. At most 2L bytes are
+  checksummed, plus, in a log segment, once more the bytes of the one direct read that found the first damage (at most
+  a batch, 8 MiB). Block headers are read at most 16 times per 8 bytes. Working memory, beyond the file and what the
+  read reports, is about one batch in a segment and one block (16 MiB) in the manifest. A body checksum is derived from
+  a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes (Q-110).
+  A body whose checksum holds is checked by its type (A.5, A.6, A.14). A **failed read** is a candidate read in full,
+  with at least one body checked, that is rejected: a resynchronisation candidate or a boundary read that keeps no
+  batch (A.2), or a manifest record whose checksum holds and whose fields are rejected (A.14). The file is divided into
+  **windows** of w bytes from offset 0: w = 8 MiB (a batch) in a log segment, 16 MiB (a body) in the manifest. Once
+  the failed reads starting in one window have checked 16 MiB of body, no other candidate in it is read in full: the
+  rest of the window is passed as damaged and reported with the invalid region, corrupt record or torn tail it falls
+  in (Q-110). Failed reads caused by damage check disjoint bodies, each inside its own batch, so those starting in one
+  segment window check less than the window and one batch beyond it, 16 MiB; a manifest record needs a valid checksum
+  to fail this way. Damage to a file the engine wrote, or older complete batches left at their offsets, therefore never
+  reach the budget; overlapping bodies, which only a crafted file has, do. In a segment, body checks total at most 2L,
+  the direct read that found damage, and per window the budget and the read that reached it (two batches): about
+  390 MiB of bodies for a 64 MiB segment and 100 MiB for a 16 MiB one. A facts row takes at least 20 bytes of body
+  and decodes in about 100 ns at most (a 255-byte text value, release build), so a crafted segment costs at most
+  about 2 s at 64 MiB and 0.6 s at 16 MiB, against 29 to 170 ms for an undamaged one. A crafted manifest costs at most
+  about 0.25 s per 16 MiB for the start's reader and 0.45 s for the whole-file reader (measured: 0.16 s and 0.28 s on
+  a crafted 16.5 MB window; Q-230). An undamaged segment is read in one pass of direct checksums; the bounded reading
+  starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231). Apart from
+  the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |
@@ -85,7 +108,10 @@ each data block's `body_crc32c`, every body (A.7), so a batch image at any other
 that imitate a batch without its exact blocks, are not accepted. A reader
 process applies the same rule below the mark's `offset` and never above it. A structural failure inside a
 checksum-valid block (the checks of A.5 and A.6) makes the block invalid; the region is handled as corruption
-(`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14).
+(`spec.md` §3 Recovery rule 2) and its loss record carries cause 4, invalid content (A.14). Once failed reads
+starting in one 8 MiB window of the file have checked 16 MiB of body (common rules: scan bound), the rest of that
+window is not read: it lies in the invalid
+region, or the torn tail, that holds it.
 
 ### A.3 Versioning
 - A reader refuses a file whose `format_major` is greater than it supports, with an error that names both
@@ -461,7 +487,8 @@ exists; a new file is created only when none exists.
   store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file.
 - A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor, lease and registry
   file decoders included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
-  length before it is checked against the body, and decoded output is bounded by the row and entry limits.
+  length before it is checked against the body, and decoded output is bounded by the row and entry limits. The
+  segment and manifest targets also check the scan bound (common rules).
 - Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
   batches before it.
 
@@ -620,7 +647,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   Fields that settling Q-33 and Q-48 needs are added by roadmap 4.5 as new field ids.
 - A torn tail and a corrupt record are told apart as `spec.md` §7 Manifest says: a forward search at 8-byte steps
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
-  synced.
+  synced. Once failed reads starting in one 16 MiB window of the file have checked 16 MiB of body (common rules:
+  scan bound), the search passes the rest of that window: a valid record beyond it makes the passed bytes part of the
+  corrupt span; with none, they are part of the torn tail (provisional, Q-650).
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body; a log segment's
   hash is computed from its bytes, A.9). A corrupt record with no copy is rebuilt by the writer itself, by the

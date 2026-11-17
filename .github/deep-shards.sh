@@ -41,6 +41,7 @@ log-recovery    log   recovery    --rest
 log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
 log-seal-describe log seal_describe
+log-scan-bound  log   scan_bound
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-restore-plan kvik restore_plan_model

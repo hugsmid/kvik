@@ -70,6 +70,16 @@ with ALP for decimal `f64` data, about 1 % for the same series declared as scale
 dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.3
 confirms the format against Parquet.
 
+**Crafted files.** The restart budget covers files the engine wrote, damaged or not; an undamaged segment is read in
+one pass of direct checksums (Q-231). A file crafted by a process with write access to the store has its cost
+bounded by `format.md` A, common rules (scan bound; Q-110): about 2L bytes checksummed and 16 block headers per 8 bytes
+for a file of L bytes, and failed full reads checking at most 16 MiB of body per window (8 MiB in a segment, 16 MiB in
+the manifest), past which the rest of the window is passed as damaged and reported with the damage around it; damage
+does not reach that budget. A crafted segment costs at most about 2 s at 64 MiB and 0.6 s at 16 MiB, a crafted
+manifest about 0.25 s per 16 MiB at a start and 0.45 s at a refresh (Q-230). That is above the 1 s restart budget at
+64 MiB, which the Q-110 ruling meant crafted files to stay within: whether the promise or the bound changes is the
+owner's (Q-651).
+
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).
 
