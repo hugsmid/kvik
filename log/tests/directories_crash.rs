@@ -120,3 +120,30 @@ fn a_group_of_another_generation_than_the_root_names_is_not_used() {
     let d = r.load().unwrap();
     assert!(d.groups.last().unwrap().is_none());
 }
+
+#[test]
+fn a_file_under_another_generation_s_name_is_not_taken() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 400, 0);
+    r.settle();
+    ingest(&mut r, 400, 20_000_000);
+    r.settle();
+    for family in [Family::Root, Family::Series] {
+        let gens = directory::generations(&r.fs, &dir(), family);
+        let newest = gens[0].0;
+        // The previous generation's bytes under a newer name: its header's `file_id` is not the name's.
+        let old = r.fs.read(&gens[1].1).unwrap();
+        let name = dir().join(DERIVED_DIR).join(family.file_name(newest + 5));
+        let f = r.fs.open(&name, kvik_log::fs::OpenMode::CreateNew).unwrap();
+        f.write_at(&old, 0).unwrap();
+        drop(f);
+        let found = match family {
+            Family::Root => read_latest(&r.fs, &dir(), family, |b| Root::decode(b, &STORE_ID))
+                .unwrap()
+                .map(|(f, _)| f.file_id),
+            _ => r.series().map(|(f, _)| f.file_id),
+        };
+        assert_eq!(found, Some(newest), "{family:?}");
+        r.fs.remove_file(&name).unwrap();
+    }
+}

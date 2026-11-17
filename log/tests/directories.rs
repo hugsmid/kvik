@@ -411,7 +411,10 @@ fn a_family_of_a_newer_version_is_left_alone_and_not_retried() {
         .iter()
         .filter(|w| **w == Some(Duration::from_millis(100)))
         .count();
-    assert!(retries <= waits.len() / 5, "no retry of a family left alone: {waits:?}");
+    assert!(
+        retries <= waits.len() / 5,
+        "no retry of a family left alone: {waits:?}"
+    );
     assert_eq!(
         r.fs.read(&gens[0].1).unwrap(),
         bytes,
