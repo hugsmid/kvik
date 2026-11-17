@@ -540,6 +540,30 @@ fn a_held_cut_whose_lease_the_writer_expired_is_ended_at_its_check() {
 }
 
 #[test]
+fn a_young_cut_whose_lease_the_writer_deleted_ends_at_its_check() {
+    let mut r = Rig::new();
+    let mut c = ReaderConfig::new(
+        dir(),
+        Arc::new(r.fs.clone()),
+        r.clock.clone(),
+        Some([1; 16]),
+        [8; 16],
+    );
+    c.cut_max_age = Duration::from_secs(3_600);
+    let mut reader = LogReader::open(c).unwrap();
+    reader.refresh().unwrap();
+    r.writer_view();
+    r.clock.advance(Duration::from_secs(14 * 60 - 61));
+    let renewed = reader.state().lease_renewed_at;
+    reader.refresh().unwrap();
+    assert_eq!(reader.state().lease_renewed_at, renewed, "not due");
+    let held = reader.hold();
+    r.clock.advance(Duration::from_secs(48 * 60));
+    assert_eq!(r.writer_view(), None, "the writer deleted the lease");
+    assert_eq!(ended(&mut reader, held.id), Err(CutEnd::LeaseLost));
+}
+
+#[test]
 fn an_epoch_the_reader_has_read_is_never_used_again_while_an_older_cut_holds_the_lease() {
     let mut r = Rig::with_sealed(2);
     let first = r.reader.hold();

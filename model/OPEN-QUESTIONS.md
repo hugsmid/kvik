@@ -1739,7 +1739,8 @@ model's cuts is left for 9.0c, with `Snapshot`; the example tests cover each rul
 **Pinned by.** `a_cut_max_age_above_the_grace_period_is_taken_as_the_grace_period`,
 `a_cut_counts_its_age_from_the_manifest_check_that_found_its_epoch_current`,
 `a_check_that_finds_a_cuts_epoch_still_current_renews_its_age`,
-`a_held_cut_whose_lease_the_writer_expired_is_ended_at_its_check` (`log/tests/reader_calls.rs`);
+`a_held_cut_whose_lease_the_writer_expired_is_ended_at_its_check`,
+`a_young_cut_whose_lease_the_writer_deleted_ends_at_its_check` (`log/tests/reader_calls.rs`);
 `a_call_that_outlives_cut_max_age_ends_with_cut_expired_and_releases_its_cut`,
 `the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it` (`kvik/src/durable/read/cut.rs`);
 `a_cut_max_age_of_zero_is_refused` (`kvik/tests/durable.rs`).
