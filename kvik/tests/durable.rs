@@ -876,6 +876,13 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
     prop::collection::vec(step, 1..16)
 }
 
+fn outranked_on_arrival(s: &Store, ids: &[SeriesId]) -> u64 {
+    ids.iter()
+        .filter_map(|id| s.series_stats(*id))
+        .map(|st| st.outranked_on_arrival)
+        .sum()
+}
+
 /// What a history gives on one backend: every result in a comparable form, and per series its facts in each view.
 struct Run {
     out: Vec<String>,
@@ -913,6 +920,7 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
                         r
                     })
                     .collect();
+                let outranked_before = outranked_on_arrival(&s, &all);
                 let intent = if *revise {
                     Intent::Revise
                 } else {
@@ -932,6 +940,26 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
                     block_on(s.emit_with(&readings, intent))
                 }
                 .unwrap();
+                let outranked_then_current =
+                    rs.iter().zip(&ack.outcomes).enumerate().any(|(k, (r, o))| {
+                        matches!(
+                            o,
+                            Outcome::Recorded {
+                                outranked: true,
+                                ..
+                            }
+                        ) && rs.iter().zip(&ack.outcomes).skip(k + 1).any(|(later, lo)| {
+                            (later.0, later.1) == (r.0, r.1)
+                                && matches!(
+                                    lo,
+                                    Outcome::Recorded {
+                                        outranked: false,
+                                        ..
+                                    }
+                                )
+                        })
+                    });
+                WITHIN_CALL.fetch_add(u64::from(outranked_then_current), Ordering::Relaxed);
                 let outcomes: Vec<String> = ack
                     .outcomes
                     .iter()
@@ -948,6 +976,11 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
                     })
                     .collect();
                 out.push(format!("emit {outcomes:?}"));
+                // Per call: the backends rebuild different counters at a start.
+                out.push(format!(
+                    "outranked_on_arrival +{}",
+                    outranked_on_arrival(&s, &all) - outranked_before
+                ));
             }
             Step::Retire(i, t) => out.push(format!(
                 "retire {:?}",
@@ -1149,6 +1182,10 @@ fn the_durable_backend_decides_as_the_model_does() {
         })
         .unwrap();
     assert!(
+        WITHIN_CALL.load(Ordering::Relaxed) > 0,
+        "some call records a reading outranked at commit and then its key's current fact (Q-705)"
+    );
+    assert!(
         SLOW.load(Ordering::Relaxed) > 0,
         "some history takes the slow path"
     );
@@ -1156,6 +1193,10 @@ fn the_durable_backend_decides_as_the_model_does() {
 
 /// Readings the differential histories decided by the slow path.
 static SLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Calls of the differential histories holding a reading outranked at commit and a later reading of its key that is
+/// not (Q-705).
+static WITHIN_CALL: AtomicU64 = AtomicU64::new(0);
 
 fn next() -> u64 {
     static N: AtomicU64 = AtomicU64::new(0);
