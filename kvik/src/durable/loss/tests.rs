@@ -132,6 +132,56 @@ fn a_region_after_a_void_takes_the_commit_time_of_the_batch_before_it() {
     assert_eq!(found[0].report.commit_time_before, Some(Timestamp(1)));
 }
 
+#[test]
+fn a_recovery_entry_naming_a_tail_is_a_possible_loss_until_a_void_takes_it() {
+    use kvik_log::entries::{Entry, MarkState, Recovery};
+    let recovery = |tail_bytes| {
+        Item::from(Entry::Recovery(Recovery {
+            after: 1,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes,
+            readable_commits: 0,
+            mark_state: MarkState::Readable,
+            id_floor: 0,
+            consumers: Vec::new(),
+        }))
+    };
+    let entry = |first: u64, item| {
+        ReadEvent::Batch(ReadBatch {
+            file_id: 1,
+            offset: 0,
+            first: at(first),
+            last: at(first),
+            commit_time: first as i64,
+            content: BatchContent {
+                first_sequence: first,
+                received_at: first as i64,
+                items: vec![item],
+            },
+        })
+    };
+    let mut f = Finder::default();
+    f.apply(
+        &[batch(1, 1), entry(2, recovery(0)), entry(3, recovery(40))],
+        MARK,
+    );
+    let losses = f.losses(&[]);
+    assert_eq!(losses.len(), 1, "{losses:?}");
+    assert_eq!(
+        (losses[0].kind, losses[0].identity, losses[0].bytes),
+        (LossKind::PossibleLoss, Position::new(0, 3), 40)
+    );
+    f.apply(
+        &[ReadEvent::Void {
+            above: at(2),
+            cause: kvik_log::reader::VoidCause::Rewritten,
+        }],
+        MARK,
+    );
+    assert!(f.losses(&[]).is_empty());
+}
+
 fn find(first: u64, last: u64) -> Find {
     let mut f = Finder::default();
     let found = f.apply(

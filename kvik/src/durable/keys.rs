@@ -207,4 +207,83 @@ mod tests {
         assert!(facts.between(1, 0, 10).is_none());
         assert_eq!(facts.read_between(1, 0, 10), (Vec::new(), false));
     }
+
+    #[test]
+    fn a_region_the_latch_holds_is_skipped_and_any_other_makes_the_keys_it_may_hold_unreadable() {
+        use std::path::Path;
+        use std::time::Duration;
+
+        use kvik_log::content::Item;
+        use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
+        use kvik_log::fs::MemFs;
+        use kvik_log::reader::ReaderConfig;
+        use kvik_log::store::{NewStore, StoreDir};
+        use kvik_log::writer::{Log, LogWriter, SystemClock, WriterConfig};
+
+        let fs = Arc::new(MemFs::new());
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(fs.clone(), Path::new("s"), Some(&new)).unwrap();
+        let w = LogWriter::open(
+            store,
+            WriterConfig::default(),
+            Some([2; 16]),
+            Duration::ZERO,
+            0,
+        )
+        .unwrap();
+        let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+        for (t, text) in [(10, "KEY-ONE"), (20, "KEY-TWO"), (30, "KEY-THREE")] {
+            let row = FactRow {
+                series_id: 1,
+                t,
+                quality: Quality::Good,
+                flags: FactFlags::default(),
+                value: Value::Text(text.into()),
+                changed_at: None,
+            };
+            log.submit(vec![Item::Fact(row)]).unwrap().wait().unwrap();
+        }
+        log.shutdown().unwrap();
+        let (path, bytes) = fs
+            .paths()
+            .into_iter()
+            .filter_map(|p| fs.read(&p).map(|b| (p, b)))
+            .find(|(p, b)| {
+                p.extension().is_some_and(|e| e == "open") && b.windows(7).any(|x| x == b"KEY-TWO")
+            })
+            .unwrap();
+        let at = bytes.windows(7).position(|x| x == b"KEY-TWO").unwrap();
+        fs.poke(&path, at, b"X");
+        let reader = || {
+            let clock = Arc::new(SystemClock::default());
+            LogReader::open(ReaderConfig::new(
+                "s",
+                fs.clone(),
+                clock,
+                Some([2; 16]),
+                [9; 16],
+            ))
+            .unwrap()
+        };
+        let mut scan = reader();
+        let u = scan.refresh().unwrap();
+        let latch = Arc::new(Latch::default());
+        latch.note(&super::super::loss::Finder::default().apply(&u.events, u.state.durable));
+        assert_eq!(latch.found().len(), 1);
+        let keys = [(1, 10), (1, 20)];
+
+        let found = LogFacts::new(reader(), Regions::default(), latch).at(&keys);
+        assert!(found.unreadable.is_empty(), "{found:?}");
+        assert_eq!(found.facts.get(&(1, 10)).map(Vec::len), Some(1));
+        assert!(!found.facts.contains_key(&(1, 20)));
+
+        let found = LogFacts::new(reader(), Regions::default(), Arc::default()).at(&keys);
+        assert!(found.unreadable.contains(&(1, 20)), "{found:?}");
+    }
 }
