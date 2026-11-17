@@ -39,6 +39,7 @@
 mod block;
 mod bytes;
 mod error;
+pub mod file;
 pub mod float;
 pub mod fuzz;
 pub mod ints;
