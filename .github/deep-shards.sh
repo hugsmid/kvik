@@ -31,6 +31,7 @@ recovery        model recovery_histories
 edge_cases      model edge_cases
 rules           model rules
 open_questions  model open_questions
+names           model names
 durability      model durability
 self_repair     model self_repair
 model           model model
