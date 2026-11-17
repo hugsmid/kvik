@@ -75,6 +75,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-832 | §5.1, §8 tree checkpoints, §11 `series_stats`, §13 Restart | A start independent of the log's length without tree checkpoints |
 | Q-834 | `format.md` A.9 `file_crc32c`, A.4 Sealing | The seal's file checksum from the block checksums |
 | Q-835 | §3 Order of a start, §11 Health | How much of a start may be deferred past `open` |
+| Q-836 | §3 Recovery rule 2, §7 Readers, §11 Health | Facts a damaged recovery entry voided read again as live |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1580,6 +1581,12 @@ same still drops the map.
 by other values of the same keys; later lookups decode fewer batches than a whole read and return what a fresh
 reader's first lookup returns) and `a_recovery_entry_voids_what_precedes_it_at_every_lookup` (unit tests of the log
 reader).
+**Damage after mapping (the lead's decision at the re-check).** The map does not read an entry's batch again, so an
+entry mapped before its batch was damaged keeps voiding for that reader until a start: the facts it voids were void,
+and the mapped answer is the better one. A fresh reader passes over the damaged batch (Q-836). Pinned by
+`a_recovery_entry_mapped_before_its_batch_was_damaged_keeps_voiding_for_that_reader` and
+`a_reader_looking_up_again_finds_what_a_fresh_reader_and_a_refresh_find`, whose damage step also flips a byte of a
+header or of a recovery entry's batch (`log/src/reader/tests/lookup_properties.rs`).
 
 ## Q-832 — A start independent of the log's length without tree checkpoints
 Recorded by the first profiling sweep. **Kept with Q-752** for later (the lead's decision), to be settled by roadmap
@@ -1612,6 +1619,22 @@ consumer registered its read of the log (about 40 % of a start) could run on `kv
 not until a consumer is taken.
 **Open.** That changes when `Health` and the delivery counts become true after a start, and what `Store::consumer`
 costs the first time.
+
+## Q-836 — Facts a damaged recovery entry voided read again as live
+Recorded at the re-check of the first profiling sweep. To be settled by roadmap 6.3b, with Q-755.
+**Scenario.** A recovery entry voids what precedes it in its segment above its `after`. A byte of the entry's batch
+is then damaged. A refresh or a lookup of a reader that has not mapped the entry meets the batch as an invalid
+region: it reports the region (a `Corruption` event, health degraded by Q-755), a lookup leaves the ranges of the
+segment incomplete unless the caller takes the region as lost, and no void is applied, so the facts the entry voided
+are taken as live and nothing says they were void. A reader that mapped the entry before the damage keeps voiding
+(Q-831).
+**As built.** Unchanged: the positions between the batches around the region are lost; the facts before it are live.
+**Proposal.** Report the range as corrupt, as the owner ruled for corrupt manifest spans (Q-650): a region that may
+hold a recovery entry makes the positions it could void, from the start of its segment to the region, corrupt rather
+than live. This is a correctness promise, so it is not changed here; the cost is that damage to any batch then
+withholds the earlier facts of its segment until it is repaired.
+**Pinned by.** `a_recovery_entry_mapped_before_its_batch_was_damaged_keeps_voiding_for_that_reader`
+(`log/src/reader/tests/lookup_properties.rs`), which asserts today's refresh.
 
 ## Q-710 — The default floor of the batch-sync interval
 
@@ -1687,7 +1710,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1764,6 +1787,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-832 | 7.1b | A start that skips old segments; kept with Q-752 by the lead; recorded by the first profiling sweep |
 | Q-834 | 6.3b | The seal's file checksum without the re-read; recorded only, by the lead's decision |
 | Q-835 | 5.6 | The deliverer's read of the log past `open`; deferred by the lead |
+| Q-836 | 6.3b | Facts a damaged recovery entry voided read again as live; with Q-755; recorded at the re-check of the first profiling sweep |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
@@ -2019,7 +2043,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
 | Q-750 | The duplicate rule's slow path on damage found during a run | `kvik/src/durable/ingest.rs`, `deliver/recent.rs`, `health.rs` (settled by the owner's ruling at the review of roadmap 11.0: recorded and delivered flagged unchecked, counted on their own, health degraded until the next start; ingest never stops; an unrecorded damaged region after it is Q-755) |
 | Q-830 | Whether every poll runs every consumer's timers | `kvik/src/durable/deliver/funnels.rs` (decided by the lead: only timers that are due if exactly equivalent; it is not, since a held-for or stale-for evaluation reads the live state at `now` and counts unchecked evaluations and reads of the log, so all are kept; the per-poll work that changed nothing is removed) |
-| Q-831 | A segment holding a recovery entry read whole by every lookup | `log/src/reader/lookup.rs` (settled by the lead: the batch map is kept with each entry's place and `after`, applied in file order as a scan applies them) |
+| Q-831 | A segment holding a recovery entry read whole by every lookup | `log/src/reader/lookup.rs` (settled by the lead: the batch map is kept with each entry's place and `after`, applied in file order as a scan applies them; an entry mapped before its batch was damaged keeps voiding for that reader until a start) |
 | Q-833 | Recovery taking the last sealed segment's last position from its trailer alone | `log/src/writer/recovery.rs` (declined by the lead: recovery keeps reading the last sealed segment, so damage there is still noticed at a start) |
 
 ## Where the model differs from the specification

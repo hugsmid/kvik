@@ -5,6 +5,7 @@ use proptest::prelude::*;
 use super::*;
 use crate::entries::{Entry, MarkState, Recovery};
 use crate::facts::{FactFlags, FactRow, Quality, Value};
+use crate::name::SegmentName;
 use crate::store::{NewStore, StoreDir};
 use crate::writer::{Log, LogWriter, SystemClock, WriterConfig};
 
@@ -30,6 +31,28 @@ fn bits(v: &Value) -> u64 {
 
 fn seen(f: &FoundFact) -> Seen {
     (f.position, f.row.series_id, f.row.t, bits(&f.row.value))
+}
+
+fn recovery(after: u64) -> Item {
+    Item::from(Entry::Recovery(Recovery {
+        after,
+        stamp: None,
+        boot_id: [0; 16],
+        tail_bytes: 0,
+        readable_commits: 0,
+        mark_state: MarkState::Readable,
+        id_floor: 0,
+        consumers: Vec::new(),
+    }))
+}
+
+/// What the damage step did to a sealed segment.
+enum Damage {
+    None,
+    /// A byte of the header or of a batch without a recovery entry.
+    Other,
+    /// A byte of a recovery entry's batch, with every fact a refresh took before it.
+    Entry(BTreeSet<Seen>),
 }
 
 struct World {
@@ -118,6 +141,53 @@ impl World {
         .unwrap()
     }
 
+    fn path(&self, name: SegmentName) -> std::path::PathBuf {
+        Path::new("s")
+            .join(crate::store::LOG_DIR)
+            .join(name.to_string())
+    }
+
+    /// The sealed segments, by file id.
+    fn sealed(&self) -> Vec<SegmentName> {
+        let dir = Path::new("s").join(crate::store::LOG_DIR);
+        let mut names: Vec<_> = self
+            .fs
+            .read_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| SegmentName::parse(&e.name))
+            .filter(|n| n.sealed)
+            .collect();
+        names.sort_by_key(|n| n.file_id);
+        names
+    }
+
+    /// The start and end offsets of the segment's batches that hold a recovery entry.
+    fn entry_batches(&self, name: SegmentName) -> Vec<(usize, usize)> {
+        let bytes = self.fs.read(&self.path(name)).unwrap();
+        let id = SegmentIdentity {
+            store_id: [1; 16],
+            file_id: name.file_id,
+            generation: name.generation,
+        };
+        let mut scan = Scanner::new(&bytes, &id, ScanLimit::End)
+            .unwrap()
+            .keeping_content();
+        let mut out = Vec::new();
+        while let Some(found) = scan.next() {
+            if let Ok(Found::Batch(b)) = found
+                && scan.take_content().is_some_and(|c| {
+                    c.items
+                        .iter()
+                        .any(|i| matches!(i, Item::Entry(e) if matches!(**e, Entry::Recovery(_))))
+                })
+            {
+                out.push((b.offset as usize, b.end() as usize));
+            }
+        }
+        out
+    }
+
     /// Every fact a fresh refresh takes, voids applied.
     fn refreshed(&mut self) -> BTreeSet<Seen> {
         let mut out = BTreeSet::new();
@@ -145,21 +215,22 @@ impl World {
 }
 
 /// Checks a lookup of the reader under test against a fresh reader's first lookup and, where complete, a refresh.
-/// With `damaged`, the reader under test may know a range complete that a fresh reader does not: a damaged batch its
-/// map shows cannot hold a wanted key is not read again (only complete ranges are compared).
+/// After damage the reader under test may know a range complete that a fresh reader does not: a damaged batch its
+/// map shows cannot hold a wanted key is not read again (only complete ranges are compared). A recovery entry it
+/// mapped before its batch was damaged keeps voiding for it, so it answers what a refresh gave before (Q-831).
 fn check(
     w: &mut World,
     a: &mut LogReader,
     wanted: &[Wanted],
-    damaged: bool,
+    damage: &Damage,
 ) -> Result<(), TestCaseError> {
     let got = a.lookup(wanted, &|_, _, _| false).unwrap();
     let fresh = w.reader().lookup(wanted, &|_, _, _| false).unwrap();
     for (mine, theirs) in got.complete.iter().zip(&fresh.complete) {
-        if damaged {
-            prop_assert!(*mine || !*theirs);
-        } else {
+        if matches!(damage, Damage::None) {
             prop_assert_eq!(mine, theirs);
+        } else {
+            prop_assert!(*mine || !*theirs);
         }
     }
     let in_range = |f: &Seen, keep: &[bool]| {
@@ -193,8 +264,11 @@ fn check(
         .map(seen)
         .filter(|f| in_range(f, &got.complete))
         .collect();
-    let want: BTreeSet<Seen> = w
-        .refreshed()
+    let refreshed = match damage {
+        Damage::Entry(before) => before.clone(),
+        _ => w.refreshed(),
+    };
+    let want: BTreeSet<Seen> = refreshed
         .into_iter()
         .filter(|f| in_range(f, &got.complete))
         .collect();
@@ -218,7 +292,7 @@ proptest! {
     fn a_reader_looking_up_again_finds_what_a_fresh_reader_and_a_refresh_find(
         ops in ops(),
         wanted in prop::collection::vec((0u32..4, 0i64..50, 0i64..10), 1..4),
-        damage in prop::option::of((any::<prop::sample::Index>(), any::<prop::sample::Index>())),
+        damage in prop::option::of((any::<bool>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())),
     ) {
         let wanted: Vec<Wanted> = wanted
             .into_iter()
@@ -232,18 +306,8 @@ proptest! {
                 Op::Recovery(back) => {
                     let durable = w.durable();
                     let after = durable.saturating_sub(u64::from(back)).max(w.segment.0 - 1);
-                    let entry = Recovery {
-                        after,
-                        stamp: None,
-                        boot_id: [0; 16],
-                        tail_bytes: 0,
-                        readable_commits: 0,
-                        mark_state: MarkState::Readable,
-                        id_floor: 0,
-                        consumers: Vec::new(),
-                    };
                     // A recovery entry voids only what precedes it in its own segment (format A.4).
-                    if w.submit(vec![Item::from(Entry::Recovery(entry))]) && after < durable {
+                    if w.submit(vec![recovery(after)]) && after < durable {
                         return Ok(());
                     }
                     // Past the voided positions, so that no batch the entry voids lies above the mark.
@@ -251,32 +315,88 @@ proptest! {
                         w.call(20);
                     }
                 }
-                Op::Lookup => check(&mut w, &mut a, &wanted, false)?,
+                Op::Lookup => check(&mut w, &mut a, &wanted, &Damage::None)?,
             }
         }
-        check(&mut w, &mut a, &wanted, false)?;
-        if let Some((seg, at)) = damage {
-            let dir = Path::new("s").join(crate::store::LOG_DIR);
-            let mut names: Vec<_> = w
-                .fs
-                .read_dir(&dir)
-                .unwrap()
-                .into_iter()
-                .filter_map(|e| crate::name::SegmentName::parse(&e.name))
-                .filter(|n| n.sealed)
-                .collect();
-            names.sort_by_key(|n| n.file_id);
+        check(&mut w, &mut a, &wanted, &Damage::None)?;
+        if let Some((header, seg, at)) = damage {
+            let names = w.sealed();
             if !names.is_empty() {
-                let path = dir.join(seg.get(&names).to_string());
+                let name = *seg.get(&names);
+                let path = w.path(name);
                 let len = w.fs.read(&path).unwrap().len();
                 if len > 2 * HEADER_LEN {
-                    let off = HEADER_LEN + at.index(len / 2 - HEADER_LEN);
+                    let off = if header {
+                        at.index(HEADER_LEN)
+                    } else {
+                        HEADER_LEN + at.index(len / 2 - HEADER_LEN)
+                    };
+                    let in_entry = w
+                        .entry_batches(name)
+                        .iter()
+                        .any(|&(start, end)| start <= off && off < end);
+                    let damage = if in_entry {
+                        Damage::Entry(w.refreshed())
+                    } else {
+                        Damage::Other
+                    };
                     let b = w.fs.read(&path).unwrap()[off];
                     w.fs.poke(&path, off, &[b ^ 0x5A]);
-                    check(&mut w, &mut a, &wanted, true)?;
+                    check(&mut w, &mut a, &wanted, &damage)?;
                 }
             }
         }
         w.log.shutdown().unwrap();
     }
+}
+
+#[test]
+fn a_recovery_entry_mapped_before_its_batch_was_damaged_keeps_voiding_for_that_reader() {
+    let mut w = World::new();
+    (0..3).for_each(|_| w.call(10));
+    let durable = w.durable();
+    let after = durable - 5;
+    w.submit(vec![recovery(after)]);
+    let file_id = w.log.stats().open_file_id.unwrap();
+    while !w.sealed().iter().any(|n| n.file_id == file_id) {
+        w.call(30);
+    }
+    let name = *w.sealed().iter().find(|n| n.file_id == file_id).unwrap();
+    let voided = |f: &Seen| after < f.0.sequence && f.0.sequence <= durable;
+    let wanted: Vec<Wanted> = (0..4)
+        .map(|series_id| Wanted {
+            series_id,
+            from: 0,
+            to: 49,
+        })
+        .collect();
+    let mut a = w.reader();
+    let first = a.lookup(&wanted, &|_, _, _| false).unwrap();
+    let taken: BTreeSet<Seen> = first.facts.iter().map(seen).collect();
+    assert!(first.complete.iter().all(|c| *c));
+    assert!(!taken.is_empty() && !taken.iter().any(voided));
+    assert_eq!(taken, w.refreshed());
+
+    let [(start, end)] = w.entry_batches(name)[..] else {
+        panic!("one recovery entry");
+    };
+    let path = w.path(name);
+    let off = (start + end) / 2;
+    let b = w.fs.read(&path).unwrap()[off];
+    w.fs.poke(&path, off, &[b ^ 0x5A]);
+
+    let again = a.lookup(&wanted, &|_, _, _| false).unwrap();
+    assert!(again.complete.iter().all(|c| *c));
+    assert_eq!(again.facts.iter().map(seen).collect::<BTreeSet<_>>(), taken);
+    let fresh = w.reader().lookup(&wanted, &|_, _, _| false).unwrap();
+    assert!(fresh.complete.iter().all(|c| !*c));
+    // Q-836: a refresh reports the entry's batch as a region, applies no void and takes what it voided as live.
+    let events = w.reader().refresh().unwrap().events;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ReadEvent::Corruption { file_id: f, region } if *f == file_id
+            && region.start as usize <= start && end <= region.end as usize
+    )));
+    assert!(!events.iter().any(|e| matches!(e, ReadEvent::Void { .. })));
+    assert!(w.refreshed().iter().any(voided));
 }
