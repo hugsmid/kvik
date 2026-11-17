@@ -207,7 +207,18 @@ fn check(entries: &[SeriesEntry], index: &Index, written_at: i64) -> usize {
                     .series_facts(id)
                     .find(|s| s.position == c.position)
                     .unwrap();
-                assert_eq!(Some(c.value), value_of(&f.row.value), "series {id}");
+                let expected = match &f.row.value {
+                    Value::F64(b) => CandidateValue::F64(*b),
+                    Value::Decimal { units, scale } => CandidateValue::Decimal {
+                        units: *units,
+                        scale: *scale,
+                    },
+                    Value::State(x) => CandidateValue::State(*x),
+                    Value::Bool(x) => CandidateValue::Bool(*x),
+                    Value::Text(_) => CandidateValue::Text,
+                    Value::Absent { .. } => unreachable!("a candidate has a value"),
+                };
+                assert_eq!(c.value, expected, "series {id}");
                 assert_eq!(c.quality, f.row.quality, "series {id}");
             }
         }
@@ -419,4 +430,65 @@ fn the_fold_follows_the_synced_mark_without_being_asked_for_entries() {
         );
     }
     assert_eq!(lock(&fold.fold).applied, h.last().unwrap().last);
+}
+
+/// Series 3 (versioned) facts at `t` one second apart from `T0 + 1 s`: `(dt, quality code, changed_at)`.
+fn versioned(facts: &[&[(i64, u8, u64)]]) -> Vec<ReadBatch> {
+    let gens: Vec<Vec<Gen>> = facts
+        .iter()
+        .map(|b| {
+            b.iter()
+                .map(|&(dt, quality, changed_at)| Gen {
+                    series: 3,
+                    dt,
+                    quality,
+                    absent: false,
+                    future: false,
+                    changed_at,
+                    unsynced: false,
+                    kind: 0,
+                })
+                .collect()
+        })
+        .collect();
+    history(&gens)
+}
+
+/// Folds `h`, continues a second fold from the first's entries after batch `cut`, and checks the continuation's
+/// final entries against the full index.
+fn continue_after(h: &[ReadBatch], cut: usize) -> SeriesEntry {
+    let last = h.last().unwrap().last;
+    let first = SeriesFold::new(last);
+    for b in &h[..=cut] {
+        first.batch(b);
+    }
+    let e0 = first
+        .entries(h[cut].last, h[cut].content.received_at)
+        .unwrap();
+    let continued = SeriesFold::new(last);
+    continued.seed(e0.through, e0.judged_at, &e0.entries);
+    for b in h {
+        continued.batch(b);
+    }
+    let e = continued
+        .entries(last, h.last().unwrap().content.received_at + S)
+        .unwrap();
+    check(&e.entries, &index_of(h, last), e.judged_at);
+    *e.entries.iter().find(|e| e.series_id == 3).unwrap()
+}
+
+#[test]
+fn a_continued_versioned_series_does_not_take_a_version_a_bad_one_before_the_file_outranks() {
+    // Before the file: a good fact at t=2 and a bad one at t=5 of version 3. After it: version 1 of t=5, outranked.
+    let h = versioned(&[&[(1, 3, 0)], &[(3, 0, 3)], &[(2, 3, 1)]]);
+    let e = continue_after(&h, 2);
+    assert!(e.candidate_unsure || e.candidate.is_some_and(|c| c.t == T0 + 2 * S));
+}
+
+#[test]
+fn a_continued_pending_fact_of_a_versioned_series_has_no_rank_to_keep_it() {
+    // Before the file: version 3 of t = 30 s, ahead. After it: version 1 of the same `t`, which it outranks.
+    let h = versioned(&[&[(29, 3, 3)], &[(28, 3, 1)], &[(0, 3, 0)]]);
+    let e = continue_after(&h, 1);
+    assert!(e.pending_more || e.pending.is_some_and(|p| p.position.sequence == 4));
 }
