@@ -40,32 +40,88 @@ impl<K: Ord + Clone, V: Clone + PartialEq> PartialEq for PMap<K, V> {
     }
 }
 
-/// Entries copied because a node was shared, on this thread: the cost of a change to a published map.
+/// What the maps of this thread have done since it started: the cost of a change to a published map and of a read.
 #[cfg(test)]
-pub(crate) mod copied {
+pub(crate) mod count {
     use std::cell::Cell;
 
-    thread_local!(static COPIED: Cell<u64> = const { Cell::new(0) });
-
-    pub(crate) fn add(n: usize) {
-        COPIED.with(|c| c.set(c.get() + n as u64));
+    /// Counts on this thread.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        /// Entries copied because their node was shared.
+        pub(crate) copied: u64,
+        /// Bytes those copies took.
+        pub(crate) bytes: u64,
+        /// Allocations made for nodes, copied or new (two a node: its `Arc` and its entries), and by ranges.
+        pub(crate) allocations: u64,
+        /// Nodes a range descended into or stepped to.
+        pub(crate) visited: u64,
     }
 
-    /// Entries copied on this thread since it started.
-    pub(crate) fn get() -> u64 {
-        COPIED.with(Cell::get)
+    thread_local!(static COUNTS: Cell<Counts> = const {
+        Cell::new(Counts { copied: 0, bytes: 0, allocations: 0, visited: 0 })
+    });
+
+    pub(crate) fn add(f: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|c| {
+            let mut v = c.get();
+            f(&mut v);
+            c.set(v);
+        });
+    }
+
+    /// The counts on this thread since it started.
+    pub(crate) fn get() -> Counts {
+        COUNTS.with(Cell::get)
+    }
+
+    /// What happened on this thread during `f`.
+    pub(crate) fn during<R>(f: impl FnOnce() -> R) -> (R, Counts) {
+        let a = get();
+        let r = f();
+        let b = get();
+        let d = Counts {
+            copied: b.copied - a.copied,
+            bytes: b.bytes - a.bytes,
+            allocations: b.allocations - a.allocations,
+            visited: b.visited - a.visited,
+        };
+        (r, d)
     }
 }
 
-fn make_mut<K: Clone, V: Clone>(n: &mut Arc<Node<K, V>>) -> &mut Node<K, V> {
+/// A node's entries, with room for the one an insert adds before it splits: allocated once at the size it keeps.
+fn entries<T: Clone>(from: &[T]) -> Vec<T> {
+    let mut v = Vec::with_capacity(NODE + 1);
+    v.extend_from_slice(from);
+    v
+}
+
+fn new_node<K, V>(n: Node<K, V>) -> Arc<Node<K, V>> {
     #[cfg(test)]
-    if Arc::strong_count(n) > 1 {
-        copied::add(match &**n {
-            Node::Leaf(es) => es.len(),
-            Node::Branch(cs) => cs.len(),
+    count::add(|c| c.allocations += 2);
+    Arc::new(n)
+}
+
+/// The node, to change; a copy first when it is shared.
+fn make_mut<K: Clone, V: Clone>(n: &mut Arc<Node<K, V>>) -> &mut Node<K, V> {
+    if Arc::get_mut(n).is_none() {
+        let copy = match &**n {
+            Node::Leaf(es) => Node::Leaf(entries(es)),
+            Node::Branch(cs) => Node::Branch(entries(cs)),
+        };
+        #[cfg(test)]
+        count::add(|c| {
+            let (len, size) = match &copy {
+                Node::Leaf(es) => (es.len(), std::mem::size_of::<(K, V)>()),
+                Node::Branch(cs) => (cs.len(), std::mem::size_of::<(K, Arc<Node<K, V>>)>()),
+            };
+            c.copied += len as u64;
+            c.bytes += ((NODE + 1) * size) as u64;
         });
+        *n = new_node(copy);
     }
-    Arc::make_mut(n)
+    Arc::get_mut(n).expect("unique after the copy")
 }
 
 /// Splits `v` once it holds more than [`NODE`] entries: off its last entry when that is where the insert went (an
@@ -75,7 +131,9 @@ fn split<T>(v: &mut Vec<T>, at_end: bool) -> Option<Vec<T>> {
         return None;
     }
     let at = if at_end { v.len() - 1 } else { v.len() / 2 };
-    Some(v.split_off(at))
+    let mut right = Vec::with_capacity(NODE + 1);
+    right.extend(v.drain(at..));
+    Some(right)
 }
 
 type Split<K, V> = Option<(K, Arc<Node<K, V>>)>;
@@ -93,7 +151,7 @@ fn insert_in<K: Ord + Clone, V: Clone>(
                 let right = split(es, i + 1 == es.len());
                 (
                     None,
-                    right.map(|r| (r[0].0.clone(), Arc::new(Node::Leaf(r)))),
+                    right.map(|r| (r[0].0.clone(), new_node(Node::Leaf(r)))),
                 )
             }
         },
@@ -110,7 +168,7 @@ fn insert_in<K: Ord + Clone, V: Clone>(
             let right = split(cs, i + 2 == cs.len());
             (
                 old,
-                right.map(|r| (r[0].0.clone(), Arc::new(Node::Branch(r)))),
+                right.map(|r| (r[0].0.clone(), new_node(Node::Branch(r)))),
             )
         }
     }
@@ -146,31 +204,200 @@ fn child<K: Ord, V>(cs: &[(K, Arc<Node<K, V>>)], k: &K) -> Option<usize> {
     cs.partition_point(|(f, _)| f <= k).checked_sub(1)
 }
 
-fn leaves<'a, K: Ord, V>(
-    n: &'a Node<K, V>,
-    lo: Bound<&K>,
-    hi: Bound<&K>,
-    out: &mut Vec<&'a [(K, V)]>,
-) {
-    match n {
-        Node::Leaf(es) => {
-            let a = lower(es, |e| &e.0, lo);
-            let b = upper(es, |e| &e.0, hi);
-            if a < b {
-                out.push(&es[a..b]);
+/// A branch's child with the lowest key it holds.
+type Child<K, V> = (K, Arc<Node<K, V>>);
+
+/// A place in a map: the branches above a leaf, each with the child taken, the leaf and an entry of it.
+struct Cursor<'a, K, V> {
+    path: Vec<(&'a [Child<K, V>], usize)>,
+    leaf: &'a [(K, V)],
+    at: usize,
+}
+
+impl<'a, K, V> Cursor<'a, K, V> {
+    fn new() -> Self {
+        #[cfg(test)]
+        count::add(|c| c.allocations += 1);
+        Cursor {
+            path: Vec::with_capacity(8),
+            leaf: &[],
+            at: 0,
+        }
+    }
+
+    fn entry(&self) -> Option<(&'a K, &'a V)> {
+        self.leaf.get(self.at).map(|(k, v)| (k, v))
+    }
+
+    /// Descends from `n` along its first children (`first`) or its last to a leaf.
+    fn descend(&mut self, mut n: &'a Node<K, V>, first: bool) {
+        loop {
+            #[cfg(test)]
+            count::add(|c| c.visited += 1);
+            match n {
+                Node::Leaf(es) => {
+                    self.leaf = es;
+                    self.at = if first { 0 } else { es.len().saturating_sub(1) };
+                    return;
+                }
+                Node::Branch(cs) => {
+                    let i = if first { 0 } else { cs.len() - 1 };
+                    self.path.push((cs, i));
+                    n = &cs[i].1;
+                }
             }
         }
-        Node::Branch(cs) => {
-            // A child holds the keys from its own first key to the next child's.
-            let a = match lo {
-                Bound::Unbounded => 0,
-                Bound::Included(b) | Bound::Excluded(b) => child(cs, b).unwrap_or(0),
-            };
-            let b = upper(cs, |c| &c.0, hi);
-            for (_, c) in cs.get(a..b).unwrap_or_default() {
-                leaves(c, lo, hi, out);
+    }
+
+    /// Moves to the next entry; `None` past the last.
+    fn forward(&mut self) -> Option<(&'a K, &'a V)> {
+        if self.at + 1 < self.leaf.len() {
+            self.at += 1;
+            return self.entry();
+        }
+        while let Some(&(cs, i)) = self.path.last() {
+            if i + 1 < cs.len() {
+                self.path.last_mut().expect("looked at above").1 = i + 1;
+                self.descend(&cs[i + 1].1, true);
+                return self.entry();
+            }
+            self.path.pop();
+        }
+        None
+    }
+
+    /// Moves to the entry before; `None` before the first.
+    fn back(&mut self) -> Option<(&'a K, &'a V)> {
+        if self.at > 0 {
+            self.at -= 1;
+            return self.entry();
+        }
+        while let Some(&(cs, i)) = self.path.last() {
+            if i > 0 {
+                self.path.last_mut().expect("looked at above").1 = i - 1;
+                self.descend(&cs[i - 1].1, false);
+                return self.entry();
+            }
+            self.path.pop();
+        }
+        None
+    }
+}
+
+/// The entries of a map between two bounds, read from both ends as they are asked for (query design §3.5: a read
+/// that wants the last fact before a time costs a descent, not the series).
+pub(crate) struct Range<'a, K, V> {
+    front: Cursor<'a, K, V>,
+    back: Cursor<'a, K, V>,
+    /// The next entry from each end; `None` once they have met.
+    next: Option<(&'a K, &'a V)>,
+    last: Option<(&'a K, &'a V)>,
+}
+
+impl<'a, K: Ord, V> Range<'a, K, V> {
+    fn new(root: Option<&'a Node<K, V>>, lo: Bound<&K>, hi: Bound<&K>) -> Self {
+        let mut r = Range {
+            front: Cursor::new(),
+            back: Cursor::new(),
+            next: None,
+            last: None,
+        };
+        let Some(root) = root else { return r };
+        r.next = r.front.seek_first(root, lo);
+        r.last = r.back.seek_last(root, hi);
+        if let (Some((a, _)), Some((z, _))) = (r.next, r.last)
+            && a <= z
+        {
+            return r;
+        }
+        r.next = None;
+        r.last = None;
+        r
+    }
+}
+
+impl<'a, K: Ord, V> Cursor<'a, K, V> {
+    /// Places the cursor at the first entry the lower bound admits.
+    fn seek_first(&mut self, mut n: &'a Node<K, V>, lo: Bound<&K>) -> Option<(&'a K, &'a V)> {
+        loop {
+            #[cfg(test)]
+            count::add(|c| c.visited += 1);
+            match n {
+                Node::Leaf(es) => {
+                    self.leaf = es;
+                    self.at = lower(es, |e| &e.0, lo);
+                    return if self.at < es.len() {
+                        self.entry()
+                    } else {
+                        self.at = es.len().saturating_sub(1);
+                        self.forward()
+                    };
+                }
+                Node::Branch(cs) => {
+                    // A child holds the keys from its own first key to the next child's.
+                    let i = match lo {
+                        Bound::Unbounded => 0,
+                        Bound::Included(b) | Bound::Excluded(b) => child(cs, b).unwrap_or(0),
+                    };
+                    self.path.push((cs, i));
+                    n = &cs[i].1;
+                }
             }
         }
+    }
+
+    /// Places the cursor at the last entry the upper bound admits.
+    fn seek_last(&mut self, mut n: &'a Node<K, V>, hi: Bound<&K>) -> Option<(&'a K, &'a V)> {
+        loop {
+            #[cfg(test)]
+            count::add(|c| c.visited += 1);
+            match n {
+                Node::Leaf(es) => {
+                    self.leaf = es;
+                    let end = upper(es, |e| &e.0, hi);
+                    return if end > 0 {
+                        self.at = end - 1;
+                        self.entry()
+                    } else {
+                        self.at = 0;
+                        self.back()
+                    };
+                }
+                Node::Branch(cs) => {
+                    let i = upper(cs, |c| &c.0, hi).checked_sub(1)?;
+                    self.path.push((cs, i));
+                    n = &cs[i].1;
+                }
+            }
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for Range<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let e = self.next?;
+        if self.last.is_some_and(|l| std::ptr::eq(l.0, e.0)) {
+            self.next = None;
+            self.last = None;
+        } else {
+            self.next = self.front.forward();
+        }
+        Some(e)
+    }
+}
+
+impl<K, V> DoubleEndedIterator for Range<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let e = self.last?;
+        if self.next.is_some_and(|n| std::ptr::eq(n.0, e.0)) {
+            self.next = None;
+            self.last = None;
+        } else {
+            self.last = self.back.back();
+        }
+        Some(e)
     }
 }
 
@@ -179,8 +406,9 @@ fn build<K: Clone, V>(mut level: Vec<(K, Arc<Node<K, V>>)>) -> Option<Arc<Node<K
         let mut up = Vec::with_capacity(level.len().div_ceil(NODE));
         let mut it = level.into_iter().peekable();
         while it.peek().is_some() {
-            let cs: Vec<_> = it.by_ref().take(NODE).collect();
-            up.push((cs[0].0.clone(), Arc::new(Node::Branch(cs))));
+            let mut cs = Vec::with_capacity(NODE + 1);
+            cs.extend(it.by_ref().take(NODE));
+            up.push((cs[0].0.clone(), new_node(Node::Branch(cs))));
         }
         level = up;
     }
@@ -194,9 +422,10 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V> {
         let mut level = Vec::new();
         let mut it = entries.into_iter().peekable();
         while it.peek().is_some() {
-            let es: Vec<_> = it.by_ref().take(NODE).collect();
+            let mut es = Vec::with_capacity(NODE + 1);
+            es.extend(it.by_ref().take(NODE));
             len += es.len();
-            level.push((es[0].0.clone(), Arc::new(Node::Leaf(es))));
+            level.push((es[0].0.clone(), new_node(Node::Leaf(es))));
         }
         PMap {
             root: build(level),
@@ -217,14 +446,19 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V> {
     /// Inserts `v` under `k`; returns the value it replaced.
     pub(crate) fn insert(&mut self, k: K, v: V) -> Option<V> {
         let Some(root) = self.root.as_mut() else {
-            self.root = Some(Arc::new(Node::Leaf(vec![(k, v)])));
+            let mut es = Vec::with_capacity(NODE + 1);
+            es.push((k, v));
+            self.root = Some(new_node(Node::Leaf(es)));
             self.len = 1;
             return None;
         };
         let (old, split) = insert_in(root, k, v);
         if let Some(right) = split {
             let left = root.clone();
-            *root = Arc::new(Node::Branch(vec![(first_key(&left).clone(), left), right]));
+            let mut cs = Vec::with_capacity(NODE + 1);
+            cs.push((first_key(&left).clone(), left));
+            cs.push(right);
+            *root = new_node(Node::Branch(cs));
         }
         if old.is_none() {
             self.len += 1;
@@ -278,16 +512,8 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V> {
     }
 
     /// The entries with keys between `lo` and `hi`, in key order; nothing for an empty or inverted range.
-    pub(crate) fn range<'a>(
-        &'a self,
-        lo: Bound<&K>,
-        hi: Bound<&K>,
-    ) -> impl DoubleEndedIterator<Item = (&'a K, &'a V)> + use<'a, K, V> {
-        let mut out = Vec::new();
-        if let Some(r) = self.root.as_deref() {
-            leaves(r, lo, hi, &mut out);
-        }
-        out.into_iter().flat_map(|s| s.iter().map(|(k, v)| (k, v)))
+    pub(crate) fn range<'a>(&'a self, lo: Bound<&K>, hi: Bound<&K>) -> Range<'a, K, V> {
+        Range::new(self.root.as_deref(), lo, hi)
     }
 
     /// Every entry in key order.
@@ -407,15 +633,58 @@ mod tests {
     fn a_change_to_a_shared_map_copies_one_node_a_level_and_leaves_the_snapshot_as_it_was() {
         let mut m = PMap::from_sorted((0..100_000u32).map(|k| (k, k)));
         let snap = m.clone();
-        let before = copied::get();
-        *m.get_mut(&50_000).unwrap() = 7;
-        m.insert(100_000, 1);
+        let ((), c) = count::during(|| {
+            *m.get_mut(&50_000).unwrap() = 7;
+            m.insert(100_000, 1);
+        });
         let levels = 3; // 64^2 < 100,000 <= 64^3
-        assert!(copied::get() - before <= 2 * levels * NODE as u64);
+        assert!(c.copied <= 2 * levels * NODE as u64, "{c:?}");
+        assert!(c.allocations <= 2 * 2 * levels, "{c:?}");
         assert_eq!(snap.get(&50_000), Some(&50_000));
         assert_eq!(snap.get(&100_000), None);
         assert_eq!(m.get(&50_000), Some(&7));
         assert_eq!(m.len(), 100_001);
+    }
+
+    #[test]
+    fn a_copied_node_takes_the_insert_that_follows_without_growing() {
+        let mut m = PMap::from_sorted((0..NODE as u32).map(|k| (2 * k, ())));
+        let snap = m.clone();
+        m.insert(1, ());
+        let Some(Node::Branch(cs)) = m.root.as_deref() else {
+            panic!("a full leaf split under a branch")
+        };
+        for (_, c) in cs {
+            let Node::Leaf(es) = &**c else {
+                panic!("a leaf")
+            };
+            assert_eq!(es.capacity(), NODE + 1);
+        }
+        assert_eq!(snap.len(), NODE);
+    }
+
+    #[test]
+    fn a_range_read_from_either_end_visits_a_path_not_the_map() {
+        let visits = |n: u32| {
+            let m = PMap::from_sorted((0..n).map(|k| (k, ())));
+            let mid = n / 2;
+            let (back, b) =
+                count::during(|| m.range(Bound::Unbounded, Bound::Included(&mid)).next_back());
+            let (front, f) =
+                count::during(|| m.range(Bound::Excluded(&mid), Bound::Unbounded).next());
+            assert_eq!((back, front), (Some((&mid, &())), Some((&(mid + 1), &()))));
+            (b, f)
+        };
+        let (small, large) = (visits(1_000), visits(1_000_000));
+        for (s, l) in [(small.0, large.0), (small.1, large.1)] {
+            // Both ends descend one path; one level more for a thousand times the entries.
+            assert!(
+                l.visited <= 2 * 4 && l.visited <= s.visited + 4,
+                "{s:?} {l:?}"
+            );
+            assert_eq!(l.allocations, s.allocations, "{s:?} {l:?}");
+            assert_eq!(l.allocations, 2);
+        }
     }
 
     #[test]

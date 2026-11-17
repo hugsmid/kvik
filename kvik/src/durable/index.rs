@@ -499,7 +499,12 @@ mod tests {
     use kvik_log::facts::FactFlags as LogFlags;
     use kvik_log::reader::VoidCause;
 
+    use std::sync::Arc;
+
+    use super::super::read::pmap::NODE;
+    use super::super::read::pmap::count::{self, Counts};
     use super::*;
+    use crate::env::ManualClock;
     use crate::series::{Kind, SeriesSpec, ValueType};
 
     fn batch(first: u64, items: Vec<Item>) -> ReadEvent {
@@ -540,35 +545,92 @@ mod tests {
         }
     }
 
-    /// An index of `series` series with one fact each, taken in 64 batches, published, then given one batch with one
-    /// fact: the entries that batch copied.
-    fn copied_by_one_fact(series: u32) -> u64 {
-        let per = series / 64;
+    /// An index of `series` series with 20 facts each in 80 batches, published, then given one batch with one fact: what that
+    /// batch cost the map.
+    fn cost_of_one_fact(series: u32) -> Counts {
         let mut i = Index::default();
-        for b in 0..64 {
-            let items = (b * per..(b + 1) * per)
-                .map(|id| fact_of(id + 1, 10))
-                .collect();
-            i.apply(&[batch(u64::from(b * per) + 1, items)]);
+        let mut next = 1;
+        for t in 0..20 {
+            // Four batches each, so the commit times' map is the same size whatever the series.
+            for ids in (1..=series).collect::<Vec<_>>().chunks(series as usize / 4) {
+                let items: Vec<_> = ids.iter().map(|id| fact_of(*id, t)).collect();
+                let n = items.len() as u64;
+                i.apply(&[batch(next, items)]);
+                next += n;
+            }
         }
         let published = i.clone();
-        let before = super::super::read::pmap::copied::get();
-        i.apply(&[batch(u64::from(series) + 1, vec![fact_of(series / 2, 20)])]);
-        let copied = super::super::read::pmap::copied::get() - before;
-        assert_eq!(published.series_facts(series / 2).count(), 1);
-        assert_eq!(i.series_facts(series / 2).count(), 2);
+        let ((), c) = count::during(|| {
+            i.apply(&[batch(next, vec![fact_of(series / 2, 20)])]);
+        });
+        assert_eq!(published.series_facts(series / 2).count(), 20);
+        assert_eq!(i.series_facts(series / 2).count(), 21);
         assert_eq!(i.latest_t(series / 2), Some(20));
-        copied
+        c
     }
 
     #[test]
-    fn a_refresh_after_a_publish_copies_about_the_same_whatever_the_number_of_series() {
-        use super::super::read::pmap::NODE;
-        let small = copied_by_one_fact(128);
-        let large = copied_by_one_fact(65_536);
-        // One node a level on each path it changes: one level more for 512 times the series.
-        assert!(large <= small + 2 * NODE as u64, "{small} and {large}");
-        assert!(large < 6 * NODE as u64, "{large}");
+    fn a_refresh_after_a_publish_costs_about_the_same_whatever_the_number_of_series() {
+        let small = cost_of_one_fact(128);
+        let large = cost_of_one_fact(16_384);
+        // One node a level on each path it changes: one level more for 128 times the series, and a root that grows.
+        assert!(
+            large.copied <= small.copied + 2 * NODE as u64,
+            "{small:?} {large:?}"
+        );
+        assert!(
+            large.allocations <= small.allocations + 2,
+            "{small:?} {large:?}"
+        );
+        assert!(
+            large.bytes <= small.bytes + 2 * 1_024,
+            "{small:?} {large:?}"
+        );
+        assert!(
+            large.allocations <= 16 && large.bytes <= 24 * 1_024,
+            "{large:?}"
+        );
+    }
+
+    /// An index of one gauge with `n` facts at seconds 1 to `n`: what a live-state read at the end costs the map.
+    fn cost_of_live(n: i64) -> Counts {
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let def =
+            super::super::registry::definition_of(&spec, 1, Duration::from_secs(300)).unwrap();
+        let mut i = Index::default();
+        i.apply(&[batch(
+            1,
+            vec![Item::Entry(Entry::Definition(Box::new(def)))],
+        )]);
+        let mut next = 2;
+        for first in (1..=n).step_by(10_000) {
+            let items: Vec<_> = (first..(first + 10_000).min(n + 1))
+                .map(|t| fact(t * 1_000_000_000, t as f64))
+                .collect();
+            let len = items.len() as u64;
+            i.apply(&[batch(next, items)]);
+            next += len;
+        }
+        let clocks = super::super::clock::Clocks::new(Arc::new(ManualClock::new(Timestamp(0))));
+        let now = (n + 1) * 1_000_000_000;
+        let (live, c) =
+            count::during(|| super::super::windows::live_in(&i, &clocks, SeriesId(1), now));
+        assert!(matches!(live, Ok(crate::read::Live::Value(_))), "{live:?}");
+        c
+    }
+
+    #[test]
+    fn a_live_read_visits_a_path_whatever_the_length_of_the_series() {
+        let (short, long) = (cost_of_live(1_000), cost_of_live(200_000));
+        assert!(long.visited <= short.visited + 4, "{short:?} {long:?}");
+        assert_eq!(long.allocations, short.allocations, "{short:?} {long:?}");
+        assert!(long.visited <= 16, "{long:?}");
     }
 
     #[test]

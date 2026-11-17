@@ -1773,14 +1773,20 @@ must share them, or each refresh copies the whole index.
 `(t, position)`, the entries, the commit times, the recovery entries) is one persistent B-tree with nodes of at most
 64 entries, reference-counted: a published view is a clone that copies no entry, and the next refresh copies only the
 nodes on the paths it changes, one node a level. A level is added per 64-fold growth, so the cost grows with the
-logarithm of the number of series and of a series' length, not with either: one fact after a publish copies 131
-entries at 128 series and 209 at 65,536. Flat pages of 1,024 would copy a whole page per page touched under a root
+logarithm of the number of series and of a series' length, not with either. One fact alone in a refresh after a
+publish, with 20 facts a series, costs the map 104 entries copied, 13,000 bytes and 10 allocations at 128 series, and
+170 entries, 14,040 bytes and 12 allocations at 16,384 (its own allocations, counted by the map: a node is allocated
+once, with room for the entry an insert adds, two allocations a node); each further series touched costs about one
+leaf of its facts and one of the directory. A range is read lazily from both ends, so the last fact before a time is
+one descent whatever the series' length. Flat pages of 1,024 would copy a whole page per page touched under a root
 that grows with the series, and late facts need ordered inserts that append-only runs do not give; one structure
 serves every map. A void (a reset) builds the maps it changes again, as the index did before. Counting the nodes a
 held view pins against the memory cap comes with the accountant (roadmap 9.0f).
-**Pinned by.** `a_refresh_after_a_publish_copies_about_the_same_whatever_the_number_of_series`
-(`kvik/src/durable/index.rs`); `a_map_and_its_snapshots_read_as_ordered_maps_do`,
-`a_change_to_a_shared_map_copies_one_node_a_level_and_leaves_the_snapshot_as_it_was`
+**Pinned by.** `a_refresh_after_a_publish_costs_about_the_same_whatever_the_number_of_series`,
+`a_live_read_visits_a_path_whatever_the_length_of_the_series` (`kvik/src/durable/index.rs`);
+`a_map_and_its_snapshots_read_as_ordered_maps_do`,
+`a_change_to_a_shared_map_copies_one_node_a_level_and_leaves_the_snapshot_as_it_was`,
+`a_copied_node_takes_the_insert_that_follows_without_growing`, `a_range_read_from_either_end_visits_a_path_not_the_map`
 (`kvik/src/durable/read/pmap.rs`).
 
 ## Q-901 — The model checker for the single-flight refresh
