@@ -425,6 +425,10 @@ impl Decider {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+mod bounded;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

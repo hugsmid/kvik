@@ -20,8 +20,14 @@ mod consumers;
 mod deliver;
 mod emit;
 mod entries;
+#[cfg(test)]
+#[allow(dead_code)]
+mod history;
 mod index;
 mod ingest;
+#[cfg(test)]
+#[allow(dead_code)]
+mod keys;
 mod loss;
 mod open;
 pub(crate) mod reader;
