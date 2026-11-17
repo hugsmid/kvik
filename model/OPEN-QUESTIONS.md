@@ -1380,7 +1380,9 @@ costs at most about 0.6 s, 16 MiB about 0.17 s, and a crafted manifest at most a
 Natural damage is unchanged: the verdicts are the same and the window rule is untouched. Tests:
 `log/tests/body_check.rs` (each check against its decoder, the text table against `std::str::from_utf8`, and
 `state_names_at_the_limit_are_told_distinct_and_past_it_refused`), `log/tests/batches.rs`
-`after_damage_a_recovery_entry_not_alone_is_still_invalid_content`,
+`after_damage_a_recovery_entry_not_alone_is_still_invalid_content` (the entry first, last or between others) and
+`a_judged_batch_finds_a_recovery_entry_as_the_full_check_does`, `log/src/manifest.rs`
+`a_lost_range_field_given_twice_is_read_from_its_first_occurrence`,
 `log/tests/crafted_files.rs` `after_damage_each_kept_body_is_checked_once` and the crafted tests of Q-110 at the
 tighter budget, `log/tests/scan_bound.rs` (the differential property against the reference scan at the new bound),
 `log/src/scan/tests.rs` `the_bound_holds_body_checks_and_the_failed_read_budget_per_window`, `files/tests/records.rs`

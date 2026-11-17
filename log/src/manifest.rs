@@ -562,6 +562,42 @@ mod tests {
         ));
     }
 
+    /// Q-651: the start's reader takes a lost-range field's first occurrence, in one pass, as it did field by field:
+    /// a valid identity then an invalid one is read, an invalid one then a valid one is a corrupt record.
+    #[test]
+    fn a_lost_range_field_given_twice_is_read_from_its_first_occurrence() {
+        let with_identity_twice = |first: &[u8], second: &[u8]| {
+            let record = encode_record(RECORD_LOST_RANGE, 2, 0, 1, Some(&lost(4, 9)));
+            let body = &record[16..];
+            // The prefix, field 1, a second field 1, then the rest.
+            let mut again = body[..24].to_vec();
+            push_field(&mut again, 1, first);
+            push_field(&mut again, 1, second);
+            again.extend_from_slice(&body[24 + 16..]);
+            let mut m = encode_initial([2; 16], 0);
+            encode_block(RECORD_LOST_RANGE, 0, &again, &mut m).unwrap();
+            m.extend(encode_record(RECORD_EMPTY, 3, 0, 2, None));
+            read_manifest(&m, &[2; 16])
+        };
+        let valid = pos_bytes((0, 4));
+        let r = with_identity_twice(&valid, &[1, 2, 3]).unwrap();
+        assert_eq!(r.records.len(), 3);
+        assert_eq!(r.records[1].lost, Some(lost(4, 9)));
+        assert!(matches!(
+            with_identity_twice(&[1, 2, 3], &valid),
+            Err(ManifestError::Corrupt(_))
+        ));
+        assert_eq!(
+            with_identity_twice(&valid, &pos_bytes((0, 5)))
+                .unwrap()
+                .records[1]
+                .lost
+                .as_ref()
+                .map(|l| l.identity),
+            Some((0, 4))
+        );
+    }
+
     #[test]
     fn reserved_and_later_record_types_are_passed_over_with_their_epochs() {
         let mut m = encode_initial([2; 16], 0);

@@ -1646,10 +1646,44 @@ fn rec() -> Entry {
     })
 }
 
+/// One batch of one entries block holding `entries`, after a damaged word when `damaged` (so that the scan reads it
+/// on the bounded path, without checking its body again), then zeros: whether the scan keeps it.
+fn kept_after(entries: Vec<Entry>, damaged: bool) -> bool {
+    let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
+    if damaged {
+        f.extend_from_slice(&[0xFF; 8]);
+    }
+    let at = f.len() as u64;
+    let mut b = BatchBuilder::new();
+    let body = EntriesBlock {
+        first_sequence: 1,
+        received_at: T0,
+        entries,
+    };
+    b.push(block_type::ENTRIES, body.encode().unwrap()).unwrap();
+    f.extend(b.encode(&ID, at, 0).unwrap());
+    f.resize(f.len() + 64, 0);
+    let r = scan(&f, &ID, ScanLimit::End).unwrap();
+    r.batches.iter().any(|b| b.offset == at)
+}
+
 /// Q-651: past damage, a boundary read's batch is read without checking its bodies again, and a recovery entry that
-/// is not alone in its batch is still found there, from the entry headers.
+/// is not alone in its batch is still found there, from the entry headers, wherever it lies in its body.
 #[test]
 fn after_damage_a_recovery_entry_not_alone_is_still_invalid_content() {
+    let named = |name: &str| Entry::Alias {
+        id: 1,
+        name: name.into(),
+    };
+    for entries in [
+        vec![rec(), named("a")],
+        vec![named("a"), rec()],
+        vec![named("a name that pads its entry"), named("b"), rec()],
+    ] {
+        assert!(!kept_after(entries.clone(), true), "{entries:?}");
+        assert!(!kept_after(entries, false));
+    }
+    assert!(kept_after(vec![rec()], true));
     let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
     f.extend_from_slice(&[0xFF; 8]);
     let at = f.len() as u64;
@@ -1703,6 +1737,24 @@ fn after_damage_a_recovery_entry_not_alone_is_still_invalid_content() {
             (bad_at, alone_at, LossCause::InvalidContent)
         ]
     );
+}
+
+proptest! {
+    /// Q-651: a batch read without checking its body again (past damage) and one read with every check (before any)
+    /// are kept alike, whatever entries precede or follow a recovery entry and however they are padded.
+    #[test]
+    fn a_judged_batch_finds_a_recovery_entry_as_the_full_check_does(
+        entries in prop::collection::vec(
+            prop_oneof![
+                Just(rec()),
+                "[a-z]{1,30}".prop_map(|name| Entry::Alias { id: 1, name }),
+                "[a-z0-9]{1,15}".prop_map(|version| Entry::Tzdata { version }),
+            ],
+            1..6,
+        ),
+    ) {
+        prop_assert_eq!(kept_after(entries.clone(), true), kept_after(entries, false));
+    }
 }
 
 #[test]
