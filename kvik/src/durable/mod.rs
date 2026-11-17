@@ -204,8 +204,10 @@ pub(crate) struct Writer {
     clocks: Arc<clock::Clocks>,
     /// Consumers and routing; `None` when the start left the store read-only before the log could be read.
     hub: Option<Arc<deliver::Hub>>,
-    /// The losses the reader of this process finds (Q-200).
+    /// The losses the scanning readers of this process find (Q-200).
     latch: Arc<Latch>,
+    /// The reader `losses` and `health` move (Q-927); `None` when it could not be opened.
+    watch: Mutex<Option<loss::Watch>>,
     /// The losses the start found and could not record (`spec.md` §3 Order of a start, step 3).
     start_losses: Vec<LossReport>,
 }

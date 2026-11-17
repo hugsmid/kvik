@@ -1,6 +1,6 @@
 //! A reader on the durable log (`docs/api.md` Reader processes): the log reader of `kvik-log`, which takes no lock
 //! and reads up to the durable mark, and an [`Index`] of what it returned. Every call reads the mark and the
-//! entries appended since the last call first.
+//! entries appended since the last call first, and forgets the ranges the process found lost since (Q-938).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -24,6 +24,8 @@ use crate::types::ResetStamp;
 struct State {
     log: Option<LogReader>,
     index: Index,
+    /// The latch's closed ranges already forgotten.
+    closed_seen: usize,
 }
 
 impl Drop for State {
@@ -65,7 +67,7 @@ pub(crate) fn open_error(dir: &Path, e: ReaderError) -> OpenError {
     }
 }
 
-fn query_error(dir: &Path, e: ReaderError) -> QueryError {
+pub(crate) fn query_error(dir: &Path, e: ReaderError) -> QueryError {
     match e {
         ReaderError::MarkUnreadable => QueryError::MarkUnreadable,
         ReaderError::Unsupported { path, .. } => QueryError::UnsupportedFormat { file: path },
@@ -80,6 +82,25 @@ fn query_error(dir: &Path, e: ReaderError) -> QueryError {
             file: PathBuf::from(format!("{}: {other}", dir.display())),
         },
     }
+}
+
+/// A log reader on the store in `dir` with this process's clock and boot id and a fresh reader id.
+pub(crate) fn log_reader(
+    dir: &Path,
+    env: &Env,
+    lease_refresh: Duration,
+) -> Result<LogReader, ReaderError> {
+    let mut id = [0u8; 16];
+    env.entropy.fill(&mut id);
+    let mut cfg = LogReaderConfig::new(
+        dir,
+        env.fs.clone(),
+        Arc::new(LogClock::new(env.clock.clone())),
+        env.boot.current(),
+        id,
+    );
+    cfg.lease_refresh = lease_refresh;
+    LogReader::open(cfg)
 }
 
 impl DurableReader {
@@ -102,17 +123,7 @@ impl DurableReader {
         clocks: Arc<Clocks>,
         latch: Arc<Latch>,
     ) -> Result<Self, OpenError> {
-        let mut id = [0u8; 16];
-        env.entropy.fill(&mut id);
-        let mut cfg = LogReaderConfig::new(
-            dir,
-            env.fs.clone(),
-            Arc::new(LogClock::new(env.clock.clone())),
-            env.boot.current(),
-            id,
-        );
-        cfg.lease_refresh = lease_refresh;
-        let log = LogReader::open(cfg).map_err(|e| open_error(dir, e))?;
+        let log = log_reader(dir, env, lease_refresh).map_err(|e| open_error(dir, e))?;
         let descriptor = kvik_log::store::read_descriptor(&*env.fs, dir)
             .map_err(|e| super::store_error(dir, e))?;
         Ok(DurableReader {
@@ -120,6 +131,7 @@ impl DurableReader {
             state: Mutex::new(State {
                 log: Some(log),
                 index: Index::default(),
+                closed_seen: 0,
             }),
             clocks,
             created_zone: descriptor.site_zone,
@@ -166,6 +178,9 @@ impl DurableReader {
         let found = s.index.apply(&update.events, update.state.durable);
         if !found.is_empty() {
             self.latch.note(&found);
+        }
+        for (first, last) in self.latch.closed_since(&mut s.closed_seen) {
+            s.index.forget(first, last);
         }
         f(&s.index, log).map_err(Error::query)
     }

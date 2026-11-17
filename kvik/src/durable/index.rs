@@ -1,24 +1,23 @@
-//! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch, the
-//! recovery entries and the lost ranges its reads found, built from what a log reader returns and cut back when it
-//! voids what it took (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
+//! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch, and
+//! the losses its reads found ([`Finder`]), built from what a log reader returns and cut back when it voids what it
+//! took (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::time::Duration;
 
 use kvik_log::content::Item;
-use kvik_log::entries::{Entry, MarkState as LogMarkState, Recovery};
+use kvik_log::entries::{Entry, MarkState as LogMarkState};
 use kvik_log::facts::{FactRow, Quality as LogQuality, Value as LogValue};
 use kvik_log::manifest::{LossCause as LogCause, LostRange};
 use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::registry::RegistryFile;
-use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 use kvik_log::writer::Position as LogPos;
 
-use super::loss::{self, merge};
+use super::loss::{Find, Finder};
 use super::registry::{Registry, Series};
 use crate::backend::Error;
-use crate::health::{LossCause, LossKind, LossReport, MarkState};
+use crate::health::{LossCause, LossReport, MarkState};
 use crate::read::View;
 use crate::series::{SeriesInfo, SeriesKey, Timing};
 use crate::time::{TimeRange, Timestamp};
@@ -47,9 +46,7 @@ pub(crate) struct Index {
     facts: BTreeMap<u32, BTreeMap<(i64, LogPos), Stored>>,
     /// Each batch's last position and commit time, in log order.
     commits: Vec<(LogPos, i64)>,
-    recoveries: BTreeMap<LogPos, Recovery>,
-    /// Lost ranges found by this index's reads, latched (spec §3 Recovery rule 2, Q-200).
-    found: Vec<LossReport>,
+    finder: Finder,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -146,83 +143,20 @@ pub(crate) fn fact_out(s: &Stored) -> Fact {
 }
 
 impl Index {
-    /// Applies what a refresh up to the mark's position `durable` found, in order. Returns the lost ranges it found.
-    pub(crate) fn apply(&mut self, events: &[ReadEvent], durable: LogPos) -> Vec<LossReport> {
-        let mut found = Vec::new();
+    /// Applies what a refresh up to the mark's position `durable` found, in order. Returns the losses it found.
+    pub(crate) fn apply(&mut self, events: &[ReadEvent], durable: LogPos) -> Vec<Find> {
+        let found = self.finder.apply(events, durable);
         for e in events {
             match e {
                 ReadEvent::Batch(b) => self.batch(b),
                 ReadEvent::Void { above, .. } => self.void(*above),
-                ReadEvent::Corruption { file_id, region } => {
-                    found.extend(self.corruption(*file_id, region, durable));
-                }
+                ReadEvent::Corruption { .. } => {}
             }
         }
         found
     }
 
-    /// A region below the mark: the positions from the last batch before it to the next batch after it or, at the
-    /// tail, to the mark's last position are lost (spec §3 Recovery rule 2), with the identity the next start
-    /// records them under.
-    fn corruption(
-        &mut self,
-        file_id: u64,
-        region: &InvalidRegion,
-        durable: LogPos,
-    ) -> Option<LossReport> {
-        let before = self.commits.last().copied();
-        let first = region
-            .last_sequence_before
-            .or(before.map(|(p, _)| p.sequence))
-            .map_or(1, |s| s.saturating_add(1));
-        let last = region
-            .first_sequence_after
-            .map_or(durable.sequence, |s| s.saturating_sub(1));
-        if last < first {
-            return None;
-        }
-        let g = durable.generation;
-        let report = LossReport {
-            identity: Position::new(g, first),
-            kind: LossKind::DataLost,
-            cause: match region.cause {
-                ScanCause::Corruption => LossCause::Corruption,
-                ScanCause::InvalidContent => LossCause::InvalidContent,
-            },
-            first: Some(Position::new(g, first)),
-            last: Some(Position::new(g, last)),
-            file_id: Some(file_id),
-            bytes: region.end.saturating_sub(region.start),
-            readable_commit_blocks: 0,
-            mark_state: MarkState::Readable,
-            boot_id: None,
-            commit_time_before: before.map(|(_, t)| Timestamp(t)),
-            commit_time_after: None,
-            cursors_missing: Vec::new(),
-            recorded: false,
-            acknowledged: false,
-        };
-        // A region that overlaps a loss already found is that loss, grown, under its first identity (spec §3 Order
-        // of a start step 4).
-        let overlaps = |f: &&mut LossReport| f.first <= report.last && report.first <= f.last;
-        if let Some(f) = self.found.iter_mut().find(overlaps) {
-            if !loss::widen(f, &report) {
-                return None;
-            }
-            return Some(f.clone());
-        }
-        self.found.push(report.clone());
-        Some(report)
-    }
-
     fn batch(&mut self, b: &ReadBatch) {
-        if let Some(l) = self.found.last_mut()
-            && l.commit_time_after.is_none()
-            && l.last
-                .is_some_and(|p| log_pos(p).sequence.checked_add(1) == Some(b.first.sequence))
-        {
-            l.commit_time_after = Some(Timestamp(b.commit_time));
-        }
         let mut sequence = b.first.sequence;
         for item in &b.content.items {
             let p = LogPos {
@@ -245,9 +179,6 @@ impl Index {
                 Item::Entry(e) => {
                     let e: &Entry = e;
                     self.registry.apply(e);
-                    if let Entry::Recovery(r) = e {
-                        self.recoveries.insert(p, r.clone());
-                    }
                     self.entries.insert(p, (b.content.received_at, e.clone()));
                 }
             }
@@ -260,13 +191,11 @@ impl Index {
     fn void(&mut self, above: LogPos) {
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
-        self.recoveries.retain(|p, _| keep(p));
         self.commits.retain(|(p, _)| keep(p));
         for f in self.facts.values_mut() {
             f.retain(|(_, p), _| keep(p));
         }
         self.facts.retain(|_, f| !f.is_empty());
-        // Found losses outlive a void: lost positions are never reused (spec §3 Recovery rule 2).
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
@@ -466,70 +395,19 @@ impl Index {
             .collect()
     }
 
-    /// Losses: the manifest's lost-range records, the recovery entries of the kept log (Q-116 (c)) and the lost
-    /// ranges this index's reads found that no record holds yet.
+    /// Losses: the manifest's lost-range records, the recovery entries of the kept log and the lost ranges this
+    /// index's reads found that no record holds yet.
     pub(crate) fn losses(&self, recorded: &[LostRange]) -> Vec<LossReport> {
-        let mut out: BTreeMap<(Position, bool), LossReport> = BTreeMap::new();
-        for l in recorded {
-            let identity = Position::new(l.identity.0, l.identity.1);
-            let first = Position::new(l.first.0, l.first.1);
-            let last = Position::new(l.last.0, l.last.1);
-            let e = out.entry((identity, false)).or_insert_with(|| LossReport {
-                identity,
-                kind: LossKind::DataLost,
-                cause: cause_out(l.cause),
-                first: Some(first),
-                last: Some(last),
-                file_id: Some(l.file_id),
-                bytes: l.length,
-                readable_commit_blocks: 0,
-                mark_state: MarkState::Readable,
-                boot_id: (l.boot_id != [0; 16]).then_some(l.boot_id),
-                commit_time_before: l.time_before.map(Timestamp),
-                commit_time_after: l.time_after.map(Timestamp),
-                cursors_missing: Vec::new(),
-                recorded: true,
-                acknowledged: false,
-            });
-            // A record that extends a loss widens its range; the loss is counted once.
-            e.first = e.first.min(Some(first));
-            e.last = e.last.max(Some(last));
+        self.finder.losses(recorded)
+    }
+
+    /// Forgets the facts at positions from `first` to `last`, a range the process found lost after this index took
+    /// it (Q-938).
+    pub(crate) fn forget(&mut self, first: LogPos, last: LogPos) {
+        for f in self.facts.values_mut() {
+            f.retain(|(_, p), _| *p < first || last < *p);
         }
-        // A recovery entry is a possible loss when it names a non-empty tail, a mark not readable or stale, or a
-        // missing or unreadable cursor file; its identity is its own position (`spec.md` §11 Health, §3 step 4).
-        for (p, r) in &self.recoveries {
-            if r.tail_bytes == 0
-                && r.readable_commits == 0
-                && r.mark_state == LogMarkState::Readable
-                && r.consumers.is_empty()
-            {
-                continue;
-            }
-            let identity = Position::new(p.generation, p.sequence);
-            out.insert(
-                (identity, true),
-                LossReport {
-                    identity,
-                    kind: LossKind::PossibleLoss,
-                    cause: LossCause::TruncatedTail,
-                    first: None,
-                    last: None,
-                    file_id: None,
-                    bytes: r.tail_bytes,
-                    readable_commit_blocks: r.readable_commits,
-                    mark_state: mark_state_out(r.mark_state),
-                    boot_id: (r.boot_id != [0; 16]).then_some(r.boot_id),
-                    commit_time_before: None,
-                    commit_time_after: None,
-                    cursors_missing: r.consumers.clone(),
-                    recorded: true,
-                    acknowledged: false,
-                },
-            );
-        }
-        let mut out: Vec<LossReport> = out.into_values().collect();
-        merge(&mut out, self.found.iter().cloned());
-        out
+        self.facts.retain(|_, f| !f.is_empty());
     }
 }
 
@@ -540,6 +418,7 @@ mod tests {
     use kvik_log::content::BatchContent;
     use kvik_log::facts::FactFlags as LogFlags;
     use kvik_log::reader::VoidCause;
+    use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 
     use super::*;
     use crate::series::{Kind, SeriesSpec, ValueType};

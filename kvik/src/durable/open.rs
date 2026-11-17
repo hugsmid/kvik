@@ -57,6 +57,13 @@ impl Writer {
                 path: dir.clone(),
                 source: io::Error::other(e.to_string()),
             })?;
+        // The loss watch, at the kept log's head; a catch-up that fails here is tried again at the first ask.
+        let mut watch = reader::log_reader(&dir, &env, READER_LEASE)
+            .ok()
+            .map(loss::Watch::new);
+        if let Some(w) = watch.as_mut() {
+            let _ = w.catch_up(&latch);
+        }
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
         let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
@@ -143,6 +150,7 @@ impl Writer {
             clocks,
             hub,
             latch,
+            watch: Mutex::new(watch),
             start_losses,
             env,
         });

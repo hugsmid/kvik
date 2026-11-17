@@ -1,0 +1,282 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+use kvik_log::content::{BatchContent, Item};
+use kvik_log::facts::{FactFlags, FactRow, Quality, Value as LogValue};
+use kvik_log::reader::{ReadBatch, ReadEvent};
+use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
+use kvik_log::writer::Position as LogPos;
+
+use super::*;
+use crate::config::StoreConfig;
+use crate::durable::reader::{DurableReader, log_reader};
+use crate::durable::{Emitted, Writer};
+use crate::env::{Env, ManualClock, MemFs};
+use crate::health::LossKind;
+use crate::series::{Kind, SeriesSpec};
+use crate::time::Timestamp;
+use crate::types::{Intent, Position, Reading, Value};
+
+const MARK: LogPos = LogPos {
+    generation: 0,
+    sequence: 100,
+};
+
+fn at(sequence: u64) -> LogPos {
+    LogPos {
+        generation: 0,
+        sequence,
+    }
+}
+
+fn batch(first: u64, n: u64) -> ReadEvent {
+    let items = (0..n)
+        .map(|i| {
+            Item::Fact(FactRow {
+                series_id: 1,
+                t: (first + i) as i64,
+                quality: Quality::Good,
+                flags: FactFlags::default(),
+                value: LogValue::F64(1.0f64.to_bits()),
+                changed_at: None,
+            })
+        })
+        .collect();
+    ReadEvent::Batch(ReadBatch {
+        file_id: 1,
+        offset: 0,
+        first: at(first),
+        last: at(first + n - 1),
+        commit_time: first as i64,
+        content: BatchContent {
+            first_sequence: first,
+            received_at: first as i64,
+            items,
+        },
+    })
+}
+
+fn region(start: u64, before: Option<u64>, after: Option<u64>) -> ReadEvent {
+    ReadEvent::Corruption {
+        file_id: 1,
+        region: InvalidRegion {
+            start,
+            end: start + 64,
+            last_sequence_before: before,
+            first_sequence_after: after,
+            cause: ScanCause::Corruption,
+        },
+    }
+}
+
+#[test]
+fn an_open_ended_region_is_closed_at_the_next_batch_of_the_part_and_its_report_kept_wide() {
+    let mut f = Finder::default();
+    let found = f.apply(
+        &[batch(1, 2), region(100, Some(2), None), batch(5, 1)],
+        MARK,
+    );
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].closed, (at(3), at(4)));
+    assert_eq!(found[0].report.last, Some(Position::new(0, MARK.sequence)));
+    assert_eq!((found[0].file_id, found[0].span), (1, (100, 164)));
+}
+
+#[test]
+fn an_open_ended_region_at_the_tail_of_what_was_read_is_closed_at_the_mark() {
+    let mut f = Finder::default();
+    let found = f.apply(&[batch(1, 2), region(100, Some(2), None)], MARK);
+    assert_eq!(found[0].closed, (at(3), MARK));
+    let found = f.apply(&[region(100, Some(2), Some(7)), batch(7, 1)], MARK);
+    assert_eq!(
+        found.len(),
+        0,
+        "the same region, no longer open, adds nothing"
+    );
+}
+
+#[test]
+fn a_region_after_a_void_past_the_commits_kept_starts_after_the_void() {
+    let mut f = Finder::default();
+    let mut events: Vec<ReadEvent> = (0..100).map(|i| batch(1 + 2 * i, 2)).collect();
+    events.push(ReadEvent::Void {
+        above: at(20),
+        cause: kvik_log::reader::VoidCause::Rewritten,
+    });
+    events.push(region(100, None, Some(30)));
+    events.push(batch(30, 1));
+    let found = f.apply(&events, MARK);
+    assert_eq!(found[0].closed, (at(21), at(29)));
+    assert_eq!(found[0].report.commit_time_before, None);
+}
+
+#[test]
+fn a_region_after_a_void_takes_the_commit_time_of_the_batch_before_it() {
+    let mut f = Finder::default();
+    let found = f.apply(
+        &[
+            batch(1, 2),
+            batch(3, 2),
+            ReadEvent::Void {
+                above: at(2),
+                cause: kvik_log::reader::VoidCause::Rewritten,
+            },
+            region(100, None, Some(5)),
+            batch(5, 1),
+        ],
+        MARK,
+    );
+    assert_eq!(found[0].closed, (at(3), at(4)));
+    assert_eq!(found[0].report.commit_time_before, Some(Timestamp(1)));
+}
+
+fn find(first: u64, last: u64) -> Find {
+    let mut f = Finder::default();
+    let found = f.apply(
+        &[
+            batch(1, 1),
+            region(first * 10, Some(first - 1), Some(last + 1)),
+            batch(last + 1, 1),
+        ],
+        MARK,
+    );
+    found.into_iter().next().unwrap()
+}
+
+#[test]
+fn the_latch_holds_one_report_per_loss_in_order_and_a_bridged_pair_becomes_one() {
+    let latch = Latch::default();
+    latch.note(&[find(20, 22), find(5, 6), find(40, 41)]);
+    let ids = |l: &Latch| -> Vec<(Position, Option<Position>, Option<Position>)> {
+        l.found()
+            .iter()
+            .map(|r| (r.identity, r.first, r.last))
+            .collect()
+    };
+    let p = |s| Position::new(0, s);
+    assert_eq!(
+        ids(&latch),
+        vec![
+            (p(5), Some(p(5)), Some(p(6))),
+            (p(20), Some(p(20)), Some(p(22))),
+            (p(40), Some(p(40)), Some(p(41)))
+        ]
+    );
+    latch.note(&[find(21, 23)]);
+    assert_eq!(ids(&latch)[1], (p(20), Some(p(20)), Some(p(23))));
+    latch.note(&[find(23, 40)]);
+    assert_eq!(
+        ids(&latch),
+        vec![
+            (p(5), Some(p(5)), Some(p(6))),
+            (p(20), Some(p(20)), Some(p(41)))
+        ]
+    );
+    assert_eq!(latch.take_fresh().len(), 5);
+    assert!(latch.take_fresh().is_empty());
+}
+
+#[test]
+fn closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_never() {
+    let latch = Latch::default();
+    let (mut a, mut b) = (0, 0);
+    latch.note(&[find(5, 6)]);
+    assert_eq!(latch.closed_since(&mut a), vec![(at(5), at(6))]);
+    let mut f = Finder::default();
+    let empty = f.apply(
+        &[batch(1, 2), region(100, Some(2), None), batch(3, 1)],
+        MARK,
+    );
+    assert!(empty[0].closed.0 > empty[0].closed.1);
+    latch.note(&empty);
+    latch.note(&[find(9, 9)]);
+    assert_eq!(latch.closed_since(&mut a), vec![(at(9), at(9))]);
+    assert_eq!(
+        latch.closed_since(&mut b),
+        vec![(at(5), at(6)), (at(9), at(9))]
+    );
+    assert!(latch.closed_since(&mut a).is_empty());
+    assert!(latch.covers(1, 50, 114) && latch.covers(1, 90, 154));
+    assert!(!latch.covers(1, 50, 170));
+}
+
+fn wait(e: Emitted) -> crate::types::Ack {
+    match e {
+        Emitted::Ready(a) => a,
+        Emitted::Queued(mut q) => {
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(r) = q.poll(&mut cx) {
+                    return q.finish(r).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn damage(fs: &MemFs, dir: &Path, text: &[u8]) {
+    let log = dir.join("log");
+    let (path, bytes) = fs
+        .paths()
+        .into_iter()
+        .filter(|p| p.starts_with(&log) && p.extension().is_some_and(|e| e == "open"))
+        .filter_map(|p| fs.read(&p).map(|b| (p, b)))
+        .find(|(_, b)| b.windows(text.len()).any(|x| x == text))
+        .unwrap();
+    let i = bytes.windows(text.len()).position(|x| x == text).unwrap();
+    fs.poke(&path, i, b"X");
+}
+
+#[test]
+fn the_watchs_reports_taken_in_parts_equal_a_full_reads_and_it_keeps_no_segment_bytes() {
+    let fs = MemFs::new();
+    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+    let mut env = Env::test(clock.clone());
+    env.fs = Arc::new(fs.clone());
+    let dir = PathBuf::from("durable-unit/watch");
+    let config = StoreConfig::new(&dir, "Etc/UTC")
+        .create_if_missing(true)
+        .env(env.clone());
+    let emit = |w: &Arc<Writer>, id, t: i64, text: &str| {
+        let r = Reading::new(id, Timestamp(t), Value::Text(text.into()));
+        wait(w.emit(&[r], Intent::Normal, true).unwrap())
+    };
+    let w = Writer::open(&config).unwrap();
+    let id = w
+        .define(&SeriesSpec::new("a/b/note", Kind::Text, ""))
+        .unwrap();
+    for (i, t) in ["W-ONE", "W-TWO", "W-THREE", "W-FOUR"].iter().enumerate() {
+        emit(&w, id, i as i64, t);
+    }
+    w.shutdown().unwrap();
+    drop(w);
+    damage(&fs, &dir, b"W-TWO");
+    damage(&fs, &dir, b"W-FOUR");
+    let w = Writer::open(&config).unwrap();
+    for (i, t) in ["W-FIVE", "W-SIX", "W-SEVEN"].iter().enumerate() {
+        emit(&w, id, 10 + i as i64, t);
+    }
+    damage(&fs, &dir, b"W-SIX");
+
+    let mut watch = Watch::with_part(log_reader(&dir, &env, Duration::from_secs(60)).unwrap(), 1);
+    watch.catch_up(&Latch::default()).unwrap();
+    assert_eq!(watch.kept_bytes(), 0);
+    let full = DurableReader::open(&dir, &env, Duration::from_secs(60))
+        .unwrap()
+        .losses()
+        .unwrap();
+    assert_eq!(watch.reports(), full);
+    assert!(
+        full.iter()
+            .any(|l| l.kind == LossKind::DataLost && l.recorded)
+    );
+    assert!(
+        full.iter()
+            .any(|l| l.kind == LossKind::DataLost && !l.recorded)
+    );
+    assert_eq!(w.losses().len(), full.len());
+    w.shutdown().unwrap();
+}

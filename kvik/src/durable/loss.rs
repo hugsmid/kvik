@@ -1,22 +1,35 @@
 //! Losses found while the store is open (spec §3 Recovery rule 2, §11 Health, Q-200), and the merge of the sources of
-//! loss reports into one report per loss.
+//! loss reports into one report per loss. [`Finder`] finds them in what a log reader returns, [`Watch`] is the reader
+//! that finds them for `losses` and `health` (Q-927), and the [`Latch`] holds what every finder of the process found.
+
+mod finder;
+mod regions;
+mod watch;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kvik_log::writer::Position as LogPos;
+
+pub(crate) use finder::{Find, Finder};
+pub(crate) use regions::Regions;
+pub(crate) use watch::Watch;
 
 use super::index::log_pos;
 use crate::health::{LossKind, LossReport};
 
 #[derive(Debug, Default)]
 struct State {
+    /// Ordered by first position, no two overlapping.
     found: Vec<LossReport>,
     /// Lost ranges the writer's decisions have not yet taken in.
     fresh: Vec<(LogPos, LogPos)>,
+    /// Every closed range taken, in the order taken (Q-938).
+    closed: Vec<(LogPos, LogPos)>,
+    regions: Regions,
 }
 
-/// The losses a process's own reader found, latched for the life of the process and handed to the writer's
-/// decisions.
+/// The losses the scanning readers of a process found, latched for the life of the process: the reports, the
+/// ranges for the writer's decisions and for the reader that answers queries, and the regions (Q-926).
 #[derive(Debug, Default)]
 pub(crate) struct Latch(Mutex<State>);
 
@@ -26,18 +39,18 @@ impl Latch {
     }
 
     /// Notes losses found by a read.
-    pub(crate) fn note(&self, found: &[LossReport]) {
+    pub(crate) fn note(&self, found: &[Find]) {
         let mut s = self.lock();
-        for l in found {
+        for f in found {
+            let l = &f.report;
             if let (Some(a), Some(b)) = (l.first, l.last) {
                 s.fresh.push((log_pos(a), log_pos(b)));
             }
-            match s.found.iter_mut().find(|f| same_loss(f, l)) {
-                Some(f) => {
-                    widen(f, l);
-                }
-                None => s.found.push(l.clone()),
+            if f.closed.0 <= f.closed.1 {
+                s.closed.push(f.closed);
             }
+            s.regions.insert(f.file_id, f.span.0, f.span.1);
+            hold(&mut s.found, l);
         }
     }
 
@@ -46,10 +59,41 @@ impl Latch {
         std::mem::take(&mut self.lock().fresh)
     }
 
+    /// The closed ranges taken after the first `*seen`, which then counts them all.
+    pub(crate) fn closed_since(&self, seen: &mut usize) -> Vec<(LogPos, LogPos)> {
+        let s = self.lock();
+        let new = s.closed.get(*seen..).unwrap_or_default().to_vec();
+        *seen = s.closed.len();
+        new
+    }
+
+    /// Whether the regions found hold the whole span `start..end` of segment `file_id` (Q-922).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn covers(&self, file_id: u64, start: u64, end: u64) -> bool {
+        self.lock().regions.covers(file_id, start, end)
+    }
+
     /// Every loss found.
     pub(crate) fn found(&self) -> Vec<LossReport> {
         self.lock().found.clone()
     }
+}
+
+/// Adds lost-data report `l` to `found`, ordered by first position: a report it overlaps is the same loss and grows
+/// to hold it, and reports it bridges become one under the identity of the lowest (Q-940).
+fn hold(found: &mut Vec<LossReport>, l: &LossReport) {
+    let lo = found.partition_point(|f| f.last < l.first);
+    let hi = found.partition_point(|f| f.first <= l.last);
+    if lo >= hi {
+        found.insert(lo, l.clone());
+        return;
+    }
+    let mut merged = found[lo].clone();
+    for f in found.drain(lo + 1..hi).collect::<Vec<_>>() {
+        widen(&mut merged, &f);
+    }
+    widen(&mut merged, l);
+    found[lo] = merged;
 }
 
 /// Whether two reports stand for one loss: of one kind, with the same identity or, for lost data, overlapping ranges
@@ -104,3 +148,6 @@ pub(crate) fn merge(into: &mut Vec<LossReport>, extra: impl IntoIterator<Item = 
     }
     into.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
 }
+
+#[cfg(test)]
+mod tests;

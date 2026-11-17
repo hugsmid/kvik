@@ -429,3 +429,47 @@ fn acknowledging_an_identity_that_has_no_loss_covers_no_later_loss_under_it() {
     assert!(matches!(s.health(), Health::Ok), "{:?}", s.health());
     block_on(s.shutdown()).unwrap();
 }
+
+#[test]
+fn a_fact_lost_after_the_stores_reader_read_it_is_shown_once_with_its_replay() {
+    let w = World::new("lost-after-read");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let two = emit_notes(&s, id, &["SEEN-ONE", "SEEN-TWO", "SEEN-THREE"])[1];
+    assert_eq!(history(&s.reader(), id).len(), 3);
+    damage(&w, b"SEEN-TWO");
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(two, Some(two), Some(two), false)]
+    );
+    let ack = block_on(s.emit(&[note(id, 1, "SEEN-TWO")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
+    let shown = history(&s.reader(), id);
+    assert_eq!(shown.len(), 3, "{shown:?}");
+    assert!(shown.iter().all(|f| f.position != two));
+    assert_eq!(history(&w.reader(), id), shown);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn two_damaged_neighbours_are_one_loss_as_a_reader_process_reports_it_and_each_replay_is_recorded()
+{
+    let w = World::new("neighbours");
+    let s = w.open();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let at = emit_notes(&s, id, &["NB-ONE", "NB-TWO", "NB-THREE", "NB-FOUR"]);
+    damage(&w, b"NB-TWO");
+    damage(&w, b"NB-THREE");
+    let one = vec![(at[1], Some(at[1]), Some(at[2]), false)];
+    assert_eq!(data_lost(&s.losses()), one);
+    assert_eq!(data_lost(&w.reader().losses()), one);
+    for (i, t) in [(1, "NB-TWO"), (2, "NB-THREE")] {
+        let ack = block_on(s.emit(&[note(id, i, t)])).unwrap();
+        assert_eq!(ack.recorded(), 1, "{t}: {:?}", ack.outcomes);
+    }
+    assert_eq!(data_lost(&s.losses()), one);
+    assert_eq!(history(&s.reader(), id).len(), 4);
+    let ack = block_on(s.emit(&[note(id, 3, "NB-FOUR")])).unwrap();
+    assert_eq!(ack.duplicates_dropped(), 1);
+    block_on(s.shutdown()).unwrap();
+}

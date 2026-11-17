@@ -8,10 +8,19 @@ impl Writer {
     }
 
     /// Every loss report this process holds, and why the files could not be read, if they could not: the reports
-    /// the files hold, then those of the start that could not record them, then those of this process's reads.
+    /// the files hold, then those of the start that could not record them, then those of this process's reads. The
+    /// files' reports come from the loss watch after it caught up (Q-926, Q-927); without one, from the store's own
+    /// reader.
     pub(crate) fn loss_reports(&self) -> (Vec<LossReport>, Option<String>) {
         let acked = lock(&self.acknowledged).clone();
-        let (read, error) = match self.reader().and_then(|r| r.losses()) {
+        let watched = lock(&self.watch)
+            .as_mut()
+            .map(|w| match w.catch_up(&self.latch) {
+                Ok(()) => Ok(w.reports()),
+                Err(e) => Err(reader::query_error(&self.dir, e)),
+            });
+        let read = watched.unwrap_or_else(|| self.reader().and_then(|r| r.losses()));
+        let (read, error) = match read {
             Ok(v) => (v, None),
             Err(e) => (Vec::new(), Some(e.to_string())),
         };
