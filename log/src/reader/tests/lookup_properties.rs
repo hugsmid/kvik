@@ -49,10 +49,12 @@ fn recovery(after: u64) -> Item {
 /// What the damage step did to a sealed segment.
 enum Damage {
     None,
-    /// A byte of the header or of a batch without a recovery entry.
+    /// A byte of a batch without a recovery entry.
     Other,
     /// A byte of a recovery entry's batch, with every fact a refresh took before it.
     Entry(BTreeSet<Seen>),
+    /// A header field that refuses the segment, with every fact a refresh took before it outside the segment.
+    Refused(BTreeSet<Seen>),
 }
 
 struct World {
@@ -162,6 +164,24 @@ impl World {
         names
     }
 
+    /// The first and last sequence of the segment's batches.
+    fn sequences(&self, name: SegmentName) -> (u64, u64) {
+        let bytes = self.fs.read(&self.path(name)).unwrap();
+        let id = SegmentIdentity {
+            store_id: [1; 16],
+            file_id: name.file_id,
+            generation: name.generation,
+        };
+        let batches: Vec<_> = Scanner::new(&bytes, &id, ScanLimit::End)
+            .unwrap()
+            .filter_map(|f| match f {
+                Ok(Found::Batch(b)) => Some((b.commit.first_sequence, b.commit.last_sequence)),
+                _ => None,
+            })
+            .collect();
+        (batches[0].0, batches[batches.len() - 1].1)
+    }
+
     /// The start and end offsets of the segment's batches that hold a recovery entry.
     fn entry_batches(&self, name: SegmentName) -> Vec<(usize, usize)> {
         let bytes = self.fs.read(&self.path(name)).unwrap();
@@ -190,8 +210,13 @@ impl World {
 
     /// Every fact a fresh refresh takes, voids applied.
     fn refreshed(&mut self) -> BTreeSet<Seen> {
+        self.try_refreshed().unwrap()
+    }
+
+    /// [`World::refreshed`]; `None` if a segment is refused.
+    fn try_refreshed(&mut self) -> Option<BTreeSet<Seen>> {
         let mut out = BTreeSet::new();
-        for e in self.reader().refresh().unwrap().events {
+        for e in self.reader().refresh().ok()?.events {
             match e {
                 ReadEvent::Batch(b) => {
                     let mut s = b.first.sequence;
@@ -210,7 +235,7 @@ impl World {
                 ReadEvent::Corruption { .. } => {}
             }
         }
-        out
+        Some(out)
     }
 }
 
@@ -265,9 +290,11 @@ fn check(
         .filter(|f| in_range(f, &got.complete))
         .collect();
     let refreshed = match damage {
-        Damage::Entry(before) => before.clone(),
+        Damage::Entry(before) | Damage::Refused(before) => before.clone(),
         _ => w.refreshed(),
     };
+    // A range left incomplete may lack facts, but holds none a refresh does not take.
+    prop_assert!(got.facts.iter().all(|f| refreshed.contains(&seen(f))));
     let want: BTreeSet<Seen> = refreshed
         .into_iter()
         .filter(|f| in_range(f, &got.complete))
@@ -325,12 +352,26 @@ proptest! {
                 let name = *seg.get(&names);
                 let path = w.path(name);
                 let len = w.fs.read(&path).unwrap().len();
-                if len > 2 * HEADER_LEN {
-                    let off = if header {
-                        at.index(HEADER_LEN)
-                    } else {
-                        HEADER_LEN + at.index(len / 2 - HEADER_LEN)
-                    };
+                if len > 2 * HEADER_LEN && header {
+                    // Under a valid checksum, one of the fields a scan checks against the segment's name and store
+                    // (kind, generation, file id, store id): the segment is refused. A header that fails its
+                    // checksum is not.
+                    let fields: Vec<usize> = std::iter::once(4).chain(12..24).chain(40..56).collect();
+                    let mut h = w.fs.read(&path).unwrap()[..HEADER_LEN].to_vec();
+                    h[*at.get(&fields)] ^= 0x5A;
+                    let crc = crc32c(&h[..HEADER_LEN - 4]);
+                    h[HEADER_LEN - 4..].copy_from_slice(&crc.to_le_bytes());
+                    let before = w.refreshed();
+                    let (first, last) = w.sequences(name);
+                    w.fs.poke(&path, 0, &h);
+                    prop_assert!(w.try_refreshed().is_none());
+                    let outside = before
+                        .into_iter()
+                        .filter(|f| !(first..=last).contains(&f.0.sequence))
+                        .collect();
+                    check(&mut w, &mut a, &wanted, &Damage::Refused(outside))?;
+                } else if len > 2 * HEADER_LEN {
+                    let off = HEADER_LEN + at.index(len / 2 - HEADER_LEN);
                     let in_entry = w
                         .entry_batches(name)
                         .iter()

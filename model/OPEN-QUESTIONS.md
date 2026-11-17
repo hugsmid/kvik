@@ -1586,7 +1586,8 @@ entry mapped before its batch was damaged keeps voiding for that reader until a 
 and the mapped answer is the better one. A fresh reader passes over the damaged batch (Q-836). Pinned by
 `a_recovery_entry_mapped_before_its_batch_was_damaged_keeps_voiding_for_that_reader` and
 `a_reader_looking_up_again_finds_what_a_fresh_reader_and_a_refresh_find`, whose damage step also flips a byte of a
-header or of a recovery entry's batch (`log/src/reader/tests/lookup_properties.rs`).
+recovery entry's batch, or changes a header field the scan checks under a valid checksum, which refuses the segment
+for the mapped reader too (`log/src/reader/tests/lookup_properties.rs`).
 
 ## Q-832 — A start independent of the log's length without tree checkpoints
 Recorded by the first profiling sweep. **Kept with Q-752** for later (the lead's decision), to be settled by roadmap
