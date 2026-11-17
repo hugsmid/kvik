@@ -566,8 +566,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   no other listed file holds; otherwise (the re-upload from a local copy or the lost-range record not yet written)
   it stays listed and the restore judges it (`spec.md` §8 Restore, Failures and end). A
   re-upload from a verified local copy writes a new `0x27`, as does an object that answers again while its loss is
-  open and so restores it in full; whether one that answers again after its loss was closed otherwise gets one, and
-  so returns to a restore's plan, is Q-600. Decoded strictly
+  open and so restores it in full; one that answers again after its loss was closed gets none, so it stays out of
+  every restore's plan and the closed loss stays closed in every generation (Q-600). Decoded strictly
   from roadmap 8.5b, with `0x24` fields 3 to 5 and `0x25` fields 11 to 13; until then it is read as a reserved type.
 - Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 24 bytes): 0 kind `u8` (1 a file, by its
   quarantine record; 2 a lost range, by its loss's identity; 3 a manifest record); 1 reserved (3 bytes); 4 for a
