@@ -68,12 +68,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-704 | §7 Readers, Leases, Retired files | The writer's own delivery reader skips a refresh at the writer's durable position; that needs a manifest that changes only at a start |
 | Q-705 | §2.3, §4 Outranked facts; `api.md` `Outcome` | The model backend's `outranked` when a later reading of the same call outranks an earlier one |
-| Q-773 | §7 Derived files; `format.md` A.18 Cadence | The series directory's cadence against a reader's allowance for large segments |
+| Q-773 | §7 Derived files; `format.md` A.18 Cadence | The series directory's cadence against a reader's allowance (decided; confirmed by 9.0b1) |
+| Q-774 | `format.md` A.18, A.12 | The derived files' layout, names and generations (decided by the lead, awaiting review) |
 | Q-775 | §7 Derived files; `format.md` A.18 Validation | Checking a log directory before the manifest lists sealed segments |
 | Q-776 | §7 Derived files, Reset stamp and saved points | When the writer keeps a series directory across a reset |
 | Q-777 | §2.3, §7 Derived files; `format.md` A.18 | The live candidate's write time and what bounded state cannot tell |
 | Q-778 | §7 Derived files; `format.md` A.18 | What the status file holds before the query envelope exists |
-| Q-779 | §7 Derived files; `format.md` A.18 | Group numbers once compacted log segments are removed locally |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1487,20 +1487,24 @@ without data that could not be read are the owner's ruling, Q-750.
 `deliveries_follow_the_model_over_restarts` (`kvik/tests/consumer_properties.rs`), whose histories jump past the
 window.
 
-## Q-773 — The series directory's cadence against a reader's allowance for large segments
-Recorded by roadmap 9.0a. To be settled by roadmap 9.0b1, which first reads the directories.
+## Q-773 — The series directory's cadence against a reader's allowance
+Recorded by roadmap 9.0a; decided at its review (technical). To be confirmed by roadmap 9.0b1, which first reads the
+directories.
 **Scenario.** A reader covers the sealed segments its directories do not yet cover by reading them, up to 64 MiB in
-all, and fails with `DirectoryUnavailable` beyond (the query design's section 4). The design writes the series
-directory "whenever the sealed bytes it does not yet cover would pass 32 MiB". With `segment_size` 256 MiB a single
-sealed segment is 256 MiB uncovered between its seal and the write that covers it, a wait of up to one mark sync (the
-writer forces one), so a one-shot reader in that window fails although the writer runs normally.
-**Decision (technical, the lead's).** "Would pass" is read as "the uncovered bytes plus one more `segment_size` would
-pass 32 MiB", so between writes the uncovered bytes stay at most `32 MiB − segment_size` and during the wait at most
-`max(32 MiB, segment_size)`: within the 64 MiB allowance for every `segment_size` up to 64 MiB, the default
-(`log/src/directory/cadence.rs`, `format.md` A.18 Cadence).
-**Open.** For larger segments: an allowance of `max(64 MiB, segment_size)`, a reader that waits one mark-sync interval
-and tries again before `DirectoryUnavailable`, or a `segment_size` ceiling of 64 MiB where directories matter.
-**Pinned by.** `uncovered_bytes_stay_inside_the_allowance_at_any_rate` (`log/tests/directories.rs`).
+all, and fails with `DirectoryUnavailable` beyond (the query design's section 4). Between a seal and the series
+directory write that covers it (a wait of up to one mark sync, which the writer forces, or until the deliverer takes
+the batches), a store with `segment_size` above 32 MiB is past half the allowance, and one above 64 MiB past all of
+it, although the writer runs normally.
+**Decision.** The series directory is written once the uncovered sealed bytes plus the largest of the last 16 seals
+would pass 32 MiB, and otherwise at least every 15 minutes (`log/src/directory/cadence.rs`, `format.md` A.18
+Cadence): between writes the uncovered bytes stay at most 32 MiB, and segments that seal by size (the default
+64 MiB) are covered at every seal, which is what the earlier rule did too, while small timed seals follow the
+15-minute rule. A reader past its allowance waits one mark-sync interval and tries again before
+`DirectoryUnavailable`. A `segment_size` ceiling was not taken: it would change a documented configuration range.
+The rule holds while one seal takes less time than a segment takes to fill (seals run before the directories on
+`kvik-maint`).
+**Pinned by.** `uncovered_bytes_stay_bounded_through_the_directories_at_any_rate`,
+`a_series_write_covers_the_seals_so_the_next_small_seal_waits` (`log/tests/directories.rs`).
 
 ## Q-774 — Where the derived files are laid out, their names and generations
 Recorded and decided by the lead in roadmap 9.0a (technical; the design's Q-736 makes them normative in Part A).
@@ -1520,9 +1524,15 @@ compare without reading every segment whole (the whole kept log, hours on a card
 two small positional reads, gives its last sequence, length and `file_crc32c`, and those replace the hash in the
 check (`log/src/directory/catalogue.rs`, `catalogue_from_disk`). A segment rewritten with the same trailer but other
 content would pass; A.9's copy-and-swap writes a new `file_id`, so a replaced segment does not.
-**Open.** With 6.3b the check uses the manifest's hash and the start stops listing `log/` for it.
+The cost is two small reads of every sealed segment at every start, in steps between the maintenance thread's
+other duties (105,000 segments a year at the home rate), and a full read of each segment no valid group record
+describes (after a restore, a lost `derived/`, or the first start with the derived files): background time only. A
+sealed segment whose trailer cannot be read at the start ends the listing below it (A.18 Contiguity). The root's
+epoch and lost ranges are those of the start: the manifest changes only at a start today (Q-704).
+**Open.** With 6.3b the check uses the manifest's hash, the start stops listing `log/` for it, and the root follows
+the manifest as it grows (a record per seal would otherwise make a reader parse a run's records at each call).
 
-## Q-776 — When the writer keeps a series directory across a reset
+## Q-776 — When the writer keeps a series directory across a reset or a loss
 Recorded by roadmap 9.0a. To be settled by roadmap 9.0b1, whose reader judges saved points in full.
 **Scenario.** A series directory written at `through` = 900 under stamp S; a power cut; the start writes a recovery
 entry with `after` = 950 and a new stamp S'. The file's positions are all kept, so it is still a function of the
@@ -1531,9 +1541,12 @@ kept log; a file with `through` above 950 would not be.
 can judge at its own start (`DirectoryStart::keeps`): same generation, and the current stamp or a `through` at or
 below the `after` of the recovery entry this start wrote or adopted. A file written under an earlier stamp and kept
 across a start without a reset of its own is therefore dropped at the next start and written again: conservative,
-never wrong.
+never wrong. A lost range is not a reset (the stamp does not change), so the file also records how many lost ranges
+at or below its `through` the manifest held (`format.md` A.18): one recorded since drops it, at the writer's start
+(`kept_series`, shared by `kvik`'s seed) and for a reader.
 **Pinned by.** `a_reset_below_the_series_directory_invalidates_it_and_one_above_keeps_it`,
-`a_restore_invalidates_every_file_of_the_older_generation` (`log/tests/directories.rs`).
+`a_restore_invalidates_every_file_of_the_older_generation`, `a_lost_range_recorded_below_the_series_directory_drops_it`
+(`log/tests/directories_check.rs`).
 
 ## Q-777 — The live candidate's write time and what bounded state cannot tell
 Recorded by roadmap 9.0a. To be settled by roadmap 9.0c, the first reader of the series directory.
@@ -1545,7 +1558,11 @@ in a versioned series, or the fact in force before a candidate later corrected t
 the candidate, the earliest and the latest good fact ahead, and in a versioned series up to 16 bad facts above the
 candidate; where that cannot tell, the entry sets "candidate unsure" (a fact ahead not named may have fallen due; a
 correction to bad; a versioned series continued from a file, until a candidate later than its latest `t`) or "more
-pending" (`kvik/src/durable/derived.rs`). The counts, latest `t` and lateness reference are always exact.
+pending" (`kvik/src/durable/derived.rs`). The counts, latest `t` and lateness reference are always exact. The
+judging time is recorded in the file (`judged_at`); a candidate above a reader's `now` is found again by
+`at(series, now)`. A pending fact continued from a file falls due as a candidate of value kind 0, "read at the
+position", since the entry holds no value or quality for it; in a versioned series a later version of its key makes
+what lies ahead unbounded.
 **Open.** Whether 9.0c's reader wants the latest fact ahead in the entry too (the reserved bytes allow it), which would
 clear most "more pending" marks.
 **Pinned by.** `the_fold_equals_a_full_index`, `a_fold_continued_from_a_directory_equals_the_whole_fold`,
@@ -1554,20 +1571,24 @@ clear most "more pending" marks.
 
 ## Q-778 — What the status file holds before the query envelope exists
 Recorded by roadmap 9.0a. To be settled by roadmap 9.0g (the pressure flag, slots) and 9.0e (`kvik health`).
-**Decision.** Health from what the writer holds in memory (the log's reasons and a fault); data-lost reasons are not
-in it, since finding them reads the log. The interval is the design's 60 s as a constant: no `status_interval`
+**Decision.** Health from what the writer holds in memory (the log's reasons); data-lost and manifest reasons are
+not in it, since finding them reads the log, so the file carries the flag "partial" until 9.0e and its level covers
+only the reasons it carries. A store that turns read-only writes no file more (`spec.md` §3 Write or sync failure):
+a file older than twice its interval says nothing about the writer, which A.18 tells a reader. The interval is the design's 60 s as a constant: no `status_interval`
 configuration key is added before 9.0e, so no user promise changes here. The pressure flag is written clear and the
 slot count 0; their fields are reserved in A.18.
 **Open.** The configuration key (`api.md`), and losses in the status file.
 
 ## Q-779 — Group numbers once compacted log segments are removed locally
-Recorded by roadmap 9.0a. To be settled by roadmap 6.3e, which removes log segments under Q-745's conditions.
+Recorded by roadmap 9.0a; settled at its review (technical), before roadmap 9.0b1 reads groups.
 **Scenario.** Groups hold the sealed segments 256n to 256n + 255 in position order. Once a compacted segment is removed
-locally (7 days after its compaction, Q-745), every later segment's ordinal moves down by one, so every later group
-no longer matches and is written again.
-**Open.** Number groups by the first segment's position or keep a removed segment's record marked removed, and decide
-how the root lists the compacted files that then serve those positions (C(E), the compacted catalogue: reserved in
-A.18).
+locally (7 days after its compaction, Q-745), every later segment's ordinal would move down by one, so every later
+group would no longer match and be written again.
+**Decision.** A full group's membership never changes: a segment removed locally keeps its record, with flag bit 1
+"not local", and is checked against the catalogue's description wherever it is (`format.md` A.18 Group body).
+Roadmap 6.3e writes the bit with the removal; what serves those positions then (C(E), the compacted files) stays
+reserved in the root.
+
 ## Q-754 — The lookup's batch maps across a reset stamp or generation
 Recorded by roadmap 11.0. To be settled by roadmap 9.0a, which adds reader processes that look up keys.
 **Scenario.** A reader in another process maps a segment's batches by lookup, then the writer restarts after a power
@@ -1655,7 +1676,7 @@ of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
 
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-754; the owner settled Q-750 at its review. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-754; the owner settled Q-750 at its review. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1729,13 +1750,13 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-751 | 5.6 | The recent windows' memory: constants per series and `limits.window_memory` store-wide, decided by the lead at the review of roadmap 11.0 |
 | Q-752 | 7.1b | A start bounded in memory but not in time until tree checkpoints carry the decision state; recorded by roadmap 11.0 |
 | Q-753 | 5.6 | The deliverer's recent window and its reads of the log; decided by the lead with roadmap 11.0 |
-| Q-773 | 9.0b1 | The series directory's cadence against a reader's allowance when `segment_size` is above 64 MiB; recorded by roadmap 9.0a |
+| Q-773 | 9.0b1 | The series directory's cadence against a reader's allowance; decided at 9.0a's review (recent seals, reader retry), to be confirmed by 9.0b1 |
 | Q-774 | 9.0b1 | The derived files' layout, names and generations; decided by the lead with roadmap 9.0a, awaiting review |
 | Q-775 | 6.3b | The log directory checked by trailers until the manifest lists sealed segments; recorded by roadmap 9.0a |
 | Q-776 | 9.0b1 | The writer's subset of the saved-point rule for a series directory across a reset; recorded by roadmap 9.0a |
 | Q-777 | 9.0c | The live candidate's write time and the unsure marks of bounded state; recorded by roadmap 9.0a |
 | Q-778 | 9.0g | The status file's health, interval and reserved pressure fields; recorded by roadmap 9.0a |
-| Q-779 | 6.3e | Group numbers once compacted log segments are removed locally; recorded by roadmap 9.0a |
+| Q-779 | 6.3e | Group numbers once compacted log segments are removed locally; settled at 9.0a's review ("not local" bit); 6.3e writes the bit |
 | Q-754 | 9.0a | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |

@@ -661,7 +661,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   returns the error. Positions are read in order, so a reader catching up (a consumer, a live read's tail) that
   cannot read a file returns the error for that file and reads nothing at or past it until it can; a query (roadmap
   9.0f) returns the error only if the file's segment index (`format.md` A.8) lists one of its series or the file has
-  entries, and otherwise passes over it. A manifest record a reader cannot take an epoch from is an
+  entries, or the index cannot be read either, and otherwise passes over it. A manifest record a reader cannot take an epoch from is an
   error of the manifest for the reader. Accepted residuals: a reader may read a mark that is not yet synced (from
   the page cache, before a start's sync of it or after that sync failed); the new reset stamp of the start that then
   truncates voids what it took. Corruption events reported by a pass that a start overtook (it truncated and wrote
@@ -676,7 +676,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   sealed bytes; the files speed reads up and never change a result. A series directory, or a root, is a function of
   the kept log while its `through` with the reset stamp it records, judged as a saved point (below), is kept or void
   above no lower position; the writer, which judges at each start, keeps one written under the current stamp or with
-  `through` at or below the `after` of the recovery entry its start wrote (Q-776). A part of the log directory whose
+  `through` at or below the `after` of the recovery entry its start wrote (Q-776); a lost range recorded at or below
+  a series directory's `through` since it was written makes it no longer one. A part of the log directory whose
   segments the catalogue no longer describes (a replaced segment, a restore, a manifest rebuild) is not used.
 - **Reset stamp and saved points.** The mark carries the current reset stamp: zero until the first reset, then
   the stamp of the last recovery entry a start wrote (§3 Recovery rules 1 and 3) or of the last restore record (§8
