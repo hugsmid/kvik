@@ -78,17 +78,24 @@ fn rec() -> Entry {
     })
 }
 
-/// One batch of one entries block holding `entries`, after a damaged word when `damaged` (so that the scan reads it
-/// on the bounded path, without checking its body again), then zeros: whether the scan keeps it.
+/// One batch of one entries block holding `entries`, then zeros: whether the scan keeps it. When `damaged`, a damaged
+/// word and a batch of one alias come first: the resynchronisation finds the alias batch, and the batch under test
+/// is read at the boundary after it, on the bounded path, without checking its body again.
 fn kept_after(entries: Vec<Entry>, damaged: bool) -> bool {
     let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
     if damaged {
         f.extend_from_slice(&[0xFF; 8]);
+        let at = f.len() as u64;
+        f.extend(
+            entries_batch(1, T0, &[alias(1, "a")])
+                .encode(&ID, at, 0)
+                .unwrap(),
+        );
     }
     let at = f.len() as u64;
     let mut b = BatchBuilder::new();
     let body = EntriesBlock {
-        first_sequence: 1,
+        first_sequence: 2,
         received_at: T0,
         entries,
     };

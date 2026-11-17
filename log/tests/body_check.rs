@@ -161,6 +161,30 @@ fn entry() -> impl Strategy<Value = (u8, Vec<(u16, Vec<u8>)>)> {
         (name.clone(), any::<i64>())
             .prop_map(|(n, t)| (6u8, vec![(20u16, t.to_le_bytes().to_vec()), (30, n)])),
         Just((0x80u8, Vec::new())),
+        prop::collection::vec(
+            prop_oneof![
+                Just(b"c1".to_vec()),
+                Just(b"C!".to_vec()),
+                Just(Vec::new()),
+                Just(vec![0xC3])
+            ],
+            0..3,
+        )
+        .prop_map(|consumers| {
+            let mut stamp = 5u64.to_le_bytes().to_vec();
+            stamp.extend_from_slice(&9u64.to_le_bytes());
+            let mut f = vec![
+                (40u16, 4u64.to_le_bytes().to_vec()),
+                (41, stamp),
+                (42, vec![7; 16]),
+                (43, 100u64.to_le_bytes().to_vec()),
+                (44, 1u32.to_le_bytes().to_vec()),
+                (45, vec![0]),
+                (46, 3u32.to_le_bytes().to_vec()),
+            ];
+            f.extend(consumers.into_iter().map(|c| (47u16, c)));
+            (8u8, f)
+        }),
         (any::<u32>(), states).prop_map(|(id, names)| {
             let mut d = definition(id, "s", "");
             d.1[3].1 = vec![3];
