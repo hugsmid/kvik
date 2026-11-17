@@ -1,8 +1,9 @@
 # kvik-chunk
 
 Column encodings and block bodies of kvik's compacted chunks, laid out in
-[`docs/format-chunk.md`](../docs/format-chunk.md) (roadmap 6.1). Part of the kvik storage engine; not published on its
-own.
+[`docs/format-chunk.md`](../docs/format-chunk.md) (roadmap 6.1), and the compacted segment and chunk index object
+around them, laid out in [`docs/format-compacted.md`](../docs/format-compacted.md) (roadmap 6.2a1). Part of the kvik
+storage engine; not published on its own.
 
 - `t`, positions and `changed_at`: delta, frame-of-reference bit-packed per 128 values.
 - `f64` values: scaled decimal with per-value exceptions, else XOR, compressed with zstd where that is smaller; every
@@ -33,6 +34,11 @@ let body = block.encode().unwrap();
 assert_eq!(Block::decode_canonical(&body).unwrap(), block);
 ```
 
-Tests: property tests (`tests/properties.rs`), golden bodies (`tests/golden/`), the fuzz entry over random and mutated
-inputs (`tests/fuzz_inputs.rs`), and a cargo-fuzz target in [`fuzz/`](fuzz/README.md). The size check against roadmap
+The `file` module writes a compacted segment one series at a time (`FileWriter`), reads it by position with every
+block bound to its parent's checksum (`CompactedFile`), extracts and reads its chunk index object (`extract`,
+`IndexObject`) and applies the canonical checks (`check_canonical`); the module's documentation has an example.
+
+Tests: property tests (`tests/properties.rs`, `tests/file_properties.rs`), damage and binding
+(`tests/file_damage.rs`), golden bodies and files (`tests/golden/`, `tests/golden/compacted/`), the fuzz entries over
+random and mutated inputs (`tests/fuzz_inputs.rs`), and cargo-fuzz targets in [`fuzz/`](fuzz/README.md). The size check against roadmap
 2.1 is `cargo run --release -p encodings --example chunk_sizes` ([`docs/measurements/6.1-encodings.md`](../docs/measurements/6.1-encodings.md)).

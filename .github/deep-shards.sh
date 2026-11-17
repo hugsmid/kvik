@@ -47,6 +47,7 @@ kvik-differential kvik differential
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
+chunk-file-properties chunk file_properties
 files-records   files records
 files-manifest  files manifest
 files-rebuild   files rebuild

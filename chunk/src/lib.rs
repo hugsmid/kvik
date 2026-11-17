@@ -1,4 +1,5 @@
-//! Column encodings of kvik's compacted chunks (`docs/format-chunk.md`, roadmap 6.1).
+//! Column encodings of kvik's compacted chunks (`docs/format-chunk.md`, roadmap 6.1), and the compacted segment and
+//! chunk index object around them ([`file`], `docs/format-compacted.md`, roadmap 6.2a1).
 //!
 //! A compacted segment holds per-series chunks; each chunk is split into blocks of at most [`MAX_ROWS`] rows, and
 //! each block body holds the rows' columns, each in its own encoding. This crate encodes and decodes one block
