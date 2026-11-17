@@ -236,11 +236,11 @@ A.10) is treated as a different boot. The rules apply in this order:
    record's in a restored generation, Q-264) to the next valid batch or, at the tail, to the mark's last position, is reported as `data_lost` when found and recorded in the manifest as a **lost range**
    by step 4 below; neither makes the store read-only. Its positions are not reused. A lost range is a reset point
    for consumers (§4 Resync). Because the first batch in a segment is acknowledged only once a synced mark names it
-   (Commit), a segment holding acknowledged batches that is damaged, zeroed or missing whole leaves a valid mark
-   naming a position in it or in a later segment, while the mark is readable, so its loss is a `data_lost` from that anchor at least up to the
-   mark's position, also when it was the only unsealed segment and no other source names a position (Q-630);
-   positions acknowledged above the durable mark and lost with it are a reset point under rule 1 or 3, as for any
-   tail beyond the mark.
+   (Commit), a segment holding acknowledged batches that is damaged, zeroed or missing whole leaves a valid mark naming
+   a position in it or in a later segment, while the mark is readable, so its loss is a `data_lost` from that anchor at
+   least up to the mark's position, also when it was the only unsealed segment and no other source names a position
+   (Q-630); positions acknowledged above the durable mark and lost with it are a reset point under rule 1 or 3, as for
+   any tail beyond the mark.
 3. **Different boot id** (the machine rebooted, the page cache is gone), or the mark missing, unreadable or stale
    (rule 1): any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
    batch's last position and the end of a lost range found at the tail under rule 2. Let F = 1 + the highest

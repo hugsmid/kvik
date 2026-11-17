@@ -476,10 +476,10 @@ exists; a new file is created only when none exists.
   at creation (ASCII, at most 15 bytes); `0x8001` creating software version (ignorable). The store id is the
   header's. The site-zone and tzdata entries (A.6) override fields 1 and 2 from their positions, so positions start
   at 1 with the application's entries (`spec.md` §5.7). A restore copies `STORE` unchanged.
-- **Creation** (only in a directory that does not exist or is empty): create the directory and sync its parent, so
-  the store's own entry is durable (directories above the parent that creation made are the caller's), create `LOCK`
-  and take the lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and the
-  directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
+- **Creation** (only in a directory that does not exist or is empty): create the directory and sync its parent, so the
+  store's own entry is durable (directories above the parent that creation made are the caller's), create `LOCK` and
+  take the lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and
+  the directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
   store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
 - **Open.** `STORE` valid: sync the directory (a creation cut short between the rename and that sync may have left
   `STORE` in the page cache only, as may a rebuild cut short between renaming `MANIFEST.new` and its directory sync,

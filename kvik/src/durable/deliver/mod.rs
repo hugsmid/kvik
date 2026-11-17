@@ -1,15 +1,15 @@
 //! Delivery on the durable backend (`spec.md` §4, §6; roadmap 5.2): consumers, their bounded queues, condition
 //! funnels, latches and durable cursors.
 //!
-//! Everything is read from the committed log. A [`Deliverer`] holds its own log reader and takes each batch, in
-//! commit order, once it is acknowledged (a batch holding an entry that is not a fact, or the first batch in a
-//! segment (Q-630), once the mark is synced past it, and every later batch behind it). Taking a batch applies its entries to the routing table and registry,
-//! enqueues its facts for the live consumers whose fact funnels select them, and evaluates their condition funnels
-//! ([`funnels`]) as the reference model does (`kvik_model::condition`), on the live state of roadmap 5.4. A consumer
-//! that is behind (resuming after a restart, or whose queue filled) reads the log from its position with the routes
-//! in force at each position, pausing at every reset point for a `resync` carrying `forget_above`, and ends a resume
-//! with a `resync` that carries each funnel's state now ([`resync`]). Confirmations move the cursor and the latches,
-//! which the cursor file holds ([`confirm`]).
+//! Everything is read from the committed log. A [`Deliverer`] holds its own log reader and takes each batch, in commit
+//! order, once it is acknowledged (a batch holding an entry that is not a fact, or the first batch in a segment
+//! (Q-630), once the mark is synced past it, and every later batch behind it). Taking a batch applies its entries to
+//! the routing table and registry, enqueues its facts for the live consumers whose fact funnels select them, and
+//! evaluates their condition funnels ([`funnels`]) as the reference model does (`kvik_model::condition`), on the live
+//! state of roadmap 5.4. A consumer that is behind (resuming after a restart, or whose queue filled) reads the log from
+//! its position with the routes in force at each position, pausing at every reset point for a `resync` carrying
+//! `forget_above`, and ends a resume with a `resync` that carries each funnel's state now ([`resync`]). Confirmations
+//! move the cursor and the latches, which the cursor file holds ([`confirm`]).
 //!
 //! The work is done on the calling thread of the call that needs it (an emit's acknowledgement, a poll, a
 //! confirmation, [`crate::Store::tick`]) and by the `kvik-deliver` thread ([`Hub`]), never on the writer thread.
