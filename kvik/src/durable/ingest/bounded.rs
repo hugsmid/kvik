@@ -2,7 +2,7 @@
 //! recorded without one, the duplicate rule and outranked facts. The reference model makes the same decisions
 //! inside its commit, which is not callable on its own; this follows it rule by rule, except where the
 //! specification has moved on (the first clause of `late` uses the lateness reference, spec §2.2), and the
-//! differential test in `tests/durable.rs` holds the two backends to the same outcomes.
+//! differential test in `tests/durable_differential.rs` holds the two backends to the same outcomes.
 //!
 //! Decisions are made in the order calls are queued in the log, against every fact already queued, so a call
 //! sees the calls before it whether or not their sync has returned yet. The facts are found as [`History`] says: in

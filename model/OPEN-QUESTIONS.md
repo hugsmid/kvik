@@ -2132,7 +2132,10 @@ ends the range at the mark's last position: the report runs from B's first posit
 fixes' decider takes that range (at a start as well) and forgets C and D, which are intact; their replays are
 recorded again.
 **Now.** The public report is built as before, wide bound included. The range a process removes from the index that
-answers its queries is the closed one (Q-938), so no query rests on the bound.
+answers its queries is the closed one (Q-938), so no query rests on the bound. The writer's loss watch reads the log
+in parts and ends the wide range at the last position of the part it met the region in; a reader process refreshes
+whole and ends it at the mark. So `losses()` in the two can differ in `last` for one such loss, after a long gap
+between polls and at a start that reads more than one part. Ending the report at the next batch read removes both.
 **Needed.** Whether the report ends at the next batch read (`first − 1`), as the closed range does; proposed test
 `damage_to_the_last_batch_of_a_sealed_segment_loses_only_that_batch`. A separate item.
 
