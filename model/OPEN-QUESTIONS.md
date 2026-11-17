@@ -1826,7 +1826,7 @@ its operating-system code. The view a round supersedes is freed after the flight
 `a_round_whose_leader_panics_ends_and_its_follower_leads_the_next`,
 `a_follower_after_unwound_rounds_reports_no_error_of_a_round_before_it_began`, and the loom tests of Q-901
 (`kvik/src/durable/read/flight.rs`); `concurrent_calls_equal_sequential_ones_at_the_same_cuts`,
-`many_calls_of_every_kind_from_many_threads_while_the_writer_writes` (`kvik/src/durable/read/tests.rs`).
+`many_calls_of_every_kind_from_many_threads_across_a_power_loss_and_a_restart` (`kvik/src/durable/read/tests.rs`).
 
 ## Q-903 — A call's cut when calls share views
 Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
