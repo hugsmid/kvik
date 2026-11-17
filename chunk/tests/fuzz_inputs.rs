@@ -127,9 +127,9 @@ proptest! {
         };
         let mut obj = object.clone();
         for (at, byte) in &edits {
-            let i = 64 + at.index(data.len() - 80);
+            let i = at.index(data.len());
             data[i] = *byte;
-            let j = 64 + at.index(obj.len() - 80);
+            let j = at.index(obj.len());
             obj[j] = *byte;
         }
         decode_compacted_resealed(&data);

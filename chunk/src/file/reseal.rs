@@ -5,6 +5,11 @@
 
 use kvik_log::crc::crc32c;
 
+/// A sum that saturates, so an offset read from the file can only miss the buffer, never overflow.
+fn sum(parts: &[usize]) -> usize {
+    parts.iter().fold(0usize, |a, &p| a.saturating_add(p))
+}
+
 fn get(b: &[u8], at: usize, n: usize) -> Option<&[u8]> {
     b.get(at..at.checked_add(n)?)
 }
@@ -48,7 +53,7 @@ fn seal(b: &mut [u8], at: usize) -> Option<u32> {
     let crc = crc_of(b, at)?;
     put_u32(b, at.checked_add(8)?, crc);
     let h = crc32c(get(b, at, 12)?);
-    put_u32(b, at + 12, h);
+    put_u32(b, sum(&[at, 12]), h);
     Some(crc)
 }
 
@@ -59,13 +64,13 @@ fn walk(b: &[u8], end: usize) -> Vec<usize> {
     while let Some(len) = at
         .checked_add(16)
         .filter(|&e| e <= end)
-        .and_then(|_| u32_at(b, at + 4))
+        .and_then(|_| u32_at(b, sum(&[at, 4])))
     {
         out.push(at);
         let next = (len as usize)
             .div_ceil(8)
             .checked_mul(8)
-            .and_then(|l| l.checked_add(at + 16));
+            .and_then(|l| l.checked_add(sum(&[at, 16])));
         match next {
             Some(n) if n <= end => at = n,
             _ => break,
@@ -97,11 +102,11 @@ pub fn reseal_segment(bytes: &[u8]) -> Vec<u8> {
 fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
     let trailer = seal_all(b)?;
     let t = trailer.checked_add(16)?;
-    let entries_offset = usize_at(b, t + 80)?;
-    let times_offset = usize_at(b, t + 88)?;
-    let times_dir = usize_at(b, t + 96)?;
-    let index_offset = usize_at(b, t + 104)?;
-    let root = usize_at(b, t + 112)?;
+    let entries_offset = usize_at(b, sum(&[t, 80]))?;
+    let times_offset = usize_at(b, sum(&[t, 88]))?;
+    let times_dir = usize_at(b, sum(&[t, 96]))?;
+    let index_offset = usize_at(b, sum(&[t, 104]))?;
+    let root = usize_at(b, sum(&[t, 112]))?;
     let root_records = |b: &[u8]| -> Vec<(usize, usize)> {
         let Some(rb) = body(b, root) else {
             return Vec::new();
@@ -113,7 +118,7 @@ fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
         (0..count.min(rb.len() / size.max(1)))
             .filter_map(|i| {
                 let r = 8usize.checked_add(size.checked_mul(i)?)?;
-                let off = usize_at(rb, r + 16)?;
+                let off = usize_at(rb, sum(&[r, 16]))?;
                 Some((r, index_offset.checked_add(off)?))
             })
             .collect()
@@ -132,11 +137,11 @@ fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
             let Some(e) = size.checked_mul(i).and_then(|x| x.checked_add(8)) else {
                 continue;
             };
-            let entry_at = block + 16 + e;
+            let entry_at = sum(&[block, 16, e]);
             let (Some(chunk), Some(chunk_len), Some(dir_len)) = (
-                usize_at(&ib, e + 56),
-                u32_at(&ib, e + 64),
-                u32_at(&ib, e + 68),
+                usize_at(&ib, sum(&[e, 56])),
+                u32_at(&ib, sum(&[e, 64])),
+                u32_at(&ib, sum(&[e, 68])),
             ) else {
                 continue;
             };
@@ -158,16 +163,16 @@ fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
                         continue;
                     };
                     let Some(data) =
-                        u32_at(&db, r + 16).and_then(|o| chunk.checked_add(o as usize))
+                        u32_at(&db, sum(&[r, 16])).and_then(|o| chunk.checked_add(o as usize))
                     else {
                         continue;
                     };
                     if let Some(c) = crc_of(b, data) {
-                        put_u32(b, dir + 16 + r + 28, c);
+                        put_u32(b, sum(&[dir, 16, r, 28]), c);
                     }
                 }
                 if let Some(c) = seal(b, dir) {
-                    put_u32(b, entry_at + 76, c);
+                    put_u32(b, sum(&[entry_at, 76]), c);
                 }
             }
         }
@@ -175,7 +180,7 @@ fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
     }
     for (r, block) in root_records(b) {
         if let Some(c) = crc_of(b, block) {
-            put_u32(b, root + 16 + r + 28, c);
+            put_u32(b, sum(&[root, 16, r, 28]), c);
         }
     }
     let root_crc = seal(b, root);
@@ -188,8 +193,8 @@ fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
             let Some(r) = size.checked_mul(i).and_then(|x| x.checked_add(8)) else {
                 continue;
             };
-            if let Some(c) = usize_at(&db, r + 40).and_then(|o| crc_of(b, o)) {
-                put_u32(b, times_dir + 16 + r + 4, c);
+            if let Some(c) = usize_at(&db, sum(&[r, 40])).and_then(|o| crc_of(b, o)) {
+                put_u32(b, sum(&[times_dir, 16, r, 4]), c);
             }
         }
     }
@@ -206,11 +211,11 @@ fn reseal_segment_in(b: &mut [u8]) -> Option<()> {
         (136, entries_crc),
     ] {
         if let Some(v) = v {
-            put_u32(b, t + at, v);
+            put_u32(b, sum(&[t, at]), v);
         }
     }
     let file = crc32c(b.get(..trailer)?);
-    put_u32(b, t + 120, file);
+    put_u32(b, sum(&[t, 120]), file);
     seal(b, trailer);
     Some(())
 }
@@ -226,11 +231,11 @@ pub fn reseal_index_object(bytes: &[u8]) -> Vec<u8> {
 fn reseal_index_object_in(b: &mut [u8]) -> Option<()> {
     let trailer = seal_all(b)?;
     let t = trailer.checked_add(16)?;
-    if let Some(c) = usize_at(b, t + 8).and_then(|root| crc_of(b, root)) {
-        put_u32(b, t + 28, c);
+    if let Some(c) = usize_at(b, sum(&[t, 8])).and_then(|root| crc_of(b, root)) {
+        put_u32(b, sum(&[t, 28]), c);
     }
     let file = crc32c(b.get(..trailer)?);
-    put_u32(b, t + 24, file);
+    put_u32(b, sum(&[t, 24]), file);
     seal(b, trailer);
     Some(())
 }
@@ -252,13 +257,11 @@ pub fn edit_blocks(
         if b.get(at) != Some(&ty) {
             continue;
         }
-        let Some(len) = u32_at(&b, at + 4).map(|l| l as usize) else {
+        let Some(len) = u32_at(&b, sum(&[at, 4])).map(|l| l as usize) else {
             continue;
         };
-        if let Some(body) = (at + 16)
-            .checked_add(len)
-            .and_then(|e| b.get_mut(at + 16..e))
-        {
+        let start = sum(&[at, 16]);
+        if let Some(body) = start.checked_add(len).and_then(|e| b.get_mut(start..e)) {
             edit(at, n, body);
             n += 1;
         }

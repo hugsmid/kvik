@@ -88,7 +88,6 @@ dependencies = [
 name = "kvik-chunk"
 version = "0.1.0"
 dependencies = [
- "crc",
  "kvik-log",
  "thiserror",
  "zstd",
