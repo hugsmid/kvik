@@ -493,7 +493,7 @@ impl Writer {
         let pending = {
             let log = self.log();
             let log = log.as_ref().ok_or(Error::Closed)?;
-            log.submit(vec![Item::Entry(entry.clone())])
+            log.submit(vec![Item::from(entry.clone())])
                 .map_err(|e| self.submit_error(e))?
         };
         let ack = pending.wait().map_err(|e| match e {

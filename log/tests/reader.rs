@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kvik_log::batch::SegmentIdentity;
-use kvik_log::content::{BatchContent, Item};
+use kvik_log::content::{BatchContent, Item, ItemRef};
 use kvik_log::entries::Entry;
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{Fs, MemFs, OpenMode, StdFs};
@@ -74,7 +74,7 @@ fn fact(series: u32, t: i64) -> Item {
 }
 
 fn alias(id: u32) -> Item {
-    Item::Entry(Entry::Alias {
+    Item::from(Entry::Alias {
         id,
         name: format!("a{id}"),
     })
@@ -510,7 +510,7 @@ fn a_returned_batch_truncated_after_a_page_cache_loss_on_the_same_boot_is_voided
     assert_eq!(stamp.sequence, 2);
     assert_ne!(stamp.nonce, 0);
     assert_eq!(u.state.stamp, stamp);
-    assert!(matches!(r.held.items[&2], Item::Entry(Entry::Recovery(_))));
+    assert!(matches!(r.held.items[&2].view(), ItemRef::Entry(Entry::Recovery(_))));
     r.check_held();
     r.check_caught_up();
 }
@@ -568,7 +568,7 @@ fn long_truncation(from: u64) {
     }
     r.refresh().unwrap();
     assert_eq!(r.held.items.len(), 90);
-    assert!(matches!(r.held.items[&1], Item::Entry(Entry::Recovery(_))));
+    assert!(matches!(r.held.items[&1].view(), ItemRef::Entry(Entry::Recovery(_))));
     // Every batch from position `from` on is damaged and the mark is lost: the start truncates them all.
     r.kill();
     let m = r.mark().unwrap();

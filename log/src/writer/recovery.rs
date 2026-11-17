@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::batch::{BatchBuilder, SegmentIdentity};
 use crate::body::IndexRecord;
-use crate::content::{BatchContent, Item};
+use crate::content::{BatchContent, Item, ItemRef};
 use crate::entries::{Entry, IntervalLength, MarkState, Recovery};
 use crate::fs::{FsFile, OpenMode};
 use crate::header::{FileHeader, HEADER_LEN, kind};
@@ -141,10 +141,7 @@ struct B {
 
 impl B {
     fn recovery(&self) -> Option<&Recovery> {
-        match self.content.items.as_slice() {
-            [Item::Entry(Entry::Recovery(r))] => Some(r),
-            _ => None,
-        }
+        self.content.recovery()
     }
 }
 
@@ -987,7 +984,7 @@ pub(super) fn start(
         .chain(segs.iter().flat_map(|s| {
             s.batches.iter().flat_map(|b| {
                 b.content.items.iter().filter_map(|i| match i {
-                    Item::Entry(e) => Some(e),
+                    Item::Entry(e) => Some(&**e),
                     Item::Fact(_) => None,
                 })
             })
@@ -1022,7 +1019,7 @@ pub(super) fn start(
                 continue;
             };
             for i in &content.items {
-                if let Item::Entry(Entry::Routing(r)) = i {
+                if let ItemRef::Entry(Entry::Routing(r)) = i.view() {
                     consumers.insert(r.consumer.clone());
                 }
             }
@@ -1265,9 +1262,9 @@ pub(super) fn start(
     // A batch superseded by a stopped reset's entry may have been acknowledged too.
     for &(i, j) in &p.superseded {
         for item in &segs[i].batches[j].content.items {
-            match item {
-                Item::Fact(r) => id_floor = id_floor.max(r.series_id),
-                Item::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
+            match item.view() {
+                ItemRef::Fact(r) => id_floor = id_floor.max(r.series_id),
+                ItemRef::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
                 _ => {}
             }
         }
@@ -1277,9 +1274,9 @@ pub(super) fn start(
         for &i in &in_use_idx {
             for b in segs[i].batches.iter().skip(p.kept[i]) {
                 for item in &b.content.items {
-                    match item {
-                        Item::Fact(r) => id_floor = id_floor.max(r.series_id),
-                        Item::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
+                    match item.view() {
+                        ItemRef::Fact(r) => id_floor = id_floor.max(r.series_id),
+                        ItemRef::Entry(Entry::Definition(d)) => id_floor = id_floor.max(d.id),
                         _ => {}
                     }
                 }
@@ -1289,15 +1286,15 @@ pub(super) fn start(
     for &i in &in_use_idx {
         for b in segs[i].batches.iter().take(p.kept[i]) {
             for item in &b.content.items {
-                match item {
-                    Item::Fact(r) => id_floor = id_floor.max(r.series_id),
-                    Item::Entry(Entry::Definition(d)) => {
+                match item.view() {
+                    ItemRef::Fact(r) => id_floor = id_floor.max(r.series_id),
+                    ItemRef::Entry(Entry::Definition(d)) => {
                         id_floor = id_floor.max(d.id);
                         if let Some(iv) = &d.interval {
                             intervals.insert(d.id, iv.clone());
                         }
                     }
-                    Item::Entry(Entry::Recovery(r)) => id_floor = id_floor.max(r.id_floor),
+                    ItemRef::Entry(Entry::Recovery(r)) => id_floor = id_floor.max(r.id_floor),
                     _ => {}
                 }
             }
@@ -1416,7 +1413,7 @@ pub(super) fn start(
             let content = BatchContent {
                 first_sequence: f_seq,
                 received_at: commit_time,
-                items: vec![Item::Entry(Entry::Recovery(entry.clone()))],
+                items: vec![Item::from(Entry::Recovery(entry.clone()))],
             };
             let builder: BatchBuilder = content.builder().expect("a recovery entry encodes");
             let need = builder.data_len() + 64;

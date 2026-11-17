@@ -58,7 +58,7 @@ fn facts(series: u32, from: i64, n: usize, text: usize) -> Vec<Item> {
 }
 
 fn definition(id: u32, interval: Option<IntervalLength>) -> Item {
-    Item::Entry(Entry::Definition(Box::new(Definition {
+    Item::from(Entry::Definition(Box::new(Definition {
         id,
         name: format!("s{id}"),
         kind: if interval.is_some() {
@@ -85,7 +85,7 @@ fn definition(id: u32, interval: Option<IntervalLength>) -> Item {
 }
 
 fn recovery() -> Item {
-    Item::Entry(Entry::Recovery(Recovery {
+    Item::from(Entry::Recovery(Recovery {
         after: 0,
         stamp: None,
         boot_id: BOOT,
@@ -228,7 +228,7 @@ fn history() -> H {
     h.submit(vec![definition(1, Some(day)), definition(2, None)]);
     h.submit(facts(1, T0, 40, 0));
     h.submit([facts(2, T0, 3, 17), facts(1, T0 + 100 * SECOND, 2, 0)].concat());
-    h.submit(vec![Item::Entry(Entry::Alias {
+    h.submit(vec![Item::from(Entry::Alias {
         id: 2,
         name: "a2".into(),
     })]);

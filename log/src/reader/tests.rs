@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use super::*;
+use crate::content::Item;
 use crate::fs::{FsFile, MemFs, OpenMode};
 
 fn file(len: usize) -> Box<dyn FsFile> {
@@ -681,7 +682,7 @@ mod parts_and_lookup {
             id_floor: 0,
             consumers: Vec::new(),
         };
-        log.submit(vec![Item::Entry(crate::entries::Entry::Recovery(r))])
+        log.submit(vec![Item::from(crate::entries::Entry::Recovery(r))])
             .unwrap()
             .wait()
             .unwrap();

@@ -200,7 +200,7 @@ proptest! {
                         expected.push(ModelItem::Fact(f));
                     }
                     ModelItem::Event(e) => {
-                        log_items.push(Item::Entry(event_to_entry(&e)));
+                        log_items.push(Item::from(event_to_entry(&e)));
                         expected.push(ModelItem::Event(e));
                     }
                 }

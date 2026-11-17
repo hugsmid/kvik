@@ -31,7 +31,7 @@
 //! let store = StoreDir::open(Arc::new(MemFs::new()), Path::new("store"), Some(&new)).unwrap();
 //! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO, 0).unwrap();
 //! let log = Log::start(writer, Arc::new(SystemClock::default())).unwrap();
-//! let alias = Item::Entry(Entry::Alias { id: 1, name: "hall".into() });
+//! let alias = Item::from(Entry::Alias { id: 1, name: "hall".into() });
 //! // Acknowledged after the batch's sync and, as it holds an entry that is not a fact, the mark's sync.
 //! let ack = log.submit(vec![alias]).unwrap().wait().unwrap();
 //! assert_eq!(ack.first.sequence, 1);
@@ -64,7 +64,7 @@ pub use threads::{Clock, Log, Pending, SubmitError, SystemClock, Watch};
 use crate::batch::SegmentIdentity;
 use crate::block::{BLOCK_HEADER_LEN, block_type};
 use crate::body::{COMMIT_LEN, IndexRecord};
-use crate::content::{BatchContent, Item};
+use crate::content::{BatchContent, Item, ItemRef};
 use crate::entries::{Entry, IntervalLength};
 use crate::error::EncodeError;
 use crate::fs::{Fs, FsFile};
@@ -1294,8 +1294,8 @@ impl LogWriter {
         seg.has_entries |= builder.block_types().any(|t| t == block_type::ENTRIES);
         let (file_id, offset) = (seg.id.file_id, seg.write_offset);
         for item in &content.items {
-            match item {
-                Item::Fact(r) => {
+            match item.view() {
+                ItemRef::Fact(r) => {
                     let reach = reach(r.t, intervals.get(&r.series_id));
                     let rec = seg.index.entry(r.series_id).or_insert(IndexRecord {
                         series_id: r.series_id,
@@ -1307,13 +1307,13 @@ impl LogWriter {
                     rec.min_t = rec.min_t.min(r.t);
                     rec.max_t = rec.max_t.max(reach);
                 }
-                Item::Entry(Entry::Definition(d)) => {
+                ItemRef::Entry(Entry::Definition(d)) => {
                     *max_series_id = (*max_series_id).max(d.id);
                     if let Some(i) = &d.interval {
                         intervals.insert(d.id, i.clone());
                     }
                 }
-                Item::Entry(_) => {}
+                ItemRef::Entry(_) => {}
             }
         }
         if let Some(n) = next {

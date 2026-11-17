@@ -298,7 +298,7 @@ fn a_mark_sync_leaves_the_estimate_alone() {
                 s.push();
             } else {
                 // An alias is not a fact: its batch forces a mark sync.
-                s.push_items(vec![Item::Entry(Entry::Alias {
+                s.push_items(vec![Item::from(Entry::Alias {
                     id: k,
                     name: format!("a{k}"),
                 })]);

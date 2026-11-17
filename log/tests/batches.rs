@@ -367,8 +367,8 @@ fn entry() -> impl Strategy<Value = Entry> {
 
 fn content() -> impl Strategy<Value = BatchContent> {
     let items = prop_oneof![
-        1 => recovery().prop_map(|r| vec![Item::Entry(Entry::Recovery(r))]),
-        6 => prop::collection::vec(prop_oneof![row().prop_map(Item::Fact), entry().prop_map(Item::Entry)], 1..30),
+        1 => recovery().prop_map(|r| vec![Item::from(Entry::Recovery(r))]),
+        6 => prop::collection::vec(prop_oneof![row().prop_map(Item::Fact), entry().prop_map(Item::from)], 1..30),
     ];
     (1u64..1 << 40, any::<i64>(), items).prop_map(|(first_sequence, received_at, items)| {
         BatchContent {
@@ -1592,13 +1592,13 @@ fn blocks_split_canonically() {
     };
     // Arrival order: entries, facts, entries again.
     let items = vec![
-        Item::Entry(Entry::Alias {
+        Item::from(Entry::Alias {
             id: 1,
             name: "a".into(),
         }),
         fact(Value::Bool(true)),
         fact(Value::Bool(false)),
-        Item::Entry(Entry::Retirement { id: 1, t_r: T0 }),
+        Item::from(Entry::Retirement { id: 1, t_r: T0 }),
     ];
     let blocks = c(items).blocks().unwrap();
     let firsts: Vec<_> = blocks
@@ -1651,7 +1651,7 @@ fn a_recovery_entry_is_alone_in_its_batch() {
     let c = BatchContent {
         first_sequence: 5,
         received_at: T0,
-        items: vec![Item::Entry(rec()), fact(Value::Bool(true))],
+        items: vec![Item::from(rec()), fact(Value::Bool(true))],
     };
     assert_eq!(
         c.blocks().err(),
@@ -1690,7 +1690,7 @@ fn a_recovery_entry_is_alone_in_its_batch() {
     let alone = BatchContent {
         first_sequence: 1,
         received_at: T0,
-        items: vec![Item::Entry(rec())],
+        items: vec![Item::from(rec())],
     };
     let (s, _) = segment(ID, 1024, 1, &[(alone.builder().unwrap(), T0)]);
     let r = scan(s.bytes(), &ID, ScanLimit::End).unwrap();

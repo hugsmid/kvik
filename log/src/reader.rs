@@ -55,7 +55,7 @@
 //! let store = StoreDir::open(fs.clone(), Path::new("store"), Some(&new)).unwrap();
 //! let writer = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), Duration::ZERO, 0).unwrap();
 //! let log = Log::start(writer, Arc::new(SystemClock::default())).unwrap();
-//! let alias = Item::Entry(Entry::Alias { id: 1, name: "hall".into() });
+//! let alias = Item::from(Entry::Alias { id: 1, name: "hall".into() });
 //! log.submit(vec![alias.clone()]).unwrap().wait().unwrap();
 //!
 //! // Another handle on the same files: no lock, no thread.
@@ -74,10 +74,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::batch::SegmentIdentity;
-use crate::content::{BatchContent, Item};
+use crate::content::BatchContent;
 use crate::content_error::BodyError;
 use crate::crc::crc32c;
-use crate::entries::Entry;
 use crate::error::FormatError;
 use crate::fs::Fs;
 use crate::header::HEADER_LEN;
@@ -232,10 +231,7 @@ pub struct ReadBatch {
 impl ReadBatch {
     /// The recovery entry this batch holds, if it is one (`spec.md` §3 Recovery rule 3).
     pub fn recovery(&self) -> Option<&crate::entries::Recovery> {
-        match self.content.items.as_slice() {
-            [Item::Entry(Entry::Recovery(r))] => Some(r),
-            _ => None,
-        }
+        self.content.recovery()
     }
 }
 

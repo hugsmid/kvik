@@ -806,7 +806,7 @@ struct World {
 fn item_of(e: &ModelEntry, types: &BTreeMap<u32, ValueType>) -> Item {
     match &e.body {
         EntryBody::Fact(f) => Item::Fact(fact_to_row(f, types[&f.series.0])),
-        EntryBody::Registry(ev) => Item::Entry(event_to_entry(ev)),
+        EntryBody::Registry(ev) => Item::from(event_to_entry(ev)),
         EntryBody::Route(_) => unreachable!("no routing change is generated"),
         EntryBody::Recovery(_) => unreachable!("a recovery entry is never committed"),
     }
@@ -875,7 +875,7 @@ impl World {
             "the model is read-only, the log is not"
         );
         let (now, wall) = self.clocks();
-        let alias = Item::Entry(LogEntry::Alias {
+        let alias = Item::from(LogEntry::Alias {
             id: 0,
             name: "refused".into(),
         });
@@ -1473,7 +1473,7 @@ impl World {
                 last + 1,
                 "dense positions: no lost range is made"
             );
-            if let [Item::Entry(LogEntry::Recovery(r))] = b.items.as_slice() {
+            if let Some(r) = b.recovery() {
                 assert_eq!(
                     r.after, last,
                     "a recovery entry follows the last kept position"

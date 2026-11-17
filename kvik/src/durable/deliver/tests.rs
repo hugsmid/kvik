@@ -52,7 +52,7 @@ fn a_reader_at_the_writers_durable_position_only_renews_its_lease_when_due() {
     .unwrap();
     let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
     let alias = |id| {
-        vec![Item::Entry(Entry::Alias {
+        vec![Item::from(Entry::Alias {
             id,
             name: format!("a{id}"),
         })]

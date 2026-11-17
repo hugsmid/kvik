@@ -361,8 +361,8 @@ fn golden_files_decode_to_what_they_show() {
     let content = kvik_log::content::BatchContent::decode(&r.batches[1]).unwrap();
     assert_eq!(content.items.len(), 3);
     assert!(matches!(
-        content.items[1],
-        kvik_log::content::Item::Entry(kvik_log::entries::Entry::Ignored { count: 1 })
+        content.items[1].view(),
+        kvik_log::content::ItemRef::Entry(kvik_log::entries::Entry::Ignored { count: 1 })
     ));
     for (name, element) in [
         ("unknown-critical-column.open", Element::Column(0x10)),

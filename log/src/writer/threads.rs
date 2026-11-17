@@ -714,7 +714,7 @@ mod tests {
         .unwrap();
         let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
         let alias = |id| {
-            Item::Entry(Entry::Alias {
+            Item::from(Entry::Alias {
                 id,
                 name: format!("a{id}"),
             })

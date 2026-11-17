@@ -92,7 +92,7 @@ fn concurrent_callers_get_dense_positions_and_every_batch_is_on_disk() {
                 for i in 0..150i64 {
                     let mut items: Vec<Item> = (0..1 + i % 3).map(|k| fact(t, i * 4 + k)).collect();
                     if i % 37 == 0 {
-                        items.push(Item::Entry(Entry::Alias {
+                        items.push(Item::from(Entry::Alias {
                             id: t,
                             name: format!("t{t}-{i}"),
                         }));
@@ -398,7 +398,7 @@ fn smoke_on_the_real_file_system() {
     for i in 0..400i64 {
         let mut items = vec![fact(1, i), fact(2, i)];
         if i % 100 == 0 {
-            items.push(Item::Entry(Entry::Alias {
+            items.push(Item::from(Entry::Alias {
                 id: 1,
                 name: format!("n{i}"),
             }));

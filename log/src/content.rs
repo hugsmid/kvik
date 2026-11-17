@@ -15,11 +15,34 @@ use crate::facts::{FactRow, FactsBlock, MAX_PLAIN_LEN};
 pub enum Item {
     /// A reading.
     Fact(FactRow),
+    /// Any other entry, boxed so that an item is the size of a fact row.
+    Entry(Box<Entry>),
+}
+
+/// An item by reference with its entry unboxed, for matching.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ItemRef<'a> {
+    /// A reading.
+    Fact(&'a FactRow),
     /// Any other entry.
-    Entry(Entry),
+    Entry(&'a Entry),
+}
+
+impl From<Entry> for Item {
+    fn from(e: Entry) -> Self {
+        Item::Entry(Box::new(e))
+    }
 }
 
 impl Item {
+    /// The item by reference, for matching an entry's variant.
+    pub fn view(&self) -> ItemRef<'_> {
+        match self {
+            Self::Fact(r) => ItemRef::Fact(r),
+            Self::Entry(e) => ItemRef::Entry(e),
+        }
+    }
+
     /// The sequences this item takes: 1, or the count of an [`Entry::Ignored`].
     pub fn sequences(&self) -> u64 {
         match self {
@@ -59,6 +82,17 @@ pub struct BatchContent {
 }
 
 impl BatchContent {
+    /// The recovery entry this batch holds, if it is one (A.6: a recovery entry is alone in its batch).
+    pub fn recovery(&self) -> Option<&crate::entries::Recovery> {
+        match self.items.as_slice() {
+            [Item::Entry(e)] => match &**e {
+                Entry::Recovery(r) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The last sequence.
     pub fn last_sequence(&self) -> u64 {
         self.first_sequence + self.items.iter().map(Item::sequences).sum::<u64>() - 1
@@ -75,7 +109,7 @@ impl BatchContent {
         if let Some(k) = self
             .items
             .iter()
-            .position(|i| matches!(i, Item::Entry(Entry::Ignored { .. })))
+            .position(|i| matches!(i, Item::Entry(e) if matches!(**e, Entry::Ignored { .. })))
         {
             return Err(EncodeError::Content(ContentError::FieldPresence {
                 entry: k as u32,
@@ -123,7 +157,7 @@ impl BatchContent {
                     }
                 }
                 Item::Entry(e) => {
-                    let len = entry_len(e);
+                    let (e, len) = (&**e, entry_len(e));
                     match out.last_mut() {
                         Some(DataBody::Entries(b))
                             if entries_len + len <= u64::from(MAX_BODY_LEN) =>
@@ -202,7 +236,7 @@ impl BatchContent {
                 }
                 DataBody::Entries(e) => {
                     received_at.get_or_insert(e.received_at);
-                    items.extend(e.entries.into_iter().map(Item::Entry));
+                    items.extend(e.entries.into_iter().map(Item::from));
                 }
             }
         }
@@ -272,4 +306,14 @@ pub(crate) fn check_block(
             (prefix, recovery, Some(DataBody::Entries(e)))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_item_is_the_size_of_a_fact_row_and_its_tag() {
+        assert!(std::mem::size_of::<Item>() <= std::mem::size_of::<FactRow>() + 8);
+    }
 }

@@ -658,7 +658,9 @@ fn scan_new(
                 min_t,
                 max_t,
             });
-            if let [Item::Entry(crate::entries::Entry::Recovery(r))] = content.items.as_slice() {
+            if let [Item::Entry(e)] = content.items.as_slice()
+                && let crate::entries::Entry::Recovery(r) = &**e
+            {
                 map.recovery = true;
                 let after = Position {
                     generation: g,
