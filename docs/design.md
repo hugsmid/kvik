@@ -70,8 +70,8 @@ with ALP for decimal `f64` data, about 1 % for the same series declared as scale
 dictionary on low-cardinality converted values; an `f64` dictionary for such blocks is worth a look. Gate 10.3
 confirms the format against Parquet.
 
-**Crafted files.** The restart budget covers files the engine wrote, damaged or not; an undamaged segment is read in
-one pass of direct checksums (Q-231). A file crafted by a process with write access to the store has its cost bounded by
+**Crafted files.** The restart budget covers files the engine wrote, damaged or not; an undamaged segment is read in one
+pass of direct checksums (Q-231). A file crafted by a process with write access to the store has its cost bounded by
 `format.md` A, common rules (scan bound; Q-110): about 2L bytes checksummed and 16 block headers per 8 bytes for a file
 of L bytes, and failed full reads checking at most 16 MiB of body per window (8 MiB in a segment, 16 MiB in the
 manifest), past which the rest of the window is passed as damaged and reported with the damage around it; damage does
@@ -79,14 +79,19 @@ not reach that budget. Each kept body is checked once, and the checks keep nothi
 (Q-651). Measured in a release build on one shared 4-core cloud machine, against the bound (264 MiB of bodies for a 64
 MiB segment): the body checks of a crafted segment cost at most about 0.8 s at 64 MiB and 0.22 s at 16 MiB, and those of
 a crafted manifest about 0.09 s per 16 MiB at a start and 0.15 s at a refresh, within the 1 s restart budget. The header
-reads are bounded in count but not yet in time: a file with a valid block header every 8 bytes and no body checksum that
-holds measured 7.75 s for a 64 MiB segment and 1.2 to 1.3 s for a 16 MiB manifest, above the budget, until roadmap 4.9e
-bounds that walk (Q-873). Files built to the body bound measured 0.22 s (nested facts images over every window of a 64
-MiB segment; 0.90 s before), 0.10 s (64 MiB of batches whose rows share one text value, after damage; 1.85 s before) and
-0.08 s (a 16 MiB manifest window of rejected records; 0.15 s before) at a start. Every entry type, small and large,
-costs at most about 2.9 ns a byte to check, a definition of 65,536 state names of two 4-byte characters being the
-dearest (definitions of short names 5.2 to 5.7 ns before; small definitions and routing entries 3 to 5.5 ns before,
-about 1 ns now), so nested entries bodies over the bound cost at most about 0.8 s at 64 MiB (Q-870).
+walk is bounded in time too (Q-873): each 8-byte step's header is read once, where its chain of block headers comes to
+is kept in a ring of 4-byte entries, and a step is a candidate exactly when that entry names it, so no chain is walked
+twice. The failed reads and the direct read (200 MiB of the bound's bodies, about 0.6 s) are reached only through
+overlapping bodies; the rest of a crafted segment's cost is one pass over its own bytes, whose dearest shapes built
+measured 0.20 to 0.36 s for 64 MiB (a valid block header every 8 bytes 0.24 s, 7.75 s before). So a crafted segment
+costs at most about 0.98 s at 64 MiB and 0.3 s at 16 MiB, and a crafted manifest at most about 0.35 s per 16 MiB (its
+header walk 0.15 to 0.18 s, 1.2 to 1.3 s before): within the budget (Q-970). Files built to the body bound measured 0.22
+s (nested facts images over every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches whose rows share
+one text value, after damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records; 0.15 s before) at
+a start. Every entry type, small and large, costs at most about 2.9 ns a byte to check, a definition of 65,536 state
+names of two 4-byte characters being the dearest (definitions of short names 5.2 to 5.7 ns before; small definitions and
+routing entries 3 to 5.5 ns before, about 1 ns now), so nested entries bodies over the bound cost at most about 0.8 s at
+64 MiB (Q-870).
 
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).

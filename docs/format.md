@@ -41,7 +41,8 @@ specified here before the roadmap item that writes it.
 - **Scan bound.** A reader's work on a file of L bytes is bounded whatever its bytes. At most 2L bytes are
   checksummed, plus, in a log segment, once more the bytes of the one direct read that found the first damage (at most
   a batch, 8 MiB). Block headers are read at most 16 times per 8 bytes. Working memory, beyond the file and what the
-  read reports, is about one batch in a segment and one block (16 MiB) in the manifest. A body checksum is derived from
+  read reports, is about one batch in a segment, with 8 MiB of chain ends once damage is found, and one block (16 MiB)
+  in the manifest. A body checksum is derived from
   a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes (Q-110).
   A body whose checksum holds is checked by its type (A.5, A.6, A.14). A **failed read** is a candidate read in full,
   with at least one body checked, that is rejected: a resynchronisation candidate or a boundary read that keeps no
@@ -65,11 +66,25 @@ specified here before the roadmap item that writes it.
   at most about 1.3 ns for every other entry and about 0.5 ns for facts, so the body checks of a crafted segment cost
   at most about 0.8 s at 64 MiB and 0.22 s at 16 MiB, against 29 to 170 ms for an undamaged one; those of a crafted
   manifest at most about 0.09 s per 16 MiB for the start's reader and 0.15 s for the whole-file reader (Q-651). The
-  header reads are bounded in count, not yet in time: a file holding a valid block header every 8 bytes, each with a
-  body checksum that does not hold, checks no body and fails no read, and measured 7.75 s for a 64 MiB segment and
-  1.2 to 1.3 s for a 16 MiB manifest. Bounding that walk to the restart budget is roadmap 4.9e (Q-873). An undamaged
-  segment is read in one pass of direct checksums; the bounded
-  reading starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231).
+  header walk is bounded in time too (Q-873). Resynchronisation reads each 8-byte step's header once, a batch ahead of
+  the candidates, and keeps where the chain of block headers from it comes to: a 4-byte entry per step in a ring
+  indexed by offset, found 4 MiB of steps at a time from the highest down, a step taking its successor's entry when the
+  successor lies in the same block and each block passing its ends back to the steps whose chains enter it. A step is a
+  candidate exactly when its own entry is a commit block that names it, so no chain is walked twice. The tail's commit
+  search reads a header only where a commit block starts, a header the chain ends found valid is read again without its
+  checksum, a boundary read keeps no verdict for the blocks of a batch it keeps, and a CRC shift costs at most eight
+  lookups in nibble tables, so a manifest step reads one header and takes at most one checksum. Of the 264 MiB of
+  bodies, those of failed reads and the direct read (200 MiB, about 0.6 s) are reached only by overlapping bodies; the
+  rest of a crafted segment's cost is one pass over its own bytes: the header walk, candidates read in full without a
+  body check, the tail's commit blocks, and kept batches with their bodies. The dearest shapes built measured (release
+  build, one shared 4-core cloud machine, the best of five) 0.20 to 0.36 s for 64 MiB: a valid header every 8 bytes
+  0.24 s (5.7 s before; 7.75 s at the re-check), commit blocks naming data headers 0.21 s (3.1 s), candidates whose
+  framing holds 0.23 s (0.8 s), chains of empty skippable blocks read in full 0.34 s (1.1 s), kept batches of them
+  after damage 0.36 s (0.76 s), kept batches of the dearest entries after damage 0.20 s. So a crafted segment costs at
+  most about 0.98 s at 64 MiB and 0.3 s at 16 MiB (Q-970); a crafted manifest's header walk measured 0.15 to 0.18 s per
+  16 MiB with either reader (0.84 to 0.89 s before), at most about 0.35 s with its body checks: within the 1 s restart
+  budget. An undamaged segment is read in one pass of direct checksums; the bounded reading starts at the first
+  boundary read that finds no complete batch and holds to the end of the scan (Q-231).
   Apart from the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
 
 ### A.1 File header (64 bytes, every file except the mark)
