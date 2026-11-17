@@ -55,10 +55,14 @@ pub struct Description {
     pub inputs: Vec<Input>,
     /// Fields 8 and 9: the first and last series name of a split part.
     pub name_range: Option<(String, String)>,
+    /// Field 10: the positions held per generation, generations strictly ascending, each count at least 1.
+    pub positions: Vec<(u32, u64)>,
     /// Field 11: the file holds entries.
     pub has_entries: bool,
     /// Field 12: the file holds set-aside chunks.
     pub has_set_aside: bool,
+    /// Field 13: every element of every input was known and carried (Q-809, Q-810).
+    pub complete: bool,
 }
 
 const CLASS: u16 = 1;
@@ -70,9 +74,14 @@ const RUN_COUNT: u16 = 6;
 const INPUTS: u16 = 7;
 const FIRST_NAME: u16 = 8;
 const LAST_NAME: u16 = 9;
+const POSITIONS: u16 = 10;
 const HAS_ENTRIES: u16 = 11;
 const HAS_SET_ASIDE: u16 = 12;
+const COMPLETE: u16 = 13;
 const INPUT_LEN: usize = 12;
+const GENERATION_LEN: usize = 16;
+/// The most generations field 10 holds: its value fits a field.
+const MAX_GENERATIONS: usize = u16::MAX as usize / GENERATION_LEN;
 
 pub(crate) fn push_field(out: &mut Vec<u8>, id: u16, value: &[u8]) {
     out.extend_from_slice(&id.to_le_bytes());
@@ -123,6 +132,13 @@ impl Description {
         {
             return Err("description name range");
         }
+        if self.positions.is_empty()
+            || self.positions.len() > MAX_GENERATIONS
+            || !self.positions.windows(2).all(|w| w[0].0 < w[1].0)
+            || self.positions.iter().any(|&(_, n)| n == 0)
+        {
+            return Err("description positions per generation");
+        }
         if (self.has_entries && self.class != Class::Current)
             || (self.has_set_aside && self.class != Class::Revision)
         {
@@ -150,11 +166,21 @@ impl Description {
             push_field(&mut b, FIRST_NAME, first.as_bytes());
             push_field(&mut b, LAST_NAME, last.as_bytes());
         }
-        if self.has_entries {
-            push_field(&mut b, HAS_ENTRIES, &[]);
+        let mut positions = Vec::with_capacity(GENERATION_LEN * self.positions.len());
+        for &(g, n) in &self.positions {
+            positions.extend_from_slice(&g.to_le_bytes());
+            positions.extend_from_slice(&[0; 4]);
+            positions.extend_from_slice(&n.to_le_bytes());
         }
-        if self.has_set_aside {
-            push_field(&mut b, HAS_SET_ASIDE, &[]);
+        push_field(&mut b, POSITIONS, &positions);
+        for (flag, id) in [
+            (self.has_entries, HAS_ENTRIES),
+            (self.has_set_aside, HAS_SET_ASIDE),
+            (self.complete, COMPLETE),
+        ] {
+            if flag {
+                push_field(&mut b, id, &[]);
+            }
         }
         b
     }
@@ -163,8 +189,14 @@ impl Description {
     /// ignorable one (`≥ 0x8000`) skipped; then [`Description::check`].
     pub(crate) fn decode(body: &[u8]) -> Result<Self, Bad> {
         let fields = parse_fields(body).ok_or(Bad::body("description field list"))?;
+        if let Some(&(id, _)) = fields
+            .iter()
+            .find(|&&(id, _)| id < 0x8000 && !(CLASS..=COMPLETE).contains(&id))
+        {
+            return Err(Bad::Unsupported(FileElement::DescriptionField(id)));
+        }
         let mut last = 0u16;
-        let mut got: [Option<&[u8]>; 13] = [None; 13];
+        let mut got: [Option<&[u8]>; 14] = [None; 14];
         for &(id, v) in &fields {
             if id >= 0x8000 {
                 continue;
@@ -173,10 +205,7 @@ impl Description {
                 return Err(Bad::body("description field order"));
             }
             last = id;
-            match id {
-                CLASS..=LAST_NAME | HAS_ENTRIES | HAS_SET_ASIDE => got[usize::from(id)] = Some(v),
-                _ => return Err(Bad::Unsupported(FileElement::DescriptionField(id))),
-            }
+            got[usize::from(id)] = Some(v);
         }
         let fixed = |id: u16, n: usize| {
             got[usize::from(id)]
@@ -223,6 +252,21 @@ impl Description {
             (None, None) => None,
             _ => return Err(Bad::body("description name range")),
         };
+        let raw = got[usize::from(POSITIONS)].ok_or(Bad::body("description positions missing"))?;
+        if raw.len() % GENERATION_LEN != 0 {
+            return Err(Bad::body("description positions per generation"));
+        }
+        let positions = raw
+            .as_chunks::<GENERATION_LEN>()
+            .0
+            .iter()
+            .map(|c| {
+                (
+                    u32::from_le_bytes(c[..4].try_into().unwrap_or_default()),
+                    u64::from_le_bytes(c[8..].try_into().unwrap_or_default()),
+                )
+            })
+            .collect();
         let flag = |id: u16| match got[usize::from(id)] {
             None => Ok(false),
             Some([]) => Ok(true),
@@ -237,8 +281,10 @@ impl Description {
             run_count: u32::from_le_bytes(fixed(RUN_COUNT, 4)?.try_into().unwrap_or_default()),
             inputs,
             name_range,
+            positions,
             has_entries: flag(HAS_ENTRIES)?,
             has_set_aside: flag(HAS_SET_ASIDE)?,
+            complete: flag(COMPLETE)?,
         };
         d.check().map_err(Bad::body)?;
         Ok(d)
@@ -269,8 +315,10 @@ mod tests {
                 },
             ],
             name_range: Some(("a".into(), "b/c".into())),
+            positions: vec![(1, 5), (3, 2)],
             has_entries: false,
             has_set_aside: true,
+            complete: true,
         }
     }
 
@@ -289,10 +337,18 @@ mod tests {
         push_field(&mut ignorable, 0x8001, &[9, 9]);
         assert_eq!(Description::decode(&ignorable), Ok(sample()));
         let mut critical = base.clone();
-        push_field(&mut critical, 13, &[]);
+        push_field(&mut critical, 14, &[]);
         assert_eq!(
             Description::decode(&critical),
-            Err(Bad::Unsupported(FileElement::DescriptionField(13)))
+            Err(Bad::Unsupported(FileElement::DescriptionField(14)))
+        );
+        let mut first = vec![];
+        push_field(&mut first, 0, &[]);
+        first.extend_from_slice(&base);
+        assert_eq!(
+            Description::decode(&first),
+            Err(Bad::Unsupported(FileElement::DescriptionField(0))),
+            "an unknown critical field is refused before the order is judged"
         );
         let mut class = base.clone();
         class[4] = 3;
@@ -325,6 +381,18 @@ mod tests {
             },
             Description {
                 name_range: Some(("b".into(), "a".into())),
+                ..sample()
+            },
+            Description {
+                positions: vec![(3, 2), (1, 5)],
+                ..sample()
+            },
+            Description {
+                positions: vec![(1, 0)],
+                ..sample()
+            },
+            Description {
+                positions: vec![],
                 ..sample()
             },
         ] {

@@ -11,7 +11,7 @@ use super::block_type;
 use super::desc::Class;
 use super::error::{Fault, FileElement, FileError};
 use super::layout::Identity;
-use super::parts::{IndexEntry, RootRecord, TimesRecord, Trailer, decode_index_block};
+use super::parts::{ENTRY_LEN, IndexEntry, RootRecord, TimesRecord, Trailer, decode_index_block};
 use super::source::ReadAt;
 use super::stats::Bounds;
 use super::write::Fact;
@@ -121,7 +121,9 @@ impl Index {
         at: u64,
     ) -> Result<Self, FileError> {
         let sum: u64 = records.iter().map(|r| u64::from(r.entry_count)).sum();
-        let placed = records.first().is_none_or(|r| r.offset == 0)
+        let room = limit.saturating_sub(base) / ENTRY_LEN as u64;
+        let placed = u64::from(chunk_count) <= room
+            && records.first().is_none_or(|r| r.offset == 0)
             && records
                 .iter()
                 .all(|r| base.checked_add(r.offset).is_some_and(|o| o < limit));
@@ -140,8 +142,11 @@ impl Index {
         &self,
         src: &S,
         i: usize,
-    ) -> Result<Vec<IndexEntry>, FileError> {
-        let r = self.records[i];
+    ) -> Result<(Vec<IndexEntry>, u8), FileError> {
+        let r = *self.records.get(i).ok_or(FileError::invalid(
+            self.limit,
+            Fault::Mismatch("index root"),
+        ))?;
         let at = self.base + r.offset;
         let (_, body) = read_bound(src, at, block_type::INDEX, Some(r.body_crc32c), self.limit)?;
         let entries = decode_index_block(&body).map_err(|b| b.at(at))?;
@@ -153,7 +158,7 @@ impl Index {
         {
             return Err(FileError::invalid(at, Fault::Mismatch("index block")));
         }
-        Ok(entries)
+        Ok((entries, super::read::record_tail(&body, 0, 96)))
     }
 
     /// The blocks that may hold entries of `series_id`.
@@ -188,17 +193,18 @@ pub(crate) fn section_block(
         }));
     }
     let start = at + BLOCK_HEADER_LEN;
-    let body = section
-        .get(start..start + h.body_len as usize)
+    let body = start
+        .checked_add(h.body_len as usize)
+        .and_then(|end| section.get(start..end))
         .filter(|_| h.body_len <= MAX_BODY_LEN)
         .ok_or(fault(Fault::BlockLength))?;
     if crc32c(body) != h.body_crc32c {
         return Err(fault(Fault::BlockChecksum));
     }
-    let next = at + h.block_len() as usize;
-    if next > section.len() {
-        return Err(fault(Fault::BlockLength));
-    }
+    let next = at
+        .checked_add(h.block_len() as usize)
+        .filter(|&n| n <= section.len())
+        .ok_or(fault(Fault::BlockLength))?;
     Ok((h, body, next))
 }
 

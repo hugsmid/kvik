@@ -57,8 +57,10 @@ pub fn description(class: Class) -> Description {
             },
         ],
         name_range: None,
+        positions: vec![],
         has_entries: false,
         has_set_aside: false,
+        complete: true,
     }
 }
 
@@ -79,6 +81,13 @@ impl Content {
     pub fn settle(mut self) -> Self {
         self.description.has_entries = !self.entries.is_empty();
         self.description.has_set_aside = self.series.iter().any(|s| !s.set_aside.is_empty());
+        self.description.positions = Vec::new();
+        for p in self.positions() {
+            match self.description.positions.last_mut() {
+                Some((g, n)) if *g == p.0 => *n += 1,
+                _ => self.description.positions.push((p.0, 1)),
+            }
+        }
         self.series.sort_by(|a, b| {
             let key = |s: &Series| (s.name.is_none(), s.name.clone(), s.series_id);
             key(a).cmp(&key(b))
@@ -97,7 +106,7 @@ impl Content {
         .unwrap()
         .with_tweaks(self.tweaks.clone());
         for s in &self.series {
-            w.series(s).unwrap();
+            w.series(s.clone()).unwrap();
         }
         w.entries(&self.entries).unwrap();
         w.finish().unwrap()

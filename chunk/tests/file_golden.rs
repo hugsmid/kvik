@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use compacted::*;
 use kvik_chunk::file::{
-    Batch, Bounds, CanonicalError, Class, CompactedFile, Fact, FileElement, FileError, IndexObject,
-    Input, Level, Reach, Series, check_canonical, extract,
+    Batch, Bounds, CanonicalError, Class, CompactedFile, Fact, FileElement, FileError, Ignored,
+    IndexObject, Input, Level, Reach, Series, check_canonical, extract,
 };
 use kvik_chunk::{Element, encoding, flag, value_type};
 use kvik_log::entries::{Entry, MarkState, Recovery};
@@ -580,7 +580,7 @@ fn hand_built() -> Vec<(&'static str, Content)> {
         ),
         (
             "unknown-critical-description.kvc",
-            tweaked(|c| c.tweaks.description_field = Some((13, vec![]))),
+            tweaked(|c| c.tweaks.description_field = Some((14, vec![]))),
         ),
         (
             "undefined-flag.kvc",
@@ -849,18 +849,28 @@ fn read_all(b: &[u8]) -> Result<(), FileError> {
 
 #[test]
 fn unknown_elements_are_skipped_or_refused_by_the_critical_rule() {
-    for name in ["longer-trailer.kvc", "unknown-ignorable.kvc"] {
+    let skipped = [
+        ("longer-trailer.kvc", Ignored::TRAILER_TAIL),
+        (
+            "unknown-ignorable.kvc",
+            Ignored::DESCRIPTION_FIELD | Ignored::TIMES_COLUMN | Ignored::DATA_COLUMN,
+        ),
+    ];
+    for (name, bits) in skipped {
         let b = read(name);
         read_all(&b).unwrap_or_else(|e| panic!("{name}: {e}"));
         let c = level(Level::L0, T0, DAY);
-        assert!(
-            matches!(
-                check_canonical(&b, &id(40), &|s| c.info(s)),
-                Err(CanonicalError::Bytes(_))
-            ),
-            "{name}"
-        );
+        match check_canonical(&b, &id(40), &|s| c.info(s)) {
+            Err(CanonicalError::Unknown(i)) => assert_eq!(i, Ignored(bits), "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
     }
+    let b = read("l0-current.kvc");
+    let f = CompactedFile::open(b.as_slice(), &id(40), None).unwrap();
+    for e in f.index().unwrap() {
+        f.read_chunk(&e).unwrap();
+    }
+    assert!(f.ignored().is_empty(), "a v1 file skips nothing");
     let refused = |name: &str| match read_all(&read(name)) {
         Err(FileError::Unsupported { element, .. }) => element,
         other => panic!("{name}: {other:?}"),
@@ -875,7 +885,7 @@ fn unknown_elements_are_skipped_or_refused_by_the_critical_rule() {
     );
     assert_eq!(
         refused("unknown-critical-description.kvc"),
-        FileElement::DescriptionField(13)
+        FileElement::DescriptionField(14)
     );
     assert_eq!(
         refused("undefined-flag.kvc"),

@@ -6,8 +6,8 @@ use kvik_log::body::encode_end_marker;
 use kvik_log::crc::crc32c;
 use kvik_log::header::{FileHeader, HEADER_LEN};
 
-use super::access::{Index, check_entry, read_bound, read_header, read_tail};
-use super::desc::Description;
+use super::access::{Index, check_entry, check_times, read_bound, read_header, read_tail};
+use super::desc::{Description, Input};
 use super::error::{Fault, FileError};
 use super::layout::{Identity, Layout};
 use super::parts::{
@@ -15,8 +15,9 @@ use super::parts::{
     decode_times_directory, u64_at,
 };
 use super::read::CompactedFile;
+use super::read::check_positions;
 use super::source::ReadAt;
-use super::{KIND_INDEX, block_type};
+use super::{KIND_COMPACTED, KIND_INDEX, block_type};
 
 /// Bytes after the segment's trailer body in the `0x38` block: the segment's length and plaintext SHA-256.
 const SEGMENT_TAIL: usize = 8 + 32;
@@ -134,6 +135,12 @@ impl<S: ReadAt> IndexObject<S> {
         let at = HEADER_LEN as u64;
         let (dh, desc) = read_bound(&src, at, block_type::DESCRIPTION, None, trailer_offset)?;
         let description = Description::decode(&desc).map_err(|b| b.at(at))?;
+        if description.inputs.contains(&Input {
+            kind: KIND_COMPACTED,
+            file_id: id.file_id,
+        }) {
+            return Err(FileError::invalid(at, Fault::Body("description inputs")));
+        }
         let seg_at = at + dh.block_len();
         let (sh, seg) = read_bound(&src, seg_at, block_type::SEGMENT, None, trailer_offset)?;
         let split = seg
@@ -149,6 +156,7 @@ impl<S: ReadAt> IndexObject<S> {
         if dh.body_crc32c != segment.description_crc32c
             || description.has_entries != (segment.entries_offset != 0)
             || segment.index_root_offset >= segment_len
+            || check_positions(&description, &segment).is_err()
         {
             return Err(mismatch(seg_at, "segment record"));
         }
@@ -163,6 +171,8 @@ impl<S: ReadAt> IndexObject<S> {
             trailer_offset,
         )?;
         let times = decode_times_directory(&dir).map_err(|b| b.at(own.times_dir_offset))?;
+        check_times(&times, &segment)
+            .map_err(|w| FileError::invalid(own.times_dir_offset, Fault::Mismatch(w)))?;
         let after_dir = own.times_dir_offset + th.block_len();
         let index_start = if segment.chunk_count == 0 {
             own.index_offset == 0
@@ -237,7 +247,7 @@ impl<S: ReadAt> IndexObject<S> {
     }
 
     fn block(&self, i: usize) -> Result<Vec<IndexEntry>, FileError> {
-        let entries = self.index.block(&self.src, i)?;
+        let (entries, _) = self.index.block(&self.src, i)?;
         let at = self.index.base + self.index.records[i].offset;
         for e in &entries {
             check_entry(

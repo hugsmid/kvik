@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use super::access::facts_of;
 use super::error::FileError;
-use super::layout::Identity;
+use super::layout::{Identity, Ignored};
 use super::read::CompactedFile;
 use super::stats::Reach;
 use super::write::{Fact, FileWriter, Series, Tweaks, WriteError};
@@ -30,9 +31,12 @@ pub enum CanonicalError {
     /// What it holds breaks a writer's rule.
     #[error("the content cannot be written: {0}")]
     Content(#[from] WriteError),
-    /// A position held twice, or an entry a v1 writer never writes.
-    #[error("a position held twice or an ignored entry")]
+    /// A position held twice.
+    #[error("a position held twice")]
     Positions,
+    /// It holds elements this version does not know and skipped: it is read, but not judged.
+    #[error("holds elements this version skipped: {0:?}")]
+    Unknown(Ignored),
     /// Its bytes differ from the canonical ones from this offset.
     #[error("not canonical from offset {0}")]
     Bytes(u64),
@@ -59,21 +63,26 @@ pub fn check_canonical(
         } else {
             &mut s.0
         };
-        for f in file.read_chunk(e)? {
-            positions.push(f.fact.position);
-            facts.push(f.fact);
-        }
         for i in 0..d.blocks.len() {
-            bodies.push(file.data_block_raw(e, &d, i)?.1);
+            let (block, body) = file.data_block_raw(e, &d, i)?;
+            for f in facts_of(e.series_id, &block) {
+                file.batch(f.position)?;
+                positions.push(f.position);
+                facts.push(f);
+            }
+            bodies.push(body);
         }
     }
     let mut entries = Vec::new();
     for r in file.entries()? {
         if matches!(r.entry, kvik_log::entries::Entry::Ignored { .. }) {
-            return Err(CanonicalError::Positions);
+            return Err(CanonicalError::Unknown(file.ignored()));
         }
         positions.push(r.position);
         entries.push((r.position, r.entry));
+    }
+    if !file.ignored().is_empty() {
+        return Err(CanonicalError::Unknown(file.ignored()));
     }
     positions.sort_unstable();
     if !positions.windows(2).all(|w| w[0] < w[1]) {
@@ -100,22 +109,53 @@ pub fn check_canonical(
         bodies,
         ..Tweaks::default()
     };
+    let compare = Compare {
+        source: bytes,
+        at: 0,
+        first_difference: None,
+    };
     let mut w = FileWriter::new(
-        Vec::with_capacity(bytes.len()),
+        compare,
         *id,
         file.header().created_at,
         file.description(),
         batches,
     )?
     .with_tweaks(tweaks);
-    for s in &ordered {
+    for s in ordered {
         w.series(s)?;
     }
     w.entries(&entries)?;
-    let (again, _) = w.finish()?;
-    match again.iter().zip(bytes).position(|(a, b)| a != b) {
-        None if again.len() == bytes.len() => Ok(()),
-        None => Err(CanonicalError::Bytes(again.len().min(bytes.len()) as u64)),
+    let (compare, _) = w.finish()?;
+    match compare.first_difference {
+        None if compare.at == bytes.len() => Ok(()),
+        None => Err(CanonicalError::Bytes(compare.at.min(bytes.len()) as u64)),
         Some(at) => Err(CanonicalError::Bytes(at as u64)),
+    }
+}
+
+/// A sink that compares what the writer writes with the file as it is produced, holding no copy.
+struct Compare<'a> {
+    source: &'a [u8],
+    at: usize,
+    first_difference: Option<usize>,
+}
+
+impl std::io::Write for Compare<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.first_difference.is_none() {
+            let have = self.source.get(self.at..).unwrap_or_default();
+            if let Some(k) = buf.iter().zip(have).position(|(a, b)| a != b) {
+                self.first_difference = Some(self.at + k);
+            } else if have.len() < buf.len() {
+                self.first_difference = Some(self.at + have.len());
+            }
+        }
+        self.at += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

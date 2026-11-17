@@ -2,7 +2,8 @@
 //! end marker and trailer at open, then each block a caller follows a pointer to, bound to the checksum its parent
 //! records.
 
-use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use kvik_log::block::BLOCK_HEADER_LEN;
 use kvik_log::crc::crc32c;
@@ -12,11 +13,11 @@ use kvik_log::header::{FileHeader, HEADER_LEN};
 use super::access::{
     Index, check_entry, check_times, facts_of, read_bound, read_header, read_tail, section_block,
 };
-use super::desc::{Description, Input};
+use super::desc::{Description, Input, parse_fields};
 use super::error::{Fault, FileElement, FileError};
-use super::layout::{EntryRow, Identity, Layout, TimedFact};
+use super::layout::{EntryRow, Identity, Ignored, Layout, TimedFact};
 use super::parts::{
-    Directory, IndexEntry, MARKER_LEN, RootRecord, TimesRecord, Trailer, decode_root,
+    Directory, IndexEntry, MARKER_LEN, RootRecord, TRAILER_LEN, TimesRecord, Trailer, decode_root,
     decode_times_directory, u32_at,
 };
 use super::source::ReadAt;
@@ -33,7 +34,9 @@ pub struct CompactedFile<S: ReadAt> {
     trailer_offset: u64,
     description_end: u64,
     times: Vec<TimesRecord>,
+    table: Vec<OnceLock<Vec<Batch>>>,
     index: Index,
+    ignored: AtomicU8,
 }
 
 impl<S: ReadAt> std::fmt::Debug for CompactedFile<S> {
@@ -46,9 +49,6 @@ impl<S: ReadAt> std::fmt::Debug for CompactedFile<S> {
     }
 }
 
-/// Commit-times blocks read so far by one call.
-type TimesCache = HashMap<usize, Vec<Batch>>;
-
 impl<S: ReadAt> CompactedFile<S> {
     /// Opens a compacted segment: the header against `id`, the end marker, the trailer, and the blocks the trailer
     /// binds (description, commit-time directory, index root); with `layout`, the trailer and description must
@@ -57,6 +57,11 @@ impl<S: ReadAt> CompactedFile<S> {
         let header = read_header(&src, KIND_COMPACTED, id)?;
         let (trailer_offset, body) = read_tail(&src)?;
         let trailer = Trailer::decode(&body).map_err(|b| b.at(trailer_offset))?;
+        let mut skipped = if body.len() > TRAILER_LEN {
+            Ignored::TRAILER_TAIL
+        } else {
+            0
+        };
         let t = &trailer;
         let mismatch = |what| FileError::invalid(trailer_offset, Fault::Mismatch(what));
         if t.index_root_offset >= trailer_offset {
@@ -75,10 +80,14 @@ impl<S: ReadAt> CompactedFile<S> {
             first_section,
         )?;
         let description = Description::decode(&body).map_err(|b| b.at(HEADER_LEN as u64))?;
+        if parse_fields(&body).is_some_and(|f| f.iter().any(|&(id, _)| id >= 0x8000)) {
+            skipped |= Ignored::DESCRIPTION_FIELD;
+        }
         let description_end = HEADER_LEN as u64 + dh.block_len();
         if description.has_entries != (t.entries_offset != 0) {
             return Err(mismatch("description flags"));
         }
+        check_positions(&description, t).map_err(mismatch)?;
         if description.inputs.contains(&Input {
             kind: KIND_COMPACTED,
             file_id: id.file_id,
@@ -96,6 +105,7 @@ impl<S: ReadAt> CompactedFile<S> {
             trailer_offset,
         )?;
         let times = decode_times_directory(&body).map_err(|b| b.at(t.times_dir_offset))?;
+        skipped |= record_tail(&body, 0, 48);
         check_times(&times, t)
             .map_err(|w| FileError::invalid(t.times_dir_offset, Fault::Mismatch(w)))?;
         let (_, body) = read_bound(
@@ -106,6 +116,7 @@ impl<S: ReadAt> CompactedFile<S> {
             trailer_offset,
         )?;
         let records = decode_root(&body).map_err(|b| b.at(t.index_root_offset))?;
+        skipped |= record_tail(&body, 0, 32);
         let index = Index::new(
             records,
             t.index_offset,
@@ -120,8 +131,10 @@ impl<S: ReadAt> CompactedFile<S> {
             trailer,
             trailer_offset,
             description_end,
+            table: (0..times.len()).map(|_| OnceLock::new()).collect(),
             times,
             index,
+            ignored: AtomicU8::new(skipped),
         };
         if let Some(expected) = layout
             && let Some(field) = file.layout().difference(expected)
@@ -165,6 +178,18 @@ impl<S: ReadAt> CompactedFile<S> {
         self.trailer_offset
     }
 
+    /// The elements this reader has skipped so far, as the critical and ignorable rule allows; complete once every
+    /// block has been read (as [`check_canonical`](super::check_canonical) reads them).
+    pub fn ignored(&self) -> Ignored {
+        Ignored(self.ignored.load(Ordering::Relaxed))
+    }
+
+    fn skip(&self, bits: u8) {
+        if bits != 0 {
+            self.ignored.fetch_or(bits, Ordering::Relaxed);
+        }
+    }
+
     /// The layout the manifest records for this file.
     pub fn layout(&self) -> Layout {
         let id = Identity {
@@ -176,7 +201,8 @@ impl<S: ReadAt> CompactedFile<S> {
     }
 
     fn index_block(&self, i: usize) -> Result<Vec<IndexEntry>, FileError> {
-        let entries = self.index.block(&self.src, i)?;
+        let (entries, skipped) = self.index.block(&self.src, i)?;
+        self.skip(skipped);
         let at = self.index.base + self.index.records[i].offset;
         for e in &entries {
             check_entry(
@@ -205,7 +231,7 @@ impl<S: ReadAt> CompactedFile<S> {
 
     /// Every index entry, in index order.
     pub fn index(&self) -> Result<Vec<IndexEntry>, FileError> {
-        let mut out = Vec::with_capacity(self.trailer.chunk_count as usize);
+        let mut out = Vec::with_capacity(self.trailer.chunk_count.min(1 << 16) as usize);
         for i in 0..self.index.records.len() {
             out.extend(self.index_block(i)?);
         }
@@ -228,6 +254,7 @@ impl<S: ReadAt> CompactedFile<S> {
             return Err(FileError::invalid(at, Fault::BlockLength));
         }
         let d = Directory::decode(&body).map_err(|b| b.at(at))?;
+        self.skip(record_tail(&body, 16, 32));
         if d.series_id != e.series_id || d.row_count != e.row_count {
             return Err(mismatch("chunk directory"));
         }
@@ -284,18 +311,20 @@ impl<S: ReadAt> CompactedFile<S> {
         {
             return Err(FileError::invalid(at, Fault::Mismatch("data block record")));
         }
+        if crate::block::directory(&body).is_some_and(|c| c.iter().any(|col| col.0 >= 0x80)) {
+            self.skip(Ignored::DATA_COLUMN);
+        }
         Ok((b, body))
     }
 
     /// Every fact of a chunk, with its batch's receive and commit times.
     pub fn read_chunk(&self, e: &IndexEntry) -> Result<Vec<TimedFact>, FileError> {
         let d = self.directory(e)?;
-        let mut cache = TimesCache::new();
         let mut out = Vec::with_capacity(e.row_count as usize);
         for i in 0..d.blocks.len() {
             let b = self.data_block(e, &d, i)?;
             for fact in facts_of(e.series_id, &b) {
-                let batch = self.batch_cached(&mut cache, fact.position)?;
+                let batch = self.batch(fact.position)?;
                 out.push(TimedFact {
                     fact,
                     received_at: batch.received_at,
@@ -308,8 +337,14 @@ impl<S: ReadAt> CompactedFile<S> {
 
     /// Commit-times block `i`, bound to its directory record: the generation, the first and last row's sequences
     /// and commit times the record's.
-    pub fn times_block(&self, i: usize) -> Result<Vec<Batch>, FileError> {
-        let r = self.times[i];
+    pub fn times_block(&self, i: usize) -> Result<&[Batch], FileError> {
+        let r = *self.times.get(i).ok_or(FileError::invalid(
+            self.trailer.times_dir_offset,
+            Fault::Mismatch("commit-time directory"),
+        ))?;
+        if let Some(rows) = self.table[i].get() {
+            return Ok(rows);
+        }
         let (_, body) = read_bound(
             &self.src,
             r.offset,
@@ -317,7 +352,10 @@ impl<S: ReadAt> CompactedFile<S> {
             Some(r.body_crc32c),
             self.trailer.times_dir_offset,
         )?;
-        let (g, rows) = decode_times(&body).map_err(|b| b.at(r.offset))?;
+        let (g, rows, skipped) = decode_times(&body).map_err(|b| b.at(r.offset))?;
+        if skipped {
+            self.skip(Ignored::TIMES_COLUMN);
+        }
         let (a, z) = (rows[0], rows[rows.len() - 1]);
         if g != r.generation
             || a.first_sequence != r.first_sequence
@@ -330,10 +368,12 @@ impl<S: ReadAt> CompactedFile<S> {
                 Fault::Mismatch("commit-times record"),
             ));
         }
-        Ok(rows)
+        let _ = self.table[i].set(rows);
+        Ok(self.table[i].get().map_or(&[], Vec::as_slice))
     }
 
-    fn batch_cached(&self, cache: &mut TimesCache, p: Position) -> Result<Batch, FileError> {
+    /// The batch row that holds `p`: the directory picks one block, which is read once per open file.
+    pub fn batch(&self, p: Position) -> Result<Batch, FileError> {
         let none = || FileError::invalid(self.trailer.times_offset, Fault::NoBatch(p.0, p.1));
         let i = self
             .times
@@ -342,20 +382,12 @@ impl<S: ReadAt> CompactedFile<S> {
         if r.generation != p.0 || r.first_sequence > p.1 {
             return Err(none());
         }
-        let rows = match cache.entry(i) {
-            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => v.insert(self.times_block(i)?),
-        };
+        let rows = self.times_block(i)?;
         let j = rows.partition_point(|b| b.last_sequence < p.1);
         rows.get(j)
             .filter(|b| b.holds(p.0, p.1))
             .copied()
             .ok_or_else(none)
-    }
-
-    /// The batch row that holds `p`: the directory picks one block, which is read.
-    pub fn batch(&self, p: Position) -> Result<Batch, FileError> {
-        self.batch_cached(&mut TimesCache::new(), p)
     }
 
     /// Every batch row, in file order.
@@ -386,7 +418,7 @@ impl<S: ReadAt> CompactedFile<S> {
                 } else {
                     let rows = self.times_block(i + k - 1)?;
                     let n = rows.partition_point(|b| b.commit_time <= t);
-                    rows[n - 1].last_sequence
+                    rows[n.saturating_sub(1)].last_sequence
                 };
                 best = best.max(Some((g, last)));
             }
@@ -404,11 +436,15 @@ impl<S: ReadAt> CompactedFile<S> {
             return Ok(Vec::new());
         }
         let base = t.entries_offset;
-        let section = self.src.read_at(base, (t.times_offset - base) as usize)?;
+        let len = t
+            .times_offset
+            .checked_sub(base)
+            .filter(|&n| n <= self.src.len())
+            .ok_or(FileError::invalid(base, Fault::Mismatch("trailer offsets")))?;
+        let section = self.src.read_at(base, len as usize)?;
         if crc32c(&section) != t.entries_crc32c {
             return Err(FileError::invalid(base, Fault::Binding));
         }
-        let mut cache = TimesCache::new();
         let mut out: Vec<EntryRow> = Vec::new();
         let mut at = 0usize;
         let mut last_gen: Option<u32> = None;
@@ -440,6 +476,9 @@ impl<S: ReadAt> CompactedFile<S> {
                         FileError::invalid(here, Fault::Body("entries block"))
                     }
                 })?;
+                if b.encode().ok().as_deref() != Some(body) {
+                    self.skip(Ignored::ENTRY);
+                }
                 let mut s = b.first_sequence;
                 for entry in b.entries {
                     let p = (g, s);
@@ -447,17 +486,22 @@ impl<S: ReadAt> CompactedFile<S> {
                     if prev.is_some_and(|q| q >= p) || p < t.first || p > t.last {
                         return Err(FileError::invalid(here, Fault::Mismatch("entry position")));
                     }
-                    let batch = self.batch_cached(&mut cache, p)?;
-                    if batch.received_at != b.received_at {
-                        return Err(FileError::invalid(
-                            here,
-                            Fault::Mismatch("entry receive time"),
-                        ));
-                    }
                     let end = n
                         .checked_sub(1)
                         .and_then(|k| s.checked_add(k))
+                        .filter(|&e| (g, e) <= t.last)
                         .ok_or(FileError::invalid(here, Fault::Mismatch("entry position")))?;
+                    let batch = self.batch(p)?;
+                    for q in s..=end {
+                        let held = if q == s { batch } else { self.batch((g, q))? };
+                        if held.received_at != b.received_at {
+                            return Err(FileError::invalid(
+                                here,
+                                Fault::Mismatch("entry receive time"),
+                            ));
+                        }
+                    }
+
                     prev = Some((g, end));
                     count += n;
                     out.push(EntryRow {
@@ -488,4 +532,32 @@ fn chunk_span(e: &IndexEntry) -> Result<(u64, u64), FileError> {
             e.chunk_offset,
             Fault::Mismatch("chunk index entry"),
         ))
+}
+
+/// Field 10 against the trailer (Q-810): its first and last generation those of the trailer's range, its counts
+/// summing to `entry_count`.
+pub(crate) fn check_positions(d: &Description, t: &Trailer) -> Result<(), &'static str> {
+    let sum = d
+        .positions
+        .iter()
+        .try_fold(0u64, |a, &(_, n)| a.checked_add(n));
+    let ends = d.positions.first().map(|p| p.0) == Some(t.first.0)
+        && d.positions.last().map(|p| p.0) == Some(t.last.0);
+    if ends && sum == Some(t.entry_count) {
+        Ok(())
+    } else {
+        Err("description positions")
+    }
+}
+
+/// [`Ignored::RECORD_TAIL`] when the record size at `at` is above v1's.
+pub(crate) fn record_tail(body: &[u8], at: usize, v1: u16) -> u8 {
+    if body
+        .get(at..at + 2)
+        .is_some_and(|b| u16::from_le_bytes([b[0], b[1]]) > v1)
+    {
+        Ignored::RECORD_TAIL
+    } else {
+        0
+    }
 }

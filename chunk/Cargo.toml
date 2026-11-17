@@ -12,8 +12,6 @@ keywords = ["time-series", "storage", "embedded", "compression"]
 categories = ["database-implementations", "compression"]
 
 [dependencies]
-# Incremental CRC32C for a file being written, as `kvik-log` computes it (`format.md` A, common rules).
-crc = "3.4"
 # File header, block framing, entries bodies and the end marker of a compacted segment (`docs/format-compacted.md`).
 kvik-log = { path = "../log" }
 thiserror = "2"

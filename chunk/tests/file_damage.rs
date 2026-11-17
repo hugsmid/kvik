@@ -430,6 +430,8 @@ fn a_chunk_index_object_with_any_bit_flipped_is_invalid() {
 #[test]
 fn an_undefined_directory_flag_is_refused_where_the_index_bit_is_defined() {
     let mut c = sample(1);
+    c.series.retain(|s| s.series_id != 3);
+    let mut c = c.settle();
     c.tweaks.chunk_flags = BIT_1;
     let bytes = c.write().0;
     let f = open(&bytes);

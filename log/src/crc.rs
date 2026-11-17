@@ -20,20 +20,30 @@ thread_local! {
 }
 
 /// An incremental CRC32C over several slices.
-pub(crate) struct Crc32c(Digest<'static, u32, Table<16>>);
+#[derive(Clone)]
+pub struct Crc32c(Digest<'static, u32, Table<16>>);
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Crc32c {
-    pub(crate) fn new() -> Self {
+    /// A digest of nothing yet.
+    pub fn new() -> Self {
         Self(CASTAGNOLI.digest())
     }
 
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
+    /// Adds `bytes`.
+    pub fn update(&mut self, bytes: &[u8]) {
         #[cfg(test)]
         BYTES_HASHED.with(|c| c.set(c.get() + bytes.len() as u64));
         self.0.update(bytes);
     }
 
-    pub(crate) fn finish(self) -> u32 {
+    /// The CRC32C of everything added.
+    pub fn finish(self) -> u32 {
         self.0.finalize()
     }
 }

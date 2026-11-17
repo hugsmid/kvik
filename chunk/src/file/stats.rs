@@ -116,7 +116,7 @@ impl Bounds {
 }
 
 /// The key of an `f64` bit pattern in IEEE 754 total order.
-fn total_order(bits: u64) -> u64 {
+pub(crate) fn total_order(bits: u64) -> u64 {
     if bits >> 63 == 1 {
         !bits
     } else {

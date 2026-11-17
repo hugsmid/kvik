@@ -95,8 +95,8 @@ pub(crate) fn encode_times(generation: u32, rows: &[Batch], extra: Option<(u8, &
 
 /// Decodes a body: its generation and rows. Columns 1–4 are mandatory, an unknown id below `0x80` is a version
 /// refusal and one at or above it is skipped; rows ascend and do not overlap, a commit time is never below its
-/// receive time, and commit times do not decrease.
-pub(crate) fn decode_times(body: &[u8]) -> Result<(u32, Vec<Batch>), Bad> {
+/// receive time, and commit times do not decrease. The flag says an ignorable column was skipped.
+pub(crate) fn decode_times(body: &[u8]) -> Result<(u32, Vec<Batch>, bool), Bad> {
     let bad = || Bad::body("commit-times block");
     let mut r = Reader::new(body);
     let generation = r.u32().map_err(|_| bad())?;
@@ -111,15 +111,22 @@ pub(crate) fn decode_times(body: &[u8]) -> Result<(u32, Vec<Batch>), Bad> {
         let id = r.u8().map_err(|_| bad())?;
         let enc = r.u8().map_err(|_| bad())?;
         let len = r.leb128(3).map_err(|_| bad())? as usize;
-        if dir.last().is_some_and(|&(last, _, _)| id <= last) {
-            return Err(bad());
-        }
         total += len;
         dir.push((id, enc, len));
+    }
+    if let Some(&(id, _, _)) = dir
+        .iter()
+        .find(|&&(id, _, _)| id < 0x80 && !(FIRST..=LAG).contains(&id))
+    {
+        return Err(Bad::Unsupported(FileElement::TimesColumn(id)));
+    }
+    if !dir.windows(2).all(|w| w[0].0 < w[1].0) {
+        return Err(bad());
     }
     if body.len() - r.position() != total {
         return Err(bad());
     }
+    let skipped = dir.iter().any(|c| c.0 >= 0x80);
     let mut cols: [Option<Vec<i64>>; 5] = Default::default();
     for (id, enc, len) in dir {
         let payload = r.bytes(len).map_err(|_| bad())?;
@@ -129,8 +136,7 @@ pub(crate) fn decode_times(body: &[u8]) -> Result<(u32, Vec<Batch>), Bad> {
                 enc,
                 encoding::PLAIN | encoding::RUN_LENGTH | encoding::DELTA
             ),
-            0x80.. => continue,
-            _ => return Err(Bad::Unsupported(FileElement::TimesColumn(id))),
+            _ => continue,
         };
         if !allowed {
             return Err(bad());
@@ -168,7 +174,7 @@ pub(crate) fn decode_times(body: &[u8]) -> Result<(u32, Vec<Batch>), Bad> {
         }
         rows.push(row);
     }
-    Ok((generation, rows))
+    Ok((generation, rows, skipped))
 }
 
 #[cfg(test)]
@@ -192,7 +198,7 @@ mod tests {
         let b = encode_times(3, &rows(), None);
         assert_eq!(&b[..4], &3u32.to_le_bytes());
         // Column 4 holds one run: run-length is the shortest.
-        assert_eq!(decode_times(&b), Ok((3, rows())));
+        assert_eq!(decode_times(&b), Ok((3, rows(), false)));
         let mut at = 7;
         let mut encs = vec![];
         for _ in 0..4 {
@@ -217,7 +223,10 @@ mod tests {
     #[test]
     fn unknown_columns_follow_the_critical_rule() {
         let ignorable = encode_times(3, &rows()[..2], Some((0x90, &[1, 2, 3])));
-        assert_eq!(decode_times(&ignorable), Ok((3, rows()[..2].to_vec())));
+        assert_eq!(
+            decode_times(&ignorable),
+            Ok((3, rows()[..2].to_vec(), true))
+        );
         let critical = encode_times(3, &rows()[..2], Some((0x05, &[1])));
         assert_eq!(
             decode_times(&critical),

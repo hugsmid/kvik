@@ -24,8 +24,10 @@
 //!     run_count: 1,
 //!     inputs: vec![Input { kind: 1, file_id: 3 }],
 //!     name_range: None,
+//!     positions: vec![(0, 2)],
 //!     has_entries: false,
 //!     has_set_aside: false,
+//!     complete: true,
 //! };
 //! let batches = vec![Batch {
 //!     generation: 0,
@@ -36,7 +38,7 @@
 //! }];
 //! let fact = |sequence, t, v: f64| Fact::value(7, (0, sequence), t, value_type::F64, v.to_bits());
 //! let mut w = FileWriter::new(Vec::new(), id, 0, &description, batches).unwrap();
-//! w.series(&Series {
+//! w.series(Series {
 //!     series_id: 7,
 //!     name: Some("room/temperature".into()),
 //!     reach: Reach::Point,
@@ -70,7 +72,7 @@ pub use canonical::{CanonicalError, SeriesInfo, check_canonical};
 pub use desc::{Class, Description, Input, Level};
 pub use error::{Fault, FileElement, FileError};
 pub use index::{IndexObject, extract};
-pub use layout::{EntryRow, Identity, Layout, TimedFact};
+pub use layout::{EntryRow, Identity, Ignored, Layout, TimedFact};
 pub use parts::{BlockRecord, Directory, IndexEntry, RootRecord, TimesRecord, Trailer};
 pub use read::CompactedFile;
 pub use source::ReadAt;
@@ -157,10 +159,10 @@ pub(crate) fn fuzz_bodies(data: &[u8]) {
     if let Ok(t) = parts::IndexTrailer::decode(data) {
         assert_eq!(parts::IndexTrailer::decode(&t.encode()), Ok(t));
     }
-    if let Ok((g, rows)) = times::decode_times(data) {
+    if let Ok((g, rows, _)) = times::decode_times(data) {
         assert_eq!(
             times::decode_times(&times::encode_times(g, &rows, None)),
-            Ok((g, rows))
+            Ok((g, rows, false))
         );
     }
 }

@@ -4,10 +4,9 @@
 
 use std::io::{self, Write};
 
-use crc::{CRC_32_ISCSI, Crc, Digest, Table};
 use kvik_log::block::{BlockHeader, MAX_BODY_LEN, encode_block};
 use kvik_log::body::encode_end_marker;
-use kvik_log::crc::crc32c;
+use kvik_log::crc::{Crc32c, crc32c};
 use kvik_log::entries::{EntriesBlock, Entry};
 use kvik_log::header::FileHeader;
 
@@ -25,8 +24,6 @@ use super::{
 use crate::block::directory;
 use crate::bytes::put_leb128;
 use crate::{Block, flag, value_type};
-
-static CASTAGNOLI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI);
 
 /// One fact of a series, as the log holds it; `received_at` and the commit time come from its batch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -140,7 +137,7 @@ pub struct Tweaks {
 pub struct FileWriter<W: Write> {
     out: W,
     offset: u64,
-    crc: Digest<'static, u32, Table<16>>,
+    crc: Crc32c,
     id: Identity,
     description: Description,
     description_crc: u32,
@@ -238,7 +235,7 @@ impl<W: Write> FileWriter<W> {
         let mut w = Self {
             out,
             offset: 0,
-            crc: CASTAGNOLI.digest(),
+            crc: Crc32c::new(),
             id,
             description: description.clone(),
             description_crc: 0,
@@ -326,9 +323,10 @@ impl<W: Write> FileWriter<W> {
         Ok(())
     }
 
-    /// Writes the chunks of one series. Series come in the order of B.1 (by name as UTF-8 bytes, then those with
-    /// no definition by id), each once; facts of a current file have strictly ascending `t`.
-    pub fn series(&mut self, s: &Series) -> Result<(), WriteError> {
+    /// Writes the chunks of one series, which it takes so that its facts are sorted in place. Series come in the
+    /// order of B.1 (by name as UTF-8 bytes, then those with no definition by id), each once; facts of a current
+    /// file have strictly ascending `t`.
+    pub fn series(&mut self, mut s: Series) -> Result<(), WriteError> {
         if self.entries_written {
             return Err(content("a series after the entries"));
         }
@@ -349,31 +347,53 @@ impl<W: Write> FileWriter<W> {
         if !s.set_aside.is_empty() && self.description.class != Class::Revision {
             return Err(content("set-aside facts outside a revision file"));
         }
-        let mut chunks: Vec<(u16, Vec<Fact>)> = Vec::new();
-        for (flags, facts) in [(0, &s.facts), (SET_ASIDE, &s.set_aside)] {
+        if matches!(s.reach, Reach::Fixed(d) if d <= 0) {
+            return Err(content("an interval length of 0 or less"));
+        }
+        let mut chunks: Vec<(u16, bool, std::ops::Range<usize>)> = Vec::new();
+        for (flags, aside) in [(0, false), (SET_ASIDE, true)] {
+            let facts = if aside {
+                &mut s.set_aside
+            } else {
+                &mut s.facts
+            };
             if facts.iter().any(|f| f.series_id != s.series_id) {
                 return Err(content("a fact of another series"));
             }
-            let mut sorted = facts.clone();
-            sorted.sort_by_key(|f| (f.t, f.position));
+            facts.sort_unstable_by_key(|f| (f.t, f.position));
             if self.description.class == Class::Current
-                && !sorted.windows(2).all(|w| w[0].t < w[1].t)
+                && !facts.windows(2).all(|w| w[0].t < w[1].t)
             {
                 return Err(content("two facts of one key in a current file"));
             }
-            for c in sorted.chunks(CHUNK_ROWS) {
-                chunks.push((flags, c.to_vec()));
+            for start in (0..facts.len()).step_by(CHUNK_ROWS) {
+                chunks.push((flags, aside, start..facts.len().min(start + CHUNK_ROWS)));
             }
         }
-        let first_of = |c: &[Fact]| c.iter().map(|f| f.position).min();
-        chunks.sort_by_key(|(_, c)| (c[0].t, first_of(c)));
-        for (flags, facts) in chunks {
-            self.chunk(s, flags, &facts)?;
+        let rows = |aside: bool, r: &std::ops::Range<usize>| {
+            if aside {
+                &s.set_aside[r.clone()]
+            } else {
+                &s.facts[r.clone()]
+            }
+        };
+        chunks.sort_by_key(|(_, aside, r)| {
+            let c = rows(*aside, r);
+            (c[0].t, c.iter().map(|f| f.position).min())
+        });
+        for (flags, aside, r) in &chunks {
+            self.chunk(s.series_id, s.reach, *flags, rows(*aside, r))?;
         }
         Ok(())
     }
 
-    fn chunk(&mut self, s: &Series, flags: u16, facts: &[Fact]) -> Result<(), WriteError> {
+    fn chunk(
+        &mut self,
+        series_id: u32,
+        reach: Reach,
+        flags: u16,
+        facts: &[Fact],
+    ) -> Result<(), WriteError> {
         for f in facts {
             self.hold(f.position)?;
         }
@@ -383,6 +403,7 @@ impl<W: Write> FileWriter<W> {
             let block = columns(rows);
             let mut body = block.encode()?;
             if let Some(alt) = self.tweaks.bodies.get(self.data_blocks)
+                && *alt != body
                 && Block::decode_canonical(alt).as_ref() == Ok(&block)
             {
                 body = alt.clone();
@@ -409,7 +430,7 @@ impl<W: Write> FileWriter<W> {
             recorded -= u32::from(records.pop().map_or(0, |r| r.row_count));
         }
         let dir = Directory {
-            series_id: s.series_id,
+            series_id,
             flags,
             row_count: recorded,
             blocks: records,
@@ -423,9 +444,9 @@ impl<W: Write> FileWriter<W> {
         );
         let raw = b.map(|b| b.raw()).unwrap_or_default();
         let min_t = facts.iter().map(|f| f.t).min().unwrap_or(0);
-        let reach = facts.iter().map(|f| s.reach.of(f.t)).max().unwrap_or(0);
+        let reach = facts.iter().map(|f| reach.of(f.t)).max().unwrap_or(0);
         let entry = IndexEntry {
-            series_id: s.series_id,
+            series_id,
             flags: flags
                 | if b.is_some() {
                     super::parts::HAS_BOUNDS
@@ -545,6 +566,18 @@ impl<W: Write> FileWriter<W> {
         let Some((first, last)) = self.range else {
             return Err(content("a file holds at least one position"));
         };
+        let mut positions: Vec<(u32, u64)> = Vec::new();
+        for (b, &n) in self.batches.iter().zip(&self.held).filter(|(_, n)| **n > 0) {
+            match positions.last_mut() {
+                Some((g, count)) if *g == b.generation => *count += n,
+                _ => positions.push((b.generation, n)),
+            }
+        }
+        if positions != self.description.positions {
+            return Err(content(
+                "description positions per generation disagree with the content",
+            ));
+        }
         let used: Vec<Batch> = match self.tweaks.times_rows.take() {
             Some(rows) => rows,
             None => self
@@ -612,7 +645,7 @@ impl<W: Write> FileWriter<W> {
             times_dir_offset,
             index_offset,
             index_root_offset,
-            file_crc32c: self.crc.clone().finalize(),
+            file_crc32c: self.crc.clone().finish(),
             root_crc32c: rh.body_crc32c,
             times_dir_crc32c: tdh.body_crc32c,
             description_crc32c: self.description_crc,

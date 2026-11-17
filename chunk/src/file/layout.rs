@@ -61,6 +61,10 @@ pub struct Layout {
     pub has_set_aside: bool,
     /// A split part's first and last series name.
     pub name_range: Option<(String, String)>,
+    /// Positions held per generation (Q-810).
+    pub positions: Vec<(u32, u64)>,
+    /// Every element of every input was known and carried (Q-810).
+    pub complete: bool,
 }
 
 impl Layout {
@@ -85,6 +89,8 @@ impl Layout {
             has_entries: d.has_entries,
             has_set_aside: d.has_set_aside,
             name_range: d.name_range.clone(),
+            positions: d.positions.clone(),
+            complete: d.complete,
         }
     }
 
@@ -119,6 +125,8 @@ impl Layout {
                 (self.has_entries, self.has_set_aside) == (o.has_entries, o.has_set_aside),
             ),
             ("name range", self.name_range == o.name_range),
+            ("positions per generation", self.positions == o.positions),
+            ("complete", self.complete == o.complete),
         ]
         .into_iter()
         .find(|(_, same)| !same)
@@ -149,4 +157,34 @@ pub struct EntryRow {
     pub commit_time: i64,
     /// The entry.
     pub entry: Entry,
+}
+
+/// Elements a reader of this version skipped, as the critical and ignorable rule allows (`format.md` common
+/// rules). A file holding any is read, but the canonical checks do not judge it and a merge of it is not complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Ignored(pub u8);
+
+impl Ignored {
+    /// A trailer longer than v1's.
+    pub const TRAILER_TAIL: u8 = 1;
+    /// A description field at or above `0x8000`.
+    pub const DESCRIPTION_FIELD: u8 = 1 << 1;
+    /// A record of a directory, index, root or commit-time directory longer than v1's.
+    pub const RECORD_TAIL: u8 = 1 << 2;
+    /// A data block column at or above `0x80`.
+    pub const DATA_COLUMN: u8 = 1 << 3;
+    /// A commit-times column at or above `0x80`.
+    pub const TIMES_COLUMN: u8 = 1 << 4;
+    /// An ignorable entry type or field (`format.md` A.6).
+    pub const ENTRY: u8 = 1 << 5;
+
+    /// Whether nothing was skipped.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether the element `bit` was skipped.
+    pub fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
 }

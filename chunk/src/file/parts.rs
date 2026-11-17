@@ -2,6 +2,7 @@
 //! index root, commit-time directory, generation marker and trailer; and the chunk index object's own (B.2).
 
 use super::error::{Bad, FileElement};
+use super::stats::total_order;
 use super::{INDEX_BLOCK_ENTRIES, MAX_CHUNK_BLOCKS, Position};
 
 pub(crate) fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -265,7 +266,15 @@ impl IndexEntry {
             max_value: u64_at(r, 88),
         };
         let bounded = flags & HAS_BOUNDS != 0;
+        let ordered = match e.value_type {
+            1 => total_order(e.min_value) <= total_order(e.max_value),
+            2 => (e.min_value as i64) <= (e.max_value as i64),
+            _ => e.min_value <= e.max_value,
+        };
         if e.min_t > e.max_t
+            || e.reach < e.max_t
+            || (flags & HAS_NAN != 0 && e.value_type > 1)
+            || !ordered
             || e.first > e.last
             || e.row_count == 0
             || bounded != (e.value_type != 0)
@@ -633,6 +642,9 @@ impl Trailer {
             && (t.entries_offset != 0 || t.entries_crc32c == 0);
         if !ok {
             return Err(Bad::body("trailer counts"));
+        }
+        if t.times_offset == 0 || t.times_dir_offset == 0 || t.index_root_offset == 0 {
+            return Err(Bad::body("trailer offsets"));
         }
         let mut at = [
             t.entries_offset,
