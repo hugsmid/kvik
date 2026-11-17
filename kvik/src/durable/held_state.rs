@@ -430,7 +430,7 @@ fn a_routing_change_writes_the_registry_file_a_full_read_gives_without_reading_t
     use crate::consume::{Funnel, Select, Start};
     let dir = "held-route";
     let (s, env, io) = store(dir, 40);
-    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    let c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     io.take();
     block_on(c.route(Funnel::facts(Select::All))).unwrap();
     let read = io.take();
