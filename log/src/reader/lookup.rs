@@ -249,18 +249,28 @@ fn part(f: &dyn crate::fs::FsFile, len: u64, from: u64, to: u64) -> Option<Vec<u
     Some(buf)
 }
 
-/// The batch at `s`, read and checked again alone; `None` if it no longer reads as the same complete batch.
+/// The batch at `s`, read into `buf` (the segment's header in place, zeroed lazily elsewhere) and checked again
+/// alone; `None` if it no longer reads as the same complete batch.
 fn read_batch_at(
     f: &dyn crate::fs::FsFile,
     id: &SegmentIdentity,
     s: &Span,
+    buf: &mut [u8],
 ) -> Option<BatchContent> {
-    let buf = part(f, s.end, s.offset, s.end)?;
+    let (a, z) = (
+        usize::try_from(s.offset).ok()?,
+        usize::try_from(s.end).ok()?,
+    );
+    let got = read_at_full(f, buf.get_mut(a..z)?, s.offset).ok()?;
+    if got != z - a {
+        return None;
+    }
+    let buf = &buf[..z];
     let from = Resume {
         offset: s.offset,
         last_sequence: Some(s.first.saturating_sub(1)),
     };
-    let mut scanner = Scanner::resume(&buf, id, ScanLimit::Mark(s.end), from).ok()?;
+    let mut scanner = Scanner::resume(buf, id, ScanLimit::Mark(s.end), from).ok()?;
     match scanner.next()? {
         Ok(Found::Batch(b))
             if b.offset == s.offset && b.end() == s.end && b.commit.first_sequence == s.first =>
@@ -444,11 +454,20 @@ impl LogReader {
             map = SegmentMap::default();
         }
         let mut stale = false;
+        // One buffer for the batches read again: allocated once, touched only where they lie.
+        let mut again: Option<Vec<u8>> = None;
         for s in map.batches.iter().filter(|s| query.may_hold(s)) {
             if s.generation == query.generation && s.last > query.last_sequence {
                 break;
             }
-            match read_batch_at(&*f, &id, s) {
+            if again.is_none() {
+                again = part(&*f, len, 0, 0);
+            }
+            let Some(buf) = again.as_mut() else {
+                stale = true;
+                break;
+            };
+            match read_batch_at(&*f, &id, s, buf) {
                 Some(content) => query.take(content, s.generation, s.first, facts),
                 None => {
                     stale = true;
