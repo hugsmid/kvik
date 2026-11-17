@@ -644,7 +644,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   file passes 16 MiB the writer writes `<name>.cur.new` with the current state, syncs it, renames it over the old one
   and syncs the directory.
 - **Lease**, `leases/<reader_id>.lease`, kind 8, 128 bytes: an A.1 header (`file_id` 0, the generation at
-  creation) then one slot rewritten in place with one positional write: 64 `epoch: u64`; 72 `refresh_counter: u64`; 80
+  creation) then one slot rewritten in place with one positional write: 64 `epoch: u64` (the lowest epoch of the reader's live
+  cuts, `spec.md` §7 Readers); 72 `refresh_counter: u64`; 80
   `boot_id` (16 bytes); 96 `created_at: i64`;
   104 reserved (20 bytes); 124 `crc32c` over bytes 64..124. `reader_id` is 16 random bytes per reader handle. A lease
   is never synced (it is void on another boot). An invalid lease counts as holding epoch 0 until it expires; a zero

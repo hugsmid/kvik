@@ -85,6 +85,18 @@ fn a_reader_at_the_writers_durable_position_only_renews_its_lease_when_due() {
         .unwrap()
         .unwrap();
     assert_eq!(u.events.len(), 1);
+    assert_eq!(
+        counter(&fs, &r),
+        at + 1,
+        "a refresh writes the lease only when its epoch changes or half of lease_refresh passed"
+    );
+    *clock.0.lock().unwrap() += Duration::from_millis(1_100);
+    log.submit(alias(3)).unwrap().wait().unwrap();
+    assert!(
+        read_new(&mut r, Some(log.stats().durable))
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(counter(&fs, &r), at + 2);
     log.shutdown().unwrap();
 }

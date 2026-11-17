@@ -68,15 +68,17 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-704 | §7 Readers, Leases, Retired files | The writer's own delivery reader skips a refresh at the writer's durable position; that needs a manifest that changes only at a start |
 | Q-705 | §2.3, §4 Outranked facts; `api.md` `Outcome` | The model backend's `outranked` when a later reading of the same call outranks an earlier one |
-| Q-773 | §7 Derived files; `format.md` A.18 Cadence | The series directory's cadence against a reader's allowance (decided; confirmed by 9.0b1) |
+| Q-773 | §7 Derived files; `format.md` A.18 Cadence | The series directory's cadence against a reader's allowance (decided; confirmed by 9.0c) |
 | Q-774 | `format.md` A.18, A.12 | The derived files' layout, names and generations (decided by the lead, awaiting review) |
 | Q-775 | §7 Derived files; `format.md` A.18 Validation | Checking a log directory before the manifest lists sealed segments |
 | Q-776 | §7 Derived files, Reset stamp and saved points | When the writer keeps a series directory across a reset |
 | Q-777 | §2.3, §7 Derived files; `format.md` A.18 | The live candidate's write time and what bounded state cannot tell |
 | Q-778 | §7 Derived files; `format.md` A.18 | What the status file holds before the query envelope exists |
 | Q-780 | §8 Generations, Restore; `format.md` A.18 Contiguity | The log directory across a generation change |
+| Q-850 | §7 Readers; `api.md` Reader processes | The error of a second reset stamp change during one materialised call |
 | Q-851 | §7 Readers | The second read of the mark after a pass that took something (decided, awaiting review) |
 | Q-852 | §7 Readers, Manifest; `format.md` A.13 | What a reader call reads once caught up (decided, awaiting review) |
+| Q-853 | §7 Readers; `api.md` `ReaderConfig` | `cut_max_age`'s default and bound, and the clock it runs on (decided, awaiting review) |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1495,8 +1497,8 @@ without data that could not be read are the owner's ruling, Q-750.
 window.
 
 ## Q-773 — The series directory's cadence against a reader's allowance
-Recorded by roadmap 9.0a; decided at its review (technical). To be confirmed by roadmap 9.0b1, which first reads the
-directories.
+Recorded by roadmap 9.0a; decided at its review (technical). To be confirmed by roadmap 9.0c, which first reads the
+directories (moved from 9.0b1, whose reader reads none).
 **Scenario.** A reader covers the sealed segments its directories do not yet cover by reading them, up to 64 MiB in
 all, and fails with `DirectoryUnavailable` beyond (the query design's section 4). Between a seal and the series
 directory write that covers it (a wait of up to one mark sync, which the writer forces, or until the deliverer takes
@@ -1540,7 +1542,8 @@ epoch and lost ranges are those of the start: the manifest changes only at a sta
 the manifest as it grows (a record per seal would otherwise make a reader parse a run's records at each call).
 
 ## Q-776 — When the writer keeps a series directory across a reset or a loss
-Recorded by roadmap 9.0a. To be settled by roadmap 9.0b1, whose reader judges saved points in full.
+Recorded by roadmap 9.0a. To be settled by roadmap 9.0c, the first reader of the series directory (moved from 9.0b1,
+whose reader reads no directory).
 **Scenario.** A series directory written at `through` = 900 under stamp S; a power cut; the start writes a recovery
 entry with `after` = 950 and a new stamp S'. The file's positions are all kept, so it is still a function of the
 kept log; a file with `through` above 950 would not be.
@@ -1652,6 +1655,19 @@ Corrupt block describes for a sealed segment, with the quarantine and copy), so 
 (health after the restart) and `a_region_a_consumers_read_meets_after_the_open_is_counted`
 (`kvik/tests/slow_path.rs`).
 
+## Q-850 — The error of a second reset during one materialised call
+Recorded by roadmap 9.0b1. To be settled by roadmap 9.0c, the first item that holds a cut across calls (`Snapshot`).
+**Scenario.** The query design §3.2 rule 3: a materialised result whose reset stamp changed during the read "is
+computed once more under the new cut and returned with the new state; a second change is an error". It does not name
+the error. Two starts that each reset the store within one call (two page-cache losses on the same boot, or a reset
+and a restore) are the only way to reach it.
+**Proposal, built.** `QueryError::CutExpired`, the error the same item adds for a cut that ended: the caller's remedy is
+the same (start the read again), and no second new variant is added to a public enum for a case this rare. The
+alternative is a variant of its own (for example `Reset { stamp }`), which an iteration needs anyway for its error item
+(roadmap 9.0f: the reset with `after` and the stamp); if 9.0f adds one, this case can move to it.
+**Pinned by.** `a_reset_during_a_call_is_read_again_under_the_new_cut_and_a_second_is_cut_expired`
+(`kvik/src/durable/read/cut.rs`).
+
 ## Q-851 — The second read of the mark after a pass
 Recorded and decided by roadmap 9.0b1 (technical). To be confirmed at its review.
 **Scenario.** The query design §3.1 lists the second read of the mark among the per-call work that goes. That read is
@@ -1683,11 +1699,24 @@ more is read; longer, it is parsed from where the reader stopped; shorter or cha
 before the last one damaged after the reader parsed it is therefore found at the next manifest rebuild or reopen, not
 at the next call. Measured through the `Fs` seam on stores with 10 and 1,000 sealed segments: an idle call made 14
 calls and listed 26 and 2,006 entries before, 8 calls and no listing after; a call with one new batch 21 calls and 28
-and 2,008 entries before, 18 calls and no listing after, also after a seal; the lease write per call went (Q-850's
-neighbour rules, `spec.md` §7 Readers).
+and 2,008 entries before, 18 calls and no listing after, also after a seal. Each wrote the lease once before and
+not at all after (the lease rules of `spec.md` §7 Readers).
 **Pinned by.** `a_calls_file_system_calls_and_writes_do_not_grow_with_the_sealed_segments`,
 `an_unchanged_manifest_is_read_at_its_last_record_a_longer_one_past_it_and_a_replaced_one_whole`
 (`log/tests/reader_calls.rs`); `an_earlier_segment_listed_but_gone_when_opened_is_an_error` (`log/tests/reader.rs`).
+
+## Q-853 — `cut_max_age`'s default and bound, and its clock
+Recorded and decided by roadmap 9.0b1 (technical). To be confirmed at its review.
+**Scenario.** The query design §2.1 sketches `cut_max_age: Duration, // default lease_refresh; at most the grace hour`.
+A default that follows `lease_refresh` needs an optional field or a builder that sets both.
+**Decision.** `ReaderConfig.cut_max_age` defaults to 30 minutes, the default `lease_refresh`, independently of a
+`lease_refresh` the caller sets; a value above an hour (`LEASE_EXPIRY`, the grace period) is taken as an hour. Safety
+does not rest on the bound alone: retired files go only an hour after their retirement, which a cut taken before it
+has outlived, and a lease the writer deleted ends every cut at the next renewal. A durable reader's lease renewal and
+cut ages run on the environment's monotonic clock (`Env::clock`), so an injected clock drives them; the writer's own
+clock is unchanged.
+**Pinned by.** `a_cut_max_age_above_the_grace_period_is_taken_as_the_grace_period` (`log/tests/reader_calls.rs`);
+`a_call_that_outlives_cut_max_age_ends_with_cut_expired_and_releases_its_cut` (`kvik/src/durable/read/cut.rs`).
 
 ## Q-710 — The default floor of the batch-sync interval
 
@@ -1765,7 +1794,7 @@ of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
 
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773 and Q-776 to 9.0c.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1839,18 +1868,20 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-751 | 5.6 | The recent windows' memory: constants per series and `limits.window_memory` store-wide, decided by the lead at the review of roadmap 11.0 |
 | Q-752 | 7.1b | A start bounded in memory but not in time until tree checkpoints carry the decision state; recorded by roadmap 11.0 |
 | Q-753 | 5.6 | The deliverer's recent window and its reads of the log; decided by the lead with roadmap 11.0 |
-| Q-773 | 9.0b1 | The series directory's cadence against a reader's allowance; decided at 9.0a's review (recent seals, reader retry), to be confirmed by 9.0b1 |
+| Q-773 | 9.0c | The series directory's cadence against a reader's allowance; decided at 9.0a's review (recent seals, reader retry), to be confirmed by 9.0c, which first reads the directories (moved from 9.0b1) |
 | Q-774 | 9.0b1 | The derived files' layout, names and generations; decided by the lead with roadmap 9.0a, awaiting review |
 | Q-775 | 6.3b | The log directory checked by trailers until the manifest lists sealed segments; recorded by roadmap 9.0a |
-| Q-776 | 9.0b1 | The writer's subset of the saved-point rule for a series directory across a reset; recorded by roadmap 9.0a |
+| Q-776 | 9.0c | The writer's subset of the saved-point rule for a series directory across a reset; recorded by roadmap 9.0a; moved from 9.0b1, which reads no directory |
 | Q-777 | 9.0c | The live candidate's write time and the unsure marks of bounded state; recorded by roadmap 9.0a |
 | Q-778 | 9.0g | The status file's health, interval and reserved pressure fields; recorded by roadmap 9.0a |
 | Q-779 | 6.3e | Group numbers once compacted log segments are removed locally; settled at 9.0a's review ("not local" bit); 6.3e writes the bit |
 | Q-780 | 8.3 | The log directory across a generation change: restored ends in the root; recorded by roadmap 9.0a |
 | Q-754 | 9.0f | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
 | Q-755 | 6.3b | Damage found during a run recorded durably as a loss; health held degraded meanwhile by the lead's decision at the re-check of roadmap 11.0 |
+| Q-850 | 9.0c | The error of a second reset stamp change during a materialised call: `CutExpired` proposed and built by roadmap 9.0b1 |
 | Q-851 | 9.0b2 | The second read of the mark kept after a pass that took something; decided by roadmap 9.0b1, awaiting review |
 | Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
+| Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, on the environment's clock; decided by roadmap 9.0b1, awaiting review |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |

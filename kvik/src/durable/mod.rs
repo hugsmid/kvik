@@ -23,6 +23,7 @@ mod history;
 mod index;
 mod ingest;
 mod keys;
+mod read;
 pub(crate) mod reader;
 mod registry;
 mod routing;
@@ -434,7 +435,7 @@ impl Writer {
             DurableReader::open_with(
                 &self.dir,
                 &self.env,
-                Duration::from_secs(30 * 60),
+                (Duration::from_secs(30 * 60), Duration::from_secs(30 * 60)),
                 self.clocks.clone(),
             )
             .map_err(|e| QueryError::NotAvailable {

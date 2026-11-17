@@ -1,6 +1,6 @@
 //! A reader on the durable log (`docs/api.md` Reader processes): the log reader of `kvik-log`, which takes no lock
 //! and reads up to the durable mark, and an [`Index`] of what it returned. Every call reads the mark and the
-//! entries appended since the last call first.
+//! entries appended since the last call first, then runs under its cut ([`cut`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use kvik_log::reader::{LogReader, ReaderConfig as LogReaderConfig, ReaderError};
 
-use super::LogClock;
 use super::clock::Clocks;
 use super::index::{Index, pos};
+use super::read::cut;
 use crate::backend::Error;
-use crate::env::Env;
+use crate::env::{Clock, Env};
 use crate::error::{OpenError, QueryError};
 use crate::health::LossReport;
 use crate::read::ReaderState;
@@ -31,6 +31,19 @@ impl Drop for State {
         if let Some(r) = self.log.take() {
             let _ = r.close();
         }
+    }
+}
+
+/// The environment's clocks for the log reader, so that the lease's renewal and a cut's age follow an injected clock.
+#[derive(Debug)]
+struct ReaderClock(Arc<dyn Clock>);
+
+impl kvik_log::writer::Clock for ReaderClock {
+    fn monotonic(&self) -> Duration {
+        Duration::from_nanos(self.0.monotonic().0)
+    }
+    fn wall(&self) -> i64 {
+        self.0.wall().0
     }
 }
 
@@ -80,20 +93,26 @@ fn query_error(dir: &Path, e: ReaderError) -> QueryError {
 
 impl DurableReader {
     /// Opens a reader on the store in `dir`; reads nothing until the first call.
-    pub(crate) fn open(dir: &Path, env: &Env, lease_refresh: Duration) -> Result<Self, OpenError> {
+    pub(crate) fn open(
+        dir: &Path,
+        env: &Env,
+        lease_refresh: Duration,
+        cut_max_age: Duration,
+    ) -> Result<Self, OpenError> {
         Self::open_with(
             dir,
             env,
-            lease_refresh,
+            (lease_refresh, cut_max_age),
             Arc::new(Clocks::new(env.clock.clone())),
         )
     }
 
-    /// [`DurableReader::open`] with the window clock and refresh instants of the process.
+    /// [`DurableReader::open`] with the window clock and refresh instants of the process; `ages` is `lease_refresh`
+    /// and `cut_max_age`.
     pub(crate) fn open_with(
         dir: &Path,
         env: &Env,
-        lease_refresh: Duration,
+        ages: (Duration, Duration),
         clocks: Arc<Clocks>,
     ) -> Result<Self, OpenError> {
         let mut id = [0u8; 16];
@@ -101,11 +120,11 @@ impl DurableReader {
         let mut cfg = LogReaderConfig::new(
             dir,
             env.fs.clone(),
-            Arc::new(LogClock::new(env.clock.clone())),
+            Arc::new(ReaderClock(env.clock.clone())),
             env.boot.current(),
             id,
         );
-        cfg.lease_refresh = lease_refresh;
+        (cfg.lease_refresh, cfg.cut_max_age) = ages;
         let log = LogReader::open(cfg).map_err(|e| open_error(dir, e))?;
         let created_zone = kvik_log::store::read_descriptor(&*env.fs, dir)
             .map_err(|e| super::store_error(dir, e))?
@@ -140,7 +159,8 @@ impl DurableReader {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reads what was appended since the last call, then runs `f` on the index.
+    /// Reads what was appended since the last call, then runs `f` on the index under the call's cut: a materialised
+    /// call ([`cut`]).
     pub(crate) fn with<R>(
         &self,
         f: impl FnOnce(&Index, &LogReader) -> Result<R, Error>,
@@ -150,12 +170,17 @@ impl DurableReader {
         let Some(log) = s.log.as_mut() else {
             return Err(QueryError::Closed);
         };
-        let update = log.refresh().map_err(|e| query_error(&self.dir, e))?;
+        let update = cut::refresh(log).map_err(|e| query_error(&self.dir, e))??;
         s.index.apply(&update.events);
-        f(&s.index, log).map_err(Error::query)
+        let c = cut::take(log);
+        let r = f(&s.index, log).map_err(Error::query);
+        let live = cut::check(log, &c);
+        log.release(c.id);
+        live?;
+        r
     }
 
-    /// Re-reads the mark, the manifest and new entries and renews the lease.
+    /// Re-reads the mark, the manifest and new entries, and renews the lease when due.
     pub(crate) fn refresh(&self) -> Result<ReaderState, QueryError> {
         self.with(|_, log| {
             let st = log.state();
@@ -170,6 +195,12 @@ impl DurableReader {
                 lease_renewed_at: Timestamp(st.lease_renewed_at),
             })
         })
+    }
+
+    /// How many cuts the log reader holds.
+    #[cfg(test)]
+    pub(crate) fn cuts_held(&self) -> usize {
+        self.lock().log.as_ref().map_or(0, LogReader::cuts_held)
     }
 
     /// Losses the files report: the manifest's lost ranges and the recovery entries of the kept log.

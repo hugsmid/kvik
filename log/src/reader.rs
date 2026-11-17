@@ -433,6 +433,7 @@ impl LogReader {
         r.take_manifest()?;
         r.renew(r.manifest.epoch, mark.generation)?;
         r.lost = r.manifest.lost.clone();
+        r.lost_stale = false;
         r.state.durable = Position {
             generation: mark.generation,
             sequence: mark.last_sequence,

@@ -562,6 +562,7 @@ impl Reader {
                 &config.dir,
                 &config.env,
                 config.lease_refresh,
+                config.cut_max_age,
             )?)),
         };
         Ok(Reader { inner })
@@ -588,7 +589,7 @@ impl Reader {
     }
 
     /// Re-reads the mark, the manifest tail and the new entries, and renews
-    /// the lease.
+    /// the lease when its epoch changes or half of `lease_refresh` has passed.
     pub fn refresh(&self) -> Result<ReaderState, QueryError> {
         self.on(
             |s| s.with(|s| s.refresh()).map_err(|e| e.query()),

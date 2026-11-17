@@ -1,8 +1,8 @@
 //! Reader leases (`format.md` A.15, `spec.md` §7 Leases): the 128-byte lease file a reader process writes and
 //! renews, and the writer's view of the lease files it finds.
 //!
-//! A reader names in its lease the manifest epoch it took; the writer keeps what a live lease may still read. Each
-//! lease carries a refresh counter that the reader increments at every renewal. The writer expires a lease whose
+//! A reader names in its lease the lowest manifest epoch of its live cuts ([`Cuts`]); the writer keeps what a live
+//! lease may still read. Each lease carries a refresh counter that the reader increments at every renewal. The writer expires a lease whose
 //! counter has not changed for [`LEASE_EXPIRY`] of the writer's monotonic clock since the writer first observed
 //! that value, and treats a lease of another boot as void; it deletes void and expired leases. A lease is never
 //! synced.

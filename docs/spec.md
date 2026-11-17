@@ -651,17 +651,20 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   later of the retirement record and the writer's start), once the files that replaced them are verified in another
   tier, and when no live reader lease names an older epoch.
 - **Leases:** a lease file holds the epoch, the boot id (from the same source as the mark's) and a refresh counter
-  that the reader increments at every refresh. The writer expires a lease when its counter has not changed for
+  that the reader increments at every renewal. The writer expires a lease when its counter has not changed for
   1 hour of the writer's monotonic clock since the writer first observed that value; at writer start, every lease of
   the current boot counts as first observed then. A lease is void only when both boot ids are non-zero and differ.
   The writer looks at leases at its own turns, at most once a minute, with no timer of its own: a late look only
   makes an expiry later.
-- **Readers** take an epoch, write a lease file naming it, and refresh both at least every 30 minutes. A reader
-  needs nothing from the writer's memory: it reads via the manifest, the documented layout, tree files and log
-  segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
+- **Readers** read under cuts: a cut is the manifest epoch whose files it reads, with the durable position and reset
+  stamp it was taken at. A reader's lease names the lowest epoch of its live cuts, and the reader renews it at least
+  every 30 minutes; a cut ends after `cut_max_age` (`api.md` `ReaderConfig`; at most the grace period of Retired
+  files); a lease found gone or changed ends every cut. A reader needs nothing from the writer's memory: it reads via
+  the manifest, the documented layout, tree files and log segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
   `after`; it compares the mark's reset stamp before and after reading, and discards what it read if the stamp
-  changed meanwhile. A reader reads nothing without a renewed lease: if the lease write fails, the open or refresh
-  returns the error. Positions are read in order, so a reader catching up (a consumer, a live read's tail) that
+  changed meanwhile; a call with a materialised result then reads once more under the new cut, and a second change
+  ends it with `CutExpired` (Q-850). A reader reads nothing without a lease, renewed within `lease_refresh`, that names an epoch at or below
+  its cut's: if a lease write that a call needs fails, the call returns the error. Positions are read in order, so a reader catching up (a consumer, a live read's tail) that
   cannot read a file returns the error for that file and reads nothing at or past it until it can; a query (roadmap
   9.0f) returns the error only if the file's segment index (`format.md` A.8) lists one of its series or the file has
   entries, or the index cannot be read either, and otherwise passes over it. A manifest record a reader cannot take an epoch from is an

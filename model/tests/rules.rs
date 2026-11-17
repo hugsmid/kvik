@@ -3886,6 +3886,98 @@ fn s7_leases_expire_on_the_writers_monotonic_clock() {
     );
 }
 
+/// §7 Readers: "a reader's lease names the lowest epoch of its live cuts". A
+/// held cut keeps the files it reads across a retirement; once it ends, the
+/// lease names the latest epoch and the retired files go. The cut is held past
+/// the grace period here (the model does not cap `cut_max_age`), so that the
+/// lease alone keeps them.
+#[test]
+fn s7_a_held_cut_keeps_its_files_across_a_retirement_until_it_ends() {
+    let (mut m, _, chunks) = chunked_model(5);
+    m.config.cut_max_age = 2 * HOUR;
+    let reader = m.lease_reader();
+    let held = m.take_cut(&reader).unwrap();
+    let (_, facts) = m.read_cut(&held).unwrap();
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    let later = m.take_cut(&reader).unwrap();
+    assert!(later.epoch > held.epoch);
+    m.refresh_reader(&reader, true);
+    assert_eq!(
+        m.live_lease_epochs(),
+        vec![held.epoch],
+        "never a later epoch"
+    );
+    m.advance(HOUR);
+    m.refresh_reader(&reader, true);
+    assert!(
+        m.housekeeping().unwrap().is_empty(),
+        "kept for the held cut"
+    );
+    let (loc, again) = m.read_cut(&held).unwrap();
+    assert!(loc.iter().all(|(_, l)| *l == Locality::Hot));
+    assert_eq!(again, facts);
+    m.end_cut(&held);
+    m.end_cut(&later);
+    m.refresh_reader(&reader, true);
+    let mut gone = m.housekeeping().unwrap();
+    gone.sort();
+    assert_eq!(gone, chunks);
+    assert_eq!(m.read_cut(&held), Err(Error::CutExpired), "released");
+}
+
+/// §7 Readers: "a cut ends after `cut_max_age`". It no longer holds the lease
+/// down, so a busy reader never pins an epoch for longer.
+#[test]
+fn s7_a_cut_ends_after_cut_max_age_and_no_longer_holds_the_lease_down() {
+    let (mut m, _, chunks) = chunked_model(5);
+    let reader = m.lease_reader();
+    let held = m.take_cut(&reader).unwrap();
+    m.merge_chunks(None).unwrap();
+    m.upload();
+    m.advance(m.config.cut_max_age - 1);
+    m.refresh_reader(&reader, true);
+    assert!(m.read_cut(&held).is_ok());
+    assert_eq!(m.live_lease_epochs(), vec![held.epoch]);
+    m.advance(1);
+    assert_eq!(m.read_cut(&held), Err(Error::CutExpired));
+    m.refresh_reader(&reader, true);
+    assert_eq!(m.live_lease_epochs(), vec![m.disk.latest_epoch()]);
+    m.advance(HOUR);
+    m.refresh_reader(&reader, true);
+    let mut gone = m.housekeeping().unwrap();
+    gone.sort();
+    assert_eq!(gone, chunks);
+}
+
+/// §7 Readers: "a lease found gone or changed ends every cut". A reader
+/// stopped for over an hour finds its lease expired, as the writer deletes it.
+#[test]
+fn s7_a_lease_found_gone_ends_every_cut_of_the_reader() {
+    let (mut m, _, _) = chunked_model(5);
+    let reader = m.lease_reader();
+    let other = m.lease_reader();
+    let (a, b) = (m.take_cut(&reader).unwrap(), m.take_cut(&reader).unwrap());
+    let theirs = m.take_cut(&other).unwrap();
+    m.config.cut_max_age = 2 * HOUR;
+    // The writer looks at the lease files, then the reader stops for an hour.
+    m.live_lease_epochs();
+    m.advance(HOUR);
+    m.refresh_reader(&other, false);
+    let c = m.take_cut(&reader).unwrap();
+    assert_eq!(m.read_cut(&a), Err(Error::CutExpired));
+    assert_eq!(m.read_cut(&b), Err(Error::CutExpired));
+    assert!(m.read_cut(&c).is_ok());
+    assert!(
+        m.read_cut(&theirs).is_ok(),
+        "another reader's lease is its own"
+    );
+    m.close_reader(&reader);
+    let d = m.take_cut(&reader).unwrap();
+    assert_eq!(m.read_cut(&c), Err(Error::CutExpired), "closed: gone");
+    assert!(m.read_cut(&d).is_ok());
+}
+
 // ----- tiers and eviction (§3 Disk space, §8) -----
 
 /// The manifest's tier moves, in order.

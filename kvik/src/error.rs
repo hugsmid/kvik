@@ -354,6 +354,12 @@ pub enum QueryError {
     /// backend after a shutdown, which keeps it readable).
     #[error("the store is closed")]
     Closed,
+    /// The read's cut ended before the read did (spec §7 Readers): held for
+    /// `cut_max_age`, its lease found gone or changed, or the mark's reset
+    /// stamp changed twice during one call (Q-850). Nothing of the read is
+    /// returned; start it again.
+    #[error("the read's cut expired; start it again")]
+    CutExpired,
 }
 
 /// The error of a consumer call, funnel compilation errors included

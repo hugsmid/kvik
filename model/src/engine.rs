@@ -15,7 +15,9 @@ use crate::recovery::{
     ResetPoint, ResetStamp, SavedPoint, Tail,
 };
 
+mod cuts;
 mod recovery;
+
 use crate::registry::{
     Registry, RegistryError, RegistryEvent, RetentionClass, SeriesDef, SeriesOptions, Timing,
 };
@@ -26,6 +28,7 @@ use crate::types::{
     SECOND, SeriesId, TSource, Value, ValueType, floor_to,
 };
 use crate::view;
+pub use cuts::Cut;
 
 /// Engine configuration. Defaults follow the spec where it gives one.
 #[derive(Clone, Debug)]
@@ -54,6 +57,9 @@ pub struct Config {
     /// A lease whose counter has not changed for this long on the writer's
     /// monotonic clock expires (§7: 1 hour).
     pub lease_expiry: Nanos,
+    /// A reader's cut ends once it is this old (§7 Readers: 30 minutes by
+    /// default, at most the grace period).
+    pub cut_max_age: Nanos,
     /// Compacted chunks of a series overlapping one 15-minute span are
     /// merged when they number more than this (§7: 4).
     pub merge_threshold: usize,
@@ -115,6 +121,7 @@ impl Default for Config {
             seal_interval: 5 * MINUTE,
             grace: HOUR,
             lease_expiry: HOUR,
+            cut_max_age: 30 * MINUTE,
             merge_threshold: 4,
             eviction_age: 90 * 24 * HOUR,
             revision_age: BTreeMap::new(),
@@ -746,6 +753,10 @@ pub enum Error {
         /// The position.
         position: Position,
     },
+    /// A reader's cut ended before the read (§7 Readers): it is
+    /// `cut_max_age` old, its lease was found gone, or it was released.
+    #[error("the cut expired")]
+    CutExpired,
     /// The configured site zone is not the store's: opening (or restoring)
     /// with another zone would re-take past days (§5.7, §12 D3).
     #[error("site zone {configured} configured, but the store's is {store}")]
@@ -1892,6 +1903,9 @@ pub struct Model {
     pub calendar_log: Vec<CalendarRebuild>,
     vol: Option<Volatile>,
     sessions: BTreeMap<ConsumerId, u32>,
+    /// The cuts reader processes hold, by id.
+    cuts: BTreeMap<u64, cuts::HeldCut>,
+    next_cut: u64,
 }
 
 impl Model {
@@ -1926,6 +1940,8 @@ impl Model {
             calendar_log: Vec::new(),
             vol: None,
             sessions: BTreeMap::new(),
+            cuts: BTreeMap::new(),
+            next_cut: 0,
         };
         m.restart();
         m
@@ -4691,15 +4707,25 @@ impl Model {
 
     /// A reader refreshes its lease (§7: at least every 30 minutes): it
     /// increments the refresh counter and, with `latest`, takes the latest
-    /// epoch, which the lease then names. The boot id stays the one the lease
+    /// epoch, which the lease then names unless one of the reader's live cuts
+    /// is older ([`Model::take_cut`]). The boot id stays the one the lease
     /// was written with, so a lease from before a reboot stays void. A reader
     /// without a lease file is returned unchanged.
     pub fn refresh_reader(&mut self, r: &Reader, latest: bool) -> Reader {
-        let Some(lease) = r.lease.and_then(|id| self.disk.leases.get_mut(&id)) else {
+        let Some(id) = r.lease else {
+            return r.clone();
+        };
+        let lowest = self.lowest_cut(id);
+        let current = self.disk.manifest.last().map_or(0, |x| x.epoch);
+        let Some(lease) = self.disk.leases.get_mut(&id) else {
             return r.clone();
         };
         if latest {
-            lease.epoch = self.disk.manifest.last().map_or(0, |x| x.epoch);
+            lease.epoch = current;
+        }
+        // Never a later epoch than one of its live cuts (§7 Readers).
+        if let Some(l) = lowest {
+            lease.epoch = lease.epoch.min(l);
         }
         lease.counter += 1;
         let epoch = lease.epoch;
@@ -4753,10 +4779,8 @@ impl Model {
         }
     }
 
-    /// Epochs named by live leases: of this boot, with a counter that has
-    /// changed within `lease_expiry` of the writer's monotonic clock since it
-    /// was first observed (§7 Leases).
-    pub fn live_lease_epochs(&mut self) -> Vec<u64> {
+    /// Ids of the live leases, as [`Model::live_lease_epochs`] judges them.
+    fn live_lease_ids(&mut self) -> Vec<u64> {
         self.observe_leases();
         let Some(v) = self.vol.as_ref() else {
             return Vec::new();
@@ -4770,7 +4794,17 @@ impl Model {
                         .get(id)
                         .is_some_and(|(_, at)| self.mono - at < self.config.lease_expiry)
             })
-            .map(|(_, l)| l.epoch)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Epochs named by live leases: of this boot, with a counter that has
+    /// changed within `lease_expiry` of the writer's monotonic clock since it
+    /// was first observed (§7 Leases).
+    pub fn live_lease_epochs(&mut self) -> Vec<u64> {
+        self.live_lease_ids()
+            .iter()
+            .map(|id| self.disk.leases[id].epoch)
             .collect()
     }
 
