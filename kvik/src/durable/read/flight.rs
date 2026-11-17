@@ -2,7 +2,7 @@
 //! arrives while one runs waits for the next, so every call gets a view read after it began. A follower takes the
 //! leader's view; on the leader's error it leads or follows once more, then reports the error.
 //!
-//! Under `--cfg kvik_loom` the locks are the model checker's, for the tests of [`loom_tests`] only (Q-901).
+//! Under `--cfg kvik_loom` the locks are the model checker's, for the tests of `loom_tests` only (Q-901).
 
 use std::sync::{Arc, PoisonError};
 
