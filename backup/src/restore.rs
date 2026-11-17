@@ -20,6 +20,7 @@ mod driver;
 mod judge;
 mod local;
 mod probe;
+mod source;
 
 pub use driver::Restorer;
 
@@ -138,6 +139,67 @@ pub enum RestoreError {
         /// The epoch it names.
         previous: u64,
     },
+    /// The generation read has records and no last-uploaded marker: a bucket written before the marker, or one that
+    /// lost it (format A.17; Q-614). [`RestoreConfig::accept_unmarked`] restores it without the marker check.
+    #[error(
+        "generation {generation} has records and no last-uploaded marker: written before markers, or the marker is lost"
+    )]
+    MarkerMissing {
+        /// The generation.
+        generation: u32,
+    },
+    /// The latest marker of the generation read does not open or decode, or names another key's generation or
+    /// sequence (Q-614).
+    #[error("generation {generation}'s last-uploaded marker {sequence} is unreadable: {reason}")]
+    MarkerUnreadable {
+        /// The generation.
+        generation: u32,
+        /// The marker's sequence number.
+        sequence: u64,
+        /// Why.
+        reason: String,
+    },
+    /// The latest marker names record `epoch` (the last uploaded, or an end of the records a restore reads), which
+    /// the bucket does not report (Q-614).
+    #[error(
+        "generation {generation}'s last-uploaded marker {sequence} names record {epoch}, which the bucket does not hold"
+    )]
+    MarkerUnreached {
+        /// The generation.
+        generation: u32,
+        /// The marker's sequence number.
+        sequence: u64,
+        /// The record.
+        epoch: u64,
+    },
+    /// The records read end before the range the latest marker names, though the bucket lists both its ends
+    /// (Q-614).
+    #[error(
+        "generation {generation}'s last-uploaded marker {sequence} names records {marked:?}, and the restore reads {read:?}"
+    )]
+    MarkerMismatch {
+        /// The generation.
+        generation: u32,
+        /// The marker's sequence number.
+        sequence: u64,
+        /// The first and last record the marker names.
+        marked: (u64, u64),
+        /// The first and last record read, if any.
+        read: Option<(u64, u64)>,
+    },
+    /// The marker named a record that `stat` reports and the listing did not show at each of `tries` consecutive
+    /// `prepare` calls of this driver ([`MARKER_LISTING_TRIES`]; Q-614): the listing lags longer than the retries.
+    #[error(
+        "the listing of generation {generation}'s records did not show record {epoch}, which its last-uploaded marker names, in {tries} tries"
+    )]
+    MarkerNotListed {
+        /// The generation.
+        generation: u32,
+        /// The record.
+        epoch: u64,
+        /// The tries.
+        tries: u32,
+    },
     /// No plan can be made.
     #[error(transparent)]
     Plan(#[from] PlanError),
@@ -171,4 +233,11 @@ pub struct RestoreConfig {
     pub retry_first: Duration,
     /// The longest retry delay.
     pub retry_max: Duration,
+    /// Restores a generation that has records and no last-uploaded marker without the marker check, instead of
+    /// failing with [`RestoreError::MarkerMissing`] (Q-614). A marker present is always checked.
+    pub accept_unmarked: bool,
 }
+
+/// Consecutive `prepare` calls of one driver that may find the marker ahead of the listing: the earlier ones fail as
+/// [`RestoreError::ListingIncomplete`], to be retried, the last as [`RestoreError::MarkerNotListed`] (Q-614).
+pub const MARKER_LISTING_TRIES: u32 = 10;

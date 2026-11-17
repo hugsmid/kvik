@@ -1,6 +1,7 @@
 //! The chain of uploaded manifest records at a restore (`format.md` A.17 Uploaded forms; Q-611, Q-612): each break
 //! of the chain, a record the listing hides, the tail checks found, not found and unanswered, and the files of the
-//! generation read that no record names (Q-613).
+//! generation read that no record names (Q-613). Each record is followed by its last-uploaded marker (Q-614), whose
+//! own cases are in `restore_marker.rs`.
 
 mod support;
 
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::Keys;
+use kvik_backup::marker::Summary;
 use kvik_backup::plan::{
     ChainBreak, PlanError, PlanMode, TAIL_PROBES, after_last, check_chain, read_tail,
     records_to_read,
@@ -81,8 +83,10 @@ fn bucket(mut src: Source, chain: &[UploadedRecord]) -> Arc<FaultSink> {
     let mem = MemSink::new();
     upload_files(&mem, &mut src);
     use_copies(&src);
-    for u in chain {
+    for (i, u) in chain.iter().enumerate() {
         put_record(&mem, ID, u.previous, &u.record);
+        let summary = Summary::of(chain[..=i].iter().map(|u| &u.record));
+        put_marker(&mem, ID, 0, i as u64 + 1, summary);
     }
     Arc::new(FaultSink::new(mem))
 }
@@ -476,11 +480,12 @@ fn q614_a_last_record_hidden_behind_skipped_epochs_within_the_bound_is_a_lagging
 }
 
 #[test]
-fn q614_a_last_record_hidden_behind_more_skipped_epochs_than_the_bound_is_not_seen() {
+fn q614_a_last_record_hidden_behind_more_skipped_epochs_than_the_bound_is_found_by_the_marker() {
     let (src, s1, s2) = segments();
     let sink = bucket(src, &skipping(&s1, &s2, TAIL_PROBES));
     sink.set(&key(3 + TAIL_PROBES), Some(Fault::Unlisted));
-    both(&sink, |r| assert_eq!(r.unwrap().record.files.len(), 1));
+    both(&sink, lagging);
+    nothing_recorded(&sink);
 }
 
 #[test]

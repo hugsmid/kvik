@@ -74,10 +74,12 @@ fn check_objects(h: &Harness) {
                     .expect("an object for a record not in the manifest");
                 env.seal(&k, &uploaded_form(&records, i)).unwrap()
             }
+            Some(ObjectName::Marker { .. }) => continue,
             other => panic!("unexpected object {k}: {other:?}"),
         };
         assert_eq!(v, want, "{k}");
     }
+    check_markers(&h.sink.mem, false);
     assert_eq!(
         kvik_backup::plan::check_chain(&in_bucket(&h.sink.mem)),
         Ok(())

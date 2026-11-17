@@ -14,6 +14,7 @@ use kvik_backup::LocalStore;
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::Keys;
+use kvik_backup::marker::{Marker, Summary};
 use kvik_backup::plan::{PlanError, PlanInput, PlanMode, RestorePlan};
 use kvik_backup::restore::{
     Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreStep, Restorer,
@@ -100,8 +101,10 @@ fn put(sink: &dyn BackupSink, key: &str, bytes: Vec<u8>) -> Stored {
 pub fn upload(sink: &dyn BackupSink, src: &mut Source) {
     upload_files(sink, src);
     let mut previous = 0;
-    for r in records_of(src) {
-        put_record(sink, src.id, previous, &r);
+    let records = records_of(src);
+    for (i, r) in records.iter().enumerate() {
+        put_record(sink, src.id, previous, r);
+        put_marker(sink, src.id, 0, i as u64 + 1, Summary::of(&records[..=i]));
         previous = r.epoch;
     }
 }
@@ -156,6 +159,27 @@ pub fn put_record(sink: &dyn BackupSink, id: [u8; 16], previous: u64, r: &Record
         TestEnvelope::new(KEY)
             .seal(&k, &uploaded(previous, r))
             .unwrap(),
+    );
+}
+
+/// Seals and puts store `id`'s last-uploaded marker `sequence` of `generation`, as the upload driver would (Q-614).
+pub fn put_marker(
+    sink: &dyn BackupSink,
+    id: [u8; 16],
+    generation: u32,
+    sequence: u64,
+    summary: Summary,
+) {
+    let k = Keys::new(id).marker(generation, sequence);
+    let m = Marker {
+        generation,
+        sequence,
+        summary,
+    };
+    put(
+        sink,
+        &k,
+        TestEnvelope::new(KEY).seal(&k, &m.encode()).unwrap(),
     );
 }
 
@@ -228,6 +252,7 @@ pub fn cfg(mode: PlanMode) -> RestoreConfig {
         lost_over: 10 * MIN,
         retry_first: Duration::from_secs(1),
         retry_max: MIN,
+        accept_unmarked: false,
     }
 }
 

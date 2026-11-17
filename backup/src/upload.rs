@@ -15,6 +15,7 @@ use crate::envelope::EnvelopeError;
 use crate::port::PortError;
 
 mod driver;
+mod mark;
 mod probe;
 
 pub use driver::Uploader;

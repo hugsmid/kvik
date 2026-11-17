@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
-use kvik_backup::keys::{ClaimMarker, Keys};
+use kvik_backup::keys::{ClaimMarker, Keys, ObjectName};
+use kvik_backup::marker::Marker;
 use kvik_backup::plan::{PlanError, PlanMode};
 use kvik_backup::restore::{RestoreDriver, RestoreError};
 use kvik_files::desc::FileRef;
@@ -80,7 +81,15 @@ fn a_full_restore_claims_generation_one_uploads_its_record_and_installs_every_fi
             .keys()
             .any(|k| k.starts_with(&format!("{}/", keys.probe())))
     );
-    assert_eq!(after.len(), objects.len() + 3);
+    let marker = TestEnvelope::new(KEY)
+        .open(&keys.marker(1, 1), &after[&keys.marker(1, 1)])
+        .unwrap();
+    let marker = Marker::decode(&marker).unwrap().summary;
+    assert_eq!(
+        (marker.epoch, marker.open, marker.read),
+        (1, 1, Some((1, 1)))
+    );
+    assert_eq!(after.len(), objects.len() + 4);
 }
 
 #[test]
@@ -376,6 +385,31 @@ fn each_object_lost_damaged_or_delayed_in_turn() {
             }
             let file = src.segments.iter().position(|(d, _)| &keys.file(d) == key);
             let ctx = format!("{key} {fault:?}");
+            if matches!(keys.parse(key), Some(ObjectName::Marker { .. })) {
+                match (fault, key == &keys.marker(0, 4)) {
+                    (Fault::Damage, true) => {
+                        let e = prepared.expect_err(&ctx);
+                        assert!(
+                            matches!(
+                                e,
+                                RestoreError::MarkerUnreadable {
+                                    generation: 0,
+                                    sequence: 4,
+                                    ..
+                                }
+                            ),
+                            "{ctx}: {e:?}"
+                        );
+                    }
+                    // An earlier marker is read: it names records the bucket holds.
+                    _ => {
+                        prepared.expect(&ctx);
+                        steps(&mut r, Duration::ZERO, 120 * MIN).expect(&ctx);
+                        assert_installed(&fs, &src, &[]);
+                    }
+                }
+                continue;
+            }
             match (file, fault, key == &keys.store()) {
                 (Some(i), Fault::Lose | Fault::Damage, _) => {
                     prepared.expect(&ctx);
@@ -397,8 +431,18 @@ fn each_object_lost_damaged_or_delayed_in_turn() {
                         "{ctx}: {e:?}"
                     );
                 }
-                // A lost record object is not visible to a listing (Q-304).
-                (None, Fault::Lose, false) => {}
+                // A lost record breaks the chain, or, the last, leaves the marker unreached (Q-611, Q-614).
+                (None, Fault::Lose, false) => {
+                    let e = prepared.expect_err(&ctx);
+                    assert!(
+                        matches!(
+                            e,
+                            RestoreError::BrokenChain { .. } | RestoreError::MarkerUnreached { .. }
+                        ),
+                        "{ctx}: {e:?}"
+                    );
+                    assert!(fs.paths().is_empty(), "{ctx}");
+                }
                 (None, Fault::Damage, _) => {
                     let e = prepared.expect_err(&ctx);
                     assert!(matches!(e, RestoreError::Envelope(_)), "{ctx}: {e:?}");
