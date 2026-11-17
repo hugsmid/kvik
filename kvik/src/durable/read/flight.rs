@@ -89,7 +89,7 @@ impl<V, E: Clone> Flight<V, E> {
     /// `refresh` with the current view, outside the flight's lock, and returns what it returns.
     pub(crate) fn get(
         &self,
-        mut refresh: impl FnMut(Option<Arc<V>>) -> Result<Arc<V>, E>,
+        refresh: impl FnOnce(Option<Arc<V>>) -> Result<Arc<V>, E>,
     ) -> Result<Arc<V>, E> {
         let mut g = self.lock();
         let mut target = g.started + 1;

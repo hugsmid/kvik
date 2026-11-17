@@ -2,9 +2,10 @@
 //! while it runs, with the stamp rule of its call kind (spec §7 Readers).
 //!
 //! - A materialised call (`live`, `at`, `window`, `buckets`, `calendar`, `interval`, `series`, and `facts` until it
-//!   streams, roadmap 9.0f) refreshes, holds its cut for the call and ends it at its return. A pass the log reader
-//!   discarded because the mark's reset stamp changed while it read is read once more, under the new cut; a second
-//!   such change is [`QueryError::CutExpired`] (Q-850).
+//!   streams, roadmap 9.0f) runs under the cut of the view a refresh published after it began, which the view holds
+//!   until it is superseded and no call holds it (Q-903). A pass the log reader discarded because the mark's reset
+//!   stamp changed while it read is read once more, under the new cut; a second such change is
+//!   [`QueryError::CutExpired`] (Q-850).
 //! - A cut held across calls (a snapshot, roadmap 9.0c; an iteration, 9.0f) ends with `CutExpired` once its epoch was
 //!   last found current `cut_max_age` ago or a renewal found the lease gone or changed; the lease names the lowest
 //!   epoch of the live cuts.
