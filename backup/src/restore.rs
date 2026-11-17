@@ -49,6 +49,38 @@ pub struct Prepared {
     /// Files of the source generation in the bucket that no record read names, which the restore leaves out (Q-613);
     /// empty on a resume.
     pub unnamed: Vec<FileRef>,
+    /// The latest last-uploaded marker could not be read and an earlier one was checked instead (Q-614); `None` on a
+    /// resume.
+    pub marker_fallback: Option<MarkerFallback>,
+    /// Records a marker names that the bucket does not hold, accepted by [`RestoreConfig::accept_earlier_state`]
+    /// (Q-962); `None` on a resume.
+    pub earlier_state: Option<EarlierState>,
+}
+
+/// A restore checked an earlier marker than the latest (Q-614).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerFallback {
+    /// The generation.
+    pub generation: u32,
+    /// The sequences passed over, latest first: not readable, or no longer in the bucket.
+    pub unreadable: Vec<u64>,
+    /// The sequence checked.
+    pub used: u64,
+}
+
+/// What a restore that accepts an earlier state left out (Q-962).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EarlierState {
+    /// The generation whose marker names the records.
+    pub generation: u32,
+    /// The marker's sequence number.
+    pub sequence: u64,
+    /// The records the marker names that the bucket does not hold.
+    pub missing: Vec<u64>,
+    /// The last record read, if any: the epochs after it up to `marked_end` are not restored.
+    pub read_end: Option<u64>,
+    /// The last record the marker names.
+    pub marked_end: u64,
 }
 
 /// What one [`RestoreDriver::step`] did.
@@ -139,17 +171,18 @@ pub enum RestoreError {
         /// The epoch it names.
         previous: u64,
     },
-    /// The generation read has records and no last-uploaded marker: a bucket written before the marker, or one that
-    /// lost it (format A.17; Q-614). [`RestoreConfig::accept_unmarked`] restores it without the marker check.
+    /// The generation read has records and no last-uploaded marker: a bucket written before the marker, one that
+    /// lost it, or a first record whose marker is not yet put (format A.17; Q-614). [`RestoreConfig::accept_unmarked`]
+    /// restores it without the marker check.
     #[error(
-        "generation {generation} has records and no last-uploaded marker: written before markers, or the marker is lost"
+        "generation {generation} has records and no last-uploaded marker: written before markers, the marker is lost, or its first marker is not yet put (try again)"
     )]
     MarkerMissing {
         /// The generation.
         generation: u32,
     },
-    /// The latest marker of the generation read does not open or decode, or names another key's generation or
-    /// sequence (Q-614).
+    /// No marker of the generation read opens and decodes, or the latest readable one is of a version this build does
+    /// not read (Q-614); `sequence` is the marker that failed.
     #[error("generation {generation}'s last-uploaded marker {sequence} is unreadable: {reason}")]
     MarkerUnreadable {
         /// The generation.
@@ -236,6 +269,9 @@ pub struct RestoreConfig {
     /// Restores a generation that has records and no last-uploaded marker without the marker check, instead of
     /// failing with [`RestoreError::MarkerMissing`] (Q-614). A marker present is always checked.
     pub accept_unmarked: bool,
+    /// Restores what the bucket holds when a marker names records it does not hold, reporting them in
+    /// [`Prepared::earlier_state`], instead of failing with [`RestoreError::MarkerUnreached`] (Q-962; off by default).
+    pub accept_earlier_state: bool,
 }
 
 /// Consecutive `prepare` calls of one driver that may find the marker ahead of the listing: the earlier ones fail as

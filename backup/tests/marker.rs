@@ -1,10 +1,18 @@
 //! Properties of the last-uploaded marker (`format.md` A.17; Q-614): the summary built record by record reads what
 //! `plan::records_to_read` reads over the same records, every summary of a record list round-trips through the
-//! format, and no bytes make decoding panic.
+//! format, no bytes make decoding panic, and the latest marker is found whatever the listing shows and however it
+//! pages.
 
-use kvik_backup::marker::{MARKER_LEN, Marker, Summary};
+use std::collections::BTreeSet;
+use std::ops::Range;
+use std::sync::Arc;
+
+use kvik_backup::fake::{MemSink, block_on};
+use kvik_backup::keys::Keys;
+use kvik_backup::marker::{MARKER_LEN, Marker, Summary, latest};
 use kvik_backup::plan::records_to_read;
 use kvik_files::record::{Body, Rebuild, Record};
+use kvik_sink_api::{BackupSink, ListPage, SinkFuture, Stored};
 use proptest::prelude::*;
 
 /// What one record of a generation's uploaded list is.
@@ -50,7 +58,82 @@ fn records() -> impl Strategy<Value = Vec<Record>> {
     })
 }
 
+/// A bucket whose listings leave out `hidden` and return at most `page` keys at a time.
+struct Paged {
+    inner: MemSink,
+    hidden: BTreeSet<String>,
+    page: usize,
+}
+
+impl BackupSink for Paged {
+    fn put<'a>(&'a self, key: &'a str, b: Arc<[u8]>, sha: [u8; 32]) -> SinkFuture<'a, Stored> {
+        self.inner.put(key, b, sha)
+    }
+    fn stat<'a>(&'a self, key: &'a str) -> SinkFuture<'a, Option<Stored>> {
+        self.inner.stat(key)
+    }
+    fn get<'a>(&'a self, key: &'a str, r: Option<Range<u64>>) -> SinkFuture<'a, Vec<u8>> {
+        self.inner.get(key, r)
+    }
+    fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>) -> SinkFuture<'a, ListPage> {
+        let r = block_on(self.inner.list(prefix, None)).map(|p| {
+            let keys: Vec<String> = p
+                .keys
+                .into_iter()
+                .filter(|k| !self.hidden.contains(k) && after.is_none_or(|a| k.as_str() > a))
+                .collect();
+            let more = keys.len() > self.page;
+            ListPage::new(keys.into_iter().take(self.page).collect(), more)
+        });
+        Box::pin(async move { r })
+    }
+}
+
+const ID: [u8; 16] = [3; 16];
+
+/// `n` markers of generation 1 (their content does not matter to `latest`), and one of generation 2.
+fn markers(n: u64, hidden: impl Fn(u64) -> bool, page: usize) -> Paged {
+    let keys = Keys::new(ID);
+    let inner = MemSink::new();
+    for s in 1..=n {
+        inner.set(&keys.marker(1, s), b"m");
+    }
+    inner.set(&keys.marker(2, n + 5), b"m");
+    let hidden = (1..=n)
+        .filter(|s| hidden(*s))
+        .map(|s| keys.marker(1, s))
+        .collect();
+    Paged {
+        inner,
+        hidden,
+        page,
+    }
+}
+
+#[test]
+fn the_latest_of_many_markers_is_found_across_listing_pages_of_a_thousand() {
+    let keys = Keys::new(ID);
+    for (n, hide_from) in [(2_500, u64::MAX), (2_500, 1_001), (1_000, 1), (1_001, 990)] {
+        let sink = markers(n, |s| s >= hide_from, 1_000);
+        assert_eq!(block_on(latest(&sink, &keys, 1)), Ok(n), "{n} {hide_from}");
+    }
+    assert_eq!(
+        block_on(latest(&markers(0, |_| false, 1_000), &keys, 1)),
+        Ok(0)
+    );
+}
+
 proptest! {
+    #[test]
+    fn the_latest_marker_is_found_whatever_the_listing_hides_and_however_it_pages(
+        n in 0u64..300,
+        hidden in prop::collection::vec(any::<bool>(), 300),
+        page in 1usize..20,
+    ) {
+        let sink = markers(n, |s| hidden[s as usize - 1], page);
+        prop_assert_eq!(block_on(latest(&sink, &Keys::new(ID), 1)), Ok(n));
+    }
+
     #[test]
     fn the_summary_record_by_record_reads_what_records_to_read_reads(v in records()) {
         let read = records_to_read(&v);

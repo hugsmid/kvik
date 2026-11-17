@@ -98,6 +98,17 @@ pub enum UploadError {
     /// The bucket reported other content than was uploaded.
     #[error(transparent)]
     Verify(#[from] VerifyError),
+    /// The latest last-uploaded marker is of a version this build does not read: a later build wrote it, and an
+    /// earlier version put after it would undo what it says (format A.17; Q-960).
+    #[error(
+        "last-uploaded marker {sequence} is of version {version}, which this build does not read"
+    )]
+    MarkerVersion {
+        /// The marker's sequence number.
+        sequence: u64,
+        /// Its version.
+        version: u16,
+    },
     /// A restore claimed a generation above the store's: uploads stop for good and the store becomes read-only
     /// (`spec.md` §8 Generations; Q-265).
     #[error("generation {by} was claimed by a restore")]

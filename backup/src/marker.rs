@@ -144,20 +144,26 @@ impl Marker {
     }
 
     /// A marker from exactly its plaintext.
+    /// Format A.17: magic and version first, so a later version of any length is a version refusal.
     pub fn decode(b: &[u8]) -> Result<Self, MarkerError> {
-        let b: &[u8; MARKER_LEN] = b.try_into().map_err(|_| MarkerError::Length(b.len()))?;
-        if b[..4] != MAGIC {
+        if b.get(..4).is_some_and(|m| m != MAGIC) {
             return Err(MarkerError::Magic);
         }
+        if let Some(v) = b.get(4..6) {
+            let version = u16::from_le_bytes([v[0], v[1]]);
+            if version != VERSION {
+                return Err(MarkerError::Version(version));
+            }
+        }
+        let b: &[u8; MARKER_LEN] = b.try_into().map_err(|_| MarkerError::Length(b.len()))?;
         if crc32c(&b[..56]) != u32_at(b, 56) {
             return Err(MarkerError::Checksum);
         }
-        let version = u16::from_le_bytes([b[4], b[5]]);
-        if version != VERSION {
-            return Err(MarkerError::Version(version));
-        }
         if b[6..8] != [0; 2] || b[12..16] != [0; 4] {
             return Err(MarkerError::Invalid("a marker with reserved bytes set"));
+        }
+        if u64_at(b, 16) == 0 {
+            return Err(MarkerError::Invalid("a marker of sequence 0"));
         }
         let (first, last) = (u64_at(b, 40), u64_at(b, 48));
         let read = match (first, last) {
@@ -178,9 +184,6 @@ impl Marker {
                 read,
             },
         };
-        if m.sequence == 0 {
-            return Err(MarkerError::Invalid("a marker of sequence 0"));
-        }
         m.summary.valid().map_err(MarkerError::Invalid)?;
         Ok(m)
     }
@@ -193,6 +196,8 @@ pub enum ReadError {
     Sink(SinkError),
     /// The object does not open, does not decode, or names another generation or sequence than its key.
     Unreadable(String),
+    /// A version this build does not read: a later build wrote it, and nothing may put an earlier version after it.
+    Version(u16),
 }
 
 /// Why a marker could not be put.
@@ -277,7 +282,10 @@ pub async fn read<S: BackupSink + ?Sized, E: Envelope + ?Sized>(
     let plain = env
         .open(&key, &bytes)
         .map_err(|e| ReadError::Unreadable(e.to_string()))?;
-    let m = Marker::decode(&plain).map_err(|e| ReadError::Unreadable(e.to_string()))?;
+    let m = Marker::decode(&plain).map_err(|e| match e {
+        MarkerError::Version(v) => ReadError::Version(v),
+        e => ReadError::Unreadable(e.to_string()),
+    })?;
     if (m.generation, m.sequence) != (g, sequence) {
         return Err(ReadError::Unreadable(
             "a marker naming another generation or sequence than its key".into(),
@@ -411,6 +419,11 @@ mod tests {
             Marker::decode(&v)
         };
         assert_eq!(reseal(&|v| v[4] = 2), Err(MarkerError::Version(2)));
+        let mut later = MAGIC.to_vec();
+        later.extend_from_slice(&2u16.to_le_bytes());
+        later.extend_from_slice(&[0; 90]);
+        assert_eq!(Marker::decode(&later), Err(MarkerError::Version(2)));
+        assert_eq!(Marker::decode(&later[..5]), Err(MarkerError::Length(5)));
         for (at, why) in [
             (6, "a marker with reserved bytes set"),
             (12, "a marker with reserved bytes set"),

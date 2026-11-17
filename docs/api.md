@@ -570,14 +570,19 @@ only, boxed `Send` futures):
   or one no listing could hide (`format.md` A.17 Uploaded forms; `RestoreError::BrokenChain`, Q-611); a retry gives
   the same answer. The latest last-uploaded marker of the generation read (`format.md` A.17) is read before
   its records are listed (Q-614): `RestoreError::MarkerUnreached { generation, sequence, epoch }`, a record it names
-  that the bucket does not report; `MarkerMismatch { generation, sequence, marked, read }`, records read that end
-  before those it names although both ends are listed; `MarkerUnreadable { generation, sequence, reason }`, a latest
-  marker that does not open, decode or match its key; `MarkerMissing { generation }`, a generation with records and
-  no marker, unless `RestoreConfig::accept_unmarked` (off by default) restores it without the check. A record the
-  marker names that the listing does not show and `stat` reports is `ListingIncomplete`, retried; on the tenth
-  consecutive `prepare` of one driver that finds it so (`MARKER_LISTING_TRIES`), `MarkerNotListed { generation,
-  epoch, tries }`. Each is reported by `Store::restore` as the additive `BackupError::Marker { generation, reason }`,
-  and the switch reaches it, with roadmap 8.3d (Q-961). A full restore whose
+  that the bucket does not report, unless `RestoreConfig::accept_earlier_state` (off by default; Q-962) restores what
+  the bucket holds and names the missing records in `Prepared::earlier_state`; `MarkerMismatch { generation,
+  sequence, marked, read }`, records read that end before those it names although both ends are listed;
+  `MarkerUnreadable { generation, sequence, reason }`, no marker that opens, decodes and matches its key, or a latest
+  readable one of a later version (a marker that cannot be read is passed over for the one before it, reported in
+  `Prepared::marker_fallback`); `MarkerMissing { generation }`, a generation with records and no marker, unless
+  `RestoreConfig::accept_unmarked` (off by default) restores it without the check. A record the marker names that
+  the listing does not show and `stat` reports is `ListingIncomplete`, retried; on the tenth consecutive `prepare`
+  of one driver that finds it so (`MARKER_LISTING_TRIES`), `MarkerNotListed { generation, epoch, tries }`. The
+  bound counts calls, so the caller paces its retries. Each is reported by `Store::restore` as the additive
+  `BackupError::Marker { generation, reason }`, and the switches reach it, with roadmap 8.3d (Q-961). The upload
+  driver stops with `UploadError::MarkerVersion { sequence, version }` on a latest marker of a version it does not
+  read. A full restore whose
   `prepare` fails after its claim, retried on the same driver, runs in the generation it claimed while no higher one
   is claimed; a new driver, or a new process, claims the next (Q-266).
 - **Superseded writer.** The upload driver reads the claim above its generation before each record upload; once a

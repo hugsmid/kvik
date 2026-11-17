@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::judge::{FileState, Verdict};
 use super::local::{self, Found, invalid};
-use super::source::{SourceError, source_records};
+use super::source::{Accept, SourceError, Sourced, source_records};
 use super::{
     MARKER_LISTING_TRIES, Prepared, RestoreConfig, RestoreDriver, RestoreError, RestoreProgress,
     RestoreStep, probe,
@@ -474,10 +474,18 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             &env,
             &keys,
             generation,
-            self.cfg.accept_unmarked,
+            Accept {
+                unmarked: self.cfg.accept_unmarked,
+                earlier: self.cfg.accept_earlier_state,
+            },
         )
         .await;
-        let (source_generation, records) = match found {
+        let Sourced {
+            generation: source_generation,
+            records,
+            fallback,
+            earlier,
+        } = match found {
             Ok(v) => {
                 self.marker_ahead = 0;
                 v
@@ -513,19 +521,23 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
         let written = Record::new(1, generation, wall, plan.record.to_body());
         local::write_manifest(&self.local, store_id, &written, wall)?;
         let appender = local::open_appender(&self.local, store_id)?;
-        self.finish(
-            keys,
-            env,
-            appender,
-            written,
-            plan.record,
-            &[],
-            &store,
-            wall,
-            false,
-            unnamed,
-        )
-        .await
+        let mut p = self
+            .finish(
+                keys,
+                env,
+                appender,
+                written,
+                plan.record,
+                &[],
+                &store,
+                wall,
+                false,
+                unnamed,
+            )
+            .await?;
+        p.marker_fallback = fallback;
+        p.earlier_state = earlier;
+        Ok(p)
     }
 
     /// After the record is synced: settle and upload it, read the claims again (Full), copy `STORE`, list what is
@@ -598,6 +610,8 @@ impl<S: BackupSink, E: Envelope> Restorer<S, E> {
             record,
             resumed,
             unnamed,
+            marker_fallback: None,
+            earlier_state: None,
         })
     }
 

@@ -388,18 +388,15 @@ fn each_object_lost_damaged_or_delayed_in_turn() {
             if matches!(keys.parse(key), Some(ObjectName::Marker { .. })) {
                 match (fault, key == &keys.marker(0, 4)) {
                     (Fault::Damage, true) => {
-                        let e = prepared.expect_err(&ctx);
-                        assert!(
-                            matches!(
-                                e,
-                                RestoreError::MarkerUnreadable {
-                                    generation: 0,
-                                    sequence: 4,
-                                    ..
-                                }
-                            ),
-                            "{ctx}: {e:?}"
+                        let p = prepared.expect(&ctx);
+                        let f = p.marker_fallback.expect(&ctx);
+                        assert_eq!(
+                            (f.generation, f.unreadable, f.used),
+                            (0, vec![4], 3),
+                            "{ctx}"
                         );
+                        steps(&mut r, Duration::ZERO, 120 * MIN).expect(&ctx);
+                        assert_installed(&fs, &src, &[]);
                     }
                     // An earlier marker is read: it names records the bucket holds.
                     _ => {

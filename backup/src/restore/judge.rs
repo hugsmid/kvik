@@ -107,6 +107,7 @@ mod tests {
             retry_first: Duration::from_secs(1),
             retry_max: Duration::from_secs(120),
             accept_unmarked: false,
+            accept_earlier_state: false,
         }
     }
 

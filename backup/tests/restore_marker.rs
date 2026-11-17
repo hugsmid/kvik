@@ -11,7 +11,10 @@ use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::{Keys, ObjectName};
 use kvik_backup::marker::{Marker, Summary};
 use kvik_backup::plan::{PlanMode, TAIL_PROBES};
-use kvik_backup::restore::{MARKER_LISTING_TRIES, Prepared, RestoreDriver, RestoreError, Restorer};
+use kvik_backup::restore::{
+    EarlierState, MARKER_LISTING_TRIES, MarkerFallback, Prepared, RestoreDriver, RestoreError,
+    Restorer,
+};
 use kvik_backup::uploaded::UploadedRecord;
 use kvik_files::record::{Body, Rebuild, Record};
 use kvik_log::fs::MemFs;
@@ -327,14 +330,63 @@ fn q614_a_generation_whose_records_are_all_lost_is_not_skipped_while_its_marker_
     both(&sink, unreached(4, 4));
 }
 
-#[test]
-fn q614_an_unreadable_latest_marker_fails_as_unreadable() {
-    let (src, s1, s2) = segments();
-    let sink = bucket(src, &plain(&s1, &s2, 0));
-    let mut b = sink.inner.objects()[&marker_key(4)].clone();
+/// Flips a byte in the middle of marker `sequence`'s object.
+fn damage_marker(sink: &FaultSink, sequence: u64) {
+    let mut b = sink.inner.objects()[&marker_key(sequence)].clone();
     let mid = b.len() / 2;
     b[mid] ^= 1;
-    sink.inner.set(&marker_key(4), &b);
+    sink.inner.set(&marker_key(sequence), &b);
+}
+
+#[test]
+fn q614_an_unreadable_latest_marker_falls_back_to_the_one_before_and_reports_it() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    damage_marker(&sink, 4);
+    both(&sink, |r| {
+        let p = r.unwrap();
+        assert_eq!(
+            p.marker_fallback,
+            Some(MarkerFallback {
+                generation: 0,
+                unreadable: vec![4],
+                used: 3
+            })
+        );
+        assert_eq!(p.record.files.len(), 2);
+    });
+}
+
+#[test]
+fn q614_a_fallback_marker_is_checked_as_the_latest_would_be_and_fails_where_it_is_not_reached() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    damage_marker(&sink, 4);
+    damage_marker(&sink, 3);
+    sink.set(&key(4), Some(Fault::Lose));
+    both(&sink, |r| {
+        let p = r.unwrap();
+        let f = p.marker_fallback.unwrap();
+        assert_eq!((f.unreadable, f.used), (vec![4, 3], 2));
+    });
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    damage_marker(&sink, 4);
+    damage_marker(&sink, 3);
+    for e in 2..=4 {
+        sink.set(&key(e), Some(Fault::Lose));
+    }
+    both(&sink, unreached(2, 2));
+    nothing_recorded(&sink);
+}
+
+#[test]
+fn q614_no_readable_marker_fails_as_unreadable_naming_the_latest() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    for s in 1..=4 {
+        damage_marker(&sink, s);
+    }
     both(&sink, |r| {
         assert!(
             matches!(
@@ -352,23 +404,28 @@ fn q614_an_unreadable_latest_marker_fails_as_unreadable() {
 }
 
 #[test]
-fn q614_a_marker_naming_another_sequence_than_its_key_is_unreadable() {
+fn q614_a_latest_marker_of_a_later_version_fails_as_unreadable_with_no_fallback() {
     let (src, s1, s2) = segments();
     let chain = plain(&s1, &s2, 0);
     let sink = bucket_marked(src, &chain, 3);
-    let m = Marker {
+    let mut later = Marker {
         generation: 0,
-        sequence: 3,
+        sequence: 4,
         summary: Summary::of(chain.iter().map(|u| &u.record)),
-    };
+    }
+    .encode();
+    later[4] = 2;
+    later.extend_from_slice(&[0; 8]);
     let k = marker_key(4);
-    let sealed = TestEnvelope::new(KEY).seal(&k, &m.encode()).unwrap();
-    sink.inner.set(&k, &sealed);
-    both(&sink, |r| {
-        assert!(
-            matches!(r, Err(RestoreError::MarkerUnreadable { sequence: 4, .. })),
-            "{r:?}"
-        );
+    sink.inner
+        .set(&k, &TestEnvelope::new(KEY).seal(&k, &later).unwrap());
+    both(&sink, |r| match r {
+        Err(RestoreError::MarkerUnreadable {
+            generation: 0,
+            sequence: 4,
+            reason,
+        }) => assert!(reason.contains("version 2"), "{reason}"),
+        other => panic!("{other:?}"),
     });
 }
 
@@ -429,6 +486,131 @@ fn q614_a_full_restore_puts_its_generations_first_marker_after_its_record() {
             read: Some((1, 1))
         }
     );
+    assert_eq!(
+        prepare(&sink, PlanMode::Drill)
+            .unwrap()
+            .record
+            .source_generation,
+        1
+    );
+}
+
+fn restorer_with(
+    sink: &Arc<FaultSink>,
+    fs: &MemFs,
+    mode: PlanMode,
+    earlier: bool,
+) -> Restorer<Arc<FaultSink>, TestEnvelope> {
+    let mut c = cfg(mode);
+    c.accept_earlier_state = earlier;
+    Restorer::new(
+        sink.clone(),
+        Box::new(|_| TestEnvelope::new(KEY)),
+        local(fs),
+        hand_plan,
+        Box::new({
+            let mut n = 500;
+            move || {
+                n += 1;
+                n
+            }
+        }),
+        c,
+    )
+}
+
+#[test]
+fn q962_accepting_an_earlier_state_restores_what_the_bucket_holds_and_names_what_is_missing() {
+    for mode in [PlanMode::Drill, PlanMode::Full] {
+        let (src, s1, s2) = segments();
+        let sink = bucket(src, &plain(&s1, &s2, TAIL_PROBES + 3));
+        let last = 4 + TAIL_PROBES + 3;
+        sink.set(&key(last), Some(Fault::Lose));
+        let fs = MemFs::new();
+        let p = block_on(restorer_with(&sink, &fs, mode, true).prepare(100)).unwrap();
+        assert_eq!(
+            p.earlier_state,
+            Some(EarlierState {
+                generation: 0,
+                sequence: 4,
+                missing: vec![last],
+                read_end: Some(3 + TAIL_PROBES + 3),
+                marked_end: last,
+            })
+        );
+        assert_eq!(p.record.files.len(), 2);
+    }
+}
+
+#[test]
+fn q962_accepting_an_earlier_state_names_the_lost_last_old_record_before_an_unfinished_rebuilt_manifest()
+ {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &unfinished(&s1, &s2, 6, 0));
+    sink.set(&key(6), Some(Fault::Lose));
+    let fs = MemFs::new();
+    let p = block_on(restorer_with(&sink, &fs, PlanMode::Drill, true).prepare(100)).unwrap();
+    let e = p.earlier_state.unwrap();
+    assert_eq!((e.sequence, e.missing, e.read_end), (6, vec![6], Some(2)));
+    assert_eq!(p.record.files.len(), 1);
+}
+
+#[test]
+fn q962_accepting_an_earlier_state_reports_nothing_on_a_healthy_bucket_and_still_retries_a_lagging_listing()
+ {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    let fs = MemFs::new();
+    let p = block_on(restorer_with(&sink, &fs, PlanMode::Drill, true).prepare(100)).unwrap();
+    assert_eq!((p.earlier_state, p.marker_fallback), (None, None));
+    sink.set(&key(4), Some(Fault::Unlisted));
+    lagging(block_on(
+        restorer_with(&sink, &MemFs::new(), PlanMode::Drill, true).prepare(100),
+    ));
+}
+
+#[test]
+fn q614_a_successful_prepare_starts_the_lagging_count_again() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    let fs = MemFs::new();
+    let mut r = restorer(sink.clone(), &fs, PlanMode::Drill, KEY);
+    sink.set(&key(4), Some(Fault::Unlisted));
+    for _ in 1..MARKER_LISTING_TRIES {
+        lagging(block_on(r.prepare(100)));
+    }
+    sink.set(&key(4), None);
+    block_on(r.prepare(100)).unwrap();
+    for p in fs.paths() {
+        let _ = kvik_log::fs::Fs::remove_file(&fs, &p);
+    }
+    sink.set(&key(4), Some(Fault::Unlisted));
+    for _ in 1..MARKER_LISTING_TRIES {
+        lagging(block_on(r.prepare(100)));
+    }
+}
+
+#[test]
+fn q614_a_resumed_full_restore_puts_the_marker_its_first_try_did_not() {
+    let (src, s1, s2) = segments();
+    let sink = bucket(src, &plain(&s1, &s2, 0));
+    let k = Keys::new(ID).marker(1, 1);
+    sink.set(&k, Some(Fault::Delay(1)));
+    let fs = MemFs::new();
+    let mut r = restorer(sink.clone(), &fs, PlanMode::Full, KEY);
+    assert!(
+        matches!(block_on(r.prepare(100)), Err(RestoreError::Sink(_))),
+        "the marker put fails"
+    );
+    assert!(!sink.inner.objects().contains_key(&k));
+    assert!(
+        sink.inner
+            .objects()
+            .contains_key(&Keys::new(ID).record(1, 1))
+    );
+    let p = block_on(restorer(sink.clone(), &fs, PlanMode::Full, KEY).prepare(100)).unwrap();
+    assert!(p.resumed);
+    assert!(sink.inner.objects().contains_key(&k));
     assert_eq!(
         prepare(&sink, PlanMode::Drill)
             .unwrap()

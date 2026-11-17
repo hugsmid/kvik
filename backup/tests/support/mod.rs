@@ -253,6 +253,7 @@ pub fn cfg(mode: PlanMode) -> RestoreConfig {
         retry_first: Duration::from_secs(1),
         retry_max: MIN,
         accept_unmarked: false,
+        accept_earlier_state: false,
     }
 }
 
