@@ -584,3 +584,53 @@ fn q650_field_7_writes_a_span_with_no_later_record_as_0_and_only_as_the_last() {
     assert!(rebuild(vec![(2, None), (3, Some(4))]).encode().is_err());
     assert!(rebuild(vec![(2, None), (3, None)]).encode().is_err());
 }
+
+/// A record body: the 24-byte prefix, then `fields` as written, each value padded to 4.
+fn body_of(epoch: u64, fields: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut b = vec![0u8; 24];
+    b[..8].copy_from_slice(&epoch.to_le_bytes());
+    for (id, v) in fields {
+        b.extend_from_slice(&id.to_le_bytes());
+        b.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        b.extend_from_slice(v);
+        b.resize(b.len().div_ceil(4) * 4, 0);
+    }
+    b
+}
+
+/// Q-651: the whole-file decoder keeps a field the type does not repeat at most twice and finds an undefined field
+/// in one pass, with the verdict and the error of reading every field.
+#[test]
+fn a_rejected_record_gives_the_same_error_with_its_fields_kept_at_most_twice() {
+    let pos = [0u8; 12];
+    let decode =
+        |fields: &[(u16, &[u8])]| Record::decode(RECORD_LOST_RANGE, false, &body_of(5, fields));
+    let three = [(1u16, &pos[..]), (2, &pos), (2, &pos), (2, &pos), (7, &[1])];
+    assert_eq!(
+        decode(&three),
+        Err(RecordError::Invalid("a field appears twice"))
+    );
+    let undefined_late = [(2u16, &pos[..]), (2, &pos), (2, &pos), (14, &pos)];
+    assert_eq!(
+        decode(&undefined_late),
+        Err(RecordError::Unsupported(Element::Field {
+            entry_type: RECORD_LOST_RANGE,
+            field: 14
+        }))
+    );
+    // A field 100 error anywhere comes before an undefined field, as every field is read first.
+    let epoch = 7u64.to_le_bytes();
+    let both = [(14u16, &pos[..]), (100, &epoch), (100, &epoch)];
+    assert_eq!(decode(&both), Err(RecordError::Invalid("field 100 twice")));
+    // An acknowledgement's field 2 is not repeated: a third one is the same error as a second.
+    let ack = |n: usize| {
+        let fields: Vec<(u16, &[u8])> = (0..n).map(|_| (2u16, &epoch[..])).collect();
+        Record::decode(
+            kvik_files::record::record_type::ACKNOWLEDGEMENT,
+            false,
+            &body_of(5, &fields),
+        )
+    };
+    assert_eq!(ack(2), Err(RecordError::Invalid("field 2 twice")));
+    assert_eq!(ack(5), ack(2));
+}

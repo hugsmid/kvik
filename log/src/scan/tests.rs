@@ -430,10 +430,11 @@ fn an_undamaged_segment_is_read_in_one_pass_of_direct_reads() {
 #[test]
 fn the_bound_holds_body_checks_and_the_failed_read_budget_per_window() {
     let len = 1u64 << 20;
-    // Twice the file, the direct read that found damage, and per window the budget and the read that reached it.
-    let per_window = FAILED_READ_BUDGET + 2 * len;
+    // The file once (Q-651), the direct read that found damage, and per window the budget and the read that reached
+    // it.
+    let per_window = FAILED_READ_BUDGET + len;
     let at_bound = ScanStats {
-        bytes_body_checked: 3 * len + per_window,
+        bytes_body_checked: 2 * len + per_window,
         failed_bytes_peak: per_window,
         ..ScanStats::default()
     };
@@ -448,6 +449,23 @@ fn the_bound_holds_body_checks_and_the_failed_read_budget_per_window() {
         ..at_bound
     };
     assert!(!more_failed.within_bound(len));
+    // A manifest's windows are a body: in a 32 MiB file, two windows each of the budget and one body.
+    let big = 32u64 << 20;
+    let manifest_window = FAILED_READ_BUDGET + u64::from(crate::block::MAX_BODY_LEN);
+    let manifest = ScanStats {
+        bytes_body_checked: big + 2 * manifest_window,
+        failed_bytes_peak: manifest_window,
+        ..ScanStats::default()
+    };
+    assert!(manifest.within_manifest_bound(big));
+    assert!(!manifest.within_bound(big));
+    assert!(
+        !ScanStats {
+            bytes_body_checked: manifest.bytes_body_checked + 1,
+            ..manifest
+        }
+        .within_manifest_bound(big)
+    );
 }
 
 #[test]

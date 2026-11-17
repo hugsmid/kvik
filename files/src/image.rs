@@ -171,7 +171,7 @@ pub fn read(bytes: &[u8], store_id: &[u8; 16]) -> Result<Image, ReadError> {
     read_with_stats(bytes, store_id).0
 }
 
-/// [`read`], with the work it did; [`ScanStats::within_bound`] holds for every input (`format.md` A, common rules).
+/// [`read`], with the work it did; [`ScanStats::within_manifest_bound`] holds for every input (`format.md` A, common rules).
 pub fn read_with_stats(bytes: &[u8], store_id: &[u8; 16]) -> (Result<Image, ReadError>, ScanStats) {
     let mut search = Search::new(bytes);
     let r = read_all(bytes, store_id, &mut search);
@@ -322,7 +322,10 @@ mod tests {
                 stats.bytes_checksummed <= 2 * len,
                 "{stats:?} for {len} bytes"
             );
-            assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+            assert!(
+                stats.within_manifest_bound(len),
+                "{stats:?} for {len} bytes"
+            );
         }
     }
 
@@ -330,11 +333,15 @@ mod tests {
     /// fields: record `k` starts inside a field of every record before it. Each has a valid checksum and no field 1,
     /// so each is read in full and rejected.
     fn crafted(m: u64, g: u64) -> Vec<u8> {
+        crafted_with(m, g, 0x8001)
+    }
+
+    /// [`crafted`] with the shared fields of id `field`.
+    fn crafted_with(m: u64, g: u64, field: u16) -> Vec<u8> {
         use kvik_log::crc::{crc32c, crc32c_shift};
         let put = |f: &mut Vec<u8>, at: u64, b: &[u8]| {
             f[at as usize..at as usize + b.len()].copy_from_slice(b);
         };
-        let field = 0x8001u16;
         let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
             .encode()
             .to_vec();
@@ -391,7 +398,7 @@ mod tests {
         f.extend(empty(1 << 40));
         let (img, stats) = read_with_stats(&f, &[9; 16]);
         assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
-        assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+        assert!(stats.within_manifest_bound(f.len() as u64), "{stats:?}");
         assert!(stats.bytes_body_checked >= BUDGET, "{stats:?}");
         // The record in the passed part of the window is not found, and nothing after it: the passed bytes are a
         // corrupt span with no later record, kept rather than dropped (Q-650).
@@ -434,9 +441,66 @@ mod tests {
         let elapsed = t.elapsed();
         assert_eq!(img.unwrap().corrupt[0].before_epoch, None);
         assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
-        assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+        assert!(
+            stats.within_manifest_bound(len),
+            "{stats:?} for {len} bytes"
+        );
         // A smoke ceiling for a slow shared machine; the pin is the budget.
         assert!(elapsed.as_secs() < 5, "{elapsed:?} for {len} bytes");
+    }
+
+    /// Empty records of `fields` empty ignorable fields each, valid, filling about `len` bytes.
+    fn valid_wide_records(len: u64, fields: usize) -> Vec<u8> {
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+            .encode()
+            .to_vec();
+        let mut epoch = 1;
+        while (f.len() as u64) < len {
+            let mut body = kvik_log::manifest::encode_record(
+                kvik_log::manifest::RECORD_EMPTY,
+                epoch,
+                0,
+                0,
+                None,
+            )[16..40]
+                .to_vec();
+            for _ in 0..fields {
+                body.extend_from_slice(&0x8001u16.to_le_bytes());
+                body.extend_from_slice(&[0, 0]);
+            }
+            kvik_log::block::encode_block(0x20, 0, &body, &mut f).unwrap();
+            epoch += 1;
+        }
+        f
+    }
+
+    /// The crafted manifests against the restart budget, timed (Q-651). Run in a release build, one at a time:
+    /// `cargo test --release -p kvik-files --lib -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn crafted_manifests_timed() {
+        let window = crafted(20_000, 3_900_000);
+        let own = crafted_with(20_000, 3_900_000, 2);
+        let wide = valid_wide_records(16 << 20, 1 << 20);
+        for (name, f) in [
+            ("failed reads in one window, ignorable fields", &window),
+            ("failed reads in one window, repeated own fields", &own),
+            ("valid wide records", &wide),
+        ] {
+            let t = std::time::Instant::now();
+            let (img, stats) = read_with_stats(f, &[9; 16]);
+            let whole = t.elapsed();
+            img.unwrap();
+            let t = std::time::Instant::now();
+            let _ = kvik_log::manifest::read_manifest_with_stats(f, &[9; 16]);
+            let start = t.elapsed();
+            println!(
+                "{name}, {} MiB: whole-file reader {:.3} s, start's reader {:.3} s, {stats:?}",
+                f.len() >> 20,
+                whole.as_secs_f64(),
+                start.as_secs_f64()
+            );
+        }
     }
 
     #[test]

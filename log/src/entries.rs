@@ -715,6 +715,11 @@ impl EntriesBlock {
         decode(body)
     }
 
+    /// The checks of [`EntriesBlock::decode`], with its verdict, keeping no entry and copying no text (Q-651).
+    pub fn check(body: &[u8]) -> Result<(), BodyError> {
+        check(body).map(|_| ())
+    }
+
     /// Decodes a body and also requires it to be exactly what [`EntriesBlock::encode`] writes for its content.
     pub fn decode_canonical(body: &[u8]) -> Result<Self, BodyError> {
         let b = decode(body)?;
@@ -772,18 +777,25 @@ fn repeated(t: u8, id: u16) -> bool {
     )
 }
 
-/// The fields of one entry, framing and order checked.
+/// The fields of one entry, framing and order checked. Without `keep`, text is checked but not copied (Q-651).
 struct Parsed<'a> {
     entry: u32,
     fields: Vec<(u16, &'a [u8])>,
+    keep: bool,
 }
 
 impl<'a> Parsed<'a> {
+    /// The fields with `id`; [`fields`] keeps them in ascending order of id, so this is a binary search (Q-651).
+    fn with(&self, id: u16) -> &[(u16, &'a [u8])] {
+        let from = self.fields.partition_point(|f| f.0 < id);
+        let to = self.fields.partition_point(|f| f.0 <= id);
+        &self.fields[from..to]
+    }
     fn get(&self, id: u16) -> Option<&'a [u8]> {
-        self.fields.iter().find(|f| f.0 == id).map(|f| f.1)
+        self.with(id).first().map(|f| f.1)
     }
     fn all(&self, id: u16) -> impl Iterator<Item = &'a [u8]> + '_ {
-        self.fields.iter().filter(move |f| f.0 == id).map(|f| f.1)
+        self.with(id).iter().map(|f| f.1)
     }
     fn bad(&self, field: u16) -> BodyError {
         ContentError::Field {
@@ -850,20 +862,28 @@ impl<'a> Parsed<'a> {
             _ => Err(self.bad(id)),
         }
     }
-    fn text(&self, id: u16, v: &[u8], min: usize, max: usize) -> Result<String, BodyError> {
+    fn text(&self, id: u16, v: &'a [u8], min: usize, max: usize) -> Result<&'a str, BodyError> {
         match std::str::from_utf8(v) {
-            Ok(s) if (min..=max).contains(&s.len()) => Ok(s.to_owned()),
+            Ok(s) if (min..=max).contains(&s.len()) => Ok(s),
             _ => Err(self.bad(id)),
         }
     }
-    fn need_text(&self, id: u16, min: usize, max: usize) -> Result<String, BodyError> {
+    fn need_text(&self, id: u16, min: usize, max: usize) -> Result<&'a str, BodyError> {
         self.text(id, self.need(id)?, min, max)
+    }
+    /// The entry's copy of a checked text: empty without `keep`.
+    fn own(&self, s: &str) -> String {
+        if self.keep {
+            s.to_owned()
+        } else {
+            String::new()
+        }
     }
 }
 
 fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
     let mut entries: Vec<Entry> = Vec::new();
-    let p = walk(body, |e| match (entries.last_mut(), e) {
+    let p = walk(body, true, |e| match (entries.last_mut(), e) {
         // Consecutive ignored entries are counted, not stored one by one.
         (Some(Entry::Ignored { count }), Entry::Ignored { count: n }) => *count += n,
         (_, e) => entries.push(e),
@@ -876,17 +896,40 @@ fn decode(body: &[u8]) -> Result<EntriesBlock, BodyError> {
 }
 
 /// Applies every check of A.6 to a body without keeping its entries: its prefix, and whether it holds a recovery
-/// entry. This is what a reader runs on every entries block it accepts.
+/// entry. This is what a reader runs on every entries block it accepts; it copies no text (Q-651).
 pub(crate) fn check(body: &[u8]) -> Result<(DataPrefix, bool), BodyError> {
     let mut recovery = false;
-    let p = walk(body, |e| recovery |= e.is_recovery())?;
+    let p = walk(body, false, |e| recovery |= e.is_recovery())?;
     Ok((p, recovery))
 }
 
-/// Decodes the entries of a body one at a time, handing each to `sink`.
-fn walk(body: &[u8], mut sink: impl FnMut(Entry)) -> Result<DataPrefix, BodyError> {
+/// Whether a body that passed [`check`] holds a recovery entry, read from the entry headers alone.
+pub(crate) fn holds_recovery(body: &[u8]) -> bool {
+    let Ok(p) = DataPrefix::decode(block_type::ENTRIES, body) else {
+        return false;
+    };
+    let mut at = DATA_PREFIX_LEN;
+    for _ in 0..p.count {
+        let Some(head) = body.get(at..at + 8) else {
+            return false;
+        };
+        if head[0] == entry_type::RECOVERY {
+            return true;
+        }
+        at = at
+            .saturating_add(8)
+            .saturating_add(u32_at(head, 4) as usize)
+            .div_ceil(8)
+            .saturating_mul(8);
+    }
+    false
+}
+
+/// Decodes the entries of a body one at a time, handing each to `sink`; without `keep` their text is left empty.
+fn walk(body: &[u8], keep: bool, mut sink: impl FnMut(Entry)) -> Result<DataPrefix, BodyError> {
     let p = DataPrefix::decode(block_type::ENTRIES, body).map_err(|_| ContentError::Prefix)?;
     let mut at = DATA_PREFIX_LEN;
+    let mut buf = Vec::new();
     for i in 0..p.count {
         let overrun = BodyError::from(ContentError::EntryOverrun { entry: i });
         let head = body.get(at..at + 8).ok_or(overrun)?;
@@ -900,25 +943,34 @@ fn walk(body: &[u8], mut sink: impl FnMut(Entry)) -> Result<DataPrefix, BodyErro
         let known = matches!(t, 1..=9);
         if !known {
             if t >= 0x80 {
-                fields(raw, i, t, false)?;
+                fields(raw, i, t, false, &mut buf)?;
                 sink(Entry::Ignored { count: 1 });
                 continue;
             }
             return Err(BodyError::Unsupported(Element::EntryType(t)));
         }
+        fields(raw, i, t, true, &mut buf)?;
         let parsed = Parsed {
             entry: i,
-            fields: fields(raw, i, t, true)?,
+            fields: std::mem::take(&mut buf),
+            keep,
         };
         sink(entry(t, &parsed)?);
+        buf = parsed.fields;
     }
     // Bytes after the last entry are not checked here (Q-106 (a)); the canonical decoder rejects them.
     Ok(p)
 }
 
-/// Splits a field list, checking framing and, for a known type, order and allowed ids.
-fn fields(raw: &[u8], entry: u32, t: u8, known: bool) -> Result<Vec<(u16, &[u8])>, BodyError> {
-    let mut out = Vec::new();
+/// Splits a field list into `out`, checking framing and, for a known type, order and allowed ids.
+fn fields<'a>(
+    raw: &'a [u8],
+    entry: u32,
+    t: u8,
+    known: bool,
+    out: &mut Vec<(u16, &'a [u8])>,
+) -> Result<(), BodyError> {
+    out.clear();
     let mut at = 0;
     let mut prev: Option<u16> = None;
     while at < raw.len() {
@@ -956,7 +1008,7 @@ fn fields(raw: &[u8], entry: u32, t: u8, known: bool) -> Result<Vec<(u16, &[u8])
             out.push((id, v));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
@@ -965,7 +1017,7 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
         entry_type::PARAMETER_CHANGE => Entry::ParameterChange(parameter_change(p)?),
         entry_type::ALIAS => Entry::Alias {
             id: p.u32(1)?,
-            name: p.need_text(2, 1, 255)?,
+            name: p.own(p.need_text(2, 1, 255)?),
         },
         entry_type::RETIREMENT => Entry::Retirement {
             id: p.u32(1)?,
@@ -973,7 +1025,7 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
         },
         entry_type::ROUTING => Entry::Routing(Box::new(routing(p)?)),
         entry_type::SITE_ZONE => Entry::SiteZone {
-            zone: p.need_text(30, 1, 63)?,
+            zone: p.own(p.need_text(30, 1, 63)?),
             effective: p.i64(20)?,
         },
         entry_type::TZDATA => {
@@ -981,7 +1033,7 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
             if !v.bytes().all(|b| b.is_ascii_graphic()) {
                 return Err(p.bad(31));
             }
-            Entry::Tzdata { version: v }
+            Entry::Tzdata { version: p.own(v) }
         }
         entry_type::RECOVERY => {
             let boot = p.need(42)?;
@@ -1002,7 +1054,7 @@ fn entry(t: u8, p: &Parsed<'_>) -> Result<Entry, BodyError> {
             let consumers = p
                 .all(47)
                 .map(|v| match std::str::from_utf8(v) {
-                    Ok(s) if consumer_name_ok(s) => Ok(s.to_owned()),
+                    Ok(s) if consumer_name_ok(s) => Ok(p.own(s)),
                     _ => Err(p.bad(47)),
                 })
                 .collect::<Result<_, _>>()?;
@@ -1057,7 +1109,7 @@ fn read_selection(p: &Parsed<'_>, kind: u16, resolved_ok: bool) -> Result<Select
                 return Err(p.presence(kind + 1));
             }
             Selection::Pattern {
-                pattern: p.need_text(kind + 2, 1, 255)?,
+                pattern: p.own(p.need_text(kind + 2, 1, 255)?),
                 resolved: ids,
             }
         }
@@ -1077,7 +1129,7 @@ fn non_negative(p: &Parsed<'_>, id: u16) -> Result<i64, BodyError> {
 fn routing(p: &Parsed<'_>) -> Result<Routing, BodyError> {
     let v = p.need(50)?;
     let consumer = match std::str::from_utf8(v) {
-        Ok(s) if consumer_name_ok(s) => s.to_owned(),
+        Ok(s) if consumer_name_ok(s) => p.own(s),
         _ => return Err(p.bad(50)),
     };
     let op = match p.u8_in(51, 3)? {
@@ -1225,15 +1277,15 @@ fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
         p.none(11)?;
         None
     };
-    let state_names: Vec<String> = p
+    let state_names: Vec<&str> = p
         .all(13)
         .map(|v| p.text(13, v, 1, 63))
         .collect::<Result<_, _>>()?;
-    // Distinct, so a state's index and its name count the same transitions (Q-182).
-    let distinct = {
-        let mut sorted: Vec<&String> = state_names.iter().collect();
-        sorted.sort_unstable();
-        sorted.windows(2).all(|w| w[0] != w[1])
+    // Distinct, so a state's index and its name count the same transitions (Q-182). Past the limit the verdict is the
+    // same either way, so the names are not looked at; a set rather than a sort keeps the cost linear (Q-651).
+    let distinct = state_names.len() > MAX_STATE_NAMES || {
+        let mut seen = std::collections::HashSet::with_capacity(state_names.len());
+        state_names.iter().all(|s| seen.insert(*s))
     };
     if (value_type == ValueType::State) == state_names.is_empty()
         || state_names.len() > MAX_STATE_NAMES
@@ -1262,7 +1314,7 @@ fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
             tag => {
                 p.none(17)?;
                 p.none(18)?;
-                let zone = p.need_text(19, 1, 63)?;
+                let zone = p.own(p.need_text(19, 1, 63)?);
                 if tag == 1 {
                     let day_start = p.i64(22)?;
                     if !(0..DAY).contains(&day_start) {
@@ -1304,17 +1356,17 @@ fn definition(p: &Parsed<'_>) -> Result<Definition, BodyError> {
     };
     Ok(Definition {
         id: p.u32(1)?,
-        name: p.need_text(2, 1, 255)?,
+        name: p.own(p.need_text(2, 1, 255)?),
         kind,
         value_type,
         scale,
-        unit: p.need_text(6, 0, 63)?,
+        unit: p.own(p.need_text(6, 0, 63)?),
         expected_interval: p.opt_i64_of(7, p.need(7)?, true)?,
         staleness: p.opt_i64_of(8, p.need(8)?, true)?,
         record_on_change: p.u8_in(9, 1)? == 1,
         counter,
         lateness_bound: p.i64(12)?,
-        state_names,
+        state_names: state_names.iter().map(|s| p.own(s)).collect(),
         versioning: match p.u8_in(14, 2)? {
             0 => Versioning::None,
             1 => Versioning::Time,

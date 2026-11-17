@@ -65,6 +65,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-870 | `format.md` A common rules (Scan bound), A.6 field 13; `design.md` Budgets | Definitions with many short state names against the 1 s restart budget |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1338,16 +1339,60 @@ for any corrupt record. The rebuild record's field 7 writes such a span's `befor
 target checks that a span with no later record holds the rest of the file. Natural damage is unchanged: it never
 reaches the window rule, so a torn tail stays a torn tail.
 
-## Q-651 — The crafted-file worst case against the 1 s restart budget (OWNER)
+## Q-651 — The crafted-file worst case against the 1 s restart budget
 
-**Scenario.** A crafted 64 MiB log segment reaches the scan bound's worst case (`format.md` A, common rules): about
-390 MiB of bodies checked, about 2 s at 100 ns per row; 0.6 s at 16 MiB; a crafted manifest about 0.45 s per 16 MiB at
-a refresh. The 1 s restart budget (`design.md` Budgets) is exceeded at 64 MiB.
-**Now.** `design.md` and `SECURITY.md` state the figures and that the budget is exceeded; the Q-110 ruling meant
-crafted files to be bounded rather than placed outside the budget. The failed-read budget alone cannot reach 1 s: the
-2L term (each kept body checked at most twice) is about 0.7 s at 64 MiB by the same arithmetic.
-**Needed.** The owner's choice: amend the published promise (crafted files bounded at about 2 s per 64 MiB, outside
-the 1 s budget), or tighten the bound by other means (a cheaper body check, or each kept body checked once).
+**Scenario.** A crafted 64 MiB log segment reached the scan bound's worst case (`format.md` A, common rules): about
+390 MiB of bodies checked, about 2 s at 100 ns per row; 0.6 s at 16 MiB; a crafted manifest about 0.45 s per 16 MiB
+at a refresh. The 1 s restart budget (`design.md` Budgets) was exceeded at 64 MiB.
+**Settled (owner's ruling, 2026-11-17): tighten the scan; the published 1 s promise stays.** Both means the ruling
+named, chosen by measurement (release build, one shared 4-core cloud machine, one run at a time; the harness is
+`log/tests/crafted_files.rs` `crafted_worst_cases_timed` and `files/src/image.rs` `crafted_manifests_timed`, both
+ignored tests):
+1. Each kept body is checked once. A boundary read judged every body of a batch and the batch read then checked them
+   again (`read_batch`); it now reads the judged batch without checking its bodies again
+   (`kvik_log::batch::read_judged_batch`, a recovery entry found from the entry headers), so body checks total at
+   most L instead of 2L, and the read that reaches a window's budget adds at most a batch instead of two:
+   264 MiB of bodies for a 64 MiB segment instead of 390 MiB (`ScanStats::within_bound`; a manifest has its own,
+   `within_manifest_bound`, with a body as its window and no direct read).
+2. Cheaper body checks with the same verdict. The facts check keeps no row and validates text through
+   `kvik_log::utf8::HeapText`: directly while the text checked stays within the heap's length, then from a table built
+   in one pass, so rows that all name one 255-byte value cost a constant each (it was a decode and a copy, about
+   100 ns a row). The entries check copies no text, reuses one field list, finds fields by binary search (a lookup
+   scanned the whole list, so a definition with 65,536 state names cost 20 lookups of 65,536) and tells state names
+   distinct with a set instead of a sort, skipped past the limit, where the verdict is the same. The start's
+   manifest reader reads a record's fields without keeping them and a lost range in one pass; the whole-file reader
+   copies no field and gathers no ignorable field until the record's checks hold, keeps a field its type does not
+   repeat at most twice, and finds an undefined field in the same pass, with the error it gave before.
+Measured, before and after: nested facts images over every window of a 64 MiB segment 0.90 s and 0.22 s; 64 MiB of
+batches whose rows share one text value, after damage, 1.85 s and 0.10 s; a 16 MiB manifest window of rejected
+records 0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh; per byte checked, at most about 0.5 ns for facts
+and 2 ns for entries other than state-name definitions. So against the bound a crafted 64 MiB segment costs at most
+about 0.6 s, 16 MiB about 0.2 s, and a crafted manifest at most about 0.09 s per 16 MiB at a start and 0.15 s at a
+refresh: inside the 1 s budget. Definitions holding many short state names stay above it (about 5 ns a byte, 1.5 s at
+64 MiB): Q-870. `format.md` A common rules (scan bound), `design.md` Budgets and `SECURITY.md` state the figures.
+Natural damage is unchanged: the verdicts are the same and the window rule is untouched. Tests:
+`log/tests/body_check.rs` (each check against its decoder, and the text table against `std::str::from_utf8`),
+`log/tests/crafted_files.rs` `after_damage_each_kept_body_is_checked_once` and the crafted tests of Q-110 at the
+tighter budget, `log/tests/scan_bound.rs` (the differential property against the reference scan at the new bound),
+`log/src/scan/tests.rs` `the_bound_holds_body_checks_and_the_failed_read_budget_per_window`, `files/tests/records.rs`
+`a_rejected_record_gives_the_same_error_with_its_fields_kept_at_most_twice`; the fuzz targets assert the new bounds.
+
+## Q-870 — Definitions with many short state names against the 1 s restart budget (OWNER)
+
+**Scenario.** After Q-651, a crafted segment whose bodies are definition entries, each holding up to 65,536 state
+names of one to four bytes (8 bytes of body a name), costs about 5 ns a byte to check: telling the names distinct
+(Q-182) costs a hash per name, about 30 ns on the machine measured, and nothing else in any body costs more than about
+2 ns a byte. Against the bound (264 MiB of bodies at 64 MiB, of which 192 MiB are failed reads that nest such bodies)
+that is about 1.5 s at 64 MiB and 0.4 s at 16 MiB, above the 1 s restart budget; 64 MiB of such definitions kept, each
+checked once, measured 0.36 to 0.55 s. A sort of packed keys costs about the same per name on that machine.
+**Now.** The figures are stated in `format.md`, `design.md` and `SECURITY.md` as the one case above the budget.
+**Options.** (a) Require state names in ascending byte order in the format (A.6 field 13), so that distinct is one
+linear pass with no hash: a format rule, and writers already know every name at definition. (b) Charge a definition's
+state names to the failed-read budget by count rather than by bytes, or lower the budget for entries bodies: the
+window rule changes, and that damage cannot reach it must be shown again. (c) Remember each definition's distinct
+verdict per file offset within a scan, so nested images that share one definition pay once; it removes the nesting
+measured but needs an argument for definitions that overlap at other offsets. (d) Accept, and state the case outside
+the budget. Proposed: (a), as it makes the check linear for every input and costs a writer nothing.
 
 ## Open at v0.2
 
@@ -1361,7 +1406,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1428,7 +1473,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
-| Q-651 | 4.9 | OWNER. Gate; the crafted-file worst case (about 2 s per 64 MiB segment) against the 1 s restart budget; recorded at the re-check of roadmap 4.9d |
+| Q-870 | 4.9 | OWNER. Gate; definitions with many short state names keep a crafted 64 MiB segment at about 1.5 s against the 1 s restart budget; recorded by the implementation of the Q-651 ruling |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1679,6 +1724,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-230 | Body checks of checksum-valid bodies that nest | `format.md` common rules (Scan bound), A.2, A.5, A.6, A.14; `design.md` Budgets; `SECURITY.md` (settled by the owner's ruling after roadmap 4.9d: the per-window cost is bounded by a constant fixed by the format, so the total is accepted for v1 and the exact bound stated instead of "linear whatever its bytes". Scenario: a block whose checksums hold still has its body checked by type, and a writer of the file can nest such bodies, n facts blocks a few dozen bytes apart each running to its own commit block with a valid `batch_crc32c`, so the decoding grows with the square of n within one window. Bound: each body is checked a bounded number of times per candidate; a resynchronisation candidate is read in full only at the offset its commit block names, so at most one per commit block, its bodies within w = 8 MiB; a manifest forward-search candidate is one per 8-byte step, its body within w = 16 MiB; so at most about L/8 × w for a file of L bytes. Reaching it needs the checksums right, so only a writer of the file can. Superseded by the budget of Q-110's fix round, as the measured figure was about 40 minutes per 64 MiB segment: body checks now total at most 2L, the direct read that found damage, and per window 16 MiB of failed reads plus the read that reached it (two batches), that is about 390 MiB of bodies for a 64 MiB segment and 100 MiB for a 16 MiB one; at least 20 bytes per facts row and about 100 ns per row at most (a 255-byte text value, release build) give about 2 s and 0.6 s. A manifest window holds its valid records once and 16 MiB of failed reads plus one body: at most about 0.25 s per 16 MiB for the start's reader and 0.45 s for the whole-file reader, measured at 0.16 s and 0.28 s on a crafted 16.5 MB window (load about 4 on a shared 4-core machine). The review's crafted segment construction measured 0.12 s per 16 MiB. Above the 1 s budget at 64 MiB: Q-651) |
 | Q-231 | The bounded scan's cost on undamaged segments | `format.md` common rules (Scan bound); `design.md` Budgets (settled by the owner's ruling after roadmap 4.9d: undamaged segments take a cheap path, the bounded path runs only once damage is found, and a crafted file must not be able to force the slow path repeatedly. Scenario: on a full, undamaged 64 MiB segment in a release build the bounded scan took 170 ms with 280,000 small batches and 76 ms with 15,000 large ones, against 56 ms and 29 ms for the reference scan, with restarts measured at 0.39–0.74 s against the 1 s budget. Implemented: a scan reads each batch at a boundary once with direct checksums until the first boundary read that finds no complete batch; from there to the end of that scan it uses the prefix table and the remembered verdicts. The switch is one way, so a crafted file costs at most one failed direct read per scan (at most a batch) before the bounded path, and the bytes checksummed stay within 2L plus that read. After: 52 ms and 32 ms on the same segments, equal to the reference. `log/src/scan/tests.rs` `an_undamaged_segment_is_read_in_one_pass_of_direct_reads`; the crafted-file tests of Q-110 and the differential property are unchanged) |
 | Q-650 | A manifest search that passes a window and finds no later record | `spec.md` §7 Manifest; `format.md` A.14 (settled by the owner's ruling: the passed bytes are a corrupt span with no later record, kept and repaired by a copy or a rebuild; the rebuild record's field 7 writes its `before` as 0; see the question) |
+| Q-651 | The crafted-file worst case against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by the owner's ruling: each kept body checked once and cheaper body checks with the same verdicts, measured inside the budget except for Q-870; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

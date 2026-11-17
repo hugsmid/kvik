@@ -2,7 +2,7 @@
 
 use crate::batch::MAX_BATCH_DATA;
 use crate::block::{
-    BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, peek_raw, read_block_with,
+    BLOCK_HEADER_LEN, BlockFault, BlockHeader, MAX_BODY_LEN, RawBlock, peek_raw, read_block_with,
 };
 use crate::body::{COMMIT_LEN, DataPrefix};
 use crate::content::check_block;
@@ -83,17 +83,28 @@ impl ScanStats {
     /// Whether the counts keep the scan bound for a file of `len` bytes (`format.md` A, common rules: scan bound):
     /// at most `2 · len` bytes checksummed, plus once more the bytes of the one direct read that found damage (at
     /// most a batch); [`HEADERS_PER_WORD`] headers per 8 bytes; failed reads per window checking at most
-    /// [`FAILED_READ_BUDGET`] plus the read that reached it (two batches); and body checks of at most `2 · len`,
-    /// that direct read, and those failed reads.
+    /// [`FAILED_READ_BUDGET`] plus the read that reached it (a batch); and body checks of at most `len` (each kept
+    /// body once, Q-651), that direct read, and those failed reads.
     pub fn within_bound(&self, len: u64) -> bool {
         let first_read = len.min(MAX_BATCH_DATA + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64);
-        let per_window = FAILED_READ_BUDGET.saturating_add(2 * len.min(MAX_BATCH_DATA));
-        let failed = per_window.saturating_mul(len.div_ceil(MAX_BATCH_DATA));
+        self.within(len, MAX_BATCH_DATA, first_read)
+    }
+
+    /// [`ScanStats::within_bound`] for a manifest, whose windows are a body (16 MiB) and which has no direct read:
+    /// each valid record checked once, and per window the budget and the read that reached it (a body).
+    pub fn within_manifest_bound(&self, len: u64) -> bool {
+        self.within(len, u64::from(MAX_BODY_LEN), 0)
+    }
+
+    fn within(&self, len: u64, window: u64, first_read: u64) -> bool {
+        let per_window = FAILED_READ_BUDGET.saturating_add(len.min(window));
+        let failed = per_window.saturating_mul(len.div_ceil(window));
         let twice = len.saturating_mul(2).saturating_add(first_read);
+        let once = len.saturating_add(first_read);
         self.bytes_checksummed <= twice
             && self.headers_visited <= (len / 8 + 2).saturating_mul(HEADERS_PER_WORD)
             && self.failed_bytes_peak <= per_window
-            && self.bytes_body_checked <= twice.saturating_add(failed)
+            && self.bytes_body_checked <= once.saturating_add(failed)
     }
 }
 

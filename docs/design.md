@@ -75,10 +75,15 @@ one pass of direct checksums (Q-231). A file crafted by a process with write acc
 bounded by `format.md` A, common rules (scan bound; Q-110): about 2L bytes checksummed and 16 block headers per 8 bytes
 for a file of L bytes, and failed full reads checking at most 16 MiB of body per window (8 MiB in a segment, 16 MiB in
 the manifest), past which the rest of the window is passed as damaged and reported with the damage around it; damage
-does not reach that budget. A crafted segment costs at most about 2 s at 64 MiB and 0.6 s at 16 MiB, a crafted
-manifest about 0.25 s per 16 MiB at a start and 0.45 s at a refresh (Q-230). That is above the 1 s restart budget at
-64 MiB, which the Q-110 ruling meant crafted files to stay within: whether the promise or the bound changes is the
-owner's (Q-651).
+does not reach that budget. Each kept body is checked once, and the checks keep nothing and cost a bounded time per
+byte (Q-651). Measured in a release build on one shared 4-core cloud machine, against the bound (264 MiB of bodies
+for a 64 MiB segment): a crafted segment costs at most about 0.6 s at 64 MiB and 0.2 s at 16 MiB, and a crafted
+manifest about 0.09 s per 16 MiB at a start and 0.15 s at a refresh, so a crafted 64 MiB segment and a crafted 16 MiB
+manifest stay within the 1 s restart budget. Files built to that bound measured 0.22 s (nested facts images over
+every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches whose rows share one text value, after
+damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records; 0.15 s before) at a start. One case
+is still above the budget: bodies that are definitions holding many short state names, whose distinct check costs
+about 5 ns a byte, about 1.5 s at 64 MiB (0.4 s at 16 MiB); that case is the owner's (Q-870).
 
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).

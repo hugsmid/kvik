@@ -15,7 +15,7 @@ pub fn decode_all(data: &[u8]) {
     }
     let (img, stats) = read_with_stats(data, &store_id);
     assert!(
-        stats.within_bound(data.len() as u64),
+        stats.within_manifest_bound(data.len() as u64),
         "{stats:?} for {} bytes",
         data.len()
     );

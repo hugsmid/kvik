@@ -21,6 +21,41 @@ pub(crate) fn parse(body: &[u8]) -> Option<Vec<Field<'_>>> {
     Some(out)
 }
 
+/// The fields of a field list, in order, read as they are asked for; [`fit`] first tells whether every field fits.
+pub(crate) fn iter(body: &[u8]) -> impl Iterator<Item = Field<'_>> {
+    let mut at = 0usize;
+    std::iter::from_fn(move || {
+        let h = body.get(at..at.checked_add(4)?)?;
+        let id = u16::from_le_bytes([h[0], h[1]]);
+        let len = usize::from(u16::from_le_bytes([h[2], h[3]]));
+        let start = at + 4;
+        let v = body.get(start..start.checked_add(len)?)?;
+        at = (start + len).div_ceil(4) * 4;
+        Some((id, v))
+    })
+}
+
+/// Whether every field of a field list fits, as [`parse`] has it, without keeping them (Q-651).
+pub(crate) fn fit(body: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at < body.len() {
+        let Some(h) = at.checked_add(4).and_then(|end| body.get(at..end)) else {
+            return false;
+        };
+        let len = usize::from(u16::from_le_bytes([h[2], h[3]]));
+        let start = at + 4;
+        if start
+            .checked_add(len)
+            .and_then(|end| body.get(start..end))
+            .is_none()
+        {
+            return false;
+        }
+        at = (start + len).div_ceil(4) * 4;
+    }
+    true
+}
+
 /// Appends one field, its value padded to 4. `None` if the value is longer than a field can hold.
 #[must_use]
 pub(crate) fn push(out: &mut Vec<u8>, id: u16, value: &[u8]) -> Option<()> {

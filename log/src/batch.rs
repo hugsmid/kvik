@@ -106,6 +106,30 @@ pub(crate) fn read_batch<'a>(
     min_first: u64,
     refusal: Refusal,
 ) -> BatchRead<'a> {
+    read_batch_with(reads, id, o, limit, min_first, refusal, false)
+}
+
+/// [`read_batch`] of a batch whose data blocks a boundary read of this scan has already judged, each body passing
+/// the checks of its type: the bodies are not checked again, so a kept body is checked once (Q-651).
+pub(crate) fn read_judged_batch<'a>(
+    reads: &mut Reads<'a>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+) -> BatchRead<'a> {
+    read_batch_with(reads, id, o, limit, min_first, Refusal::AtOnce, true)
+}
+
+fn read_batch_with<'a>(
+    reads: &mut Reads<'a>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+    refusal: Refusal,
+    judged: bool,
+) -> BatchRead<'a> {
     let incomplete = |fault| BatchRead::Incomplete { fault };
     let mut crc = Crc32c::new();
     crc.update(&id.store_id);
@@ -141,6 +165,13 @@ pub(crate) fn read_batch<'a>(
             block_type::COMMIT => break b,
             // The body checks of A.5 and A.6; an unknown critical element inside is refused like an unknown
             // critical block.
+            block_type::FACTS | block_type::ENTRIES if judged => {
+                let Ok(p) = DataPrefix::decode(t, b.body) else {
+                    return incomplete(BatchFault::Content);
+                };
+                recovery |= t == block_type::ENTRIES && crate::entries::holds_recovery(b.body);
+                Some(p)
+            }
             block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body) {
                 Ok((p, r)) => {
                     recovery |= r;

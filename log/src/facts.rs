@@ -6,6 +6,7 @@ use crate::bytes::{i64_at, put, u32_at, u64_at};
 use crate::content_error::{BodyError, ContentError};
 use crate::error::{Element, EncodeError};
 use crate::rle;
+use crate::utf8::HeapText;
 
 /// Size of a v1 column directory entry.
 pub const DIR_ENTRY_LEN: u8 = 12;
@@ -404,12 +405,24 @@ impl FactsBlock {
 
     /// Decodes a body, applying every check of A.5. An unknown ignorable column is skipped.
     pub fn decode(body: &[u8]) -> Result<Self, BodyError> {
-        decode(body)
+        let mut rows = Collect(Vec::new());
+        let p = walk(body, &mut rows)?;
+        Ok(FactsBlock {
+            first_sequence: p.first_sequence,
+            received_at: p.received_at,
+            rows: rows.0,
+        })
+    }
+
+    /// The checks of [`FactsBlock::decode`], with its verdict, keeping no row: a text value named by many rows is
+    /// checked at a cost linear in the body (Q-651).
+    pub fn check(body: &[u8]) -> Result<(), BodyError> {
+        walk(body, &mut Check(HeapText::default())).map(|_| ())
     }
 
     /// Decodes a body and also requires it to be exactly what [`FactsBlock::encode`] writes for its content.
     pub fn decode_canonical(body: &[u8]) -> Result<Self, BodyError> {
-        let b = decode(body)?;
+        let b = Self::decode(body)?;
         match b.encode() {
             Ok(again) if again == body => Ok(b),
             _ => Err(BodyError::NonCanonical),
@@ -422,7 +435,36 @@ struct Col<'a> {
     payload: &'a [u8],
 }
 
-fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
+/// What a walk over the rows does with each: [`Collect`] keeps them, [`Check`] keeps none.
+trait Rows {
+    /// The text `heap[off..end]`, or `None` when it is not UTF-8.
+    fn text(&mut self, heap: &[u8], off: usize, end: usize) -> Option<String>;
+    fn row(&mut self, row: FactRow);
+}
+
+struct Collect(Vec<FactRow>);
+
+impl Rows for Collect {
+    fn text(&mut self, heap: &[u8], off: usize, end: usize) -> Option<String> {
+        std::str::from_utf8(&heap[off..end]).ok().map(str::to_owned)
+    }
+
+    fn row(&mut self, row: FactRow) {
+        self.0.push(row);
+    }
+}
+
+struct Check(HeapText);
+
+impl Rows for Check {
+    fn text(&mut self, heap: &[u8], off: usize, end: usize) -> Option<String> {
+        self.0.is_utf8(heap, off, end).then(String::new)
+    }
+
+    fn row(&mut self, _: FactRow) {}
+}
+
+fn walk<R: Rows>(body: &[u8], sink: &mut R) -> Result<DataPrefix, BodyError> {
     use ContentError as E;
     let p = DataPrefix::decode(block_type::FACTS, body).map_err(|_| {
         if body.len() < DATA_PREFIX_LEN {
@@ -548,7 +590,6 @@ fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
             f & flag::UNDEFINED,
         )));
     }
-    let mut out = Vec::with_capacity(n);
     let (mut any_text, mut any_changed, mut any_decimal) = (false, false, false);
     for i in 0..n {
         let row = i as u32;
@@ -633,15 +674,14 @@ fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
                     let h = heap.unwrap_or_default();
                     let text = off
                         .checked_add(len)
-                        .filter(|_| len <= MAX_TEXT_LEN)
-                        .and_then(|end| h.get(off..end))
-                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .filter(|&end| len <= MAX_TEXT_LEN && end <= h.len())
+                        .and_then(|end| sink.text(h, off, end))
                         .ok_or(E::Text { row })?;
-                    Value::Text(text.to_owned())
+                    Value::Text(text)
                 }
             }
         };
-        out.push(FactRow {
+        sink.row(FactRow {
             series_id: u32_at(series, i * 4),
             t: i64_at(ts, i * 8),
             quality,
@@ -666,9 +706,5 @@ fn decode(body: &[u8]) -> Result<FactsBlock, BodyError> {
             return Err(E::Presence { column: id }.into());
         }
     }
-    Ok(FactsBlock {
-        first_sequence: p.first_sequence,
-        received_at: p.received_at,
-        rows: out,
-    })
+    Ok(p)
 }

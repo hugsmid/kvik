@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::batch::{BatchFault, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, read_batch};
+use crate::batch::{BatchFault, BatchRead, MAX_BATCH_DATA, SegmentIdentity, read_judged_batch};
 use crate::block::block_type;
 use crate::body::{COMMIT_LEN, Commit};
 use crate::content_error::BodyError;
@@ -93,8 +93,9 @@ fn judge(reads: &mut Reads<'_>, p: u64, o: u64, limit: u64) -> Judged {
 }
 
 impl Walks {
-    /// `read_batch(o, Refusal::AtOnce)`, with the same result; a read that checked a body and kept no batch is
-    /// charged the body bytes it checked against its window (`format.md` A, common rules: scan bound).
+    /// `read_batch(o, Refusal::AtOnce)`, with the same result, each body checked once; a read that checked a body
+    /// and kept no batch is charged the body bytes it checked against its window (`format.md` A, common rules: scan
+    /// bound).
     pub(crate) fn read<'a>(
         &mut self,
         reads: &mut Reads<'a>,
@@ -167,7 +168,7 @@ impl Walks {
             }
             Stop::Commit(None) => incomplete(BatchFault::Content),
             Stop::Commit(Some(c)) if c.batch_bytes == p - o => {
-                read_batch(reads, id, o, limit, min_first, Refusal::AtOnce)
+                read_judged_batch(reads, id, o, limit, min_first)
             }
             Stop::Commit(Some(_)) => incomplete(BatchFault::Disagreement),
         }

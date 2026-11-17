@@ -246,7 +246,7 @@ pub(crate) fn check_block(t: u8, body: &[u8]) -> Result<(DataPrefix, bool), Body
         }
     })?;
     let recovery = match t {
-        block_type::FACTS => FactsBlock::decode(body).map(|_| false)?,
+        block_type::FACTS => FactsBlock::check(body).map(|_| false)?,
         _ => crate::entries::check(body)?.1,
     };
     Ok((prefix, recovery))

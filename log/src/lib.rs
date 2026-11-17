@@ -83,6 +83,8 @@ pub mod scan;
 pub mod segment;
 pub mod setaside;
 pub mod store;
+#[doc(hidden)]
+pub mod utf8;
 pub mod writer;
 
 pub use content_error::{BodyError, ContentError};
