@@ -198,6 +198,25 @@ fn a_call_as_old_as_half_lease_refresh_renews_the_lease_at_its_check_and_finds_i
     assert!(r.with(|_, _| Ok(())).is_ok());
 }
 
+#[test]
+fn a_long_calls_check_that_finds_the_lease_gone_ends_the_views_of_other_calls_in_flight() {
+    let (store, env, clock) = store(1);
+    block_on(store.emit(&[reading(1, 1, 1.0)])).unwrap();
+    block_on(store.shutdown()).unwrap();
+    let r = reader(&env, Duration::from_secs(60), LONG);
+    let (old, release_old) = held_call(&r);
+    clock.advance(Duration::from_secs(1));
+    let (young, release_young) = held_call(&r);
+    delete_leases(&env);
+    clock.advance(Duration::from_secs(29));
+    release_old.send(()).unwrap();
+    let ended = old.join().unwrap();
+    assert!(matches!(ended, Err(QueryError::CutExpired)), "{ended:?}");
+    release_young.send(()).unwrap();
+    let ended = young.join().unwrap();
+    assert!(matches!(ended, Err(QueryError::CutExpired)), "{ended:?}");
+}
+
 #[derive(Clone, Debug)]
 struct History {
     series: u32,

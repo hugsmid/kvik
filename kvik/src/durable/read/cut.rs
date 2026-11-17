@@ -264,6 +264,27 @@ mod tests {
     }
 
     #[test]
+    fn a_calls_cut_ages_from_the_start_of_the_refresh_that_published_its_view() {
+        let rig = Rig::new("cut-began");
+        let r = rig.reader();
+        let during = rig.clock.clone();
+        *rig.fs.hook.lock().unwrap() = (
+            0,
+            Some(HookBox(Box::new(move |_: &MemFs, n: u32| {
+                if n == 0 {
+                    during.advance(MAX_AGE / 2 + Duration::from_secs(1));
+                }
+            }))),
+        );
+        let clock = rig.clock.clone();
+        let call = r.with(|_, _| {
+            clock.advance(MAX_AGE / 2);
+            Ok(())
+        });
+        assert!(matches!(call, Err(QueryError::CutExpired)), "{call:?}");
+    }
+
+    #[test]
     fn the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it() {
         let rig = Rig::new("cut-again");
         let r = rig.reader();

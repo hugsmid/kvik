@@ -110,7 +110,10 @@ fn copy(e: &QueryError) -> QueryError {
         Q::Corrupt { file } => Q::Corrupt { file: file.clone() },
         Q::Io { path, source } => Q::Io {
             path: path.clone(),
-            source: std::io::Error::new(source.kind(), source.to_string()),
+            source: match source.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(source.kind(), source.to_string()),
+            },
         },
         Q::Invalid { reason } => Q::Invalid {
             reason: reason.clone(),

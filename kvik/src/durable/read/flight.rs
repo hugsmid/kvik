@@ -17,7 +17,7 @@ struct Rounds<V, E> {
     finished: u64,
     /// The view of the last round that succeeded, with its number.
     current: Option<(u64, Arc<V>)>,
-    /// The error of the last round that failed.
+    /// The error of the last round, if it failed.
     failed: Option<E>,
     /// The round each waiting call waits for.
     #[cfg(test)]
@@ -47,13 +47,20 @@ impl<V, E> Drop for Lead<'_, V, E> {
         let mut g = self.flight.lock();
         g.finished += 1;
         let round = g.finished;
+        let mut superseded = None;
         match self.outcome.take() {
-            Some(Ok(v)) => g.current = Some((round, v)),
+            Some(Ok(v)) => {
+                superseded = g.current.replace((round, v));
+                g.failed = None;
+            }
             Some(Err(e)) => g.failed = Some(e),
-            None => {}
+            // An unwound round leaves no error, so no follower reports one from a round before it.
+            None => g.failed = None,
         }
         drop(g);
         self.flight.ended.notify_all();
+        // Freeing the old view can free a whole index; not while calls wait on the lock.
+        drop(superseded);
     }
 }
 
@@ -230,6 +237,26 @@ mod tests {
     }
 
     #[test]
+    fn a_follower_after_unwound_rounds_reports_no_error_of_a_round_before_it_began() {
+        let flight = Arc::new(Flight::new());
+        let rounds = Arc::new(AtomicU32::new(0));
+        let outcome = |r| match r {
+            1 => Err(1),
+            2 | 3 => panic!("refresh panicked"),
+            _ => Ok(r),
+        };
+        let a = call(&flight, &rounds, 4, outcome);
+        started(&rounds, 1);
+        let rest: Vec<_> = (0..3).map(|_| call(&flight, &rounds, 4, outcome)).collect();
+        assert_eq!(a.join().unwrap(), Err(1));
+        let ended: Vec<_> = rest.into_iter().map(|c| c.join().ok()).collect();
+        assert_eq!(ended.iter().filter(|e| e.is_none()).count(), 2);
+        let last: Vec<_> = ended.into_iter().flatten().collect();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].as_deref(), Ok(&4));
+    }
+
+    #[test]
     fn a_round_whose_leader_panics_ends_and_its_follower_leads_the_next() {
         let flight = Arc::new(Flight::<u32, u32>::new());
         let (f, go) = (flight.clone(), Arc::new(AtomicU32::new(0)));
@@ -340,28 +367,29 @@ mod loom_tests {
         });
     }
 
-    /// Three calls whose refreshes fail on the runs `fail` names.
-    fn three(fail: fn(u64) -> bool) -> [Seen; 3] {
+    /// `n` calls whose refreshes fail on the runs `fail` names.
+    fn calls(n: usize, fail: fn(u64) -> bool) -> Vec<Seen> {
         let w = world();
-        let others: Vec<_> = (0..2)
+        let others: Vec<_> = (1..n)
             .map(|_| {
                 let w = w.clone();
                 thread::spawn(move || call(&w, fail))
             })
             .collect();
-        let mine = call(&w, fail);
-        let mut it = others.into_iter().map(|t| t.join().unwrap());
-        [mine, it.next().unwrap(), it.next().unwrap()]
+        let mut seen = vec![call(&w, fail)];
+        seen.extend(others.into_iter().map(|t| t.join().unwrap()));
+        seen
     }
 
     #[test]
     fn only_the_leader_of_a_failed_round_reports_its_error() {
         model(|| {
-            for (seen, _, r, failed_here) in three(|run| run == 0) {
+            // Run 0 is the first round, which no call can follow; run 1 can have followers.
+            for (seen, _, r, failed_here) in calls(4, |run| run == 1) {
                 match r {
                     Ok(m) => assert!(m >= seen),
                     Err(run) => assert!(
-                        failed_here && run == 0,
+                        failed_here && run == 1,
                         "a follower reported its leader's error"
                     ),
                 }
@@ -372,7 +400,7 @@ mod loom_tests {
     #[test]
     fn a_follower_reports_an_error_only_after_two_failed_rounds() {
         model(|| {
-            for (_, begun, r, failed_here) in three(|_| true) {
+            for (_, begun, r, failed_here) in calls(3, |_| true) {
                 // The first round a follower can follow is the run numbered `begun`.
                 let run = r.unwrap_err();
                 assert!(
