@@ -42,10 +42,6 @@ log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
 log-pacing      log   pacing
 log-directories log   directories
-log-dir-crash   log   directories_crash
-log-dir-check   log   directories_check
-log-dir-lookup  log   directories_lookup
-log-dir-maint   log   directories_maint
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-differential kvik differential
