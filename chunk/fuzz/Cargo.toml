@@ -43,3 +43,17 @@ path = "fuzz_targets/file_bodies.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "compacted_resealed"
+path = "fuzz_targets/compacted_resealed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_index_resealed"
+path = "fuzz_targets/chunk_index_resealed.rs"
+test = false
+doc = false
+bench = false

@@ -13,6 +13,8 @@ cargo +nightly fuzz run compacted
 mkdir -p corpus/chunk_index && cp ../tests/golden/compacted/*.kvi corpus/chunk_index/
 cargo +nightly fuzz run chunk_index
 cargo +nightly fuzz run file_bodies
+cargo +nightly fuzz run compacted_resealed corpus/compacted
+cargo +nightly fuzz run chunk_index_resealed corpus/chunk_index
 ```
 
 | Target | Feeds arbitrary bytes to |
@@ -20,6 +22,7 @@ cargo +nightly fuzz run file_bodies
 | `block` | `kvik_chunk::fuzz::decode_all`: the block decoder, plain and canonical, and, with a value count taken from the first two bytes, every column decoder (plain, run-length at each width, delta, decimal, XOR, compressed XOR); whatever decodes must encode again to the same content |
 | `compacted` | `kvik_chunk::fuzz::decode_compacted`: the compacted segment reader on every path (index, chunks, entries, commit times, as-of time), the layout comparison and the canonical checks; a file that opens extracts to a chunk index object with the same layout and index |
 | `chunk_index` | `kvik_chunk::fuzz::decode_index_object`: the chunk index object reader and its index |
+| `compacted_resealed`, `chunk_index_resealed` | the same readers after `kvik_chunk::file::reseal` has re-sealed the input's block checksums and each parent's record of them, so a mutated golden file reaches the checks behind the checksum chain |
 | `file_bodies` | `kvik_chunk::fuzz::decode_file_bodies`: the description, chunk directory, index block, root, commit-time directory, commit-times, trailer and index object trailer decoders; whatever decodes must encode and decode again to itself |
 
 Its `Cargo.lock` is committed, so `libfuzzer-sys` is pinned.

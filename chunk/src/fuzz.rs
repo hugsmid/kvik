@@ -161,3 +161,14 @@ pub fn decode_index_object(data: &[u8]) {
 pub fn decode_file_bodies(data: &[u8]) {
     crate::file::fuzz_bodies(data);
 }
+
+/// Re-seals `data` as a compacted segment and feeds it to [`decode_compacted`], so that edits get past the
+/// checksum chain to the checks behind it.
+pub fn decode_compacted_resealed(data: &[u8]) {
+    decode_compacted(&crate::file::reseal::reseal_segment(data));
+}
+
+/// Re-seals `data` as a chunk index object and feeds it to [`decode_index_object`].
+pub fn decode_index_object_resealed(data: &[u8]) {
+    decode_index_object(&crate::file::reseal::reseal_index_object(data));
+}

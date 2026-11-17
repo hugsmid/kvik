@@ -7,7 +7,10 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 
-use kvik_chunk::fuzz::{decode_all, decode_compacted, decode_file_bodies, decode_index_object};
+use kvik_chunk::fuzz::{
+    decode_all, decode_compacted, decode_compacted_resealed, decode_file_bodies,
+    decode_index_object, decode_index_object_resealed,
+};
 use proptest::prelude::*;
 use support::*;
 
@@ -112,6 +115,28 @@ proptest! {
     }
 
     #[test]
+    fn resealed_edits_of_generated_files_never_panic(
+        s in compacted::spec(),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..6),
+    ) {
+        let c = compacted::build(&s).0;
+        let mut data = c.write().0;
+        let object = {
+            let f = kvik_chunk::file::CompactedFile::open(data.as_slice(), &c.id, None).unwrap();
+            kvik_chunk::file::extract(&f, [5; 32]).unwrap()
+        };
+        let mut obj = object.clone();
+        for (at, byte) in &edits {
+            let i = 64 + at.index(data.len() - 80);
+            data[i] = *byte;
+            let j = 64 + at.index(obj.len() - 80);
+            obj[j] = *byte;
+        }
+        decode_compacted_resealed(&data);
+        decode_index_object_resealed(&obj);
+    }
+
+    #[test]
     fn mutated_compacted_golden_files(
         which in any::<prop::sample::Index>(),
         edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..8),
@@ -124,6 +149,8 @@ proptest! {
             data[i] = byte;
         }
         decode_any_file(&data);
+        decode_compacted_resealed(&data);
+        decode_index_object_resealed(&data);
         let k = cut.index(data.len() + 1);
         decode_any_file(&data[..k]);
     }
