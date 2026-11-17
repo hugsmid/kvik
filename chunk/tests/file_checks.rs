@@ -310,7 +310,7 @@ fn a_data_block_that_disagrees_with_its_record_is_refused() {
     let raw = two_blocks();
     let b = edit(&raw, block_type::DIRECTORY, 0, |d| {
         let len = u32_at(d, 24 + 20);
-        let other = if len % 8 == 0 {
+        let other = if len.is_multiple_of(8) {
             len - 1
         } else {
             len + 1 - (len % 8 == 7) as u32 * 2
