@@ -266,6 +266,39 @@ mod tests {
         names.iter().map(|n| (13, n.as_slice())).collect()
     }
 
+    /// A packed key holds a name's length and every byte, so names that differ only there are told apart.
+    #[test]
+    fn packed_keys_tell_apart_names_that_differ_in_length_or_any_one_byte() {
+        let names: Vec<Vec<u8>> = [
+            &b"a"[..],
+            b"a\0",
+            b"a\0\0",
+            b"\0a",
+            b"aa",
+            b"aaa",
+            b"aab",
+            b"aba",
+            b"baa",
+            b"abcd",
+            b"abce",
+            b"abdd",
+            b"abcdefg",
+            b"abcdefh",
+            b"abcdeff",
+            b"bbcdefg",
+            b"abcdefgh",
+        ]
+        .iter()
+        .map(|n| n.to_vec())
+        .collect();
+        assert!(Names::default().valid(&fields(&names)));
+        for i in 1..names.len() {
+            let mut repeated = names.clone();
+            repeated[i - 1] = names[i].clone();
+            assert!(!Names::default().valid(&fields(&repeated)), "{i}");
+        }
+    }
+
     /// The sort that ends a long probe run, and the one that settles equal hashed keys, give the table's verdict.
     #[test]
     fn the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict() {
