@@ -355,3 +355,20 @@ impl DurableReader {
         self.with(|index, log| Ok(index.losses(log.lost_ranges())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copied_io_error_keeps_its_operating_system_code() {
+        let e = QueryError::Io {
+            path: PathBuf::from("a"),
+            source: std::io::Error::from_raw_os_error(28),
+        };
+        let QueryError::Io { source, .. } = copy(&e) else {
+            panic!("an I/O error")
+        };
+        assert_eq!(source.raw_os_error(), Some(28));
+    }
+}

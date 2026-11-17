@@ -681,5 +681,10 @@ mod tests {
         }]);
         assert!(i.registry().get(1).is_none());
         assert_eq!(i.series_facts(1).count(), 0);
+        assert_eq!(
+            i.fact_series().count(),
+            0,
+            "a series the void emptied is gone"
+        );
     }
 }
