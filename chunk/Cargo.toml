@@ -18,7 +18,12 @@ thiserror = "2"
 # The compressed XOR fallback (`docs/format-chunk.md`); the level and library measured in roadmap 2.1.
 zstd = { version = "0.14", default-features = false }
 
+[features]
+# Writer departures that make files a v1 writer never writes, for golden files and the reader's tests.
+tweaks = []
+
 [dev-dependencies]
+kvik-chunk = { path = ".", features = ["tweaks"] }
 proptest = "1"
 # The plaintext hash a chunk index object carries (`docs/format-compacted.md` B.2).
 sha2 = "0.11"

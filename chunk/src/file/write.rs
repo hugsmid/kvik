@@ -111,26 +111,84 @@ pub struct Written {
     pub layout: Layout,
 }
 
-/// Departures from canonical writing, for golden files of unknown elements and for the canonical check, which
-/// hands the file's own data block bodies back (a compressed XOR payload is a writer's choice, C.10).
+/// Departures from canonical writing. `bodies` serves the canonical check, which hands the file's own data block
+/// bodies back (a compressed XOR payload is a writer's choice, C.10); the other fields write files a v1 writer
+/// never writes, for golden files and the reader's tests, and exist only with the `tweaks` feature.
 #[derive(Clone, Debug, Default)]
 pub struct Tweaks {
-    /// Bits set in every chunk's directory and index flags.
-    pub chunk_flags: u16,
-    /// A plain column added to the first data block.
-    pub data_column: Option<(u8, Vec<u8>)>,
-    /// A plain column added to the first commit-times block.
-    pub times_column: Option<(u8, Vec<u8>)>,
-    /// A field appended to the description.
-    pub description_field: Option<(u16, Vec<u8>)>,
-    /// Bytes appended to the trailer body.
-    pub trailer_tail: Vec<u8>,
     /// Data block bodies in file order, each used where it is a canonical body of the same rows.
     pub bodies: Vec<Vec<u8>>,
+    /// Bits set in every chunk's directory and index flags.
+    #[cfg(feature = "tweaks")]
+    pub chunk_flags: u16,
+    /// A plain column added to the first data block.
+    #[cfg(feature = "tweaks")]
+    pub data_column: Option<(u8, Vec<u8>)>,
+    /// A plain column added to the first commit-times block.
+    #[cfg(feature = "tweaks")]
+    pub times_column: Option<(u8, Vec<u8>)>,
+    /// A field appended to the description.
+    #[cfg(feature = "tweaks")]
+    pub description_field: Option<(u16, Vec<u8>)>,
+    /// Bytes appended to the trailer body.
+    #[cfg(feature = "tweaks")]
+    pub trailer_tail: Vec<u8>,
     /// Batch rows written in place of the held batches, unchecked.
+    #[cfg(feature = "tweaks")]
     pub times_rows: Option<Vec<Batch>>,
     /// Leaves each chunk's last block out of its directory and index entry, though it is written.
+    #[cfg(feature = "tweaks")]
     pub unrecorded_last_block: bool,
+}
+
+#[cfg(feature = "tweaks")]
+impl Tweaks {
+    fn chunk_flags(&self) -> u16 {
+        self.chunk_flags
+    }
+    fn data_column(&self) -> Option<(u8, Vec<u8>)> {
+        self.data_column.clone()
+    }
+    fn take_times_column(&mut self) -> Option<(u8, Vec<u8>)> {
+        self.times_column.take()
+    }
+    fn description_field(&self) -> Option<(u16, Vec<u8>)> {
+        self.description_field.clone()
+    }
+    fn trailer_tail(&self) -> &[u8] {
+        &self.trailer_tail
+    }
+    fn take_times_rows(&mut self) -> Option<Vec<Batch>> {
+        self.times_rows.take()
+    }
+    fn unrecorded_last_block(&self) -> bool {
+        self.unrecorded_last_block
+    }
+}
+
+#[cfg(not(feature = "tweaks"))]
+impl Tweaks {
+    fn chunk_flags(&self) -> u16 {
+        0
+    }
+    fn data_column(&self) -> Option<(u8, Vec<u8>)> {
+        None
+    }
+    fn take_times_column(&mut self) -> Option<(u8, Vec<u8>)> {
+        None
+    }
+    fn description_field(&self) -> Option<(u16, Vec<u8>)> {
+        None
+    }
+    fn trailer_tail(&self) -> &[u8] {
+        &[]
+    }
+    fn take_times_rows(&mut self) -> Option<Vec<Batch>> {
+        None
+    }
+    fn unrecorded_last_block(&self) -> bool {
+        false
+    }
 }
 
 /// Writes one compacted segment.
@@ -293,7 +351,7 @@ impl<W: Write> FileWriter<W> {
             return Ok(());
         }
         let mut body = self.description.encode();
-        if let Some((id, v)) = self.tweaks.description_field.clone() {
+        if let Some((id, v)) = self.tweaks.description_field() {
             push_field(&mut body, id, &v);
         }
         let (_, h) = self.block(block_type::DESCRIPTION, &body)?;
@@ -409,9 +467,9 @@ impl<W: Write> FileWriter<W> {
                 body = alt.clone();
             }
             if self.data_blocks == 0
-                && let Some((id, payload)) = &self.tweaks.data_column
+                && let Some((id, payload)) = self.tweaks.data_column()
             {
-                body = insert_column(&body, 0, *id, payload);
+                body = insert_column(&body, 0, id, &payload);
             }
             self.data_blocks += 1;
             let (at, h) = self.block(block_type::DATA, &body)?;
@@ -424,9 +482,9 @@ impl<W: Write> FileWriter<W> {
                 body_crc32c: h.body_crc32c,
             });
         }
-        let flags = flags | self.tweaks.chunk_flags;
+        let flags = flags | self.tweaks.chunk_flags();
         let mut recorded = facts.len() as u32;
-        if self.tweaks.unrecorded_last_block && records.len() > 1 {
+        if self.tweaks.unrecorded_last_block() && records.len() > 1 {
             recorded -= u32::from(records.pop().map_or(0, |r| r.row_count));
         }
         let dir = Directory {
@@ -578,7 +636,7 @@ impl<W: Write> FileWriter<W> {
                 "description positions per generation disagree with the content",
             ));
         }
-        let used: Vec<Batch> = match self.tweaks.times_rows.take() {
+        let used: Vec<Batch> = match self.tweaks.take_times_rows() {
             Some(rows) => rows,
             None => self
                 .batches
@@ -595,7 +653,7 @@ impl<W: Write> FileWriter<W> {
             let g = used[at].generation;
             let end = at + used[at..].iter().take_while(|b| b.generation == g).count();
             for rows in used[at..end].chunks(TIMES_ROWS) {
-                let extra = self.tweaks.times_column.take();
+                let extra = self.tweaks.take_times_column();
                 let body = encode_times(g, rows, extra.as_ref().map(|(i, p)| (*i, p.as_slice())));
                 let (offset, h) = self.block(block_type::TIMES, &body)?;
                 times.push(TimesRecord {
@@ -652,7 +710,7 @@ impl<W: Write> FileWriter<W> {
             entries_crc32c: self.entries_crc,
         };
         let mut body = trailer.encode();
-        body.extend_from_slice(&self.tweaks.trailer_tail);
+        body.extend_from_slice(self.tweaks.trailer_tail());
         let (trailer_offset, _) = self.block(block_type::TRAILER, &body)?;
         self.put(&encode_end_marker(trailer_offset))?;
         let layout = Layout::of(&self.id, &self.description, &trailer);

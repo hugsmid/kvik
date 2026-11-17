@@ -705,6 +705,7 @@ dependencies = [
 name = "kvik-chunk"
 version = "0.1.0"
 dependencies = [
+ "kvik-chunk",
  "kvik-log",
  "proptest",
  "sha2",
