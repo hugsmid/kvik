@@ -95,10 +95,11 @@ enum Step {
     Complete(u8),
     /// The calls in flight are polled; a complete call is seen when its flag (cycled) is set.
     Poll(Vec<bool>),
-    /// The positions of the `n`-th complete call with positions (cycled), through as many more calls, are lost;
+    /// The positions of the `n`-th complete call with positions (cycled), through as many more calls, are lost, and
+    /// reported lost through as many more positions as the third field says (Q-937);
     /// then a poll, and a call for each series and offset, of one reading that far below its old reference, the
     /// lowest first.
-    Lose(usize, u8, Vec<bool>, Vec<u8>),
+    Lose(usize, u8, u8, Vec<bool>, Vec<u8>),
 }
 
 struct Rig {
@@ -109,7 +110,9 @@ struct Rig {
     /// Calls queued with facts, in call order, until the bounded decider has seen them acknowledged.
     inflight: Vec<(u64, LogPos, LogPos)>,
     placed: Vec<(u64, LogPos, LogPos)>,
+    /// The ranges the log lost, for the oracle, and the ranges reported, for the bounded decider.
     fresh: Vec<(LogPos, LogPos)>,
+    reported: Vec<Fresh>,
     budget: usize,
     forgettings: usize,
 }
@@ -164,6 +167,7 @@ impl Rig {
             inflight: Vec::new(),
             placed: Vec::new(),
             fresh: Vec::new(),
+            reported: Vec::new(),
             budget,
             forgettings: 0,
         }
@@ -266,10 +270,9 @@ impl Rig {
             })
             .collect();
         let fresh = std::mem::take(&mut self.fresh);
-        let new = fresh
-            .iter()
-            .any(|&(a, b)| !self.bounded.lost.iter().any(|&(x, y)| x <= a && b <= y));
-        let taken = self.bounded.settle(acks, self.next_call, &fresh);
+        let reported = std::mem::take(&mut self.reported);
+        let new = reported.iter().any(|f| f.grew);
+        let taken = self.bounded.settle(acks, self.next_call, &reported);
         self.forgettings += usize::from(new);
         for c in &taken {
             let i = self.inflight.iter().position(|(x, _, _)| x == c).unwrap();
@@ -285,7 +288,7 @@ impl Rig {
         }
     }
 
-    fn lose(&mut self, n: usize, more: u8) -> bool {
+    fn lose(&mut self, n: usize, more: u8, wider: u8) -> bool {
         let done = self.log.done;
         let complete: Vec<(u64, u64)> = self
             .log
@@ -307,8 +310,15 @@ impl Rig {
         let in_range = |c: u64| calls[i] <= c && c <= last_call;
         let a = complete.iter().find(|(c, _)| in_range(*c)).unwrap().1;
         let b = complete.iter().rev().find(|(c, _)| in_range(*c)).unwrap().1;
+        let head = complete.iter().map(|(_, p)| *p).max().unwrap_or(b);
+        let grew = (a..=b).any(|p| !self.log.lost.iter().any(|&(x, y)| x <= p && p <= y));
         self.log.lost.push((a, b));
         self.fresh.push((pos(a), pos(b)));
+        self.reported.push(Fresh {
+            first: pos(a),
+            last: pos(b.saturating_add(u64::from(wider)).min(head)),
+            grew,
+        });
         true
     }
 
@@ -320,9 +330,9 @@ impl Rig {
                     self.log.done = (self.log.done.max(1) + u64::from(*k)).min(self.next_call);
                 }
                 Step::Poll(seen) => self.poll(seen),
-                Step::Lose(n, more, seen, offsets) => {
+                Step::Lose(n, more, wider, seen, offsets) => {
                     let before = self.oracle.reference.clone();
-                    if self.lose(*n, *more) {
+                    if self.lose(*n, *more, *wider) {
                         self.poll(seen);
                         let mut offsets = offsets.clone();
                         offsets.sort_unstable_by(|a, b| b.cmp(a));
@@ -354,8 +364,14 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
                 .prop_map(|(r, rev, synced)| Step::Call(r, rev, synced)),
             2 => (0u8..3).prop_map(Step::Complete),
             2 => mask.clone().prop_map(Step::Poll),
-            1 => (any::<usize>(), 0u8..2, mask, prop::collection::vec(0u8..40, 1..4))
-                .prop_map(|(n, more, seen, offsets)| Step::Lose(n, more, seen, offsets)),
+            1 => (
+                any::<usize>(),
+                0u8..2,
+                prop_oneof![2 => Just(0u8), 1 => 1u8..20],
+                mask,
+                prop::collection::vec(0u8..40, 1..4)
+            )
+                .prop_map(|(n, more, wider, seen, offsets)| Step::Lose(n, more, wider, seen, offsets)),
         ],
         1..60,
     )
@@ -393,7 +409,7 @@ fn oracle_acknowledgements_polled_out_of_order_stop_at_the_first_pending() {
         call(&[(1, -1, 0, 0)]),
         Step::Complete(3),
         Step::Poll(vec![false, true, true]),
-        Step::Lose(1, 0, vec![false, true, true], vec![0, 10]),
+        Step::Lose(1, 0, 0, vec![false, true, true], vec![0, 10]),
         call(&[(1, -5, 0, 0)]),
         Step::Poll(vec![true]),
         call(&[(1, -5, 0, 0)]),
@@ -409,7 +425,7 @@ fn oracle_a_log_that_shows_a_call_before_its_acknowledgement_is_polled() {
         Step::Complete(2),
         Step::Poll(vec![true, false]),
         call(&[(1, -10, 0, 0), (2, -10, 0, 1)]),
-        Step::Lose(0, 0, vec![false], vec![0]),
+        Step::Lose(0, 0, 0, vec![false], vec![0]),
         call(&[(1, -10, 0, 0), (2, -10, 0, 1), (2, -10, 1, 0)]),
     ]);
     assert_eq!(rig.placed.len(), 1);
@@ -422,7 +438,7 @@ fn oracle_a_loss_taken_while_a_call_inside_it_is_in_flight_then_acknowledged() {
         call(&[(1, -10, 0, 0)]),
         call(&[(1, -8, 0, 0)]),
         Step::Complete(2),
-        Step::Lose(0, 1, vec![false], vec![5]),
+        Step::Lose(0, 1, 0, vec![false], vec![5]),
         call(&[(1, -10, 0, 0), (1, -8, 0, 0)]),
         Step::Poll(vec![true]),
         call(&[(1, -10, 0, 0), (1, -8, 0, 0)]),
@@ -437,10 +453,10 @@ fn oracle_two_losses_in_a_row_with_facts_noted_between() {
         call(&[(1, -20, 0, 0)]),
         Step::Complete(2),
         Step::Poll(vec![true]),
-        Step::Lose(1, 0, vec![true], vec![0, 20]),
+        Step::Lose(1, 0, 0, vec![true], vec![0, 20]),
         call(&[(1, -25, 1, 0), (3, -10, 0, 0)]),
         Step::Complete(3),
-        Step::Lose(0, 0, vec![true], vec![0, 20]),
+        Step::Lose(0, 0, 0, vec![true], vec![0, 20]),
         call(&[(1, -30, 0, 0), (1, -25, 1, 0), (1, -20, 0, 0)]),
     ]);
     assert!(rig.forgettings >= 2);
@@ -453,7 +469,7 @@ fn oracle_facts_already_in_the_overlay_at_a_forgetting() {
         Step::Complete(1),
         call(&[(2, -1, 0, 2)]),
         call(&[(3, -2, 0, 0), (1, -3, 0, 0), (3, -1, 1, 0)]),
-        Step::Lose(0, 0, vec![true, false], vec![0, 15, 30]),
+        Step::Lose(0, 0, 0, vec![true, false], vec![0, 15, 30]),
         call(&[(2, -1, 0, 2), (2, -1, 1, 1)]),
     ]);
     assert!(!rig.inflight.is_empty());
@@ -466,7 +482,7 @@ fn oracle_a_reading_below_the_old_reference_after_a_loss_takes_the_reference_rea
         call(&[(1, 0, 0, 0)]),
         Step::Complete(2),
         Step::Poll(vec![true]),
-        Step::Lose(1, 0, vec![true], vec![0, 10, 30]),
+        Step::Lose(1, 0, 0, vec![true], vec![0, 10, 30]),
     ]);
     assert!(rig.log.span_reads > 0);
 }
@@ -479,7 +495,7 @@ fn oracle_versions_late_and_future_readings_and_an_unsynchronised_clock_after_a_
         call(&[(1, 100, 0, 0), (3, -5, 0, 0)]),
         Step::Complete(3),
         Step::Poll(vec![true]),
-        Step::Lose(0, 0, vec![true], vec![0, 30]),
+        Step::Lose(0, 0, 0, vec![true], vec![0, 30]),
         call(&[
             (2, -10, 0, 2),
             (2, -10, 0, 1),
@@ -490,4 +506,22 @@ fn oracle_versions_late_and_future_readings_and_an_unsynchronised_clock_after_a_
         call(&[(3, -60, 0, 0), (1, 100, 0, 0)]),
     ]);
     assert!(rig.forgettings > 0);
+}
+
+#[test]
+fn oracle_a_loss_found_inside_a_range_already_reported_too_wide() {
+    let rig = run(&[
+        call(&[(3, -20, 0, 0)]),
+        call(&[(2, -10, 0, 1)]),
+        call(&[(2, -10, 1, 2)]),
+        Step::Complete(3),
+        Step::Poll(vec![true]),
+        Step::Lose(0, 0, 5, vec![true], vec![0]),
+        call(&[(2, -10, 2, 3)]),
+        Step::Complete(9),
+        Step::Poll(vec![true]),
+        Step::Lose(2, 0, 0, vec![true], vec![0]),
+        call(&[(2, -10, 1, 2), (2, -10, 0, 0), (2, -10, 1, 1)]),
+    ]);
+    assert!(rig.forgettings >= 2);
 }

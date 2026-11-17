@@ -22,10 +22,19 @@ struct State {
     /// Ordered by first position, no two overlapping.
     found: Vec<LossReport>,
     /// Lost ranges the writer's decisions have not yet taken in.
-    fresh: Vec<(LogPos, LogPos)>,
+    fresh: Vec<Fresh>,
     /// Every closed range taken, in the order taken (Q-938).
     closed: Vec<(LogPos, LogPos)>,
     regions: Regions,
+}
+
+/// A lost range for the writer's decisions, and whether its find grew the regions found (Q-943): a find of damage
+/// already found grows nothing, whatever its range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fresh {
+    pub(crate) first: LogPos,
+    pub(crate) last: LogPos,
+    pub(crate) grew: bool,
 }
 
 /// The losses the scanning readers of a process found, latched for the life of the process: the reports, the
@@ -43,19 +52,24 @@ impl Latch {
         let mut s = self.lock();
         for f in found {
             let l = &f.report;
+            let grew = !s.regions.covers(f.file_id, f.span.0, f.span.1);
+            s.regions.insert(f.file_id, f.span.0, f.span.1);
             if let (Some(a), Some(b)) = (l.first, l.last) {
-                s.fresh.push((log_pos(a), log_pos(b)));
+                s.fresh.push(Fresh {
+                    first: log_pos(a),
+                    last: log_pos(b),
+                    grew,
+                });
             }
             if f.closed.0 <= f.closed.1 {
                 s.closed.push(f.closed);
             }
-            s.regions.insert(f.file_id, f.span.0, f.span.1);
             hold(&mut s.found, l);
         }
     }
 
     /// The lost ranges found since the last call.
-    pub(crate) fn take_fresh(&self) -> Vec<(LogPos, LogPos)> {
+    pub(crate) fn take_fresh(&self) -> Vec<Fresh> {
         std::mem::take(&mut self.lock().fresh)
     }
 

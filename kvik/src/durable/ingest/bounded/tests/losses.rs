@@ -11,6 +11,15 @@ fn at(sequence: u64) -> LogPos {
     }
 }
 
+/// A newly found lost range, from position `a` to `b`.
+fn found(a: u64, b: u64) -> Fresh {
+    Fresh {
+        first: at(a),
+        last: at(b),
+        grew: true,
+    }
+}
+
 /// Series 5, an observed gauge with S = 10 s: `late` by the reference is more than 20 s behind it.
 fn with_observed(mut d: Decider) -> Decider {
     let spec = SeriesSpec::new(
@@ -49,7 +58,7 @@ fn settle(d: &mut Decider, mem: &mut Mem, next: u64, fresh: &[(u64, u64)]) -> Ve
         .collect();
     calls.dedup();
     let acks: Vec<_> = calls.iter().map(|&c| (c, placed(mem, c))).collect();
-    let fresh: Vec<_> = fresh.iter().map(|&(a, b)| (at(a), at(b))).collect();
+    let fresh: Vec<_> = fresh.iter().map(|&(a, b)| found(a, b)).collect();
     d.settle(acks, next, &fresh)
 }
 
@@ -143,7 +152,7 @@ fn a_call_acknowledged_inside_a_range_already_lost_leaves_the_history() {
     let mut d = with_observed(decider(History::default()));
     let mut mem = Mem::default();
     commit(&mut d, &mut mem, &[replay()], Intent::Normal, 1);
-    let fresh = [(at(1), at(1))];
+    let fresh = [found(1, 1)];
     mem.lost.push((1, 1));
     assert!(d.settle([(1, None)], 2, &fresh).is_empty());
     assert_eq!(settle(&mut d, &mut mem, 2, &[]), vec![1]);
@@ -199,7 +208,7 @@ fn a_reference_fact_in_the_overlay_at_a_loss_still_holds_the_lateness_reference(
     let seen = d.settle(
         [(1, placed(&mem, 1)), (2, None), (3, placed(&mem, 3))],
         4,
-        &[(at(1), at(1))],
+        &[found(1, 1)],
     );
     assert_eq!(seen, vec![1]);
     assert!(late(&one(
@@ -316,5 +325,88 @@ fn a_read_that_finds_no_reference_narrows_it_and_a_reading_it_then_decides_reads
     assert_eq!(
         mem.span_reads, 2,
         "the fact at -50 s, read once the call holding it is shown"
+    );
+}
+
+#[test]
+fn a_loss_found_inside_a_range_already_reported_too_wide_forgets_its_facts() {
+    let mut d = decider(History::default());
+    let mut mem = Mem::default();
+    let t = WALL - 10 * S;
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, t - S, 1.0, None)],
+        Intent::Normal,
+        1,
+    );
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(2, t, 1.0, Some(1))],
+        Intent::Normal,
+        2,
+    );
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(2, t, 2.0, Some(2))],
+        Intent::Normal,
+        3,
+    );
+    // Reported lost to the head (Q-937); the log lost position 1 only.
+    mem.readable_below = 4;
+    mem.lost.push((1, 1));
+    let acks: Vec<_> = (1..4).map(|c| (c, placed(&mem, c))).collect();
+    d.settle(acks, 4, &[found(1, 3)]);
+    let p = commit(
+        &mut d,
+        &mut mem,
+        &[reading(2, t, 3.0, Some(3))],
+        Intent::Normal,
+        4,
+    );
+    assert!(matches!(p.decisions[0], Decision::Record { .. }));
+    assert_eq!(d.history.held().revised_keys, 1);
+    mem.readable_below = 5;
+    mem.lost.push((3, 3));
+    d.settle([(4, placed(&mem, 4))], 5, &[found(3, 3)]);
+    let replay = one(&d, &mut mem, reading(2, t, 2.0, Some(2)), 5);
+    assert!(
+        matches!(
+            replay.decisions[0],
+            Decision::Record {
+                outranked: true,
+                ..
+            }
+        ),
+        "{replay:?}"
+    );
+    let lower = one(&d, &mut mem, reading(2, t, 9.0, Some(1)), 5);
+    assert!(matches!(
+        lower.decisions[0],
+        Decision::Record {
+            outranked: true,
+            ..
+        }
+    ));
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(2, t, 4.0, Some(4))],
+        Intent::Normal,
+        5,
+    );
+    assert_eq!(d.history.held().revised_keys, 1);
+    mem.readable_below = 6;
+    let again = Fresh {
+        grew: false,
+        ..found(3, 3)
+    };
+    d.settle([(5, placed(&mem, 5))], 6, &[again]);
+    assert_eq!(
+        d.history.held().revised_keys,
+        1,
+        "the same damage found again forgets nothing"
     );
 }

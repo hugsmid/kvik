@@ -152,8 +152,8 @@ impl Writer {
             }
             _ => true,
         });
-        for (first, last) in self.latch.take_fresh() {
-            d.lose(first, last);
+        for f in self.latch.take_fresh() {
+            d.lose(f.first, f.last);
         }
     }
 

@@ -27,6 +27,7 @@ use kvik_log::writer::Position as LogPos;
 use crate::durable::history::{Facts, History, Key, Known, Reference, span_of};
 use crate::durable::index::{Index, quality_in};
 use crate::durable::keys::LocalFacts;
+use crate::durable::loss::Fresh;
 use crate::durable::registry::Registry;
 use crate::error::Refusal;
 use crate::types::{Intent, Reading, TimeSource, Value};
@@ -171,13 +172,13 @@ impl Decider {
     /// Takes in what happened since the last decision (Q-923): `acks` are the calls in flight in call order, each
     /// with its first and last positions once acknowledged, and `next` the call after them; `fresh` the ranges found
     /// lost since. The calls seen acknowledged stop at the first still pending, so they are always a prefix; they
-    /// are returned and need no tracking. A call seen acknowledged inside a lost range, or a range not already
-    /// lost, forgets what the log shows, once.
+    /// are returned and need no tracking. A call seen acknowledged inside a lost range, or a find that grew the
+    /// regions found (Q-943), forgets what the log shows, once. No range's bounds are trusted (Q-937).
     pub(crate) fn settle(
         &mut self,
         acks: impl IntoIterator<Item = (u64, Option<(LogPos, LogPos)>)>,
         next: u64,
-        fresh: &[(LogPos, LogPos)],
+        fresh: &[Fresh],
     ) -> Vec<u64> {
         let mut seen = Vec::new();
         let mut readable = next;
@@ -191,9 +192,9 @@ impl Decider {
             seen.push(call);
         }
         self.history.readable_below(readable);
-        for &(first, last) in fresh {
-            forget |= !self.lost.iter().any(|&(a, b)| a <= first && last <= b);
-            self.lose(first, last);
+        for f in fresh {
+            forget |= f.grew;
+            self.lose(f.first, f.last);
         }
         if forget {
             self.history.forget_shown();
