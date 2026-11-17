@@ -14,6 +14,7 @@ use kvik_log::directory::logdir;
 use kvik_log::directory::series::SeriesDirectory;
 use kvik_log::directory::status::{StatusFile, counter, health};
 use kvik_log::directory::{Family, read_latest};
+use kvik_log::fs::Fs as _;
 use kvik_log::writer::writer_catalogue;
 
 fn open(w: &World) -> Store {
@@ -178,4 +179,44 @@ fn an_idle_store_gets_a_status_file() {
         assert_eq!(st.flags, kvik_log::directory::status::flag::PARTIAL);
         block_on(s.shutdown()).unwrap();
     }
+}
+
+#[test]
+fn a_store_read_only_by_a_fault_of_its_own_writes_no_status_file() {
+    let w = World::new("derived-own-fault");
+    let s = open(&w);
+    block_on(s.define_series(gauge("site/dev/m0"))).unwrap();
+    block_on(s.shutdown()).unwrap();
+    let id = store_id(&w);
+    let dir = Path::new(&w.dir);
+    for (_, _, p) in kvik_log::directory::list(&*w.fs, dir).unwrap() {
+        w.fs.remove_file(&p).unwrap();
+    }
+    // The registry file must be written again at the start, and that write fails: the store opens read-only while
+    // its log runs.
+    let reg = dir.join(kvik_log::registry::REGISTRY_DIR);
+    for e in w.fs.read_dir(&reg).unwrap() {
+        w.fs.remove_file(&reg.join(&e.name)).unwrap();
+    }
+    w.fs.fail_nth(
+        kvik_log::fs::FaultOp::Create,
+        kvik_log::registry::REGISTRY_DIR,
+        0,
+        std::io::ErrorKind::Other,
+    );
+    let s = open(&w);
+    assert!(block_on(s.define_series(gauge("site/dev/m1"))).is_err());
+    // The start's work ends with the root; a store that may report writes its status file in that same run.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while read_latest(&*w.fs, dir, Family::Root, |b| logdir::Root::decode(b, &id))
+        .unwrap()
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "no root");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let st = read_latest(&*w.fs, dir, Family::Status, |b| StatusFile::decode(b, &id)).unwrap();
+    assert!(st.is_none(), "a read-only store reported {st:?}");
+    let _ = block_on(s.shutdown());
 }
