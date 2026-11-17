@@ -31,8 +31,9 @@ durable mark's slots and segment file names.
 - `fs` is the file-system seam every file operation goes through (A.13), with an in-memory implementation for tests
   that injects faults, logs operations and keeps a durable image of each file.
 
-Tests: unit tests, behaviour tests (`tests/segment.rs`), batch codec tests (`tests/batches.rs`), differential tests
-against the reference model, of the codecs (`tests/model_differential.rs`) and of the log on generated histories with
+Tests: unit tests, behaviour tests (`tests/segment.rs`), batch codec tests (`tests/batches.rs`,
+`tests/facts_checks.rs`, `tests/entries_checks.rs`, `tests/batch_assembly.rs`), differential tests against the
+reference model, of the codecs (`tests/model_differential.rs`) and of the log on generated histories with
 crashes, power losses, remounts, failed syncs and reader refreshes (`tests/model_histories.rs`, with a long variant run
 by `--ignored`), golden files (`tests/golden/`, see its README), property
 tests (`tests/properties.rs`), the commit path driven deterministically (`tests/writer.rs`) and on its threads, with a

@@ -34,6 +34,7 @@ model           model model
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
+log-batch-assembly log batch_assembly
 log-model       log   model_differential
 log-histories   log   model_histories
 log-writer      log   writer
