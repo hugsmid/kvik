@@ -1815,7 +1815,8 @@ followers go on to the next. The refresh is outside every budget by construction
 `a_follower_leads_once_more_after_its_leaders_error_and_the_leader_reports_it`,
 `a_follower_whose_second_round_fails_too_reports_that_error`,
 `a_round_whose_leader_panics_ends_and_its_follower_leads_the_next`, and the loom tests of Q-901
-(`kvik/src/durable/read/flight.rs`).
+(`kvik/src/durable/read/flight.rs`); `concurrent_calls_equal_sequential_ones_at_the_same_cuts`,
+`many_calls_of_every_kind_from_many_threads_while_the_writer_writes` (`kvik/src/durable/read/tests.rs`).
 
 ## Q-903 — A call's cut when calls share views
 Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
@@ -1833,7 +1834,11 @@ therefore names the lowest epoch of the live views: after an epoch change it nam
 released, one call or refresh later, and `ReaderState.epoch` shows that; which epoch that field means is still 9.0c's
 (Q-853).
 **Pinned by.** `a_call_that_outlives_cut_max_age_ends_with_cut_expired_and_releases_its_cut`,
-`the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it` (`kvik/src/durable/read/cut.rs`).
+`the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it` (`kvik/src/durable/read/cut.rs`);
+`a_call_runs_while_another_call_holds_its_view_and_each_view_keeps_its_cut_until_released`,
+`a_lease_another_calls_refresh_finds_gone_ends_a_call_in_flight`,
+`a_call_as_old_as_half_lease_refresh_renews_the_lease_at_its_check_and_finds_it_gone`
+(`kvik/src/durable/read/tests.rs`).
 
 ## Q-904 — The recent window's shard locks
 Recorded and decided by roadmap 9.0b2 (technical). To be settled by roadmap 9.0c.
