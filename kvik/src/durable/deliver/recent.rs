@@ -530,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn a_late_fact_takes_its_place_in_the_window_and_one_in_order_goes_at_the_end() {
+        let mut r = Recent::with_limits(1_000, usize::MAX);
+        for (k, t) in [0, 1, 3, 2, 4].into_iter().enumerate() {
+            r.note(&rec(1, t * S, k as u64 + 1), || i64::MAX, i64::MAX);
+        }
+        for t in 0..5 {
+            assert_eq!(r.key((1, t * S)).map(|v| v.len()), Some(1), "t = {t}");
+        }
+        let order: Vec<i64> = r.newest_first(1, i64::MAX).map(|s| s.row.t / S).collect();
+        assert_eq!(order, [4, 3, 2, 1, 0]);
+    }
+
+    #[test]
     fn the_windows_stay_within_their_byte_budget() {
         let one = fact_bytes(&rec(1, 0, 1));
         let mut r = Recent::with_limits(1_000, 50 * one);

@@ -170,6 +170,36 @@ mod tests {
     }
 
     #[test]
+    fn a_region_is_recorded_only_inside_a_lost_range_of_its_segment() {
+        let range = |file_id, offset, length| kvik_log::manifest::LostRange {
+            identity: (0, 1),
+            first: (0, 1),
+            last: (0, 2),
+            file_id,
+            offset,
+            length,
+            cause: kvik_log::manifest::LossCause::Corruption,
+            boot_id: [0; 16],
+            id_floor: 0,
+            time_before: None,
+            time_after: None,
+            extends: false,
+            stamp: None,
+        };
+        let mut lost = Lost::default();
+        lost.insert(3, 64, 400);
+        assert_eq!(lost.unrecorded(&[]), 1);
+        assert_eq!(lost.unrecorded(&[range(3, 64, 336)]), 0);
+        assert_eq!(
+            lost.unrecorded(&[range(3, 64, 335)]),
+            1,
+            "ends short of the region"
+        );
+        assert_eq!(lost.unrecorded(&[range(3, 72, 400)]), 1, "starts after it");
+        assert_eq!(lost.unrecorded(&[range(4, 64, 336)]), 1, "another segment");
+    }
+
+    #[test]
     fn a_lookup_that_fails_reports_every_key_unreadable() {
         use std::path::Path;
         use std::sync::Arc;
