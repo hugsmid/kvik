@@ -71,7 +71,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 | Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
-| Q-630 | §3 Recovery rule 2, Durable mark; §8 Restore step 1 | Acknowledged positions lost with the whole unsealed log when nothing names them |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1369,9 +1368,9 @@ source names (Q-264), and no position given again under the unchanged stamp. Rea
 position must see a reset before that position is given again, and "the first mark counts as no mark" must not
 suppress the report Q-264 owes. Nothing is acknowledged while the boot-less mark is the durable one, since the first
 start syncs its own mark before it takes ingest. With no sealed segment of its own, a start counts nothing below the
-generation's first position as lost (`plan`'s `kept_last`). Where no source names a lost position, see Q-630. Tests:
+generation's first position as lost (`plan`'s `kept_last`). Where no other source names a lost position, the mark synced at the segment's first batch does (Q-630). Tests:
 `log/tests/generation/first_start.rs`
-`losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`,
+`losing_the_only_segment_before_the_timed_mark_sync_is_data_lost_from_the_anchor_in_every_generation`,
 `a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position`,
 `a_generation_starting_above_1_loses_nothing_below_its_first_position_after_its_first_start`,
 `a_first_mark_with_another_stamp_is_read_as_a_mark` and, for a crash at each operation of `init_generation` and the
@@ -1450,8 +1449,9 @@ remains and the mark names no position. This report is not suppressed by Q-260's
 recovery entry with a new stamp, as in generation 0, and a source that names a lost position (a cursor file, the
 registry file, a lost range) makes the range from the generation's first position a recorded `data_lost`. Reason:
 Q-125's reset and this rule's report apply whatever mark the generation began with. With no such source nothing
-names the lost positions in either generation (Q-630). Tests: `log/tests/generation/first_start.rs`
-`losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`,
+named the lost positions in either generation; since Q-630's ruling the mark synced at the segment's first batch
+names one, so the loss is `data_lost` from the anchor in both. Tests: `log/tests/generation/first_start.rs`
+`losing_the_only_segment_before_the_timed_mark_sync_is_data_lost_from_the_anchor_in_every_generation`,
 `a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position`.
 ## Q-267 — The start options 8.3c does not act on
 Recorded by roadmap 8.3c. To be settled by roadmap 6.3c.
@@ -1501,21 +1501,37 @@ crash, is left for a later version. Tests: `backup/tests/restore_guards.rs`
 `a_full_restore_retried_after_a_failure_past_its_claim_keeps_its_generation`,
 `a_retry_past_its_claim_after_a_higher_claim_is_superseded_and_claims_nothing_more`.
 ## Q-630 — Acknowledged positions lost with the whole unsealed log when nothing names them
-Recorded by roadmap 8.3c (fix round of its review). For the owner.
+Recorded by roadmap 8.3c (fix round of its review). Settled by the owner's ruling (option (c)).
 **Scenario.** Any generation, with a timed mark sync (the default). The durable mark names no position of the
 generation yet (its first start's mark, not yet moved); batches are acknowledged at positions 1 to 3; a power loss;
 then the only unsealed segment is missing or zeroed, with no sealed segment of the generation and no cursor file,
-registry file or lost range naming a position above the mark. The start writes a recovery entry at position 1 with a
-new reset stamp and gives positions 2 and 3 again under it; no `data_lost` is reported, since nothing left names
+registry file or lost range naming a position above the mark. The start wrote a recovery entry at position 1 with a
+new reset stamp and gave positions 2 and 3 again under it; no `data_lost` was reported, since nothing left named
 positions 1 to 3. Q-264 and Q-321 promise a `data_lost` from the anchor for a lowest segment damaged, zeroed or
-missing; that holds only where some source names a position at or above the lost ones.
-**Now.** Generation 0 and a restored generation behave alike (Q-260 as refined): readers and consumers reset on the
-new stamp, and health shows no `data_lost`. Pinned by `log/tests/generation/first_start.rs`
-`losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0`.
-**Options.** (a) Accept, and say in §3 Recovery rule 2 that where nothing names the lost positions the reset is the
-only report. (b) Record a lost range of unknown extent above the mark: a new manifest record form. (c) Sync the mark at
-the first commit into each segment, so that a durable mark names a position in every segment holding acknowledged
-data: a new write on the commit path.
+missing; that held only where some source named a position at or above the lost ones. The same held for any segment
+whose batches were all above the durable mark (the next segment after a roll, before the timer fired).
+**Options were.** (a) Accept, and say in §3 Recovery rule 2 that where nothing names the lost positions the reset is
+the only report. (b) Record a lost range of unknown extent above the mark: a new manifest record form. (c) Sync the
+mark at the first commit into each segment.
+**Settled (owner's ruling, option (c)).** The batch that is the first commit into a segment is acknowledged only after
+the mark naming it is synced: the writer forces that mark sync as it does for a batch holding an entry that is not a
+fact (`log/src/writer/mod.rs` `commit`), one mark sync more per segment, none for a segment taken into use by a timed
+seal with no batch. A durable mark then names a position in every segment holding acknowledged data, so losing the
+only unsealed segment before the timed mark sync is a recorded `data_lost` from the generation's anchor up to the
+mark's position, by the existing rule 2 path for a mark's segment lost at the tail, and positions acknowledged above
+the mark are the recovery entry's reset (with a source naming them, its gap, `data_lost` of cause truncated tail).
+Reason: a loss of acknowledged data must be reported, not hidden in a reset, and one sync per segment is cheap
+(64 MiB or 5 minutes). `spec.md` §3 Commit, Durable mark and Recovery rule 2, `format.md` A.4 Sealing and A.10, and
+`api.md` `log.mark_sync` say so. The reference model syncs its mark at the first batch of each segment
+(`model/src/engine/recovery.rs` `sync_mark`), so its power loss never loses a segment's first batch. Cost on the
+commit path: `docs/measurements/4.8-commit-latency.md`, Q-630 note. Tests: `log/tests/generation/first_start.rs`
+`losing_the_only_segment_before_the_timed_mark_sync_is_data_lost_from_the_anchor_in_every_generation`,
+`the_only_segment_lost_before_the_timed_mark_sync_is_a_recorded_lost_range_from_the_anchor`,
+`the_first_batch_in_each_segment_forces_exactly_one_mark_sync` (mark syncs counted through `MemFs`) and
+`a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position` (now two ranges: up to the
+mark by corruption, above it by the entry's gap). Tests whose scenario needed a first batch beyond the mark now
+commit one batch first (`log/tests/recovery.rs`, `log/tests/writer.rs`, `log/tests/threads.rs`).
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1601,7 +1617,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
-| Q-630 | 8.3 | Owner: whether a reset with no `data_lost` is the report when nothing names the lost positions (Q-264, Q-321) |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1852,6 +1867,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-262 | The writer's scans in a restored generation: set-aside batches and the id floor | §8 Restore step 1, §3 Recovery rule 3, §2.1 (settled by the owner's acceptance of roadmap 8.3c's decision: set-aside batches reserve ids and give no consumer or interval; the three changes in generation 0 are listed in the question) |
 | Q-264 | Position 1 as the chain's start in a restored generation | §3 Recovery rule 2, §8 Generations (settled by the owner's ruling: with no sealed segment of its own, a generation's first position anchors the log start, so a lowest segment damaged, zeroed or missing is `data_lost` from it; see the question) |
 | Q-266 | A full restore retried after a failure past its claim | §8 Generations, Restore; `api.md` Backup and restore (settled by the owner's ruling for v1: in-memory claim reuse on the same driver; a crash burns a generation, which is safe; a durable note is a follow-up; see the question) |
+| Q-630 | Acknowledged positions lost with the whole unsealed log when nothing names them | §3 Commit, Durable mark, Recovery rule 2; `format.md` A.4, A.10 (settled by the owner's ruling, option (c): the first batch in each segment is acknowledged only after the mark naming it is synced, so a durable mark names a position in every segment holding acknowledged data and losing it whole is `data_lost` from the anchor; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

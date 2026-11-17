@@ -595,21 +595,30 @@ fn calls_arriving_during_a_sync_form_the_next_batch() {
 #[test]
 fn a_batch_with_an_entry_that_is_not_a_fact_forces_the_mark_sync() {
     let mut h = H::new(cfg());
+    let first = h.submit(vec![fact(1, T0, 0)]);
+    h.step();
+    assert!(h.done[&first].is_ok());
+    assert_eq!(
+        durable_mark(&h.fs).last_sequence,
+        1,
+        "the segment's first batch forces it (Q-630)"
+    );
+    h.advance(Duration::from_millis(20));
     let a = h.submit(vec![fact(1, T0, 0)]);
     h.step();
     assert!(h.done[&a].is_ok());
     assert_eq!(
         durable_mark(&h.fs).last_sequence,
-        0,
+        1,
         "facts wait for the timer"
     );
-    assert_eq!(h.w.mark().last_sequence, 1);
+    assert_eq!(h.w.mark().last_sequence, 2);
     h.advance(Duration::from_millis(20));
     h.fs.clear_ops();
     let b = h.submit(vec![alias(1)]);
     h.step();
     assert!(h.done[&b].is_ok());
-    assert_eq!(durable_mark(&h.fs).last_sequence, 2);
+    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
     let ops: Vec<_> =
         h.fs.ops()
             .into_iter()
@@ -630,19 +639,19 @@ fn a_batch_with_an_entry_that_is_not_a_fact_forces_the_mark_sync() {
     let c = h.submit(vec![fact(1, T0, 0)]);
     let next = h.step();
     assert!(h.done[&c].is_ok());
-    assert_eq!(durable_mark(&h.fs).last_sequence, 2);
-    assert_eq!(next, Some(Duration::from_millis(1_020)));
+    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
+    assert_eq!(next, Some(Duration::from_millis(1_040)));
     h.advance(next.unwrap() - h.now);
     h.step();
-    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
-    assert_eq!(h.w.stats().mark_synced.sequence, 3);
+    assert_eq!(durable_mark(&h.fs).last_sequence, 4);
+    assert_eq!(h.w.stats().mark_synced.sequence, 4);
     // Clean shutdown syncs the mark.
     h.advance(MS);
     h.submit(vec![fact(1, T0, 0)]);
     h.step();
-    assert_eq!(durable_mark(&h.fs).last_sequence, 3);
-    h.w.shutdown(h.now).unwrap();
     assert_eq!(durable_mark(&h.fs).last_sequence, 4);
+    h.w.shutdown(h.now).unwrap();
+    assert_eq!(durable_mark(&h.fs).last_sequence, 5);
     check(&h);
 }
 

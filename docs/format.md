@@ -152,7 +152,8 @@ of the segment it resumes in again, in place, before its first sync (`spec.md` �
 segment being sealed is never the last in use: (1) at the offset just past S's last complete batch, write the
 segment index block, the trailer block and the 16-byte end marker; (2) set the file length to the end of the end
 marker (the file may grow or shrink); (3) `sync_all`; (4) rename `.open` to `.kvl`; (5) sync the directory. The mark
-does not move at sealing: it keeps naming S until the first commit in the next segment. An empty segment is never
+does not move at sealing: it keeps naming S until the first commit in the next segment, whose batch is acknowledged
+only once the mark naming it is synced (`spec.md` §3 Commit, Q-630). An empty segment is never
 sealed.
 
 **States recovery may find**, handled in `file_id` order. `spec.md` §3 Recovery rules 1 and 3 (truncation, torn
@@ -381,8 +382,8 @@ loss report.
 ## A.10 Durable mark (`log/MARK`, version 3)
 `log/MARK` is 4,224 bytes: two 128-byte slots at offsets 0 and 4,096 (separate sectors). It has no A.1 header. It is
 read and written by positional I/O and never mapped; it is synced on the timer (`mark_sync_interval`, on the writer
-thread, also when idle), at once after a batch holding an entry that is not a fact (`spec.md` §3 Commit), at clean
-shutdown and by recovery. It is updated in place and never replaced while it
+thread, also when idle), at once after a batch holding an entry that is not a fact or the first batch in a segment
+(`spec.md` §3 Commit, Q-630), at clean shutdown and by recovery. It is updated in place and never replaced while it
 exists; a new file is created only when none exists.
 
 | Offset | Size | Field | Notes |

@@ -9,6 +9,7 @@ use kvik_log::content::Item;
 use kvik_log::cursor::{CursorState, append};
 use kvik_log::entries::MarkState;
 use kvik_log::fs::{FaultOp, Fs, MemFs};
+use kvik_log::manifest::LossCause;
 use kvik_log::mark::{MarkSlot, ResetStamp, read_mark};
 use kvik_log::setaside::{RestoredEnd, SetAside};
 use kvik_log::store::StoreDir;
@@ -67,35 +68,110 @@ fn lose_the_only_segment(
     (rep, r.acked[0], r.mark().stamp != before)
 }
 
-/// Q-260 as refined by Q-125: once the first start has written its mark, losing the only segment before the mark
-/// moves is a reset with a new stamp, as in generation 0, and (1, 1) is never acknowledged again under the restore's
-/// stamp.
+/// Q-630 (owner's ruling, option (c)): the first batch in the only segment is acknowledged once the mark naming it
+/// is synced, so losing that segment before the timed mark sync is a recorded `data_lost` from the generation's first
+/// position up to the mark's, then a reset with a new stamp, alike in generation 0 and a restored generation.
 #[test]
-fn losing_the_only_segment_before_the_first_mark_moves_is_a_reset_as_in_generation_0() {
+fn losing_the_only_segment_before_the_timed_mark_sync_is_data_lost_from_the_anchor_in_every_generation()
+ {
     for zeroed in [false, true] {
         let (rep, next, restamped) = lose_the_only_segment(restored(lazy()).0, 1, zeroed);
         let (rep0, next0, restamped0) =
             lose_the_only_segment(Rig::on(MemFs::new(), lazy(), None), 0, zeroed);
-        assert_eq!(rep.rule, StartRule::Reboot(MarkState::Readable));
-        assert_eq!(rep.rule, rep0.rule, "zeroed {zeroed}");
-        let e = rep.entry.as_ref().expect("a recovery entry");
-        assert_eq!((e.entry.after, e.sequence), (0, 1), "zeroed {zeroed}");
-        assert_ne!(e.entry.stamp, Some(stamp()));
-        assert!(restamped && restamped0, "zeroed {zeroed}");
-        assert_eq!((next.generation, next.sequence), (1, 2), "zeroed {zeroed}");
-        assert_eq!(next.sequence, next0.sequence);
-        for r in [&rep, &rep0] {
+        for (generation, rep, next, restamped) in
+            [(1, &rep, next, restamped), (0, &rep0, next0, restamped0)]
+        {
+            let ctx = format!("generation {generation}, zeroed {zeroed}");
+            assert_eq!(rep.rule, StartRule::Reboot(MarkState::Readable), "{ctx}");
+            let e = rep.entry.as_ref().expect("a recovery entry");
+            assert_eq!((e.entry.after, e.sequence), (1, 2), "{ctx}");
+            assert!(restamped, "{ctx}");
+            assert_eq!((next.generation, next.sequence), (generation, 3), "{ctx}");
             assert!(
-                r.losses.iter().all(|l| l.kind == LossKind::PossibleLoss),
-                "zeroed {zeroed}: {:?}",
-                r.losses
+                rep.losses.iter().any(
+                    |l| l.kind == LossKind::DataLost && (l.first, l.last) == (Some(1), Some(1))
+                ),
+                "{ctx}: {:?}",
+                rep.losses
+            );
+        }
+        assert_ne!(rep.entry.as_ref().unwrap().entry.stamp, Some(stamp()));
+    }
+}
+
+/// Q-630: the lost range of the only segment is recorded in the manifest from the anchor, in each generation.
+#[test]
+fn the_only_segment_lost_before_the_timed_mark_sync_is_a_recorded_lost_range_from_the_anchor() {
+    for generation in [0, 1] {
+        let mut r = if generation == 0 {
+            Rig::on(MemFs::new(), lazy(), None)
+        } else {
+            restored(lazy()).0
+        };
+        r.open();
+        for k in 0..3 {
+            r.submit(vec![fact(5, k)]);
+            r.drain();
+        }
+        assert_eq!(r.mark().last_sequence, 3);
+        lose_unsealed(&mut r, generation, false);
+        r.boot += 1;
+        r.open();
+        let lost: Vec<_> = r
+            .lost_ranges()
+            .into_iter()
+            .map(|(g, l)| (g, l.first, l.last))
+            .collect();
+        assert_eq!(
+            lost,
+            vec![(generation, (generation, 1), (generation, 1))],
+            "generation {generation}"
+        );
+    }
+}
+
+/// Q-630: one mark sync more per segment, at the segment's first batch, and none for the later batches of a segment
+/// or for a segment taken into use by a timed seal with no batch.
+#[test]
+fn the_first_batch_in_each_segment_forces_exactly_one_mark_sync() {
+    let mark_syncs = |fs: &MemFs| {
+        fs.ops()
+            .iter()
+            .filter(|o| o.op == FaultOp::Sync && o.ok && o.path == log_path("MARK"))
+            .count()
+    };
+    for generation in [0, 1] {
+        let mut r = if generation == 0 {
+            Rig::on(MemFs::new(), lazy(), None)
+        } else {
+            restored(lazy()).0
+        };
+        r.open();
+        for segment in 0..3 {
+            r.fs.clear_ops();
+            for k in 0..4 {
+                r.submit(vec![fact(5, 10 * segment + k)]);
+                r.drain();
+            }
+            assert_eq!(
+                mark_syncs(&r.fs),
+                1,
+                "generation {generation}, segment {segment}"
+            );
+            r.fs.clear_ops();
+            r.timed_seal();
+            assert_eq!(
+                mark_syncs(&r.fs),
+                0,
+                "generation {generation}, segment {segment}"
             );
         }
     }
 }
 
-/// Q-264 with Q-125: a cursor file naming a position the lost segment held makes the loss a recorded `data_lost`
-/// from the generation's first position, in both generations.
+/// Q-264 with Q-125 and Q-630: a cursor file naming a position the lost segment held makes the whole loss a recorded
+/// `data_lost` from the generation's first position, in both generations: up to the mark's position by corruption,
+/// above it by the recovery entry's gap.
 #[test]
 fn a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position() {
     for generation in [0, 1] {
@@ -122,15 +198,22 @@ fn a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_firs
         let e = rep.entry.as_ref().expect("a recovery entry");
         assert_eq!(
             (e.entry.after, e.sequence),
-            (0, 4),
+            (1, 4),
             "generation {generation}"
         );
-        assert!(
-            rep.losses
-                .iter()
-                .any(|l| l.kind == LossKind::DataLost && (l.first, l.last) == (Some(1), Some(3))),
-            "generation {generation}: {:?}",
-            rep.losses
+        let data_lost: Vec<_> = rep
+            .losses
+            .iter()
+            .filter(|l| l.kind == LossKind::DataLost)
+            .map(|l| (l.cause, l.first, l.last))
+            .collect();
+        assert_eq!(
+            data_lost,
+            vec![
+                (LossCause::Corruption, Some(1), Some(1)),
+                (LossCause::TruncatedTail, Some(2), Some(3))
+            ],
+            "generation {generation}"
         );
         let lost: Vec<_> = r
             .lost_ranges()
@@ -139,7 +222,10 @@ fn a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_firs
             .collect();
         assert_eq!(
             lost,
-            vec![(generation, (generation, 1), (generation, 3))],
+            vec![
+                (generation, (generation, 1), (generation, 1)),
+                (generation, (generation, 2), (generation, 3))
+            ],
             "generation {generation}"
         );
     }

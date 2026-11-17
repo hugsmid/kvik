@@ -90,7 +90,8 @@ const DAY_NS: i64 = 86_400_000_000_000;
 /// When the mark file is synced (`api.md` `log.mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkSync {
-    /// On a timer, `mark_sync_interval` (default 1 s), and at once after a batch holding an entry that is not a fact.
+    /// On a timer, `mark_sync_interval` (default 1 s), and at once after a batch holding an entry that is not a fact
+    /// or the first batch in a segment (Q-630).
     Interval(Duration),
     /// After every mark update, before the batch is acknowledged.
     EveryCommit,
@@ -429,7 +430,7 @@ pub enum EveryCommitReason {
 /// How the mark is synced (`api.md` `LogStats::mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkSyncMode {
-    /// On the timer, and at once after a batch holding an entry that is not a fact.
+    /// On the timer, and at once after a batch holding an entry that is not a fact or the first batch in a segment.
     Interval(Duration),
     /// At every commit.
     EveryCommit {
@@ -1220,6 +1221,8 @@ impl LogWriter {
             .as_mut()
             .or(self.open.as_mut())
             .expect("a segment in use");
+        // Q-630: the first batch in a segment is acknowledged only once a synced mark names it.
+        let first_in_segment = seg.summary.is_none();
         seg.write_offset += bytes.len() as u64;
         seg.summary = Some(match seg.summary {
             None => SealSummary {
@@ -1298,6 +1301,7 @@ impl LogWriter {
         self.mark_written = true;
         self.mark_dirty = true;
         let forced = matches!(self.mark_mode, MarkSyncMode::EveryCommit { .. })
+            || first_in_segment
             || calls.iter().any(Call::has_non_fact);
         if forced {
             self.sync_mark(now);
