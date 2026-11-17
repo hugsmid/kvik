@@ -1,16 +1,21 @@
 //! A reader on the durable log (`docs/api.md` Reader processes): the log reader of `kvik-log`, which takes no lock
-//! and reads up to the durable mark, and an [`Index`] of what it returned. Every call reads the mark and the
-//! entries appended since the last call first, then runs under its cut ([`cut`]).
+//! and reads up to the durable mark, and an [`Index`] of what it returned. Every call takes a view published by a
+//! refresh that began after the call did, and runs on it with no lock under the view's cut (query design §3.5,
+//! [`cut`], [`view`](super::read::view)).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 
+use kvik_log::lease::CutEnd;
+use kvik_log::manifest::LostRange;
 use kvik_log::reader::{LogReader, ReaderConfig as LogReaderConfig, ReaderError};
 
 use super::clock::Clocks;
 use super::index::{Index, pos};
 use super::read::cut;
+use super::read::flight::Flight;
+use super::read::view::{Cuts, View};
 use crate::backend::Error;
 use crate::env::{Clock, Env};
 use crate::error::{OpenError, QueryError};
@@ -19,13 +24,15 @@ use crate::read::ReaderState;
 use crate::time::Timestamp;
 use crate::types::ResetStamp;
 
+/// What the refresh leading a round works on: the log reader, and the index the next view is a clone of.
 #[derive(Debug)]
-struct State {
+struct Work {
     log: Option<LogReader>,
     index: Index,
+    lost_ranges: Arc<[LostRange]>,
 }
 
-impl Drop for State {
+impl Drop for Work {
     fn drop(&mut self) {
         // Deletes the lease; a reader that cannot is a lease left to expire.
         if let Some(r) = self.log.take() {
@@ -51,7 +58,15 @@ impl kvik_log::writer::Clock for ReaderClock {
 #[derive(Debug)]
 pub(crate) struct DurableReader {
     dir: PathBuf,
-    state: Mutex<State>,
+    /// Locked by the refresh that leads a round, and by the check of a call as old as half `lease_refresh`; never
+    /// by a call's own work.
+    work: Mutex<Work>,
+    flight: Flight<View, Arc<QueryError>>,
+    cuts: Arc<Cuts>,
+    clock: Arc<dyn Clock>,
+    /// The log reader's `lease_refresh` and `cut_max_age`.
+    lease_refresh: Duration,
+    cut_max_age: Duration,
     /// The window clock and refresh instants of this process: the writer's, for the reader of its own process.
     clocks: Arc<Clocks>,
     /// The site zone at creation, from the store descriptor: in force before the first site-zone entry (spec §5.7).
@@ -72,6 +87,41 @@ pub(crate) fn open_error(dir: &Path, e: ReaderError) -> OpenError {
             file: PathBuf::from(format!("{}: {other}", dir.display())),
         },
     }
+}
+
+/// A copy of an error that several calls report: the error of a refresh one call led and others followed.
+fn copy(e: &QueryError) -> QueryError {
+    use QueryError as Q;
+    match e {
+        Q::UnknownSeries => Q::UnknownSeries,
+        Q::DetailNotLocal { local_from } => Q::DetailNotLocal {
+            local_from: *local_from,
+        },
+        Q::AggregateRefused { reason } => Q::AggregateRefused {
+            reason: reason.clone(),
+        },
+        Q::UnknownZone => Q::UnknownZone,
+        Q::NotAvailable { reason } => Q::NotAvailable {
+            reason: reason.clone(),
+        },
+        Q::LostRange { id } => Q::LostRange { id: *id },
+        Q::MarkUnreadable => Q::MarkUnreadable,
+        Q::UnsupportedFormat { file } => Q::UnsupportedFormat { file: file.clone() },
+        Q::Corrupt { file } => Q::Corrupt { file: file.clone() },
+        Q::Io { path, source } => Q::Io {
+            path: path.clone(),
+            source: std::io::Error::new(source.kind(), source.to_string()),
+        },
+        Q::Invalid { reason } => Q::Invalid {
+            reason: reason.clone(),
+        },
+        Q::Closed => Q::Closed,
+        Q::CutExpired => Q::CutExpired,
+    }
+}
+
+fn unshare(e: Arc<QueryError>) -> QueryError {
+    Arc::try_unwrap(e).unwrap_or_else(|e| copy(&e))
 }
 
 fn query_error(dir: &Path, e: ReaderError) -> QueryError {
@@ -130,12 +180,19 @@ impl DurableReader {
         let created_zone = kvik_log::store::read_descriptor(&*env.fs, dir)
             .map_err(|e| super::store_error(dir, e))?
             .site_zone;
+        let (lease_refresh, cut_max_age) = log.ages();
         Ok(DurableReader {
             dir: dir.to_path_buf(),
-            state: Mutex::new(State {
+            work: Mutex::new(Work {
                 log: Some(log),
                 index: Index::default(),
+                lost_ranges: Arc::new([]),
             }),
+            flight: Flight::new(),
+            cuts: Arc::default(),
+            clock: env.clock.clone(),
+            lease_refresh,
+            cut_max_age,
             clocks,
             created_zone,
         })
@@ -156,36 +213,110 @@ impl DurableReader {
         &self.created_zone
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Work> {
+        self.work.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reads what was appended since the last call, then runs `f` on the index under the call's cut: a materialised
-    /// call ([`cut`]).
+    fn monotonic(&self) -> Duration {
+        Duration::from_nanos(self.clock.monotonic().0)
+    }
+
+    /// Takes a view read after this call began ([`Flight`]), then runs `f` on it with no lock under its cut: a
+    /// materialised call ([`cut`]).
     pub(crate) fn with<R>(
         &self,
-        f: impl FnOnce(&Index, &LogReader) -> Result<R, Error>,
+        f: impl FnOnce(&Index, &View) -> Result<R, Error>,
     ) -> Result<R, QueryError> {
-        let mut s = self.lock();
-        let s = &mut *s;
-        let Some(log) = s.log.as_mut() else {
+        let v = self
+            .flight
+            .get(|current| self.round(current))
+            .map_err(unshare)?;
+        let r = f(v.index(), &v).map_err(Error::query);
+        let live = self.check(&v);
+        drop(v);
+        self.release_dropped();
+        live?;
+        r
+    }
+
+    /// Releases the cuts of views no call holds any more, unless a round runs, which releases them itself.
+    fn release_dropped(&self) {
+        let mut w = match self.work.try_lock() {
+            Ok(w) => w,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if let Some(log) = w.log.as_mut() {
+            for id in self.cuts.take_dropped() {
+                log.release(id);
+            }
+        }
+    }
+
+    /// One refresh, which the call leading a round runs: releases the cuts of dropped views, reads what was appended
+    /// since the last round and publishes the next view, holding its own cut.
+    fn round(&self, current: Option<Arc<View>>) -> Result<Arc<View>, Arc<QueryError>> {
+        let began = self.monotonic();
+        let mut w = self.lock();
+        let w = &mut *w;
+        let Some(log) = w.log.as_mut() else {
+            return Err(Arc::new(QueryError::Closed));
+        };
+        for id in self.cuts.take_dropped() {
+            log.release(id);
+        }
+        let update = cut::refresh(log);
+        // A renewal that found the lease gone or changed ended every cut, the current view's among them.
+        if let Some(v) = &current
+            && let Err(ReaderError::CutEnded(CutEnd::LeaseLost)) = cut::check(log, v.cut())
+        {
+            self.cuts.lose_all();
+        }
+        let update = update
+            .map_err(|e| query_error(&self.dir, e))
+            .and_then(|u| u)
+            .map_err(Arc::new)?;
+        w.index.apply(&update.events);
+        if log.lost_ranges() != &*w.lost_ranges {
+            w.lost_ranges = log.lost_ranges().into();
+        }
+        Ok(Arc::new(View::new(
+            w.index.clone(),
+            log.state(),
+            w.lost_ranges.clone(),
+            cut::take(log),
+            began,
+            self.cuts.clone(),
+        )))
+    }
+
+    /// Whether the call on `v` ends under a live cut ([`View::live`]). A call as old as half `lease_refresh` may
+    /// have outlived a lease no refresh renewed since: the log reader's check then renews it when due and finds it
+    /// gone (Q-853, Q-903).
+    fn check(&self, v: &View) -> Result<(), QueryError> {
+        let now = self.monotonic();
+        if !v.live(now, self.cut_max_age) {
+            return Err(QueryError::CutExpired);
+        }
+        if v.age(now) < self.lease_refresh / 2 {
+            return Ok(());
+        }
+        let mut w = self.lock();
+        let Some(log) = w.log.as_mut() else {
             return Err(QueryError::Closed);
         };
-        let update = cut::refresh(log).map_err(|e| query_error(&self.dir, e))??;
-        s.index.apply(&update.events);
-        let c = cut::take(log);
-        let r = f(&s.index, log).map_err(Error::query);
-        let live = cut::check(log, &c);
-        log.release(c.id);
-        live.map_err(|e| query_error(&self.dir, e))?;
-        r
+        let r = cut::check(log, v.cut());
+        if let Err(ReaderError::CutEnded(CutEnd::LeaseLost)) = r {
+            self.cuts.lose_all();
+        }
+        r.map_err(|e| query_error(&self.dir, e))
     }
 
     /// [`DurableReader::with`], called once more if the first call's cut ended: for the store's own reads, which
     /// have no caller to start again.
     pub(crate) fn with_again<R>(
         &self,
-        mut f: impl FnMut(&Index, &LogReader) -> Result<R, Error>,
+        mut f: impl FnMut(&Index, &View) -> Result<R, Error>,
     ) -> Result<R, QueryError> {
         match self.with(&mut f) {
             Err(QueryError::CutExpired) => self.with(f),
@@ -210,7 +341,7 @@ impl DurableReader {
         })
     }
 
-    /// How many cuts the log reader holds.
+    /// How many cuts the log reader holds: the current view's and those of views not yet released.
     #[cfg(test)]
     pub(crate) fn cuts_held(&self) -> usize {
         self.lock().log.as_ref().map_or(0, LogReader::cuts_held)

@@ -81,6 +81,10 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-853 | §7 Readers; `api.md` `ReaderConfig` | `cut_max_age`'s default and bound, and the clock it runs on (decided, awaiting review) |
 | Q-854 | §7 Manifest, Leases; `format.md` A.15 | The highest epoch a reader has read, recorded in its lease (decided by the lead) |
 | Q-900 | §7 Readers; query design §3.5 | How a reader's published views share structure (decided, awaiting review) |
+| Q-901 | query design §3.5 Verified by | The model checker for the single-flight refresh (decided, awaiting review) |
+| Q-902 | §7 Readers; query design §3.5 | The single-flight refresh: rounds, followers and a leader's error (decided, awaiting review) |
+| Q-903 | §7 Readers, Leases; query design §3.3, §3.5 | A call's cut when calls share views (decided, awaiting review) |
+| Q-904 | query design §3.5; roadmap 9.0b2 | The recent window's shard locks, left for the first query that reads the recent window |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1778,6 +1782,74 @@ held view pins against the memory cap comes with the accountant (roadmap 9.0f).
 (`kvik/src/durable/index.rs`); `a_map_and_its_snapshots_read_as_ordered_maps_do`,
 `a_change_to_a_shared_map_copies_one_node_a_level_and_leaves_the_snapshot_as_it_was`
 (`kvik/src/durable/read/pmap.rs`).
+
+## Q-901 — The model checker for the single-flight refresh
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.5 verifies the view swap and the single-flight refresh under a model checker for
+interleavings, a dev-dependency on the stable toolchain. The workspace had none.
+**Decision.** loom 0.7.2 (MIT), a dev-dependency only under `cfg(kvik_loom)`: normal and test builds neither compile
+nor link it (it is in `Cargo.lock`, as every target-specific dependency is). Under `--cfg kvik_loom` the flight's mutex
+and condition variable are loom's, and only `durable::read::flight::loom_tests` run so, in their own CI job
+(`model-check`, release build, the cfg in `RUSTFLAGS`), with at most three preemptions unless loom's environment sets
+another bound. loom rather than shuttle: it explores every interleaving within the bound instead of a random sample,
+which a wait-and-wake protocol needs; shuttle's randomised search is the fallback if the state space outgrows it. The
+flight is generic over its view, so the checked code is the code the reader runs. 0.7.3 was nine days old when this
+was built and is not taken.
+**Pinned by.** `every_call_gets_a_view_read_after_it_began_and_refreshes_never_overlap`,
+`only_the_leader_of_a_failed_round_reports_its_error`, `a_follower_reports_an_error_only_after_two_failed_rounds`
+(`kvik/src/durable/read/flight.rs`, under `--cfg kvik_loom`).
+
+## Q-902 — The single-flight refresh: rounds, followers and a leader's error
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.5: calls that arrive together share one mark read; a call that began after a refresh
+started joins the next one, so every call sees the mark as of its start; a follower gets the leader's result, and on
+the leader's error retries once itself.
+**Decision.** Refreshes run in numbered rounds, never two at once. A call needs the first round that begins after it
+does: the next one if a round runs, else one it leads at once; it returns the view of that round or of a later one.
+The leader runs the refresh on its own thread, outside the flight's lock, and returns its own result, error included.
+A follower whose round failed takes part in the next round to end, leading it if none runs, and reports that round's
+error if it fails too: refreshes are serialised, so followers that retry together share one round as any calls do,
+and "retries once itself" is read as one more round. A leader that unwinds ends its round with no result and its
+followers go on to the next. The refresh is outside every budget by construction; the budgets come with roadmap 9.0g.
+**Pinned by.** `calls_that_arrive_during_a_refresh_share_the_next_one`,
+`a_follower_leads_once_more_after_its_leaders_error_and_the_leader_reports_it`,
+`a_follower_whose_second_round_fails_too_reports_that_error`,
+`a_round_whose_leader_panics_ends_and_its_follower_leads_the_next`, and the loom tests of Q-901
+(`kvik/src/durable/read/flight.rs`).
+
+## Q-903 — A call's cut when calls share views
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** Roadmap 9.0b1 took a cut of the log reader per call under the call-long lock and checked it at the end
+with `LogReader::check_cut`, which renews a due lease. With no lock across a call, a call that took or checked a cut of
+the log reader would wait for whatever refresh runs.
+**Decision.** A view holds one cut of the log reader, taken by the refresh that publishes it and released once the view
+is superseded and no call holds it, by the end of the next call or the next refresh. A call's cut is its view's. Its
+check needs no lock: the cut has ended if a lease was found gone or changed since the view was taken (a refresh that
+finds the current view's cut ended that way ends every view), or once `cut_max_age` has passed since the refresh that
+took it began. Later refreshes do not renew a call's age, so calls running together end as each would alone. A call
+as old as half `lease_refresh` also checks its cut through the log reader under its lock, which renews a due lease and
+finds one the writer deleted (9.0b1's review, S2): at most one wait for a refresh, for such a call only. The lease
+therefore names the lowest epoch of the live views: after an epoch change it names the old one until the old view is
+released, one call or refresh later, and `ReaderState.epoch` shows that; which epoch that field means is still 9.0c's
+(Q-853).
+**Pinned by.** `a_call_that_outlives_cut_max_age_ends_with_cut_expired_and_releases_its_cut`,
+`the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it` (`kvik/src/durable/read/cut.rs`).
+
+## Q-904 — The recent window's shard locks
+Recorded and decided by roadmap 9.0b2 (technical). To be settled by roadmap 9.0c.
+**Scenario.** The query design §3.5: the recent window is not in a view; in the writer's process a query copies the
+rows it needs for one series under that series' shard lock (at most 1,024 facts, filtered to its cut), and the
+decision path holds a shard lock only for its own insert. The roadmap row of 9.0b2 lists the shard locks.
+**Decision.** They are built with the first query that reads the recent window: the latest values in the writer's
+process (roadmap 9.0c, S1). No query reads it yet. Every read of the writer's process goes through its own reader,
+and the recent window (`kvik/src/durable/history.rs`) is the decider's, under the decider's lock. It records each
+fact's call, not its position, so a copy filtered to a cut needs the position recorded at queueing, and its eviction
+for the store-wide budget walks every series, which locks per series must not serialise: both change the decision
+path, and only a reader of the window can test them. What 9.0b2 does for the promise they serve (the commit path takes
+no lock a query holds across a read): no call holds a lock during its work, so the writer's own reads (the registry
+file after a routing change, read under the decider's lock, and at shutdown) wait at most for one refresh and never for
+another call.
+**Pinned by.** Nothing yet; 9.0c's tests.
 
 ## Q-710 — The default floor of the batch-sync interval
 

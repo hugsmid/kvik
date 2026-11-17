@@ -259,7 +259,7 @@ mod tests {
         });
         assert!(matches!(slow, Err(QueryError::CutExpired)), "{slow:?}");
         assert_eq!(facts(&r).unwrap(), 2);
-        assert_eq!(r.cuts_held(), 0);
+        assert_eq!(r.cuts_held(), 1, "the current view's alone");
     }
 
     #[test]

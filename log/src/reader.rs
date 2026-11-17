@@ -466,6 +466,11 @@ impl LogReader {
         &self.lease_path
     }
 
+    /// The `lease_refresh` and `cut_max_age` in force, bounded as [`LogReader::open`] bounds them.
+    pub fn ages(&self) -> (Duration, Duration) {
+        (self.cfg.lease_refresh, self.cfg.cut_max_age)
+    }
+
     /// Re-reads the mark, the manifest and the batches appended since the last refresh, below the mark only, and
     /// renews the lease when due (module documentation; `api.md` `refresh`). On an error nothing the reader
     /// holds changes and nothing it found is lost: the next refresh finds it again.

@@ -40,5 +40,9 @@ thiserror = "2"
 [dev-dependencies]
 proptest = "1"
 
+# The model checker for the single-flight refresh, built only with `--cfg kvik_loom` (Q-901).
+[target.'cfg(kvik_loom)'.dev-dependencies]
+loom = "0.7.2"
+
 [lints]
 workspace = true
