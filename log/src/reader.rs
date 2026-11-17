@@ -691,15 +691,15 @@ impl LogReader {
             // would leave its positions unread: an error, as for the mark's.
             let opened = match self.open_segment(name)? {
                 Some(o) => Some(o),
-                None if listing.is_none() => {
-                    let listed = self.listed(&mut listing, view, mark)?;
-                    match listed.into_iter().find(|n| n.file_id == file_id) {
-                        Some(n) => self.open_segment(n)?,
-                        None if file_id == mark.file_id => None,
-                        None => continue,
-                    }
-                }
-                None => None,
+                // The mark's segment is listed, or `listed` failed.
+                None => match self
+                    .listed(&mut listing, view, mark)?
+                    .into_iter()
+                    .find(|n| n.file_id == file_id)
+                {
+                    Some(n) => self.open_segment(n)?,
+                    None => continue,
+                },
             };
             let Some((n, f)) = opened else {
                 return Err(ReaderError::SegmentMissing { file_id });

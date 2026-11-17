@@ -82,6 +82,8 @@ impl Counters {
 struct CountFs {
     inner: MemFs,
     n: Arc<Counters>,
+    /// Opens of a path containing this are not found.
+    refuse: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +137,11 @@ impl FsFile for CountFile {
 impl Fs for CountFs {
     fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<Box<dyn FsFile>> {
         self.n.call();
+        if let Some(r) = self.refuse.lock().unwrap().as_deref()
+            && path.to_string_lossy().contains(r)
+        {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
         if mode == OpenMode::CreateNew {
             self.n.write();
         }
@@ -214,6 +221,7 @@ struct Rig {
     q: IngestQueue,
     reader: LogReader,
     n: Arc<Counters>,
+    refuse: Arc<Mutex<Option<String>>>,
 }
 
 impl Rig {
@@ -231,9 +239,11 @@ impl Rig {
         let w =
             LogWriter::open(store, cfg(), Some([1; 16]), clock.monotonic(), clock.wall()).unwrap();
         let n = Arc::new(Counters::default());
+        let refuse = Arc::new(Mutex::new(None));
         let seam = Arc::new(CountFs {
             inner: fs.clone(),
             n: n.clone(),
+            refuse: refuse.clone(),
         });
         let reader = LogReader::open(ReaderConfig::new(
             dir(),
@@ -250,6 +260,7 @@ impl Rig {
             w,
             reader,
             n,
+            refuse,
         };
         r.maint();
         r
@@ -390,6 +401,40 @@ fn a_calls_file_system_calls_and_writes_do_not_grow_with_the_sealed_segments() {
         assert_eq!(c.writes, 0, "no lease write per call: {c:?}");
     }
     assert_eq!(renewed.writes, 1, "the lease at half of lease_refresh");
+}
+
+#[test]
+fn a_caught_up_reader_that_cannot_open_a_listed_segment_by_name_stops_there_as_a_first_pass_does() {
+    let mut r = Rig::with_sealed(2);
+    let next = r.reader.state().durable;
+    r.clock.advance(20 * MS);
+    r.maint();
+    r.submit(facts(4, 1 << 41));
+    let mark_segment =
+        r.fs.paths()
+            .into_iter()
+            .filter(|p| p.to_string_lossy().ends_with(".open"))
+            .min()
+            .unwrap();
+    let name = mark_segment
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let stem = name.trim_end_matches(".open").to_string();
+    *r.refuse.lock().unwrap() = Some(stem.clone());
+    let refused = r.reader.refresh();
+    assert!(
+        matches!(
+            refused,
+            Err(kvik_log::reader::ReaderError::SegmentMissing { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(r.reader.state().durable, next);
+    *r.refuse.lock().unwrap() = None;
+    let u = r.reader.refresh().unwrap();
+    assert_eq!(u.events.len(), 1);
 }
 
 #[test]
