@@ -65,6 +65,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
+| Q-872 | §7 Manifest step 4; `format.md` A.14 | The epochs a rebuild takes above a corrupt span with no later record |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1332,11 +1333,18 @@ for any corrupt record. The rebuild record's field 7 writes such a span's `befor
 `a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`,
 `a_full_crafted_window_stays_within_the_budget_and_a_smoke_ceiling`; `log/tests/crafted_files.rs`
 `a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`,
-`a_full_crafted_manifest_window_stays_within_the_budget_and_a_smoke_ceiling`; `files/tests/rebuild_copies.rs`
+`a_full_crafted_manifest_window_stays_within_the_budget_and_a_smoke_ceiling`; `files/tests/open_span.rs`
 `q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span`;
 `files/tests/records.rs` `q650_field_7_writes_a_span_with_no_later_record_as_0_and_only_as_the_last`; the files fuzz
 target checks that a span with no later record holds the rest of the file. Natural damage is unchanged: it never
-reaches the window rule, so a torn tail stays a torn tail.
+reaches the window rule, so a torn tail stays a torn tail. Added at the review: a copy written back for such a span
+goes before it and its bytes are kept whole after the copy, never written over or dropped, as the passed part may
+hold valid records (`kvik_files::rebuild::repair_with_copy`; `files/tests/open_span.rs`
+`q650_a_copy_written_back_keeps_an_open_spans_bytes_after_it`); the rebuild's epochs go above what such a span may
+hold (Q-872); and that it counts as several records in step 3 is pinned by
+`q650_a_loss_no_valid_record_names_behind_an_open_span_counts_in_field_6`. A passed part that holds only zeros, where
+no record can be, is still reported corrupt, not a torn tail: only a crafted file reaches it, and the copy or rebuild
+path is safe for it.
 
 ## Q-651 — The crafted-file worst case against the 1 s restart budget
 
@@ -1364,7 +1372,7 @@ ignored tests):
    repeat at most twice, and finds an undefined field in the same pass, with the error it gave before.
 Measured, before and after: nested facts images over every window of a 64 MiB segment 0.90 s and 0.22 s; 64 MiB of
 batches whose rows share one text value, after damage, 1.85 s and 0.10 s; a 16 MiB manifest window of rejected
-records 0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh; per byte checked, about 0.5 ns for facts and at
+records 0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh (0.13 s with Q-872's pass); per byte checked, about 0.5 ns for facts and at
 most about 2.3 ns for entries, every type small and large (Q-870). So against the bound a crafted 64 MiB segment
 costs at most about 0.6 s, 16 MiB about 0.17 s, and a crafted manifest at most about 0.09 s per 16 MiB at a start and
 0.15 s at a refresh: inside the 1 s budget. `format.md` A common rules (scan bound), `design.md` Budgets and
@@ -1411,6 +1419,28 @@ costs at most about 0.6 s at 64 MiB and 0.17 s at 16 MiB, inside the budget. `fo
 and `state_names_at_the_limit_are_told_distinct_and_past_it_refused`; `log/src/entries/definition.rs`
 `the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict`; the field index is checked
 against a linear search by a debug assertion.
+
+## Q-872 — The epochs a rebuild takes above a corrupt span with no later record
+Recorded at the review of the Q-650 ruling. For the owner's acceptance.
+**Scenario.** A rebuild took its first epoch above every epoch a valid record names, every closed span's later
+epoch and the leases. A span with no later record (Q-650) has no later epoch, so the rebuild record took the last
+valid epoch + 1: the epochs of records the span may hold, synced and perhaps uploaded under
+`manifest/<generation>/<epoch>`. The rebuilt records at those epochs are then not uploaded, or meet another record
+under their key, and a restore reads a chain without the rebuild.
+**Decided.** Such a span bounds the rebuild's epochs from above with the higher of two figures
+(`kvik_files::image::CorruptSpan::epoch_ceiling`): the highest epoch above the last valid one that a checksum-valid
+record image starting in the span names, whether or not its fields pass (`named_epoch`; the search now also visits
+the passed part of a window for this, with checksums and no field checks, so the window rule's bound on body checks
+is unchanged), and the last valid epoch plus the records of 40 bytes, the shortest record, that the span's length
+could hold, for records there that damage has also made unreadable. Epochs normally rise by one a record; after a
+start they may jump above a lease (`format.md` A.14), which names an epoch a reader saw, and the record images give
+that case. A crafted image may name a very high epoch and use up the epochs left, which a crafted valid record can do
+already. Cost: the passed part's headers and checksums, about 0.13 s at a refresh for a crafted 16 MiB window (0.10 s
+before). `spec.md` §7 Manifest step 4 and `format.md` A.14 say so. Tests: `files/tests/open_span.rs`
+`q872_a_rebuild_takes_no_epoch_of_a_valid_record_hidden_in_an_open_span` (the review's probe),
+`q872_a_hidden_record_far_above_the_spans_length_still_bounds_the_rebuilds_epochs` and
+`q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span` (the length bound);
+`files/src/image.rs` `a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`.
 
 ## Open at v0.2
 
@@ -1491,6 +1521,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
+| Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

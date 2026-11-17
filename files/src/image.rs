@@ -38,6 +38,9 @@ pub struct CorruptSpan {
     pub after_epoch: u64,
     /// The epoch of the next valid record; `None` for a span with no later record, always the last span.
     pub before_epoch: Option<u64>,
+    /// For a span with no later record, the highest epoch above `after_epoch` that a checksum-valid record image
+    /// starting in it names, whether or not its fields pass; 0 for none and for any other span.
+    pub named_epoch: u64,
 }
 
 impl CorruptSpan {
@@ -46,7 +49,19 @@ impl CorruptSpan {
     pub fn presumed_epoch(&self) -> u64 {
         self.after_epoch + 1
     }
+
+    /// An epoch no record the span may hold exceeds (Q-872): below `before_epoch`; for a span with no later record,
+    /// the higher of `named_epoch` and `after_epoch` plus the records its length could hold.
+    pub fn epoch_ceiling(&self) -> u64 {
+        self.before_epoch.unwrap_or_else(|| {
+            let room = (self.end.saturating_sub(self.offset)) / MIN_RECORD_LEN;
+            self.named_epoch.max(self.after_epoch.saturating_add(room))
+        })
+    }
 }
+
+/// The shortest record block: a header and the record prefix (`format.md` A.2, A.14).
+const MIN_RECORD_LEN: u64 = (BLOCK_HEADER_LEN + RECORD_PREFIX) as u64;
 
 /// A manifest as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +107,8 @@ struct Search<'a> {
     headers: u64,
     body: u64,
     failed: FailedReads,
+    /// The highest epoch a checksum-valid record image read since it was last reset names.
+    named: u64,
 }
 
 impl<'a> Search<'a> {
@@ -102,6 +119,7 @@ impl<'a> Search<'a> {
             headers: 0,
             body: 0,
             failed: FailedReads::new(u64::from(MAX_BODY_LEN)),
+            named: 0,
         }
     }
 
@@ -115,38 +133,9 @@ impl<'a> Search<'a> {
     }
 
     fn record_at(&mut self, at: u64, min_epoch: u64) -> Result<Option<Placed>, FormatError> {
-        let bytes = self.bytes;
-        self.sums.forget_below(at);
-        let Some(start) = usize::try_from(at).ok() else {
+        let Some((h, body)) = self.image_at(at, min_epoch) else {
             return Ok(None);
         };
-        let Some(raw) = bytes.get(start..start.saturating_add(BLOCK_HEADER_LEN)) else {
-            return Ok(None);
-        };
-        let raw: &[u8; BLOCK_HEADER_LEN] = raw.try_into().unwrap_or(&[0; BLOCK_HEADER_LEN]);
-        if raw.iter().all(|&b| b == 0) {
-            return Ok(None);
-        }
-        self.headers += 1;
-        let Some(h) = BlockHeader::decode(raw).filter(|h| h.block_type != 0) else {
-            return Ok(None);
-        };
-        // Judged on the header and the body's first bytes before the body is checksummed, so that a search over bytes
-        // that imitate headers claiming long bodies checksums only candidates that could be the record looked for: a
-        // body that holds the record prefix and fits in the file, and an epoch above the previous record's.
-        if h.body_len > MAX_BODY_LEN || (h.body_len as usize) < RECORD_PREFIX {
-            return Ok(None);
-        }
-        let body_start = start + BLOCK_HEADER_LEN;
-        let Some(body) = bytes.get(body_start..body_start + h.body_len as usize) else {
-            return Ok(None);
-        };
-        if u64::from_le_bytes(body[..8].try_into().unwrap_or_default()) <= min_epoch {
-            return Ok(None);
-        }
-        if self.sums.range(body_start as u64, body.len() as u64) != Some(h.body_crc32c) {
-            return Ok(None);
-        }
         self.body += body.len() as u64;
         match Record::decode(h.block_type, h.skippable(), body) {
             Ok(r) if r.epoch > min_epoch => Ok(Some(Placed {
@@ -163,6 +152,38 @@ impl<'a> Search<'a> {
                 element,
             }),
         }
+    }
+
+    /// A checksum-valid record image at `at` whose epoch is above `min_epoch`, its fields not checked; its epoch is
+    /// noted in `named`.
+    fn image_at(&mut self, at: u64, min_epoch: u64) -> Option<(BlockHeader, &'a [u8])> {
+        let bytes = self.bytes;
+        self.sums.forget_below(at);
+        let start = usize::try_from(at).ok()?;
+        let raw = bytes.get(start..start.saturating_add(BLOCK_HEADER_LEN))?;
+        let raw: &[u8; BLOCK_HEADER_LEN] = raw.try_into().unwrap_or(&[0; BLOCK_HEADER_LEN]);
+        if raw.iter().all(|&b| b == 0) {
+            return None;
+        }
+        self.headers += 1;
+        let h = BlockHeader::decode(raw).filter(|h| h.block_type != 0)?;
+        // Judged on the header and the body's first bytes before the body is checksummed, so that a search over bytes
+        // that imitate headers claiming long bodies checksums only candidates that could be the record looked for: a
+        // body that holds the record prefix and fits in the file, and an epoch above the previous record's.
+        if h.body_len > MAX_BODY_LEN || (h.body_len as usize) < RECORD_PREFIX {
+            return None;
+        }
+        let body_start = start + BLOCK_HEADER_LEN;
+        let body = bytes.get(body_start..body_start + h.body_len as usize)?;
+        let epoch = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
+        if epoch <= min_epoch {
+            return None;
+        }
+        if self.sums.range(body_start as u64, body.len() as u64) != Some(h.body_crc32c) {
+            return None;
+        }
+        self.named = self.named.max(epoch);
+        Some((h, body))
     }
 }
 
@@ -199,6 +220,7 @@ fn read_all(
     let mut at = HEADER_LEN as u64;
     loop {
         let min = records.last().map_or(0, |p| p.record.epoch);
+        search.named = 0;
         if at < len
             && let Some(p) = search.record_at(at, min).map_err(ReadError::Unsupported)?
         {
@@ -214,8 +236,11 @@ fn read_all(
         while probe + (BLOCK_HEADER_LEN as u64) <= len {
             let next = search.failed.next_from(probe);
             if next != probe {
+                // Passed bytes are not searched, but the epochs of record images in them bound what the span may
+                // hold, at the cost of checksums alone (Q-872).
                 passed = true;
-                probe = next;
+                search.image_at(probe, min);
+                probe += 8;
                 continue;
             }
             if let Some(p) = search
@@ -234,6 +259,7 @@ fn read_all(
                     end: p.offset,
                     after_epoch: min,
                     before_epoch: Some(p.record.epoch),
+                    named_epoch: 0,
                 });
                 at = p.end;
                 records.push(p);
@@ -245,6 +271,7 @@ fn read_all(
                     end: len,
                     after_epoch: min,
                     before_epoch: None,
+                    named_epoch: search.named,
                 });
                 break;
             }
@@ -401,7 +428,8 @@ mod tests {
         assert!(stats.within_manifest_bound(f.len() as u64), "{stats:?}");
         assert!(stats.bytes_body_checked >= BUDGET, "{stats:?}");
         // The record in the passed part of the window is not found, and nothing after it: the passed bytes are a
-        // corrupt span with no later record, kept rather than dropped (Q-650).
+        // corrupt span with no later record, kept rather than dropped (Q-650). Its epoch is named, as one the span
+        // may hold (Q-872).
         let img = img.unwrap();
         assert!(img.records.is_empty() && !img.torn);
         assert_eq!(
@@ -411,6 +439,7 @@ mod tests {
                 end: f.len() as u64,
                 after_epoch: 0,
                 before_epoch: None,
+                named_epoch: 1 << 40,
             }]
         );
         assert!(img.is_corrupt());
@@ -427,6 +456,7 @@ mod tests {
                 end: window,
                 after_epoch: 0,
                 before_epoch: Some(1 << 41),
+                named_epoch: 0,
             }]
         );
     }
@@ -524,6 +554,7 @@ mod tests {
                 end: fourth,
                 after_epoch: 2,
                 before_epoch: Some(4),
+                named_epoch: 0,
             }]
         );
         assert!(!img.torn);

@@ -420,11 +420,12 @@ pub fn plan(
         });
     }
 
-    // Step 4's records: epochs above every epoch a valid record names and every lease.
+    // Step 4's records: epochs above every epoch a valid record names, every lease and every epoch a corrupt span
+    // may hold (Q-872).
     let top = valid
         .iter()
         .flat_map(|r| r.epochs_named())
-        .chain(image.corrupt.iter().filter_map(|s| s.before_epoch))
+        .chain(image.corrupt.iter().map(|s| s.epoch_ceiling()))
         .chain([input.lease_epoch])
         .max()
         .unwrap_or(0);

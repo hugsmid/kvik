@@ -641,8 +641,11 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   synced. Once failed reads starting in one 16 MiB window of the file have checked 16 MiB of body (common rules:
   scan bound), the search passes the rest of that window: a valid record beyond it makes the passed bytes part of the
   corrupt span; with none, the passed bytes and everything after them are a corrupt span with no later record, kept
-  and never truncated, and repaired by a copy or a rebuild like any corrupt record (Q-650). Damage does not reach the
-  window rule, so a torn tail is never reported this way.
+  and never truncated, and repaired by a copy or a rebuild like any corrupt record (Q-650): a copy is written before
+  the span's bytes, which stay after it, and a rebuild takes its epochs above every epoch a checksum-valid record
+  image starting in the span names and above the last valid epoch before it plus the records of 40 bytes, the
+  shortest, that the span could hold (Q-872). Damage does not reach the window rule, so a torn tail is never reported
+  this way.
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
   with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator

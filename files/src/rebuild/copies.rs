@@ -126,7 +126,8 @@ fn check_copy(copy: &[u8], gap: Gap) -> Result<Record, CopyError> {
 /// bytes it is written in place over their start and synced; bytes of the span it does not fill stay as they are,
 /// so another corrupt record there is found by the next open, which fetches it again, rebuilds or waits as for
 /// any. A copy longer than the span is written by writing the manifest again with the copy in the span's place, as
-/// `MANIFEST.new` renamed over `MANIFEST`. No handle may hold `MANIFEST`.
+/// `MANIFEST.new` renamed over `MANIFEST`. A span with no later record may hold valid records the search passed, so
+/// its bytes are kept whole after the copy, written again the same way (Q-650). No handle may hold `MANIFEST`.
 pub fn repair_with_copy(
     fs: &dyn Fs,
     dir: &Path,
@@ -142,7 +143,8 @@ pub fn repair_with_copy(
             before: span.before_epoch,
         },
     )?;
-    if copy.len() as u64 <= span.end - span.offset {
+    let open = span.before_epoch.is_none();
+    if !open && copy.len() as u64 <= span.end - span.offset {
         let f = fs
             .open(&dir.join(MANIFEST), OpenMode::ReadWrite)
             .map_err(WriteError::from)?;
@@ -153,7 +155,8 @@ pub fn repair_with_copy(
     }
     let mut out = bytes[..span.offset as usize].to_vec();
     out.extend_from_slice(copy);
-    out.extend_from_slice(&bytes[span.end as usize..]);
+    let kept = if open { span.offset } else { span.end };
+    out.extend_from_slice(&bytes[kept as usize..]);
     replace_manifest(fs, dir, &out).map_err(WriteError::from)?;
     Ok(())
 }
