@@ -106,7 +106,7 @@ impl Hub {
         );
     }
 
-    /// Raised before a consumer is taken, ahead of the pump that sets it up: every batch acknowledged before an emit
+    /// Raised before a consumer is taken, ahead of the pumps that set it up: every batch acknowledged before an emit
     /// read the flag lowered is then taken before the consumer exists (Q-706).
     pub(crate) fn consumer_coming(&self) {
         self.consumers.store(true, Ordering::SeqCst);

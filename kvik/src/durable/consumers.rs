@@ -115,7 +115,7 @@ impl Writer {
             ));
         }
         let emits = emits_in(emits);
-        // Before the setup pump below (Q-706). A take refused after this leaves the flag raised for the run, which
+        // Before the pumps below (Q-706). A take refused after this leaves the flag raised for the run, which
         // only costs emits the work they would skip.
         hub.consumer_coming();
         let mut d = lock(&self.decider);
