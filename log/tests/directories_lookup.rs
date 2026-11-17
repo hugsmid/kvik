@@ -200,6 +200,7 @@ fn a_position_the_root_names_raises_f() {
         groups: vec![g.entry()],
         lost: Vec::new(),
         quarantined: Vec::new(),
+        restored: Vec::new(),
     };
     let frame = Frame {
         generation: 0,

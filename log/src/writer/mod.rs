@@ -722,6 +722,8 @@ impl LogWriter {
             segment_size: self.cfg.segment_size,
             disk_critical: self.cfg.disk_critical,
             series_bytes: crate::directory::cadence::SERIES_BYTES,
+            // Generation 0 only until roadmap 8.3 (`StartOptions::generation` is refused), so no restore is in force.
+            restored: Vec::new(),
         }
     }
 

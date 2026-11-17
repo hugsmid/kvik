@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Directories, Position, kept_series, lost_of};
+use super::{Directories, Position, Work, kept_series, lost_of};
 use crate::batch::SegmentIdentity;
 use crate::directory::catalogue::{Catalogue, DESCRIBE_STEP, Describe, read_trailer};
 use crate::directory::logdir::{Group, Root, SegmentRecord};
@@ -58,12 +58,13 @@ impl Directories {
         };
         let done = match s.stage {
             Stage::Begin => {
-                if self.backing_off(now) {
+                if self.backing_off(Work::Start, now) {
                     false
                 } else if self.begin(&mut s).is_err() {
-                    self.failed(now);
+                    self.failed(Work::Start, now);
                     false
                 } else {
+                    self.backoff.remove(&Work::Start);
                     s.stage = Stage::Trailers;
                     false
                 }

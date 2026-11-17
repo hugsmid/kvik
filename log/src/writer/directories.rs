@@ -29,6 +29,7 @@ use crate::directory::{self, DerivedError, Family, Frame, read_latest};
 use crate::fs::Fs;
 use crate::manifest::read_manifest;
 use crate::mark::ResetStamp;
+use crate::setaside::RestoredEnd;
 use crate::store::{MANIFEST, read_all};
 
 use super::Position;
@@ -114,7 +115,7 @@ impl fmt::Debug for DirectoryOptions {
 }
 
 /// What a start tells the directories.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryStart {
     /// The store generation.
     pub generation: u32,
@@ -129,6 +130,8 @@ pub struct DirectoryStart {
     /// The series directory's bound on uncovered sealed bytes ([`crate::directory::cadence::SERIES_BYTES`]; tests
     /// use a smaller one).
     pub series_bytes: u64,
+    /// The restored ends in force (`spec.md` §8 Generations), which the root carries.
+    pub restored: Vec<RestoredEnd>,
 }
 
 impl DirectoryStart {
@@ -141,11 +144,24 @@ impl DirectoryStart {
     }
 }
 
-/// The lost ranges at or below `through`, in its generation.
+/// The positions of `through`'s generation at or below it that lost ranges cover, saturating at `u32::MAX` (A.18
+/// series directory offset 12): a loss extended under its identity counts the positions it gained.
 pub fn lost_below(lost: &[LostEntry], through: Position) -> u32 {
-    lost.iter()
+    let mut ranges: Vec<(u64, u64)> = lost
+        .iter()
         .filter(|l| l.first.generation == through.generation && l.first <= through)
-        .count() as u32
+        .map(|l| (l.first.sequence, l.last.min(through).sequence))
+        .collect();
+    ranges.sort_unstable();
+    let (mut n, mut next) = (0u64, 0u64);
+    for (a, z) in ranges {
+        let a = a.max(next);
+        if z >= a {
+            n += z - a + 1;
+            next = z + 1;
+        }
+    }
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 /// The manifest's lost ranges, one per identity, widened to every range recorded for it.
@@ -186,7 +202,8 @@ pub fn kept_series(
         .unwrap_or_default();
     read_latest(fs, dir, Family::Series, |b| {
         let (f, d) = SeriesDirectory::decode(b, store_id)?;
-        if start.keeps(f.generation, d.stamp, d.through) && lost_below(&lost, d.through) <= d.lost {
+        let lost_since = d.lost == u32::MAX || lost_below(&lost, d.through) > d.lost;
+        if start.keeps(f.generation, d.stamp, d.through) && !lost_since {
             Ok((f, d))
         } else {
             Err(DerivedError::Invalid("behind a reset or a loss"))
@@ -211,6 +228,25 @@ pub struct DirectoryStats {
     pub hook_panics: u64,
 }
 
+/// What a failure backs off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Work {
+    Start,
+    LogDirectory,
+    Series,
+    Status,
+}
+
+impl Work {
+    fn of(family: Family) -> Self {
+        match family {
+            Family::Root | Family::Group(_) => Work::LogDirectory,
+            Family::Series => Work::Series,
+            Family::Status => Work::Status,
+        }
+    }
+}
+
 /// See the module documentation.
 pub struct Directories {
     fs: Arc<dyn Fs>,
@@ -223,8 +259,9 @@ pub struct Directories {
     refused: BTreeSet<Family>,
     /// The body CRC32C of each group generation found valid at the start, by group number.
     on_disk: BTreeMap<u32, BTreeSet<u32>>,
-    failures: u32,
-    retry_at: Option<Duration>,
+    /// Failures in a row and the time of the next try, per kind of work: one that keeps failing never holds back
+    /// another.
+    backoff: BTreeMap<Work, (u32, Duration)>,
     // The log directory.
     epoch: u64,
     manifest_end: u64,
@@ -287,8 +324,7 @@ impl Directories {
             next_id: BTreeMap::new(),
             refused: BTreeSet::new(),
             on_disk: BTreeMap::new(),
-            failures: 0,
-            retry_at: None,
+            backoff: BTreeMap::new(),
             epoch: 0,
             manifest_end: 0,
             manifest_crc32c: 0,
@@ -353,17 +389,25 @@ impl Directories {
         self.pending.iter().any(|r| r.last() > synced)
     }
 
-    fn backing_off(&self, now: Duration) -> bool {
-        self.retry_at.is_some_and(|t| now < t)
+    /// How long `work` still waits before its next try; `None` when it may try now.
+    fn retry_in(&self, work: Work, now: Duration) -> Option<Duration> {
+        self.backoff
+            .get(&work)
+            .and_then(|&(_, at)| at.checked_sub(now))
+            .filter(|d| !d.is_zero())
     }
 
-    fn failed(&mut self, now: Duration) {
+    fn backing_off(&self, work: Work, now: Duration) -> bool {
+        self.retry_in(work, now).is_some()
+    }
+
+    fn failed(&mut self, work: Work, now: Duration) {
         self.stats.failed += 1;
-        self.failures = self.failures.saturating_add(1);
+        let n = self.backoff.get(&work).map_or(0, |b| b.0).saturating_add(1);
         let wait = RETRY
-            .saturating_mul(1 << self.failures.min(16).saturating_sub(1))
+            .saturating_mul(1 << n.min(16).saturating_sub(1))
             .min(RETRY_MAX);
-        self.retry_at = Some(now + wait);
+        self.backoff.insert(work, (n, now + wait));
     }
 
     /// Writes a file of `family`: the same `file_id` is tried again until it succeeds. A refused family counts as
@@ -378,7 +422,8 @@ impl Directories {
         if self.refused.contains(&family) {
             return true;
         }
-        if self.backing_off(now) {
+        let work = Work::of(family);
+        if self.backing_off(work, now) {
             return false;
         }
         let file_id = *self.next_id.entry(family).or_insert(1);
@@ -393,13 +438,12 @@ impl Directories {
             .free_space(&self.dir)
             .is_ok_and(|free| free < self.start.disk_critical.saturating_add(bytes.len() as u64));
         if low || directory::write_file(&*self.fs, &self.dir, family, file_id, &bytes).is_err() {
-            self.failed(now);
+            self.failed(work, now);
             return false;
         }
         self.next_id.insert(family, file_id + 1);
         self.stats.written += 1;
-        self.failures = 0;
-        self.retry_at = None;
+        self.backoff.remove(&work);
         true
     }
 
@@ -427,6 +471,7 @@ impl Directories {
             groups,
             lost: self.lost.clone(),
             quarantined: Vec::new(),
+            restored: self.start.restored.clone(),
         }
     }
 
@@ -451,14 +496,8 @@ impl Directories {
                 // A segment sealed before the files were read, handed over again.
                 continue;
             }
-            let start = Position {
-                generation: r.generation,
-                sequence: 0,
-            };
-            let joins = match listed {
-                Some(l) => logdir::joins(l, r.first(), &self.lost),
-                None => r.generation != 0 || logdir::joins(start, r.first(), &self.lost),
-            };
+            let prev = listed.unwrap_or_else(|| logdir::before(r.generation));
+            let joins = logdir::joins(prev, r.first(), &self.lost, &self.start.restored);
             if !joins {
                 keep.push(r);
                 continue;
@@ -548,7 +587,7 @@ impl Directories {
             if self.open.segments.len() == logdir::GROUP_SEGMENTS && self.root_dirty {
                 self.write_log_directory(now, wall);
             }
-            return Some(Duration::ZERO);
+            return Some(self.retry_in(Work::Start, now).unwrap_or(Duration::ZERO));
         }
         let mut wait: Option<Duration> = None;
         let mut soon = |d: Duration| wait = Some(wait.map_or(d, |w| w.min(d)));
@@ -557,7 +596,7 @@ impl Directories {
             soon(RETRY);
         }
         if self.root_dirty && !self.write_log_directory(now, wall) {
-            soon(self.retry_at.map_or(RETRY, |t| t.saturating_sub(now)));
+            soon(self.retry_in(Work::LogDirectory, now).unwrap_or(RETRY));
         }
         if self.opts.hook.is_some() && !self.refused.contains(&Family::Series) {
             let since = self.series_at.map(|t| now.saturating_sub(t));
@@ -566,8 +605,8 @@ impl Directories {
                 && !self.write_series(synced, now, wall)
             {
                 soon(
-                    self.retry_at
-                        .map_or(RETRY, |t| t.saturating_sub(now).max(RETRY)),
+                    self.retry_in(Work::Series, now)
+                        .map_or(RETRY, |d| d.max(RETRY)),
                 );
             }
         }
@@ -581,7 +620,7 @@ impl Directories {
     /// shutdown never waits for.
     pub fn finish(&mut self, synced: Position, now: Duration, wall: i64) {
         if self.starting.is_none() {
-            self.retry_at = None;
+            self.backoff.clear();
             self.run(synced, now, wall);
         }
     }
@@ -598,20 +637,20 @@ impl Directories {
     }
 
     fn write_series(&mut self, synced: Position, now: Duration, wall: i64) -> bool {
-        if self.backing_off(now) {
+        if self.backing_off(Work::Series, now) {
             return false;
         }
         let Some(s) = self.call(|h| h.series(synced, wall)) else {
-            self.failed(now);
+            self.failed(Work::Series, now);
             return false;
         };
         if s.through > synced || s.through.sequence == 0 {
-            self.failed(now);
+            self.failed(Work::Series, now);
             return false;
         }
         if self.series_through.is_some_and(|t| s.through <= t) {
             // No progress: the hook is behind the seals; tried again after a wait.
-            self.failed(now);
+            self.failed(Work::Series, now);
             return false;
         }
         let d = SeriesDirectory {
@@ -651,7 +690,7 @@ impl Directories {
             .status_interval
             .is_some_and(|i| self.status_at.is_none_or(|t| now >= t + i));
         if (changed || due)
-            && !self.backing_off(now)
+            && !self.backing_off(Work::Status, now)
             && let Some(content) = self.call(|h| h.status())
         {
             let mut counters = content.counters;

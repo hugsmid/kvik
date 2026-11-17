@@ -265,7 +265,7 @@ fn a_group_with_a_hole_or_groups_that_do_not_join_are_not_used() {
     let mut g = d.groups[0].clone().unwrap();
     // A record taken out of the middle: the group no longer joins up (A.18 Contiguity).
     g.segments.remove(5);
-    assert!(!logdir::contiguous(&g, &[]));
+    assert!(!logdir::contiguous(&g, &[], &[]));
     let lost = [kvik_log::directory::logdir::LostEntry {
         first: Position {
             generation: 0,
@@ -278,7 +278,10 @@ fn a_group_with_a_hole_or_groups_that_do_not_join_are_not_used() {
         file_id: 0,
         cause: 1,
     }];
-    assert!(logdir::contiguous(&g, &lost), "a lost range covers the gap");
+    assert!(
+        logdir::contiguous(&g, &lost, &[]),
+        "a lost range covers the gap"
+    );
     // A root whose groups do not join is invalid.
     let mut root = d.root.clone();
     root.groups[1].first.sequence += 1;

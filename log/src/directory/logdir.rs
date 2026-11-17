@@ -20,6 +20,7 @@ use crate::error::EncodeError;
 use crate::header::kind;
 use crate::mark::ResetStamp;
 use crate::scan::{ScanLimit, scan};
+use crate::setaside::RestoredEnd;
 use crate::writer::Position;
 
 /// Sealed segments per group.
@@ -32,8 +33,10 @@ pub const GROUP_ENTRY_LEN: u16 = 72;
 pub const LOST_ENTRY_LEN: u16 = 40;
 /// A quarantined-file entry's size in v1.
 pub const QUARANTINED_ENTRY_LEN: u16 = 16;
+/// A restored-end entry's size in v1.
+pub const RESTORED_ENTRY_LEN: u16 = 16;
 const GROUP_PREFIX: usize = 16;
-const ROOT_PREFIX: usize = 96;
+const ROOT_PREFIX: usize = 104;
 /// A residence: the hot tier.
 pub const RESIDENCE_HOT: u8 = 1;
 
@@ -340,6 +343,8 @@ pub struct Root {
     pub lost: Vec<LostEntry>,
     /// Quarantined files.
     pub quarantined: Vec<QuarantinedEntry>,
+    /// The restored ends in force (`spec.md` §8 Generations), by the generation of their restore.
+    pub restored: Vec<RestoredEnd>,
 }
 
 impl Root {
@@ -362,12 +367,20 @@ impl Root {
             self.lost.len(),
             self.quarantined.len(),
             0,
+            self.restored.len(),
         ] {
             b.extend_from_slice(&(n as u32).to_le_bytes());
         }
-        for n in [GROUP_ENTRY_LEN, LOST_ENTRY_LEN, QUARANTINED_ENTRY_LEN, 0] {
+        for n in [
+            GROUP_ENTRY_LEN,
+            LOST_ENTRY_LEN,
+            QUARANTINED_ENTRY_LEN,
+            0,
+            RESTORED_ENTRY_LEN,
+        ] {
             b.extend_from_slice(&n.to_le_bytes());
         }
+        b.extend_from_slice(&[0; 2]);
         for g in &self.groups {
             g.encode(&mut b);
         }
@@ -383,6 +396,11 @@ impl Root {
             b.extend_from_slice(&[0; 3]);
             b.extend_from_slice(&q.generation.to_le_bytes());
             b.extend_from_slice(&q.file_id.to_le_bytes());
+        }
+        for r in &self.restored {
+            b.extend_from_slice(&r.generation.to_le_bytes());
+            b.extend_from_slice(&r.end.0.to_le_bytes());
+            b.extend_from_slice(&r.end.1.to_le_bytes());
         }
         b
     }
@@ -404,8 +422,8 @@ impl Root {
         if body.len() < ROOT_PREFIX {
             return Err(DerivedError::Invalid("root body"));
         }
-        let counts = [72, 76, 80, 84].map(|at| u32_at(body, at));
-        let sizes = [88, 90, 92, 94].map(|at| u16_at(body, at));
+        let counts = [72, 76, 80, 84, 88].map(|at| u32_at(body, at));
+        let sizes = [92, 94, 96, 98, 100].map(|at| u16_at(body, at));
         let mut at = ROOT_PREFIX;
         let mut take = |i: usize, min: u16| -> Result<Vec<&[u8]>, DerivedError> {
             let v: Vec<_> = records(body, at, counts[i], sizes[i], usize::from(min))?.collect();
@@ -434,6 +452,13 @@ impl Root {
             })
             .collect();
         take(3, 0)?;
+        let restored: Vec<_> = take(4, RESTORED_ENTRY_LEN)?
+            .into_iter()
+            .map(|b| RestoredEnd {
+                generation: u32_at(b, 0),
+                end: (u32_at(b, 4), u64_at(b, 8)),
+            })
+            .collect();
         if at != body.len() {
             return Err(DerivedError::Invalid("bytes after the records"));
         }
@@ -455,14 +480,24 @@ impl Root {
             groups,
             lost,
             quarantined,
+            restored,
         };
         root.check()?;
         Ok((frame, root))
     }
 
     /// The structural checks of A.18: groups numbered from 0, every group but the last full, counts summing to
-    /// `segment_count`, each group joining the one before it, the last group ending at `through`.
+    /// `segment_count`, the first group starting its generation and each joining the one before it, the last group
+    /// ending at `through`; restored ends ascending by their restore's generation, each in a generation below it.
     fn check(&self) -> Result<(), DerivedError> {
+        let ends_ordered = self
+            .restored
+            .windows(2)
+            .all(|w| w[0].generation < w[1].generation)
+            && self.restored.iter().all(|r| r.end.0 < r.generation);
+        if !ends_ordered {
+            return Err(DerivedError::Invalid("root restored ends"));
+        }
         let bad = || Err(DerivedError::Invalid("root groups"));
         let mut sum: u64 = 0;
         for (i, g) in self.groups.iter().enumerate() {
@@ -476,7 +511,11 @@ impl Root {
             {
                 return bad();
             }
-            if i > 0 && !joins(self.groups[i - 1].last, g.first, &self.lost) {
+            let prev = match i {
+                0 => before(g.first.generation),
+                _ => self.groups[i - 1].last,
+            };
+            if !joins(prev, g.first, &self.lost, &self.restored) {
                 return bad();
             }
             sum += u64::from(g.segment_count);
@@ -494,30 +533,67 @@ pub use super::catalogue::{
     read_trailer,
 };
 
-/// Whether a segment starting at `next` follows one ending at `prev` with no sealed segment between (A.18
-/// Contiguity): `next` is the position after `prev`, or a lost range covers every position between them, or `next`
-/// starts a later generation.
-pub fn joins(prev: Position, next: Position, lost: &[LostEntry]) -> bool {
-    if next.generation != prev.generation {
-        return next.generation > prev.generation;
+/// The position before the first of `generation`, which the first segment listed joins.
+pub fn before(generation: u32) -> Position {
+    Position {
+        generation,
+        sequence: 0,
     }
-    if next.sequence <= prev.sequence {
+}
+
+/// Whether a segment starting at `next` follows one ending at `prev` with no sealed segment between (A.18
+/// Contiguity). Within a generation, `next` is the position after `prev` or lost ranges cover every position between
+/// them. Across generations, `next` starts its generation in the same way from sequence 1, `prev` reaches its
+/// generation's restored end, and no generation between them held a position.
+pub fn joins(prev: Position, next: Position, lost: &[LostEntry], restored: &[RestoredEnd]) -> bool {
+    if next.generation == prev.generation {
+        return next.sequence > prev.sequence
+            && covered(prev.generation, prev.sequence + 1, next.sequence - 1, lost);
+    }
+    if next.generation < prev.generation || next.sequence == 0 {
         return false;
     }
-    let (from, to) = (prev.sequence + 1, next.sequence - 1);
-    from > to
-        || lost.iter().any(|l| {
-            l.first.generation == prev.generation
-                && l.first.sequence <= from
-                && l.last.sequence >= to
-        })
+    let between =
+        |r: &&RestoredEnd| r.generation > prev.generation && r.generation <= next.generation;
+    let end = restored
+        .iter()
+        .filter(between)
+        .filter(|r| r.end.0 == prev.generation)
+        .map(|r| r.end.1)
+        .min();
+    let skipped_held = restored
+        .iter()
+        .filter(between)
+        .any(|r| r.end.0 > prev.generation && r.end.0 < next.generation && r.end.1 > 0);
+    end.is_some_and(|e| prev.sequence >= e)
+        && !skipped_held
+        && covered(next.generation, 1, next.sequence - 1, lost)
+}
+
+/// Whether the lost ranges of `generation` between them cover every sequence from `from` to `to`.
+fn covered(generation: u32, from: u64, to: u64, lost: &[LostEntry]) -> bool {
+    let mut need = from;
+    while need <= to {
+        let reach = lost
+            .iter()
+            .filter(|l| l.first.generation == generation && l.first.sequence <= need)
+            .map(|l| l.last.sequence)
+            .filter(|&last| last >= need)
+            .max();
+        match reach {
+            Some(last) if last >= to => return true,
+            Some(last) => need = last + 1,
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Whether a group's records follow one another with no sealed segment between them.
-pub fn contiguous(g: &Group, lost: &[LostEntry]) -> bool {
+pub fn contiguous(g: &Group, lost: &[LostEntry], restored: &[RestoredEnd]) -> bool {
     g.segments
         .windows(2)
-        .all(|w| joins(w[0].last(), w[1].first(), lost))
+        .all(|w| joins(w[0].last(), w[1].first(), lost, restored))
 }
 
 #[cfg(test)]
@@ -604,6 +680,7 @@ mod tests {
                 cause: 1,
             }],
             quarantined: vec![],
+            restored: vec![],
         };
         let bytes = root.encode(frame(), [1; 16]).unwrap();
         assert_eq!(
@@ -618,5 +695,124 @@ mod tests {
         behind.through.sequence = 9;
         let bytes = behind.encode(frame(), [1; 16]).unwrap();
         assert!(Root::decode(&bytes, &[1; 16]).is_err());
+    }
+
+    fn p(generation: u32, sequence: u64) -> Position {
+        Position {
+            generation,
+            sequence,
+        }
+    }
+
+    fn lost(generation: u32, first: u64, last: u64) -> LostEntry {
+        LostEntry {
+            first: p(generation, first),
+            last: p(generation, last),
+            file_id: 0,
+            cause: 1,
+        }
+    }
+
+    fn end(generation: u32, end: (u32, u64)) -> RestoredEnd {
+        RestoredEnd { generation, end }
+    }
+
+    #[test]
+    fn lost_ranges_join_a_gap_only_when_they_cover_all_of_it_between_them() {
+        assert!(joins(p(0, 10), p(0, 31), &[lost(0, 11, 30)], &[]));
+        assert!(joins(
+            p(0, 10),
+            p(0, 31),
+            &[lost(0, 21, 30), lost(0, 11, 20)],
+            &[]
+        ));
+        assert!(joins(
+            p(0, 10),
+            p(0, 31),
+            &[lost(0, 5, 25), lost(0, 18, 40)],
+            &[]
+        ));
+        assert!(!joins(p(0, 10), p(0, 31), &[lost(0, 11, 20)], &[]));
+        assert!(!joins(p(0, 10), p(0, 31), &[lost(0, 15, 30)], &[]));
+        assert!(!joins(
+            p(0, 10),
+            p(0, 31),
+            &[lost(0, 11, 19), lost(0, 21, 30)],
+            &[]
+        ));
+        assert!(!joins(p(0, 10), p(0, 31), &[lost(1, 11, 30)], &[]));
+    }
+
+    #[test]
+    fn a_later_generation_joins_from_its_first_position_once_the_earlier_reaches_its_restored_end()
+    {
+        let ends = [end(1, (0, 100))];
+        assert!(joins(p(0, 100), p(1, 1), &[], &ends));
+        assert!(
+            joins(p(0, 120), p(1, 1), &[], &ends),
+            "a segment past the end, set aside"
+        );
+        assert!(!joins(p(0, 100), p(1, 500), &[], &ends));
+        assert!(joins(p(0, 100), p(1, 500), &[lost(1, 1, 499)], &ends));
+        assert!(
+            !joins(p(0, 50), p(1, 1), &[], &ends),
+            "51 to 100 restored and not listed"
+        );
+        assert!(
+            !joins(p(0, 100), p(1, 1), &[], &[]),
+            "no restore record for the change"
+        );
+        assert!(!joins(p(1, 1), p(0, 2), &[], &ends));
+    }
+
+    #[test]
+    fn a_skipped_generation_joins_only_when_it_held_no_position() {
+        let empty = [end(1, (0, 100)), end(2, (0, 100))];
+        assert!(joins(p(0, 100), p(2, 1), &[], &empty));
+        let held = [end(1, (0, 100)), end(2, (1, 40))];
+        assert!(!joins(p(0, 100), p(2, 1), &[], &held));
+    }
+
+    #[test]
+    fn a_root_carries_its_restored_ends_and_its_first_group_starts_its_generation() {
+        let g = Group {
+            number: 0,
+            segments: vec![seg(1, 1, 5)],
+        };
+        let mut root = Root {
+            epoch: 2,
+            manifest_end: 200,
+            manifest_crc32c: 0xabcd,
+            through: p(0, 5),
+            segment_count: 1,
+            stamp: None,
+            compacted_through: None,
+            groups: vec![g.entry()],
+            lost: vec![],
+            quarantined: vec![],
+            restored: vec![end(1, (0, 9)), end(3, (2, 0))],
+        };
+        let bytes = root.encode(frame(), [1; 16]).unwrap();
+        let body = &bytes[80..];
+        assert_eq!(
+            (u32_at(body, 88), u16_at(body, 100)),
+            (2, RESTORED_ENTRY_LEN)
+        );
+        let at = ROOT_PREFIX + usize::from(GROUP_ENTRY_LEN);
+        assert_eq!(
+            (u32_at(body, at), u32_at(body, at + 4), u64_at(body, at + 8)),
+            (1, 0, 9)
+        );
+        assert_eq!(Root::decode(&bytes, &[1; 16]).unwrap().1, root);
+        let mut unordered = root.clone();
+        unordered.restored.reverse();
+        assert!(Root::decode(&unordered.encode(frame(), [1; 16]).unwrap(), &[1; 16]).is_err());
+        let mut late = root.clone();
+        late.groups[0].first = p(0, 2);
+        assert!(Root::decode(&late.encode(frame(), [1; 16]).unwrap(), &[1; 16]).is_err());
+        late.lost = vec![lost(0, 1, 1)];
+        assert!(Root::decode(&late.encode(frame(), [1; 16]).unwrap(), &[1; 16]).is_ok());
+        root.restored = vec![end(1, (1, 9))];
+        assert!(Root::decode(&root.encode(frame(), [1; 16]).unwrap(), &[1; 16]).is_err());
     }
 }

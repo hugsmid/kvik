@@ -239,6 +239,7 @@ fn uncovered_bytes_stay_bounded_through_the_directories_at_any_rate() {
                 segment_size,
                 disk_critical: 0,
                 series_bytes: SERIES_BYTES,
+                restored: Vec::new(),
             };
             let opts = DirectoryOptions {
                 hook: Some(hook.clone()),
@@ -289,6 +290,7 @@ fn a_hook_behind_the_seals_is_asked_again_after_a_growing_wait_and_then_written(
         segment_size: 64 << 20,
         disk_critical: 0,
         series_bytes: SERIES_BYTES,
+        restored: Vec::new(),
     };
     let opts = DirectoryOptions {
         hook: Some(hook.clone()),

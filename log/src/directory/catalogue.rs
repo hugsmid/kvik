@@ -126,7 +126,7 @@ pub fn load(
                     if f.file_id == id
                         && crc == e.body_crc32c
                         && g.entry() == *e
-                        && super::logdir::contiguous(&g, &root.lost)
+                        && super::logdir::contiguous(&g, &root.lost, &root.restored)
                         && cat.group_matches(f.generation, &g) =>
                 {
                     found = Some(g);

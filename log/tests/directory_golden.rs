@@ -165,6 +165,7 @@ fn root() -> Root {
             cause: 1,
         }],
         quarantined: vec![],
+        restored: vec![],
     }
 }
 
@@ -175,8 +176,8 @@ fn root_bytes() -> Vec<u8> {
     b.u64(4).u64(312).u32(0).u32(0x1234_5678).u64(90).u64(2);
     b.u64(12).u64(0x5eed);
     b.u32(0).zeros(4).u64(0);
-    b.u32(1).u32(1).u32(0).u32(0);
-    b.u16(72).u16(40).u16(16).u16(0);
+    b.u32(1).u32(1).u32(0).u32(0).u32(0);
+    b.u16(72).u16(40).u16(16).u16(0).u16(16).zeros(2);
     b.u32(0).u32(2).u64(1).u64(2).pos(0, 1).pos(0, 90);
     b.i64(g.first_commit_time)
         .i64(g.last_commit_time)
