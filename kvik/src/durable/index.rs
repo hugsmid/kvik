@@ -47,10 +47,35 @@ pub(crate) struct Index {
     /// Each batch's last position and commit time, in log order.
     commits: Vec<(LogPos, i64)>,
     recoveries: BTreeMap<LogPos, Recovery>,
-    /// Facts are not kept, only each series' first fact position (roadmap 11.0: the writer's start and the
-    /// deliverer need the registry and the commit times, not the facts).
+    /// Facts are not kept, only each series' [`Summary`] (roadmap 11.0: the writer's start and the deliverer need the
+    /// registry and the commit times, not the facts).
     no_facts: bool,
-    first_fact: ById<LogPos>,
+    summary: ById<Summary>,
+    /// A void removed facts the summaries counted: they are rebuilt by [`read_summary`] before they are used.
+    stale: bool,
+}
+
+/// What an index without facts keeps of a series' facts: the first position, the latest `t` and the lateness
+/// reference (spec §2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Summary {
+    first: LogPos,
+    latest: i64,
+    reference: Option<i64>,
+}
+
+impl Summary {
+    fn note(s: &mut ById<Summary>, p: LogPos, row: &FactRow) {
+        let x = s.get_or_insert_with(row.series_id, || Summary {
+            first: p,
+            latest: row.t,
+            reference: None,
+        });
+        x.latest = x.latest.max(row.t);
+        if !row.flags.future && !row.flags.unsynced_clock {
+            x.reference = x.reference.max(Some(row.t));
+        }
+    }
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -159,7 +184,7 @@ impl Index {
             match item {
                 Item::Fact(row) if self.no_facts => {
                     self.registry.note_fact(row.series_id);
-                    self.first_fact.get_or_insert_with(row.series_id, || p);
+                    Summary::note(&mut self.summary, p, row);
                 }
                 Item::Fact(row) => {
                     self.registry.note_fact(row.series_id);
@@ -192,19 +217,32 @@ impl Index {
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
         self.recoveries.retain(|p, _| keep(p));
+        let taken = self.commits.len();
         self.commits.retain(|(p, _)| keep(p));
+        self.stale |= self.no_facts && self.commits.len() != taken;
         for f in self.facts.values_mut() {
             f.retain(|(_, p), _| keep(p));
         }
         self.facts.retain(|_, f| !f.is_empty());
-        self.first_fact.retain(|_, p| keep(p));
+        self.summary.retain(|_, s| keep(&s.first));
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
-        for id in self.facts.keys().copied().chain(self.first_fact.iter().map(|(id, _)| id)) {
+        for id in self.facts.keys().copied().chain(self.summary.iter().map(|(id, _)| id)) {
             self.registry.note_fact(id);
         }
+    }
+
+    /// Whether a void left the summaries of an index without facts to be rebuilt ([`read_summary`]).
+    pub(crate) fn summary_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Replaces the summaries with those of a read of the kept log that reached at least as far as this index.
+    pub(crate) fn set_summary(&mut self, s: ById<Summary>) {
+        self.summary = s;
+        self.stale = false;
     }
 
     /// The registry of the kept log.
@@ -312,6 +350,9 @@ impl Index {
 
     /// The latest recorded `t` of a series (spec §2.2).
     pub(crate) fn latest_t(&self, id: u32) -> Option<i64> {
+        if self.no_facts {
+            return self.summary.get(id).map(|s| s.latest);
+        }
         self.facts
             .get(&id)
             .and_then(|m| m.keys().map(|(t, _)| *t).max())
@@ -320,6 +361,9 @@ impl Index {
     /// The lateness reference of an observed series (spec §2.2): the greatest `t` of its facts flagged neither
     /// `future` nor `unsynced_clock`.
     pub(crate) fn lateness_reference(&self, id: u32) -> Option<i64> {
+        if self.no_facts {
+            return self.summary.get(id).and_then(|s| s.reference);
+        }
         self.series_facts(id)
             .filter(|s| !s.row.flags.future && !s.row.flags.unsynced_clock)
             .map(|s| s.row.t)
@@ -472,6 +516,89 @@ impl Index {
     }
 }
 
+/// The second pass of [`read_summary`]: each fact counted unless a later void of the stream removes it, which the
+/// first pass found.
+struct SummaryPass {
+    /// Per void, in stream order, the least `above` of it and every later one.
+    bounds: Vec<LogPos>,
+    seen: usize,
+    summary: ById<Summary>,
+}
+
+impl SummaryPass {
+    fn new(mut voids: Vec<LogPos>) -> Self {
+        for k in (0..voids.len().saturating_sub(1)).rev() {
+            voids[k] = voids[k].min(voids[k + 1]);
+        }
+        SummaryPass {
+            bounds: voids,
+            seen: 0,
+            summary: ById::default(),
+        }
+    }
+
+    fn apply(&mut self, events: &[ReadEvent]) {
+        for e in events {
+            match e {
+                ReadEvent::Batch(b) => {
+                    let bound = self.bounds.get(self.seen).copied();
+                    let mut sequence = b.first.sequence;
+                    for item in &b.content.items {
+                        let p = LogPos {
+                            generation: b.first.generation,
+                            sequence,
+                        };
+                        if let Item::Fact(row) = item
+                            && bound.is_none_or(|a| p <= a)
+                        {
+                            Summary::note(&mut self.summary, p, row);
+                        }
+                        sequence += item.sequences();
+                    }
+                }
+                ReadEvent::Void { .. } => self.seen += 1,
+                ReadEvent::Corruption { .. } => {}
+            }
+        }
+    }
+}
+
+fn voids_of(events: &[ReadEvent], out: &mut Vec<LogPos>) {
+    out.extend(events.iter().filter_map(|e| match e {
+        ReadEvent::Void { above, .. } => Some(*above),
+        _ => None,
+    }));
+}
+
+/// The summaries of the kept log, read in parts of `part` items with two fresh readers: the first pass finds where
+/// voids fall, the second counts each fact no later void removes, so that memory holds one part at a time.
+pub(crate) fn read_summary(
+    open: impl Fn() -> Result<kvik_log::reader::LogReader, kvik_log::reader::ReaderError>,
+    part: usize,
+) -> Result<ById<Summary>, kvik_log::reader::ReaderError> {
+    let mut voids = Vec::new();
+    let mut r = open()?;
+    loop {
+        let (u, more) = r.refresh_some(part)?;
+        voids_of(&u.events, &mut voids);
+        if !more {
+            break;
+        }
+    }
+    let _ = r.close();
+    let mut pass = SummaryPass::new(voids);
+    let mut r = open()?;
+    loop {
+        let (u, more) = r.refresh_some(part)?;
+        pass.apply(&u.events);
+        if !more {
+            break;
+        }
+    }
+    let _ = r.close();
+    Ok(pass.summary)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -562,5 +689,68 @@ mod tests {
         }]);
         assert!(i.registry().get(1).is_none());
         assert_eq!(i.series_facts(1).count(), 0);
+    }
+
+    fn fact_of(series_id: u32, t: i64, future: bool) -> Item {
+        Item::Fact(FactRow {
+            series_id,
+            t,
+            quality: LogQuality::Good,
+            flags: LogFlags {
+                future,
+                ..LogFlags::default()
+            },
+            value: LogValue::F64(1),
+            changed_at: None,
+        })
+    }
+
+    #[test]
+    fn summaries_held_and_read_in_two_passes_equal_those_of_every_fact() {
+        let void = |above| ReadEvent::Void {
+            above: LogPos {
+                generation: 0,
+                sequence: above,
+            },
+            cause: VoidCause::Rewritten,
+        };
+        // Facts of series 1 and 2; a void above 3 removes the later ones, which are taken again lower; then a second
+        // void above 5 and more facts.
+        let stream = vec![
+            batch(1, vec![fact_of(1, 10, false), fact_of(2, 50, true)]),
+            batch(3, vec![fact_of(1, 30, false), fact_of(2, 40, false)]),
+            batch(5, vec![fact_of(1, 99, false)]),
+            void(3),
+            batch(4, vec![fact_of(1, 20, false), fact_of(2, 45, false)]),
+            batch(6, vec![fact_of(2, 70, true)]),
+            void(5),
+            batch(6, vec![fact_of(3, 5, false)]),
+        ];
+        let mut full = Index::default();
+        full.apply(&stream);
+        let mut held = Index::without_facts();
+        let mut voids = Vec::new();
+        for (k, e) in stream.iter().enumerate() {
+            held.apply(std::slice::from_ref(e));
+            voids_of(std::slice::from_ref(e), &mut voids);
+            assert_eq!(held.summary_stale(), k >= 3);
+        }
+        let mut pass = SummaryPass::new(voids);
+        for e in &stream {
+            pass.apply(std::slice::from_ref(e));
+        }
+        held.set_summary(pass.summary);
+        assert!(!held.summary_stale());
+        for id in 1..=4 {
+            assert_eq!(held.latest_t(id), full.latest_t(id), "series {id}");
+            assert_eq!(held.lateness_reference(id), full.lateness_reference(id), "series {id}");
+        }
+        assert_eq!((held.latest_t(2), held.lateness_reference(2)), (Some(50), Some(45)));
+        assert_eq!(held.lateness_reference(1), Some(30));
+        // Without a void the summaries are kept exactly as facts are taken.
+        let mut plain = Index::without_facts();
+        plain.apply(&stream[..3]);
+        assert!(!plain.summary_stale());
+        assert_eq!((plain.latest_t(1), plain.lateness_reference(2)), (Some(99), Some(40)));
     }
 }

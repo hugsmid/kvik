@@ -87,7 +87,11 @@ latest time and lateness reference, one commit time per batch, and the slow path
 sealed segments' indexes and the maps of their batches, also during one lookup; batches read again touch about a
 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
 cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms. A start reads the whole log once, a part at a time (Q-752); the public
-`Reader` still holds every fact it has read (roadmap 9.0a). Worst case of the slow path, under the decision lock that
+`Reader` still holds every fact it has read (roadmap 9.0a), and so does the store's own reader, opened by the first
+`facts`, `at` or `interval` call on a `Store`. `series`, `series_stats`, `losses`, `health` and the clean shutdown's
+registry file are answered from the deliverer's held state (registry, per-series summaries, recovery entries and the
+manifest's lost ranges); after a start whose read of the log was voided part-way, the summaries are rebuilt once by
+a read of the log in parts that keeps no facts. Worst case of the slow path, under the decision lock that
 every `emit` and entry call takes: the first read of a segment after a start scans it whole (64 MiB at the default
 `segment_size`, about a second at 60 MB/s), later reads only the batches whose event times may hold the key and those
 appended since (`docs/measurements/store-emit-throughput.md`).

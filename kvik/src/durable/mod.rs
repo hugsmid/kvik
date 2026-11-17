@@ -686,8 +686,20 @@ impl Writer {
         .map(|_| ())
     }
 
+    /// From the deliverer's held state; the reader of the process only when there is no deliverer or its
+    /// summaries could not be made exact.
     pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, QueryError> {
+        if let Some(r) = self.held(|d| d.series(key)) {
+            return r.map_err(Error::query);
+        }
         self.reader()?.with(|i, _| i.series(key))
+    }
+
+    /// `f` on the deliverer once it has taken what is acknowledged and its summaries are exact.
+    fn held<R>(&self, f: impl FnOnce(&deliver::Deliverer) -> R) -> Option<R> {
+        self.hub
+            .as_ref()?
+            .run_quiet(|d, c| d.held(c).then(|| f(d)))
     }
 
     // ----- writing -----
@@ -906,8 +918,13 @@ impl Writer {
 
     pub(crate) fn losses(&self) -> Vec<LossReport> {
         let acked = lock(&self.acknowledged).clone();
-        self.reader()
-            .and_then(|r| r.losses())
+        let held = self.hub.as_ref().map(|h| {
+            h.run_quiet(|d, c| {
+                d.pump(c);
+                d.losses()
+            })
+        });
+        held.or_else(|| self.reader().and_then(|r| r.losses()).ok())
             .unwrap_or_default()
             .into_iter()
             .map(|mut l| {
@@ -1051,11 +1068,16 @@ impl Writer {
             .get(&id.0)
             .cloned()
             .unwrap_or_default();
-        if let Ok(r) = self.reader() {
-            let _ = r.with(|i, _| {
-                st.latest_t = i.latest_t(id.0).map(Timestamp);
-                Ok(())
-            });
+        match self.held(|d| d.latest_t(id.0)) {
+            Some(t) => st.latest_t = t.map(Timestamp),
+            None => {
+                if let Ok(r) = self.reader() {
+                    let _ = r.with(|i, _| {
+                        st.latest_t = i.latest_t(id.0).map(Timestamp);
+                        Ok(())
+                    });
+                }
+            }
         }
         Some(st)
     }
