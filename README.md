@@ -40,13 +40,13 @@ a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 > | 3. Format and interface | 3 of 3 done; gate 3.3 passed |
 > | 4. Log | 8 of 9 done (the interface crate, on the reference model; the segment container; arrival batches; the commit path; recovery; the second-process reader and leases; differential tests against the model; commit benchmarks, on macOS and the Linux NVMe target) |
 > | 5. Delivery | 2 of 10 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.5a, durability levels in the specification and the model, is written and waits for the owner's ruling on Q-250, Q-252 and Q-254 and confirmation of Q-251, Q-253, Q-255 to Q-259, Q-680 and Q-681) |
-> | 6. Compacted segments | 2 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
+> | 6. Compacted segments | 3 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export at schema version 1, with the partitioned layout) |
 > | 7. Summary tree | 1 of 5 done (7.1a, summary nodes: the fold, merge and byte layout) |
 > | 8. Tiers and backup | 1 of 5 done (8.2, the backup sink interface) |
 > | 9. Query | not started |
 > | 10. Scale | not started |
 >
-> 28 of 55 roadmap items are done, including 3 of 9 gates.
+> 29 of 55 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
@@ -127,7 +127,7 @@ engine does not exist yet, so each item below says what it is designed to do, no
 ### What it is not
 kvik is a storage engine, not a complete system. **Not planned for v1:** a network server, SQL, multiple writers,
 clustering, conditions over several series, interval readings over irregular billing periods, or any form of
-deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export for other tools exists, with a provisional schema ([`docs/export.md`](docs/export.md)). An application
+deletion ([`docs/api.md`](docs/api.md#not-in-v1)); a Parquet export for other tools exists, at schema version 1 ([`docs/export.md`](docs/export.md)). An application
 built on it would add:
 
 - adapters for the protocols its devices speak, such as OPC UA, Modbus or MQTT;
@@ -275,7 +275,7 @@ queries at any zoom level, restart to serving and size on disk; the figures and 
 | [`log/`](log/) | `kvik-log`: the on-disk log format (segment container, checksums, the reader up to the durable mark, the mark's slots, typed arrival batches), with golden files, property tests, a differential test against the model and a fuzz target |
 | [`chunk/`](chunk/) | `kvik-chunk`: the column encodings and block bodies of compacted chunks (delta bit-packing, scaled decimals with exceptions, XOR with a compressed fallback, run-length), with golden files, property tests and a fuzz target |
 | [`files/`](files/) | `kvik-files`: the manifest's records, the catalogue of files replayed from them, and the rebuild of a manifest with a corrupt record from the local files, with golden files, property tests and a fuzz target |
-| [`export/`](export/) | `kvik-export`: Parquet export of a series' facts; the schema is provisional ([`docs/export.md`](docs/export.md)) |
+| [`export/`](export/) | `kvik-export`: Parquet export of a series' facts, one file or one per UTC month; schema version 1 ([`docs/export.md`](docs/export.md)) |
 | [`sinkapi/`](sinkapi/) | `kvik-sink-api`: the backup sink trait and its types, a leaf crate shared by the store, the sinks and the backup driver; `kvik` re-exports it |
 | [`backup/`](backup/) | `kvik-backup`: backup and restore: the envelope, object keys, the manifest port and the upload and restore drivers' interfaces, with fakes behind the `test-support` feature |
 | [`sink/`](sink/) | `kvik-sink`: the backup sink over S3-compatible object storage (signing, conditional single-part uploads with their SHA-256, retries and timeouts) and an in-memory fake bucket with injected faults |

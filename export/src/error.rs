@@ -21,7 +21,7 @@ pub enum ExportError {
         /// Why.
         reason: &'static str,
     },
-    /// The series has a kind or value type the provisional schema does not cover.
+    /// The series has a kind or value type the schema does not cover yet.
     #[error("series not supported by the export: {reason}")]
     UnsupportedSeries {
         /// Why.
@@ -71,7 +71,7 @@ pub enum ExportError {
         /// The fact's position.
         position: Position,
     },
-    /// A `changed_at` of kind `time` above `i64::MAX` nanoseconds, which a Parquet timestamp cannot hold (Q-195).
+    /// A `changed_at` of kind `time` above `i64::MAX`, beyond a Parquet timestamp; ingest refuses one (Q-195).
     #[error("fact at {position}: changed_at {changed_at} beyond the timestamp range")]
     ChangedAtOutOfRange {
         /// The fact's position.
@@ -84,6 +84,14 @@ pub enum ExportError {
     IntervalEndOutOfRange {
         /// The fact's position.
         position: Position,
+    },
+    /// A partitioned export could not open one of its files.
+    #[error("cannot open {path}: {source}")]
+    Open {
+        /// The file's relative path.
+        path: String,
+        /// Why.
+        source: std::io::Error,
     },
     /// A file that does not follow the export schema.
     #[error("not an export file: {reason}")]

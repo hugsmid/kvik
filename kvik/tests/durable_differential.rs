@@ -72,6 +72,7 @@ fn specs() -> Vec<SeriesSpec> {
             },
             "",
         ),
+        SeriesSpec::new("h/w/notice", Kind::Text, "").versioned(ChangedAtKind::Time),
     ]
 }
 
@@ -106,20 +107,25 @@ fn quality(code: u8) -> Quality {
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     let reading = (
-        0usize..8,
+        0usize..9,
         -400i64..200,
         any::<u8>(),
         any::<u8>(),
-        prop_oneof![Just(None), (0u64..3).prop_map(Some)],
+        // The bound of a `time` `changed_at` (Q-195) as well as small versions.
+        prop_oneof![
+            1 => Just(None),
+            2 => (0u64..3).prop_map(Some),
+            1 => prop::sample::select(vec![i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX]).prop_map(Some),
+        ],
         prop::bool::weighted(0.15),
     );
     let step = prop_oneof![
         10 => (prop::collection::vec(reading, 1..6), any::<bool>())
             .prop_map(|(r, rev)| Step::Emit(r, rev)),
-        1 => (0usize..7, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
-        1 => (0usize..7, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
-        1 => (0usize..7).prop_map(Step::Define),
-        1 => (0usize..7, any::<bool>()).prop_map(|(i, d)| Step::Retention(i, d)),
+        1 => (0usize..8, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
+        1 => (0usize..8, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
+        1 => (0usize..8).prop_map(Step::Define),
+        1 => (0usize..8, any::<bool>()).prop_map(|(i, d)| Step::Retention(i, d)),
         1 => (0usize..ZONES.len(), -100i64..100).prop_map(|(z, t)| Step::SiteZone(z, t)),
         2 => (0u64..400).prop_map(Step::Advance),
         1 => prop::bool::weighted(0.7).prop_map(Step::Synced),

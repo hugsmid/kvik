@@ -211,6 +211,10 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
+    pub(crate) fn store_id(&self) -> [u8; 16] {
+        self.store_id
+    }
+
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }

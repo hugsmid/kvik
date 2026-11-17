@@ -3481,6 +3481,46 @@ fn s2_2_changed_at_on_versioned_series_only() {
     assert_eq!(m.current().unwrap()[&(v, T0)].changed_at, Some(1));
 }
 
+/// §2.2, Q-195: a `changed_at` of kind `time` above `i64::MAX` is refused and
+/// counted; one of kind `version` is not.
+#[test]
+fn s2_2_a_time_changed_at_above_i64_max_is_refused() {
+    let (mut m, version) = versioned_model();
+    let time = m
+        .define_with(
+            "site/forecast-1/issued",
+            Kind::Gauge,
+            ValueType::Number,
+            "kW",
+            10 * SECOND,
+            SeriesOptions {
+                expected_interval: Some(SECOND),
+                ..SeriesOptions::versioned(ChangedAtKind::Time)
+            },
+        )
+        .unwrap();
+    let max = i64::MAX as u64;
+    for c in [max + 1, u64::MAX] {
+        assert_eq!(
+            m.emit(Reading::versioned(time, T0, 1.0, c)),
+            Err(Refusal::ChangedAtOutOfRange.into())
+        );
+    }
+    assert_eq!(m.counters.refused[&Refusal::ChangedAtOutOfRange], 2);
+    assert_eq!(
+        m.emit_revise(Reading::versioned(time, T0, 1.0, max + 1)),
+        Err(Refusal::ReviseOnVersioned.into())
+    );
+    m.ingest(vec![
+        Reading::versioned(time, T0, 1.0, max),
+        Reading::versioned(version, T0, 1.0, u64::MAX),
+    ])
+    .unwrap();
+    let current = m.current().unwrap();
+    assert_eq!(current[&(time, T0)].changed_at, Some(max));
+    assert_eq!(current[&(version, T0)].changed_at, Some(u64::MAX));
+}
+
 /// §2.1 `timing`: a forecast series "must be versioned with `changed_at kind`
 /// `time`".
 #[test]

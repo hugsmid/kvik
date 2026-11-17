@@ -126,6 +126,7 @@ pub(crate) fn refusal(r: &km::engine::Refusal) -> Option<Refusal> {
         R::ChangedAtMissing => Refusal::ChangedAtMissing,
         R::ChangedAtUnexpected => Refusal::ChangedAtUnexpected,
         R::ReviseOnVersioned => Refusal::ReviseOnVersioned,
+        R::ChangedAtOutOfRange => Refusal::ChangedAtOutOfRange,
         R::OffPhase => Refusal::OffPhase,
     })
 }

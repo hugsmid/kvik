@@ -88,6 +88,10 @@ impl Shared {
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
+
+    pub(crate) fn store_id(&self) -> [u8; 16] {
+        self.with(|s| s.store_id)
+    }
 }
 
 /// Finds the in-memory store of a directory, for a reader.
@@ -185,6 +189,9 @@ pub(crate) struct Slot {
     /// Waits by reason.
     waits: BTreeMap<Wait, u64>,
     batches: u64,
+    /// Drawn from the environment's entropy at creation, as the durable backend's is; kept across restarts in
+    /// this process.
+    store_id: [u8; 16],
     clock_jumps: u64,
     last_jump: Option<ClockJump>,
     /// Loss identities acknowledged.
@@ -237,6 +244,8 @@ impl Slot {
             .collect::<Result<Vec<_>>>()?;
         let mut model = Model::new(model_config(config)?, slots, wall);
         model.clock_synchronised = clock.synchronised();
+        let mut store_id = [0u8; 16];
+        config.env.entropy.fill(&mut store_id);
         Ok(Slot {
             dir: config.dir.clone(),
             mark_sync: mark_sync_mode(config),
@@ -256,6 +265,7 @@ impl Slot {
             next_wait_token: 0,
             waits: BTreeMap::new(),
             batches: 0,
+            store_id,
             clock_jumps: 0,
             last_jump: None,
             acknowledged: BTreeSet::new(),

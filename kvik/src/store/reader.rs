@@ -60,6 +60,17 @@ impl Reader {
         }
     }
 
+    /// The store's id (`format.md` A.1), as read at open: no file is read and
+    /// the lease is not renewed. The model backend draws one when the
+    /// store is created, from the environment's entropy.
+    pub fn store_id(&self) -> [u8; 16] {
+        match &self.inner {
+            ReaderInner::Model(s) => s.store_id(),
+            ReaderInner::Process(r) => r.store_id(),
+            ReaderInner::Store(w) => w.store_id(),
+        }
+    }
+
     /// Re-reads the mark, the manifest tail and the new entries, and renews
     /// the lease.
     pub fn refresh(&self) -> Result<ReaderState, QueryError> {

@@ -1,5 +1,4 @@
-//! The provisional export schema (`docs/export.md`, Q-190): columns, their Arrow types and the file's key-value
-//! metadata.
+//! The export schema (`docs/export.md`, Q-190): columns, their Arrow types and the file's key-value metadata.
 
 use std::sync::Arc;
 
@@ -10,8 +9,8 @@ use kvik::{
 
 use crate::ExportError;
 
-/// The schema version written to every file; `0` while the schema is provisional (Q-190).
-pub const EXPORT_VERSION: &str = "0";
+/// The schema version written to every file (Q-190, `docs/export.md` Compatibility).
+pub const EXPORT_VERSION: &str = "1";
 
 /// Precision of the decimal value column: every `i64` units value fits (Q-192).
 pub const DECIMAL_PRECISION: u8 = 19;

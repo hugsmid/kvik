@@ -38,6 +38,9 @@ pub enum Refusal {
     /// `revise` intent on a versioned series (spec §2.4).
     #[error("revise on a versioned series")]
     ReviseOnVersioned,
+    /// A `changed_at` above `i64::MAX` on a series of `changed_at kind` `time` (spec §2.2, Q-195).
+    #[error("changed_at of kind time above i64::MAX")]
+    ChangedAtOutOfRange,
     /// A reading of an interval series whose `t` is not an interval start.
     #[error("t is not an interval start")]
     OffPhase,

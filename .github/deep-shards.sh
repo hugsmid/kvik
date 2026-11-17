@@ -64,6 +64,7 @@ backup-upload   backup upload_histories
 backup-plan     backup restore_plan
 backup-restore  backup restore_properties
 backup-chain    backup restore_chain_properties
+export-layout   export layout
 '
 
 cd "$(dirname "$0")/.."

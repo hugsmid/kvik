@@ -75,7 +75,7 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   A.14; Q-171 and Q-174 settled at its review)
 - [ ] 6.3b Atomic publish-and-retire: the store publishes compaction outputs and retires inputs through the manifest,
   and a start calls the rebuild and the copies of a corrupt record (moved from 6.3)
-- [ ] 6.4a Parquet export: the export schema (provisional, `docs/export.md`) and the Parquet writer (unticked pending Q-190 to Q-197)
+- [x] 6.4a Parquet export: the export schema (`docs/export.md`, version 1 by the owner's rulings on Q-190 to Q-197), the Parquet writer and the partitioned layout
 - [ ] 6.4b Differential check of compacted data against the Parquet export (moved from 6.4)
 - [ ] 6.5 **Gate** — compaction looked at as a whole (includes: measure a pure-Rust codec, `ruzstd` or `lz4_flex`, on the XOR
   stream; within about 10 % of zstd level 3 on the °F→°C shape it replaces the C library, otherwise zstd stays and CI

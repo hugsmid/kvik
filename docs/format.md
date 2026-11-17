@@ -259,8 +259,10 @@ and ignorable rule.
   stored: bad for a `no_value` row, else the worse of the supplied quality and suspect when `future` is set.
 - A `no_value` row has `value = 0` and the series' declared `value_type`.
 - Flag bit 6 `has_changed_at`: the row belongs to a versioned series and column 8 holds its `changed_at`, an unsigned
-  integer to which the rule that times are `i64` does not apply; other rows hold 0 there. Flag bit 7 `rounded`: the
-  value was rounded to the series' scale (`spec.md` §2.1 `excess precision`). Bits 8–15 are undefined and critical.
+  integer to which the rule that times are `i64` does not apply; other rows hold 0 there. Ingest refuses a `changed_at`
+  above `i64::MAX` on a series of versioning 1 (`spec.md` §2.2, Q-195); a reader accepts any value (Q-760). Flag
+  bit 7 `rounded`: the value was rounded to the series' scale (`spec.md` §2.1 `excess precision`). Bits 8–15 are
+  undefined and critical.
 - Column 9 holds the scale each decimal row was stored at (the series' scale at the row's position); other rows hold
   0 there. A reader rescales exactly to the series' current scale, so a fact never depends on a raise entry being
   kept.

@@ -1532,6 +1532,81 @@ fn versioned_series_and_outranked_facts_on(b: Backend) {
 }
 
 #[test]
+fn the_store_id_is_the_same_through_every_reader_and_after_a_reopen() {
+    for b in BACKENDS {
+        let name = "store-id";
+        let (s, clock) = store_on(b, name);
+        let id = s.reader().store_id();
+        assert_ne!(id, [0u8; 16], "{b:?}");
+        let other = Reader::open(reader_on(b, name, &clock)).unwrap();
+        assert_eq!(other.store_id(), id, "{b:?}");
+        drop(other);
+        drop(s);
+        let mut reopen = config_on(b, name, &clock);
+        reopen.env.entropy = Arc::new(kvik::env::FixedEntropy::new(50));
+        let again = block_on(Store::open(reopen)).unwrap();
+        assert_eq!(again.reader().store_id(), id, "{b:?}");
+        let mut config = config_on(b, "store-id-other", &clock);
+        config.env.entropy = Arc::new(kvik::env::FixedEntropy::new(100));
+        let fresh = block_on(Store::open(config)).unwrap();
+        assert_eq!(fresh.reader().store_id()[0], 100, "{b:?}");
+    }
+}
+
+#[test]
+fn a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not() {
+    for b in BACKENDS {
+        a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not_on(b);
+    }
+}
+
+fn a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not_on(b: Backend) {
+    let (s, _clock) = store_on(b, "changed-at-range");
+    let time =
+        block_on(s.define_series(gauge("grid/area/issued", 1).versioned(ChangedAtKind::Time)))
+            .unwrap();
+    let version =
+        block_on(s.define_series(gauge("grid/area/counted", 1).versioned(ChangedAtKind::Version)))
+            .unwrap();
+    let max = i64::MAX as u64;
+    let ack = block_on(s.emit(&[
+        num(time, 0, 1.0).changed_at(max),
+        num(time, 1, 1.0).changed_at(max + 1),
+        num(time, 2, 1.0).changed_at(u64::MAX),
+        num(version, 0, 1.0).changed_at(u64::MAX),
+    ]))
+    .unwrap();
+    assert_eq!(
+        refused(&ack),
+        vec![
+            (1, Refusal::ChangedAtOutOfRange),
+            (2, Refusal::ChangedAtOutOfRange)
+        ],
+        "{b:?}"
+    );
+    assert_eq!(ack.recorded(), 2);
+    assert_eq!(
+        s.series_stats(time).unwrap().refused[&Refusal::ChangedAtOutOfRange],
+        2
+    );
+    let revise =
+        block_on(s.emit_with(&[num(time, 3, 1.0).changed_at(max + 1)], Intent::Revise)).unwrap();
+    assert_eq!(refused(&revise), vec![(0, Refusal::ReviseOnVersioned)]);
+    let r = s.reader();
+    assert_eq!(
+        facts(&r, time, at(0)..at(4), View::History)
+            .iter()
+            .map(|f| f.changed_at)
+            .collect::<Vec<_>>(),
+        vec![Some(max)]
+    );
+    assert_eq!(
+        facts(&r, version, at(0)..at(1), View::Current)[0].changed_at,
+        Some(u64::MAX)
+    );
+}
+
+#[test]
 fn future_facts_are_flagged() {
     for b in BACKENDS {
         future_facts_are_flagged_on(b);

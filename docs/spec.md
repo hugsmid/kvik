@@ -88,8 +88,9 @@ and counted. The old id stays reachable by id.
   reading and should rise with each, and it is the same on every replay of one revision: the adapter must not take a
   time at replay. It is compared as an unsigned
   integer and never with `t`, `received_at` or any clock. A reading on a versioned series without it, or with it on
-  any other series, is refused and counted. A source whose versions are coarser than its revisions can still have a
-  correction with the same `changed_at` reverted (§2.4).
+  any other series, is refused and counted, as is one above `i64::MAX` on a series of `changed_at kind` `time`, which
+  must fit a timestamp as every other time does (Q-195). A source whose versions are coarser than its revisions can
+  still have a correction with the same `changed_at` reverted (§2.4).
 - **Rank:** a fact's position, or in a versioned series `(changed_at, position)`, compared lexicographically.
 - `t`: event time, UTC nanoseconds, from the adapter. The adapter declares `t_source: device | host`.
 - `received_at`: host clock at commit. `commit_time`: per batch, `max(received_at, previous commit_time)`.

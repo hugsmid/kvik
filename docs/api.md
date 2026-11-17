@@ -121,7 +121,7 @@ pub struct ZoneName(String);       // an IANA name; checked against the tzdata r
 ```rust
 pub enum Refusal {                 // per reading, in Ack; each counted per series
     UnknownSeries, Retired, WrongType, StateOutOfRange, TextTooLong, ChangedAtMissing, ChangedAtUnexpected,
-    ReviseOnVersioned, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
+    ReviseOnVersioned, ChangedAtOutOfRange, OffPhase, NotDeclared, ExcessPrecision { scale_needed: u8 } }
 pub enum Wait { QueueFull, DiskFull, UnsyncedClock }                // back-pressure: not a refusal, not a fault
 pub enum EmitError {               // per call
     Busy(Wait),                    // try_emit only: nothing was queued
@@ -245,7 +245,9 @@ store.emit_with(&readings, Intent::Revise).await?;
   which is acknowledged after every batch before it (Q-123 (b)).
 - Individual readings may be refused (`Refusal`, reported per index); a non-finite value is recorded, not refused,
   and so is a decimal value out of range, whose outcome says so (`out_of_range`, spec §2.5).
-  A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`.
+  A reading of an interval series whose `t` is not an interval start is refused with `Refusal::OffPhase`, and a
+  `changed_at` above `i64::MAX` on a series of `changed_at kind` `time` with `Refusal::ChangedAtOutOfRange` (spec
+  §2.2, Q-195).
 - **Back-pressure** is a wait, with its reason: `try_emit` returns `Busy(Wait)`, including `UnsyncedClock` when the
   call holds a host-stamped reading; `emit` waits, and `stats().ingest.waiting` and health name the reason. There is
   no timeout parameter: a caller that must not wait uses `try_emit`.
@@ -335,6 +337,7 @@ pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySe
 ```rust
 pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min }; blocking
 pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease
+pub fn store_id(&self) -> [u8; 16];   // added for the export (Q-196): the id read at open; no file read, no lease renewal
 pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
 pub struct ResetStamp { pub sequence: u64, pub nonce: u64 }      // zero before any reset (spec §7 Readers)
 pub struct SavedPoint { pub position: Position, pub stamp: ResetStamp }
@@ -344,7 +347,9 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 - Every read call first reads the mark and the entries appended since the reader's last call, so it sees data up to
   the mark at call time. The lease is written at open and renewed by any call once half of `lease_refresh` has
   passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
-  epoch on its next call. There is no background task.
+  epoch on its next call. There is no background task. `store_id` is the exception: an additive item (Q-196), it
+  returns the store id (`format.md` A.1) read with the descriptor at open and reads nothing. On the model backend it
+  is drawn from the environment's entropy at creation and kept while the process lives.
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
   (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
   reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
@@ -586,8 +591,10 @@ the `kvik-sink` crate. The object keys, the uploaded forms, the claim marker and
   A restore reports a refused bucket as `RestoreError::Refused` (Q-214).
 
 A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
-`export_series(&reader, id, &ExportOptions, writer)`. Its schema is provisional ([`export.md`](export.md), Q-190 to
-Q-197).
+`export_series(&reader, id, &ExportOptions, writer)` for one file, `export_partitioned(&reader, id, &ExportOptions,
+open)` for one file per UTC month under `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/`, the
+series name's three segments (Q-670); both write `reader.store_id()` into every file. Its schema is export version
+1 ([`export.md`](export.md), Q-190 to Q-197).
 
 ## Environment seams (accepted at gate 3.3)
 ```rust

@@ -31,6 +31,9 @@ fn assert_round_trip(r: &Reader, id: SeriesId, view: View) -> Vec<u8> {
     let expected = facts(r, id, view);
     assert!(!expected.is_empty());
     assert_eq!(bits(&read_back(&file)), bits(&expected), "{view:?}");
+    assert_eq!(open(&file).metadata("kvik.export_version"), Some("1"));
+    let hex: String = r.store_id().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(open(&file).metadata("kvik.store_id"), Some(hex.as_str()));
     file
 }
 

@@ -1,12 +1,18 @@
 # kvik-export
 
-Parquet export of a kvik store's facts (roadmap 6.4). The schema is provisional, drafted in
-[`docs/export.md`](../docs/export.md) with its open decisions (Q-190 to Q-197 in
+Parquet export of a kvik store's facts (roadmap 6.4). The schema, export version 1, is in
+[`docs/export.md`](../docs/export.md), with the decisions behind it (Q-190 to Q-197 in
 [`model/OPEN-QUESTIONS.md`](../model/OPEN-QUESTIONS.md)).
 
 - `export_series(&reader, id, &options, writer)` streams one series' facts from `Reader::facts` into one Parquet
   file; the exporter holds at most one row group and one batch of rows (end to end once `Reader::facts` streams).
-- `export_rows` does the same for rows from any source; `SeriesSchema::from_info` gives a series' schema.
+- `export_partitioned(&reader, id, &options, open)` writes one file per UTC month with a fact, at
+  `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet`, the series name split into its
+  three segments, each escaped on its own (a month cut by the range gets a `.partial-` name); `options.site` is
+  required, and a name without three non-empty segments is refused (Q-670). Both calls write the reader's store id
+  (`Reader::store_id`) to every file's metadata, and the partitioned one the site label.
+- `export_rows` does the same as `export_series` for rows from any source; `SeriesSchema::from_info` gives a series'
+  schema.
 - `read_rows` reads a file back into `ExportRow`s from its Parquet types alone.
 
 Built on the `parquet` crate (Apache-2.0) with only its `arrow` and `zstd` features.

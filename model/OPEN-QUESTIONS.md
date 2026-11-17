@@ -32,14 +32,6 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-164 | §8 Retention class, Restore; `api.md` Reading, Backup and restore | Interface points deferred to 8.2 that need tiers or restore |
 | Q-173 | §7 Manifest, `api.md` | The operator call `rebuild_manifest`: finality, a readable manifest, several corrupt records |
 | Q-175 | §7 Manifest (rebuild step 2) | An intermediate output no record and no local file describes |
-| Q-190 | §11; `docs/export.md` | The Parquet export schema as a user contract: columns, types, version |
-| Q-191 | §2.3, §8 Re-ingest; `docs/export.md`; `api.md` Backup and restore | The default view of an export, and Parquet for orphaned and set-aside facts |
-| Q-192 | §2.1 `decimal scale`; `docs/export.md` | Decimal values in the export, and the scale in force on `SeriesInfo` |
-| Q-193 | §2.2 fact flags; `docs/export.md` | Fact flags as boolean columns or a bitfield |
-| Q-194 | §2.1 `kind`, §2.2 `quality`; `docs/export.md` | Quality and named states in the export |
-| Q-195 | §2.1 `changed_at kind`, §2.2 `changed_at`, `timing`; `docs/export.md` | A `changed_at` of kind `time` beyond the timestamp range; forecast labels |
-| Q-196 | §11, §7 Readers; `docs/export.md` | Export file layout, compression and store-level metadata |
-| Q-197 | §2.1 `interval length`; `docs/export.md` | The interval end in an export, and calendar-length interval series |
 | Q-198 | §8 Deep, Encryption, Generations, Restore; `api.md` Backup and restore | The backup and restore interfaces ahead of their implementations |
 | Q-202 | §3 Back-pressure, Commit; `api.md` Writing | A definition waiting for its acknowledgement holds up every other decision |
 | Q-203 | §3 Recovery rule 2, Order of a start step 4; §8 Acknowledging a loss | The identity of a loss found while the store is open that grows downward before a start records it |
@@ -91,6 +83,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-670 (c) | §4 Funnel; `api.md` Consuming, Errors | The pattern grammar and `RouteError` as a public promise |
 | Q-680 | `api.md` Writing, Health | `Outcome::Recorded` carrying the level and `LogStats.acknowledged` |
 | Q-681 | §2.1 `durability`, §3 Commit, invariant 10; `api.md` Configuration | What `max_unsynced` bounds |
+| Q-760 | §2.2 `changed_at`; `format.md` A.5 | A stored `changed_at` of kind `time` above `i64::MAX` |
+| Q-761 | `docs/export.md` Partitioned layout | Long and renamed series names in the partitioned layout |
 | Q-871 | `format.md` A.12 Open | A store creation cut short between its rename and the directory sync |
 
 ## Q-16 — Which commits refresh live staleness
@@ -788,92 +782,139 @@ count the same transitions (`spec.md` §2.1 `value type`).
 
 **Scenario.** A user loads monthly exports into an analytics tool by column name. If a later release renames
 `supplied_quality` or turns `generation` signed, their queries break, although no fact changed.
-**Now.** `docs/export.md` drafts the columns, their Parquet logical types and the file metadata; every file carries
-`kvik.export_version` = `0`, and the crate `kvik-export` writes and reads it back (round-trip tests in
+**Draft (roadmap 6.4a).** `docs/export.md` drafts the columns, their Parquet logical types and the file metadata; every
+file carries `kvik.export_version` = `0`, and the crate `kvik-export` writes and reads it back (round-trip tests in
 `export/tests/`).
-**Needed (owner decision pending).** Approval of the column list, names and types, or changes to them. Recommendation:
-approve as drafted, then write version `1`; adding a column or a metadata key is not a breaking change, while
-renaming, retyping or removing one raises the version.
+**Settled by the owner, 2026-11-16,** as recommended: the schema as drafted is a user contract, and every file
+carries `kvik.export_version` = `1`. Adding a column or a metadata key is not a breaking change; renaming, retyping or
+removing one raises the version (`docs/export.md` Compatibility; `export/tests/rows.rs`
+`file_metadata_names_the_series_view_and_range`).
 
 ## Q-191 — The default view of an export, and Parquet for orphaned and set-aside facts
 
 **Scenario.** A versioned price series has three revisions of the 14:00 value. An export in the current view holds
 one row for 14:00; one in the history view holds all three, which re-ingest into an empty store (§8 Re-ingest)
 needs to reproduce the revisions and the duplicate rule's state.
-**Now.** `ExportOptions::view` defaults to `Current`, and `History`, `AsOf(P)` and `AsOfTime(T)` are options.
-Orphaned and set-aside facts are returned as facts by their own calls (`api.md`), not written to Parquet.
-**Needed (owner decision pending).** (a) The default view. Recommendation: `Current`, the table most users want, with
-the re-ingest documentation naming `History`; the alternative is `History`, so that an export always survives
-re-ingest. (b) Whether orphaned and set-aside facts get a Parquet form. Recommendation: the same schema, one file
-per call, its rows spanning several series, added with roadmap 8.3.
+**Draft (roadmap 6.4a).** `ExportOptions::view` defaults to `Current`, and `History`, `AsOf(P)` and `AsOfTime(T)` are
+options. Orphaned and set-aside facts are returned as facts by their own calls (`api.md`), not written to Parquet.
+**Settled by the owner, 2026-11-16,** as recommended. (a) The default view is `Current`; `docs/export.md` Options
+names `History` as the view to export for re-ingest. (b) Orphaned and set-aside facts get the same schema, one file
+per call with rows of several series, added with roadmap 8.3 (settle-by row).
 
 ## Q-192 — Decimal values in the export, and the scale in force on `SeriesInfo`
 
 **Scenario.** A series is defined at scale 2 and raised to scale 4 (§2.1 `decimal scale`); facts are stored at
 both. One Parquet column has one `DECIMAL(p, s)`.
-**Now.** `value` is `DECIMAL(19, s)`, `s` the series' scale, each value rescaled exactly (19 digits hold any `i64`
-units), and `stored_scale` keeps each fact's stored scale, so the units and stored scale come back unchanged; a
-fact stored above `s` is an error, never rounded. `SeriesInfo` exposes only the definition's scale, so the exporter
-uses it; decimal series are not stored by either backend yet, and the tests use synthetic rows
+**Draft (roadmap 6.4a).** `value` is `DECIMAL(19, s)`, `s` the series' scale, each value rescaled exactly (19 digits
+hold any `i64` units), and `stored_scale` keeps each fact's stored scale, so the units and stored scale come back
+unchanged; a fact stored above `s` is an error, never rounded. `SeriesInfo` exposes only the definition's scale, so the
+exporter uses it; decimal series are not stored by either backend yet, and the tests use synthetic rows
 (`export/tests/rows.rs` `decimals_round_trip_with_their_stored_scale`,
 `a_decimal_stored_above_the_export_scale_is_an_error_not_a_rounding`).
-**Needed (owner decision pending).** (a) The representation. Recommendation: `DECIMAL(19, scale in force)` with
-`stored_scale` (numeric in every tool, lossless). Alternatives: `units` (`INT64`) and `scale` (`INT(8, false)`)
-columns, lossless but not directly numeric; or `DECIMAL(38, 18)` for every decimal series, numeric and lossless
-without knowing the scale in force, but showing 18 places. (b) `SeriesInfo` (or the export call) gains the scale in
-force when decimal series reach the durable backend. Until then (roadmap 6.4b) the export refuses a series whose
-stored scale exceeds the definition's (`ScaleAboveExport`), rather than taking the raised scale.
+**Settled by the owner, 2026-11-16,** as recommended. (a) `DECIMAL(19, scale in force)` with `stored_scale`. (b) The
+scale in force reaches `SeriesInfo` or the export call with decimal series on the durable backend (roadmap 6.4b,
+settle-by row); until then the export refuses a fact stored above the definition's scale (`ScaleAboveExport`).
 
 ## Q-193 — Fact flags as boolean columns or a bitfield
 
 **Scenario.** A user wants every late reading of last week: `WHERE late` against `WHERE flags & 2 <> 0`.
-**Now.** Seven `BOOLEAN` columns, named as in §2.2 and §2.5.
-**Needed (owner decision pending).** Recommendation: boolean columns; Parquet stores runs of equal booleans in a few
-bytes, and each is self-describing. Alternative: one `INT(16, false)` bitfield in `format.md` A.5 bit order, more
-compact in memory, which every query must decode with a key.
+**Draft (roadmap 6.4a).** Seven `BOOLEAN` columns, named as in §2.2 and §2.5.
+**Settled by the owner, 2026-11-16,** as recommended: seven `BOOLEAN` columns (`export/tests/rows.rs`
+`each_flag_lands_in_the_column_of_its_name`).
 
 ## Q-194 — Quality and named states in the export
 
 **Scenario.** A dashboard filters `quality = 'good'`; a re-ingest needs a named state's index, which a reordered
 list of names would change.
-**Now.** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`), dictionary-encoded; a
-named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and the declared
-names in the metadata.
-**Needed (owner decision pending).** Recommendation: as now. Alternatives: quality as `INT(8, false)` codes 0–3 (best
-to worst), smaller but needing a key; a named state as its name only, with the index found from the metadata.
+**Draft (roadmap 6.4a).** `quality` and `supplied_quality` are strings (`good`, `estimated`, `suspect`, `bad`),
+dictionary-encoded; a named state is its index (`INT(16, false)`) in `value` with its declared name in `state_name`, and
+the declared names in the metadata.
+**Settled by the owner, 2026-11-16,** as recommended: quality as dictionary-encoded strings (the outcome pinned by
+`export/tests/rows.rs` `quality_columns_are_dictionary_encoded`; the writer's explicit request matches its default
+today); a named state as its index in `value` with `state_name` beside it.
 
 ## Q-195 — A `changed_at` of kind `time` beyond the timestamp range; forecast labels
 
 **Scenario.** An adapter sends `changed_at` = 2^63 on a series of `changed_at kind` `time`. §2.2 makes `changed_at` a
 `u64` and the store records it; a Parquet timestamp is a signed 64-bit integer and cannot hold it.
-**Now.** The export fails with `ChangedAtOutOfRange` (`export/tests/rows.rs`
-`changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by
-`kvik.timing` = `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
-**Needed (owner decision pending).** (a) Recommendation: a rule that a `time` `changed_at` above `i64::MAX` is refused
-at ingest, as every other time in `format.md` is an `i64`; alternatively the column becomes `INT(64, false)` for both
-kinds, with the kind in the metadata. (b) Whether forecast exports rename their columns (`valid_time`,
-`issue_time`). Recommendation: no; the metadata label suffices and the column names stay stable.
+**Draft (roadmap 6.4a).** The export fails with `ChangedAtOutOfRange` (`export/tests/rows.rs`
+`changed_at_must_match_the_series_versioning_and_fit_a_timestamp`). A forecast series is labelled only by `kvik.timing`
+= `forecast`: `t` is the valid time and `changed_at` the issue time (F-13).
+**Settled by the owner, 2026-11-16,** as recommended. (a) A `changed_at` above `i64::MAX` on a series of `changed_at
+kind` `time` is refused at ingest and counted, as every other time in `format.md` is an `i64`:
+`Refusal::ChangedAtOutOfRange` on both backends, checked after `ChangedAtMissing`, `ChangedAtUnexpected` and
+`ReviseOnVersioned` (`spec.md` §2.2, `api.md` Errors; `model/tests/rules.rs`
+`s2_2_a_time_changed_at_above_i64_max_is_refused`, `kvik/tests/api.rs`
+`a_time_changed_at_above_i64_max_is_refused_and_a_version_is_not`). `i64::MAX` itself is accepted; a `changed_at` of
+kind `version` stays any `u64`. The export keeps `ChangedAtOutOfRange` for rows that reach it otherwise (`export_rows`,
+or a log that holds one, Q-760). (b) Forecast exports keep the column names `t` and `changed_at`; the label
+`kvik.timing` = `forecast` says which is the valid time and which the issue time.
 
 ## Q-196 — Export file layout, compression and store-level metadata
 
 **Scenario.** A user exports a hundred series: a hundred files, each with a typed `value` column, or one file whose
 value column cannot have one type. Later they want to know which store and which durable point an export came from.
-**Now.** One file per series per call; row groups of at most 131,072 rows; zstd level 1. The metadata names the
-series, view and range, not the store: its id, tzdata version, durable position and reset stamp are not reachable
-through the public `Reader` without a side effect (`refresh`).
-**Needed (owner decision pending).** (a) Recommendation: one file per series; the alternative, one file per export
-with a value column per value type (all but one null in each row), suits many small series. (b) The row-group
-default and the compression. (c) Store-level metadata, recommended when the export call joins the store's
-interface (8.3), and the saved point of a continued export (row 7b) after 5.3.
+**Draft (roadmap 6.4a).** One file per series per call; row groups of at most 131,072 rows; zstd level 1. The metadata
+names the series, view and range, not the store: its id, tzdata version, durable position and reset stamp are not
+reachable through the public `Reader` without a side effect (`refresh`).
+**Settled by the owner, 2026-11-16,** as recommended, and beyond the draft. (a) One file per series per period. (b) Row
+groups of at most 131,072 rows; zstd level 1. Beyond the draft: store and site identity in every file's metadata now,
+and a partitioned path layout `site=<site>/series=<series>/month=<YYYY-MM>/` for consolidating many sites from a
+bucket. Applied as follows (`docs/export.md` Options, Partitioned layout, Metadata; `export/tests/layout.rs`), the
+choices below being the implementation's, not the ruling's:
+- `kvik.store_id` (32 lower-case hex digits, as `format.md` A.17 writes a store id) is in every file `export_series`
+  and `export_partitioned` write: they take it from `Reader::store_id`, an additive read-only item of the interface
+  that returns the id read at open (`api.md` Reader processes; `kvik/tests/api.rs`
+  `the_store_id_is_the_same_through_every_reader_and_after_a_reopen`), and refuse a different one in the options.
+  `kvik.site` is in every partitioned file, which needs a site; `export_series` writes it when given. `export_rows`,
+  which has no reader, writes either only when given.
+- The rest of the store-level metadata (tzdata version, durable position, reset stamp) is not reachable through the
+  public `Reader` without a side effect (`refresh`), so it is not yet in the files; it comes with the export call in
+  the store's interface, and the saved point of a continued export (row 7b) after 5.3 (c, settle-by row 8.3).
+- A site label is 1 to 64 bytes of `a`–`z`, `0`–`9`, `-` and `_`, starting with a letter: one folder on every file
+  system and bucket, case-folding or not, never `.` or `..`, and never read as a number by a Hive-style reader
+  (pyarrow and polars read `site=0042` as 42).
+- `export_partitioned` writes one file per series per UTC month with a fact, at
+  `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet` (the amendment below). Each
+  segment is escaped on its own, byte by byte: `a`–`z`, `0`–`9`, `-` and `_` kept, every other byte `%XX` in
+  upper-case hex; reversible, one escaped form per segment, and injective under case folding (property tests
+  `any_name_round_trips_through_its_segment`, `each_name_segment_round_trips_through_its_own_path_segment`,
+  `a_segment_built_from_valid_tokens_is_the_escape_of_its_name`, `a_segment_with_one_invalid_token_does_not_unescape`).
+  An all-digit segment stays all digits, so `docs/export.md` tells readers to declare the partition columns as
+  strings. The month is the UTC month of `t` for every series, interval series included (an interval goes under
+  the month of its start): it needs no tzdata, so it is the same in every release and site zone and months line up
+  across sites (`months_cut_at_utc_midnight_on_the_first`, `a_month_holds_its_timestamps_and_starts_where_the_last_ends`
+  against a days-from-civil oracle). The file name is the view (`current`, `history`, `as_of-<g>-<s>`,
+  `as_of_time-<ns>`), so exports in different views do not replace one another; a month the range cuts is named
+  `<view>.partial-<from_ns>_<to_ns>.parquet`, so it never replaces a whole month's file. The files of one call are
+  not one cut of the store, and a caller publishes them after the call returns (`docs/export.md` Partitioned
+  layout). Long and renamed names: Q-761.
+
+**Amended by the owner, 2026-11-17.** With three-segment names (Q-670), the path splits the series name into its
+segments, `site=<site>/area=<segment 1>/device=<segment 2>/metric=<segment 3>/month=<YYYY-MM>/`, so cloud engines can
+prune by area, device or metric; file contents and export version 1 unchanged. Applied as follows, the choices being
+the implementation's:
+- The name is split at `/` (`name_segments`), and each segment escaped as above; a segment holds no `/`, so no
+  escaped segment holds `%2F`. Until Q-670 is enforced at definition and alias, `export_partitioned` refuses a series
+  whose name has fewer or more than three segments, or an empty one, with `UnsupportedSeries` before it reads a fact
+  or calls `open`, rather than filing it elsewhere
+  (`a_name_without_exactly_three_non_empty_segments_has_no_partition_folder`,
+  `a_name_of_other_than_three_segments_or_with_an_empty_one_is_refused`,
+  `a_partitioned_export_refuses_a_name_without_three_non_empty_segments_and_opens_nothing_on_both_backends`).
+- `area`, `device` and `metric` join `site`, `series` and `month` as names no file column may take (`docs/export.md`
+  Compatibility); `series` stays reserved for readers of the first form.
+- The reading examples declare all five partition columns as strings; DuckDB, pyarrow and polars were checked on
+  exported files, pruned by device and by metric across devices.
 
 ## Q-197 — The interval end in an export, and calendar-length interval series
 
 **Scenario.** A half-hourly import series is exported for a billing tool that wants each interval's end, not its
 length.
-**Now.** An interval series has an `interval_end` column, `t + d` (F-14, F-17), and `kvik.interval_length_ns`.
-Calendar-length interval series are refused by the export, as neither backend stores them.
-**Needed (owner decision pending).** Recommendation: keep `interval_end`; for calendar lengths (7.3) take each end from
-the interval zone under the tzdata version in force at export, recorded in the metadata.
+**Draft (roadmap 6.4a).** An interval series has an `interval_end` column, `t + d` (F-14, F-17), and
+`kvik.interval_length_ns`. Calendar-length interval series are refused by the export, as neither backend stores them.
+**Settled by the owner, 2026-11-16,** as recommended: keep `interval_end`. For calendar lengths each end is taken from
+the interval zone under the tzdata version in force at export, recorded in the metadata; built with calendar-length
+interval series (roadmap 7.3, settle-by row).
 
 ## Q-198 — The backup and restore interfaces ahead of their implementations
 
@@ -2025,6 +2066,37 @@ and the writer starts that sync at the latest `max_unsynced` after the first fla
 `api.md` Configuration). **Proposed.** Keep the wording; a hard bound would make ingest of `written` series wait
 while a sync overruns.
 
+## Q-760 — A stored `changed_at` of kind `time` above `i64::MAX`
+
+**Scenario.** Since Q-195 (a) ingest refuses a `changed_at` above `i64::MAX` on a series of `changed_at kind` `time`.
+A log written before that rule, or by other software, holds a fact row of such a series with `changed_at` = 2^63
+(`format.md` A.5 column 8). Recovery and the readers accept it as stored; the export then fails on that series with
+`ChangedAtOutOfRange`.
+**Now.** A reader accepts any `u64` in column 8 (`format.md` A.5); only ingest checks the range. The facts block
+alone does not know the series' versioning, so a check would sit with the registry, as the Q-182 check of a
+definition's state names does in its own entry.
+**Needed.** Whether such a row is invalid content in the log (recovery treats the batch as damaged), is kept and
+reported, or stays accepted as now. Recommendation: accept it as now, because no store has recorded one under the
+rule and refusing it at recovery would turn a valid older log into a loss.
+
+## Q-761 — Long and renamed series names in the partitioned layout
+
+**Scenario.** (a) A series name may be up to 255 bytes (`format.md` A.6 definition field 2), so its three segments
+(Q-670) hold at most 253 bytes together and one at most 251. In the partitioned layout (Q-196 as amended) each is
+escaped to up to three times its length, so a folder such as `device=<segment>` can reach 760 bytes and exceed the
+255-byte limit most local file systems put on one file name. The longest path is 960 bytes (a 64-byte site, 759
+bytes of escaped segments and the longest partial `as_of` file name, 95 bytes), so a bucket key (1,024 bytes) holds
+it only while the caller's own prefix is at most 64 bytes. (b) A series renamed in
+March is filed under its new name from March on, and so is January when it is exported again, so one series' months
+sit in two folders.
+**Now.** The layout is as settled: the folders are the escaped segments of the display name at export time;
+`kvik.series_id` in every file ties a renamed series' folders together; a path the caller cannot create fails in
+`open` (`ExportError::Open`).
+**Needed.** (a) Whether a long name keeps its full segment (as now), or a shorter form takes its place, such as a
+truncated segment with a hash, which is not reversible. (b) Whether the path should carry the series id as well
+or instead of the name, which a rename does not change but a reader cannot filter by name.
+Recommendation: (a) as now, as a bucket is the target; (b) as now, with the id in the metadata.
+
 ## Q-871 — A store creation cut short between its rename and the directory sync
 Recorded by the implementation of the Q-630 ruling (the crash sweep of
 `log/tests/recovery.rs` `a_crash_while_creating_the_store_or_in_its_first_start_is_recovered` found it once the
@@ -2050,7 +2122,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -2083,14 +2155,10 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-164 | 8.1, 8.3 | Interface points deferred to 8.2: (a) and (b) with 8.1, (c) with 8.3; recorded by roadmap 8.2 |
 | Q-173 | 6.3b | The operator call `rebuild_manifest`; recorded by roadmap 6.3a; its signature and finality come with the call in `api.md`, which 6.3b adds |
 | Q-175 | 6.3b | An intermediate output no record and no local file describes; recorded at the review of roadmap 6.3a; needs two corrupt merges, so it arises only once 6.3b publishes compaction outputs |
-| Q-190 | 6.4 | Parquet export schema; recorded by roadmap 6.4a; owner decision pending |
-| Q-191 | 6.4 | Default export view; recorded by roadmap 6.4a; owner decision pending |
-| Q-192 | 6.4 | Decimal export; recorded by roadmap 6.4a; owner decision pending; the scale in force on `SeriesInfo` comes with decimal series in the durable backend |
-| Q-193 | 6.4 | Flag columns; recorded by roadmap 6.4a; owner decision pending |
-| Q-194 | 6.4 | Quality and state columns; recorded by roadmap 6.4a; owner decision pending |
-| Q-195 | 6.4 | `changed_at` of kind `time` beyond `i64::MAX`; recorded by roadmap 6.4a; owner decision pending |
-| Q-196 | 6.4 | Export file layout; recorded by roadmap 6.4a; owner decision pending; store-level metadata with 8.3 and 5.3 |
-| Q-197 | 6.4 | Interval end; recorded by roadmap 6.4a; owner decision pending; calendar lengths with 7.3 |
+| Q-191 (b) | 8.3 | Parquet form of orphaned and set-aside facts; settled by the owner, 2026-11-16 (the export schema, one file per call); built with the export call at 8.3 |
+| Q-192 (b) | 6.4b | The scale in force on `SeriesInfo` or the export call; settled by the owner, 2026-11-16; comes with decimal series on the durable backend, `ScaleAboveExport` until then |
+| Q-196 (c) | 8.3 | Store-level metadata beyond the store id (tzdata version, durable position, reset stamp) with the export call in the store's interface; the saved point of a continued export after 5.3; settled by the owner, 2026-11-16; the store id is in every file already, from `Reader::store_id` |
+| Q-197 (calendar lengths) | 7.3 | Interval ends of calendar-length series from the interval zone, tzdata version in the metadata; settled by the owner, 2026-11-16; built with calendar-length interval series |
 | Q-198 | 8.1b, 8.3 | Backup and restore interfaces; recorded at the interfaces commit; (a) to (d) decided and built by 8.1b to 8.3d; (e) and (f) settled by `format.md` A.17 at 8.1a; the remaining mismatches, Q-213 and Q-214, settled by 8.3b |
 | Q-202 | 5.5 | Entries acknowledged under the decision lock; recorded by the review of the durable backend |
 | Q-203 | 5.6 | Gate, with Q-123 (d); recorded by the review of the durable backend |
@@ -2146,6 +2214,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
 | Q-871 | 8.3 | Decided with the Q-630 work: opening a store syncs its directory; for the owner's acceptance |
+| Q-760 | 5.6 | Gate; recorded when the owner's ruling on Q-195 (a) was applied |
+| Q-761 | 6.4b | Partitioned export layout; recorded when the owner's ruling on Q-196 was applied |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -2379,6 +2449,14 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-180 | Stored nodes keep sums, integrals and increases exact | `spec.md` §5.6, §6, invariants 6, 7, 21, 22; `format-tree.md` T.3 (settled at the review of roadmap 7.1a: exact, stored as dyadic numbers, folded with a dyadic accumulator; measurements in the question) |
 | Q-181 | Which zero is the minimum of +0.0 and −0.0 | `spec.md` §5.2, §5.6; `format-tree.md` T.5 (settled at the review of roadmap 7.1a: IEEE total order, −0.0 below +0.0) |
 | Q-182 | A state name declared twice | `spec.md` §2.1 `value type`; `format.md` A.6 field 13 (settled at the review of roadmap 7.1a: names are distinct, a definition repeating one is refused) |
+| Q-190 | The Parquet export schema as a user contract | `docs/export.md` Columns, Metadata and Compatibility (settled by the owner, 2026-11-16: the schema as drafted, `kvik.export_version` = `1`; adding a column or metadata key is not breaking, renaming, retyping or removing one raises the version) |
+| Q-191 | The default view of an export, and Parquet for orphaned and set-aside facts | `docs/export.md` Scope and Options (settled by the owner, 2026-11-16: (a) `Current` by default, `History` named for re-ingest; (b) the same schema, one file per call, built at 8.3) |
+| Q-192 | Decimal values in the export, and the scale in force on `SeriesInfo` | `docs/export.md` Columns (settled by the owner, 2026-11-16: (a) `DECIMAL(19, scale in force)` with `stored_scale`; (b) the scale in force with decimal series on the durable backend, 6.4b; `ScaleAboveExport` until then) |
+| Q-193 | Fact flags as boolean columns or a bitfield | `docs/export.md` Columns (settled by the owner, 2026-11-16: boolean columns) |
+| Q-194 | Quality and named states in the export | `docs/export.md` Columns and File layout (settled by the owner, 2026-11-16: dictionary-encoded quality strings; a named state as index plus `state_name`) |
+| Q-195 | A `changed_at` of kind `time` beyond the timestamp range; forecast labels | `spec.md` §2.2, `api.md` Errors and Writing, `format.md` A.5, `docs/export.md` (settled by the owner, 2026-11-16: (a) refused at ingest with `Refusal::ChangedAtOutOfRange` on both backends, `i64::MAX` accepted; (b) forecast exports keep their column names, labelled by `kvik.timing`; the stored case is Q-760) |
+| Q-196 | Export file layout, compression and store-level metadata | `docs/export.md` File layout, Partitioned layout, Options and Metadata; `api.md` Reader processes (settled by the owner, 2026-11-16: one file per series per period, row groups of at most 131,072 rows, zstd level 1; site and store identity in the metadata, the store id from `Reader::store_id`; `site=<site>/series=<escaped name>/month=<UTC YYYY-MM>/<view>.parquet`, amended 2026-11-17 to `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<UTC YYYY-MM>/<view>.parquet`, each segment escaped on its own and a name without three non-empty segments refused (Q-670); a clipped month as `<view>.partial-<from_ns>_<to_ns>.parquet`; the rest of the store-level metadata at 8.3, Q-196 (c); names: Q-761) |
+| Q-197 | The interval end in an export, and calendar-length interval series | `docs/export.md` Columns (settled by the owner, 2026-11-16: keep `interval_end`; calendar-length ends from the interval zone under the tzdata version in force at export, recorded in the metadata, built at 7.3) |
 | Q-108 | A restore from a rebuilt manifest only partly uploaded | §8 Generations (settled by roadmap 8.3a, as the question suggested: a rebuilt manifest counts for a restore only once it is whole in the bucket, its closing empty record, the one without field 100, uploaded; the restore reads from the last such rebuild record up to the next rebuild record, and with none whole it reads the records before the first rebuild record that opens a rebuilt manifest, which the old manifest uploaded before it; records upload in epoch order, so a whole rebuilt manifest is self-contained). Scenario: a rebuild record and some carried records are in the bucket, the rest not; read from the rebuild record, a restore misses files named only by records not yet carried, and their positions become a gap or a set-aside range although the bucket holds the files and the records naming them. A rule keyed on the rebuild record alone reads that truncated list. What a whole rebuilt manifest restores before its files are verified again is Q-295. The selection is `kvik_backup::plan::records_to_read`, which the restore driver applies before the fold (`backup/tests/restore_plan.rs` `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `q108_records_after_a_whole_rebuilt_manifest_are_read_with_it_and_a_later_partial_one_is_not`) |
 | Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, the general case of the rule). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`); a gap that holds a position of a listed segment with no copy is never bridged, since the entry is then not the next restored position. The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The loss side is guaranteed by the log's start, which goes read-only rather than seal without the record. The listing side rests on the sealed-segment record being appended after the start that recorded the gaps, an invariant roadmap 6.3b states (`format.md` A.14, Q-220 (e): no sealed-segment record has an epoch below a lost-range record of the start that preceded its seal; `log/tests/seal_describe.rs` `no_description_leaves_the_writer_before_the_gap_below_a_recovery_entry_is_recorded`, `a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing`), and roadmap 8.4a needs a kill-loop case with a truncated tail, a seal and a restore. Should it fail, the plan ends the log at the gap and sets later data aside: conservative. The hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing`, `the_restored_end_is_the_one_the_spec_walks_to` |
 | Q-293 | What a restore plan lists, places and fetches | §8 Restore steps 1 and 3, Generations; `format.md` A.14 `0x25` (decided by roadmap 8.3a). Every live file with a recorded copy in deep is listed, set-aside files included, and no other file; the copy counts whether or not a fresh check has marked it verified since a rebuild (Q-295). A listed file's tier is the one the source records give it, which is where the restore places it (step 3). The files fetched are every listed log segment (with no tree checkpoint, step 1 downloads the whole sealed log) and every other listed file placed on hot or cold, in ascending position. The restored log is scanned over log segments only: a compacted file holds only some positions of its range, and log segments are never retired by compaction (§7). When the source generation's sequence 1 is not held, the restored end is that of the restore record read, or `0:0` in generation 0. Positions of an earlier generation at or below a carried end that no copied segment or recorded loss holds fail the plan: `NotCopied` when a listed segment without a copy holds them, else `MissingBelowEnd`. Scenario: a store compacted some segments into a current file in deep and lost no segment; the plan fetches the segments, lists the compacted file and leaves it in deep. Tests: `backup/tests/restore_plan.rs` `a_listed_segment_with_no_copy_ends_the_restored_log_and_is_not_named`, `a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap`, `a_compacted_file_left_in_deep_is_listed_but_not_fetched`, `a_file_missing_at_or_below_a_carried_end_fails_the_plan`, `the_plan_names_every_copied_file_and_never_one_without_a_copy`, `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark` |

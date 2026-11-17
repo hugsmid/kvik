@@ -241,7 +241,7 @@ impl Decider {
     }
 
     /// The refusal of a reading, if any, in the order the model backend checks: unknown series, value type,
-    /// retirement, phase, `changed_at`, text length.
+    /// retirement, phase, `changed_at` (then its range, Q-195), text length.
     fn refusal(&self, r: &Reading, revise: bool) -> Result<LogValue, Refusal> {
         let s = self
             .registry
@@ -275,6 +275,11 @@ impl Decider {
             (false, true) => return Err(Refusal::ChangedAtUnexpected),
             (true, true) if revise => return Err(Refusal::ReviseOnVersioned),
             _ => {}
+        }
+        if d.versioning == Versioning::Time
+            && r.changed_at.is_some_and(|c| i64::try_from(c).is_err())
+        {
+            return Err(Refusal::ChangedAtOutOfRange);
         }
         if matches!(&value, LogValue::Text(t) if t.len() > MAX_TEXT_LEN) {
             return Err(Refusal::TextTooLong);
