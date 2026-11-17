@@ -568,7 +568,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   writer appends an empty record when it needs one, and at once after a restore record. What a dropped record
   described is found again: an unlisted compaction output is discarded (§9 row 10), an unlisted sealed log segment
   is listed again, a lost range is found again by the scan or the scrub, an acknowledgement is given again. New
-  epochs continue above every epoch named by the last valid record and by any lease file. A corrupt record is
+  epochs continue above every epoch named by the last valid record and by any lease file, as its epoch or as the
+  highest epoch its reader has read (Readers). A corrupt record is
   fetched from deep (by generation and epoch) or from the mirror path, verified, written again in place over the
   corrupt bytes and synced; where that cannot be done, the manifest is rewritten to a new file and renamed while no
   handle holds the old one open (§3 Sync primitive). Every file is self-describing: its header and trailer carry everything a publish record says
@@ -607,7 +608,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
      unacknowledged, and the rebuild record counts it.
   4. Writes the new manifest as `MANIFEST.new` (`format.md` A.12), opened by a rebuild record that carries, per file
      kind, a `file_id` floor above every id seen (`format.md` A.14), with epochs above
-     every epoch named by a valid record and by any lease file; syncs it; renames it over the old file while no handle
+     every epoch named by a valid record and by any lease file (as above); syncs it; renames it over the old file while no handle
      holds that open (§3 Sync primitive); syncs the directory. A `MANIFEST.new` left by a crash is removed at the
      next start.
   A rebuilt manifest takes no file as verified in another tier until it has been verified there again (§7 inputs
@@ -650,25 +651,29 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 - **Retired files** are removed locally only after the grace period (1 hour of the writer's monotonic clock since the
   later of the retirement record and the writer's start), once the files that replaced them are verified in another
   tier, and when no live reader lease names an older epoch.
-- **Leases:** a lease file holds the epoch, the boot id (from the same source as the mark's) and a refresh counter
-  that the reader increments at every renewal. The writer expires a lease when its counter has not changed for
+- **Leases:** a lease file holds the epoch, the highest epoch the reader has read, the boot id (from the same source
+  as the mark's) and a refresh counter that the reader increments at every renewal. The writer expires a lease when its counter has not changed for
   1 hour of the writer's monotonic clock since the writer first observed that value; at writer start, every lease of
   the current boot counts as first observed then. A lease is void only when both boot ids are non-zero and differ.
   The writer looks at leases at its own turns, at most once a minute, with no timer of its own: a late look only
   makes an expiry later.
 - **Readers** read under cuts: a cut is the manifest epoch whose files it reads, with the durable position and reset
-  stamp it was taken at. A reader's lease names the lowest epoch of its live cuts, and the reader renews it at least
-  every 30 minutes; a cut ends after `cut_max_age` (`api.md` `ReaderConfig`; at most the grace period of Retired
-  files); a lease found gone or changed ends every cut. A reader needs nothing from the writer's memory: it reads via
+  stamp it was taken at. A reader's lease names the lowest epoch of its live cuts and records the highest epoch the reader
+  has read, written before any file is read under a higher one; the reader renews it at least every 30 minutes and at
+  the check of a held cut; a cut ends `cut_max_age` (`api.md` `ReaderConfig`; at most the grace period of Retired
+  files) after the last manifest check that found its epoch current; a lease found gone or changed ends every cut. A reader needs nothing from the writer's memory: it reads via
   the manifest, the documented layout, tree files and log segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
-  `after`; it compares the mark's reset stamp before and after reading, and discards what it read if the stamp
-  changed meanwhile; a call with a materialised result then reads once more under the new cut, and a second change
+  `after`; it compares the mark's reset stamp before and after a pass that took something (a batch, a void, a
+  region or a moved resume point; a pass that took nothing has nothing to discard, Q-851), and discards what it read
+  if the stamp changed meanwhile; a call with a materialised result then reads once more under the new cut, and a second change
   ends it with `CutExpired` (Q-850). A reader reads nothing without a lease, renewed within `lease_refresh`, that names an epoch at or below
   its cut's: if a lease write that a call needs fails, the call returns the error. Positions are read in order, so a reader catching up (a consumer, a live read's tail) that
   cannot read a file returns the error for that file and reads nothing at or past it until it can; a query (roadmap
   9.0f) returns the error only if the file's segment index (`format.md` A.8) lists one of its series or the file has
   entries, or the index cannot be read either, and otherwise passes over it. A manifest record a reader cannot take an epoch from is an
-  error of the manifest for the reader. Accepted residuals: a reader may read a mark that is not yet synced (from
+  error of the manifest for the reader. A reader parses only records appended past those it holds (Q-852), so one
+  that has parsed the manifest keeps serving after an earlier record is damaged, from what it read of the valid
+  records, until the manifest is rebuilt or the reader opens again. Accepted residuals: a reader may read a mark that is not yet synced (from
   the page cache, before a start's sync of it or after that sync failed); the new reset stamp of the start that then
   truncates voids what it took. Corruption events reported by a pass that a start overtook (it truncated and wrote
   past the old mark before the reader read the mark again) may be wrong; the next refresh's check of the last batch

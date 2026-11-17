@@ -351,6 +351,24 @@ fn the_registry_is_recovered_after_crashes() {
 }
 
 #[test]
+fn a_cut_max_age_of_zero_is_refused() {
+    let w = World::new("cut-zero");
+    block_on(w.open().shutdown()).unwrap();
+    let refused = Reader::open(
+        ReaderConfig::new(&w.dir)
+            .env(w.env())
+            .cut_max_age(std::time::Duration::ZERO),
+    );
+    assert!(matches!(
+        refused,
+        Err(kvik::OpenError::Config {
+            key: "cut_max_age",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn ids_start_at_one_and_never_reuse_a_floor() {
     let w = World::new("id-floor");
     let s = w.open();
@@ -364,6 +382,8 @@ fn ids_start_at_one_and_never_reuse_a_floor() {
     }
     block_on(s.shutdown()).unwrap();
     drop(s);
+    let r = w.reader();
+    assert!(r.losses().is_empty());
     // Damage the batch that holds the second definition: synced bytes lost on the disk.
     let (path, bytes) = w
         .segments()
@@ -380,6 +400,12 @@ fn ids_start_at_one_and_never_reuse_a_floor() {
         "{losses:?}"
     );
     assert!(matches!(s.series(b), Err(kvik::QueryError::UnknownSeries)));
+    // A reader process open across the restart learns of the loss from the manifest's appended record.
+    let seen = r.losses();
+    assert!(
+        seen.iter().any(|l| l.kind == LossKind::DataLost),
+        "{seen:?}"
+    );
     // The lost definition's id stays assigned: defined again, the series gets a new id.
     let again = block_on(s.define_series(gauge("x/y/lost"))).unwrap();
     assert_eq!(again, SeriesId(3));

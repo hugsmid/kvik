@@ -70,7 +70,7 @@ impl Writer {
         let file = self
             .reader()
             .map_err(|e| Error::Internal(e.to_string()))?
-            .with(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
+            .with_again(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
             .map_err(|e| Error::Internal(e.to_string()))?;
         let wall = self.env.clock.wall().0;
         kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file).map_err(

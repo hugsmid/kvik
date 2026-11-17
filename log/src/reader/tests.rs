@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use super::files::read_part;
 use super::*;
 use crate::fs::{FsFile, MemFs, OpenMode};
+use crate::header::HEADER_LEN;
 
 fn file(len: usize) -> Box<dyn FsFile> {
     let fs = MemFs::new();

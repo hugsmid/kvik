@@ -484,7 +484,7 @@ impl Writer {
         }
         // The registry file again, up to the mark the clean shutdown synced.
         let file = self.reader().ok().and_then(|r| {
-            r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
+            r.with_again(|i, log| Ok(i.registry_file(log.state().durable, floor)))
                 .ok()
         });
         if let Some(file) = file {
@@ -1062,7 +1062,7 @@ impl Writer {
             .cloned()
             .unwrap_or_default();
         if let Ok(r) = self.reader() {
-            let _ = r.with(|i, _| {
+            let _ = r.with_again(|i, _| {
                 st.latest_t = i.latest_t(id.0).map(Timestamp);
                 Ok(())
             });

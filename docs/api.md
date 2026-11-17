@@ -326,12 +326,14 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   the mark at call time, and runs under that cut: the manifest epoch, the durable position and the reset stamp
   (spec §7 Readers). A call's file work does not grow with the store's age: one read of the mark (two after a pass
   that took something), the manifest checked by path and read only past what the reader holds, the new bytes, and no
-  directory listing once the reader has caught up. The lease names the lowest epoch of the reader's live cuts; it is
-  written at open, and by any call when that epoch changes or once half of `lease_refresh` has passed; a long
+  directory listing once the reader has caught up. The lease names the lowest epoch of the reader's live cuts and
+  records the highest epoch read; it is written at open, and by any call when either would change or once half of
+  `lease_refresh` has passed; a long
   iteration renews it as it advances. A reader idle past the expiry takes a new epoch on its next call. There is no
   background task.
-- A cut lives at most `cut_max_age` (default 30 minutes; at most an hour, the grace period of retired files); a read
-  still running under it then, or under a cut whose lease a renewal found gone or changed (a reader stopped for over
+- A cut lives at most `cut_max_age` (default 30 minutes; at most an hour, the grace period of retired files; zero is
+  refused with `OpenError::Config`) from the last manifest check that found its epoch current; a read still running
+  under it then, or under a cut whose lease a renewal found gone or changed (a reader stopped for over
   an hour), ends with `CutExpired` and the caller starts again. A call whose pass is discarded because the reset
   stamp changed while it read reads once more under the new cut; a second change is `CutExpired` too (Q-850).
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`

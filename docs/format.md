@@ -539,7 +539,7 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `epoch: u64`, `generation: u32`, reserved `u32`, `written_at: i64`, then a field list (A.6 framing). **Every**
   record, empty and lost-range records included, takes an epoch strictly above the previous record's (the first
   record, written when the store is created, takes epoch 1): the previous + 1, or after a start the next above every
-  epoch named by the last valid record and by any lease file (`spec.md`
+  epoch named by the last valid record and by any lease file, in its `epoch` or `highest_read` (A.15; `spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
   positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 the corrupt record's epoch as
@@ -647,7 +647,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   creation) then one slot rewritten in place with one positional write: 64 `epoch: u64` (the lowest epoch of the reader's live
   cuts, `spec.md` §7 Readers); 72 `refresh_counter: u64`; 80
   `boot_id` (16 bytes); 96 `created_at: i64`;
-  104 reserved (20 bytes); 124 `crc32c` over bytes 64..124. `reader_id` is 16 random bytes per reader handle. A lease
+  104 `highest_read: u64`, the highest manifest epoch the reader has read, 0 from a reader that does not write it;
+  112 reserved (12 bytes); 124 `crc32c` over bytes 64..124. `reader_id` is 16 random bytes per reader handle. A lease
   is never synced (it is void on another boot). An invalid lease counts as holding epoch 0 until it expires; a zero
   `boot_id` is honoured until expiry. The reader deletes its lease on close; the writer deletes void and expired
   ones.

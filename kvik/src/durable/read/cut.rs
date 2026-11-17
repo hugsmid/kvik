@@ -5,10 +5,10 @@
 //!   streams, roadmap 9.0f) refreshes, holds its cut for the call and ends it at its return. A pass the log reader
 //!   discarded because the mark's reset stamp changed while it read is read once more, under the new cut; a second
 //!   such change is [`QueryError::CutExpired`] (Q-850).
-//! - A cut held across calls (a snapshot, roadmap 9.0c; an iteration, 9.0f) ends with `CutExpired` once it is
-//!   `cut_max_age` old or a renewal found the lease gone or changed; the lease names the lowest epoch of the live cuts.
+//! - A cut held across calls (a snapshot, roadmap 9.0c; an iteration, 9.0f) ends with `CutExpired` once its epoch was
+//!   last found current `cut_max_age` ago or a renewal found the lease gone or changed; the lease names the lowest
+//!   epoch of the live cuts.
 
-use kvik_log::lease::CutEnd;
 use kvik_log::reader::{LogReader, ReaderError, Update};
 
 use crate::error::QueryError;
@@ -48,11 +48,10 @@ pub(crate) fn take(log: &mut LogReader) -> Cut {
     }
 }
 
-/// Whether `cut` is live: `CutExpired` once it is `cut_max_age` old or its lease was found gone or changed.
-pub(crate) fn check(log: &LogReader, cut: &Cut) -> Result<(), QueryError> {
-    log.check_cut(cut.id).map_err(|e| match e {
-        CutEnd::Expired | CutEnd::LeaseLost | CutEnd::Unknown => QueryError::CutExpired,
-    })
+/// Whether `cut` is live, renewing the lease if due: [`ReaderError::CutEnded`] once its epoch was last found current
+/// `cut_max_age` ago or its lease was found gone or changed.
+pub(crate) fn check(log: &mut LogReader, cut: &Cut) -> Result<(), ReaderError> {
+    log.check_cut(cut.id)
 }
 
 #[cfg(test)]
@@ -261,6 +260,27 @@ mod tests {
         assert!(matches!(slow, Err(QueryError::CutExpired)), "{slow:?}");
         assert_eq!(facts(&r).unwrap(), 2);
         assert_eq!(r.cuts_held(), 0);
+    }
+
+    #[test]
+    fn the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it() {
+        let rig = Rig::new("cut-again");
+        let r = rig.reader();
+        let clock = rig.clock.clone();
+        let mut calls = 0;
+        let once = r.with_again(|_, _| {
+            calls += 1;
+            if calls == 1 {
+                clock.advance(MAX_AGE);
+            }
+            Ok(calls)
+        });
+        assert_eq!(once.unwrap(), 2);
+        let always = r.with_again(|_, _| {
+            clock.advance(MAX_AGE);
+            Ok(())
+        });
+        assert!(matches!(always, Err(QueryError::CutExpired)));
     }
 
     #[test]

@@ -11,9 +11,11 @@ use std::time::Duration;
 use kvik_log::content::Item;
 use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{DirEntry, Fs, FsFile, MemFs, OpenMode};
-use kvik_log::lease::{CutEnd, LEASE_REFRESH, LeaseSlot, lease_name};
-use kvik_log::manifest::{RECORD_EMPTY, encode_record, read_manifest};
-use kvik_log::reader::{LogReader, ReaderConfig};
+use kvik_log::lease::{CutEnd, LEASE_REFRESH, LeaseSlot, highest_epoch, lease_name};
+use kvik_log::manifest::{
+    LossCause, LostRange, RECORD_EMPTY, RECORD_LOST_RANGE, encode_record, read_manifest,
+};
+use kvik_log::reader::{LogReader, ReaderConfig, ReaderError};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
     Call, CallSource as _, Clock, IngestQueue, LogWriter, MarkSync, WriterConfig, create_segment,
@@ -62,6 +64,8 @@ struct Counters {
     manifest: AtomicU64,
     /// Files report no identity, as on a platform without one.
     no_identity: std::sync::atomic::AtomicBool,
+    /// Opens of the mark.
+    marks: AtomicU64,
 }
 
 impl Counters {
@@ -142,6 +146,9 @@ impl FsFile for CountFile {
 impl Fs for CountFs {
     fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<Box<dyn FsFile>> {
         self.n.call();
+        if path.ends_with("log/MARK") {
+            self.n.marks.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(r) = self.refuse.lock().unwrap().as_deref()
             && path.to_string_lossy().contains(r)
         {
@@ -382,6 +389,15 @@ impl Rig {
     }
 }
 
+/// What a check of the cut says: live, or why it ended.
+fn ended(reader: &mut LogReader, id: u64) -> Result<(), CutEnd> {
+    match reader.check_cut(id) {
+        Ok(()) => Ok(()),
+        Err(ReaderError::CutEnded(e)) => Err(e),
+        Err(e) => panic!("{e}"),
+    }
+}
+
 fn lease_path() -> PathBuf {
     dir().join("leases").join(lease_name(&[9; 16]))
 }
@@ -406,6 +422,147 @@ fn a_calls_file_system_calls_and_writes_do_not_grow_with_the_sealed_segments() {
         assert_eq!(c.writes, 0, "no lease write per call: {c:?}");
     }
     assert_eq!(renewed.writes, 1, "the lease at half of lease_refresh");
+    assert_eq!(
+        [idle.calls, new.calls, rolled.calls, renewed.calls],
+        [8, 18, 18, 11]
+    );
+}
+
+#[test]
+fn an_idle_call_reads_the_mark_once_and_one_that_takes_a_batch_twice() {
+    let mut r = Rig::with_sealed(2);
+    let marks = |r: &Rig| r.n.marks.swap(0, Ordering::SeqCst);
+    marks(&r);
+    r.reader.refresh().unwrap();
+    assert_eq!(marks(&r), 1);
+    r.submit(facts(4, 1 << 40));
+    marks(&r);
+    assert_eq!(r.reader.refresh().unwrap().events.len(), 1);
+    assert_eq!(marks(&r), 2);
+}
+
+fn lost(epoch_floor: u32) -> LostRange {
+    LostRange {
+        identity: (0, 1),
+        first: (0, 1),
+        last: (0, 1),
+        file_id: 1,
+        offset: 64,
+        length: 8,
+        cause: LossCause::Corruption,
+        boot_id: [1; 16],
+        id_floor: epoch_floor,
+        time_before: None,
+        time_after: None,
+        extends: false,
+        stamp: None,
+    }
+}
+
+#[test]
+fn a_caught_up_reader_takes_the_lost_ranges_of_appended_records_as_a_whole_read_does() {
+    let mut r = Rig::with_sealed(2);
+    let path = dir().join("MANIFEST");
+    let man = r.fs.read(&path).unwrap();
+    let epoch = read_manifest(&man, &STORE_ID).unwrap().last_epoch();
+    let record = encode_record(RECORD_LOST_RANGE, epoch + 1, 0, T0, Some(&lost(1)));
+    r.fs.poke(&path, man.len(), &record);
+    r.reader.refresh().unwrap();
+    assert_eq!(r.reader.lost_ranges(), &[lost(1)]);
+    assert_eq!(r.reader.state().epoch, epoch + 1);
+    // A record whose epoch is not above the last is not one: the whole read stops before it, and so does the reader.
+    let man = r.fs.read(&path).unwrap();
+    let stale = encode_record(RECORD_LOST_RANGE, epoch + 1, 0, T0, Some(&lost(2)));
+    r.fs.poke(&path, man.len(), &stale);
+    r.reader.refresh().unwrap();
+    let whole = read_manifest(&r.fs.read(&path).unwrap(), &STORE_ID).unwrap();
+    assert_eq!(
+        whole.lost_ranges().cloned().collect::<Vec<_>>(),
+        vec![lost(1)]
+    );
+    assert_eq!(r.reader.lost_ranges(), &[lost(1)]);
+    assert_eq!(r.reader.state().epoch, epoch + 1);
+}
+
+#[test]
+fn a_cut_counts_its_age_from_the_manifest_check_that_found_its_epoch_current() {
+    let mut r = Rig::with_sealed(2);
+    r.clock.advance(14 * 60 * 1_000 * MS);
+    let held = r.reader.hold();
+    r.clock.advance(LEASE_REFRESH - 14 * 60 * 1_000 * MS);
+    assert!(matches!(
+        r.reader.check_cut(held.id),
+        Err(ReaderError::CutEnded(CutEnd::Expired))
+    ));
+}
+
+#[test]
+fn a_check_that_finds_a_cuts_epoch_still_current_renews_its_age() {
+    let mut r = Rig::with_sealed(2);
+    let held = r.reader.hold();
+    r.clock.advance(LEASE_REFRESH * 2 / 3);
+    r.reader.refresh().unwrap();
+    r.clock.advance(LEASE_REFRESH * 2 / 3);
+    assert_eq!(ended(&mut r.reader, held.id).ok(), Some(()));
+    let later = r.next_epoch();
+    r.reader.refresh().unwrap();
+    assert_eq!(
+        r.reader.state().epoch,
+        held.epoch,
+        "the lease still names the cut's"
+    );
+    r.clock.advance(LEASE_REFRESH * 2 / 3);
+    r.reader.refresh().unwrap();
+    assert!(r.reader.check_cut(held.id).is_err(), "behind epoch {later}");
+}
+
+#[test]
+fn a_held_cut_whose_lease_the_writer_expired_is_ended_at_its_check() {
+    let mut r = Rig::new();
+    let mut c = ReaderConfig::new(
+        dir(),
+        Arc::new(r.fs.clone()),
+        r.clock.clone(),
+        Some([1; 16]),
+        [8; 16],
+    );
+    c.cut_max_age = Duration::from_secs(3_600);
+    let mut reader = LogReader::open(c).unwrap();
+    reader.refresh().unwrap();
+    r.writer_view();
+    r.next_epoch();
+    r.clock.advance(Duration::from_secs(14 * 60));
+    let held = reader.hold();
+    r.clock.advance(Duration::from_secs(58 * 60));
+    let view = r.writer_view();
+    assert!(view.is_none() || view == Some(0), "{view:?}");
+    assert!(reader.check_cut(held.id).is_err());
+}
+
+#[test]
+fn an_epoch_the_reader_has_read_is_never_used_again_while_an_older_cut_holds_the_lease() {
+    let mut r = Rig::with_sealed(2);
+    let first = r.reader.hold();
+    let path = dir().join("MANIFEST");
+    let len = r.fs.read(&path).unwrap().len();
+    let later = r.next_epoch();
+    r.reader.refresh().unwrap();
+    let second = r.reader.hold();
+    assert_eq!(second.epoch, later);
+    assert_eq!(r.lease().epoch, first.epoch);
+    assert_eq!(r.lease().highest_read, later);
+    let floor = highest_epoch(&r.fs, &dir().join("leases"), &STORE_ID).unwrap();
+    assert_eq!(floor, later);
+    // The record is lost from the page cache; a start's next record continues above the manifest and the leases.
+    let f = r.fs.open(&path, OpenMode::ReadWrite).unwrap();
+    f.set_len(len as u64).unwrap();
+    let man = r.fs.read(&path).unwrap();
+    let again = read_manifest(&man, &STORE_ID)
+        .unwrap()
+        .last_epoch()
+        .max(floor)
+        + 1;
+    assert!(again > later);
 }
 
 #[test]
@@ -521,7 +678,7 @@ fn the_lease_names_the_lowest_epoch_of_the_live_cuts_until_the_last_is_released(
         "written at once when its epoch changes"
     );
     assert_eq!(r.writer_view(), Some(later));
-    assert_eq!(r.reader.check_cut(second.id), Ok(()));
+    assert_eq!(ended(&mut r.reader, second.id), Ok(()));
 }
 
 #[test]
@@ -531,14 +688,14 @@ fn a_cut_held_for_cut_max_age_ends_and_no_longer_holds_the_lease_down() {
     let later = r.next_epoch();
     r.clock.advance(LEASE_REFRESH - MS);
     r.reader.refresh().unwrap();
-    assert_eq!(r.reader.check_cut(held.id), Ok(()));
+    assert_eq!(ended(&mut r.reader, held.id), Ok(()));
     assert_eq!(r.lease().epoch, held.epoch);
     r.clock.advance(MS);
-    assert_eq!(r.reader.check_cut(held.id), Err(CutEnd::Expired));
+    assert_eq!(ended(&mut r.reader, held.id), Err(CutEnd::Expired));
     r.reader.refresh().unwrap();
     assert_eq!(r.lease().epoch, later);
     r.reader.release(held.id);
-    assert_eq!(r.reader.check_cut(held.id), Err(CutEnd::Unknown));
+    assert_eq!(ended(&mut r.reader, held.id), Err(CutEnd::Unknown));
     assert_eq!(r.reader.cuts_held(), 0);
 }
 
@@ -557,9 +714,9 @@ fn a_cut_max_age_above_the_grace_period_is_taken_as_the_grace_period() {
     let held = reader.hold();
     r.clock.advance(Duration::from_secs(3_600) - MS);
     reader.keep_alive().unwrap();
-    assert_eq!(reader.check_cut(held.id), Ok(()));
+    assert_eq!(ended(&mut reader, held.id), Ok(()));
     r.clock.advance(MS);
-    assert_eq!(reader.check_cut(held.id), Err(CutEnd::Expired));
+    assert_eq!(ended(&mut reader, held.id), Err(CutEnd::Expired));
     r.reader.refresh().unwrap();
 }
 
@@ -571,11 +728,11 @@ fn a_lease_found_gone_ends_every_cut_and_is_written_again_naming_the_current_epo
     r.fs.remove_file(&lease_path()).unwrap();
     r.clock.advance(LEASE_REFRESH / 2);
     r.reader.refresh().unwrap();
-    assert_eq!(r.reader.check_cut(a.id), Err(CutEnd::LeaseLost));
-    assert_eq!(r.reader.check_cut(b.id), Err(CutEnd::LeaseLost));
+    assert_eq!(ended(&mut r.reader, a.id), Err(CutEnd::LeaseLost));
+    assert_eq!(ended(&mut r.reader, b.id), Err(CutEnd::LeaseLost));
     assert_eq!(r.lease().epoch, later);
     let c = r.reader.hold();
-    assert_eq!(r.reader.check_cut(c.id), Ok(()));
+    assert_eq!(ended(&mut r.reader, c.id), Ok(()));
 }
 
 #[test]
@@ -588,10 +745,11 @@ fn a_lease_found_changed_ends_every_cut() {
     assert!(r.reader.keep_alive().is_ok_and(|w| !w), "not due");
     r.clock.advance(LEASE_REFRESH / 2);
     assert!(r.reader.keep_alive().unwrap());
-    assert_eq!(r.reader.check_cut(a.id), Err(CutEnd::LeaseLost));
+    assert_eq!(ended(&mut r.reader, a.id), Err(CutEnd::LeaseLost));
     // The lease as this reader wrote it is not a change.
+    r.reader.refresh().unwrap();
     let b = r.reader.hold();
     r.clock.advance(LEASE_REFRESH / 2);
     assert!(r.reader.keep_alive().unwrap());
-    assert_eq!(r.reader.check_cut(b.id), Ok(()));
+    assert_eq!(ended(&mut r.reader, b.id), Ok(()));
 }

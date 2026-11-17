@@ -751,6 +751,7 @@ fn leases_are_renewed_expired_voided_and_epochs_continue_above_them() {
         refresh_counter: 1,
         boot_id: [0xbb; 16],
         created_at: T0,
+        highest_read: 0,
     };
     let write = |name: [u8; 16], bytes: &[u8]| {
         let f =
@@ -765,6 +766,7 @@ fn leases_are_renewed_expired_voided_and_epochs_continue_above_them() {
         refresh_counter: 1,
         boot_id: r.boot_id(),
         created_at: T0,
+        highest_read: 0,
     };
     write([0xa3; 16], &high.encode_file(STORE_ID, 0));
     // A restart that records a loss: its manifest record's epoch is above the lease's 50.
@@ -835,6 +837,7 @@ fn an_invalid_lease_and_a_lease_without_boot_id_live_until_expiry() {
         refresh_counter: 9,
         boot_id: [0; 16],
         created_at: T0,
+        highest_read: 0,
     };
     let f =
         r.fs.open(&leases.join(lease_name(&[0xc1; 16])), OpenMode::CreateNew)
@@ -1562,6 +1565,51 @@ fn a_mark_with_a_new_reset_stamp_during_a_refresh_discards_the_pass() {
     assert_eq!(r.held.items.len(), 2);
 }
 
+/// A pass that only moves into the next segment takes no batch but has moved its resume point: a start that resets
+/// meanwhile still discards it (Q-851).
+#[test]
+fn a_pass_that_moves_on_without_a_batch_is_discarded_when_the_stamp_changes() {
+    let (mut r, fs) = hooked_rig();
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    let m = r.mark().unwrap();
+    assert_eq!(m.file_id, 1);
+    assert!(
+        r.fs.read(&log_path("00000000-0000000000000002.open"))
+            .is_some(),
+        "the segment created ahead"
+    );
+    let moved = MarkSlot {
+        counter: m.counter + 1,
+        file_id: 2,
+        offset: kvik_log::header::HEADER_LEN as u64,
+        ..m
+    };
+    r.fs.poke(&log_path("MARK"), 0, &encode_mark_file([Some(moved), None]));
+    let before = r.reader.as_ref().unwrap().state();
+    let mut opens = 0;
+    *fs.hook.lock().unwrap() = Some(Box::new(move |mem: &MemFs, p: &Path| {
+        if !p.ends_with("MARK") {
+            return true;
+        }
+        opens += 1;
+        if opens == 2 {
+            let reset = MarkSlot {
+                counter: moved.counter + 1,
+                stamp: kvik_log::mark::ResetStamp::new_at(moved.last_sequence + 1),
+                ..moved
+            };
+            mem.poke(&log_path("MARK"), 0, &encode_mark_file([Some(reset), None]));
+        }
+        true
+    }));
+    let u = r.refresh().unwrap();
+    assert!(u.events.is_empty());
+    assert!(u.discarded);
+    assert_eq!(u.state.stamp, before.stamp);
+}
+
 #[test]
 fn a_refused_segment_stops_the_reader_before_it_and_changes_nothing() {
     let mut r = Rig::new(cfg());
@@ -1661,6 +1709,7 @@ fn a_lease_naming_the_last_epoch_leaves_a_start_that_must_record_a_loss_read_onl
         refresh_counter: 1,
         boot_id: r.boot_id(),
         created_at: T0,
+        highest_read: 0,
     };
     let f =
         r.fs.open(

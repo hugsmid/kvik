@@ -554,6 +554,12 @@ impl Reader {
     /// [`OpenError::NotAStore`]); with the durable backend it reads the
     /// directory on `config.env`'s file system, in this process or another.
     pub fn open(config: ReaderConfig) -> Result<Reader, OpenError> {
+        if config.cut_max_age.is_zero() {
+            return Err(OpenError::Config {
+                key: "cut_max_age",
+                reason: "must be above zero".into(),
+            });
+        }
         let inner = match config.backend {
             Backend::Model => {
                 ReaderInner::Model(backend::find(&config.dir).map_err(|e| e.open(&config.dir))?)

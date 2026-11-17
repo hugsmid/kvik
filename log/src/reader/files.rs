@@ -5,19 +5,10 @@ use std::io;
 use super::{Fingerprint, LogReader, MARK_RETRIES, ReaderError, io_err};
 use crate::crc::crc32c;
 use crate::fs::{FsFile, OpenMode};
-use crate::header::{FileHeader, HEADER_LEN, kind};
-use crate::lease::{LEASE_LEN, LeaseSlot, SLOT_OFFSET};
+use crate::header::HEADER_LEN;
 use crate::mark::{MARK_LEN, MarkSlot, read_mark};
 use crate::name::SegmentName;
 use crate::store::MARK;
-
-/// What a renewal wrote, and whether it found the lease gone or changed.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Renewal {
-    slot: LeaseSlot,
-    image: [u8; LEASE_LEN],
-    lost: bool,
-}
 
 /// A segment opened by name, under the extension it was found with.
 pub(super) type OpenSegment = (SegmentName, Box<dyn FsFile>);
@@ -38,80 +29,6 @@ impl LogReader {
             }
         }
         Err(ReaderError::MarkUnreadable)
-    }
-
-    /// The epoch the lease would name now: the lowest of the live cuts and `epoch`, the epoch of the pass about to
-    /// read.
-    pub(super) fn lease_epoch(&self, epoch: u64) -> u64 {
-        let now = self.cfg.clock.monotonic();
-        self.cuts
-            .lowest(now, self.cfg.cut_max_age)
-            .map_or(epoch, |l| l.min(epoch))
-    }
-
-    pub(super) fn renew(&mut self, epoch: u64, generation: u32) -> Result<(), ReaderError> {
-        let s = self.renew_slot(epoch, generation)?;
-        self.commit_lease(s);
-        Ok(())
-    }
-
-    /// Writes the lease with the next counter, by path, naming the lowest epoch of the live cuts and `epoch`; creates
-    /// it again if the writer deleted it. A lease found gone or changed since the reader last wrote it ends every
-    /// cut, so it then names `epoch` (`spec.md` §7 Readers).
-    pub(super) fn renew_slot(&self, epoch: u64, generation: u32) -> Result<Renewal, ReaderError> {
-        let fs = &*self.cfg.fs;
-        let path = &self.lease_path;
-        let (f, found) = match fs.open(path, OpenMode::ReadWrite) {
-            Ok(f) => {
-                let b = read_upto(&*f, LEASE_LEN).map_err(io_err(path))?;
-                (f, Some(b))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (
-                fs.open(path, OpenMode::CreateNew).map_err(io_err(path))?,
-                None,
-            ),
-            Err(e) => return Err(io_err(path)(e)),
-        };
-        let lost = self.image.is_some_and(|i| found.as_deref() != Some(&i[..]));
-        let slot = LeaseSlot {
-            epoch: if lost { epoch } else { self.lease_epoch(epoch) },
-            refresh_counter: self.lease.refresh_counter + 1,
-            ..self.lease
-        };
-        // The slot alone, in place, when the header is the lease's own; else the whole file.
-        let header = found
-            .as_deref()
-            .and_then(|b| b.get(..HEADER_LEN))
-            .filter(|h| {
-                FileHeader::decode(h)
-                    .is_some_and(|h| h.kind == kind::LEASE && h.store_id == self.store_id)
-            });
-        let image = match header {
-            Some(h) => {
-                let mut image = [0u8; LEASE_LEN];
-                image[..HEADER_LEN].copy_from_slice(h);
-                image[SLOT_OFFSET..].copy_from_slice(&slot.encode());
-                f.write_at(&image[SLOT_OFFSET..], SLOT_OFFSET as u64)
-                    .map(|()| image)
-            }
-            None => {
-                let image = slot.encode_file(self.store_id, generation);
-                f.write_at(&image, 0).map(|()| image)
-            }
-        }
-        .map_err(io_err(path))?;
-        Ok(Renewal { slot, image, lost })
-    }
-
-    pub(super) fn commit_lease(&mut self, r: Renewal) {
-        if r.lost {
-            self.cuts.lose_all();
-        }
-        self.lease = r.slot;
-        self.image = Some(r.image);
-        self.renewed_at = self.cfg.clock.monotonic();
-        self.state.lease_renewed_at = self.cfg.clock.wall();
-        self.state.epoch = r.slot.epoch;
     }
 
     /// The segments of the log by file id, under either extension; none for a missing directory.

@@ -82,6 +82,7 @@ fn query_error(dir: &Path, e: ReaderError) -> QueryError {
             QueryError::Corrupt { file: path }
         }
         ReaderError::Io { path, source } => QueryError::Io { path, source },
+        ReaderError::CutEnded(_) => QueryError::CutExpired,
         ReaderError::SegmentMissing { file_id } => QueryError::NotAvailable {
             reason: format!("segment {file_id} is missing"),
         },
@@ -176,8 +177,20 @@ impl DurableReader {
         let r = f(&s.index, log).map_err(Error::query);
         let live = cut::check(log, &c);
         log.release(c.id);
-        live?;
+        live.map_err(|e| query_error(&self.dir, e))?;
         r
+    }
+
+    /// [`DurableReader::with`], called once more if the first call's cut ended: for the store's own reads, which
+    /// have no caller to start again.
+    pub(crate) fn with_again<R>(
+        &self,
+        mut f: impl FnMut(&Index, &LogReader) -> Result<R, Error>,
+    ) -> Result<R, QueryError> {
+        match self.with(&mut f) {
+            Err(QueryError::CutExpired) => self.with(f),
+            other => other,
+        }
     }
 
     /// Re-reads the mark, the manifest and new entries, and renews the lease when due.
