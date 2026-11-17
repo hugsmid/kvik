@@ -724,4 +724,51 @@ mod parts_and_lookup {
         let first = crate::facts::FACTS_DECODES.with(|c| c.get());
         assert!(first <= batches, "{first} decodes for {batches} batches");
     }
+
+    #[test]
+    fn a_refresh_checksums_whole_batches_only_for_the_last_ones_it_remembers() {
+        let fs = Arc::new(MemFs::new());
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(fs.clone(), Path::new("s"), Some(&new)).unwrap();
+        let cfg = WriterConfig {
+            segment_size: 1 << 20,
+            disk_critical: 0,
+            disk_low_bytes: 0,
+            relaxed_limits: true,
+            ..WriterConfig::default()
+        };
+        let w = LogWriter::open(store, cfg, Some([2; 16]), Duration::ZERO, 0).unwrap();
+        let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+        for k in 0..400 {
+            let items: Vec<Item> = (0..20).map(|i| fact(i, k, k as u64)).collect();
+            log.submit(items).unwrap().wait().unwrap();
+        }
+        log.shutdown().unwrap();
+        let mut r = reader(&fs, 47);
+        crate::crc::BYTES_HASHED.with(|c| c.set(0));
+        r.refresh().unwrap();
+        let hashed = crate::crc::BYTES_HASHED.with(|c| c.get());
+        assert_eq!(r.view.recent.len(), RECENT);
+        assert!(r.view.recent.iter().all(|f| f.crc.is_some()));
+        let log_bytes: u64 = names(&fs)
+            .iter()
+            .map(|n| {
+                let p = Path::new("s").join(crate::store::LOG_DIR).join(n.to_string());
+                crate::scan::nonzero_end(&fs.read(&p).unwrap())
+            })
+            .sum();
+        let remembered: u64 = r.view.recent.iter().map(|f| f.end - f.offset).sum();
+        // Every byte once for its block's checksum, each batch's 12-byte block headers a few times, and the
+        // remembered batches once more.
+        assert!(
+            hashed <= log_bytes + 128 * 400 + remembered,
+            "{hashed} bytes hashed for {log_bytes} bytes of log and {remembered} remembered"
+        );
+    }
 }

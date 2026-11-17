@@ -295,8 +295,9 @@ struct Fingerprint {
     /// The batch's offset and end.
     offset: u64,
     end: u64,
-    /// CRC32C over the batch's bytes, commit block included.
-    crc: u32,
+    /// CRC32C over the batch's bytes, commit block included; computed when the pass that returned it ends, for the
+    /// [`RECENT`] batches still remembered then.
+    crc: Option<u32>,
     first: Position,
     last: Position,
 }
@@ -633,6 +634,7 @@ impl LogReader {
                         // Never above the mark's last position, from any segment.
                         if g == mark.generation && last.sequence > mark.last_sequence {
                             view.resume = Some(before);
+                            fingerprint(&mut view.recent, bytes);
                             return Ok(false);
                         }
                         let content = match s.take_content() {
@@ -645,7 +647,6 @@ impl LogReader {
                                 }
                             })?,
                         };
-                        let crc = crc32c(&bytes[b.offset as usize..b.end() as usize]);
                         let rb = ReadBatch {
                             file_id,
                             offset: b.offset,
@@ -680,7 +681,7 @@ impl LogReader {
                                 file_id,
                                 offset: b.offset,
                                 end: b.end(),
-                                crc,
+                                crc: None,
                                 first: rb.first,
                                 last,
                             });
@@ -694,12 +695,14 @@ impl LogReader {
                 }
                 view.resume = Some(s.resume_point());
                 if budget.is_some_and(|b| items >= b) {
+                    fingerprint(&mut view.recent, bytes);
                     if whole {
                         scratch.whole = Some(file_id);
                     }
                     return Ok(true);
                 }
             }
+            fingerprint(&mut view.recent, bytes);
         }
         Ok(false)
     }
@@ -765,6 +768,13 @@ impl Drop for LogReader {
         if !self.closed {
             let _ = self.cfg.fs.remove_file(&self.lease_path);
         }
+    }
+}
+
+/// Computes the checksum of the remembered batches that have none, all of them read from `bytes` in this pass.
+fn fingerprint(recent: &mut VecDeque<Fingerprint>, bytes: &[u8]) {
+    for fp in recent.iter_mut().rev().take_while(|fp| fp.crc.is_none()) {
+        fp.crc = Some(crc32c(&bytes[fp.offset as usize..fp.end as usize]));
     }
 }
 

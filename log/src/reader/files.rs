@@ -139,7 +139,7 @@ impl LogReader {
             usize::try_from(fp.end - fp.offset).map_err(|e| io_err(&path)(io::Error::other(e)))?;
         let mut b = vec![0u8; len];
         let got = read_at_full(&*f, &mut b, fp.offset).map_err(io_err(&path))?;
-        Ok(got == len && crc32c(&b) == fp.crc)
+        Ok(got == len && Some(crc32c(&b)) == fp.crc)
     }
 }
 
