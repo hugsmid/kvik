@@ -13,10 +13,10 @@ durable mark's slots and segment file names.
   encoders, decoders that apply every check, and canonical decoders that also require the canonical bytes. The
   reader applies the body checks to every batch it accepts.
 - `store` creates and opens a store directory (A.12): the store descriptor, the lock and the layout.
-- `writer` is the commit path (`spec.md` §3): group commit bounded by a batch-sync interval that follows the sync's
-  duration between `sync_interval_floor` and `min_sync_interval`, one sync per batch, the durable mark with its timed
-  and forced syncs, positions, segments created ahead of use, rolled and sealed, and a read-only store after any write
-  or sync failure. A synchronous core makes every decision from explicit times;
+- `writer` is the commit path (`spec.md` §3): group commit that syncs a batch at once when nothing waited as the
+  previous sync returned and keeps `sync_interval_floor` between syncs while calls wait, one sync per batch, the
+  durable mark with its timed and forced syncs, positions, segments created ahead of use, rolled and sealed, and a
+  read-only store after any write or sync failure. A synchronous core makes every decision from explicit times;
   `Log` runs it on the `kvik-writer` and `kvik-maint` threads.
 - `writer::recovery` is the start (`spec.md` §3 Recovery, Order of a start): rule 1 truncation after the mark on the
   same boot, rule 2 losses recorded in the manifest, rule 3 recovery entries (written or adopted), the last batch

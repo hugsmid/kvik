@@ -1,19 +1,32 @@
-//! The adaptive batch-sync interval (spec §3 Group commit, Q-310, Q-712): a smoothed batch-sync duration sets the
-//! interval between the floor and `min_sync_interval`.
+//! Batch-sync pacing (spec §3 Group commit, Q-980 to Q-984): the spacing that holds between batch syncs under load,
+//! and the smoothed batch-sync duration reported in `LogStats::sync_time`.
 
 use std::time::Duration;
 
-/// The interval is this many times the smoothed batch-sync duration (Q-712).
-pub(crate) const MULTIPLIER: u64 = 8;
-/// A shorter sample moves the estimate down by this fraction of the difference (Q-712).
+/// A shorter sample moves the estimate down by this fraction of the difference.
 pub(crate) const FALL: u64 = 8;
 
 pub(crate) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The least time between the starts of two batch syncs when calls were waiting as the first returned:
+/// `min(sync_interval_floor, min_sync_interval)`, in `u64` nanoseconds (Q-981).
+pub(crate) fn spacing(floor: Duration, ceiling: Duration) -> Duration {
+    Duration::from_nanos(nanos(floor).min(nanos(ceiling)))
+}
+
+/// When the next batch sync may start: at once unless calls were waiting as the previous batch sync returned, then
+/// `spacing` after that sync started (Q-980, Q-982).
+pub(crate) fn ready_at(previous: Option<Duration>, waited: bool, spacing: Duration) -> Duration {
+    match previous {
+        Some(start) if waited => start.saturating_add(spacing),
+        _ => Duration::ZERO,
+    }
+}
+
 /// The smoothed duration of the batch syncs that succeeded, in nanoseconds: it rises at once and falls by an eighth
-/// of the difference per sample.
+/// of the difference per sample. A statistic only; it sets no timing (Q-984).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SyncPace {
     estimate: Option<u64>,
@@ -29,17 +42,6 @@ impl SyncPace {
 
     pub(crate) fn estimate(&self) -> Option<Duration> {
         self.estimate.map(Duration::from_nanos)
-    }
-
-    /// The interval in force: the ceiling with no estimate, else the estimate times [`MULTIPLIER`] within
-    /// `[min(floor, ceiling), ceiling]`; in `u64` nanoseconds either way (Q-713).
-    pub(crate) fn interval(&self, floor: Duration, ceiling: Duration) -> Duration {
-        let c = nanos(ceiling);
-        let Some(d) = self.estimate else {
-            return Duration::from_nanos(c);
-        };
-        let f = nanos(floor).min(c);
-        Duration::from_nanos(d.saturating_mul(MULTIPLIER).clamp(f, c))
     }
 }
 
@@ -65,12 +67,32 @@ mod tests {
     }
 
     #[test]
-    fn no_estimate_gives_the_ceiling_whatever_the_floor() {
-        let p = SyncPace::default();
-        assert_eq!(p.estimate(), None);
-        assert_eq!(p.interval(FLOOR, CEILING), CEILING);
-        assert_eq!(p.interval(Duration::ZERO, CEILING), CEILING);
-        assert_eq!(p.interval(20 * MS, CEILING), CEILING);
+    fn the_spacing_is_the_floor_capped_by_the_ceiling() {
+        assert_eq!(spacing(FLOOR, CEILING), FLOOR);
+        assert_eq!(spacing(20 * MS, CEILING), CEILING);
+        assert_eq!(spacing(Duration::ZERO, CEILING), Duration::ZERO);
+        assert_eq!(spacing(FLOOR, Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_spacing_stays_within_u64_nanoseconds() {
+        let top = Duration::from_nanos(u64::MAX);
+        assert_eq!(spacing(Duration::MAX, Duration::MAX), top);
+        assert_eq!(spacing(FLOOR, Duration::MAX), FLOOR);
+    }
+
+    #[test]
+    fn a_batch_sync_with_nothing_waiting_as_it_returned_leaves_the_next_free_to_start_at_once() {
+        assert_eq!(ready_at(None, true, FLOOR), Duration::ZERO);
+        assert_eq!(ready_at(Some(5 * MS), false, FLOOR), Duration::ZERO);
+        assert_eq!(ready_at(Some(5 * MS), true, FLOOR), 7 * MS);
+        assert_eq!(ready_at(Some(5 * MS), true, Duration::ZERO), 5 * MS);
+    }
+
+    #[test]
+    fn the_ready_time_saturates() {
+        let top = Duration::from_nanos(u64::MAX);
+        assert_eq!(ready_at(Some(Duration::MAX), true, top), Duration::MAX);
     }
 
     #[test]
@@ -93,80 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn the_interval_is_eight_times_the_estimate_between_the_bounds() {
-        assert_eq!(pace(&[500 * US]).interval(FLOOR, CEILING), 4 * MS);
-        assert_eq!(pace(&[1_000 * US]).interval(FLOOR, CEILING), 8 * MS);
-    }
-
-    #[test]
-    fn a_fast_device_runs_at_the_floor_and_a_zero_sample_is_valid() {
-        assert_eq!(pace(&[160 * US]).interval(FLOOR, CEILING), FLOOR);
-        assert_eq!(pace(&[0]).interval(FLOOR, CEILING), FLOOR);
-        assert_eq!(pace(&[0]).interval(Duration::ZERO, CEILING), Duration::ZERO);
-    }
-
-    #[test]
-    fn a_sync_of_an_eighth_of_the_ceiling_or_more_runs_at_the_ceiling() {
-        assert_eq!(pace(&[1_250 * US]).interval(FLOOR, CEILING), CEILING);
-        assert_eq!(
-            pace(&[1_249 * US]).interval(FLOOR, CEILING),
-            Duration::from_micros(9_992)
-        );
-        assert_eq!(pace(&[20_000 * US]).interval(FLOOR, CEILING), CEILING);
-    }
-
-    #[test]
-    fn a_floor_at_or_above_the_ceiling_fixes_the_interval_at_the_ceiling() {
-        for samples in [&[0][..], &[160 * US], &[30_000 * US]] {
-            assert_eq!(pace(samples).interval(CEILING, CEILING), CEILING);
-            assert_eq!(pace(samples).interval(20 * MS, CEILING), CEILING);
-        }
-    }
-
-    #[test]
-    fn a_zero_ceiling_disables_the_bound_whatever_the_floor() {
-        for samples in [&[][..], &[0], &[160 * US], &[30_000 * US]] {
-            assert_eq!(
-                pace(samples).interval(FLOOR, Duration::ZERO),
-                Duration::ZERO
-            );
-        }
-    }
-
-    #[test]
-    fn the_largest_sample_saturates_the_multiplication() {
+    fn no_sample_gives_no_estimate_and_the_largest_saturates() {
+        assert_eq!(SyncPace::default().estimate(), None);
         let p = pace(&[u64::MAX]);
         assert_eq!(est(&p), u64::MAX);
-        assert_eq!(p.interval(FLOOR, CEILING), CEILING);
-        let max = Duration::from_nanos(u64::MAX);
-        assert_eq!(p.interval(FLOOR, max), max);
         let p = pace(&[u64::MAX, 0]);
         assert_eq!(est(&p), u64::MAX - u64::MAX / 8);
-    }
-
-    #[test]
-    fn a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample() {
-        let top = Duration::from_nanos(u64::MAX);
-        assert_eq!(SyncPace::default().interval(FLOOR, Duration::MAX), top);
-        assert_eq!(pace(&[u64::MAX]).interval(FLOOR, Duration::MAX), top);
-    }
-
-    #[test]
-    fn a_single_slow_sync_holds_the_ceiling_for_four_intervals_and_the_floor_returns_after_23() {
-        let mut p = pace(&[160 * US; 30]);
-        assert_eq!(p.interval(FLOOR, CEILING), FLOOR);
-        p.sample(2_000 * US);
-        let mut at_ceiling = 0;
-        while p.interval(FLOOR, CEILING) == CEILING {
-            at_ceiling += 1;
-            p.sample(160 * US);
-        }
-        assert_eq!(at_ceiling, 4);
-        let mut above_floor = at_ceiling;
-        while p.interval(FLOOR, CEILING) > FLOOR {
-            above_floor += 1;
-            p.sample(160 * US);
-        }
-        assert_eq!(above_floor, 23);
     }
 }

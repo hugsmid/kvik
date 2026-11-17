@@ -30,6 +30,8 @@ const STORE_ID: [u8; 16] = [7; 16];
 const BOOT: [u8; 16] = [9; 16];
 const T0: i64 = 1_767_225_600_000_000_000;
 const MS: Duration = Duration::from_millis(1);
+const US: Duration = Duration::from_micros(1);
+const FLOOR: Duration = kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR;
 
 fn dir() -> PathBuf {
     PathBuf::from("store")
@@ -511,32 +513,54 @@ fn opening_a_store_makes_a_creations_rename_durable() {
 }
 
 #[test]
-fn group_commit_coalesces_under_load_and_adds_no_delay_after_a_quiet_period() {
+fn group_commit_keeps_the_floor_only_while_calls_wait_and_adds_no_delay_after_a_quiet_period() {
     let mut h = H::new(cfg());
+    h.maint = false;
+    let q = h.q.clone();
+    let limit = h.w.config().call_limit();
+    let fs = h.fs.clone();
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let seen = arrivals.clone();
+    fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+        if p.to_string_lossy().ends_with(".open") && seen.lock().unwrap().is_empty() {
+            let items = vec![fact(9, T0, 0)];
+            let call = Call::new(items.clone(), limit).unwrap();
+            let id = q.0.lock().unwrap().push(call).unwrap();
+            seen.lock().unwrap().push((id, items));
+        }
+    })));
     let a = h.submit(vec![fact(1, T0, 0)]);
     h.step();
     assert!(
         h.done[&a].is_ok(),
         "the first call after a quiet period is synced at once"
     );
-    let mut ids = Vec::new();
+    fs.set_sync_hook(None);
+    let mut ids = vec![arrivals.lock().unwrap()[0].0];
     for _ in 0..5 {
-        h.advance(MS);
+        h.advance(100 * US);
         ids.push(h.submit(vec![fact(1, T0, 0), fact(2, T0, 0)]));
         let next = h.step();
-        assert_eq!(next, Some(Duration::from_millis(10)));
+        assert_eq!(next, Some(FLOOR), "a call waited as the sync returned");
     }
     assert_eq!(h.done.len(), 1);
-    h.advance(Duration::from_millis(5));
+    h.advance(FLOOR - 500 * US);
     h.step();
     assert!(ids.iter().all(|i| h.done[i].is_ok()));
-    assert_eq!(h.w.stats().batches, 2, "five calls in one batch");
+    assert_eq!(h.w.stats().batches, 2, "six calls in one batch");
     assert_eq!(h.w.stats().syncs, 2);
-    // A quiet period: the next call is synced in the same step it arrives.
-    h.advance(Duration::from_secs(1));
+    // Nothing waited as that sync returned: the next call is synced in the step it arrives, inside the floor.
+    h.advance(100 * US);
     let b = h.submit(vec![fact(3, T0, 0)]);
     h.step();
     assert!(h.done[&b].is_ok());
+    h.advance(Duration::from_secs(1));
+    let c = h.submit(vec![fact(4, T0, 0)]);
+    h.step();
+    assert!(h.done[&c].is_ok());
+    for (id, items) in arrivals.lock().unwrap().iter() {
+        h.calls.insert(*id, items.clone());
+    }
     check(&h);
 
     // With the bound disabled, every step may sync.
