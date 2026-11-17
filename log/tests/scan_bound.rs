@@ -220,20 +220,30 @@ proptest! {
 
 /// A batch of a facts block and a skippable block holding a valid batch image at its own offset, `over` bytes past
 /// the 8 MiB of data a batch may hold (negative: below it). Returns the next sequence.
-fn big_batch(f: &mut Vec<u8>, seq: u64, over: i64, t: i64) -> u64 {
+/// A batch of `over` bytes past the 8 MiB limit: a facts block and a skippable one, or one block of an unknown type
+/// that is not skippable (`one`).
+fn big_batch(f: &mut Vec<u8>, seq: u64, over: i64, t: i64, one: bool) -> u64 {
     use kvik_log::batch::MAX_BATCH_DATA;
     use kvik_log::block::block_type;
     let at = f.len() as u64;
     let first = facts_body(seq, T0, &[(1, T0, 0.0)]);
-    let head = 16 + first.len().div_ceil(8) as u64 * 8 + 16;
+    let head = if one {
+        16
+    } else {
+        16 + first.len().div_ceil(8) as u64 * 8 + 16
+    };
     let mut filler = vec![0x11u8; (MAX_BATCH_DATA as i64 + over - head as i64) as usize];
     let inner_at = at + head + 4 * 4_096;
     let inner = facts(seq + 1, 2).encode(&ID, inner_at, t).unwrap();
     filler[4 * 4_096..4 * 4_096 + inner.len()].copy_from_slice(&inner);
-    let blocks = [
-        (block_type::FACTS, 0, first),
-        (0x50, FLAG_SKIPPABLE, filler),
-    ];
+    let blocks = if one {
+        vec![(0x50, 0, filler)]
+    } else {
+        vec![
+            (block_type::FACTS, 0, first),
+            (0x50, FLAG_SKIPPABLE, filler),
+        ]
+    };
     f.extend_from_slice(&raw_batch(&ID, at, &blocks, seq, seq, t));
     seq + 3
 }
@@ -241,6 +251,11 @@ fn big_batch(f: &mut Vec<u8>, seq: u64, over: i64, t: i64) -> u64 {
 /// Small batches around two batches near the 8 MiB limit, the batch before each damaged: the first is met by a
 /// boundary read once the scan has found damage, the second by resynchronisation.
 fn near_limit(over: [i64; 2], damage: &[Damage]) -> Vec<u8> {
+    near_limit_with(over, false, damage)
+}
+
+/// [`near_limit`], the second batch near the limit one block that is not skippable when `one`.
+fn near_limit_with(over: [i64; 2], one: bool, damage: &[Damage]) -> Vec<u8> {
     let mut s = SegmentImage::create_ahead(ID, T0, 4_096).unwrap();
     s.take_into_use(1).unwrap();
     let mut f = s.into_bytes();
@@ -258,9 +273,9 @@ fn near_limit(over: [i64; 2], damage: &[Damage]) -> Vec<u8> {
     small(&mut f, &mut seq, false);
     small(&mut f, &mut seq, true);
     small(&mut f, &mut seq, false);
-    seq = big_batch(&mut f, seq, over[0], T0);
+    seq = big_batch(&mut f, seq, over[0], T0, false);
     small(&mut f, &mut seq, true);
-    seq = big_batch(&mut f, seq, over[1], T0);
+    seq = big_batch(&mut f, seq, over[1], T0, one);
     small(&mut f, &mut seq, false);
     f.resize(f.len() + 4_096, 0);
     apply(&mut f, damage);
@@ -300,6 +315,122 @@ fn batches_of_exactly_the_limit_are_kept_and_a_word_over_it_is_not() {
         );
         assert!(stats.within_bound(f.len() as u64), "{stats:?}");
     }
+}
+
+#[test]
+fn a_critical_block_of_exactly_the_limit_found_by_resynchronisation_refuses_the_segment() {
+    for (over, refused) in [(0, true), (8, false)] {
+        let f = near_limit_with([8, over], true, &[]);
+        agree_at(&f, (f.len() as u64 / 2) & !7).unwrap();
+        let r = scan_with_stats(&f, &ID, ScanLimit::End).0;
+        assert_eq!(r.is_err(), refused, "{over}: {:?}", r.map(|r| r.regions));
+    }
+}
+
+#[test]
+fn a_commit_block_alone_at_the_first_damage_is_a_readable_commit_of_the_tail() {
+    use kvik_log::scan::Tail;
+    let mut s = SegmentImage::create_ahead(ID, T0, 4_096).unwrap();
+    s.take_into_use(1).unwrap();
+    let mut f = s.into_bytes();
+    f.truncate(kvik_log::header::HEADER_LEN);
+    let at = f.len();
+    f.extend_from_slice(&facts(1, 2).encode(&ID, at as u64, T0).unwrap());
+    let pos = f.len();
+    let commit = f[pos - 64..].to_vec();
+    f.extend_from_slice(&commit);
+    f.resize(f.len() + 4_096, 0);
+    agree_at(&f, pos as u64).unwrap();
+    let r = scan_with_stats(&f, &ID, ScanLimit::End).0.unwrap();
+    let Some(Tail::Torn { start, commits, .. }) = r.tail else {
+        panic!("{:?}", r.tail);
+    };
+    assert_eq!(start, pos as u64);
+    assert_eq!(
+        commits.iter().map(|c| c.offset).collect::<Vec<_>>(),
+        [pos as u64]
+    );
+}
+
+#[test]
+fn a_header_failing_its_checksum_a_ring_above_a_valid_one_is_not_taken_as_valid() {
+    use kvik_log::batch::MAX_BATCH_DATA;
+    let mut s = SegmentImage::create_ahead(ID, T0, 4_096).unwrap();
+    s.take_into_use(1).unwrap();
+    let mut f = s.into_bytes();
+    f.truncate(kvik_log::header::HEADER_LEN);
+    let mut seq = 1;
+    let small = |f: &mut Vec<u8>, seq: &mut u64, damage: Option<usize>| {
+        let at = f.len();
+        f.extend_from_slice(&facts(*seq, 2).encode(&ID, at as u64, T0).unwrap());
+        if let Some(d) = damage {
+            f[at + d] ^= 1;
+        }
+        *seq += 2;
+        f.len() - at
+    };
+    small(&mut f, &mut seq, None);
+    let len = small(&mut f, &mut seq, Some(40));
+    let ring = 16 << 20;
+    let x = f.len();
+    for _ in 0..100 {
+        small(&mut f, &mut seq, None);
+    }
+    let rest = (x + ring - len - f.len()) as i64;
+    let first = (rest / 2) & !7;
+    for total in [first, rest - first] {
+        seq = big_batch(&mut f, seq, total - 64 - MAX_BATCH_DATA as i64, T0, false);
+    }
+    small(&mut f, &mut seq, Some(40));
+    let b = f.len();
+    assert_eq!(b, x + ring);
+    small(&mut f, &mut seq, Some(12));
+    for _ in 0..4 {
+        small(&mut f, &mut seq, None);
+    }
+    f.resize(f.len() + 4_096, 0);
+    agree_at(&f, b as u64).unwrap();
+    let r = scan_with_stats(&f, &ID, ScanLimit::End).0.unwrap();
+    assert!(r.batches.iter().any(|k| k.offset == x as u64));
+    assert!(r.batches.iter().all(|k| k.offset != b as u64));
+}
+
+#[test]
+fn a_boundary_read_a_ring_above_the_valid_headers_checks_the_header_checksum() {
+    use kvik_log::batch::MAX_BATCH_DATA;
+    let mut s = SegmentImage::create_ahead(ID, T0, 4_096).unwrap();
+    s.take_into_use(1).unwrap();
+    let mut f = s.into_bytes();
+    f.truncate(kvik_log::header::HEADER_LEN);
+    let mut seq = 1;
+    let small = |f: &mut Vec<u8>, seq: &mut u64| {
+        let at = f.len();
+        f.extend_from_slice(&facts(*seq, 2).encode(&ID, at as u64, T0).unwrap());
+        *seq += 2;
+    };
+    while f.len() < 1 << 17 {
+        small(&mut f, &mut seq);
+    }
+    f.extend_from_slice(&[0xff; 8]);
+    let x = f.len();
+    let ring = 16 << 20;
+    let rest = (x + ring - f.len()) as i64;
+    let first = (rest / 2) & !7;
+    for total in [first, rest - first] {
+        seq = big_batch(&mut f, seq, total - 64 - MAX_BATCH_DATA as i64, T0, false);
+    }
+    let b = f.len();
+    assert_eq!(b, x + ring);
+    small(&mut f, &mut seq);
+    f[b + 12] ^= 1;
+    for _ in 0..4 {
+        small(&mut f, &mut seq);
+    }
+    f.resize(f.len() + 4_096, 0);
+    agree_at(&f, b as u64).unwrap();
+    let r = scan_with_stats(&f, &ID, ScanLimit::End).0.unwrap();
+    assert!(r.batches.iter().any(|k| k.offset == x as u64));
+    assert!(r.batches.iter().all(|k| k.offset != b as u64));
 }
 
 /// An engine-shaped segment of one window: about 7 MiB of batches, each an alias entry and a facts block of 20 rows

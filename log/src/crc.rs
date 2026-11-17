@@ -457,6 +457,16 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_below_an_unaligned_offset_drops_the_step_below_it() {
+        let bytes: Vec<u8> = (0..256u32).map(|i| (i * 13 + 1) as u8).collect();
+        let mut t = PrefixCrc::new(&bytes);
+        assert_eq!(t.range(0, 128), Some(crc32c(&bytes[..128])));
+        t.forget_below(61);
+        assert_eq!(t.range(56, 32), Some(crc32c(&bytes[56..88])));
+        assert_eq!(t.checksummed(), 128 + 32);
+    }
+
+    #[test]
     fn a_range_off_an_8_byte_boundary_is_checksummed_directly_and_counted() {
         let bytes: Vec<u8> = (0..64u32).map(|i| (i * 7 + 5) as u8).collect();
         let mut t = PrefixCrc::new(&bytes);

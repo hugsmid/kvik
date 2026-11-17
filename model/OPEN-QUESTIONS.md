@@ -1482,7 +1482,11 @@ budget is Q-970. Tests: `log/tests/scan_bound.rs` (deep shard)
 `crafted_header_runs_give_the_reports_the_walked_chains_give`
 (random and damaged runs of headers against `legacy::scan_with_walked_links`, the chains walked and remembered as
 before, at ring spans down to 8 bytes) and `chain_ends_find_the_candidates_a_plain_walk_finds`, and every existing
-property of that file against the walked chains too; `log/tests/header_walk.rs`
+property of that file against the walked chains too, with
+`a_critical_block_of_exactly_the_limit_found_by_resynchronisation_refuses_the_segment`,
+`a_commit_block_alone_at_the_first_damage_is_a_readable_commit_of_the_tail`,
+`a_header_failing_its_checksum_a_ring_above_a_valid_one_is_not_taken_as_valid` and
+`a_boundary_read_a_ring_above_the_valid_headers_checks_the_header_checksum`; `log/tests/header_walk.rs`
 `a_header_at_every_step_has_each_header_read_once`, `commits_naming_data_headers_have_each_header_read_once` and
 `framed_candidates_check_no_body_and_agree_with_the_walked_chains` (at the bound: at most one header read a step), and
 the ignored `crafted_header_walks_timed`; `log/src/crc.rs`
