@@ -135,6 +135,22 @@ impl Model {
             self.disk.mark_damage = None;
             self.disk.tail_fate = None;
             self.disk.invalid_tail = Tail::default();
+            // The first start of a new store writes no entry and creates the
+            // mark (§3 Recovery), so a later start on another boot finds a
+            // mark of that boot. A restored generation's first start is not
+            // one: its restore record says what the start finds.
+            if self.disk.restore.is_some() {
+                return false;
+            }
+            self.disk.mark = Some(Mark {
+                boot: self.boot,
+                file: self.disk.active.unwrap_or(FileId(self.disk.next_file)),
+                batches: 0,
+                last: Position::new(generation, 0),
+                max_series_id: 0,
+                stamp: self.stamp(),
+            });
+            self.disk.synced_mark = self.disk.mark;
             return false;
         }
         let same_boot = mark.is_some_and(|m| m.boot == self.boot);

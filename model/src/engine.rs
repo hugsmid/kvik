@@ -5373,6 +5373,9 @@ impl Model {
             g
         };
         let mut m = Model::new(config, consumers, wall);
+        // The directory is empty before the restore: no first start ran there.
+        m.disk.mark = None;
+        m.disk.synced_mark = None;
         m.disk.bucket = bucket.clone();
         if let Some(h) = &bucket.header {
             m.disk.header = h.clone();
