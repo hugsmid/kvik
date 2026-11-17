@@ -1273,6 +1273,25 @@ mod tests {
         assert_eq!(super::window_budget(&limits), 32 << 20);
     }
 
+    /// Runs a future to its end on this thread.
+    pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let mut f = std::pin::pin!(f);
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::park();
+        }
+    }
+
     /// Polls a queued call to its end on this thread.
     pub(super) fn wait(mut q: super::Queued) -> Result<crate::types::Ack, EmitError> {
         let mut cx = Context::from_waker(Waker::noop());

@@ -23,6 +23,11 @@ use crate::types::ResetStamp;
 struct State {
     log: Option<LogReader>,
     index: Index,
+    /// Items a refresh takes at a time.
+    part: usize,
+    /// Parts taken.
+    #[cfg(test)]
+    parts: u64,
 }
 
 impl Drop for State {
@@ -115,6 +120,9 @@ impl DurableReader {
             state: Mutex::new(State {
                 log: Some(log),
                 index: Index::default(),
+                part: super::start::PART,
+                #[cfg(test)]
+                parts: 0,
             }),
             clocks,
             created_zone,
@@ -150,8 +158,20 @@ impl DurableReader {
         let Some(log) = s.log.as_mut() else {
             return Err(QueryError::Closed);
         };
-        let update = log.refresh().map_err(|e| query_error(&self.dir, e))?;
-        s.index.apply(&update.events);
+        // In parts, so that a first read of a long log holds one part's batches beside the index at a time.
+        loop {
+            let (update, more) = log
+                .refresh_some(s.part)
+                .map_err(|e| query_error(&self.dir, e))?;
+            #[cfg(test)]
+            {
+                s.parts += 1;
+            }
+            s.index.apply(&update.events);
+            if !more {
+                break;
+            }
+        }
         f(&s.index, log).map_err(Error::query)
     }
 
@@ -175,5 +195,59 @@ impl DurableReader {
     /// Losses the files report: the manifest's lost ranges and the recovery entries of the kept log.
     pub(crate) fn losses(&self) -> Result<Vec<LossReport>, QueryError> {
         self.with(|index, log| Ok(index.losses(log.lost_ranges())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::ManualClock;
+    use crate::read::View;
+    use crate::series::{Kind, SeriesSpec, ValueType};
+    use crate::time::TimeRange;
+    use crate::types::{Reading, SeriesId, Value};
+    use crate::{Store, StoreConfig};
+
+    #[test]
+    fn a_first_read_in_parts_builds_the_index_one_read_whole_does() {
+        const T0: i64 = 1_767_225_600_000_000_000;
+        const S: i64 = 1_000_000_000;
+        let env = Env::test(ManualClock::new(Timestamp(T0 + 4_000 * S)));
+        let dir = Path::new("reader-parts");
+        let config = StoreConfig::new(dir, "Etc/UTC")
+            .create_if_missing(true)
+            .env(env.clone());
+        let s = crate::durable::tests::block_on(Store::open(config)).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/v",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        crate::durable::tests::block_on(s.define_series(spec)).unwrap();
+        for chunk in (0..3_000i64).collect::<Vec<_>>().chunks(250) {
+            let rs: Vec<Reading> = chunk
+                .iter()
+                .map(|&k| Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64)))
+                .collect();
+            crate::durable::tests::block_on(s.emit(&rs)).unwrap();
+        }
+        crate::durable::tests::block_on(s.shutdown()).unwrap();
+        let read = |part: usize| {
+            let r = DurableReader::open(dir, &env, Duration::from_secs(60)).unwrap();
+            r.lock().part = part;
+            let range = TimeRange::new(Timestamp(T0), Timestamp(T0 + 4_000 * S));
+            let facts = r
+                .with(|i, _| i.facts(SeriesId(1), range, View::History))
+                .unwrap();
+            let parts = r.lock().parts;
+            (facts, parts)
+        };
+        let (parts, n) = read(100);
+        let (whole, one) = read(usize::MAX);
+        assert_eq!(parts.len(), 3_000);
+        assert_eq!(parts, whole);
+        assert!(n >= 12 && one == 1, "{n} parts, {one} for the whole");
     }
 }
