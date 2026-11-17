@@ -186,3 +186,32 @@ proptest! {
         }
     }
 }
+
+/// A definition with `names` as its state names.
+fn states(names: impl Iterator<Item = Vec<u8>>) -> Vec<u8> {
+    let mut d = definition(1, "s", "");
+    d.1[3].1 = vec![3];
+    let at = d.1.iter().position(|(f, _)| *f == 14).unwrap();
+    d.1.splice(at..at, names.map(|n| (13u16, n)));
+    entries_body(1, T0, &[d])
+}
+
+/// Q-182 with Q-651: at the limit of 65,536 state names a repeated name is still found; one more name is refused
+/// whatever the names.
+#[test]
+fn state_names_at_the_limit_are_told_distinct_and_past_it_refused() {
+    let name = |k: u32| {
+        (0..3)
+            .map(|d| 0x21 + (k >> (6 * d) & 63) as u8)
+            .collect::<Vec<u8>>()
+    };
+    let distinct = states((0..65_536).map(name));
+    assert!(EntriesBlock::check(&distinct).is_ok());
+    let repeated = states((0..65_536).map(|k| name(k.min(65_534))));
+    assert!(EntriesBlock::check(&repeated).is_err());
+    let over = states((0..65_537).map(name));
+    assert!(EntriesBlock::check(&over).is_err());
+    for b in [&distinct, &repeated, &over] {
+        assert_eq!(EntriesBlock::check(b), EntriesBlock::decode(b).map(|_| ()));
+    }
+}
