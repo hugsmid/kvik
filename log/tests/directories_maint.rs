@@ -236,3 +236,53 @@ fn a_hook_that_panics_leaves_the_store_writable() {
     assert_eq!(log.fault(), None);
     log.shutdown().unwrap();
 }
+
+#[test]
+fn a_seal_is_listed_soon_although_the_timed_mark_sync_is_an_hour_away() {
+    let fs = Arc::new(SlowFs {
+        inner: MemFs::new(),
+        slow: AtomicBool::new(false),
+    });
+    let new = NewStore {
+        store_id: [9; 16],
+        created_at: T0,
+        site_zone: "Etc/UTC".into(),
+        tzdata: "2026a".into(),
+        software: "kvik test".into(),
+    };
+    let dir = PathBuf::from("store");
+    let store = StoreDir::open(fs.clone(), &dir, Some(&new)).unwrap();
+    let c = WriterConfig {
+        mark_sync: kvik_log::writer::MarkSync::Interval(Duration::from_secs(3_600)),
+        ..cfg()
+    };
+    let w = LogWriter::open(store, c, Some([5; 16]), Duration::ZERO, T0).unwrap();
+    let log = Log::start_with(
+        w,
+        Arc::new(SystemClock::default()),
+        Some(DirectoryOptions::default()),
+    )
+    .unwrap();
+    ingest(&log, 100, 0);
+    assert!(sealed(&fs.inner) > 0);
+    // The maintenance thread asks for the mark sync a listing waits for.
+    let at = Instant::now();
+    loop {
+        let root = kvik_log::directory::read_latest(
+            &fs.inner,
+            &dir,
+            kvik_log::directory::Family::Root,
+            |b| kvik_log::directory::logdir::Root::decode(b, &[9; 16]),
+        )
+        .unwrap();
+        if root.is_some_and(|(_, r)| r.segment_count > 0) {
+            break;
+        }
+        assert!(
+            at.elapsed() < Duration::from_secs(20),
+            "no sealed segment listed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    log.shutdown().unwrap();
+}

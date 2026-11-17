@@ -115,6 +115,67 @@ fn a_manifest_rebuild_invalidates_the_root_alone() {
 }
 
 #[test]
+fn a_manifest_record_of_the_same_epoch_and_length_but_other_content_invalidates_the_root() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 100, 0);
+    r.settle();
+    let path = dir().join("MANIFEST");
+    let old = read_manifest(&r.fs.read(&path).unwrap(), &STORE_ID).unwrap();
+    let last = old.records.last().unwrap().clone();
+    let mut bytes = r.fs.read(&path).unwrap();
+    let record = encode_record(last.record_type, last.epoch, last.generation, T0 + 1, None);
+    assert_eq!(record.len() as u64, last.end - last.offset);
+    bytes[last.offset as usize..last.end as usize].copy_from_slice(&record);
+    rewrite(&r, &path, &bytes);
+    assert!(
+        r.load().is_none(),
+        "matched by content, not by offset and epoch alone"
+    );
+}
+
+#[test]
+fn a_group_that_is_not_the_one_the_root_entry_describes_is_not_used() {
+    let r = two_groups();
+    let d = r.load().unwrap();
+    let frame = |id| Frame {
+        generation: 0,
+        file_id: id,
+        written_at: T0,
+    };
+    // The last group with a record taken out of its middle, under a root that names it as it now is: the root is
+    // well formed, the group does not join up.
+    let mut g = d.groups.last().unwrap().clone().unwrap();
+    g.segments.remove(1);
+    let mut root = d.root.clone();
+    *root.groups.last_mut().unwrap() = g.entry();
+    root.segment_count -= 1;
+    let gid = directory::generations(&r.fs, &dir(), Family::Group(g.number))[0].0 + 1;
+    directory::write_file(
+        &r.fs,
+        &dir(),
+        Family::Group(g.number),
+        gid,
+        &g.encode(frame(gid), STORE_ID).unwrap(),
+    )
+    .unwrap();
+    let rid = directory::generations(&r.fs, &dir(), Family::Root)[0].0 + 1;
+    directory::write_file(
+        &r.fs,
+        &dir(),
+        Family::Root,
+        rid,
+        &root.encode(frame(rid), STORE_ID).unwrap(),
+    )
+    .unwrap();
+    let found = r.load().unwrap();
+    assert_eq!(found.root, root);
+    assert!(
+        found.groups.last().unwrap().is_none(),
+        "a group with a hole"
+    );
+}
+
+#[test]
 fn a_segment_whose_trailer_changed_under_its_record_is_described_again_by_the_next_start() {
     let mut r = Rig::new(cfg());
     ingest(&mut r, 600, 0);

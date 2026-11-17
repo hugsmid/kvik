@@ -56,10 +56,18 @@ fn a_reopened_writer_reuses_every_group_and_reads_no_segment_again() {
     ingest(&mut r, 400, 0);
     r.settle();
     let live = r.load().unwrap();
+    let groups = |r: &Rig| {
+        r.derived()
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "grp"))
+            .collect::<Vec<_>>()
+    };
+    let before = groups(&r);
     r.open();
     r.settle();
     assert_eq!(r.dirs.as_ref().unwrap().stats().described, 0);
     assert_eq!(r.load().unwrap().root.groups, live.root.groups);
+    assert_eq!(groups(&r), before, "no group file written again");
 }
 
 #[test]
@@ -399,6 +407,11 @@ fn a_family_of_a_newer_version_is_left_alone_and_not_retried() {
     let d = r.dirs.as_ref().unwrap();
     assert!(d.started());
     assert_eq!(d.stats().failed, 0, "{waits:?}");
+    let retries = waits
+        .iter()
+        .filter(|w| **w == Some(Duration::from_millis(100)))
+        .count();
+    assert!(retries <= waits.len() / 5, "no retry of a family left alone: {waits:?}");
     assert_eq!(
         r.fs.read(&gens[0].1).unwrap(),
         bytes,
@@ -508,6 +521,11 @@ fn a_series_write_covers_the_seals_so_the_next_small_seal_waits() {
     r.settle();
     let more = r.sealed().len() - seals;
     assert!(
+        writes(&r) as usize * 2 + 2 >= more,
+        "the largest recent seal counts: {} writes for {more} seals",
+        writes(&r)
+    );
+    assert!(
         writes(&r) as usize * 3 / 2 <= more + 1,
         "{} writes for {more} seals",
         writes(&r)
@@ -529,4 +547,17 @@ fn a_start_removes_temporary_files_a_crash_left() {
     r.open();
     r.settle();
     assert!(r.fs.read(&tmp).is_none());
+}
+
+#[test]
+fn no_derived_file_is_written_while_free_space_is_below_the_critical_mark() {
+    let mut r = Rig::new(WriterConfig {
+        disk_critical: 1 << 30,
+        ..cfg()
+    });
+    r.fs.set_free_space(1 << 30);
+    ingest(&mut r, 300, 0);
+    r.settle();
+    assert!(r.derived().is_empty(), "{:?}", r.derived());
+    assert!(r.dirs.as_ref().unwrap().stats().failed > 0);
 }

@@ -437,11 +437,11 @@ impl Directories {
     /// what is listed (A.18 Contiguity): a later seal waits behind an earlier one not handed over yet.
     fn list_ready(&mut self, synced: Position) {
         self.pending.sort_by_key(SegmentRecord::last);
-        let mut i = 0;
-        while i < self.pending.len() {
-            let r = &self.pending[i];
+        let mut keep = Vec::new();
+        for r in std::mem::take(&mut self.pending) {
             if r.last() > synced {
-                break;
+                keep.push(r);
+                continue;
             }
             if r.last() > self.seen {
                 self.seen = r.last();
@@ -452,7 +452,6 @@ impl Directories {
             let listed = self.listed_through();
             if listed.is_some_and(|l| r.last() <= l) {
                 // A segment sealed before the files were read, handed over again.
-                self.pending.remove(i);
                 continue;
             }
             let start = Position {
@@ -464,10 +463,9 @@ impl Directories {
                 None => r.generation != 0 || logdir::joins(start, r.first(), &self.lost),
             };
             if !joins || self.hole.is_some_and(|h| r.file_id >= h) {
-                i += 1;
+                keep.push(r);
                 continue;
             }
-            let r = self.pending.remove(i);
             if self.open.segments.len() == logdir::GROUP_SEGMENTS {
                 let number = self.open.number + 1;
                 let full = std::mem::replace(
@@ -485,8 +483,8 @@ impl Directories {
             }
             self.open.segments.push(r);
             self.root_dirty = true;
-            i = 0;
         }
+        self.pending = keep;
     }
 
     /// Writes a group unless a valid file found at the start already holds it.

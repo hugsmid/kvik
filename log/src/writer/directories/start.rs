@@ -128,7 +128,11 @@ impl Directories {
                 continue;
             };
             match Group::decode(&b, &self.store_id) {
-                Ok((f, (g, crc))) if f.file_id == id && f.generation == self.start.generation => {
+                // A group of an earlier store generation (before a restore) is never named again.
+                Ok((f, _)) if f.generation != self.start.generation => {
+                    let _ = fs.remove_file(&path);
+                }
+                Ok((f, (g, crc))) if f.file_id == id => {
                     self.on_disk.entry(number).or_default().insert(crc);
                     for r in g.segments {
                         s.known.entry(r.file_id).or_insert(r);
