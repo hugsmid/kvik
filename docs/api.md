@@ -450,6 +450,12 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   `LogStats.sync_interval` is the batch-sync interval in force and `sync_time` the smoothed batch-sync duration it
   follows (`None` before the first batch sync after a start); the model backend, which does not sync, reports zero and
   `None`.
+- `Stats.delivery` counts what the store's delivery reader met taking the committed log: failed reads of the log,
+  tried again at the next one (`refresh_errors`), invalid regions below the durable mark it passed over
+  (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). While no consumer
+  is known to the store (none taken in this run, none named by a cursor file or the log), an `emit` returns without
+  reading its batch back; the `kvik-deliver` thread reads it shortly after. These counts may then lag an emit's
+  return, and `refresh_errors` counts the failed reads, not the calls (Q-706).
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
   calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,

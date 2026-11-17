@@ -1126,6 +1126,8 @@ pub struct CommitReport {
     pub positions: Vec<Position>,
     /// Readings dropped as duplicates.
     pub duplicates: usize,
+    /// Positions of the facts outranked when committed (§4 Outranked facts).
+    pub outranked: BTreeSet<Position>,
 }
 
 /// Result of [`Model::read`]: where each file was found, and the facts.
@@ -2812,6 +2814,7 @@ impl Model {
         let mut report = CommitReport {
             positions: batch.iter().map(|e| e.position).collect(),
             duplicates,
+            outranked: outranked.clone(),
         };
         if batch.is_empty() {
             return Ok(report);

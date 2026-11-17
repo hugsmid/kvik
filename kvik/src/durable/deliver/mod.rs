@@ -11,8 +11,8 @@
 //! with a `resync` that carries each funnel's state now ([`resync`]). Confirmations move the cursor and the latches,
 //! which the cursor file holds ([`confirm`]).
 //!
-//! The work is done on the calling thread of the call that needs it (an emit's acknowledgement, a poll, a
-//! confirmation, [`crate::Store::tick`]) and by the `kvik-deliver` thread ([`Hub`]), never on the writer thread.
+//! The work is done on the calling thread of the call that needs it (an emit's acknowledgement while a consumer is
+//! registered, a poll, a confirmation, [`crate::Store::tick`]) and by the `kvik-deliver` thread ([`Hub`]), never on the writer thread.
 //! Timers run on `Env`'s monotonic clock; `now` and live staleness are the writer's ([`super::clock`]).
 //!
 //! Not here yet: windowed operators in funnels, starting at a position or a time, the saved-point check, timer
@@ -405,6 +405,17 @@ impl Deliverer {
     /// The routes and registry in force.
     pub(crate) fn view(&self) -> &View {
         &self.view
+    }
+
+    /// The last position taken.
+    #[cfg(test)]
+    pub(crate) fn head(&self) -> LogPos {
+        self.head
+    }
+
+    /// Whether any consumer is known: taken in this run, or named by a cursor file or the log.
+    pub(crate) fn has_consumers(&self) -> bool {
+        !self.consumers.is_empty()
     }
 
     /// Counts of what taking the log met.

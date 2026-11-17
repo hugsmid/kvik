@@ -832,12 +832,6 @@ impl Slot {
         let facts: Vec<km::types::Fact> =
             entries.iter().filter_map(|e| e.fact().cloned()).collect();
         let mut next = facts.iter().peekable();
-        let versioned: BTreeSet<SeriesId> = self
-            .specs
-            .iter()
-            .filter(|(_, s)| s.versioned.is_some())
-            .map(|(id, _)| *id)
-            .collect();
         for (i, mr) in emitted {
             let matched = next.peek().is_some_and(|f| {
                 f.series == mr.series
@@ -851,11 +845,7 @@ impl Slot {
                 continue;
             }
             let f = next.next().expect("peeked");
-            let current = self.model.current().map_err(convert::error)?;
-            let outranked = versioned.contains(&sid(f.series))
-                && current
-                    .get(&(f.series, f.t))
-                    .is_some_and(|c| c.position < f.position);
+            let outranked = report.outranked.contains(&f.position);
             if !outranked && f.summarised() && !f.flags.future {
                 self.committed_mono.insert(sid(f.series), self.model.mono);
             }

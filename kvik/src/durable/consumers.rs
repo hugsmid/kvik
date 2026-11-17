@@ -27,9 +27,10 @@ impl Writer {
             .ok_or_else(|| Error::ReadOnly("the start could not read the log".into()))
     }
 
-    /// Takes the batches acknowledged since the last call into the consumers' queues.
+    /// Takes the batches acknowledged since the last call into the consumers' queues; with no consumer, left to the
+    /// `kvik-deliver` thread (Q-706).
     pub(crate) fn deliver(&self) {
-        if let Some(h) = &self.hub {
+        if let Some(h) = self.hub.as_ref().filter(|h| h.has_consumers()) {
             h.run(|d, c| d.pump(c));
             h.wait_wakes();
         }
@@ -52,9 +53,10 @@ impl Writer {
     }
 
     /// Runs the timers that are due, before a call is decided, as the model backend runs them; the batches and the
-    /// cursor files are left to the acknowledgement and the `kvik-deliver` thread.
+    /// cursor files are left to the acknowledgement and the `kvik-deliver` thread. With no consumer there is nothing
+    /// to evaluate (Q-706).
     pub(crate) fn run_timers(&self) {
-        if let Some(h) = &self.hub {
+        if let Some(h) = self.hub.as_ref().filter(|h| h.has_consumers()) {
             h.ticked();
             h.run(|d, c| d.tick(c));
         }
@@ -113,6 +115,9 @@ impl Writer {
             ));
         }
         let emits = emits_in(emits);
+        // Before the pumps below (Q-706). A take refused after this leaves the flag raised for the run, which
+        // only costs emits the work they would skip.
+        hub.consumer_coming();
         let mut d = lock(&self.decider);
         let change = hub.run(|dl, c| -> Result<Option<Routing>, Error> {
             dl.pump(c);
@@ -144,9 +149,13 @@ impl Writer {
         }
         drop(d);
         let r = hub.run(|dl, c| {
+            #[cfg(test)]
+            super::pause::at(&self.dir, super::pause::Point::SetUpPump);
             dl.pump(c);
             dl.take(name, start, c)
         })?;
+        #[cfg(test)]
+        super::pause::at(&self.dir, super::pause::Point::TakeSetUp);
         self.flush(r)
     }
 

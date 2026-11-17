@@ -122,7 +122,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         prop::bool::weighted(0.15),
     );
     // A few keys of the plain gauge and the versioned series, so that duplicates and outranked facts of both meet
-    // within one call, interleaved. Within a call the versioned readings' `changed_at` does not rise (Q-705).
+    // within one call, interleaved.
     let keyed = (
         prop::sample::select(vec![0usize, 4]),
         prop::sample::select(vec![0i64, 1, 2, 3, 1_500, 3_000]),
@@ -131,20 +131,16 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         0u64..3,
     )
         .prop_map(|(i, t, v, q, c)| (i, t, v, q, (i == 4).then_some(c), false));
+    // Calls on two keys of the versioned series alone, so that an earlier reading of a call is often outranked at
+    // commit while a later one becomes current (Q-705).
+    let versions = (prop::sample::select(vec![0i64, 1]), 0u8..2, 0u64..4)
+        .prop_map(|(t, v, c)| (4usize, t, v, 0u8, Some(c), false));
     let step = prop_oneof![
         10 => (prop::collection::vec(reading, 1..6), any::<bool>())
             .prop_map(|(r, rev)| Step::Emit(r, rev)),
-        4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2)).prop_map(
-            |(mut r, rev)| {
-                let at: Vec<usize> = (0..r.len()).filter(|&k| r[k].4.is_some()).collect();
-                let mut versioned: Vec<_> = at.iter().map(|&k| r[k]).collect();
-                versioned.sort_by_key(|x| std::cmp::Reverse(x.4));
-                for (k, x) in at.into_iter().zip(versioned) {
-                    r[k] = x;
-                }
-                Step::Emit(r, rev)
-            }
-        ),
+        4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2))
+            .prop_map(|(r, rev)| Step::Emit(r, rev)),
+        2 => prop::collection::vec(versions, 2..6).prop_map(|r| Step::Emit(r, false)),
         1 => (0usize..7, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
         1 => (0usize..7, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
         1 => (0usize..7).prop_map(Step::Define),
@@ -155,6 +151,13 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         1 => Just(Step::Restart),
     ];
     prop::collection::vec(step, 1..16)
+}
+
+fn outranked_on_arrival(s: &Store, ids: &[SeriesId]) -> u64 {
+    ids.iter()
+        .filter_map(|id| s.series_stats(*id))
+        .map(|st| st.outranked_on_arrival)
+        .sum()
 }
 
 /// What a history gives on one backend: every result in a comparable form, and per series its facts in each view.
@@ -198,6 +201,7 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
                         r
                     })
                     .collect();
+                let outranked_before = outranked_on_arrival(&s, &all);
                 let intent = if *revise {
                     Intent::Revise
                 } else {
@@ -217,6 +221,26 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
                     block_on(s.emit_with(&readings, intent))
                 }
                 .unwrap();
+                let outranked_then_current =
+                    rs.iter().zip(&ack.outcomes).enumerate().any(|(k, (r, o))| {
+                        matches!(
+                            o,
+                            Outcome::Recorded {
+                                outranked: true,
+                                ..
+                            }
+                        ) && rs.iter().zip(&ack.outcomes).skip(k + 1).any(|(later, lo)| {
+                            (later.0, later.1) == (r.0, r.1)
+                                && matches!(
+                                    lo,
+                                    Outcome::Recorded {
+                                        outranked: false,
+                                        ..
+                                    }
+                                )
+                        })
+                    });
+                WITHIN_CALL.fetch_add(u64::from(outranked_then_current), Ordering::Relaxed);
                 let outcomes: Vec<String> = ack
                     .outcomes
                     .iter()
@@ -233,6 +257,11 @@ fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (
                     })
                     .collect();
                 out.push(format!("emit {outcomes:?}"));
+                // Per call: the backends rebuild different counters at a start.
+                out.push(format!(
+                    "outranked_on_arrival +{}",
+                    outranked_on_arrival(&s, &all) - outranked_before
+                ));
             }
             Step::Retire(i, t) => out.push(format!(
                 "retire {:?}",
@@ -455,7 +484,15 @@ fn the_durable_backend_decides_as_the_model_does() {
     let (small, default, slow) = differential(prop::bool::weighted(0.5));
     assert!(small > 0 && default > 0, "{small} small, {default} default");
     assert!(slow > 0, "some history takes the slow path");
+    assert!(
+        WITHIN_CALL.load(Ordering::Relaxed) > 0,
+        "some call records a reading outranked at commit and then its key's current fact (Q-705)"
+    );
 }
+
+/// Calls of the differential histories holding a reading outranked at commit and a later reading of its key that is
+/// not (Q-705).
+static WITHIN_CALL: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn small_windows_decide_as_the_model_does() {
