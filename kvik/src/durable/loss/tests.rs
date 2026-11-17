@@ -330,3 +330,53 @@ fn the_watchs_reports_taken_in_parts_equal_a_full_reads_and_it_keeps_no_segment_
     assert_eq!(w.losses().len(), full.len());
     w.shutdown().unwrap();
 }
+
+#[test]
+fn a_region_inside_a_report_held_too_wide_still_reaches_the_latch_with_its_closed_range() {
+    let mut f = Finder::default();
+    let latch = Latch::default();
+    let found = f.apply(
+        &[
+            batch(1, 2),
+            region(100, Some(2), None),
+            batch(5, 1),
+            batch(6, 2),
+        ],
+        at(7),
+    );
+    latch.note(&found);
+    assert_eq!(found[0].closed, (at(3), at(4)));
+    assert_eq!(found[0].report.last, Some(Position::new(0, 7)));
+    let tail = ReadEvent::Corruption {
+        file_id: 2,
+        region: InvalidRegion {
+            start: 300,
+            end: 364,
+            last_sequence_before: Some(5),
+            first_sequence_after: None,
+            cause: ScanCause::Corruption,
+        },
+    };
+    let void = ReadEvent::Void {
+        above: at(5),
+        cause: kvik_log::reader::VoidCause::Rewritten,
+    };
+    let found = f.apply(&[void, tail.clone()], at(7));
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].report.last,
+        Some(Position::new(0, 7)),
+        "the held report, unchanged"
+    );
+    latch.note(&found);
+    let mut seen = 1;
+    assert_eq!(latch.closed_since(&mut seen), vec![(at(6), at(7))]);
+    assert!(latch.covers(2, 300, 364));
+    assert_eq!(latch.found().len(), 1);
+    let fresh = latch.take_fresh();
+    assert_eq!(
+        fresh.iter().map(|f| f.grew).collect::<Vec<_>>(),
+        vec![true, true]
+    );
+    assert!(f.apply(&[tail], at(7)).is_empty(), "met again, nothing new");
+}

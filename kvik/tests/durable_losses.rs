@@ -473,3 +473,47 @@ fn two_damaged_neighbours_are_one_loss_as_a_reader_process_reports_it_and_each_r
     assert_eq!(ack.duplicates_dropped(), 1);
     block_on(s.shutdown()).unwrap();
 }
+
+/// Waits until the segment holding `text` is sealed.
+fn sealed_with(w: &World, text: &[u8]) {
+    for _ in 0..4_000 {
+        let held = w
+            .segments()
+            .into_iter()
+            .find(|(_, b)| b.windows(text.len()).any(|x| x == text));
+        if held.is_some_and(|(p, _)| p.extension().is_some_and(|e| e == "kvl")) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the segment holding the text was not sealed");
+}
+
+#[test]
+fn damage_inside_a_loss_reported_too_wide_reaches_the_stores_reader_and_its_replay_is_recorded() {
+    let w = World::new("inside-wide");
+    let mut config = w.config();
+    config.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let two = emit_notes(&s, id, &["WIDE-ONE", "WIDE-TWO"])[1];
+    sealed_with(&w, b"WIDE-TWO");
+    for (i, t) in [(2, "WIDE-THREE"), (3, "WIDE-FOUR")] {
+        block_on(s.emit(&[note(id, i, t)])).unwrap();
+    }
+    assert_eq!(history(&s.reader(), id).len(), 4);
+    damage(&w, b"WIDE-TWO");
+    let lost = data_lost(&s.losses());
+    assert_eq!(lost.len(), 1);
+    assert!(lost[0].2 > Some(two), "reported to the mark (Q-937): {lost:?}");
+    damage(&w, b"WIDE-FOUR");
+    assert_eq!(data_lost(&s.losses()).len(), 1);
+    let ack = block_on(s.emit(&[note(id, 3, "WIDE-FOUR")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
+    let shown: Vec<_> = history(&s.reader(), id)
+        .into_iter()
+        .map(|f| f.value)
+        .collect();
+    assert_eq!(shown.len(), 3, "{shown:?}");
+    block_on(s.shutdown()).unwrap();
+}

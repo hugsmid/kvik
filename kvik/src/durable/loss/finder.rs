@@ -10,7 +10,7 @@ use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 use kvik_log::writer::Position as LogPos;
 
-use super::{merge, widen};
+use super::{Regions, merge, widen};
 use crate::durable::index::{cause_out, log_pos, mark_state_out};
 use crate::health::{LossCause, LossKind, LossReport, MarkState};
 use crate::time::Timestamp;
@@ -42,6 +42,8 @@ pub(crate) struct Finder {
     recoveries: BTreeMap<LogPos, Recovery>,
     /// Lost ranges found by this finder's reads, latched.
     found: Vec<LossReport>,
+    /// The regions met, so that a region inside a held report still reaches the latch once.
+    regions: Regions,
 }
 
 impl Finder {
@@ -130,11 +132,13 @@ impl Finder {
             closed: (at(first), at(last)),
         };
         let open = region.first_sequence_after.is_none();
+        let met = !self.regions.covers(file_id, region.start, region.end);
+        self.regions.insert(file_id, region.start, region.end);
         // A region that overlaps a loss already found is that loss, grown, under its first identity (spec §3 Order
-        // of a start step 4).
+        // of a start step 4); one inside it, met for the first time, is handed on with that loss unchanged.
         let overlaps = |f: &&mut LossReport| f.first <= report.last && report.first <= f.last;
         if let Some(f) = self.found.iter_mut().find(overlaps) {
-            if !widen(f, &report) {
+            if !widen(f, &report) && !met {
                 return None;
             }
             return Some((find(f.clone()), open));
