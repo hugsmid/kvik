@@ -71,6 +71,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 | Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
+| Q-871 | `format.md` A.12 Open | A store creation cut short between its rename and the directory sync |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1532,6 +1533,19 @@ commit path: `docs/measurements/4.8-commit-latency.md`, Q-630 note. Tests: `log/
 mark by corruption, above it by the entry's gap). Tests whose scenario needed a first batch beyond the mark now
 commit one batch first (`log/tests/recovery.rs`, `log/tests/writer.rs`, `log/tests/threads.rs`).
 
+## Q-871 — A store creation cut short between its rename and the directory sync
+Recorded by the implementation of the Q-630 ruling (the crash sweep of
+`log/tests/recovery.rs` `a_crash_while_creating_the_store_or_in_its_first_start_is_recovered` found it once the
+commit path's operations changed). For the owner's acceptance.
+**Scenario.** Store creation writes `STORE.tmp`, renames it to `STORE` and syncs the directory (`format.md` A.12). A
+process stop after the rename and before that sync, then a restart on the same boot, finds `STORE` and opened the
+store without syncing the directory; the first start then wrote the manifest, log and mark. A power loss later can
+undo the rename, leaving files under `log/` with no `STORE`: `NotAStore`, and the store cannot be opened.
+**Decided.** Opening a store whose `STORE` is present syncs the store directory first (`log/src/store.rs`
+`StoreDir::open`; `format.md` A.12 Open), so the rename is durable before anything else is written. One directory sync
+more per open; no format or interface change. Test: `log/tests/writer.rs`
+`opening_a_store_makes_a_creations_rename_durable`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1617,6 +1631,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
+| Q-871 | 8.3 | Decided with the Q-630 work: opening a store syncs its directory; for the owner's acceptance |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
