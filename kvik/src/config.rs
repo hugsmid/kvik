@@ -126,6 +126,9 @@ impl StoreConfig {
         if self.limits.consumer_queue == 0 {
             return bad("limits.consumer_queue", "at least 1");
         }
+        if self.limits.window_memory < 4 << 10 {
+            return bad("limits.window_memory", "at least 4 KiB");
+        }
         Ok(())
     }
 }
@@ -215,7 +218,16 @@ pub struct Limits {
     /// Consumers a store can have; the model backend reserves this many
     /// consumer slots when the store is created (default 64).
     pub max_consumers: usize,
+    /// Bytes the recent windows may hold in all (spec §5.1, Q-751): half for the writer's decision windows and
+    /// revised-key index, half for the deliverer's windows; beyond it the oldest entries are read from the log
+    /// instead. Default [`WINDOW_MEMORY_DESKTOP`]; [`WINDOW_MEMORY_MINIMAL`] suits the minimal hardware class.
+    pub window_memory: u64,
 }
+
+/// The default `limits.window_memory`, for the desktop class (4 or more cores, 8 GB or more).
+pub const WINDOW_MEMORY_DESKTOP: u64 = 512 << 20;
+/// `limits.window_memory` for the minimal class (1 to 3 GB of memory).
+pub const WINDOW_MEMORY_MINIMAL: u64 = 64 << 20;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -228,6 +240,7 @@ impl Default for Limits {
             default_lateness_bound: Duration::from_secs(300),
             consumer_queue: 4_096,
             max_consumers: 64,
+            window_memory: WINDOW_MEMORY_DESKTOP,
         }
     }
 }

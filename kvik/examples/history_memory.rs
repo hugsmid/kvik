@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! cargo run --release -p kvik --example history_memory -- --dir <scratch dir> \
-//!     [--series 2000] [--calls 1500] [--late-every 0] [--sample 100] [--reopen]
+//!     [--series 2000] [--calls 1500] [--late-every 0] [--sample 100] [--window-memory MiB] [--reopen]
 //! ```
 //!
 //! One writer emits `--calls` calls of one reading per series, each call at a new timestamp one second after the
@@ -60,6 +60,7 @@ struct Args {
     calls: usize,
     late_every: usize,
     sample: usize,
+    window_memory: Option<u64>,
     reopen: bool,
     open_only: bool,
     keep: bool,
@@ -72,6 +73,7 @@ fn args() -> Args {
         calls: 1_500,
         late_every: 0,
         sample: 100,
+        window_memory: None,
         reopen: false,
         open_only: false,
         keep: false,
@@ -94,6 +96,7 @@ fn args() -> Args {
                     "--calls" => a.calls = n(),
                     "--late-every" => a.late_every = n(),
                     "--sample" => a.sample = n().max(1),
+                    "--window-memory" => a.window_memory = Some(n() as u64),
                     _ => panic!("unknown argument {k}"),
                 }
             }
@@ -103,10 +106,13 @@ fn args() -> Args {
     a
 }
 
-fn config(dir: &std::path::Path) -> StoreConfig {
+fn config(dir: &std::path::Path, window_memory: Option<u64>) -> StoreConfig {
     let mut config =
         StoreConfig::new(dir.to_string_lossy().into_owned(), "Etc/UTC").create_if_missing(true);
     config.log.min_sync_interval = Duration::ZERO;
+    if let Some(m) = window_memory {
+        config.limits.window_memory = m << 20;
+    }
     config
 }
 
@@ -114,10 +120,10 @@ fn slow_path(store: &Store) -> u64 {
     store.stats().ingest.slow_path
 }
 
-fn open_and_report(dir: &std::path::Path) {
+fn open_and_report(dir: &std::path::Path, window_memory: Option<u64>) {
     let before = rss_mib();
     let t = Instant::now();
-    let store = block_on(Store::open(config(dir))).expect("open");
+    let store = block_on(Store::open(config(dir, window_memory))).expect("open");
     let took = t.elapsed();
     println!(
         "open: {:.2} s, resident {:.0} MiB (before open {:.0} MiB)",
@@ -132,11 +138,11 @@ fn main() {
     let a = args();
     let store_dir = a.dir.join("history-memory-store");
     if a.open_only {
-        open_and_report(&store_dir);
+        open_and_report(&store_dir, a.window_memory);
         return;
     }
     assert!(!store_dir.exists(), "{} exists", store_dir.display());
-    let store = block_on(Store::open(config(&store_dir))).expect("open");
+    let store = block_on(Store::open(config(&store_dir, a.window_memory))).expect("open");
     let ids: Vec<SeriesId> = (0..a.series)
         .map(|i| {
             let spec = SeriesSpec::new(
@@ -228,7 +234,7 @@ fn main() {
     block_on(store.shutdown()).expect("shutdown");
     drop(store);
     if a.reopen {
-        open_and_report(&store_dir);
+        open_and_report(&store_dir, a.window_memory);
     }
     if !a.keep {
         std::fs::remove_dir_all(&store_dir).expect("remove the store");

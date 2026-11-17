@@ -180,7 +180,17 @@ mod bounded {
 
     fn open(env: &Env, dir: &str) -> Deliverer {
         let clocks = Clocks::new(env.clock.clone());
-        Deliverer::open(Path::new(dir), env, &clocks, [0; 16], 4_096, 64, None).unwrap()
+        Deliverer::open(
+            Path::new(dir),
+            env,
+            &clocks,
+            [0; 16],
+            4_096,
+            64,
+            usize::MAX,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -191,9 +201,13 @@ mod bounded {
         assert!(d.recent.held() <= 3 * 901, "{}", d.recent.held());
         assert!(d.recent.held() <= 3 * WINDOW_FACTS);
         let now = T0 + 7_200 * S;
-        // Series 3's live-state fact is its first, two hours before the window.
+        // Series 3's live-state fact is its first, two hours before the window: found in two reads, the second
+        // reaching sixteen times as far back as the first.
+        let reads = d.slow.get();
         let live = d.live_fact(3, now).unwrap();
         assert_eq!((live.row.t, live.position.sequence > 0), (T0, true));
+        assert_eq!(d.slow.get() - reads, 2);
+        assert!(!d.incomplete.get());
         assert_eq!(d.live_fact(1, now).unwrap().row.t, T0 + 7_199 * S);
         // The late versions: 3 was outranked by the version 5 recorded before it, 9 was not.
         let clocks = Clocks::new(env.clock.clone());
@@ -208,9 +222,13 @@ mod bounded {
         };
         let late: Vec<(Option<u64>, bool)> = d
             .facts_between(LogPos::default(), next(d.head), &ctx)
+            .unwrap()
             .into_iter()
-            .filter(|(s, _)| s.row.series_id == 2 && s.row.t == T0 + 10 * S)
-            .map(|(s, o)| (s.row.changed_at, o))
+            .filter(|(s, _, _)| s.row.series_id == 2 && s.row.t == T0 + 10 * S)
+            .map(|(s, o, u)| {
+                assert!(!u);
+                (s.row.changed_at, o)
+            })
             .collect();
         assert_eq!(late, [(Some(5), false), (Some(3), true), (Some(9), false)]);
         assert!(d.slow.get() > 0);
@@ -221,11 +239,60 @@ mod bounded {
         let (env, dir) = store();
         let d = open(&env, dir);
         let read = HashMap::new();
-        // Below the window, without the key read: nothing known, so not outranked.
-        assert!(!d.outranked((2, T0 + 10 * S), next(d.head), 4, &read));
+        // Below the window, without the key read: nothing known, so not outranked, and flagged.
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 4, &read),
+            (false, true)
+        );
         let found = d.read_keys(&[(2, T0 + 10 * S)]);
-        let read: HashMap<_, _> = found.facts.into_iter().collect();
-        assert!(d.outranked((2, T0 + 10 * S), next(d.head), 4, &read));
-        assert!(!d.outranked((2, T0 + 10 * S), next(d.head), 9, &read));
+        let read: HashMap<_, _> = found
+            .facts
+            .into_iter()
+            .map(|(k, f)| (k, (f, false)))
+            .collect();
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 4, &read),
+            (true, false)
+        );
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 9, &read),
+            (false, false)
+        );
+        // Read but not all of it: an outranking fact found is enough; none found is flagged.
+        let partial: HashMap<_, _> = read.into_iter().map(|(k, (f, _))| (k, (f, true))).collect();
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 4, &partial),
+            (true, false)
+        );
+        assert_eq!(
+            d.outranked((2, T0 + 10 * S), next(d.head), 9, &partial),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn a_read_before_the_window_takes_only_what_has_been_taken() {
+        let (env, dir) = store();
+        let d = open(&env, dir);
+        // A good reading of series 3 arrives below its window after the deliverer last read the log.
+        let s = block_on(Store::open(
+            StoreConfig::new(dir, "Etc/UTC").env(env.clone()),
+        ))
+        .unwrap();
+        let late = Reading::new(SeriesId(3), Timestamp(T0 + 10 * S), Value::F64(7.0));
+        block_on(s.emit(&[late])).unwrap();
+        block_on(s.shutdown()).unwrap();
+        let live = d.live_fact(3, T0 + 7_200 * S).unwrap();
+        assert_eq!(live.row.t, T0, "a fact not yet taken is not yet in force");
+    }
+
+    #[test]
+    fn a_read_before_the_window_that_fails_marks_the_evaluation_incomplete() {
+        let (env, dir) = store();
+        let d = open(&env, dir);
+        let reader = d.reader.borrow_mut().take();
+        assert!(d.live_fact(3, T0 + 7_200 * S).is_none());
+        assert!(d.incomplete.get());
+        drop(reader);
     }
 }

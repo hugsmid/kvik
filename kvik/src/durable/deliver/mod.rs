@@ -23,11 +23,12 @@ mod funnels;
 mod hub;
 mod recent;
 mod resync;
+mod take;
 
 pub(crate) use hub::Hub;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -49,10 +50,9 @@ use super::clock::Clocks;
 use super::index::{Index, Stored, pos};
 use super::routing::{View, funnel_out};
 use crate::backend::Error;
-use crate::consume::{Delivery, Funnel, FunnelId, ResyncCause, Start, TriggerCause};
+use crate::consume::{Delivery, Funnel, FunnelId, ResyncCause, TriggerCause};
 use crate::env::Env;
 use crate::health::{ConsumerStats, DeliveryStats};
-use crate::types::SavedPoint;
 
 /// Items the open takes from the log at a time.
 const LOAD_PART: usize = 1 << 16;
@@ -104,6 +104,8 @@ pub(crate) struct Ctx<'a> {
 struct FactRec {
     stored: Stored,
     outranked: bool,
+    /// Its key's earlier facts could not all be read, so `outranked` rests on those that could (Q-750).
+    unchecked: bool,
 }
 
 /// A record of the kept log; facts are shared with the queues that hold them.
@@ -136,6 +138,7 @@ enum Pend {
         state: MState,
         cause: TriggerCause,
         position: LogPos,
+        unchecked: bool,
     },
     Resync {
         cause: ResyncCause,
@@ -144,6 +147,7 @@ enum Pend {
         funnels: Vec<FState>,
         /// It is, or ends with, a reset point: its confirmation records its id in the cursor file (field 3).
         reset: bool,
+        unchecked: bool,
     },
 }
 
@@ -209,9 +213,13 @@ pub(crate) struct Deliverer {
     index: Index,
     recent: recent::Recent,
     /// Invalid regions the reader passed over, by segment and offset: lost (Q-750).
-    damaged: BTreeSet<(u64, u64)>,
+    damaged: crate::durable::keys::Lost,
     /// Reads of the log for facts outside the recent window.
     slow: Cell<u64>,
+    /// A read of the log for facts outside the recent window met data it could not read since this was last reset.
+    incomplete: Cell<bool>,
+    /// Deliveries decided without every fact they rest on (Q-750).
+    unchecked: u64,
     /// The kept log by position, from `items_from` up (the lowest cursor); below it, a consumer that needs older
     /// records has them read from the log again ([`Deliverer::restore_items`]).
     items: BTreeMap<LogPos, Rec>,
@@ -248,6 +256,7 @@ impl Deliverer {
     /// Opens the deliverer on the kept log, before the writer's threads take calls: reads the whole log, the
     /// manifest's lost ranges and every cursor file, and sets each known consumer up to resume (`spec.md` §3 Order of
     /// a start, step 7).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         dir: &Path,
         env: &Env,
@@ -255,6 +264,7 @@ impl Deliverer {
         store_id: [u8; 16],
         capacity: usize,
         max_consumers: usize,
+        window_budget: usize,
         fold: Option<Arc<super::derived::SeriesFold>>,
     ) -> io::Result<Deliverer> {
         let mut id = [0u8; 16];
@@ -272,9 +282,14 @@ impl Deliverer {
             reader: RefCell::new(Some(reader)),
             store_id,
             index: Index::without_facts(),
-            recent: recent::Recent::default(),
-            damaged: BTreeSet::new(),
+            recent: recent::Recent::with_limits(
+                crate::durable::history::WINDOW_FACTS,
+                window_budget,
+            ),
+            damaged: crate::durable::keys::Lost::default(),
             slow: Cell::new(0),
+            incomplete: Cell::new(false),
+            unchecked: 0,
             items: BTreeMap::new(),
             items_from: LogPos::default(),
             entries: BTreeMap::new(),
@@ -393,6 +408,7 @@ impl Deliverer {
     pub(crate) fn delivery_stats(&self) -> DeliveryStats {
         DeliveryStats {
             slow_path: self.slow.get(),
+            unchecked: self.unchecked,
             ..self.stats.clone()
         }
     }
@@ -406,7 +422,7 @@ impl Deliverer {
                 // delivered.
                 ReadEvent::Corruption { file_id, region } => {
                     self.stats.corruptions += 1;
-                    self.damaged.insert((file_id, region.start));
+                    self.damaged.insert(file_id, region.start, region.end);
                 }
             }
         }
@@ -429,8 +445,10 @@ impl Deliverer {
     /// Takes the batches read that are acknowledged.
     fn take_pending(&mut self, ctx: &Ctx<'_>) {
         let stats = ctx.watch.map(Watch::stats);
-        let mut read: HashMap<crate::durable::history::Key, Vec<kvik_log::reader::FoundFact>> =
-            HashMap::new();
+        let mut read: HashMap<
+            crate::durable::history::Key,
+            (Vec<kvik_log::reader::FoundFact>, bool),
+        > = HashMap::new();
         let mut took = false;
         while let Some(b) = self.pending.front() {
             if let Some(st) = &stats {
@@ -468,22 +486,33 @@ impl Deliverer {
         self.items_from = self.items_from.max(next(floor));
     }
 
-    /// Rebuilds the records from `at` up to where they are kept, from the entries and the log's facts.
-    fn restore_items(&mut self, at: LogPos, ctx: &Ctx<'_>) {
+    /// Rebuilds the records from `at` up to where they are kept, from the entries and the log's facts. A read of the
+    /// log that fails changes nothing and is counted (`refresh_errors`): the consumer stays behind and the next
+    /// call that catches it up reads again. Returns whether the records from `at` are held.
+    fn restore_items(&mut self, at: LogPos, ctx: &Ctx<'_>) -> bool {
         if at >= self.items_from {
-            return;
+            return true;
         }
         let to = self.items_from;
+        let Some(facts) = self.facts_between(at, to, ctx) else {
+            self.stats.refresh_errors += 1;
+            return false;
+        };
         for (p, e) in self.entries.range(at..to) {
             self.items.insert(*p, Rec::Entry(e.clone()));
         }
-        for (stored, outranked) in self.facts_between(at, to, ctx) {
+        for (stored, outranked, unchecked) in facts {
             self.items.insert(
                 stored.position,
-                Rec::Fact(Arc::new(FactRec { stored, outranked })),
+                Rec::Fact(Arc::new(FactRec {
+                    stored,
+                    outranked,
+                    unchecked,
+                })),
             );
         }
         self.items_from = at;
+        true
     }
 
     fn void(&mut self, above: LogPos) {
@@ -509,7 +538,7 @@ impl Deliverer {
         &mut self,
         b: ReadBatch,
         ctx: &Ctx<'_>,
-        read: &mut HashMap<crate::durable::history::Key, Vec<kvik_log::reader::FoundFact>>,
+        read: &mut HashMap<crate::durable::history::Key, (Vec<kvik_log::reader::FoundFact>, bool)>,
     ) {
         self.index.batch(&b);
         // Versioned facts below the recent window: their keys' earlier facts are read from the log, once per pass.
@@ -528,7 +557,8 @@ impl Deliverer {
         if !keys.is_empty() {
             let found = self.read_keys(&keys);
             for k in keys {
-                read.insert(k, found.facts.get(&k).cloned().unwrap_or_default());
+                let facts = found.facts.get(&k).cloned().unwrap_or_default();
+                read.insert(k, (facts, found.unreadable.contains(&k)));
             }
         }
         let mut fed: Vec<u32> = Vec::new();
@@ -543,9 +573,11 @@ impl Deliverer {
             match item {
                 Item::Fact(row) => {
                     let key = (row.series_id, row.t);
-                    let outranked = row
-                        .changed_at
-                        .is_some_and(|c| self.outranked(key, p, c, read));
+                    let (outranked, unchecked) = match row.changed_at {
+                        Some(c) => self.outranked(key, p, c, read),
+                        None => (false, false),
+                    };
+                    self.unchecked += u64::from(unchecked);
                     let rec = Arc::new(FactRec {
                         stored: Stored {
                             position: p,
@@ -553,6 +585,7 @@ impl Deliverer {
                             row,
                         },
                         outranked,
+                        unchecked,
                     });
                     let series = rec.stored.row.series_id;
                     let registry = &self.view.registry;
@@ -622,147 +655,6 @@ impl Deliverer {
             // Catch up from the first position not enqueued in this session (`spec.md` §4 Overflow).
             rt.behind = Some(rec.stored.position);
         }
-    }
-
-    /// The position before a start (`spec.md` §4 New consumer, Resync): the last position for `start: now`, the
-    /// last position committed before `T` for `start: time` (the position before the first fact at or after `T`),
-    /// and for `start: position` the saved point judged against the resets since it was read: kept, its position;
-    /// void above X, X. An unknown point refuses the registration.
-    fn start_point(&self, start: Start) -> Result<LogPos, Error> {
-        match start {
-            Start::Now => Ok(self.head),
-            Start::Time(t) => Ok(self.index.position_at(t.0.saturating_sub(1)).min(self.head)),
-            Start::Position(p) => self.judge(p),
-        }
-    }
-
-    /// A saved point judged against the current mark (`spec.md` §7 Readers, Reset stamp and saved points).
-    fn judge(&self, point: SavedPoint) -> Result<LogPos, Error> {
-        let p = super::index::log_pos(point.position);
-        let current = self
-            .reader
-            .borrow()
-            .as_ref()
-            .map(|r| r.state().stamp)
-            .unwrap_or_default();
-        let saved = (point.stamp.sequence, point.stamp.nonce);
-        let carries = |st: Option<kvik_log::mark::ResetStamp>, s: (u64, u64)| {
-            st.is_some_and(|st| (st.sequence, st.nonce) == s)
-        };
-        if p.generation == self.head.generation && (current.sequence, current.nonce) == saved {
-            return Ok(p.min(self.head));
-        }
-        let recoveries: Vec<(LogPos, &kvik_log::entries::Recovery)> = self
-            .entries
-            .iter()
-            .filter_map(|(q, e)| match e {
-                Entry::Recovery(r) => Some((*q, r)),
-                _ => None,
-            })
-            .collect();
-        // The reset the mark names must be kept, or nothing can be told.
-        if current.nonce != 0
-            && !recoveries
-                .iter()
-                .any(|(_, r)| carries(r.stamp, (current.sequence, current.nonce)))
-        {
-            return Err(Error::UnknownPoint);
-        }
-        let from = recoveries
-            .iter()
-            .position(|(_, r)| saved.1 != 0 && carries(r.stamp, saved))
-            .map_or(0, |i| i + 1);
-        let since = recoveries.get(from).map(|(q, _)| *q);
-        let mut x = p;
-        for (_, r) in &recoveries[from..] {
-            x = x.min(LogPos {
-                generation: p.generation,
-                sequence: r.after,
-            });
-        }
-        let lost: Vec<_> = self
-            .reader
-            .borrow()
-            .as_ref()
-            .map(|r| r.lost_ranges().to_vec())
-            .unwrap_or_default();
-        for l in lost {
-            let first = LogPos {
-                generation: l.first.0,
-                sequence: l.first.1,
-            };
-            if first.generation == p.generation && since.is_none_or(|q| first >= before(q)) {
-                x = x.min(before(first));
-            }
-        }
-        Ok(x.min(self.head))
-    }
-
-    /// Takes a handle for a consumer (`docs/api.md` `Store::consumer`; Q-131, Q-95):
-    /// - a new consumer starts after the position before its start, with no resync (it has nothing to forget), its
-    ///   cursor file written at once naming that position; facts after it up to the last position are replayed;
-    /// - one whose cursor file was missing or unreadable at the start is first sent a resync of cause `NoCursor`
-    ///   whose `forget_above` is the position before its start, carrying each funnel's state (its latches are lost),
-    ///   then continues from there;
-    /// - one taken again in this run resumes from its confirmed cursor, and one with a cursor file as set up at the
-    ///   start, whatever `start`.
-    pub(crate) fn take(
-        &mut self,
-        name: &str,
-        start: Start,
-        ctx: &Ctx<'_>,
-    ) -> Result<io::Result<()>, Error> {
-        let new = match self.consumers.get(name) {
-            Some(rt) if rt.handle => return Err(Error::ConsumerInUse(name.to_string())),
-            Some(_) => false,
-            None => {
-                if self.consumers.len() >= self.max_consumers {
-                    return Err(Error::TooManyConsumers(self.max_consumers));
-                }
-                true
-            }
-        };
-        let head = self.head;
-        let lost = !new && self.consumers[name].dormant;
-        let point = if new || lost {
-            Some(self.start_point(start)?)
-        } else {
-            None
-        };
-        let rt = self.consumers.entry(name.to_string()).or_default();
-        if rt.attached {
-            // The consumer process restarted (Q-95 (b)): what it was handed is dropped and it resumes from its
-            // confirmed cursor, with its latches, as after downtime.
-            rt.queue.clear();
-            rt.parts.clear();
-            rt.unconfirmed.clear();
-            rt.gate = None;
-            rt.runners.clear();
-            rt.emitted.clear();
-            rt.evaluated.clear();
-            rt.reset_open = false;
-            rt.paused = false;
-            rt.view = None;
-            rt.behind = Some(next(rt.cursor));
-            rt.resume = Some(head);
-        }
-        rt.handle = true;
-        rt.attached = true;
-        let Some(point) = point else {
-            return Ok(Ok(()));
-        };
-        rt.dormant = false;
-        rt.resume = None;
-        rt.cursor = point;
-        rt.behind = (point < head).then(|| next(point));
-        if lost {
-            rt.latches.clear();
-            self.issue_resync(name, ResyncCause::NoCursor, Some(point), point, false, ctx);
-            return Ok(Ok(()));
-        }
-        rt.dirty = true;
-        self.sync_runners(name, ctx.mono);
-        Ok(self.write_now(name, ctx))
     }
 
     /// The handle was dropped.

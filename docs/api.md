@@ -75,6 +75,20 @@ The keys roadmap section 4 needs; all may change between opens.
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
 | `limits.disk_critical` | `u64` bytes | 512 MiB | |
 | `limits.future_tolerance`, `limits.default_lateness_bound` | `Duration` | 60 s, 5 min | |
+| `limits.window_memory` | `u64` bytes | 512 MiB (`WINDOW_MEMORY_DESKTOP`) | ≥ 4 KiB. The recent windows' bytes in all (spec §5.1, Q-751): half for the writer's decision windows and revised-key index, half for the deliverer's windows. Within it each series holds 15 minutes of facts, at most 1,024, and beyond it the oldest keys are read from the log instead (spec §2.4, slow path); decisions do not change. 64 MiB (`WINDOW_MEMORY_MINIMAL`) suits the minimal class. See Memory below |
+
+**Memory** (roadmap 11.0). A store's memory does not grow with the facts it holds. Bounded by configuration:
+`limits.window_memory` (the counted bytes of window entries and revised-key entries; a window's allocation can hold
+up to as much again while it grows), the ingest queue (`limits.ingest_queue` readings, and the decisions of calls not
+yet acknowledged), consumer queues (`limits.consumer_queue` deliveries each), and per log reader at most one segment's
+bytes while it follows a segment. Bounded by the store's shape: the registry (about 200 bytes a series), each series'
+latest time and lateness reference, one commit time per batch, and the slow path's caches (8 MiB per reader for
+sealed segments' indexes and the maps of their batches). A consumer far behind holds its records from its cursor to
+the last position while it catches up. A start reads the whole log once, a part at a time (Q-752); the public
+`Reader` still holds every fact it has read (roadmap 9.0a). Worst case of the slow path, under the decision lock that
+every `emit` and entry call takes: the first read of a segment after a start scans it whole (64 MiB at the default
+`segment_size`, about a second at 60 MB/s), later reads only the batches whose event times may hold the key and those
+appended since (`docs/measurements/store-emit-throughput.md`).
 
 Keys of later sections (consumer queue, tiers, tree, leases, backup, `mirror_path`) are listed by their items. One is
 fixed already: `manifest.rebuild_wait` (roadmap 6.3), `RebuildWait::After(Duration)` (default 15 minutes) or
@@ -263,7 +277,8 @@ enum Live { Value(Fact), None, Unknown }
   `Trigger` if it differs from the latched state, or there is none.
 - A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
   or on the timer, valid until the next resync), `flags` (`replayed`,
-  `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
+  `future`; on a trigger also `approximate_edges` and `restoring`; on any delivery `unchecked`, when local data it
+  rests on could not be read during this run, spec §2.4, Q-750) and the times needed to judge its age.
 - `start` gives the position before the start (spec §4 Resync): the last position for `Start::Now`, the position
   before the first fact at or after T for `Start::Time(T)`, and for `Start::Position(point)`, which takes a
   `SavedPoint { position, stamp }` (spec §7 Readers, Reset stamp and saved points), the position, or the lower
@@ -373,6 +388,7 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
+    LocalDataUnreadable { readings: u64, deliveries: u64 },   // decided without unreadable local data this run (Q-750)
     SetAside(SetAsideReport) }     // information, not degraded (Q-90)
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
@@ -387,12 +403,17 @@ pub fn losses(&self) -> Vec<LossReport>;                    // every loss, for e
 pub async fn acknowledge_losses(&self, identities: &[Position]) -> Result<(), WriteError>;
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
-pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
+pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats,
+                   pub delivery: DeliveryStats }
 // IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max },
-//               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */ }
+//               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */,
+//               start_whole /* the start read the log whole into memory, Q-752 */ }
 // LogStats { durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
 //            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
 //            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+// DeliveryStats { refresh_errors /* reads of the log that failed, tried again */, corruptions /* invalid regions the
+//               delivery reader passed over */, slow_path /* reads of the log for facts outside the deliverer's recent
+//               window */, unchecked /* deliveries flagged `unchecked` */ }   (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }

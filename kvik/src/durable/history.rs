@@ -101,14 +101,43 @@ pub(crate) enum Facts<'a> {
     Slow(Vec<&'a Known>),
 }
 
-/// See the module documentation.
+/// Heap bytes a value holds beyond its own size.
+fn heap(v: &LogValue) -> usize {
+    match v {
+        LogValue::Text(t) => t.capacity(),
+        _ => 0,
+    }
+}
+
+/// Bytes a fact takes in a window.
+fn window_bytes(k: &Known) -> usize {
+    std::mem::size_of::<(i64, Known)>() + heap(&k.value)
+}
+
+/// Bytes a fact takes in the revised-key index, and an entry's own.
+fn revised_fact_bytes(k: &Known) -> usize {
+    std::mem::size_of::<Known>() + heap(&k.value)
+}
+const REVISED_ENTRY: usize = std::mem::size_of::<(Key, Vec<Known>)>() + std::mem::size_of::<Key>();
+
+/// See the module documentation. Memory is bounded twice: per series by the window's span and [`WINDOW_FACTS`], and
+/// over all series by `budget` bytes for the windows and the revised-key index together (Q-751); above it the
+/// revised-key entries the log already shows go first, then each series' oldest key in turn. Correctness never
+/// depends on either: what leaves memory is read from the log.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct History {
     /// The window's span for every series in place of its own, and its most facts: other values in tests only.
     span: Option<i64>,
     cap: usize,
+    budget: usize,
+    /// Bytes held in windows and the revised-key index.
+    bytes: usize,
     series: HashMap<u32, Series>,
+    /// Series in the order they were first noted, and where the next eviction for the budget looks.
+    order: Vec<u32>,
+    cursor: usize,
     revised: HashMap<Key, Vec<Known>>,
+    revised_order: VecDeque<Key>,
     /// Facts below their series' floor and not in `revised`, of calls the log may not show yet.
     pending: HashMap<Key, Vec<Known>>,
     pending_calls: BTreeMap<u64, Vec<Key>>,
@@ -118,25 +147,46 @@ pub(crate) struct History {
 
 impl Default for History {
     fn default() -> Self {
+        History::with_budget(usize::MAX)
+    }
+}
+
+impl History {
+    /// A history holding at most `budget` bytes in windows and the revised-key index.
+    pub(crate) fn with_budget(budget: usize) -> Self {
         History {
             span: None,
             cap: WINDOW_FACTS,
+            budget,
+            bytes: 0,
             series: HashMap::new(),
+            order: Vec::new(),
+            cursor: 0,
             revised: HashMap::new(),
+            revised_order: VecDeque::new(),
             pending: HashMap::new(),
             pending_calls: BTreeMap::new(),
             readable_below: 0,
         }
     }
-}
 
-impl History {
     /// A history whose window spans `span` for every series and holds at most `cap` facts per series.
     #[cfg(test)]
     pub(crate) fn with_window(span: i64, cap: usize) -> Self {
         History {
             span: Some(span),
             cap,
+            ..History::default()
+        }
+    }
+
+    /// [`History::with_window`] with a byte budget.
+    #[cfg(test)]
+    pub(crate) fn with_window_and_budget(span: i64, cap: usize, budget: usize) -> Self {
+        History {
+            span: Some(span),
+            cap,
+            budget,
             ..History::default()
         }
     }
@@ -179,6 +229,10 @@ impl History {
         }
     }
 
+    fn shown(&self, k: &Known) -> bool {
+        k.call == 0 || k.call < self.readable_below
+    }
+
     /// Takes in a recorded fact of a series whose window span `span` gives, asked once per series; `reference`: it
     /// raises the lateness reference. `whole` is the key's complete history before it when the slow path read it, so
     /// that a key with more than one fact enters the revised-key index.
@@ -192,15 +246,23 @@ impl History {
     ) {
         let (id, t) = key;
         let fixed = self.span;
-        let s = self
-            .series
-            .entry(id)
-            .or_insert_with(|| Series::new(fixed.unwrap_or_else(span)));
+        let s = match self.series.entry(id) {
+            Slot::Occupied(e) => e.into_mut(),
+            Slot::Vacant(e) => {
+                self.order.push(id);
+                e.insert(Series::new(fixed.unwrap_or_else(span)))
+            }
+        };
         if reference {
             s.reference = s.reference.max(Some(t));
         }
         if t >= s.floor {
+            self.bytes += window_bytes(&known);
             let at = s.window.partition_point(|(u, _)| *u <= t);
+            // At the cap the fact is inserted before the eviction: room for one more, not a doubled queue.
+            if s.window.len() >= self.cap && s.window.len() == s.window.capacity() {
+                s.window.reserve_exact(1);
+            }
             s.window.insert(at, (t, known));
             if s.latest.is_none_or(|l| t > l) {
                 s.latest = Some(t);
@@ -208,48 +270,57 @@ impl History {
             } else if s.window.len() > self.cap {
                 self.evict(id);
             }
-            return;
-        }
-        if let Some(h) = self.revised.get_mut(&key) {
+        } else if let Some(h) = self.revised.get_mut(&key) {
+            self.bytes += revised_fact_bytes(&known);
             h.push(known);
-            return;
-        }
-        match whole {
-            Some(mut h) => {
-                h.extend(self.pending.remove(&key).unwrap_or_default());
-                h.push(known);
-                if h.len() > 1 {
-                    self.revised.insert(key, h);
-                } else {
-                    for k in h {
-                        self.overlay(key, k);
+        } else {
+            match whole {
+                Some(mut h) => {
+                    h.extend(self.pending.remove(&key).unwrap_or_default());
+                    h.push(known);
+                    if h.len() > 1 {
+                        self.insert_revised(key, h);
+                    } else {
+                        for k in h {
+                            self.overlay(key, k);
+                        }
                     }
                 }
+                None => self.overlay(key, known),
             }
-            None => self.overlay(key, known),
+        }
+        self.keep_budget();
+    }
+
+    fn insert_revised(&mut self, key: Key, facts: Vec<Known>) {
+        self.bytes += REVISED_ENTRY + facts.iter().map(revised_fact_bytes).sum::<usize>();
+        if let Some(old) = self.revised.insert(key, facts) {
+            self.bytes -= REVISED_ENTRY + old.iter().map(revised_fact_bytes).sum::<usize>();
+        } else {
+            self.revised_order.push_back(key);
         }
     }
 
     fn overlay(&mut self, key: Key, k: Known) {
-        if k.call == 0 || k.call < self.readable_below {
+        if self.shown(&k) {
             return;
         }
         self.pending_calls.entry(k.call).or_default().push(key);
         self.pending.entry(key).or_default().push(k);
     }
 
-    /// Raises a series' floor to its latest `t` less its span, then while the window holds more than
-    /// [`WINDOW_FACTS`] facts, past its lowest key; keys that leave go to the revised-key index (more than one
-    /// fact) or the overlay.
+    /// Raises a series' floor to its latest `t` less its span, then while the window holds more than `cap` facts,
+    /// past its lowest key; keys that leave go to the revised-key index (more than one fact) or the overlay.
     fn evict(&mut self, id: u32) {
         let cap = self.cap;
+        let readable = self.readable_below;
         let Some(s) = self.series.get_mut(&id) else {
             return;
         };
         let Some(latest) = s.latest else { return };
         s.floor = s.floor.max(latest.saturating_sub(s.span));
-        let readable = self.readable_below;
         let mut out: Vec<(i64, Vec<Known>)> = Vec::new();
+        let mut freed = 0;
         while let Some(&(t, _)) = s.window.front() {
             if t >= s.floor {
                 if s.window.len() <= cap {
@@ -258,6 +329,7 @@ impl History {
                 s.floor = t.saturating_add(1);
             }
             let (_, k) = s.window.pop_front().expect("looked at above");
+            freed += window_bytes(&k);
             let alone = s.window.front().is_none_or(|(u, _)| *u != t)
                 && out.last().is_none_or(|(u, _)| *u != t);
             // The common case, a key of one fact the log already shows, leaves without a trace.
@@ -269,9 +341,70 @@ impl History {
                 _ => out.push((t, vec![k])),
             }
         }
+        self.bytes -= freed;
         for (t, facts) in out {
             if facts.len() > 1 {
-                self.revised.insert((id, t), facts);
+                self.insert_revised((id, t), facts);
+            } else {
+                for k in facts {
+                    self.overlay((id, t), k);
+                }
+            }
+        }
+    }
+
+    /// Brings the bytes held under the budget: first revised-key entries whose facts the log shows, oldest first,
+    /// then the oldest key of each series' window in turn, which the slow path then reads.
+    fn keep_budget(&mut self) {
+        if self.bytes <= self.budget {
+            return;
+        }
+        let mut tries = self.revised_order.len();
+        while self.bytes > self.budget && tries > 0 {
+            tries -= 1;
+            let Some(key) = self.revised_order.pop_front() else {
+                break;
+            };
+            let Some(facts) = self.revised.get(&key) else {
+                continue;
+            };
+            if facts.iter().all(|k| self.shown(k)) {
+                let facts = self.revised.remove(&key).expect("looked up above");
+                self.bytes -= REVISED_ENTRY + facts.iter().map(revised_fact_bytes).sum::<usize>();
+            } else {
+                self.revised_order.push_back(key);
+            }
+        }
+        let mut idle = 0;
+        while self.bytes > self.budget && idle < self.order.len() {
+            self.cursor = (self.cursor + 1) % self.order.len();
+            let id = self.order[self.cursor];
+            let readable = self.readable_below;
+            let Some(s) = self.series.get_mut(&id) else {
+                idle += 1;
+                continue;
+            };
+            let Some(&(t, _)) = s.window.front() else {
+                idle += 1;
+                continue;
+            };
+            idle = 0;
+            s.floor = s.floor.max(t.saturating_add(1));
+            let mut facts = Vec::new();
+            while s.window.front().is_some_and(|(u, _)| *u == t) {
+                let (_, k) = s.window.pop_front().expect("looked at above");
+                self.bytes -= window_bytes(&k);
+                facts.push(k);
+            }
+            if s.window.capacity() > 2 * s.window.len() + 16 {
+                s.window.shrink_to(s.window.len() + s.window.len() / 2);
+            }
+            // A key the log shows in full leaves; one with facts in flight keeps them where the slow path looks.
+            if facts.iter().all(|k| k.call == 0 || k.call < readable) {
+                continue;
+            }
+            if facts.len() > 1 {
+                self.insert_revised((id, t), facts);
             } else {
                 for k in facts {
                     self.overlay((id, t), k);
@@ -284,6 +417,7 @@ impl History {
     #[cfg(test)]
     pub(crate) fn held(&self) -> Held {
         Held {
+            bytes: self.bytes,
             window: self.series.values().map(|s| s.window.len()).sum(),
             series: self.series.len(),
             revised_keys: self.revised.len(),
@@ -297,6 +431,7 @@ impl History {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Held {
+    pub(crate) bytes: usize,
     pub(crate) window: usize,
     pub(crate) series: usize,
     pub(crate) revised_keys: usize,

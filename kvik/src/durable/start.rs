@@ -6,7 +6,7 @@
 //! A part that voids what was taken before (a recovery entry voiding intact batches above its `after`) cannot be
 //! undone from that state: the log is then read again whole into an index of every fact, as before roadmap 11.0.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,12 +18,12 @@ use super::LogClock;
 use super::history::{Key, span_of};
 use super::index::Index;
 use super::ingest::Decider;
-use super::keys::{Found, LocalFacts, LogFacts};
+use super::keys::{Found, LocalFacts, LogFacts, Lost};
 use crate::env::Env;
 use crate::health::SeriesStats;
 
 /// Items a start takes from the log at a time.
-const PART: usize = 1 << 16;
+pub(crate) const PART: usize = 1 << 16;
 
 /// What a start reads from the kept log.
 pub(crate) struct Kept {
@@ -31,6 +31,8 @@ pub(crate) struct Kept {
     pub(crate) decider: Decider,
     pub(crate) counters: BTreeMap<u32, SeriesStats>,
     pub(crate) local: Box<dyn LocalFacts>,
+    /// The log was read again whole into memory (module documentation).
+    pub(crate) read_whole: bool,
 }
 
 impl Kept {
@@ -41,6 +43,7 @@ impl Kept {
             decider: Decider::default(),
             counters: BTreeMap::new(),
             local: Box::new(Unreadable),
+            read_whole: false,
         }
     }
 }
@@ -83,17 +86,20 @@ fn count(counters: &mut BTreeMap<u32, SeriesStats>, row: &kvik_log::facts::FactR
     st.future += u64::from(row.flags.future);
 }
 
-/// Reads the kept log with `reader` (see the module documentation); `open` gives a fresh reader for a read again.
+/// Reads the kept log with `reader` in parts of `part` items (see the module documentation), into a decision state
+/// of at most `budget` bytes; `open` gives a fresh reader for a read again.
 pub(crate) fn read_kept(
     mut reader: LogReader,
     open: impl FnOnce() -> Result<LogReader, ReaderError>,
+    part: usize,
+    budget: usize,
 ) -> Result<Kept, ReaderError> {
     let mut index = Index::without_facts();
-    let mut decider = Decider::default();
+    let mut decider = Decider::with_budget(budget);
     let mut counters = BTreeMap::new();
-    let mut lost = BTreeSet::new();
+    let mut lost = Lost::default();
     loop {
-        let (u, more) = reader.refresh_some(PART)?;
+        let (u, more) = reader.refresh_some(part)?;
         for e in u.events {
             match e {
                 ReadEvent::Batch(b) => {
@@ -107,10 +113,10 @@ pub(crate) fn read_kept(
                 }
                 ReadEvent::Void { .. } => {
                     let _ = reader.close();
-                    return read_whole(open()?);
+                    return read_whole(open()?, budget);
                 }
                 ReadEvent::Corruption { file_id, region } => {
-                    lost.insert((file_id, region.start));
+                    lost.insert(file_id, region.start, region.end);
                 }
             }
         }
@@ -124,21 +130,21 @@ pub(crate) fn read_kept(
         decider,
         counters,
         local: Box::new(LogFacts::new(reader, lost)),
+        read_whole: false,
     })
 }
 
 /// The log read whole into an index of every fact.
-fn read_whole(mut reader: LogReader) -> Result<Kept, ReaderError> {
+pub(crate) fn read_whole(mut reader: LogReader, budget: usize) -> Result<Kept, ReaderError> {
     let events = reader.refresh()?.events;
     let mut index = Index::default();
     index.apply(&events);
-    let lost = events
-        .iter()
-        .filter_map(|e| match e {
-            ReadEvent::Corruption { file_id, region } => Some((*file_id, region.start)),
-            _ => None,
-        })
-        .collect();
+    let mut lost = Lost::default();
+    for e in &events {
+        if let ReadEvent::Corruption { file_id, region } = e {
+            lost.insert(*file_id, region.start, region.end);
+        }
+    }
     drop(events);
     let mut counters = BTreeMap::new();
     for id in index.fact_series() {
@@ -146,12 +152,13 @@ fn read_whole(mut reader: LogReader) -> Result<Kept, ReaderError> {
             count(&mut counters, &f.row);
         }
     }
-    let decider = Decider::from_index(&index);
+    let decider = Decider::from_index(&index, budget);
     Ok(Kept {
         index,
         decider,
         counters,
         local: Box::new(LogFacts::new(reader, lost)),
+        read_whole: true,
     })
 }
 
@@ -223,7 +230,13 @@ mod tests {
             block_on(s.emit(&readings)).unwrap();
         }
         block_on(s.shutdown()).unwrap();
-        let kept = read_kept(log_reader(dir, &env).unwrap(), || log_reader(dir, &env)).unwrap();
+        let kept = read_kept(
+            log_reader(dir, &env).unwrap(),
+            || log_reader(dir, &env),
+            PART,
+            usize::MAX,
+        )
+        .unwrap();
         let held = kept.decider.history.held();
         assert!(held.window <= 4 * 901, "{held:?}");
         assert!(held.window <= 4 * WINDOW_FACTS);
@@ -231,5 +244,47 @@ mod tests {
         assert_eq!(kept.index.fact_series().count(), 0);
         assert_eq!(kept.index.registry().len(), 4);
         assert!(kept.counters.values().all(|c| c.recorded == 7_200));
+    }
+
+    #[test]
+    fn the_read_again_whole_gives_what_the_read_in_parts_gives() {
+        let clock = ManualClock::new(Timestamp(T0 + 7_200 * S));
+        let mut env = Env::test(clock);
+        let fs = Arc::new(kvik_log::fs::MemFs::new());
+        env.fs = fs.clone();
+        let dir = Path::new("start-whole");
+        let config = || {
+            StoreConfig::new(dir, "Etc/UTC")
+                .create_if_missing(true)
+                .env(env.clone())
+        };
+        let s = block_on(Store::open(config())).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/v",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        block_on(s.define_series(spec)).unwrap();
+        let readings: Vec<Reading> = (0..3_000)
+            .map(|k| Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64)))
+            .collect();
+        block_on(s.emit(&readings)).unwrap();
+        // A power loss: the next start writes a recovery entry.
+        fs.crash_after(0);
+        drop(s);
+        fs.power_loss();
+        let s = block_on(Store::open(config())).unwrap();
+        let last = Reading::new(SeriesId(1), Timestamp(T0 + 4_000 * S), Value::F64(1.0));
+        block_on(s.emit(&[last])).unwrap();
+        block_on(s.shutdown()).unwrap();
+        let open = || log_reader(dir, &env);
+        let parts = read_kept(open().unwrap(), open, 100, usize::MAX).unwrap();
+        let whole = read_whole(open().unwrap(), usize::MAX).unwrap();
+        assert!(whole.read_whole && !parts.read_whole);
+        assert_eq!(parts.counters, whole.counters);
+        assert_eq!(parts.decider.history.held(), whole.decider.history.held());
+        assert_eq!(parts.index.registry().len(), whole.index.registry().len());
     }
 }

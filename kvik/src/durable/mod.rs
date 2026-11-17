@@ -15,6 +15,7 @@
 //! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore (8.x).
 
 mod clock;
+mod completion;
 mod consumers;
 mod deliver;
 mod derived;
@@ -32,8 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Weak};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use kvik_log::content::Item;
@@ -42,7 +42,7 @@ use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
     Ack as LogAck, CommitError, Fault as LogFault, FaultOp, Log, LogWriter,
     MarkSync as LogMarkSync, MarkSyncMode as LogMarkSyncMode, OpenError as LogOpenError,
-    Pending as LogPending, Reason as LogReason, SubmitError, Wait as LogWait, WriterConfig,
+    Reason as LogReason, SubmitError, Wait as LogWait, WriterConfig,
 };
 
 use crate::backend::Error;
@@ -58,6 +58,8 @@ use crate::read::{Facts, ReaderState, View};
 use crate::series::{IntervalLength, Kind, ParameterChange, SeriesInfo, SeriesKey, SeriesSpec};
 use crate::time::{TimeRange, Timestamp, ZoneName};
 use crate::types::{Ack, Fact, Intent, Outcome, Position, Reading, SeriesId, TimeSource, Value};
+use completion::Completion;
+pub(crate) use completion::Queued;
 use index::{Index, fact_out, pos};
 use ingest::{Decider, Decision};
 pub(crate) use reader::DurableReader;
@@ -163,6 +165,8 @@ pub(crate) fn store_error(dir: &Path, e: StoreError) -> OpenError {
 #[derive(Debug, Default)]
 struct Counters {
     series: BTreeMap<u32, SeriesStats>,
+    /// The start read the kept log whole into memory (Q-752).
+    start_whole: bool,
     waits: BTreeMap<Wait, u64>,
     waited: Duration,
     slow_path: u64,
@@ -194,146 +198,6 @@ pub(crate) struct Writer {
     clocks: Arc<clock::Clocks>,
     /// Consumers and routing; `None` when the start left the store read-only before the log could be read.
     hub: Option<Arc<deliver::Hub>>,
-}
-
-/// How a queued call's acknowledgement becomes its [`Ack`].
-type Finish = Box<dyn FnOnce(Result<LogAck, CommitError>) -> Result<Ack, EmitError> + Send + Sync>;
-
-/// Wakes every waker registered with a [`Completion`].
-#[derive(Debug, Default)]
-struct FanOut(Mutex<Vec<Waker>>);
-
-impl Wake for FanOut {
-    fn wake(self: Arc<Self>) {
-        let wakers = std::mem::take(&mut *lock(&self.0));
-        for w in wakers {
-            w.wake();
-        }
-    }
-}
-
-/// Resolves a [`Completion`] when the log completes its call: the log wakes it on its writer thread, after the
-/// covering sync, whether or not anyone waits for the call.
-#[derive(Debug)]
-struct Resolver(Weak<Completion>);
-
-impl Wake for Resolver {
-    fn wake(self: Arc<Self>) {
-        if let Some(c) = self.0.upgrade() {
-            let _ = c.poll(None);
-        }
-    }
-}
-
-/// What a call does once the log acknowledges it, whoever waits for it.
-type OnAck = Box<dyn FnOnce() + Send>;
-
-struct CompletionState {
-    pending: Option<LogPending>,
-    result: Option<Result<LogAck, CommitError>>,
-    on_ack: Option<OnAck>,
-}
-
-impl std::fmt::Debug for CompletionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompletionState")
-            .field("pending", &self.pending)
-            .field("result", &self.result)
-            .finish_non_exhaustive()
-    }
-}
-
-/// The log's acknowledgement of one queued call, shared by the call's own future and by every later call whose
-/// outcome depends on it (a duplicate of one of its readings, Q-123 (b)), each of which may wait on it.
-#[derive(Debug)]
-pub(crate) struct Completion {
-    state: Mutex<CompletionState>,
-    wakers: Arc<FanOut>,
-    resolver: Waker,
-}
-
-impl Completion {
-    /// A completion whose `on_ack` runs once the log acknowledges the call, on the log's writer thread or in the
-    /// first poll that finds the acknowledgement.
-    fn new(pending: LogPending, on_ack: OnAck) -> Arc<Self> {
-        let c = Arc::new_cyclic(|me| Completion {
-            state: Mutex::new(CompletionState {
-                pending: Some(pending),
-                result: None,
-                on_ack: Some(on_ack),
-            }),
-            wakers: Arc::new(FanOut::default()),
-            resolver: Waker::from(Arc::new(Resolver(me.clone()))),
-        });
-        // Registers the resolver with the log, or resolves at once.
-        let _ = c.poll(None);
-        c
-    }
-
-    /// The call's result once the log has given it; registers `cx`'s waker otherwise.
-    pub(crate) fn poll(&self, cx: Option<&Context<'_>>) -> Poll<Result<LogAck, CommitError>> {
-        let mut st = lock(&self.state);
-        if let Some(r) = &st.result {
-            return Poll::Ready(r.clone());
-        }
-        if let Some(cx) = cx {
-            let mut w = lock(&self.wakers.0);
-            if !w.iter().any(|x| x.will_wake(cx.waker())) {
-                w.push(cx.waker().clone());
-            }
-        }
-        let mut resolver_cx = Context::from_waker(&self.resolver);
-        let Some(pending) = st.pending.as_mut() else {
-            return Poll::Pending;
-        };
-        match std::pin::Pin::new(pending).poll(&mut resolver_cx) {
-            Poll::Ready(r) => {
-                st.result = Some(r.clone());
-                st.pending = None;
-                let on_ack = st.on_ack.take().filter(|_| r.is_ok());
-                drop(st);
-                if let Some(f) = on_ack {
-                    f();
-                }
-                Waker::from(self.wakers.clone()).wake();
-                Poll::Ready(r)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    /// Whether the call is acknowledged.
-    fn acknowledged(&self) -> bool {
-        matches!(self.poll(None), Poll::Ready(Ok(_)))
-    }
-}
-
-/// A call waiting for the log: its own queued batch, or the queued call an outcome of it depends on; and how that
-/// call's acknowledgement becomes this call's [`Ack`].
-pub(crate) struct Queued {
-    completion: Arc<Completion>,
-    finish: Finish,
-}
-
-impl std::fmt::Debug for Queued {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Queued")
-            .field("completion", &self.completion)
-            .finish()
-    }
-}
-
-impl Queued {
-    pub(crate) fn poll(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<LogAck, CommitError>> {
-        self.completion.poll(Some(cx))
-    }
-
-    pub(crate) fn finish(self, r: Result<LogAck, CommitError>) -> Result<Ack, EmitError> {
-        (self.finish)(r)
-    }
 }
 
 /// What an emit gives back: the outcomes at once, or a call queued in the log.
@@ -387,11 +251,15 @@ impl Writer {
         let start_fault = writer.fault().cloned();
         // The kept log, read once in parts: the registry, the decision state and the counters (roadmap 11.0).
         let kept = match start::log_reader(&dir, &env) {
-            Ok(r) => start::read_kept(r, || start::log_reader(&dir, &env)).map_err(|e| {
-                OpenError::Io {
-                    path: dir.clone(),
-                    source: io::Error::other(e.to_string()),
-                }
+            Ok(r) => start::read_kept(
+                r,
+                || start::log_reader(&dir, &env),
+                start::PART,
+                window_budget(&config.limits),
+            )
+            .map_err(|e| OpenError::Io {
+                path: dir.clone(),
+                source: io::Error::other(e.to_string()),
             })?,
             // A start that could not write may leave no readable mark: the store opens read-only.
             Err(_) if start_fault.is_some() => start::Kept::unreadable(),
@@ -402,6 +270,7 @@ impl Writer {
             decider,
             counters: series_counters,
             local,
+            read_whole,
         } = kept;
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
@@ -419,6 +288,7 @@ impl Writer {
         let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
         let counters = Counters {
             series: series_counters,
+            start_whole: read_whole,
             ..Counters::default()
         };
         // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
@@ -449,6 +319,7 @@ impl Writer {
             descriptor.store_id,
             config.limits.consumer_queue,
             config.limits.max_consumers,
+            window_budget(&config.limits),
             Some(hook.fold.clone()),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
@@ -1070,6 +941,22 @@ impl Writer {
                 .filter(|l| l.kind == LossKind::DataLost && !l.acknowledged)
                 .map(Reason::DataLost),
         );
+        // Q-750: decisions made without data that could not be read hold health degraded until a restart.
+        let readings: u64 = lock(&self.counters)
+            .series
+            .values()
+            .map(|s| s.duplicates_unchecked)
+            .sum();
+        let deliveries = self
+            .hub
+            .as_ref()
+            .map_or(0, |h| h.run_quiet(|d, _| d.delivery_stats().unchecked));
+        if readings > 0 || deliveries > 0 {
+            reasons.push(Reason::LocalDataUnreadable {
+                readings,
+                deliveries,
+            });
+        }
         match (self.fault(), reasons.is_empty()) {
             (Some(f), _) => Health::ReadOnly {
                 cause: fault_out(&f),
@@ -1115,6 +1002,7 @@ impl Writer {
                     max: c.max_latency,
                 },
                 slow_path: c.slow_path,
+                start_whole: c.start_whole,
             },
             log: LogStats {
                 durable: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.durable)),
@@ -1186,6 +1074,11 @@ fn tzdata_name(v: &str) -> String {
     } else {
         v.to_string()
     }
+}
+
+/// Each side's share of `limits.window_memory`: the writer's decision windows and the deliverer's windows (Q-751).
+fn window_budget(l: &Limits) -> usize {
+    usize::try_from(l.window_memory / 2).unwrap_or(usize::MAX)
 }
 
 fn writer_config(config: &StoreConfig) -> WriterConfig {

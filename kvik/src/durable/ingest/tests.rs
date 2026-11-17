@@ -57,6 +57,8 @@ struct Mem {
     facts: Vec<(u64, FactRow)>,
     readable_below: u64,
     unreadable: HashSet<Key>,
+    /// For an unreadable key, how many of its facts are read before the damage.
+    partial: usize,
     reads: usize,
 }
 
@@ -66,7 +68,10 @@ impl LocalFacts for Mem {
         let mut out = Found::default();
         for (n, (call, row)) in self.facts.iter().enumerate() {
             let key = (row.series_id, row.t);
-            if *call < self.readable_below && keys.contains(&key) && !self.unreadable.contains(&key)
+            let seen = out.facts.get(&key).map_or(0, Vec::len);
+            if *call < self.readable_below
+                && keys.contains(&key)
+                && (!self.unreadable.contains(&key) || seen < self.partial)
             {
                 out.facts.entry(key).or_default().push(FoundFact {
                     position: LogPos {
@@ -289,6 +294,53 @@ fn a_key_that_cannot_be_read_is_recorded_unchecked_unless_a_known_fact_matches()
 }
 
 #[test]
+fn a_key_read_in_part_never_enters_the_revised_key_index() {
+    let (mut d, mut mem) = left_behind();
+    mem.readable_below = 3;
+    d.readable_below(3);
+    // A second fact at the key, with revise intent: no read, so the key stays out of the index.
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 3.0, None)],
+        Intent::Revise,
+        3,
+    );
+    mem.readable_below = 4;
+    d.readable_below(4);
+    // Only the key's first fact reads; its second lies past the damage.
+    mem.unreadable.insert((1, T0));
+    mem.partial = 1;
+    let plan = commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 2.0, None)],
+        Intent::Normal,
+        4,
+    );
+    assert!(matches!(
+        plan.decisions[0],
+        Decision::Record {
+            unchecked: true,
+            ..
+        }
+    ));
+    assert_eq!(d.history.held().revised_keys, 0);
+    // Readable again: the fact the partial read missed is found, so its replay is a duplicate.
+    mem.unreadable.clear();
+    mem.readable_below = 5;
+    d.readable_below(5);
+    let plan = commit(
+        &mut d,
+        &mut mem,
+        &[reading(1, T0, 3.0, None)],
+        Intent::Normal,
+        5,
+    );
+    assert!(matches!(plan.decisions[0], Decision::Duplicate));
+}
+
+#[test]
 fn a_fact_that_leaves_the_window_before_its_call_is_readable_stays_in_the_overlay() {
     let (mut d, mut mem) = left_behind();
     assert_eq!(d.history.held().overlay, 1);
@@ -341,8 +393,9 @@ proptest! {
         history in steps(),
         span in 1i64..20,
         cap in 1usize..6,
+        budget in prop_oneof![Just(usize::MAX), 0usize..2_000],
     ) {
-        let mut bounded = decider(History::with_window(span * S, cap));
+        let mut bounded = decider(History::with_window_and_budget(span * S, cap, budget));
         let mut all = decider(History::with_window(i64::MAX, usize::MAX));
         let mut mem = Mem::default();
         let mut call = 1;
@@ -406,5 +459,38 @@ proptest! {
         prop_assert_eq!(held.overlay, 0);
         prop_assert_eq!(held.series, series.min(n));
         prop_assert_eq!(mem.reads, 0);
+    }
+
+    #[test]
+    fn the_decision_state_stays_within_its_byte_budget(
+        n in 1usize..3_000,
+        series in 1u32..60,
+        budget in 1_000usize..40_000,
+        revisions in prop::collection::btree_set(0usize..3_000, 0..40),
+    ) {
+        let mut d = decider(History::with_budget(budget));
+        for id in 4..series + 4 {
+            let spec = SeriesSpec::new(format!("a/s{id}/v"), Kind::Gauge { value: ValueType::F64 }, "W");
+            let def = definition_of(&spec, id, Duration::from_secs(300)).unwrap();
+            d.registry.apply(&Entry::Definition(Box::new(def)));
+        }
+        let mut mem = Mem::default();
+        for k in 0..n {
+            let id = (k as u32 % series) + 4;
+            let t = T0 + (k as u32 / series) as i64 * S;
+            let mut call = vec![reading(id, t, 1.0, None)];
+            if revisions.contains(&k) {
+                call.push(reading(id, t, 2.0, None));
+            }
+            commit(&mut d, &mut mem, &call, Intent::Normal, k as u64 + 1);
+            d.readable_below(k as u64 + 2);
+            mem.readable_below = k as u64 + 2;
+            let held = d.history.held();
+            // Within the budget once the call is acknowledged, but for the call just applied.
+            prop_assert!(held.bytes <= budget + 2 * 200, "{held:?}");
+        }
+        // Everything acknowledged: a replay of the first reading is still a duplicate, from the log.
+        let plan = commit(&mut d, &mut mem, &[reading(4, T0, 1.0, None)], Intent::Normal, n as u64 + 1);
+        prop_assert_eq!(&plan.decisions, &vec![Decision::Duplicate]);
     }
 }

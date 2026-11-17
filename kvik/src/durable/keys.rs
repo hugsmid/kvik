@@ -7,7 +7,7 @@
 //! out of the log, as they are out of the state the start built. Any other damage, and a segment that cannot be read,
 //! is never taken as absence: the keys it may hold are reported unreadable (Q-750).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kvik_log::reader::{FoundFact, LogReader, Wanted};
 
@@ -32,11 +32,28 @@ pub(crate) trait LocalFacts: Send + std::fmt::Debug {
     fn between(&mut self, series: u32, from: i64, to: i64) -> Option<Vec<FoundFact>>;
 }
 
+/// The invalid regions a reader passed over, by segment: their positions are lost (spec §3 Recovery rule 2). A region
+/// met later is lost only if it lies inside one of them, so damage that lengthens one is never read as absence.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Lost(BTreeMap<u64, Vec<(u64, u64)>>);
+
+impl Lost {
+    pub(crate) fn insert(&mut self, file_id: u64, start: u64, end: u64) {
+        self.0.entry(file_id).or_default().push((start, end));
+    }
+
+    pub(crate) fn covers(&self, file_id: u64, start: u64, end: u64) -> bool {
+        self.0
+            .get(&file_id)
+            .is_some_and(|rs| rs.iter().any(|(a, z)| *a <= start && end <= *z))
+    }
+}
+
 /// [`LocalFacts`] on a log reader of this process and the regions its owner passed over as lost.
 #[derive(Debug)]
 pub(crate) struct OnLog<'a> {
     pub(crate) reader: &'a mut LogReader,
-    pub(crate) lost: &'a BTreeSet<(u64, u64)>,
+    pub(crate) lost: &'a Lost,
 }
 
 impl LocalFacts for OnLog<'_> {
@@ -51,7 +68,7 @@ impl LocalFacts for OnLog<'_> {
             .collect();
         let lost = self.lost;
         let mut out = Found::default();
-        match self.reader.lookup(&wanted, &|f, o| lost.contains(&(f, o))) {
+        match self.reader.lookup(&wanted, &|f, a, z| lost.covers(f, a, z)) {
             Ok(l) => {
                 for (k, complete) in keys.iter().zip(&l.complete) {
                     if !complete {
@@ -82,7 +99,7 @@ impl LocalFacts for OnLog<'_> {
         let lost = self.lost;
         let l = self
             .reader
-            .lookup(&wanted, &|f, o| lost.contains(&(f, o)))
+            .lookup(&wanted, &|f, a, z| lost.covers(f, a, z))
             .ok()?;
         let mut facts = l.facts;
         facts.sort_by_key(|f| f.position);
@@ -95,11 +112,11 @@ impl LocalFacts for OnLog<'_> {
 pub(crate) struct LogFacts {
     reader: LogReader,
     /// Invalid regions the start passed over, by segment and offset.
-    lost: BTreeSet<(u64, u64)>,
+    lost: Lost,
 }
 
 impl LogFacts {
-    pub(crate) fn new(reader: LogReader, lost: BTreeSet<(u64, u64)>) -> Self {
+    pub(crate) fn new(reader: LogReader, lost: Lost) -> Self {
         LogFacts { reader, lost }
     }
 
@@ -118,5 +135,69 @@ impl LocalFacts for LogFacts {
 
     fn between(&mut self, series: u32, from: i64, to: i64) -> Option<Vec<FoundFact>> {
         self.on().between(series, from, to)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_region_is_lost_only_inside_one_passed_over() {
+        let mut lost = Lost::default();
+        lost.insert(3, 64, 400);
+        assert!(lost.covers(3, 64, 400));
+        assert!(lost.covers(3, 128, 256));
+        assert!(!lost.covers(3, 64, 401), "lengthened by damage found later");
+        assert!(!lost.covers(3, 32, 400));
+        assert!(!lost.covers(4, 64, 400));
+    }
+
+    #[test]
+    fn a_lookup_that_fails_reports_every_key_unreadable() {
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use kvik_log::fs::{Fs, MemFs};
+        use kvik_log::reader::ReaderConfig;
+        use kvik_log::store::{MARK, NewStore, StoreDir};
+        use kvik_log::writer::{Log, LogWriter, SystemClock, WriterConfig};
+
+        let fs = Arc::new(MemFs::new());
+        let new = NewStore {
+            store_id: [1; 16],
+            created_at: 0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "test".into(),
+        };
+        let store = StoreDir::open(fs.clone(), Path::new("s"), Some(&new)).unwrap();
+        let w = LogWriter::open(
+            store,
+            WriterConfig::default(),
+            Some([2; 16]),
+            Duration::ZERO,
+            0,
+        )
+        .unwrap();
+        let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+        log.shutdown().unwrap();
+        let clock = Arc::new(SystemClock::default());
+        let reader = LogReader::open(ReaderConfig::new(
+            "s",
+            fs.clone(),
+            clock,
+            Some([2; 16]),
+            [9; 16],
+        ))
+        .unwrap();
+        let mut facts = LogFacts::new(reader, Lost::default());
+        fs.remove_file(&Path::new("s").join("log").join(MARK))
+            .unwrap();
+        let found = facts.at(&[(1, 10), (2, 20)]);
+        assert!(found.facts.is_empty());
+        assert_eq!(found.unreadable.len(), 2);
+        assert!(facts.between(1, 0, 10).is_none());
     }
 }

@@ -111,3 +111,40 @@ replay).
 
 The start still reads the whole log once (Q-752): it keeps only the window, the revised keys met in it and the
 counters, so its memory is bounded; its time stays proportional to the log until tree checkpoints carry that state.
+
+## With the store-wide bound (`limits.window_memory`, Q-751)
+After the review: the windows are bounded by `limits.window_memory` as well as per series, the revised-key index and
+the lookup's caches by bytes, and a segment is read a part at a time. Same harness and conditions, one or two runs
+each, the builds alternated where both ran; this day the machine ran the old build about 40 % slower than in the runs
+above, so compare within this section only. **Indicative.**
+
+**Resident memory (MiB) as readings accumulate**, one reading per series per call:
+
+| Series, build, `window_memory` | 0.5 M | 1 M | 2 M | 3 M | 4 M | 6 M | 10 M | 15 M |
+|---|---|---|---|---|---|---|---|---|
+| 2,000, before | 284 | 546 | 1,084 | 1,532 | 2,089 | | | |
+| 2,000, after, 512 MiB (default) | 125–126 | 234 | 425 | 444 | 401 | | | |
+| 2,000, after, 64 MiB (minimal class) | 98 | 139 | 158 | 177 | 134 | | | |
+| 10,000, before | | 598 | 1,123 | 1,578 | 2,122 | 3,020 | | |
+| 10,000, after, 512 MiB | | | | | | | 680 | 711 |
+| 10,000, after, 64 MiB | | | | | | | 145 | 177 |
+
+At 10,000 series the after build was sampled every 2.5 million readings: 568–727 MiB at 512 MiB, 145–193 MiB at
+64 MiB, flat from the first sample. What remains above the bound is the log readers' kept segment bytes (up to one
+64 MiB segment each, which is the saw-tooth in the rows: it falls at each segment's rollover), the ingest queue and
+the process's own allocations. Readings per second at 2,000 series (mean over the run): before 302 and 307 k, after
+at 512 MiB 258 and 273 k, at 64 MiB 358 and 355 k.
+
+**Cost of the slow path on the ingest path**, measured again (the same late-reading workload as above; extra time of a
+call with 20 late readings over the other calls of the run, and per slow-path reading):
+
+| Store | Readings | Call with late readings | Other calls | Per slow-path reading |
+|---|---|---|---|---|
+| small: 100 series | 0.5 M | 2.3 ms | 0.78 ms | 0.08 ms |
+| middle: 500 series, 512 MiB | 3 M | 9.6 ms | 2.0 ms | 0.38 ms |
+| middle: 500 series, 64 MiB | 3 M | 10.7 ms | 2.9 ms | 0.39 ms |
+| large: 2,000 series | 10 M | 26 ms | 7.5 ms | 0.94 ms |
+
+Worst case, not measured here: the first read of a segment after a start scans it, 64 MiB at the default
+`segment_size`, a part of 4 MiB at a time (`docs/api.md` Configuration, Memory), under the decision lock that every
+`emit` and entry call takes.
