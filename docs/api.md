@@ -84,14 +84,17 @@ up to as much again while it grows), the ingest queue (`limits.ingest_queue` rea
 yet acknowledged), consumer queues (`limits.consumer_queue` deliveries each), and per log reader at most one segment's
 bytes while it follows a segment. Bounded by the store's shape: the registry (about 200 bytes a series), each series'
 latest time and lateness reference, one commit time per batch, and the slow path's caches (8 MiB per reader for
-sealed segments' indexes and the maps of their batches, also during one lookup; batches read again touch about a
-4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
+sealed segments' indexes and the maps of their batches, also during one lookup; a batch read again, or appended
+since, is read into a buffer of its own length, and anything else in a 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
 cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms. A start reads the whole log once, a part at a time (Q-752); the public
 `Reader` still holds every fact it has read (roadmap 9.0a), and so does the store's own reader, opened by the first
-`facts`, `at` or `interval` call on a `Store`. `series`, `series_stats`, `losses`, `health` and the clean shutdown's
-registry file are answered from the deliverer's held state (registry, per-series summaries, recovery entries and the
-manifest's lost ranges); after a start whose read of the log was voided part-way, the summaries are rebuilt once by
-a read of the log in parts that keeps no facts. Worst case of the slow path, under the decision lock that
+`facts`, `at` or `interval` call on a `Store`. `series`, `series_stats`, `losses`, `health` and the registry file
+written after a routing change and at a clean shutdown are answered from the deliverer's held state (registry,
+per-series summaries, recovery entries and the manifest's lost ranges) once it has taken every batch acknowledged
+when the call began; otherwise, as when the log cannot be read, the store's own reader answers, with its error.
+After a start whose read of the log was voided part-way (a recovery entry voiding batches taken in an earlier part),
+the summaries are rebuilt once, at the first such call, by two reads of the log in parts that keep no facts; they
+run under the deliverer's lock, so emits with a consumer registered and entry calls wait for them. Worst case of the slow path, under the decision lock that
 every `emit` and entry call takes: the first read of a segment after a start scans it whole (64 MiB at the default
 `segment_size`, about a second at 60 MB/s), later reads only the batches whose event times may hold the key and those
 appended since (`docs/measurements/store-emit-throughput.md`).

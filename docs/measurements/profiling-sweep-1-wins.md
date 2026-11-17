@@ -1,14 +1,14 @@
 # The first profiling sweep's quick wins: before and after
 
-Instructions and CPU of a start, a clean shutdown, delivery, the duplicate rule's slow path and `emit` on the durable
-backend, before and after the quick wins of the first profiling sweep: one search for a segment's last non-zero
-byte, done a block at a time; one decode per batch; whole-batch checksums only for the reader's last 64 batches;
-no delivery records built while the deliverer loads; series looked up by id in a vector at a start and on the writer
-thread; the shutdown's registry file and `series`, `losses` and `series_stats` answered from the deliverer's held
-state; the writer's lookup reader freeing its start bytes; the reader's first refresh in parts; a boxed entry
-variant in log items; condition timers and confirmations without per-call maps; lookups reading batches into
-buffers of their own length and keeping their map across a recovery entry (Q-831); and a call's own facts kept in
-maps only for the keys and series it repeats.
+Instructions and CPU of a start, a clean shutdown, delivery, the duplicate rule's slow path and `emit` on the
+durable backend, before and after the quick wins of the first profiling sweep: one search for a segment's last non-
+zero byte, done a block at a time; one decode per batch; whole-batch checksums only for the reader's last 64
+batches; no delivery records built while the deliverer loads; series looked up by id in a vector at a start and on
+the writer thread; the registry file of a routing change and of the shutdown, and `series`, `losses` and
+`series_stats`, answered from the deliverer's held state; the writer's lookup reader freeing its start bytes; the
+reader's first refresh in parts; a boxed entry variant in log items; condition timers and confirmations without per-
+call maps; lookups reading batches into buffers of their own length and keeping their map across a recovery entry
+(Q-831); and a call's own facts kept in maps only for the keys and series it repeats.
 
 ## Method
 - **Builds.** Before is the bounded-history tree with the small store-path wins merged; after is the tree with the
@@ -49,7 +49,11 @@ maps only for the keys and series it repeats.
 | `emit`, 2 readings per call, per reading (process) | 60,449 | 53,455 | −12 % |
 
 The shutdown of the `emit` runs read the whole log before (1,380 instructions a reading of the 9,557); after, it is
-under 1 % of the run.
+under 1 % of the run. The row inside `Writer::emit` is the one to compare for the write path itself.
+
+A segment holding a recovery entry (Q-831), 22 to 32 M instructions per slow reading before by the sweep's profile,
+was not measured again: its later lookups now read only the mapped batches that may hold a key, as a clean segment's
+do (`a_segment_holding_a_recovery_entry_keeps_its_map_and_lookups_stay_exact` counts the decodes).
 
 ## Results: CPU and memory (indicative)
 | Measure | Build | CPU | Peak resident |
@@ -71,8 +75,11 @@ under 1 % of the run.
   allows to see (0.1 s and 0.5 s a run); their instruction counts are above.
 - The peak memory of a start no longer includes the shutdown's index of every fact; the running store holds 39 MiB
   less after the open (the boxed entry variant, no records while the deliverer loads, the lookup reader's start bytes
-  freed). The first `series`, `series_stats` or `losses` call no longer builds an index of every fact for the life of
-  the process.
+  freed). The first `series`, `series_stats` or `losses` call, and a routing change, no longer build an index of
+  every fact for the life of the process; the figures above are for a store without consumers, and a routing
+  change reads only what it appended (`a_routing_change_writes_the_registry_file_a_full_read_gives_without_reading_the_log`).
+  When the log cannot be read, or the deliverer has not taken what the writer acknowledged, the store's own reader
+  answers as before and builds that index.
 - The second slow call took 16 to 21 ms in every run before and 13 to 16 ms in five of six after (1.2 ms once).
   After, the later calls average 2.8 M instructions, so that time is not compute.
 

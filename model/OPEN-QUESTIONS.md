@@ -1559,8 +1559,11 @@ unchecked evaluation (`DeliveryStats::evaluations_unchecked`, counted whether or
 model's `Runner`, which exposes none. What was removed is the per-poll work that changed nothing: runner syncing,
 the copy of each consumer's map, and any evaluation for a consumer with no condition funnel (D1), and the maps of
 funnels a confirmation and a cursor write built when they did not use them (D2).
-**Pinned by.** `a_condition_routed_between_polls_is_evaluated_at_the_next` (`kvik/tests/consumers.rs`); the consumer
-property tests and the differential test against the model.
+**Pinned by.** The runner sync at a taken routing entry: `threshold_condition_delivers_transitions`,
+`on_change_and_held_for_conditions` and `rolling_operator_and_stale_for_timer` (`kvik/tests/consumers.rs`); the sync
+after a void, at the next evaluation: `a_condition_a_void_brings_back_into_force_is_evaluated_at_the_next_poll`
+(unit tests of the deliverer); `a_condition_routed_between_polls_is_evaluated_at_the_next`; the consumer property
+tests and the differential test against the model.
 
 ## Q-831 — A segment holding a recovery entry read whole by every lookup
 Recorded by the first profiling sweep. **Settled by the lead: yes**, provided lookups stay exact.

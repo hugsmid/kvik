@@ -61,6 +61,7 @@ backup-keys     backup keys
 backup-upload   backup upload_histories
 backup-plan     backup restore_plan
 backup-restore  backup restore_properties
+log-lookup      log   lib         reader::tests::lookup_properties::
 log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_zero_byte writer::seg_index::tests::
 kvik-units      kvik  lib         durable::by_id::tests::
 '
