@@ -559,6 +559,11 @@ fn creating_a_store_syncs_the_parent_of_its_directory_first() {
         drop(StoreDir::open(Arc::new(fs.clone()), Path::new(store), None).unwrap());
         assert!(fs.ops().iter().all(|o| o.path != Path::new(parent)));
     }
+    // A failed parent sync names the parent.
+    let fs = MemFs::new();
+    fs.fail_nth(MemOp::SyncDir, "data", 0, io::ErrorKind::PermissionDenied);
+    let e = StoreDir::open(Arc::new(fs), Path::new("data/store"), Some(&new_store())).unwrap_err();
+    assert!(e.to_string().contains("syncing data, the parent"), "{e}");
 }
 
 #[test]

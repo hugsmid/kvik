@@ -480,7 +480,8 @@ exists; a new file is created only when none exists.
   store's own entry is durable (directories above the parent that creation made are the caller's), create `LOCK` and
   take the lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and
   the directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
-  store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
+  store only once `STORE` exists. The first start creates the mark (`spec.md` §3). A restore that creates the store
+  directory syncs its parent the same way before it writes the manifest (`spec.md` §8 Restore, Q-871).
 - **Open.** `STORE` valid: sync the directory (a creation cut short between the rename and that sync may have left
   `STORE` in the page cache only, as may a rebuild cut short between renaming `MANIFEST.new` and its directory sync,
   A.14), then open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,

@@ -142,6 +142,7 @@ pub(crate) fn write_manifest(
             .map_err(|e| RestoreError::Append(e.into()))?,
     );
     local.fs.create_dir_all(&local.dir)?;
+    kvik_log::store::sync_parent(&*local.fs, &local.dir)?;
     write_whole(
         local,
         &local.dir.join(MANIFEST_NEW),
@@ -204,4 +205,34 @@ pub(crate) fn install(local: &LocalStore, d: &FileDescription, plain: &[u8]) -> 
         &dir.join(name),
         plain,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kvik_log::fs::{FaultOp, MemFs};
+
+    use super::*;
+
+    /// Q-871, `format.md` A.12: a restore that creates the store directory makes its entry durable by a sync of its
+    /// parent before it writes the manifest. `MemFs` has no directories, so this pins the sync, not the loss.
+    #[test]
+    fn a_restore_syncs_the_parent_of_the_store_directory_it_creates_first() {
+        for (dir, parent) in [("store", "."), ("data/store", "data")] {
+            let fs = MemFs::new();
+            let local = LocalStore {
+                fs: Arc::new(fs.clone()),
+                dir: PathBuf::from(dir),
+            };
+            let record = Record::new(1, 1, 0, Body::Empty);
+            write_manifest(&local, [3; 16], &record, 0).unwrap();
+            let ops = fs.ops();
+            assert_eq!(
+                (ops[0].op, ops[0].path.as_path()),
+                (FaultOp::SyncDir, Path::new(parent)),
+                "{dir}"
+            );
+        }
+    }
 }
