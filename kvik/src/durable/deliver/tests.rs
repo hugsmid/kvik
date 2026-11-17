@@ -132,6 +132,53 @@ mod bounded {
         )
     }
 
+    /// A manual clock that reports every read of its monotonic clock.
+    #[derive(Debug)]
+    struct Reported(ManualClock, std::sync::mpsc::SyncSender<()>);
+
+    impl crate::env::Clock for Reported {
+        fn wall(&self) -> Timestamp {
+            crate::env::Clock::wall(&self.0)
+        }
+        fn monotonic(&self) -> crate::env::Monotonic {
+            let _ = self.1.try_send(());
+            crate::env::Clock::monotonic(&self.0)
+        }
+        fn synchronised(&self) -> bool {
+            crate::env::Clock::synchronised(&self.0)
+        }
+    }
+
+    /// A call that waits for the deliverer while the clock moves acts at the time after its wait (the delivery
+    /// differential's flake: a condition runner created with a time from before the wait).
+    #[test]
+    fn a_call_that_waits_for_the_deliverer_acts_at_the_time_after_its_wait() {
+        let (mut env, dir) = store();
+        let clock = ManualClock::new(Timestamp(T0 + 7_200 * S));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1_024);
+        env.clock = Arc::new(Reported(clock.clone(), tx));
+        let d = open(&env, dir);
+        let clocks = Arc::new(Clocks::new(env.clock.clone()));
+        let hub = Hub::new(d, env.clone(), Path::new(dir), clocks);
+        while rx.try_recv().is_ok() {}
+        let held = hub.hold();
+        let h = hub.clone();
+        let call = std::thread::spawn(move || h.run_quiet(|_, c| c.mono));
+        // A call that reads the clocks before it takes the deliverer reads them now; one that reads them after
+        // cannot, and the wait only bounds how long this test gives the first kind.
+        let _read_early = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        clock.advance(std::time::Duration::from_secs(2_602));
+        drop(held);
+        let mono = call.join().unwrap();
+        assert_eq!(
+            mono,
+            i64::try_from(crate::env::Clock::monotonic(&clock).0).unwrap(),
+            "the call acted with a clock read before it waited"
+        );
+    }
+
     /// A store holding two hours of one reading a second on a gauge (1), a versioned series (2) and a gauge (3) whose
     /// readings after its first are bad; then late versions of series 2 at `T0 + 10 s`, below every window.
     fn store() -> (Env, &'static str) {

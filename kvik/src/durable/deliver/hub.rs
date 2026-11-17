@@ -111,6 +111,9 @@ impl Hub {
     /// wakes.
     pub(crate) fn run_quiet<R>(&self, f: impl FnOnce(&mut Deliverer, &Ctx<'_>) -> R) -> R {
         let watch = lock(&self.watch).clone();
+        let mut d = lock(&self.deliverer);
+        // The clocks are read once the deliverer is held: a call that waited for it acts at the time after the wait,
+        // never at one from before it (a condition runner created in the past would fire early).
         let wall = self.env.clock.wall().0;
         let now = self.clocks.now();
         let mono = i64::try_from(self.env.clock.monotonic().0).unwrap_or(i64::MAX);
@@ -123,7 +126,13 @@ impl Hub {
             wall,
             mono,
         };
-        f(&mut lock(&self.deliverer), &ctx)
+        f(&mut d, &ctx)
+    }
+
+    /// Holds the deliverer, for a test that makes a call wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> MutexGuard<'_, Deliverer> {
+        lock(&self.deliverer)
     }
 
     /// Records a cursor file fault.
