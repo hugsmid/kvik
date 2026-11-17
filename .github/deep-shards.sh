@@ -45,6 +45,7 @@ log-seal-describe log seal_describe
 log-scan-bound  log   scan_bound
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
+kvik-patterns   kvik  patterns
 kvik-restore-plan kvik restore_plan_model
 kvik-durable    kvik  durable_differential
 chunk-properties chunk properties

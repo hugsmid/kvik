@@ -268,10 +268,10 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// A history: some series first, then any operations; and whether the mark is synced at every commit.
+/// A history: up to four series first, then any operations; and whether the mark is synced at every commit.
 fn history(ops: usize) -> impl Strategy<Value = (Vec<Op>, bool)> {
     (
-        prop::collection::vec(series_spec().prop_map(Op::Define), 1..5),
+        prop::collection::vec(series_spec().prop_map(Op::Define), 0..5),
         prop::collection::vec(op(), 1..ops),
         any::<bool>(),
     )
@@ -954,7 +954,7 @@ impl World {
             durability: kvik_model::registry::Durability::Synced,
         };
         self.names += 1;
-        let name = format!("line/s{}", self.names);
+        let name = format!("line/s{}/value", self.names);
         let unit = ["", "W", "%"][usize::from(s.unit)];
         let ev = self.registry_or_read_only(|m| {
             let _ = m.define_with(&name, kind, value_type, unit, Some(3 * e), options);
@@ -1557,7 +1557,7 @@ impl World {
             Op::Rename(pick) => {
                 if let Some(s) = self.pick(*pick) {
                     self.names += 1;
-                    let name = format!("alias/a{}", self.names);
+                    let name = format!("alias/a{}/value", self.names);
                     self.registry_or_read_only(|m| {
                         let _ = m.rename(s.id, &name);
                     });
@@ -1644,6 +1644,27 @@ fn the_log_keeps_what_the_model_commits() {
             Ok(())
         })
         .unwrap();
+}
+
+/// A store that started, committed nothing and lost power: a first start creates the mark (spec §3 Recovery), so
+/// the next start, on another boot, writes the same recovery entry in the log and in the model.
+#[test]
+fn a_power_loss_with_nothing_committed_gives_the_same_recovery_entry() {
+    let refused = SeriesSpec {
+        kind: 2,
+        timing: 0,
+        versioned: 0,
+        record_on_change: false,
+        interval: 0,
+        phase: 8,
+        lateness: 0,
+        wraps: false,
+        ceiling: 0,
+        unit: 0,
+    };
+    for every in [false, true] {
+        run(&[Op::Define(refused.clone()), Op::PowerLoss], every);
+    }
 }
 
 /// Longer histories, for a local soak run: `cargo test --release -p kvik-log --test model_histories -- --ignored`.

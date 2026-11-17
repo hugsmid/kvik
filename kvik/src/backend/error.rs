@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::{
-    ConsumerError, DefineError, EmitError, Fault, OpenError, QueryError, WriteError,
+    ConsumerError, DefineError, EmitError, Fault, OpenError, QueryError, RouteError, WriteError,
 };
 use crate::types::SeriesId;
 
@@ -46,6 +46,8 @@ pub(crate) enum Error {
     },
     #[error("route refused: {0}")]
     Route(String),
+    #[error("pattern refused: {0}")]
+    Pattern(RouteError),
     #[error("routing cycle: {0}")]
     RouteCycle(String),
     #[error("consumer {0:?} in use")]
@@ -173,6 +175,7 @@ impl Error {
             Error::TooManyConsumers(n) => ConsumerError::TooManyConsumers(n),
             Error::UnknownSeries(_) => ConsumerError::UnknownSeries,
             Error::Route(r) => ConsumerError::Route(r),
+            Error::Pattern(e) => ConsumerError::Pattern(e),
             Error::RouteCycle(c) => ConsumerError::RouteCycle(c),
             Error::BadConfirm => ConsumerError::BadConfirm,
             Error::UnknownPoint => ConsumerError::UnknownPoint,

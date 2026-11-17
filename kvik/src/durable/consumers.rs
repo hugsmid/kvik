@@ -112,6 +112,9 @@ impl Writer {
                 "a consumer name is [a-z0-9][a-z0-9._-]{0,63} (format.md A.12)".into(),
             ));
         }
+        if let Select::Names(p) = emits {
+            crate::pattern::check(p).map_err(Error::Pattern)?;
+        }
         let emits = emits_in(emits);
         let mut d = lock(&self.decider);
         let change = hub.run(|dl, c| -> Result<Option<Routing>, Error> {
@@ -159,6 +162,11 @@ impl Writer {
             dl.pump(c);
             if !dl.is_bound(name) {
                 return Err(Error::Closed);
+            }
+            // Before the shortcut below, so that a funnel stored with a pattern the grammar refuses is refused when
+            // routed again (Q-670 (b)).
+            if let Select::Names(p) = &funnel.series {
+                crate::pattern::check(p).map_err(Error::Pattern)?;
             }
             let view = dl.view();
             // The same definition again (a consumer that routes at every start) is the funnel in force, with its
@@ -332,5 +340,111 @@ impl Writer {
                 })
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use kvik_log::entries::{RouteOp, Routing, Selection};
+
+    use super::super::{Emitted, Writer, lock};
+    use crate::backend::Error;
+    use crate::config::{LogConfig, StoreConfig};
+    use crate::consume::{DeliveryKind, Funnel, Select, Start};
+    use crate::env::{Env, ManualClock, MemFs};
+    use crate::error::RouteError;
+    use crate::series::{Kind, SeriesSpec, ValueType};
+    use crate::types::{Intent, Reading, SeriesId, Value};
+
+    fn emit(w: &Arc<Writer>, id: SeriesId, clock: &ManualClock) {
+        let r = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+        if let Emitted::Queued(mut q) = w.emit(&r, Intent::Normal, true).unwrap() {
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(r) = q.poll(&mut cx) {
+                    q.finish(r).unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Q-670 (b): a funnel a log holds with a pattern the grammar refuses stays in force and is read as built, each
+    /// segment a literal; routing it again is refused, not taken as the funnel in force (Q-91 (c)).
+    #[test]
+    fn a_stored_funnel_with_a_refused_pattern_is_read_literally_and_refused_when_routed_again() {
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(MemFs::new());
+        env.background_timers = false;
+        let log = LogConfig {
+            segment_size: 16 << 20,
+            ..LogConfig::default()
+        };
+        let config = StoreConfig::new(PathBuf::from("durable-unit/refused-pattern"), "UTC")
+            .create_if_missing(true)
+            .env(env)
+            .log(log);
+        let gauge = |name: &str| {
+            SeriesSpec::new(
+                name,
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            )
+        };
+        let wide = "plant/line-*/power";
+        let w = Writer::open(&config).unwrap();
+        let line = w.define(&gauge("plant/line-1/power")).unwrap();
+        let literal = w.define(&gauge(wide)).unwrap();
+        w.take_consumer("c", Start::Now, &Select::None).unwrap();
+        let change = Routing {
+            consumer: "c".into(),
+            op: RouteOp::Add,
+            funnel: Some(1),
+            selection: Some(Selection::Pattern {
+                pattern: wide.into(),
+                resolved: Vec::new(),
+            }),
+            operator: None,
+            emits: Selection::None,
+            condition: None,
+        };
+        {
+            let mut d = lock(&w.decider);
+            w.commit_routing(&mut d, change).unwrap();
+        }
+        w.release("c");
+        w.shutdown().unwrap();
+        drop(w);
+
+        let w = Writer::open(&config).unwrap();
+        w.take_consumer("c", Start::Now, &Select::None).unwrap();
+        let funnel = Funnel::facts(Select::Names(wide.into()));
+        let routes = w.routes("c").unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].1, funnel);
+        assert!(matches!(
+            w.route("c", &funnel),
+            Err(Error::Pattern(RouteError::PartialWildcard))
+        ));
+        emit(&w, line, &clock);
+        emit(&w, literal, &clock);
+        let mut got = Vec::new();
+        while let Some(d) = w.poll_delivery("c", None).unwrap() {
+            w.confirm("c", d.id).unwrap();
+            if let DeliveryKind::Fact(f) = d.kind {
+                got.push(f.series);
+            }
+        }
+        assert_eq!(got, vec![literal]);
+        w.shutdown().unwrap();
     }
 }

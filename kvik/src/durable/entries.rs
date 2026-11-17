@@ -140,12 +140,7 @@ impl Writer {
     pub(crate) fn alias(&self, id: SeriesId, name: &str) -> Result<(), Error> {
         self.commit_entry(|d| {
             self.live(d, id)?;
-            if name.is_empty() || name.len() > 255 {
-                return Err(Error::Invalid {
-                    field: "name",
-                    reason: "1 to 255 bytes".into(),
-                });
-            }
+            convert::check_name(name)?;
             // A name the series already carries is given again: it becomes the display name, as in the model.
             if d.registry.resolve(name).is_some_and(|s| s.def.id != id.0) {
                 return Err(Error::NameInUse(name.into()));

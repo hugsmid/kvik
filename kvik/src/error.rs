@@ -376,6 +376,10 @@ pub enum ConsumerError {
     /// A routing change is refused (spec §4, §6 Cadence).
     #[error("route refused: {0}")]
     Route(String),
+    /// A name pattern, in a funnel or in `emits`, is refused when routes are
+    /// compiled (spec §4 Funnel).
+    #[error("pattern refused: {0}")]
+    Pattern(RouteError),
     /// A route or a change of `emits` would close a cycle between consumers
     /// (spec §4 Routing; an alias that would is [`DefineError::RouteCycle`]).
     /// Not produced by the model backend, which accepts only consumers that
@@ -398,6 +402,31 @@ pub enum ConsumerError {
         /// What.
         what: &'static str,
     },
+}
+
+/// Why a name pattern is refused (spec §4 Funnel): a pattern has the three
+/// `/`-separated segments of a name, each a literal or `*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RouteError {
+    /// Longer than 255 bytes (`format.md` A.6 field 55).
+    #[error("{len} bytes, more than 255")]
+    TooLong {
+        /// Its length in bytes.
+        len: usize,
+    },
+    /// Not three segments.
+    #[error("{found} segments, not 3")]
+    Segments {
+        /// How many it has.
+        found: usize,
+    },
+    /// A segment is empty.
+    #[error("an empty segment")]
+    EmptySegment,
+    /// A `*` inside a segment: `*` matches one whole segment only.
+    #[error("`*` inside a segment")]
+    PartialWildcard,
 }
 
 /// The error of backup, restore and rebuild calls, settled with roadmap 8.2.

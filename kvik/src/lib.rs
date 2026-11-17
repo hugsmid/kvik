@@ -101,6 +101,7 @@ mod durable;
 mod error;
 mod fold;
 mod health;
+mod pattern;
 mod read;
 mod rules;
 mod series;
@@ -124,7 +125,7 @@ pub use consume::{
 };
 pub use error::{
     BackupError, ConsumerError, DefineError, EmitError, Fault, OpenError, QueryError, Refusal,
-    Wait, WriteError,
+    RouteError, Wait, WriteError,
 };
 pub use health::{
     BackupRefusal, BackupStats, ClockJump, ClockStats, ConsumerStats, DeliveryStats, DiskStats,

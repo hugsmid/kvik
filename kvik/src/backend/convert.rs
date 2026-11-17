@@ -146,6 +146,32 @@ pub(crate) fn mwait(b: Wait) -> km::engine::Wait {
     }
 }
 
+/// The longest name (`format.md` A.6 field 2).
+const MAX_NAME: usize = 255;
+
+/// A name given to `define_series` or `alias`: 1 to 255 bytes, then three non-empty `/`-separated segments (spec
+/// §2.1 `name`, Q-670), checked alike on both backends.
+pub(crate) fn check_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() || name.len() > MAX_NAME {
+        return Err(Error::Invalid {
+            field: "name",
+            reason: "1 to 255 bytes".into(),
+        });
+    }
+    if km::registry::name_has_three_segments(name) {
+        Ok(())
+    } else {
+        Err(name_refused())
+    }
+}
+
+fn name_refused() -> Error {
+    Error::Invalid {
+        field: "name",
+        reason: "three non-empty segments separated by '/'".into(),
+    }
+}
+
 /// A model error as an interface error.
 pub(crate) fn error(e: km::engine::Error) -> Error {
     use km::engine::Error as E;
@@ -158,6 +184,7 @@ pub(crate) fn error(e: km::engine::Error) -> Error {
         E::Registry(R::NameInUse(n)) => Error::NameInUse(n),
         E::Registry(R::Unknown(s)) => Error::UnknownSeries(sid(s).to_string()),
         E::Registry(R::Retired(s)) => Error::Retired(sid(s)),
+        E::Registry(R::BadName(_)) => name_refused(),
         E::Registry(other) => Error::Invalid {
             field: "definition",
             reason: other.to_string(),
