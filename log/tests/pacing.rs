@@ -149,6 +149,7 @@ fn no_call_is_acknowledged_before_its_batch_is_on_stable_storage() {
     let mut at = START;
     let mut first = true;
     while s.calls_waiting() || !s.pending.is_empty() {
+        assert!(s.turns.len() < 1_000, "the calls do not drain");
         let acked = s.acked.len();
         let (n, busy) = s.turn(at, sync);
         if s.acked.len() > acked {
