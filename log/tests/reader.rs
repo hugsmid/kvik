@@ -359,7 +359,11 @@ fn a_reader_on_a_new_store_holds_nothing_and_writes_its_lease() {
     let lease = LeaseSlot::decode_file(&r.fs.read(&path).unwrap(), &STORE_ID).unwrap();
     assert_eq!(lease.boot_id, r.boot_id());
     assert_eq!(lease.epoch, u.state.epoch);
-    // One at open, one at the refresh.
+    // Written at open; a refresh writes it again only once half of `lease_refresh` has passed.
+    assert_eq!(lease.refresh_counter, 1);
+    r.clock.advance(Duration::from_secs(15 * 60));
+    r.refresh().unwrap();
+    let lease = LeaseSlot::decode_file(&r.fs.read(&path).unwrap(), &STORE_ID).unwrap();
     assert_eq!(lease.refresh_counter, 2);
 }
 
@@ -670,6 +674,7 @@ fn a_failed_lease_write_or_a_corrupt_manifest_record_fails_the_refresh_and_chang
     r.submit(items(2, 0));
     r.drain();
     let before = r.reader.as_ref().unwrap().state();
+    r.clock.advance(Duration::from_secs(15 * 60));
     r.fs.fail_nth(
         kvik_log::fs::FaultOp::Write,
         ".lease",
@@ -1636,6 +1641,7 @@ fn a_lease_whose_header_is_damaged_is_written_whole_and_the_refresh_interval_is_
     let mut r = Rig::new(cfg());
     let mine = dir().join("leases").join(lease_name(&[r.readers; 16]));
     r.fs.poke(&mine, 0, &[0; 64]);
+    r.clock.advance(Duration::from_secs(15 * 60));
     r.refresh().unwrap();
     let lease = LeaseSlot::decode_file(&r.fs.read(&mine).unwrap(), &STORE_ID).unwrap();
     assert_eq!(lease.refresh_counter, 2);

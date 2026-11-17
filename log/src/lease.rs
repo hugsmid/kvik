@@ -319,6 +319,90 @@ impl LeaseTable {
     }
 }
 
+/// Why a reader's cut ended (query design §3.3, `spec.md` §7 Readers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CutEnd {
+    /// Held for `cut_max_age` or longer.
+    Expired,
+    /// A renewal found the lease gone or changed: the epoch may have been unprotected.
+    LeaseLost,
+    /// Not a cut of this reader, or released.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeldCut {
+    epoch: u64,
+    taken_at: Duration,
+    lost: bool,
+}
+
+/// A reader's live cuts (`spec.md` §7 Readers): its lease names the lowest epoch among them, a cut lives at most
+/// `max_age` of the reader's monotonic clock, and a lease found gone or changed ends every cut.
+#[derive(Clone, Debug, Default)]
+pub struct Cuts {
+    next: u64,
+    held: BTreeMap<u64, HeldCut>,
+}
+
+impl Cuts {
+    /// Takes a cut at `epoch` at `now`; returns its id.
+    pub fn take(&mut self, epoch: u64, now: Duration) -> u64 {
+        self.next += 1;
+        self.held.insert(
+            self.next,
+            HeldCut {
+                epoch,
+                taken_at: now,
+                lost: false,
+            },
+        );
+        self.next
+    }
+
+    /// Ends the cut `id`; nothing for an unknown id.
+    pub fn release(&mut self, id: u64) {
+        self.held.remove(&id);
+    }
+
+    /// Ends every cut: the lease was found gone or changed.
+    pub fn lose_all(&mut self) {
+        for c in self.held.values_mut() {
+            c.lost = true;
+        }
+    }
+
+    /// Whether the cut `id` is live at `now`.
+    pub fn check(&self, id: u64, now: Duration, max_age: Duration) -> Result<u64, CutEnd> {
+        let c = self.held.get(&id).ok_or(CutEnd::Unknown)?;
+        if c.lost {
+            Err(CutEnd::LeaseLost)
+        } else if now.saturating_sub(c.taken_at) >= max_age {
+            Err(CutEnd::Expired)
+        } else {
+            Ok(c.epoch)
+        }
+    }
+
+    /// The lowest epoch of the cuts live at `now`; `None` without one.
+    pub fn lowest(&self, now: Duration, max_age: Duration) -> Option<u64> {
+        self.held
+            .keys()
+            .filter_map(|&id| self.check(id, now, max_age).ok())
+            .min()
+    }
+
+    /// How many cuts are held, live or ended and not yet released.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether no cut is held.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -182,8 +182,13 @@ fn decode_lost(list: &[(u16, &[u8])]) -> Option<LostRange> {
     })
 }
 
-/// The record at `at`, if it is a valid record whose epoch is above `min_epoch`.
-fn record_at(bytes: &[u8], at: u64, min_epoch: u64) -> Result<Option<Record>, ManifestError> {
+/// The record at `at`, if it is a valid record whose epoch is above `min_epoch`; `bytes` start at file offset `base`.
+fn record_at(
+    bytes: &[u8],
+    at: u64,
+    min_epoch: u64,
+    base: u64,
+) -> Result<Option<Record>, ManifestError> {
     let Ok(b) = read_block(bytes, at, bytes.len() as u64) else {
         return Ok(None);
     };
@@ -216,7 +221,7 @@ fn record_at(bytes: &[u8], at: u64, min_epoch: u64) -> Result<Option<Record>, Ma
         _ if b.header.skippable() => None,
         _ => {
             return Err(ManifestError::Unsupported(FormatError::Unsupported {
-                offset: at,
+                offset: base + at,
                 element: Element::BlockType(t),
             }));
         }
@@ -244,11 +249,30 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
     if h.kind != kind::MANIFEST || &h.store_id != store_id {
         return Err(ManifestError::Header);
     }
+    let (records, valid_end) =
+        read_records(&bytes[HEADER_LEN.min(bytes.len())..], HEADER_LEN as u64, 0)?;
+    Ok(ManifestRead {
+        valid_end,
+        torn: (bytes.len() as u64) > valid_end,
+        records,
+    })
+}
+
+/// Reads the records in `tail`, the bytes of a manifest from file offset `base` (the end of a valid record, or
+/// the header's end) to its end, as [`read_manifest`] reads them past that point: each valid with an epoch above
+/// the one before, the first above `last_epoch`. Returns the records, with file offsets, and the file offset just
+/// past the last; an invalid record followed by a valid one of a higher epoch is corrupt (`spec.md` §7 Manifest).
+pub fn read_records(
+    tail: &[u8],
+    base: u64,
+    last_epoch: u64,
+) -> Result<(Vec<Record>, u64), ManifestError> {
     let mut records: Vec<Record> = Vec::new();
-    let mut at = HEADER_LEN as u64;
-    while at < bytes.len() as u64 {
-        let min = records.last().map_or(0, |r| r.epoch);
-        match record_at(bytes, at, min)? {
+    let mut at = 0u64;
+    let len = tail.len() as u64;
+    while at < len {
+        let min = records.last().map_or(last_epoch, |r| r.epoch);
+        match record_at(tail, at, min, base)? {
             Some(r) => {
                 at = r.end;
                 records.push(r);
@@ -256,21 +280,21 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
             None => break,
         }
     }
-    let valid_end = at.min(bytes.len() as u64);
+    let valid_end = at.min(len);
     // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced.
-    let min = records.last().map_or(0, |r| r.epoch);
+    let min = records.last().map_or(last_epoch, |r| r.epoch);
     let mut probe = valid_end + 8;
-    while probe + (BLOCK_HEADER_LEN as u64) <= bytes.len() as u64 {
-        if record_at(bytes, probe, min)?.is_some() {
-            return Err(ManifestError::Corrupt(valid_end));
+    while probe + (BLOCK_HEADER_LEN as u64) <= len {
+        if record_at(tail, probe, min, base)?.is_some() {
+            return Err(ManifestError::Corrupt(base + valid_end));
         }
         probe += 8;
     }
-    Ok(ManifestRead {
-        valid_end,
-        torn: (bytes.len() as u64) > valid_end,
-        records,
-    })
+    for r in &mut records {
+        r.offset += base;
+        r.end += base;
+    }
+    Ok((records, base + valid_end))
 }
 
 fn push_field(out: &mut Vec<u8>, id: u16, value: &[u8]) {

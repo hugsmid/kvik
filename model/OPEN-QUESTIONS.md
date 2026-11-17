@@ -75,6 +75,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-777 | §2.3, §7 Derived files; `format.md` A.18 | The live candidate's write time and what bounded state cannot tell |
 | Q-778 | §7 Derived files; `format.md` A.18 | What the status file holds before the query envelope exists |
 | Q-780 | §8 Generations, Restore; `format.md` A.18 Contiguity | The log directory across a generation change |
+| Q-851 | §7 Readers | The second read of the mark after a pass that took something (decided, awaiting review) |
+| Q-852 | §7 Readers, Manifest; `format.md` A.13 | What a reader call reads once caught up (decided, awaiting review) |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1650,6 +1652,43 @@ Corrupt block describes for a sealed segment, with the quarantine and copy), so 
 (health after the restart) and `a_region_a_consumers_read_meets_after_the_open_is_counted`
 (`kvik/tests/slow_path.rs`).
 
+## Q-851 — The second read of the mark after a pass
+Recorded and decided by roadmap 9.0b1 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.1 lists the second read of the mark among the per-call work that goes. That read is
+§7 Readers' comparison of the reset stamp "before and after reading": a start that truncates while a pass reads
+(a page-cache loss on the same boot) would otherwise let the pass return batches that the next call voids.
+**Decision.** A refresh reads the mark again only after a pass that took something (a batch, a void, a region, or a
+moved resume point); a pass that took nothing has nothing to discard. An idle call reads the mark once, and a call
+with new bytes twice: constant either way, so the per-call bound holds without changing §7's promise. Removing the
+read altogether would make the comparison the kvik layer's and is left to the stamp rules of the iteration kind
+(roadmap 9.0f).
+**Pinned by.** `a_mark_that_moves_backwards_during_a_refresh_discards_the_pass`,
+`a_mark_with_a_new_reset_stamp_during_a_refresh_discards_the_pass` (`log/tests/reader.rs`);
+`a_calls_file_system_calls_and_writes_do_not_grow_with_the_sealed_segments` (`log/tests/reader_calls.rs`).
+
+## Q-852 — What a reader call reads once caught up
+Recorded and decided by roadmap 9.0b1 (technical). To be revisited by roadmap 6.3b, which writes the sealed-segment
+records.
+**Scenario.** A refresh listed `log/` twice per call (the segments to read, and the segment of the last batch to check
+again) and read and parsed the whole manifest; after a year that is 105,000 names sorted per call (query design
+§3.1, review B1).
+**Decision.** Once a reader has read a segment, a call opens the segments from the one it follows to the mark's by
+name (`<generation>-<file_id>`, under either extension, the mark's generation for those after the followed one);
+only a segment not found by name is looked up in a listing, taken once for the pass, which decides as on a first
+pass: listed but not openable is `SegmentMissing`, not listed is passed over, and the mark's segment is required. The
+last batch is read again from the segment it was read from, by name. A first pass, and one after a generation change,
+lists. The manifest is checked by path at every call: its length, its file identity (device and inode on Unix, none
+elsewhere; `FsFile::identity`) and the bytes of the last record the reader parsed, at their offset; unchanged, nothing
+more is read; longer, it is parsed from where the reader stopped; shorter or changed, again from its start. A record
+before the last one damaged after the reader parsed it is therefore found at the next manifest rebuild or reopen, not
+at the next call. Measured through the `Fs` seam on stores with 10 and 1,000 sealed segments: an idle call made 14
+calls and listed 26 and 2,006 entries before, 8 calls and no listing after; a call with one new batch 21 calls and 28
+and 2,008 entries before, 18 calls and no listing after, also after a seal; the lease write per call went (Q-850's
+neighbour rules, `spec.md` §7 Readers).
+**Pinned by.** `a_calls_file_system_calls_and_writes_do_not_grow_with_the_sealed_segments`,
+`an_unchanged_manifest_is_read_at_its_last_record_a_longer_one_past_it_and_a_replaced_one_whole`
+(`log/tests/reader_calls.rs`); `an_earlier_segment_listed_but_gone_when_opened_is_an_error` (`log/tests/reader.rs`).
+
 ## Q-710 — The default floor of the batch-sync interval
 
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
@@ -1810,6 +1849,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-780 | 8.3 | The log directory across a generation change: restored ends in the root; recorded by roadmap 9.0a |
 | Q-754 | 9.0f | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
 | Q-755 | 6.3b | Damage found during a run recorded durably as a loss; health held degraded meanwhile by the lead's decision at the re-check of roadmap 11.0 |
+| Q-851 | 9.0b2 | The second read of the mark kept after a pass that took something; decided by roadmap 9.0b1, awaiting review |
+| Q-852 | 6.3b | A caught-up reader opens segments by name and checks the manifest by path; decided by roadmap 9.0b1, awaiting review |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
