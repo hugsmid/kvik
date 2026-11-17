@@ -2143,6 +2143,10 @@ fn a_start_begins_with_a_directory_sync_and_stops_if_it_fails() {
     r.fs.clear_ops();
     r.open().unwrap();
     let ops = r.fs.ops();
+    // Opening the store syncs the store directory (format A.12 Open); the start then syncs the log directory.
+    assert_eq!((ops[0].op, ops[0].ok), (FaultOp::SyncDir, true));
+    assert_eq!(ops[0].path, dir());
+    let ops = &ops[1..];
     assert_eq!((ops[0].op, ops[0].ok), (FaultOp::SyncDir, true));
     assert!(ops[0].path.ends_with("log"));
     // Step 3 syncs the kept segments and then the directory, before the manifest is touched.
@@ -2167,9 +2171,10 @@ fn a_start_begins_with_a_directory_sync_and_stops_if_it_fails() {
     let ops = r.fs.ops();
     assert_eq!(
         ops.len(),
-        1,
+        2,
         "nothing written or deleted after the failed directory sync: {ops:?}"
     );
+    assert_eq!((ops[1].op, ops[1].ok), (FaultOp::SyncDir, false));
 }
 
 #[test]
@@ -2693,7 +2698,7 @@ fn an_unused_segment_below_a_header_only_segment_left_by_a_cut_start_is_reported
     r.fs.restart();
     let unused = r.unused_bytes_beyond(Some(m));
     assert!(unused > 0);
-    r.fs.crash_after(11);
+    r.fs.crash_after(12);
     assert!(r.open().is_none());
     r.w = None;
     r.fs.power_loss_partial(5);

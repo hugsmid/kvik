@@ -479,7 +479,8 @@ exists; a new file is created only when none exists.
   lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and the
   directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
   store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
-- **Open.** `STORE` valid: open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
+- **Open.** `STORE` valid: sync the directory (a creation cut short between the rename and that sync may have left
+  `STORE` in the page cache only), then open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
   `STORE.tmp`, and the directories `log/`, `cursors/` and `leases/`, empty): a creation that did not finish; remove
   what it left and create again. No `STORE` and any other name, a file under `log/` included: `NotAStore` (never
   created over; a directory part-way

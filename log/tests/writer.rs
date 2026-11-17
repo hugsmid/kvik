@@ -486,6 +486,30 @@ fn store_creation_layout_and_open_rules() {
     ));
 }
 
+/// format A.12 Open: a creation whose last directory sync failed leaves `STORE` renamed in the page cache only; the
+/// next open syncs the directory, so a later power loss never leaves the store's files without `STORE`.
+#[test]
+fn opening_a_store_makes_a_creations_rename_durable() {
+    for seed in 0..64 {
+        let fs = MemFs::new();
+        let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+        // The fifth directory sync of a creation is the one after the rename.
+        fs.fail_nth(MemOp::SyncDir, "store", 4, io::ErrorKind::Other);
+        assert!(StoreDir::open(afs.clone(), &dir(), Some(&new_store())).is_err());
+        fs.restart();
+        let store = StoreDir::open(afs.clone(), &dir(), Some(&new_store())).unwrap();
+        let mut w = LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO, T0).unwrap();
+        w.shutdown(Duration::ZERO).unwrap();
+        drop(w);
+        fs.power_loss_partial(seed);
+        fs.restart();
+        assert!(
+            StoreDir::open(afs, &dir(), Some(&new_store())).is_ok(),
+            "seed {seed}"
+        );
+    }
+}
+
 #[test]
 fn group_commit_coalesces_under_load_and_adds_no_delay_after_a_quiet_period() {
     let mut h = H::new(cfg());
