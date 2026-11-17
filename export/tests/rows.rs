@@ -289,6 +289,12 @@ fn columns_come_in_the_documented_order_with_the_documented_nullability() {
             .map(|(n, o)| (n.to_string(), *o))
             .collect();
         assert_eq!(column_order(&file), expected, "{:?}", series.value);
+        for (name, _) in &expected {
+            assert!(
+                !["site", "series", "area", "device", "metric", "month"].contains(&name.as_str()),
+                "{name} is a partition column of the partitioned layout"
+            );
+        }
     }
 }
 

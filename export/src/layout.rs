@@ -1,5 +1,5 @@
-//! The partitioned path layout `site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet` (`docs/export.md`
-//! Partitioned layout, Q-196).
+//! The partitioned path layout `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet`
+//! (`docs/export.md` Partitioned layout, Q-196 as amended, Q-670).
 
 use std::fmt;
 
@@ -37,7 +37,7 @@ fn kept(c: u8) -> bool {
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-/// A series name as one path segment: bytes of `a`–`z`, `0`–`9`, `-` and `_` kept, every other byte as `%XX` in
+/// One segment of a series name as one path segment: bytes of `a`–`z`, `0`–`9`, `-` and `_` kept, every other byte as `%XX` in
 /// upper-case hex. Injective even on file systems that fold case, and reversed by [`unescape_segment`].
 pub fn escape_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -143,12 +143,29 @@ impl fmt::Display for Month {
     }
 }
 
-/// The folder of one series' month: `site=<site>/series=<escaped name>/month=<YYYY-MM>`.
-pub fn partition_dir(site: &str, series: &str, month: Month) -> String {
-    format!(
-        "site={site}/series={}/month={month}",
-        escape_segment(series)
-    )
+/// The segments `[area, device, metric]` of a series name; `None` unless it has exactly three, none empty (Q-670).
+pub fn name_segments(name: &str) -> Option<[&str; 3]> {
+    let mut parts = name.split('/');
+    let segments = [parts.next()?, parts.next()?, parts.next()?];
+    (parts.next().is_none() && segments.iter().all(|s| !s.is_empty())).then_some(segments)
+}
+
+pub(crate) fn checked_segments(name: &str) -> Result<[&str; 3], ExportError> {
+    name_segments(name).ok_or(ExportError::UnsupportedSeries {
+        reason: "a partitioned export needs a series name of three non-empty segments, area/device/metric (Q-670)",
+    })
+}
+
+/// The folder of one series' month: `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>`, each segment
+/// escaped on its own. A name without three non-empty segments is refused (Q-670).
+pub fn partition_dir(site: &str, series: &str, month: Month) -> Result<String, ExportError> {
+    let [area, device, metric] = checked_segments(series)?;
+    Ok(format!(
+        "site={site}/area={}/device={}/metric={}/month={month}",
+        escape_segment(area),
+        escape_segment(device),
+        escape_segment(metric)
+    ))
 }
 
 /// The file name of a whole month's export in its folder, from its view: `current.parquet`, `history.parquet`,

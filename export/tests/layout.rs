@@ -1,5 +1,6 @@
-//! Site and store identity in the metadata, and the partitioned layout: site labels, the series-name escaping,
-//! UTC month cuts and one file per month on both backends (Q-196).
+//! Site and store identity in the metadata, and the partitioned layout: site labels, the split of a series name
+//! into area, device and metric, the per-segment escaping, UTC month cuts and one file per month on both backends
+//! (Q-196 as amended, Q-670).
 
 mod common;
 
@@ -14,7 +15,8 @@ use kvik::{
 };
 use kvik_export::{
     ExportError, ExportOptions, ExportRow, MAX_SITE_LEN, Month, check_site, escape_segment,
-    export_partitioned, file_name, partial_file_name, partition_dir, unescape_segment,
+    export_partitioned, file_name, name_segments, partial_file_name, partition_dir,
+    unescape_segment,
 };
 use proptest::prelude::*;
 
@@ -80,9 +82,10 @@ fn site_and_store_id_are_in_the_metadata_when_given() {
 }
 
 #[test]
-fn series_names_escape_to_one_case_safe_segment() {
+fn name_segments_escape_to_case_safe_path_segments() {
     for (name, segment) in [
-        ("plant/line-1/temperature", "plant%2Fline-1%2Ftemperature"),
+        ("Temperature", "%54emperature"),
+        ("0042", "0042"),
         ("a_b-c9", "a_b-c9"),
         ("A", "%41"),
         ("a.b", "a%2Eb"),
@@ -136,6 +139,35 @@ proptest! {
     }
 
     #[test]
+    fn each_name_segment_round_trips_through_its_own_path_segment(
+        segments in prop::array::uniform3("[^/]{1,12}"),
+    ) {
+        let name = segments.join("/");
+        prop_assert_eq!(name_segments(&name), Some([segments[0].as_str(), segments[1].as_str(), segments[2].as_str()]));
+        let dir = partition_dir("s", &name, Month::of(Timestamp(0))).unwrap();
+        let parts: Vec<&str> = dir.split('/').collect();
+        prop_assert_eq!(parts.len(), 5, "{}", dir);
+        prop_assert_eq!(parts[0], "site=s");
+        prop_assert_eq!(parts[4], "month=1970-01");
+        for ((part, key), segment) in parts[1..4].iter().zip(["area=", "device=", "metric="]).zip(&segments) {
+            let escaped = part.strip_prefix(key).unwrap();
+            prop_assert_eq!(escaped, escape_segment(segment));
+            prop_assert_eq!(unescape_segment(escaped), Some(segment.clone()));
+            prop_assert_eq!(unescape_segment(&fold(escaped)), Some(segment.clone()));
+        }
+    }
+
+    #[test]
+    fn a_name_of_other_than_three_segments_or_with_an_empty_one_is_refused(name in misshapen_name()) {
+        prop_assert_eq!(name_segments(&name), None, "{:?}", name);
+        let refused = matches!(
+            partition_dir("s", &name, Month::of(Timestamp(0))),
+            Err(ExportError::UnsupportedSeries { .. })
+        );
+        prop_assert!(refused, "{:?}", name);
+    }
+
+    #[test]
     fn a_segment_built_from_valid_tokens_is_the_escape_of_its_name((segment, name) in valid_segment()) {
         prop_assert_eq!(unescape_segment(&segment), Some(name.clone()));
         prop_assert_eq!(escape_segment(&name), segment);
@@ -168,6 +200,22 @@ proptest! {
             prop_assert_eq!(before.range().to, r.from);
         }
     }
+}
+
+/// A name of one, two, four or five segments, or of three with at least one empty.
+fn misshapen_name() -> impl Strategy<Value = String> {
+    let other_count = prop::sample::select(vec![1usize, 2, 4, 5])
+        .prop_flat_map(|n| prop::collection::vec("[^/]{0,6}", n));
+    let three_with_an_empty =
+        (prop::array::uniform3("[^/]{0,6}"), 1u8..8).prop_map(|(mut s, empties)| {
+            for (i, segment) in s.iter_mut().enumerate() {
+                if empties & (1 << i) != 0 {
+                    segment.clear();
+                }
+            }
+            s.to_vec()
+        });
+    prop_oneof![other_count, three_with_an_empty].prop_map(|s| s.join("/"))
 }
 
 /// Tokens no escape contains: a byte that is escaped, lower-case hex, an escape of a kept byte, a cut escape, a
@@ -271,14 +319,50 @@ fn file_names_follow_the_view() {
         partial_file_name(View::Current, TimeRange::new(Timestamp(-5), Timestamp(7))).unwrap(),
         "current.partial--5_7.parquet"
     );
-    assert_eq!(
-        partition_dir(
-            "site-1",
+}
+
+#[test]
+fn a_partition_folder_splits_the_name_into_area_device_and_metric_each_escaped_alone() {
+    let feb = Month::of(ts("2026-02-01T00:00:00Z"));
+    for (name, dir) in [
+        (
             "plant/line-1/power",
-            Month::of(ts("2026-02-01T00:00:00Z"))
+            "site=site-1/area=plant/device=line-1/metric=power/month=2026-02",
         ),
-        "site=site-1/series=plant%2Fline-1%2Fpower/month=2026-02"
-    );
+        (
+            "Hall A/Pump.2/flow %",
+            "site=site-1/area=%48all%20%41/device=%50ump%2E2/metric=flow%20%25/month=2026-02",
+        ),
+        (
+            "0042/å/=",
+            "site=site-1/area=0042/device=%C3%A5/metric=%3D/month=2026-02",
+        ),
+        (
+            " / / ",
+            "site=site-1/area=%20/device=%20/metric=%20/month=2026-02",
+        ),
+    ] {
+        assert_eq!(partition_dir("site-1", name, feb).unwrap(), dir, "{name:?}");
+    }
+}
+
+#[test]
+fn a_name_without_exactly_three_non_empty_segments_has_no_partition_folder() {
+    let feb = Month::of(ts("2026-02-01T00:00:00Z"));
+    assert_eq!(name_segments("a/b/c"), Some(["a", "b", "c"]));
+    for bad in [
+        "", "a", "a/b", "a/b/c/d", "a/b/c/", "/a/b/c", "/b/c", "a//c", "a/b/", "//", "///",
+        "a/b//c",
+    ] {
+        assert_eq!(name_segments(bad), None, "{bad:?}");
+        assert!(
+            matches!(
+                partition_dir("s", bad, feb),
+                Err(ExportError::UnsupportedSeries { .. })
+            ),
+            "{bad:?}"
+        );
+    }
 }
 
 /// Files written to memory by path.
@@ -357,7 +441,7 @@ fn a_partitioned_export_writes_one_file_per_utc_month_with_facts_on_both_backend
         let hex: String = r.store_id().iter().map(|b| format!("{b:02x}")).collect();
         let options = ExportOptions::default().site("site-1");
         let files = partitioned(&r, id, &options).unwrap();
-        let dir = "site=site-1/series=plant%2Fline-1%2F%50ower";
+        let dir = "site=site-1/area=plant/device=line-1/metric=%50ower";
         assert_eq!(
             files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
             vec![
@@ -478,7 +562,9 @@ fn a_partitioned_export_as_of_a_point_writes_only_the_months_with_a_fact_then_on
             let name = file_name(view).unwrap();
             assert_eq!(
                 files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
-                vec![format!("site=s/series=a%2Fb%2Fc/month=2026-01/{name}")],
+                vec![format!(
+                    "site=s/area=a/device=b/metric=c/month=2026-01/{name}"
+                )],
                 "{backend:?} {view:?}"
             );
             assert_eq!(read_back(&files[0].1).len(), 1);
@@ -545,7 +631,7 @@ fn a_partitioned_export_needs_a_valid_site_and_reports_a_file_it_cannot_open() {
     )
     .unwrap_err();
     assert!(
-        matches!(&err, ExportError::Open { path, .. } if path == "site=s/series=a%2Fb%2Fc/month=2026-01/current.parquet"),
+        matches!(&err, ExportError::Open { path, .. } if path == "site=s/area=a/device=b/metric=c/month=2026-01/current.parquet"),
         "{err}"
     );
     block_on(store.emit(&[Reading::new(
@@ -595,4 +681,66 @@ fn a_partitioned_export_needs_a_valid_site_and_reports_a_file_it_cannot_open() {
     )
     .unwrap();
     assert!(none.is_empty());
+}
+
+#[test]
+fn a_partitioned_export_refuses_a_name_without_three_non_empty_segments_and_opens_nothing_on_both_backends()
+ {
+    for backend in BACKENDS {
+        let (store, _clock) = store_on(backend, "partitioned-shape");
+        for name in [
+            "power",
+            "line-1/power",
+            "plant/line-1/power/peak",
+            "plant//power",
+            "plant/line-1/",
+        ] {
+            let spec = SeriesSpec::new(
+                name,
+                Kind::Gauge {
+                    value: ValueType::F64,
+                },
+                "W",
+            );
+            let id = block_on(store.define_series(spec)).unwrap();
+            block_on(store.emit(&[Reading::new(
+                id,
+                ts("2026-01-05T12:00:00Z"),
+                Value::F64(1.0),
+            )]))
+            .unwrap();
+            let r = store.reader();
+            let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = opened.clone();
+            let err = export_partitioned(
+                &r,
+                id,
+                &ExportOptions::default().site("s"),
+                move |path: &str| -> io::Result<Vec<u8>> {
+                    seen.lock().unwrap().push(path.to_string());
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ExportError::UnsupportedSeries { .. }),
+                "{backend:?} {name:?}: {err}"
+            );
+            assert!(
+                err.to_string().contains("three non-empty segments"),
+                "{err}"
+            );
+            assert!(opened.lock().unwrap().is_empty(), "{backend:?} {name:?}");
+            let none = ExportOptions::default()
+                .site("s")
+                .range(Timestamp(0)..Timestamp(1));
+            assert!(
+                matches!(
+                    partitioned(&r, id, &none),
+                    Err(ExportError::UnsupportedSeries { .. })
+                ),
+                "{backend:?} {name:?}"
+            );
+        }
+    }
 }

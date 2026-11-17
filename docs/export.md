@@ -9,8 +9,9 @@ against it. Parquet is the export format only (`design.md`); stored files keep t
 
 Every file carries `kvik.export_version` = `1`. Adding a column or a metadata key is not a breaking change and keeps
 the version, so a reader should ignore columns and keys it does not know. Renaming, retyping or removing a column or
-a metadata key raises the version. No file column may be named `site`, `series` or `month`: Hive-style readers of the
-partitioned layout add columns of those names.
+a metadata key raises the version. No file column may be named `site`, `area`, `device`, `metric`, `series` or
+`month`: Hive-style readers of the partitioned layout add columns of those names (`series` is kept from the layout's
+first form).
 
 ## Scope
 
@@ -59,20 +60,27 @@ would remove it at some cost in size; every common Parquet reader reads all thre
 For consolidating many sites' exports in one bucket, `export_partitioned` writes, under a site label it requires,
 
 ```text
-site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet                          a whole month
-site=<site>/series=<series>/month=<YYYY-MM>/<view>.partial-<from_ns>_<to_ns>.parquet   a month clipped by range
+site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet                          a whole month
+site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.partial-<from_ns>_<to_ns>.parquet   a month clipped by range
 ```
+
+where `<s1>/<s2>/<s3>` is the series' display name split at its two `/` (the owner's amendment of Q-196,
+2026-11-17), so a cloud engine can prune by area, device or metric.
 
 - `<site>` is the site label as given; `check_site` refuses any other byte, so the folder is the same on every file
   system and bucket, whether or not it folds case, and its first letter keeps a reader from taking it for a number.
-- `<series>` is the series' display name, escaped: bytes `a`–`z`, `0`–`9`, `-` and `_` are kept and every other byte,
-  upper-case letters, `/`, `.` and `%` included, is written as `%XX` in upper-case hex (`escape_segment`). The
-  escape is reversible (`unescape_segment`), one name has exactly one segment, and two names never share a folder
-  even where case is folded. DuckDB, pyarrow and polars decode it back to the name, non-ASCII names included; Hive
-  and Spark were not checked, and may decode a multi-byte character one byte at a time (`kvik.series_name` in the
-  footer is exact either way). A name's segment is up to three times its length, so a long name can exceed a local
-  file system's 255-byte limit on a file name; and a renamed series is filed under its new name from then on,
-  earlier months exported again included, with `kvik.series_id` tying the two (Q-761).
+- A series name has three non-empty segments (Q-670; `name_segments`). Until definition and alias enforce that,
+  `export_partitioned` refuses a series whose name has fewer or more, or an empty one, before reading anything:
+  `UnsupportedSeries`, and `open` is never called.
+- `<s1>`, `<s2>` and `<s3>` are the segments, each escaped on its own: bytes `a`–`z`, `0`–`9`, `-` and `_` are kept
+  and every other byte, upper-case letters, `.` and `%` included, is written as `%XX` in upper-case hex
+  (`escape_segment`); a segment never holds `/`. The escape is reversible (`unescape_segment`), one segment has
+  exactly one escaped form, and two names never share a folder even where case is folded. DuckDB, pyarrow and polars
+  decode it back to the segment, non-ASCII included; Hive and Spark were not checked, and may decode a multi-byte
+  character one byte at a time (`kvik.series_name` in the footer is exact either way). An escaped segment is up to
+  three times its length, so a long segment can exceed a local file system's 255-byte limit on a file name; and a
+  renamed series is filed under its new name from then on, earlier months exported again included, with
+  `kvik.series_id` tying the two (Q-761).
 - `<YYYY-MM>` is the UTC month of `t`, for every series: `t` is UTC, so the cut needs no tzdata and is the same in
   every release and every site's zone, and months line up across sites. An interval is filed under the month of its
   start.
@@ -88,14 +96,24 @@ site=<site>/series=<series>/month=<YYYY-MM>/<view>.partial-<from_ns>_<to_ns>.par
   relative path, in month order.
 
 Reading the bucket: a query reads one file name, here the whole months of the current view, since a folder can also
-hold other views and partial months whose rows would be counted again. Hive-style readers add `site`, `series` and
-`month` columns and guess their types, so an all-digit escaped series name such as `0042` is read as the number 42.
-Declare the three as strings:
+hold other views and partial months whose rows would be counted again. Hive-style readers add `site`, `area`,
+`device`, `metric` and `month` columns and guess their types, so an all-digit segment such as `0042` is read as the
+number 42 and `month` as a date. Declare all five as strings:
 
 ```text
-DuckDB:  read_parquet('<root>/**/current.parquet', hive_partitioning = true, hive_types = {'site': VARCHAR, 'series': VARCHAR, 'month': VARCHAR})
-pyarrow: pyarrow.dataset.dataset(glob.glob(root + "/**/current.parquet", recursive=True), format="parquet", partitioning=pyarrow.dataset.partitioning(pyarrow.schema([("site", pyarrow.string()), ("series", pyarrow.string()), ("month", pyarrow.string())]), flavor="hive"), partition_base_dir=root)
-polars:  polars.scan_parquet(root + "/**/current.parquet", hive_partitioning=True, hive_schema={"site": polars.String, "series": polars.String, "month": polars.String})
+DuckDB:  read_parquet('<root>/**/current.parquet', hive_partitioning = true, hive_types = {'site': VARCHAR, 'area': VARCHAR, 'device': VARCHAR, 'metric': VARCHAR, 'month': VARCHAR})
+pyarrow: pyarrow.dataset.dataset(glob.glob(root + "/**/current.parquet", recursive=True), format="parquet", partitioning=pyarrow.dataset.partitioning(pyarrow.schema([(k, pyarrow.string()) for k in ("site", "area", "device", "metric", "month")]), flavor="hive"), partition_base_dir=root)
+polars:  polars.scan_parquet(root + "/**/current.parquet", hive_partitioning=True, hive_schema={k: polars.String for k in ("site", "area", "device", "metric", "month")})
+```
+
+A filter on a partition column prunes the folders read: one device across all its metrics, or one metric across
+every device, here with the decoded segment values:
+
+```text
+DuckDB:  SELECT * FROM read_parquet(...) WHERE device = 'line-1'
+         SELECT device, t, value FROM read_parquet(...) WHERE metric = 'power'
+pyarrow: dataset.to_table(filter=pyarrow.compute.field("device") == "line-1")
+polars:  lazy.filter(polars.col("metric") == "power").collect()
 ```
 
 Consistency and cost: one pass over `range` finds the months, then each month is read and written on its own. Each
@@ -183,6 +201,7 @@ so only rows given to `export_rows` can); a decimal stored above the column's sc
 rescaling; `changed_at` missing on a versioned series or present on another; a `changed_at` of kind `time` above
 `i64::MAX` (ingest refuses one, Q-195, so only rows given to `export_rows` or a log that holds one can, Q-760); an
 interval end beyond the timestamp range; a fact of another series; a series kind the schema does not cover, or a
-decimal scale above 18 (`UnsupportedSeries`). A site label outside its alphabet, a partitioned export without one, or
+decimal scale above 18, or, in a partitioned export, a series name without three non-empty segments
+(`UnsupportedSeries`). A site label outside its alphabet, a partitioned export without one, or
 a store id other than the reader's is `InvalidOptions`; a file the partitioned export cannot open is `Open`, with its
 path.

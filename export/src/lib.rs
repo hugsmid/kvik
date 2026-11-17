@@ -5,7 +5,7 @@
 //! at most the open row group ([`ExportOptions::row_group_rows`]) plus one batch ([`ExportOptions::batch_rows`]),
 //! whatever the number of facts; the bound holds end to end once `Reader::facts` streams (today both backends
 //! gather the range first). [`export_partitioned`] writes one file per UTC month in the layout
-//! `site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet`. [`read_rows`] reads a file back into
+//! `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet`. [`read_rows`] reads a file back into
 //! [`ExportRow`]s.
 //!
 //! ```
@@ -50,8 +50,8 @@ use parquet::schema::types::ColumnPath;
 pub use batch::QUALITY_NAMES;
 pub use error::ExportError;
 pub use layout::{
-    MAX_SITE_LEN, Month, check_site, escape_segment, file_name, partial_file_name, partition_dir,
-    unescape_segment,
+    MAX_SITE_LEN, Month, check_site, escape_segment, file_name, name_segments, partial_file_name,
+    partition_dir, unescape_segment,
 };
 pub use read::{ExportReader, read_rows};
 pub use row::{ExportRow, Flags};
@@ -201,8 +201,9 @@ pub struct PartitionFile {
 }
 
 /// Exports one series' facts in `options.range` and `options.view`, one file per UTC month that holds a fact, at
-/// `site=<site>/series=<series>/month=<YYYY-MM>/<view>.parquet` (`docs/export.md` Partitioned layout, Q-196).
-/// `open` is given each file's relative path in month order; `options.site` is required. Each month is read on
+/// `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet` (`docs/export.md` Partitioned
+/// layout, Q-196). `open` is given each file's relative path in month order; `options.site` is required, and a
+/// series name without three non-empty segments is refused before anything is read (Q-670). Each month is read on
 /// its own, after one pass over the range that finds the months.
 pub fn export_partitioned<W, F>(
     reader: &Reader,
@@ -221,6 +222,7 @@ where
     let name = file_name(options.view)?;
     let series = reader.series(id)?;
     SeriesSchema::from_info(&series)?;
+    layout::checked_segments(&series.name)?;
     let mut months = std::collections::BTreeSet::new();
     for f in reader.facts(id, options.range, options.view)? {
         months.insert(Month::of(f?.t));
@@ -229,7 +231,7 @@ where
     for month in months {
         let m = month.range();
         let range = TimeRange::new(m.from.max(options.range.from), m.to.min(options.range.to));
-        let dir = partition_dir(site, &series.name, month);
+        let dir = partition_dir(site, &series.name, month)?;
         let path = if range == m {
             format!("{dir}/{name}")
         } else {
