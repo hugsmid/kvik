@@ -796,4 +796,35 @@ mod parts_and_lookup {
         assert_eq!(a.events, b.events);
         assert_eq!(a.state.durable, b.state.durable);
     }
+
+    #[test]
+    fn a_later_lookup_allocates_only_the_batches_it_reads_and_those_appended() {
+        let (fs, log) = store(30);
+        // A key of the open segment's last batch.
+        let wanted = [Wanted {
+            series_id: 7,
+            from: 29,
+            to: 29,
+        }];
+        let mut r = reader(&fs, 50);
+        let first = r.lookup(&wanted, &|_, _, _| false).unwrap();
+        assert_eq!((first.complete.as_slice(), first.facts.len()), (&[true][..], 1));
+        let segment = |r: &LogReader| r.read_mark().unwrap().offset;
+        log.submit((0..20).map(|i| fact(i, 30, 30)).collect())
+            .unwrap()
+            .wait()
+            .unwrap();
+        lookup::BUFFER_BYTES.with(|c| c.set(0));
+        let again = r.lookup(&wanted, &|_, _, _| false).unwrap();
+        let allocated = lookup::BUFFER_BYTES.with(|c| c.get());
+        assert_eq!(again.facts, first.facts);
+        // The batch holding the key and the one appended, not the segment up to the mark.
+        let offset = segment(&r);
+        assert!(allocated < offset, "{allocated} bytes for a segment of {offset}");
+        lookup::BUFFER_BYTES.with(|c| c.set(0));
+        let third = r.lookup(&wanted, &|_, _, _| false).unwrap();
+        assert_eq!(third.facts, first.facts);
+        assert!(lookup::BUFFER_BYTES.with(|c| c.get()) < offset / 2);
+        log.shutdown().unwrap();
+    }
 }

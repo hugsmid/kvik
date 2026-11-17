@@ -111,7 +111,26 @@ pub(crate) fn read_batch<'a>(
     refusal: Refusal,
     keep: bool,
 ) -> BatchRead<'a> {
+    read_batch_in(bytes, 0, id, o, limit, min_first, refusal, keep)
+}
+
+/// [`read_batch`] on `bytes` holding the file from offset `base`: offsets and limits are the file's; the blocks of
+/// the batch returned carry offsets into `bytes`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_batch_in<'a>(
+    bytes: &'a [u8],
+    base: u64,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+    refusal: Refusal,
+    keep: bool,
+) -> BatchRead<'a> {
     let incomplete = |fault| BatchRead::Incomplete { fault };
+    let (Some(rel), Some(limit)) = (o.checked_sub(base), limit.checked_sub(base)) else {
+        return incomplete(BatchFault::Block(BlockFault::Header));
+    };
     let mut crc = Crc32c::new();
     crc.update(&id.store_id);
     crc.update(&id.file_id.to_le_bytes());
@@ -120,14 +139,14 @@ pub(crate) fn read_batch<'a>(
     let mut unknown_critical = None;
     let mut recovery = false;
     let mut bodies = Vec::new();
-    let mut pos = o;
+    let mut pos = rel;
     let commit_block = loop {
         // Sizes are judged on the header, before the body is checksummed: a data block that would take the batch
         // past 8 MiB, or a commit block of another length, ends the batch here.
         if let Some(h) = peek_header(bytes, pos, limit) {
             let too_long = match h.block_type {
                 block_type::COMMIT => h.body_len as usize != COMMIT_LEN,
-                _ => pos - o + h.block_len() > MAX_BATCH_DATA,
+                _ => pos - rel + h.block_len() > MAX_BATCH_DATA,
             };
             if too_long {
                 let fault = if h.block_type == block_type::COMMIT {
@@ -155,7 +174,7 @@ pub(crate) fn read_batch<'a>(
                 }
                 Err(BodyError::Unsupported(element)) => {
                     let refused = FormatError::Unsupported {
-                        offset: pos,
+                        offset: base + pos,
                         element,
                     };
                     if refusal == Refusal::AtOnce {
@@ -173,7 +192,7 @@ pub(crate) fn read_batch<'a>(
             _ if b.header.skippable() => None,
             _ => {
                 let refused = FormatError::Unsupported {
-                    offset: pos,
+                    offset: base + pos,
                     element: Element::BlockType(t),
                 };
                 if refusal == Refusal::AtOnce {
@@ -193,7 +212,7 @@ pub(crate) fn read_batch<'a>(
     };
     let framing_holds = !blocks.is_empty()
         && commit.block_count as usize == blocks.len()
-        && commit.batch_bytes == commit_block.offset - o
+        && commit.batch_bytes == commit_block.offset - rel
         && commit.generation == id.generation
         && commit.batch_crc32c == crc.finish();
     if !framing_holds {

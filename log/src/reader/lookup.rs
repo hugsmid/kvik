@@ -9,13 +9,14 @@
 //!
 //! Memory: sealed segments' indexes and the maps of segments' batches are kept least recently used within
 //! [`LOOKUP_CACHE_BYTES`], also during one lookup; a segment is read a part of [`PIECE`] bytes at a time (more only
-//! for a batch longer than that), and batches read again touch at most about a part before their buffer is freed.
+//! for a batch longer than that), and each batch read again, or appended since, is read into a buffer of its own
+//! length.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::files::read_at_full;
 use super::{LogReader, ReaderError};
-use crate::batch::SegmentIdentity;
+use crate::batch::{BatchRead, Refusal, SegmentIdentity, read_batch_in};
 use crate::block::{BLOCK_HEADER_LEN, block_type, read_block};
 use crate::body::{
     END_MARKER_LEN, IndexRecord, SegmentIndex, TRAILER_LEN, Trailer, decode_end_marker,
@@ -24,7 +25,7 @@ use crate::content::{BatchContent, Item};
 use crate::facts::FactRow;
 use crate::header::HEADER_LEN;
 use crate::name::SegmentName;
-use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner};
+use crate::scan::{Found, HeaderState, InvalidRegion, Resume, ScanLimit, Scanner, read_header};
 use crate::writer::Position;
 
 /// One series' facts wanted with event time from `from` to `to`, both inclusive.
@@ -249,10 +250,22 @@ impl Caches {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes of the buffers lookups on this thread allocated to read segments.
+    pub(super) static BUFFER_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn buffer(len: usize) -> Vec<u8> {
+    #[cfg(test)]
+    BUFFER_BYTES.with(|c| c.set(c.get() + len as u64));
+    vec![0u8; len]
+}
+
 /// A buffer of `len` bytes, zeroed lazily by the allocator, holding the segment's header and the bytes from `from` to
 /// `to` at their file offsets, as the scanner reads them; only those bytes are touched.
 fn part(f: &dyn crate::fs::FsFile, len: u64, from: u64, to: u64) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; usize::try_from(len).ok()?];
+    let mut buf = buffer(usize::try_from(len).ok()?);
     let head = buf.len().min(HEADER_LEN);
     read_at_full(f, &mut buf[..head], 0).ok()?;
     let (a, z) = (usize::try_from(from).ok()?, usize::try_from(to).ok()?);
@@ -263,40 +276,27 @@ fn part(f: &dyn crate::fs::FsFile, len: u64, from: u64, to: u64) -> Option<Vec<u
     Some(buf)
 }
 
-/// The batch at `s`, read into `buf` (the segment's header in place, zeroed lazily elsewhere) and checked again
-/// alone; `None` if it no longer reads as the same complete batch.
-fn read_batch_at(
-    f: &dyn crate::fs::FsFile,
-    id: &SegmentIdentity,
-    s: &Span,
-    buf: &mut [u8],
-) -> Option<BatchContent> {
-    let (a, z) = (
-        usize::try_from(s.offset).ok()?,
-        usize::try_from(s.end).ok()?,
-    );
-    let got = read_at_full(f, buf.get_mut(a..z)?, s.offset).ok()?;
-    if got != z - a {
+/// The batch at `s`, read into a buffer of its own length and checked again alone; `None` if it no longer reads as
+/// the same complete batch.
+fn read_batch_at(f: &dyn crate::fs::FsFile, id: &SegmentIdentity, s: &Span) -> Option<BatchContent> {
+    let mut buf = buffer(usize::try_from(s.end - s.offset).ok()?);
+    if read_at_full(f, &mut buf, s.offset).ok()? != buf.len() {
         return None;
     }
-    let buf = &buf[..z];
-    let from = Resume {
-        offset: s.offset,
-        last_sequence: Some(s.first.saturating_sub(1)),
-    };
-    let mut scanner = Scanner::resume(buf, id, ScanLimit::Mark(s.end), from)
-        .ok()?
-        .keeping_content();
-    match scanner.next()? {
-        Ok(Found::Batch(b))
-            if b.offset == s.offset && b.end() == s.end && b.commit.first_sequence == s.first =>
-        {
-            scanner
-                .take_content()
-                .or_else(|| BatchContent::decode(&b).ok())
+    match read_batch_in(&buf, s.offset, id, s.offset, s.end, s.first, Refusal::AtOnce, true) {
+        BatchRead::Complete(b, bodies) if b.end() == s.end && b.commit.first_sequence == s.first => {
+            BatchContent::from_bodies(s.first, bodies).ok()
         }
         _ => None,
     }
+}
+
+/// The segment's header as a scan reads it: `None` if it refuses the segment.
+fn header(f: &dyn crate::fs::FsFile, id: &SegmentIdentity) -> Option<HeaderState> {
+    let mut h = vec![0u8; HEADER_LEN];
+    let got = read_at_full(f, &mut h, 0).ok()?;
+    h.truncate(got);
+    read_header(&h, id).ok()
 }
 
 /// What one segment's read is for: the wanted ranges by series, the mark, and the regions taken as lost.
@@ -472,34 +472,15 @@ impl LogReader {
         if map.recovery || map.resume.is_some_and(|r| r.offset > len) {
             map = SegmentMap::default();
         }
-        let mut stale = false;
-        // One buffer for the batches read again, touched only where they lie, allocated afresh once a part's worth
-        // of it has been touched.
-        let mut again: Option<Vec<u8>> = None;
-        let mut touched = 0;
-        let piece = self.caches.piece;
-        for s in map.batches.iter().filter(|s| query.may_hold(s)) {
-            if s.generation == query.generation && s.last > query.last_sequence {
+        let mut wanted = map.batches.iter().filter(|s| query.may_hold(s)).peekable();
+        let mut stale = wanted.peek().is_some() && header(&*f, &id).is_none();
+        for s in wanted {
+            if stale || (s.generation == query.generation && s.last > query.last_sequence) {
                 break;
             }
-            if touched > piece {
-                again = None;
-            }
-            if again.is_none() {
-                again = part(&*f, len, 0, 0);
-                touched = 0;
-            }
-            touched += s.end - s.offset;
-            let Some(buf) = again.as_mut() else {
-                stale = true;
-                break;
-            };
-            match read_batch_at(&*f, &id, s, buf) {
+            match read_batch_at(&*f, &id, s) {
                 Some(content) => query.take(content, s.generation, s.first, facts),
-                None => {
-                    stale = true;
-                    break;
-                }
+                None => stale = true,
             }
         }
         if stale {
@@ -586,6 +567,10 @@ fn scan_new(
         last_sequence: None,
     });
     let mut piece = part_bytes;
+    // Every part's scan reads the header first and refuses the segment on it; complete batches up to the mark are
+    // then read into a buffer of their own length, and only what is not one is scanned in a buffer from the file's
+    // start.
+    let header = header(f, id)?;
     loop {
         let to = from
             .offset
@@ -596,6 +581,31 @@ fn scan_new(
         if !last && from.offset >= to {
             return Some(());
         }
+        let lim = if last { limit } else { ScanLimit::Mark(to) };
+        if let ScanLimit::Mark(m) = lim
+            && from.offset <= m
+        {
+            match take_complete(f, id, header, from, m, query, map, first, facts)? {
+                Taken::Stopped => return Some(()),
+                Taken::To(p) if p.offset == m => {
+                    from = p;
+                    if last {
+                        map.resume = Some(from);
+                        return Some(());
+                    }
+                    piece = part_bytes;
+                    continue;
+                }
+                Taken::To(p) => from = p,
+            }
+        }
+        let to = from
+            .offset
+            .saturating_add(piece)
+            .next_multiple_of(8)
+            .min(len)
+            .max(to);
+        let last = to >= len;
         let lim = if last { limit } else { ScanLimit::Mark(to) };
         let buf = part(
             f,
@@ -621,59 +631,15 @@ fn scan_new(
                 map.regions.push((r.start, r.end));
                 map.resume = Some(at);
             }
-            let b = match x {
-                Found::Region(r) => {
-                    held = Some((r, after));
-                    continue;
+            match x {
+                Found::Region(r) => held = Some((r, after)),
+                Found::Batch(b) => {
+                    let kept = scanner.take_content();
+                    if take_found(&b, kept, before, after, query, map, first, facts) {
+                        return Some(());
+                    }
                 }
-                Found::Batch(b) => b,
-            };
-            let g = b.commit.generation;
-            if g == query.generation && b.commit.last_sequence > query.last_sequence {
-                map.resume = Some(before);
-                return Some(());
             }
-            let kept = scanner.take_content();
-            let Some(content) = kept.or_else(|| BatchContent::decode(&b).ok()) else {
-                // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region, so
-                // that every later lookup of the segment is incomplete too.
-                map.regions.push((b.offset, b.end()));
-                map.resume = Some(after);
-                continue;
-            };
-            let (min_t, max_t) = content
-                .items
-                .iter()
-                .filter_map(|i| match i {
-                    Item::Fact(r) => Some(r.t),
-                    _ => None,
-                })
-                .fold((i64::MAX, i64::MIN), |(a, z), t| (a.min(t), z.max(t)));
-            map.batches.push(Span {
-                offset: b.offset,
-                end: b.end(),
-                generation: g,
-                first: b.commit.first_sequence,
-                last: b.commit.last_sequence,
-                min_t,
-                max_t,
-            });
-            if let [Item::Entry(e)] = content.items.as_slice()
-                && let crate::entries::Entry::Recovery(r) = &**e
-            {
-                map.recovery = true;
-                let after = Position {
-                    generation: g,
-                    sequence: r.after,
-                };
-                let mut j = 0;
-                facts.retain(|x| {
-                    j += 1;
-                    j <= first || x.position <= after
-                });
-            }
-            query.take(content, g, b.commit.first_sequence, facts);
-            map.resume = Some(after);
         }
         let end = scanner.resume_point();
         let cut = !last && held.as_ref().is_some_and(|(r, _)| r.end == to);
@@ -692,4 +658,121 @@ fn scan_new(
         from = map.resume.unwrap_or(from);
         piece = part_bytes;
     }
+}
+
+/// How far [`take_complete`] took the batches it read.
+enum Taken {
+    /// Up to this point: the limit, or the start of what is not a complete batch.
+    To(Resume),
+    /// At a batch above the mark's last position.
+    Stopped,
+}
+
+/// Takes the complete batches from `from` up to `limit` as a scan to the mark would, each read into a buffer of its own
+/// length; `None` on a refusal.
+#[allow(clippy::too_many_arguments)]
+fn take_complete(
+    f: &dyn crate::fs::FsFile,
+    id: &SegmentIdentity,
+    header: HeaderState,
+    mut from: Resume,
+    limit: u64,
+    query: &Query<'_>,
+    map: &mut SegmentMap,
+    first: usize,
+    facts: &mut Vec<FoundFact>,
+) -> Option<Taken> {
+    let mut buf = buffer(usize::try_from(limit - from.offset).ok()?);
+    let got = read_at_full(f, &mut buf, from.offset).ok()?;
+    buf[got..].fill(0);
+    let base = from.offset;
+    let header_first = match header {
+        HeaderState::Valid(h) => h.base_sequence,
+        HeaderState::Invalid => 0,
+    };
+    while from.offset < limit {
+        let min_first = from
+            .last_sequence
+            .map_or(header_first, |l| l.saturating_add(1));
+        let (b, bodies) =
+            match read_batch_in(&buf, base, id, from.offset, limit, min_first, Refusal::AtOnce, true) {
+                BatchRead::Complete(b, bodies) => (b, bodies),
+                BatchRead::Refused(_) => return None,
+                BatchRead::Incomplete { .. } => break,
+            };
+        let after = Resume {
+            offset: b.end(),
+            last_sequence: Some(b.commit.last_sequence),
+        };
+        let content = BatchContent::from_bodies(b.commit.first_sequence, bodies).ok();
+        if take_found(&b, content, from, after, query, map, first, facts) {
+            return Some(Taken::Stopped);
+        }
+        from = after;
+    }
+    Some(Taken::To(from))
+}
+
+/// Drops the facts this segment's read took, from index `first` of `facts`, above a recovery entry's `after`.
+fn void_above(facts: &mut Vec<FoundFact>, first: usize, after: Position) {
+    let mut j = 0;
+    facts.retain(|x| {
+        j += 1;
+        j <= first || x.position <= after
+    });
+}
+
+/// Takes a complete batch a scan found into the map and the wanted facts; returns whether the scan stops at it, being
+/// above the mark's last position.
+#[allow(clippy::too_many_arguments)]
+fn take_found(
+    b: &crate::batch::Batch<'_>,
+    kept: Option<BatchContent>,
+    before: Resume,
+    after: Resume,
+    query: &Query<'_>,
+    map: &mut SegmentMap,
+    first: usize,
+    facts: &mut Vec<FoundFact>,
+) -> bool {
+    let g = b.commit.generation;
+    if g == query.generation && b.commit.last_sequence > query.last_sequence {
+        map.resume = Some(before);
+        return true;
+    }
+    let Some(content) = kept.or_else(|| BatchContent::decode(b).ok()) else {
+        // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region, so that every
+        // later lookup of the segment is incomplete too.
+        map.regions.push((b.offset, b.end()));
+        map.resume = Some(after);
+        return false;
+    };
+    let (min_t, max_t) = content
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fact(r) => Some(r.t),
+            _ => None,
+        })
+        .fold((i64::MAX, i64::MIN), |(a, z), t| (a.min(t), z.max(t)));
+    map.batches.push(Span {
+        offset: b.offset,
+        end: b.end(),
+        generation: g,
+        first: b.commit.first_sequence,
+        last: b.commit.last_sequence,
+        min_t,
+        max_t,
+    });
+    if let Some(r) = content.recovery() {
+        let after = Position {
+            generation: g,
+            sequence: r.after,
+        };
+        map.recovery = true;
+        void_above(facts, first, after);
+    }
+    query.take(content, g, b.commit.first_sequence, facts);
+    map.resume = Some(after);
+    false
 }

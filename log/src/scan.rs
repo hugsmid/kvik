@@ -571,7 +571,10 @@ impl<'a> Iterator for Scanner<'a> {
     }
 }
 
-fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, FormatError> {
+pub(crate) fn read_header(
+    bytes: &[u8],
+    id: &SegmentIdentity,
+) -> Result<HeaderState, FormatError> {
     let Some(h) = FileHeader::decode(bytes) else {
         return Ok(HeaderState::Invalid);
     };
