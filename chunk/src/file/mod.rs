@@ -124,3 +124,40 @@ pub const INDEX_BLOCK_ENTRIES: usize = 1024;
 pub const MAX_INPUTS: usize = 1024;
 /// Rows in every commit-times block of a generation but its last.
 pub const TIMES_ROWS: usize = crate::MAX_ROWS;
+
+/// Feeds `data` to every body decoder of B.1 and B.2; whatever decodes must encode and decode again to itself.
+pub(crate) fn fuzz_bodies(data: &[u8]) {
+    if let Ok(d) = desc::Description::decode(data) {
+        assert_eq!(desc::Description::decode(&d.encode()), Ok(d));
+    }
+    if let Ok(d) = parts::Directory::decode(data) {
+        assert_eq!(parts::Directory::decode(&d.encode()), Ok(d));
+    }
+    if let Ok(e) = parts::decode_index_block(data) {
+        assert_eq!(
+            parts::decode_index_block(&parts::encode_index_block(&e)),
+            Ok(e)
+        );
+    }
+    if let Ok(r) = parts::decode_root(data) {
+        assert_eq!(parts::decode_root(&parts::encode_root(&r)), Ok(r));
+    }
+    if let Ok(r) = parts::decode_times_directory(data) {
+        assert_eq!(
+            parts::decode_times_directory(&parts::encode_times_directory(&r)),
+            Ok(r)
+        );
+    }
+    if let Ok(t) = parts::Trailer::decode(data) {
+        assert_eq!(parts::Trailer::decode(&t.encode()), Ok(t));
+    }
+    if let Ok(t) = parts::IndexTrailer::decode(data) {
+        assert_eq!(parts::IndexTrailer::decode(&t.encode()), Ok(t));
+    }
+    if let Ok((g, rows)) = times::decode_times(data) {
+        assert_eq!(
+            times::decode_times(&times::encode_times(g, &rows, None)),
+            Ok((g, rows))
+        );
+    }
+}

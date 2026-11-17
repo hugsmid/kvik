@@ -22,3 +22,24 @@ path = "fuzz_targets/block.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "compacted"
+path = "fuzz_targets/compacted.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_index"
+path = "fuzz_targets/chunk_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_bodies"
+path = "fuzz_targets/file_bodies.rs"
+test = false
+doc = false
+bench = false
