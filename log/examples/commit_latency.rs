@@ -384,6 +384,14 @@ fn loads(short: bool) -> Vec<(Load, u64)> {
         (
             Load::Paced {
                 writers: 16,
+                per_sec: 50,
+                readings: 10,
+            },
+            d(20, 5),
+        ),
+        (
+            Load::Paced {
+                writers: 16,
                 per_sec: 200,
                 readings: 10,
             },
@@ -417,7 +425,7 @@ struct Setup {
 }
 
 impl Setup {
-    const ALL: [Setup; 4] = [
+    const ALL: [Setup; 5] = [
         Setup {
             min_sync: Duration::ZERO,
             floor: Duration::ZERO,
@@ -431,6 +439,11 @@ impl Setup {
         Setup {
             min_sync: Duration::from_millis(10),
             floor: Duration::from_millis(2),
+            every_commit: false,
+        },
+        Setup {
+            min_sync: Duration::from_millis(10),
+            floor: Duration::ZERO,
             every_commit: false,
         },
         Setup {
