@@ -543,6 +543,22 @@ pub fn check_round_trip(c: &Content) -> Vec<u8> {
         }
     }
     assert_eq!(chunks, t.chunk_count as usize);
+    let mut in_file = file.index().unwrap();
+    in_file.sort_by_key(|e| e.chunk_offset);
+    let order = |e: &kvik_chunk::file::IndexEntry| {
+        let name = c.info(e.series_id).name;
+        (name.is_none(), name, e.series_id, e.min_t, e.first)
+    };
+    assert!(
+        in_file.windows(2).all(|w| order(&w[0]) < order(&w[1])),
+        "chunks in the order of B.1"
+    );
+    let trailer_at =
+        u64::from_le_bytes(bytes[bytes.len() - 16..bytes.len() - 8].try_into().unwrap());
+    assert_eq!(
+        kvik_log::crc::crc32c(&bytes[..trailer_at as usize]),
+        t.file_crc32c
+    );
     assert_eq!(file.index().unwrap().len(), chunks);
     let entries = file.entries().unwrap();
     let back: Vec<(Position, Entry)> = entries

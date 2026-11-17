@@ -63,6 +63,8 @@ mod index;
 mod layout;
 mod parts;
 mod read;
+#[doc(hidden)]
+pub mod reseal;
 mod source;
 mod stats;
 mod times;

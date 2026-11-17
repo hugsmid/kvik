@@ -315,6 +315,41 @@ fn a_file_that_disagrees_with_its_recorded_layout_is_refused_naming_the_field() 
     let cases: Vec<(Layout, &str)> = vec![
         (
             Layout {
+                generation: 2,
+                ..l.clone()
+            },
+            "generation",
+        ),
+        (
+            Layout {
+                file_id: 41,
+                ..l.clone()
+            },
+            "file_id",
+        ),
+        (
+            Layout {
+                class: kvik_chunk::file::Class::Revision,
+                ..l.clone()
+            },
+            "class",
+        ),
+        (
+            Layout {
+                positions: vec![(1, 1)],
+                ..l.clone()
+            },
+            "positions per generation",
+        ),
+        (
+            Layout {
+                complete: false,
+                ..l.clone()
+            },
+            "complete",
+        ),
+        (
+            Layout {
                 level: Level::Day,
                 ..l.clone()
             },
@@ -509,4 +544,109 @@ fn the_writer_refuses_a_file_named_as_its_own_input() {
     }];
     let r = kvik_chunk::file::FileWriter::new(Vec::new(), c.id, 0, &d, c.batches.clone());
     assert!(matches!(r, Err(kvik_chunk::file::WriteError::Content(_))));
+}
+
+#[test]
+fn resealing_an_unedited_file_changes_nothing() {
+    let bytes = sample(1).write().0;
+    assert_eq!(kvik_chunk::file::reseal::reseal_segment(&bytes), bytes);
+    let object = extract(&open(&bytes), [3; 32]).unwrap();
+    assert_eq!(
+        kvik_chunk::file::reseal::reseal_index_object(&object),
+        object
+    );
+}
+
+fn writes(c: &Content) -> Result<Vec<u8>, kvik_chunk::file::WriteError> {
+    let mut w = kvik_chunk::file::FileWriter::new(
+        Vec::new(),
+        c.id,
+        c.created_at,
+        &c.description,
+        c.batches.clone(),
+    )?;
+    for s in &c.series {
+        w.series(s.clone())?;
+    }
+    w.entries(&c.entries)?;
+    Ok(w.finish()?.0)
+}
+
+fn refused(c: &Content) -> &'static str {
+    match writes(c) {
+        Err(kvik_chunk::file::WriteError::Content(what)) => what,
+        other => panic!("{:?}", other.map(|b| b.len())),
+    }
+}
+
+#[test]
+fn the_writer_refuses_series_out_of_order_two_facts_of_a_key_and_flags_or_counts_that_disagree() {
+    let mut c = sample(1);
+    c.series.swap(0, 1);
+    assert_eq!(refused(&c), "series out of the order of B.1");
+    let mut c = sample(1);
+    let t = c.series[0].facts[0].t;
+    c.series[0].facts[1].t = t;
+    assert_eq!(refused(&c), "two facts of one key in a current file");
+    let mut c = set_aside_first();
+    c.description.has_set_aside = false;
+    assert_eq!(refused(&c), "description flags disagree with the content");
+    let mut c = sample(1);
+    c.description.positions[0].1 += 1;
+    c.description.positions[1].1 -= 1;
+    assert_eq!(
+        refused(&c),
+        "description positions per generation disagree with the content"
+    );
+    let mut c = sample(1);
+    c.batches[1].received_at = c.batches[0].received_at;
+    c.batches[1].commit_time = c.batches[0].commit_time - 1;
+    assert_eq!(
+        refused(&c),
+        "batches out of order, overlapping or with a negative lag"
+    );
+    let mut c = sample(1);
+    c.series[2].reach = kvik_chunk::file::Reach::Fixed(0);
+    assert_eq!(refused(&c), "an interval length of 0 or less");
+}
+
+/// A revision file whose series has a set-aside chunk with facts earlier than its other chunk.
+fn set_aside_first() -> Content {
+    let mut c = Content::new(kvik_chunk::file::Class::Revision);
+    c.batches = batches(1, 1, 8, 1);
+    let late = (0..4u64).map(|i| f64_fact(1, (1, 1 + i), T0 + 100 * SECOND + i as i64, 1.0));
+    let early = (0..4u64).map(|i| f64_fact(1, (1, 5 + i), T0 + i as i64, 2.0));
+    c.series = vec![kvik_chunk::file::Series {
+        series_id: 1,
+        name: Some("s/a".into()),
+        reach: kvik_chunk::file::Reach::Point,
+        facts: late.collect(),
+        set_aside: early.collect(),
+    }];
+    c.settle()
+}
+
+#[test]
+fn a_set_aside_chunk_with_earlier_facts_comes_first_in_its_series() {
+    let c = set_aside_first();
+    let bytes = check_round_trip(&c);
+    let mut index = open(&bytes).index().unwrap();
+    index.sort_by_key(|e| e.chunk_offset);
+    assert_eq!(
+        index.iter().map(|e| e.set_aside()).collect::<Vec<_>>(),
+        [true, false]
+    );
+}
+
+#[test]
+fn the_canonical_check_refuses_a_position_held_twice() {
+    let mut c = sample(1);
+    let p = c.series[0].facts[0].position;
+    c.series[1].facts[0].position = p;
+    let c = c.settle();
+    let bytes = writes(&c).unwrap();
+    assert!(matches!(
+        kvik_chunk::file::check_canonical(&bytes, &c.id, &|s| c.info(s)),
+        Err(kvik_chunk::file::CanonicalError::Positions)
+    ));
 }
