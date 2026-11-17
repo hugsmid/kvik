@@ -11,6 +11,8 @@ use kvik_files::restore::{RestoreRecord, RestoredFile};
 use kvik_log::manifest::RecordPosition;
 use kvik_log::mark::ResetStamp;
 
+use crate::uploaded::{UploadedRecord, opens_manifest};
+
 /// What a plan is for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -357,14 +359,90 @@ impl Gap {
 /// whose rebuilt manifest is whole in the list, its closing empty record (one without field 100) included, up to the
 /// next rebuild record; with no whole rebuilt manifest, the records before the first rebuild record that opens one.
 pub fn records_to_read(records: &[Record]) -> &[Record] {
-    let opens = |r: &Record| matches!(r.body, Body::Rebuild(_)) && r.old_epoch.is_none();
     let closes = |r: &Record| matches!(r.body, Body::Empty) && r.old_epoch.is_none();
     let mut end = records.len();
-    while let Some(i) = records[..end].iter().rposition(opens) {
+    while let Some(i) = records[..end].iter().rposition(opens_manifest) {
         if records[i + 1..end].iter().any(closes) {
             return &records[i..end];
         }
         end = i;
     }
     &records[..end]
+}
+
+/// Where listed records stop forming the chain their uploaded forms name (`format.md` A.17 Uploaded forms, Q-611).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChainBreak {
+    /// The record at `epoch` names `previous`, which lies between it and the record listed before it: the listing
+    /// does not show it, or the bucket no longer holds it.
+    Missing {
+        /// The record.
+        epoch: u64,
+        /// The epoch it names.
+        previous: u64,
+    },
+    /// The record at `epoch` names `previous`, which no listing could hide: none where one is listed before it, or
+    /// one at or below the record listed before it.
+    Forked {
+        /// The record.
+        epoch: u64,
+        /// The epoch it names.
+        previous: u64,
+    },
+    /// The listing shows `epoch` twice or out of order.
+    Repeated {
+        /// The epoch.
+        epoch: u64,
+    },
+}
+
+/// Checks that each record of one generation's listing, in listed order, names the record listed before it, and the
+/// first and each rebuild record that opens a rebuilt manifest name none (Q-611). Epochs may skip (format A.14).
+pub fn check_chain(listed: &[UploadedRecord]) -> Result<(), ChainBreak> {
+    let mut before: Option<u64> = None;
+    for u in listed {
+        let (epoch, previous) = (u.record.epoch, u.previous);
+        if before.is_some_and(|b| epoch <= b) {
+            return Err(ChainBreak::Repeated { epoch });
+        }
+        let want = match before {
+            Some(b) if !opens_manifest(&u.record) => b,
+            _ => 0,
+        };
+        if previous != want {
+            return Err(if previous > want && !opens_manifest(&u.record) {
+                ChainBreak::Missing { epoch, previous }
+            } else {
+                ChainBreak::Forked { epoch, previous }
+            });
+        }
+        before = Some(epoch);
+    }
+    Ok(())
+}
+
+/// How many epochs after a record a restore asks for, so that a record hidden behind skipped epochs is still found
+/// (format A.14 lets epochs skip; Q-614).
+pub const TAIL_PROBES: u64 = 8;
+
+/// The epochs a restore asks for after the last listed record `last` (Q-612, Q-614).
+pub fn after_last(last: u64) -> impl Iterator<Item = u64> {
+    (1..=TAIL_PROBES).map_while(move |k| last.checked_add(k))
+}
+
+/// The epochs a restore asks for where `read` ends before `listed` does: those after the last read and below the
+/// next listed, since no later record names the end of the manifest it reads; with nothing read, epoch 1, the
+/// generation's first record, unless listed (Q-612, Q-614).
+pub fn read_tail(listed: &[Record], read: &[Record]) -> Vec<u64> {
+    let Some(end) = read.last().map(|r| r.epoch) else {
+        return match listed.first() {
+            Some(f) if f.epoch > 1 => vec![1],
+            _ => Vec::new(),
+        };
+    };
+    let Some(next) = listed.iter().find(|r| r.epoch > end).map(|r| r.epoch) else {
+        return Vec::new();
+    };
+    after_last(end).take_while(|e| *e < next).collect()
 }

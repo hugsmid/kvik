@@ -5,7 +5,6 @@ mod support;
 
 use std::sync::Arc;
 
-use kvik_backup::envelope::Envelope;
 use kvik_backup::fake::{MemSink, TestEnvelope, block_on};
 use kvik_backup::keys::{ClaimMarker, Keys, ObjectName};
 use kvik_backup::plan::{PlanError, PlanInput, PlanMode, RestorePlan};
@@ -14,7 +13,7 @@ use kvik_backup::upload::Refused;
 use kvik_files::record::{Body, Rebuild, Record};
 use kvik_log::fs::MemFs;
 use kvik_sink::fake::FakeBucket;
-use kvik_sink_api::{BackupSink, SinkError};
+use kvik_sink_api::SinkError;
 use support::*;
 
 #[test]
@@ -231,20 +230,20 @@ fn q108_a_rebuilt_manifest_not_yet_whole_in_the_bucket_is_not_read() {
     let sink = MemSink::new();
     upload(&sink, &mut src);
     use_copies(&src);
-    let (keys, env) = (Keys::new(ID), TestEnvelope::new(KEY));
     let mut carried = Record::new(7, 0, 12, Body::Sealed(vec![src.segments[0].0.clone()]));
     carried.old_epoch = Some(2);
-    for r in [
-        Record::new(5, 0, 12, Body::Rebuild(Rebuild::default())),
-        Record {
-            old_epoch: Some(1),
-            ..Record::new(6, 0, 12, Body::Empty)
-        },
-        carried,
+    for (previous, r) in [
+        (0, Record::new(5, 0, 12, Body::Rebuild(Rebuild::default()))),
+        (
+            5,
+            Record {
+                old_epoch: Some(1),
+                ..Record::new(6, 0, 12, Body::Empty)
+            },
+        ),
+        (6, carried),
     ] {
-        let k = keys.record(0, r.epoch);
-        let sealed = env.seal(&k, &r.encode().unwrap()).unwrap();
-        block_on(sink.put(&k, sealed.clone().into(), sha256(&sealed))).unwrap();
+        put_record(&sink, ID, previous, &r);
     }
     let fs = MemFs::new();
     let (p, o) = restore(&mut restorer(sink, &fs, PlanMode::Drill, KEY)).unwrap();

@@ -90,6 +90,16 @@ impl Keys {
         }
     }
 
+    /// The prefix of a generation's log segments.
+    pub fn log_prefix(&self, generation: u32) -> String {
+        format!("{}log/{generation:08x}-", self.root)
+    }
+
+    /// The prefix of files of every kind but log segments.
+    pub fn files_prefix(&self) -> String {
+        format!("{}files/", self.root)
+    }
+
     /// A generation's claim marker's key.
     pub fn claim(&self, generation: u32) -> String {
         format!("{}claims/{generation:08x}", self.root)

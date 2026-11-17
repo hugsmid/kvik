@@ -6,6 +6,7 @@
 //! - [`upload`]: the upload driver, a step function the store runs on its own thread.
 //! - [`plan`]: what a restore installs, from the records it read.
 //! - [`restore`]: the restore driver.
+//! - [`uploaded`]: the uploaded form of a manifest record and the chain of epochs it names.
 //!
 //! The drivers own no thread, clock or sleep: the caller passes `now` and acts on `Retry { after }`.
 
@@ -28,6 +29,7 @@ pub mod plan;
 pub mod port;
 pub mod restore;
 pub mod upload;
+pub mod uploaded;
 
 /// The future a driver call returns: boxed, `Send` and independent of any async runtime.
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

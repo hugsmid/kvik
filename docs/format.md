@@ -791,9 +791,15 @@ its own prefix, which the engine never sees.
   listing from the first key: none is `NoStore`, more than one `SeveralStores`; `attach_backup` refuses a bucket
   holding a key under another store id (`OtherStore`).
 - **Uploaded forms (the plaintext).** `STORE` and a sealed log segment: the local file, byte for byte, so its
-  plaintext SHA-256 is the one the manifest records. A manifest record: the record's A.2 block (header, body and
-  padding) in its canonical encoding, which for a record this build wrote is the bytes `MANIFEST` holds, and
-  nothing else; checks: one valid record block, its `generation` and `epoch` those of its key. A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
+  plaintext SHA-256 is the one the manifest records. A manifest record: `previous` `u64`, the epoch of the record
+  before it in the manifest it was read from, 0 for none (a generation's first record, and a rebuild record that
+  opens a rebuilt manifest, the one without field 100), then the record's A.2 block (header, body and padding) in
+  its canonical encoding, which for a record this build wrote is the bytes `MANIFEST` holds, and nothing else;
+  checks: `previous` below the record's epoch, and 0 for a rebuild record without field 100; one valid record block,
+  its `generation` and `epoch` those of its key. `previous` comes from the manifest alone, never from the bucket, so
+  an upload repeated after a restart sends the same bytes. Records upload in epoch order, so in the bucket each
+  names the record of its generation and manifest uploaded before it, and a restore checks that chain (Q-610 to
+  Q-612). A record carried by a rebuild is uploaded under its new epoch with field 100 (A.14).
   The store id is bound by the envelope (key derivation and associated data), not repeated in the plaintext.
 - **Claim marker** (12 bytes, exactly, unsealed): 0 generation `u32`, that of its key; 4 reset nonce `u64`, the
   claiming restore's fresh nonce (`spec.md` §8 Generations), never zero. The store id and the generation are in the

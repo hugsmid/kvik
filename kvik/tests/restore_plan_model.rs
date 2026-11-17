@@ -3,7 +3,9 @@
 //! become sealed-segment records, and its bucket's objects copy-verified records (`0x27`), sometimes carried into a
 //! whole rebuilt manifest that the restore reads instead (Q-108, Q-295). Both must give the same restored end,
 //! list the same files and set aside the same ones. Where nothing was set aside, the restored model runs on in its
-//! generation and is restored again, from the first plan's record and the new generation's records.
+//! generation and is restored again, from the first plan's record and the new generation's records. The chain of
+//! predecessors those records name, built as the upload driver writes it, passes the restore's check (Q-611), so the
+//! check refuses no history the model restores.
 //!
 //! Left out, with the reason (`model/OPEN-QUESTIONS.md`):
 //! - Lost ranges: the model's restored end stops at one, the specification's does not (Q-294).
@@ -14,7 +16,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kvik_backup::plan::{PlanInput, PlanMode, RestorePlan, plan, records_to_read};
+use kvik_backup::plan::{PlanInput, PlanMode, RestorePlan, check_chain, plan, records_to_read};
+use kvik_backup::uploaded::UploadedRecord;
 use kvik_files::catalogue::{Catalogue, Tier};
 use kvik_files::desc::{FileClass, FileDescription, kind};
 use kvik_files::record::{Body, Rebuild, Record};
@@ -160,6 +163,20 @@ fn records(
             ..Record::new(i as u64 + 1, g, 0, b)
         })
         .collect();
+    let mut previous = 0;
+    let uploaded: Vec<UploadedRecord> = records
+        .iter()
+        .map(|r| {
+            let opens = matches!(r.body, Body::Rebuild(_)) && r.old_epoch.is_none();
+            let u = UploadedRecord {
+                previous: if opens { 0 } else { previous },
+                record: r.clone(),
+            };
+            previous = r.epoch;
+            u
+        })
+        .collect();
+    assert_eq!(check_chain(&uploaded), Ok(()));
     let mut c = Catalogue::new();
     for r in records_to_read(&records) {
         c.apply(r).unwrap();

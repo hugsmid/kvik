@@ -11,9 +11,7 @@ use kvik_backup::fake::{TestEnvelope, block_on};
 use kvik_backup::keys::Keys;
 use kvik_backup::upload::{BackupDriver, Step, UploadError, Uploader};
 use kvik_files::catalogue::Tier;
-use kvik_files::rebuild::{
-    Answer, Finality, LocalFile, LocalState, Place, Verifier, rebuild_manifest, resolve,
-};
+use kvik_files::rebuild::{Answer, Finality, LocalState, rebuild_manifest, resolve};
 use kvik_files::record::Body;
 use kvik_files::tier::CopyVerified;
 use kvik_log::fs::Fs;
@@ -475,25 +473,6 @@ fn files_sealed_before_any_driver_existed_are_queued_from_the_catalogue() {
     h.check_done();
 }
 
-struct AllVerify;
-
-impl Verifier for AllVerify {
-    fn verify(&self, _: &LocalFile, _: &[&LocalFile]) -> bool {
-        true
-    }
-}
-
-fn local_files(h: &Harness) -> Vec<LocalFile> {
-    h.segments
-        .iter()
-        .map(|(d, _)| LocalFile {
-            description: d.clone(),
-            place: Place::Hot,
-            verified: true,
-        })
-        .collect()
-}
-
 #[test]
 fn q280_a_rebuilt_manifest_verifies_each_copy_again_without_a_new_upload() {
     let h = three();
@@ -780,19 +759,6 @@ fn other_content_under_the_store_key_fails_and_is_never_overwritten() {
         b"not this store's descriptor"
     );
     assert_eq!(h.puts_of(&keys.file(&f)), 0);
-}
-
-fn rebuild_final(h: &Harness) -> kvik_files::appender::Appender {
-    let files = local_files(h);
-    let state = LocalState {
-        files: &files,
-        losses: &[],
-        lease_epoch: 0,
-        mark_file_id: 0,
-    };
-    rebuild_manifest(&h.fs, &h.dir, ID, state, &AllVerify, Finality::Final, T0)
-        .unwrap()
-        .0
 }
 
 #[test]

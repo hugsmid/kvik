@@ -522,7 +522,7 @@ pub enum RestoreMode { Full /* default */, Drill, Partial(RestoreScope) }   // n
 pub struct RestoreScope { pub time: Option<Range<Timestamp>> }            // non-exhaustive; a series selection arrives with 8.3f
 pub enum BackupError { NotSupportedYet { what }, Sink(SinkError), Refused(BackupRefusal), WrongKey, NotEmpty, NoStore,
     SeveralStores { store_ids: Vec<[u8; 16]> }, Superseded { generation: u32 }, AlreadyAttached, RestoreFailed { file_id: u64, reason: String }, Drill,
-    Io { op, path, kind } }
+    BrokenChain { generation: u32, epoch: u64 }, Io { op, path, kind } }
 let facts = store.export_set_aside(range)?;   // set-aside facts, each with its series name, for re-ingest
 store.rebuild(Rebuild::Derived).await?;       // recompute every derived structure from facts
 ```
@@ -556,7 +556,14 @@ only, boxed `Send` futures):
   (Q-164 (c)). `WrongKey` comes before any file is fetched. `NotEmpty`: the directory holds files and no restore
   record. `Superseded`: another restore claimed a higher generation. `Drill`: the call is refused in a drill's
   store. A generation whose records list empty while `stat` reports its restore record is a lagging listing, not a
-  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304).
+  generation without records: the restore fails as `Sink(Transient)` and is retried (Q-304). So is a record missing
+  from the listing that a later record names, or that lies within a few epochs after the last listed or the last
+  read, when `stat` reports it (Q-611, Q-612). A drill of a live store, or a full restore while the source store
+  still uploads, can see a record uploaded after its listing and is retried the same way; on a bucket whose listings
+  lag longer than the time between two record uploads it never passes, so there a drill runs from a paused copy, a
+  copy of the store's objects made while the store uploads nothing (spec §8 Restore drill, Q-612 (d)). `BrokenChain`: a record of the generation read names a predecessor the bucket does not report,
+  or one no listing could hide (`format.md` A.17 Uploaded forms; `RestoreError::BrokenChain`, Q-611); a retry gives
+  the same answer.
 - **Verified.** `Verified::check` is the only way to make a `Verified`: the bucket reported the expected size and
   SHA-256 when asked ("verified in another tier", spec §8 Hashes). It proves what the bucket reports, not the bytes,
   which the sampled download checks. Eviction (roadmap 8.1) requires one.
