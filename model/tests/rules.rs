@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use kvik_model::condition::{Condition, ConditionState};
+use kvik_model::engine::{Alert, Corruption};
 use kvik_model::engine::{
     Config, ConsumerDecl, ConsumerId, CrashPoint, DeliveryId, DeliveryKind, EntryBody, Envelope,
     Error, Fault, FileClass, FileId, Funnel, FunnelId, Level, Locality, ManifestOp, MarkSync,
@@ -745,8 +746,10 @@ fn s5_2_text_nodes_carry_coverage() {
 /// nor compacted is the only copy; corruption there loses its range, which is
 /// recorded as a lost range and reported as `data_lost`, so its positions are
 /// not issued again (§3 Recovery rule 2, invariant 1). It is never repaired in
-/// place. The model loses the whole segment, not only the damaged region, and
-/// its quarantine stays fatal (see `OPEN-QUESTIONS.md`).
+/// place. The model loses the whole segment, not only the damaged region (see
+/// `OPEN-QUESTIONS.md`). The error ends with the lost-range record (§8
+/// Corrupt block): health is degraded by the loss, not fatal, and the
+/// corruption alerts (§8 Self-repair).
 #[test]
 fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     let (mut m, s) = model(10 * SECOND);
@@ -770,9 +773,14 @@ fn s8_corrupt_log_segment_with_no_other_copy_loses_range() {
     assert!(m.disk.all_facts().is_empty());
     assert_eq!(m.disk.lost_ranges(), vec![(p, p)], "the range is recorded");
     let h = m.health();
-    assert_eq!(h.level, Level::Fatal);
-    assert!(h.reasons.contains(&Reason::Quarantined(f)));
+    assert_eq!(h.level, Level::Degraded);
+    assert!(!h.reasons.contains(&Reason::Quarantined(f)));
     assert!(h.reasons.contains(&Reason::DataLost(p, p)));
+    assert!(
+        m.attention()
+            .iter()
+            .any(|a| matches!(a, Alert::Corruption(Corruption::File(g, Some(_))) if *g == f))
+    );
     // Its positions are not issued again, also after a restart.
     m.restart();
     let next = m
@@ -1223,7 +1231,7 @@ fn s3_lost_mark_and_tail_leave_a_gap_described_by_the_entry() {
         (losses[1].kind, losses[1].identity, losses[1].mark_state),
         (LossKind::PossibleLoss, at, MarkState::Missing)
     );
-    assert_eq!(m.health().level, Level::Degraded, "until acknowledged");
+    assert_eq!(m.health().level, Level::Degraded, "until closed");
     assert_eq!(
         m.reset_points(),
         vec![ResetPoint {

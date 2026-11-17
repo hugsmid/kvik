@@ -156,8 +156,8 @@ pub fn reset_points(
 /// Whether a loss is certain (§11 Health).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LossKind {
-    /// A lost range, by corruption or a recovery entry's gap: health degraded
-    /// until acknowledged.
+    /// A lost range, by corruption, a recovery entry's gap or a file lost in
+    /// the bucket: health degraded until closed (§8 Self-repair).
     DataLost,
     /// A recovery entry that names a non-empty tail, a mark not readable or
     /// stale, or a missing cursor file: listed and counted, never degrading,
@@ -174,6 +174,41 @@ pub enum LossCause {
     /// A truncated tail: a recovery entry's tail (a `possible_loss`) and its
     /// gap (a `data_lost`), §3 Recovery rules 1 and 3.
     TruncatedTail,
+    /// A file the bucket has lost or corrupted, with no local copy left
+    /// (§8 Self-repair, Q-85).
+    LostInBucket,
+}
+
+/// How a loss was closed (§8 Self-repair stage 3; `format.md` A.14 `0x24`
+/// field 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Outcome {
+    /// Its positions hold the same facts again, from a copy; the count.
+    Restored(u64),
+    /// The re-send stage ended.
+    ResendEnded,
+    /// By `acknowledge_losses`.
+    Operator,
+}
+
+/// Where a `data_lost` stands in self-repair (§8 Self-repair, `api.md`
+/// `LossState`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LossState {
+    /// Reported, not yet recorded.
+    Found,
+    /// Recorded; a copy of its file is being brought back (stage 1).
+    Copying,
+    /// Offered for re-sending until this instant (stage 2).
+    AwaitingResend {
+        /// When stage 2 ends by the wait.
+        until: i64,
+    },
+    /// Stage 2 ended; waiting for `acknowledge_losses` (`repair.acknowledge
+    /// = manual`).
+    AwaitingOperator,
+    /// Closed (stage 3).
+    Closed(Outcome),
 }
 
 /// One loss in the list of losses (§11 Health, `api.md` `LossReport`).
@@ -200,9 +235,11 @@ pub struct Loss {
     /// Whether a manifest record or a recovery entry holds it; a range found
     /// by a start that could not write is reported as found, not recorded.
     pub recorded: bool,
-    /// Whether an acknowledgement covers its present range. Always false for
-    /// a `possible_loss`, which needs none.
+    /// Whether a closing record covers its present range, by any outcome.
+    /// Always false for a `possible_loss`, which needs none.
     pub acknowledged: bool,
+    /// Its self-repair state; `None` for a `possible_loss`.
+    pub state: Option<LossState>,
 }
 
 impl Loss {
@@ -225,10 +262,15 @@ pub struct LostRecord {
     pub to: Position,
     /// The cause.
     pub cause: LossCause,
+    /// When the record was written.
+    pub at: i64,
+    /// The record's epoch.
+    pub epoch: u64,
 }
 
-/// An acknowledgement (§8 Acknowledging a loss): a loss's identity and its
-/// first and last position as reported then.
+/// An acknowledgement or closing record's entry (§8 Acknowledging a loss,
+/// Self-repair): a loss's identity, its first and last position as reported
+/// then, and the outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acknowledged {
     /// The loss's identity.
@@ -237,6 +279,8 @@ pub struct Acknowledged {
     pub from: Position,
     /// Last position as reported.
     pub to: Position,
+    /// How it was closed.
+    pub outcome: Outcome,
 }
 
 /// The list of losses (§11 Health), from the manifest's lost-range records,
@@ -245,12 +289,14 @@ pub struct Acknowledged {
 /// union of the ranges its records name. A recovery entry's gap is a
 /// `data_lost` of cause truncated tail; the entry itself is a `possible_loss`
 /// when it names a tail, a mark not readable or stale, or a missing cursor
-/// file.
+/// file. A `data_lost` is closed by the latest closing record covering its
+/// present range; `stage` gives the self-repair stage of one recorded and open.
 pub fn losses(
     recorded: &[LostRecord],
     found: &[(Position, Position)],
     recoveries: &[(Position, RecoveryEntry)],
-    acknowledged: &[Acknowledged],
+    acknowledged: &[(u64, Acknowledged)],
+    stage: impl Fn(&Loss) -> LossState,
 ) -> Vec<Loss> {
     let mut out: Vec<Loss> = Vec::new();
     let mut add =
@@ -271,25 +317,48 @@ pub fn losses(
                     cursors_missing: Vec::new(),
                     recorded,
                     acknowledged: false,
+                    state: None,
                 });
             }
         };
     for r in recorded {
         add(r.identity, r.cause, r.from, r.to, true);
     }
+    let mut found_again = Vec::new();
     for (from, to) in found {
         // A range found again before it is recorded is the same loss.
         let identity = recorded
             .iter()
             .find(|r| r.from <= *to && *from <= r.to)
             .map_or(*from, |r| r.identity);
+        found_again.push(identity);
         add(identity, LossCause::Corruption, *from, *to, false);
     }
     for l in &mut out {
-        l.acknowledged = acknowledged.iter().any(|a| {
-            a.identity == l.identity
-                && l.first.is_some_and(|f| a.from <= f)
-                && l.last.is_some_and(|t| t <= a.to)
+        // The latest closing record that covers the present range; one
+        // "restored in full" no longer closes a loss whose positions were
+        // lost again after it (§8 Self-repair stage 1).
+        let closed = acknowledged
+            .iter()
+            .rev()
+            .find(|(_, a)| {
+                a.identity == l.identity
+                    && l.first.is_some_and(|f| a.from <= f)
+                    && l.last.is_some_and(|t| t <= a.to)
+            })
+            .filter(|(epoch, a)| {
+                !matches!(a.outcome, Outcome::Restored(_))
+                    || !(found_again.contains(&l.identity)
+                        || recorded
+                            .iter()
+                            .any(|r| r.identity == l.identity && r.epoch > *epoch))
+            })
+            .map(|(_, a)| a);
+        l.acknowledged = closed.is_some();
+        l.state = Some(match closed {
+            Some(a) => LossState::Closed(a.outcome),
+            None if l.recorded => stage(l),
+            None => LossState::Found,
         });
     }
     for (at, e) in recoveries.iter().filter(|(_, e)| e.possible_loss()) {
@@ -304,6 +373,7 @@ pub fn losses(
             cursors_missing: e.cursors_missing.clone(),
             recorded: true,
             acknowledged: false,
+            state: None,
         });
     }
     out.sort_by_key(|l| (l.identity, l.kind == LossKind::PossibleLoss));
@@ -534,8 +604,10 @@ mod tests {
             from: p(5),
             to: p(6),
             cause: LossCause::TruncatedTail,
+            at: 0,
+            epoch: 1,
         };
-        let l = losses(&[gap], &[], &[(p(7), e.clone())], &[]);
+        let l = losses(&[gap], &[], &[(p(7), e.clone())], &[], |_| LossState::Found);
         assert_eq!(l.len(), 1);
         assert_eq!(
             (l[0].kind, l[0].cause, l[0].identity),

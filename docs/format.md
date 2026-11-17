@@ -579,7 +579,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   epoch named by the last valid record and by any lease file (`spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
-  positions; field 2: the epoch of a rebuild record acknowledged); `0x28` rebuild (1 the corrupt record's epoch as
+  positions; field 2: the epoch of a rebuild record acknowledged; field 3: outcome `u8`, 1 restored in full, 2 re-send
+  ended, 3 by an operator, absent meaning 3; field 4: positions restored `u64`, present exactly with outcome 1;
+  repeated field 5: a corruption seen, below; a record with outcome 1 or 2 is a closing record of self-repair and
+  names exactly one loss in field 1, `spec.md` §8 Self-repair; one with outcome 1 closes only the lost-range records of
+  that identity with a lower epoch, so a later one opens the loss again; a record names at least one of fields 1, 2 and 5; fields 3 to 5 are
+  decoded from roadmap 8.5b, which refuses a record holding them until then, and written from roadmap 8.5c); `0x28` rebuild (1 the corrupt record's epoch as
   presumed, the last valid epoch before it + 1, `u64`; 2 epoch of the last valid record before it, `u64`; 3 files found, `u64`; 4 lost ranges recorded again, `u32`;
   5 `file_id` floor, repeated, one per file kind: kind `u8`, id `u64`, 2^32 above the highest id of that kind in any
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
@@ -588,13 +593,36 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   before `u64`, in ascending order and not overlapping), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
-  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore and `0x27` copy verified are laid out below. Reserved for its roadmap item:
-  `0x26` quarantine (8.1). A rebuild never reconstructs `0x26` or `0x27`: a
+  record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore, `0x26` quarantine and `0x27` copy verified are
+  laid out below. A rebuild never reconstructs `0x26` or `0x27`: a
   quarantine is shown by the file's place under `quarantine/`, a tier by where the file is found, and "verified in
-  another tier" is verified again, so their layouts may hold no fact that only they hold. Until their items lay them
+  another tier" is verified again, so their layouts may hold no fact that only they hold; after a rebuild a
+  file under `quarantine/` that no carried record names is a corruption dated at the rebuild record, and a lost range
+  found again with cause 5 is one too, with no new field (`spec.md` §8 Self-repair, Q-244). Until their items lay them
   out, a reader takes a record of a reserved type as a field list (A.6 framing) and a rebuild carries it unchanged
   with field 100 added; the catalogue of files does not apply one. A reserved type stays written and carried as a
   field list once laid out; only its decoding becomes strict.
+- Quarantine (`0x26`, `spec.md` §8 Corrupt block, Self-repair): 1 the file, a file description (below); 2 reason
+  `u8` (1 damaged on hot, 2 damaged on cold, 3 damaged in deep, 4 lost in the bucket); 3 the copy tried first `u8` (0
+  none, 1 hot, 2 cold, 3 deep, 4 the mirror path). Each field exactly once; another field below `0x8000` is
+  unsupported. Appended when a file is found damaged or judged lost, before a copy is fetched; it names a
+  corruption (`spec.md` §8 Self-repair, Attention). A file lost in the bucket is not moved locally. A reason 4 with no later `0x27` for the file
+  takes its copy out of a restore's plan (Q-295) only where recorded lost ranges cover each of its positions that
+  no other listed file holds; otherwise (the re-upload from a local copy or the lost-range record not yet written)
+  it stays listed and the restore judges it (`spec.md` §8 Restore, Failures and end). A
+  re-upload from a verified local copy writes a new `0x27`, as does an object that answers again while its loss is
+  open and so restores it in full; one that answers again after its loss was closed gets none, so it stays out of
+  every restore's plan and the closed loss stays closed in every generation (Q-600). Decoded strictly
+  from roadmap 8.5b, with `0x24` fields 3 to 5 and `0x25` fields 11 to 13; until then it is read as a reserved type.
+- Corruption seen (the value of `0x24` field 5 and `0x25` fields 12 and 13, 24 bytes): 0 kind `u8` (1 a file, by its
+  quarantine record; 2 a lost range, by its loss's identity; 3 a manifest record); 1 reserved (3 bytes); 4 for a
+  file, its kind `u8`, 3 reserved and `file_id` `u64` (12 bytes, as an input entry of a file description), then the
+  epoch `u64` of the quarantine record that names this finding of it (matched against field 100 where a record has
+  it) or, for a file under `quarantine/` that no valid record names after a rebuild, of that rebuild record (Q-244);
+  for a lost range, the identity (a position, 12 bytes) then 8 reserved bytes; for a manifest record, its epoch `u64`
+  then 12 reserved bytes. Each finding of a file is a corruption of its own: a file found damaged or judged lost
+  again, after its copy was swapped in or its object answered again, has a new quarantine record and is a new
+  corruption, so seeing an earlier finding does not see it. Naming a corruption seen twice changes nothing.
 - Copy verified (`0x27`, Q-281): 1 the file, a file description (below), so the record repeats the file's kind,
   position range and plaintext hash as every record naming a file does, and a record describing a file otherwise than
   an earlier record is refused; 2 the tier
@@ -640,7 +668,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   the order read; 9 repeated, a file it restores from, set-aside segments included: tier `u8` (1 hot, 2 cold, 3 deep:
   where the restore places it, step 3), 3 reserved, the size `u64` and SHA-256 (32 bytes) of its copy in deep as the
   bucket reported them (ciphertext), then its file description, in strictly ascending order of kind, generation and
-  `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded. In every range
+  `file_id`, each file once; 10 present, with no value, in a drill's record, which is never uploaded; 11 repeated, the outcome of a carried acknowledged range closed otherwise than by an operator:
+  identity (position), outcome `u8` (1 or 2), 3 reserved, positions restored `u64` (0 with outcome 2), in strictly
+  ascending order of identity, each naming a field 7 range; 12 repeated, a corruption seen carried, as `0x24` field
+  5, in the order read; 13 repeated, a corruption not yet seen carried, as `0x24` field 5, in the order read, each
+  named once in fields 12 and 13 together (fields 11 to 13 are decoded from roadmap 8.5b, which refuses a record holding them until then, and written from
+  roadmap 8.5c, Q-241). In every range
   first is at or below last. A record that breaks a rule is invalid; an unknown critical field, here or in a nested
   lost range, is a version refusal. A reader keeps a restore record's fields in the order read, as for a reserved
   type, so it is carried unchanged; canonical writing puts them in ascending id order. A record must fit one block (A.2 sizes), which bounds a restore at about 130,000

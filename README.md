@@ -42,11 +42,11 @@ a known, recorded point after a failure ([who it is for](#who-it-is-for)).
 > | 5. Delivery | 2 of 10 done (5.1a, model support for recovery entries, reset points and loss reports; 5.2, the routing table, conditions, consumer queues and durable cursors; 5.1, the series registry and the interface on the durable log, is built and waits for the owner's ruling on Q-44 (b) and (c); 5.5a, durability levels in the specification and the model, is written and waits for the owner's ruling on Q-250, Q-252 and Q-254 and confirmation of Q-251, Q-253, Q-255 to Q-259, Q-680 and Q-681) |
 > | 6. Compacted segments | 2 of 7 done (6.1, value and timestamp encodings; 6.3a, the manifest records, the file catalogue and the automatic rebuild; 6.4a, the Parquet export with its provisional schema, is built and waits for the owner's ruling on Q-190 to Q-197) |
 > | 7. Summary tree | 1 of 5 done (7.1a, summary nodes: the fold, merge and byte layout) |
-> | 8. Tiers and backup | 1 of 4 done (8.2, the backup sink interface) |
+> | 8. Tiers and backup | 1 of 5 done (8.2, the backup sink interface) |
 > | 9. Query | not started |
 > | 10. Scale | not started |
 >
-> 28 of 54 roadmap items are done, including 3 of 9 gates.
+> 28 of 55 roadmap items are done, including 3 of 9 gates.
 
 ## Principles
 *What the specification requires of the engine, in brief:*
