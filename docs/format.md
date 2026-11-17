@@ -897,7 +897,7 @@ deliverer's index); a refresh it skips (Q-704) delays it, never falsifies it.
 | 72 | 8 | the **next pending fact**'s `t`: the earliest good current fact ahead of the write time |
 | 80 | 12 | its position; 4 reserved |
 
-Checks: a known value kind and a quality up to 2 when the candidate is present, a decimal scale at most 18, a state
+Checks: a known value kind and a quality up to 2 when the candidate is present (0 for kind 0), a decimal scale at most 18, a state
 index that fits `u16`, a boolean 0 or 1. Bit 3 means the candidate may not be the live fact (it was corrected to bad,
 or a fact ahead that the entry does not name may have fallen due): a reader finds the fact in force instead (§2.3
 `at`), counted. Bit 5 means facts ahead may exist that the entry does not name: once the named one falls due, a

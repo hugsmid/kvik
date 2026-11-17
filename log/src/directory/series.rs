@@ -178,7 +178,7 @@ impl SeriesEntry {
         let has = |bit| f & bit != 0;
         let candidate = if has(flag::CANDIDATE) {
             let value = match b[6] {
-                0 => CandidateValue::AtPosition,
+                0 if b[7] == 0 => CandidateValue::AtPosition,
                 1 => CandidateValue::F64(u64_at(b, 64)),
                 2 if b[60] <= 18 => CandidateValue::Decimal {
                     units: i64_at(b, 64),
@@ -326,6 +326,38 @@ mod tests {
             SeriesDirectory::decode(&d.encode(frame, [1; 16]).unwrap(), &[1; 16]).is_err(),
             "a candidate is never bad"
         );
+    }
+
+    #[test]
+    fn a_position_only_candidate_with_a_quality_is_invalid() {
+        let frame = Frame {
+            generation: 0,
+            file_id: 1,
+            written_at: 0,
+        };
+        let d = SeriesDirectory {
+            entries: vec![SeriesEntry {
+                series_id: 1,
+                candidate: Some(Candidate {
+                    t: 0,
+                    position: Position::default(),
+                    quality: Quality::Good,
+                    value: CandidateValue::AtPosition,
+                }),
+                ..SeriesEntry::default()
+            }],
+            ..SeriesDirectory::default()
+        };
+        let mut file = d.encode(frame, [1; 16]).unwrap();
+        assert_eq!(SeriesDirectory::decode(&file, &[1; 16]).unwrap().1, d);
+        let at = 80 + 48 + 7;
+        file[at] = 2;
+        let len = u32::from_le_bytes(file[68..72].try_into().unwrap()) as usize;
+        let body = crate::crc::crc32c(&file[80..80 + len]).to_le_bytes();
+        file[72..76].copy_from_slice(&body);
+        let head = crate::crc::crc32c(&file[64..76]).to_le_bytes();
+        file[76..80].copy_from_slice(&head);
+        assert!(SeriesDirectory::decode(&file, &[1; 16]).is_err());
     }
 
     #[test]
