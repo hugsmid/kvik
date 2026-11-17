@@ -1605,7 +1605,12 @@ start, as it carries the lost ranges, so a reader checks the same. Until 8.3 the
 (`StartOptions::generation` is refused) and the array is empty.
 **Open.** Where a restore leaves the older generation's first segments on no local tier, the first record listed is
 not at sequence 1 and the listing stays empty: 8.3 says whether the restored files are local, or the rule names the
-restore's first restored position instead.
+restore's first restored position instead. Two further points for 8.3, neither reachable before it: the first
+listed record may be of any generation (`Root::check` and `list_ready` start from the generation before its own), so
+an unreadable first segment of the older generation would let the newer generation's first record lead the listing
+and `through` pass every kept older segment; the rule must require the first record to be of the lowest generation
+that keeps a position. And a restore that goes back before an intermediate generation that held positions is refused
+a join, so the listing ends there: safe, but 8.3 decides which carried restored ends are in force.
 **Pinned by.** `a_later_generation_joins_from_its_first_position_once_the_earlier_reaches_its_restored_end`,
 `a_skipped_generation_joins_only_when_it_held_no_position`,
 `a_root_carries_its_restored_ends_and_its_first_group_starts_its_generation` (`log/src/directory/logdir.rs`).
