@@ -198,13 +198,17 @@ mod tests {
     fn a_follower_leads_once_more_after_its_leaders_error_and_the_leader_reports_it() {
         let flight = Arc::new(Flight::new());
         let rounds = Arc::new(AtomicU32::new(0));
-        let first_fails = |r| if r == 1 { Err(r) } else { Ok(r) };
-        let a = call(&flight, &rounds, 2, first_fails);
+        let second_fails = |r| if r == 2 { Err(r) } else { Ok(r) };
+        let a = call(&flight, &rounds, 3, second_fails);
         started(&rounds, 1);
-        let b = call(&flight, &rounds, 2, first_fails);
-        assert_eq!(a.join().unwrap(), Err(1));
-        assert_eq!(*b.join().unwrap().unwrap(), 2);
-        assert_eq!(rounds.load(Ordering::SeqCst), 2);
+        let b = call(&flight, &rounds, 3, second_fails);
+        let c = call(&flight, &rounds, 3, second_fails);
+        assert_eq!(*a.join().unwrap().unwrap(), 1);
+        let mut rest = [b.join().unwrap().map(|v| *v), c.join().unwrap().map(|v| *v)];
+        rest.sort_unstable();
+        // Round 2's leader reports its error; its follower leads round 3.
+        assert_eq!(rest, [Ok(3), Err(2)]);
+        assert_eq!(rounds.load(Ordering::SeqCst), 3);
     }
 
     #[test]
