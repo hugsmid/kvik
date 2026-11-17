@@ -139,7 +139,7 @@ fn an_emit_returning_after_a_consumer_is_set_up_has_taken_its_batch() {
 }
 
 #[test]
-fn a_batch_acknowledged_while_a_consumer_is_taken_is_before_its_start() {
+fn an_emit_acknowledged_before_a_take_and_returning_after_it_has_taken_its_batch() {
     let (w, id, dir, t) = open("acknowledged");
     let acked = Gate::new(&dir, Point::AfterAck);
     let emitter = {
@@ -154,6 +154,44 @@ fn a_batch_acknowledged_while_a_consumer_is_taken_is_before_its_start() {
     assert!(taken(&w) >= p.sequence);
     let q = emit(&w, id, t, 1);
     assert_eq!(facts(&w, "c"), vec![q.sequence]);
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn a_consumer_taken_after_an_emit_left_its_batch_starts_at_or_after_that_batch() {
+    let (w, id, dir, t) = open("left");
+    let held = Hold::new(&dir, Point::DeliverThread);
+    let p = emit(&w, id, t, 0);
+    assert!(taken(&w) < p.sequence);
+    w.take_consumer("c", Start::Now, &Select::None).unwrap();
+    assert!(w.consumer_stats("c").unwrap().cursor >= p);
+    drop(held);
+    w.shutdown().unwrap();
+}
+
+#[test]
+fn an_emit_waits_while_a_consumer_is_set_up_instead_of_leaving_its_batch() {
+    let (w, id, dir, t) = open("setting-up");
+    let setting_up = Gate::new(&dir, Point::SetUpPump);
+    let taker = {
+        let w = w.clone();
+        std::thread::spawn(move || w.take_consumer("c", Start::Now, &Select::None))
+    };
+    setting_up.reached();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let emitter = {
+        let w = w.clone();
+        std::thread::spawn(move || tx.send(emit(&w, id, t, 0)).unwrap())
+    };
+    assert!(
+        rx.recv_timeout(Duration::from_secs(1)).is_err(),
+        "an emit returned without its batch while a consumer was being set up"
+    );
+    setting_up.release();
+    taker.join().unwrap().unwrap();
+    let p = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    emitter.join().unwrap();
+    assert!(taken(&w) >= p.sequence);
     w.shutdown().unwrap();
 }
 

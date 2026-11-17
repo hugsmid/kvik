@@ -11,6 +11,8 @@ pub(crate) enum Point {
     AfterDecision,
     /// After a call's acknowledgement, before its delivery step.
     AfterAck,
+    /// In `take_consumer`, under the deliverer's lock, before the pump that sets the consumer up.
+    SetUpPump,
     /// In `take_consumer`, once the consumer is set up.
     TakeSetUp,
     /// In the `kvik-deliver` thread's loop, before it runs the deliverer.

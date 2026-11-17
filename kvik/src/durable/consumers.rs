@@ -115,6 +115,8 @@ impl Writer {
             ));
         }
         let emits = emits_in(emits);
+        // Before the setup pump below (Q-706). A take refused after this leaves the flag raised for the run, which
+        // only costs emits the work they would skip.
         hub.consumer_coming();
         let mut d = lock(&self.decider);
         let change = hub.run(|dl, c| -> Result<Option<Routing>, Error> {
@@ -147,6 +149,8 @@ impl Writer {
         }
         drop(d);
         let r = hub.run(|dl, c| {
+            #[cfg(test)]
+            super::pause::at(&self.dir, super::pause::Point::SetUpPump);
             dl.pump(c);
             dl.take(name, start, c)
         })?;

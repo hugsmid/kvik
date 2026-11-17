@@ -1401,16 +1401,22 @@ the read-back stays on the caller's thread until acknowledged batches are handed
 **Settled by the lead: yes.** With no consumer registered, `refresh_errors` and `corruptions` may lag an emit's return;
 the `kvik-deliver` thread counts them shortly after, and `refresh_errors` counts reads, not calls (`api.md` Health and
 statistics). `emit` runs no timers, takes no batch and waits for no wake while the hub's consumer flag is lowered
-(`kvik/src/durable/consumers.rs`, `deliver/hub.rs`). The flag starts raised when the start found any consumer (taken
-before, named by a cursor file or the log), is raised by `take_consumer` before the pump that sets a consumer up, and
-is never lowered; an emit that read it lowered therefore had its batch acknowledged before that pump, which takes it
-before the consumer exists. A consumer not taken in this run receives and evaluates nothing, so starting raised for
-known consumers is a precaution. `an_idle_store_writes_no_delivery_lease_before_its_renewal_is_due`
-(`kvik/tests/write_path.rs`) therefore takes the emit's batch with a tick before it counts lease writes.
+(`kvik/src/durable/consumers.rs`, `deliver/hub.rs`). The flag is never lowered. `take_consumer` raises it before the
+pump, under the deliverer's lock, that sets the consumer up; an emit that read it lowered therefore had its batch
+acknowledged before that pump, which takes it before the consumer's start is computed. A take refused after the raise
+leaves the flag raised for the run, which costs only the work emits would skip. The flag also starts raised when the
+start found any consumer (named by a cursor file or the log); that is a precaution, since a consumer not taken in this
+run is neither fed nor evaluated. Tests that count the delivery reader's work take a consumer
+(`the_delivery_reader_refreshes_at_most_once_per_batch_sync`) or a tick
+(`an_idle_store_writes_no_delivery_lease_before_its_renewal_is_due`, `kvik/tests/write_path.rs`) so that the emit's
+read-back is done where they count. In a measurement (four writers, 500 readings per call, in-memory files) the
+thread ran at most 3,500 to 6,000 readings behind the last acknowledged position.
 **Pinned by.** `with_no_consumer_an_emit_returns_without_taking_its_batch`,
 `with_no_consumer_an_emit_never_waits_for_the_deliverer`,
+`a_consumer_taken_after_an_emit_left_its_batch_starts_at_or_after_that_batch` (the setup pump),
+`an_emit_waits_while_a_consumer_is_set_up_instead_of_leaving_its_batch` (the raise before that pump),
 `an_emit_returning_after_a_consumer_is_set_up_has_taken_its_batch`,
-`a_batch_acknowledged_while_a_consumer_is_taken_is_before_its_start`,
+`an_emit_acknowledged_before_a_take_and_returning_after_it_has_taken_its_batch`,
 `with_a_consumer_an_emit_returns_after_taking_its_batch_and_waking_it` (unit tests in
 `kvik/src/durable/registering.rs`, with pause points);
 `a_consumer_taken_during_emits_receives_every_fact_after_its_route_once_and_in_order`,

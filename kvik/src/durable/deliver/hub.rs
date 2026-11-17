@@ -27,7 +27,8 @@ pub(crate) struct Hub {
     pub(crate) fault: Mutex<Option<LogFault>>,
     pub(crate) closed: AtomicBool,
     /// A consumer is known or being taken; never lowered. Until then an `emit` leaves the timers and the read-back of
-    /// its batch to the `kvik-deliver` thread (Q-706).
+    /// its batch to the `kvik-deliver` thread (Q-706). Raised at open when the start found a consumer only as a
+    /// precaution: a consumer not taken in this run is neither fed nor evaluated.
     consumers: AtomicBool,
     /// When the timers last ran, on the process's clock: the `kvik-deliver` thread runs them only when no call has
     /// for a second, so calls that run them (emits, polls, `tick`) keep the order the model backend gives; and not
