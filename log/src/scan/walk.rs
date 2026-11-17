@@ -43,6 +43,7 @@ enum Link {
 pub(crate) struct Walks {
     links: BTreeMap<u64, Link>,
     pruned: u64,
+    walked: Vec<u64>,
 }
 
 enum Judged {
@@ -125,7 +126,9 @@ impl Walks {
             self.pruned = o;
         }
         let incomplete = |fault| BatchRead::Incomplete { fault };
-        let mut walked = Vec::new();
+        let mut walked = std::mem::take(&mut self.walked);
+        walked.clear();
+        let mut judged = None;
         let mut p = o;
         let end = loop {
             match self.links.get(&p).copied() {
@@ -143,34 +146,43 @@ impl Walks {
                         p = next;
                     }
                     Judged::Stop(e) => {
-                        self.links.insert(p, Link::At(e));
+                        judged = Some(e);
                         break Some(e);
                     }
                     Judged::TooLong => break None,
                 },
             }
         };
-        for w in walked {
-            if w != p {
-                self.links.insert(w, Link::Jump(p));
+        let read = match end {
+            None => incomplete(BatchFault::Disagreement),
+            Some(e) if e.data_end.is_some_and(|d| d - o > MAX_BATCH_DATA) => {
+                incomplete(BatchFault::Disagreement)
             }
-        }
-        let Some(e) = end else {
-            return incomplete(BatchFault::Disagreement);
+            Some(e) => match e.stop {
+                Stop::Fault(f) => incomplete(f),
+                Stop::Refuse(element) => {
+                    BatchRead::Refused(FormatError::Unsupported { offset: p, element })
+                }
+                Stop::Commit(None) => incomplete(BatchFault::Content),
+                Stop::Commit(Some(c)) if c.batch_bytes == p - o => {
+                    read_judged_batch(reads, id, o, limit, min_first)
+                }
+                Stop::Commit(Some(_)) => incomplete(BatchFault::Disagreement),
+            },
         };
-        if e.data_end.is_some_and(|d| d - o > MAX_BATCH_DATA) {
-            return incomplete(BatchFault::Disagreement);
-        }
-        match e.stop {
-            Stop::Fault(f) => incomplete(f),
-            Stop::Refuse(element) => {
-                BatchRead::Refused(FormatError::Unsupported { offset: p, element })
+        // A kept batch ends past every block walked, and later reads start at or past its end, so its verdicts are
+        // never asked for again (Q-873).
+        if !matches!(read, BatchRead::Complete(_)) {
+            if let Some(e) = judged {
+                self.links.insert(p, Link::At(e));
             }
-            Stop::Commit(None) => incomplete(BatchFault::Content),
-            Stop::Commit(Some(c)) if c.batch_bytes == p - o => {
-                read_judged_batch(reads, id, o, limit, min_first)
+            for &w in &walked {
+                if w != p {
+                    self.links.insert(w, Link::Jump(p));
+                }
             }
-            Stop::Commit(Some(_)) => incomplete(BatchFault::Disagreement),
         }
+        self.walked = walked;
+        read
     }
 }

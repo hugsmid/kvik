@@ -3,6 +3,7 @@
 use crate::batch::MAX_BATCH_DATA;
 use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, MAX_BODY_LEN, RawBlock, peek_raw, read_block_with,
+    read_body,
 };
 use crate::body::{COMMIT_LEN, DataPrefix};
 use crate::content::check_block;
@@ -120,6 +121,9 @@ pub(crate) struct Reads<'a> {
     headers: u64,
     body: u64,
     pub(crate) failed: FailedReads,
+    /// The last two valid headers read, with their offsets: a candidate's framing and its read in full ask for the
+    /// same headers in turn.
+    recent: [Option<(u64, BlockHeader, [u8; BLOCK_HEADER_LEN])>; 2],
 }
 
 impl<'a> Reads<'a> {
@@ -132,6 +136,7 @@ impl<'a> Reads<'a> {
             headers: 0,
             body: 0,
             failed: FailedReads::new(MAX_BATCH_DATA),
+            recent: [None; 2],
         }
     }
 
@@ -182,13 +187,27 @@ impl<'a> Reads<'a> {
         limit: u64,
     ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         self.headers += 1;
-        peek_raw(self.bytes, offset, limit)
+        self.recent_at(offset, limit).or_else(|| {
+            let found = peek_raw(self.bytes, offset, limit)?;
+            self.recent = [Some((offset, found.0, found.1)), self.recent[0]];
+            Some(found)
+        })
+    }
+
+    fn recent_at(&self, offset: u64, limit: u64) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
+        let fits = offset.checked_add(BLOCK_HEADER_LEN as u64)? <= limit;
+        self.recent
+            .iter()
+            .flatten()
+            .find(|r| r.0 == offset && fits)
+            .map(|r| (r.1, r.2))
     }
 
     pub(crate) fn block(&mut self, offset: u64, limit: u64) -> Result<RawBlock<'a>, BlockFault> {
         self.headers += 1;
-        let (sums, direct) = (&mut self.sums, &mut self.direct);
-        read_block_with(self.bytes, offset, limit, |at, body| {
+        let known = self.recent_at(offset, limit);
+        let (bytes, sums, direct) = (self.bytes, &mut self.sums, &mut self.direct);
+        let crc = |at, body: &[u8]| {
             let len = body.len() as u64;
             match sums.as_mut().and_then(|t| t.range(at, len)) {
                 Some(c) => c,
@@ -197,6 +216,10 @@ impl<'a> Reads<'a> {
                     crc32c(body)
                 }
             }
-        })
+        };
+        match known {
+            Some((h, raw)) => read_body(bytes, offset, limit, h, raw, crc),
+            None => read_block_with(bytes, offset, limit, crc),
+        }
     }
 }

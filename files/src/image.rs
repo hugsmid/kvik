@@ -522,6 +522,47 @@ mod tests {
         f
     }
 
+    /// A valid block header at every 8 bytes up to 2 MiB before the end, each claiming a body of 4 KiB to 16 MiB with
+    /// a checksum that does not hold: every step's checksum is taken, and no record is read (Q-873).
+    fn headers_everywhere(len: usize) -> Vec<u8> {
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+            .encode()
+            .to_vec();
+        let s = f.len();
+        f.resize(len, 0);
+        f[s] = crate::record::record_type::LOST_RANGE;
+        f[s + 4..s + 8].copy_from_slice(&4096u32.to_le_bytes());
+        let mut x = 1u32;
+        let mut p = s;
+        while p + (2 << 20) < len {
+            let room = ((len - p - 24) as u32).min(MAX_BODY_LEN);
+            loop {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                f[p + 8..p + 12].copy_from_slice(&x.to_le_bytes());
+                let c = kvik_log::crc::crc32c(&f[p..p + 12]);
+                if f[p + 8] != 0 && (4096..=room).contains(&c) {
+                    f[p + 12..p + 16].copy_from_slice(&c.to_le_bytes());
+                    break;
+                }
+            }
+            p += 8;
+        }
+        f
+    }
+
+    #[test]
+    fn a_header_at_every_step_takes_one_checksum_a_step_in_both_readers() {
+        let f = headers_everywhere(3 << 20);
+        let len = f.len() as u64;
+        let (img, stats) = read_with_stats(&f, &[9; 16]);
+        assert!(img.unwrap().torn);
+        assert!(stats.headers_visited <= len / 8 + 1, "{stats:?}");
+        assert!(stats.within_manifest_bound(len), "{stats:?}");
+        let (r, stats) = kvik_log::manifest::read_manifest_with_stats(&f, &[9; 16]);
+        assert!(r.unwrap().torn);
+        assert!(stats.headers_visited <= len / 8 + 1, "{stats:?}");
+    }
+
     /// The crafted manifests against the restart budget, timed (Q-651). Run in a release build, one at a time:
     /// `cargo test --release -p kvik-files --lib -- --ignored --nocapture`.
     #[test]
@@ -530,23 +571,29 @@ mod tests {
         let window = crafted(20_000, 3_900_000);
         let own = crafted_with(20_000, 3_900_000, 2);
         let wide = valid_wide_records(16 << 20, 1 << 20);
+        let headers = headers_everywhere(16 << 20);
         for (name, f) in [
             ("failed reads in one window, ignorable fields", &window),
             ("failed reads in one window, repeated own fields", &own),
             ("valid wide records", &wide),
+            ("a header every 8 bytes (Q-873)", &headers),
         ] {
-            let t = std::time::Instant::now();
-            let (img, stats) = read_with_stats(f, &[9; 16]);
-            let whole = t.elapsed();
-            img.unwrap();
-            let t = std::time::Instant::now();
-            let _ = kvik_log::manifest::read_manifest_with_stats(f, &[9; 16]);
-            let start = t.elapsed();
+            // The best of five, as the machine is shared.
+            let (mut whole, mut start, mut stats) = (f64::INFINITY, f64::INFINITY, None);
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let (img, s) = read_with_stats(f, &[9; 16]);
+                whole = whole.min(t.elapsed().as_secs_f64());
+                img.unwrap();
+                stats = Some(s);
+                let t = std::time::Instant::now();
+                let _ = kvik_log::manifest::read_manifest_with_stats(f, &[9; 16]);
+                start = start.min(t.elapsed().as_secs_f64());
+            }
+            let stats = stats.unwrap();
             println!(
-                "{name}, {} MiB: whole-file reader {:.3} s, start's reader {:.3} s, {stats:?}",
+                "{name}, {} MiB: whole-file reader {whole:.3} s, start's reader {start:.3} s, {stats:?}",
                 f.len() >> 20,
-                whole.as_secs_f64(),
-                start.as_secs_f64()
             );
         }
     }

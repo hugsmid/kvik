@@ -2,7 +2,7 @@
 //!
 //! All checksums go through this module, so the implementation can be swapped in one place.
 
-use crc::{CRC_32_ISCSI, Crc, Digest, Table};
+use crc::{CRC_32_ISCSI, Crc, Table};
 
 static CASTAGNOLI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI);
 
@@ -22,22 +22,35 @@ thread_local! {
     pub(crate) static BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// An incremental CRC32C over several slices.
-pub(crate) struct Crc32c(Digest<'static, u32, Table<16>>);
+/// An incremental CRC32C over several slices: short slices, such as the header fields a batch checksum covers, by
+/// slice-by-8 steps on the register, long ones by the crate's tables.
+pub(crate) struct Crc32c(u32);
 
 impl Crc32c {
     pub(crate) fn new() -> Self {
-        Self(CASTAGNOLI.digest())
+        Self(!0)
     }
 
     pub(crate) fn update(&mut self, bytes: &[u8]) {
         #[cfg(test)]
         BYTES_HASHED.with(|c| c.set(c.get() + bytes.len() as u64));
-        self.0.update(bytes);
+        if bytes.len() >= 64 {
+            let mut d = CASTAGNOLI.digest_with_initial(self.0.reverse_bits());
+            d.update(bytes);
+            self.0 = !d.finalize();
+            return;
+        }
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &w in words {
+            self.0 = step8(self.0, w);
+        }
+        for &b in rest {
+            self.0 = (self.0 >> 8) ^ SLICES[0][((self.0 ^ u32::from(b)) & 0xFF) as usize];
+        }
     }
 
     pub(crate) fn finish(self) -> u32 {
-        self.0.finalize()
+        !self.0
     }
 }
 
@@ -348,6 +361,26 @@ mod tests {
         c.update(b"1234");
         c.update(b"56789");
         assert_eq!(c.finish(), crc32c(b"123456789"));
+    }
+
+    #[test]
+    fn incremental_over_short_and_long_slices_in_any_order_equals_whole() {
+        let bytes: Vec<u8> = (0..4_096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        for cuts in [
+            &[0usize, 1, 9, 73, 80, 200, 1_000][..],
+            &[5, 6, 70, 71, 140, 4_000],
+            &[64, 128, 129],
+        ] {
+            let mut c = Crc32c::new();
+            let mut at = 0;
+            for &cut in cuts.iter().chain(&[bytes.len()]) {
+                c.update(&bytes[at..cut]);
+                at = cut;
+            }
+            assert_eq!(c.finish(), crc32c(&bytes), "{cuts:?}");
+        }
     }
 
     #[test]

@@ -142,10 +142,16 @@ impl Ends {
 
     /// The entry of the start `p` in the block that ends at `end`, its successors in the block having theirs.
     fn read(&mut self, reads: &mut Reads<'_>, p: u64, end: u64, limit: u64) -> u32 {
-        let header = slice(reads.bytes, p, 8)
-            .is_some_and(|w| u64_at(w, 0) != 0)
-            .then(|| reads.peek(p, limit))
-            .flatten();
+        // A start that no header there could make part of a batch is passed before its checksum is computed.
+        let plausible = slice(reads.bytes, p, 8).is_some_and(|w| {
+            let len = u64::from(u32::from_le_bytes([w[4], w[5], w[6], w[7]]));
+            match w[0] {
+                0 | block_type::SEGMENT_INDEX | block_type::TRAILER => false,
+                block_type::COMMIT => len == COMMIT_LEN as u64,
+                _ => BLOCK_HEADER_LEN as u64 + len.next_multiple_of(8) <= MAX_BATCH_DATA,
+            }
+        });
+        let header = plausible.then(|| reads.peek(p, limit)).flatten();
         let Some(h) = header else {
             return NONE;
         };

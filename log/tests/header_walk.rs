@@ -5,8 +5,8 @@ mod support;
 
 use std::time::Instant;
 
-use kvik_log::block::block_type;
-use kvik_log::body::COMMIT_LEN;
+use kvik_log::block::{BlockHeader, FLAG_SKIPPABLE, block_type, encode_block};
+use kvik_log::body::{COMMIT_LEN, Commit};
 use kvik_log::crc::crc32c;
 use kvik_log::header::{FileHeader, HEADER_LEN, kind};
 use kvik_log::manifest::read_manifest_with_stats;
@@ -100,6 +100,105 @@ fn named_walks(mut f: Vec<u8>, len: usize) -> Vec<u8> {
     f
 }
 
+/// From `s`, groups of `n` skippable block headers at 16-byte steps, each claiming a body with a wrong checksum that
+/// runs to its own commit block, the commits after the group in reverse: every header is a candidate whose framing and
+/// `batch_crc32c` hold, read in full and rejected on its body checksum, so it checks no body.
+fn framed_candidates(mut f: Vec<u8>, len: usize, n: usize) -> Vec<u8> {
+    let mut base = f.len().next_multiple_of(16);
+    f.resize(len, 0);
+    while base + 80 * n <= len {
+        let e = base + 16 * n;
+        for i in 0..n {
+            let (o, ci) = (base + 16 * i, e + 64 * (n - 1 - i));
+            let h = BlockHeader {
+                block_type: 0x90,
+                flags: FLAG_SKIPPABLE,
+                body_len: (ci - o - 16) as u32,
+                body_crc32c: 0xDEAD_BEEF,
+            }
+            .encode();
+            f[o..o + 16].copy_from_slice(&h);
+            let mut d = ID.store_id.to_vec();
+            d.extend_from_slice(&ID.file_id.to_le_bytes());
+            d.extend_from_slice(&(o as u64).to_le_bytes());
+            d.extend_from_slice(&h[..12]);
+            let commit = Commit {
+                generation: ID.generation,
+                block_count: 1,
+                first_sequence: 1,
+                last_sequence: 1,
+                commit_time: 0,
+                batch_bytes: (ci - o) as u64,
+                batch_crc32c: crc32c(&d),
+            };
+            let mut out = Vec::new();
+            encode_block(block_type::COMMIT, 0, &commit.encode(), &mut out).unwrap();
+            f[ci..ci + 64].copy_from_slice(&out);
+        }
+        base += 80 * n;
+    }
+    f
+}
+
+/// From `s`, candidates of `n` empty skippable blocks and a commit block whose framing and `batch_crc32c` hold, the
+/// last block's body checksum wrong: each is read in full to its last block and checks no body.
+fn skippable_chains(mut f: Vec<u8>, len: usize, n: usize) -> Vec<u8> {
+    let mut o = f.len().next_multiple_of(16);
+    f.resize(len, 0);
+    while o + 16 * n + 64 <= len {
+        let mut d = ID.store_id.to_vec();
+        d.extend_from_slice(&ID.file_id.to_le_bytes());
+        d.extend_from_slice(&(o as u64).to_le_bytes());
+        for i in 0..n {
+            let h = BlockHeader {
+                block_type: 0x90,
+                flags: FLAG_SKIPPABLE,
+                body_len: 0,
+                body_crc32c: u32::from(i + 1 == n),
+            }
+            .encode();
+            f[o + 16 * i..o + 16 * i + 16].copy_from_slice(&h);
+            d.extend_from_slice(&h[..12]);
+        }
+        let ci = o + 16 * n;
+        let commit = Commit {
+            generation: ID.generation,
+            block_count: n as u32,
+            first_sequence: 1,
+            last_sequence: 1,
+            commit_time: 0,
+            batch_bytes: (ci - o) as u64,
+            batch_crc32c: crc32c(&d),
+        };
+        let mut out = Vec::new();
+        encode_block(block_type::COMMIT, 0, &commit.encode(), &mut out).unwrap();
+        f[ci..ci + 64].copy_from_slice(&out);
+        o = ci + 64;
+    }
+    f
+}
+
+/// From `s`, complete batches of a facts block and `n` empty skippable blocks, read by boundary reads after damage.
+fn skippable_batches(mut f: Vec<u8>, len: usize, n: usize) -> Vec<u8> {
+    let mut seq = 1;
+    loop {
+        let mut b = facts_batch(seq, T0, &[(1, T0, 1.0)]);
+        for _ in 0..n {
+            b.push_unknown(0x90, FLAG_SKIPPABLE, Vec::new()).unwrap();
+        }
+        let at = f.len().next_multiple_of(8);
+        let bytes = b.encode(&ID, at as u64, T0).unwrap();
+        if at + bytes.len() > len {
+            break;
+        }
+        f.resize(at, 0);
+        f.extend_from_slice(&bytes);
+        seq += 1;
+    }
+    f.resize(len, 0);
+    f
+}
+
 fn damaged_start() -> Vec<u8> {
     let mut f = vec![0u8; HEADER_LEN + 8];
     f[HEADER_LEN..].fill(0xFF);
@@ -165,6 +264,16 @@ fn commits_naming_data_headers_have_each_header_read_once() {
     agrees_and_reads_each_header_once(&f, f.len() as u64 / 64);
 }
 
+#[test]
+fn framed_candidates_check_no_body_and_agree_with_the_walked_chains() {
+    let f = framed_candidates(damaged_start(), 2 << 20, 4_096);
+    let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
+    let (walked, _) = legacy::scan_with_walked_links(&f, &ID, ScanLimit::End);
+    assert_eq!(r, walked);
+    assert_eq!(stats.bytes_body_checked, 0);
+    assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+}
+
 fn timed_manifest(name: &str, m: &[u8]) {
     let (mut best, mut stats) = (f64::INFINITY, ScanStats::default());
     for _ in 0..5 {
@@ -193,6 +302,27 @@ fn crafted_header_walks_timed() {
     ] {
         let f = headers_everywhere(damaged_start(), len, t);
         timed(&format!("segment, a header every 8 bytes, {what}"), &f);
+    }
+    for n in [1_000, 500_000] {
+        let f = skippable_batches(damaged_start(), 64 << 20, n);
+        timed(
+            &format!("segment, kept batches of {n} empty skippable blocks after damage"),
+            &f,
+        );
+    }
+    for n in [1_000, 500_000] {
+        let f = skippable_chains(damaged_start(), 64 << 20, n);
+        timed(
+            &format!("segment, chains of {n} empty skippable blocks read in full"),
+            &f,
+        );
+    }
+    for n in [1_000, 100_000] {
+        let f = framed_candidates(damaged_start(), 64 << 20, n);
+        timed(
+            &format!("segment, candidates read in full, groups of {n}"),
+            &f,
+        );
     }
     let f = named_walks(damaged_start(), 64 << 20);
     timed("segment, commits naming data headers", &f);
