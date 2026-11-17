@@ -382,8 +382,10 @@ fn without_late(facts: &[Vec<Vec<Fact>>]) -> Vec<Vec<Vec<Fact>>> {
         .collect()
 }
 
-#[test]
-fn the_durable_backend_decides_as_the_model_does() {
+/// Runs the differential histories, each with windows of a few dozen facts (`limits.window_memory` of 8 KiB, so that
+/// the byte bound sends keys to the slow path, Q-751) when `small` gives true. Returns the histories run with small
+/// windows and with the default, and the readings decided by the slow path.
+fn differential(small: impl Strategy<Value = bool>) -> (u64, u64, u64) {
     // Each case opens a durable store; a quarter of the configured cases keeps the deep run in bounds.
     let cases = (ProptestConfig::default().cases / 4).max(16);
     let mut runner = TestRunner::new(ProptestConfig {
@@ -391,8 +393,9 @@ fn the_durable_backend_decides_as_the_model_does() {
         failure_persistence: None,
         ..ProptestConfig::default()
     });
+    let (smalls, defaults, slow) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     runner
-        .run(&steps(), |history| {
+        .run(&(steps(), small), |(history, small)| {
             let m_clock = ManualClock::new(start());
             let m_config = StoreConfig::new(
                 format!("kvik-test/differential/{}", next()),
@@ -404,10 +407,11 @@ fn the_durable_backend_decides_as_the_model_does() {
             let w = World::new("differential");
             let mut config = w.config();
             config.log.min_sync_interval = Duration::ZERO;
-            // Every other history with windows of a few dozen facts, so that the byte budget sends keys to the
-            // slow path (Q-751).
-            if next().is_multiple_of(2) {
+            if small {
                 config.limits.window_memory = 8 << 10;
+                smalls.fetch_add(1, Ordering::Relaxed);
+            } else {
+                defaults.fetch_add(1, Ordering::Relaxed);
             }
             // A restart opens with the site zone in force (`docs/api.md` Opening).
             let in_zone = |c: &StoreConfig, z: &str| {
@@ -417,7 +421,7 @@ fn the_durable_backend_decides_as_the_model_does() {
             };
             let (m, model) = run(&|z| in_zone(&m_config, z), &m_clock, &history);
             let (d, durable) = run(&|z| in_zone(&config, z), &w.clock, &history);
-            SLOW.fetch_add(durable.stats().ingest.slow_path, Ordering::Relaxed);
+            slow.fetch_add(durable.stats().ingest.slow_path, Ordering::Relaxed);
             prop_assert_eq!(&m.out, &d.out);
             prop_assert_eq!(&m.infos, &d.infos);
             prop_assert_eq!(without_late(&m.facts), without_late(&d.facts));
@@ -438,14 +442,27 @@ fn the_durable_backend_decides_as_the_model_does() {
             Ok(())
         })
         .unwrap();
-    assert!(
-        SLOW.load(Ordering::Relaxed) > 0,
-        "some history takes the slow path"
-    );
+    (
+        smalls.into_inner(),
+        defaults.into_inner(),
+        slow.into_inner(),
+    )
 }
 
-/// Readings the differential histories decided by the slow path.
-static SLOW: AtomicU64 = AtomicU64::new(0);
+/// Half the histories, chosen with each history, run with small windows.
+#[test]
+fn the_durable_backend_decides_as_the_model_does() {
+    let (small, default, slow) = differential(prop::bool::weighted(0.5));
+    assert!(small > 0 && default > 0, "{small} small, {default} default");
+    assert!(slow > 0, "some history takes the slow path");
+}
+
+#[test]
+fn small_windows_decide_as_the_model_does() {
+    let (small, default, slow) = differential(Just(true));
+    assert_eq!(default, 0);
+    assert!(small > 0 && slow > 0);
+}
 
 fn next() -> u64 {
     static N: AtomicU64 = AtomicU64::new(0);

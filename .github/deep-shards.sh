@@ -43,7 +43,8 @@ log-reader      log   reader
 log-pacing      log   pacing
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
-kvik-differential kvik differential
+kvik-differential kvik differential the_durable_backend_decides_
+kvik-differential-small kvik differential small_windows_decide_
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
