@@ -8,7 +8,11 @@ use kvik_files::catalogue::Catalogue;
 use kvik_files::image::read;
 use kvik_files::rebuild::{Finality, plan, rebuild_manifest};
 use kvik_files::record::{Body, Record};
+use std::sync::Arc;
+
+use kvik_log::fs::{Fs, MemFs, OpenMode};
 use kvik_log::manifest::{LossCause, read_manifest};
+use kvik_log::store::{NewStore, StoreDir};
 use proptest::prelude::*;
 use support::rebuild::*;
 use support::*;
@@ -300,4 +304,68 @@ fn two_corrupt_merges_retire_every_input_down_the_chain() {
     let (_, img) = image_with_corrupt(&gone, &[merges[0], merges[1]]);
     let p = plan(&input(&img, &gone), &FakeVerifier::default()).unwrap();
     assert_eq!(p.undescribed, vec![comp_ref(3)]);
+}
+
+/// Q-871, format A.12 Open: a rebuild stopped between renaming `MANIFEST.new` over `MANIFEST` and its directory sync,
+/// then a restart on the same boot. Opening the store syncs its directory before anything is appended, so a later
+/// power loss never brings the corrupt manifest back in place of the rebuilt one and the records appended to it.
+#[test]
+fn opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable() {
+    let (h, i) = lost_record_history();
+    let (bytes, _) = image_with_corrupt(&h, &[i]);
+    let store = || {
+        let fs = MemFs::new();
+        let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+        let new = NewStore {
+            store_id: STORE_ID,
+            created_at: T0,
+            site_zone: "Etc/UTC".into(),
+            tzdata: "2026a".into(),
+            software: "kvik test".into(),
+        };
+        drop(StoreDir::open(afs.clone(), &dir(), Some(&new)).unwrap());
+        let f = fs.open(&manifest_path(), OpenMode::ReadWrite).unwrap();
+        f.set_len(0).unwrap();
+        f.write_at(&bytes, 0).unwrap();
+        f.sync_all().unwrap();
+        (fs, afs)
+    };
+    let rebuild = |fs: &MemFs| {
+        rebuild_manifest(
+            fs,
+            &dir(),
+            STORE_ID,
+            state(&h),
+            &FakeVerifier::default(),
+            Finality::Final,
+            NOW,
+        )
+    };
+    let ops_to_rename = {
+        let (fs, _) = store();
+        fs.clear_ops();
+        rebuild(&fs).unwrap();
+        fs.ops()
+            .iter()
+            .position(|o| o.op == kvik_log::fs::FaultOp::Rename)
+            .unwrap()
+            + 1
+    };
+    for seed in 0..32 {
+        let (fs, afs) = store();
+        fs.crash_after(ops_to_rename);
+        assert!(rebuild(&fs).is_err());
+        fs.restart();
+        let store = StoreDir::open(afs, &dir(), None).unwrap();
+        let Opened::Ready(mut app) = Appender::open(&fs, &dir(), STORE_ID, 0).unwrap() else {
+            panic!("the rebuilt manifest reads")
+        };
+        let appended = app.append(Body::Empty, NOW).unwrap();
+        drop((app, store));
+        fs.power_loss_partial(seed);
+        fs.restart();
+        let img = read(&fs.read(&manifest_path()).unwrap(), &STORE_ID).unwrap();
+        assert!(!img.is_corrupt(), "seed {seed}");
+        assert_eq!(img.last_epoch(), appended, "seed {seed}");
+    }
 }

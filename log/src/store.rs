@@ -282,6 +282,13 @@ impl StoreDir {
         };
         let store_bytes = descriptor.encode()?;
         fs.create_dir_all(dir)?;
+        // The store's own entry in its parent (format A.12 Creation, Q-871); a stop before this sync leaves no
+        // `STORE`, so the next open creates again and syncs it then.
+        let parent = dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs.sync_dir(parent)?;
         let lock = take_lock(&*fs, dir)?;
         for n in left
             .iter()

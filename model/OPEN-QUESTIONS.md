@@ -71,7 +71,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-267 | `api.md` (log seams); roadmap 6.3b, 6.3c | The start options 8.3c does not act on |
 | Q-268 | §7 Readers, §8 Restore step 1; `format.md` A.10 | A reader on a restored directory |
 | Q-265 | §8 Generations; `api.md` Backup and restore | When a writer reads the claims, and what it does on a higher one |
-| Q-871 | `format.md` A.12 Open | A store creation cut short between its rename and the directory sync |
+| Q-871 | `format.md` A.12 Creation and Open | Store directory entries a stop or a power loss can undo |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1530,21 +1530,41 @@ commit path: `docs/measurements/4.8-commit-latency.md`, Q-630 note. Tests: `log/
 `the_only_segment_lost_before_the_timed_mark_sync_is_a_recorded_lost_range_from_the_anchor`,
 `the_first_batch_in_each_segment_forces_exactly_one_mark_sync` (mark syncs counted through `MemFs`) and
 `a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position` (now two ranges: up to the
-mark by corruption, above it by the entry's gap). Tests whose scenario needed a first batch beyond the mark now
-commit one batch first (`log/tests/recovery.rs`, `log/tests/writer.rs`, `log/tests/threads.rs`).
+mark by corruption, above it by the entry's gap), and
+`losing_a_rolled_segment_before_the_timed_mark_sync_is_data_lost_at_the_marks_position_in_every_generation` (the
+segment after a timed seal). Tests whose scenario needed a first batch beyond the mark now commit one batch first
+(`log/tests/recovery.rs`, `log/tests/writer.rs`, `log/tests/threads.rs`). The log-against-model differentials run the
+model with its mark synced at every commit (`log/tests/model_histories.rs`, header), so they do not see the rule; the
+model's side rests on `model/tests/rules.rs` `s3_the_first_batch_in_a_segment_syncs_the_mark`, and matching the two
+timers stays the follow-up that file names.
 
-## Q-871 — A store creation cut short between its rename and the directory sync
+## Q-871 — Store directory entries a stop or a power loss can undo
 Recorded by the implementation of the Q-630 ruling (the crash sweep of
 `log/tests/recovery.rs` `a_crash_while_creating_the_store_or_in_its_first_start_is_recovered` found it once the
-commit path's operations changed). For the owner's acceptance.
-**Scenario.** Store creation writes `STORE.tmp`, renames it to `STORE` and syncs the directory (`format.md` A.12). A
-process stop after the rename and before that sync, then a restart on the same boot, finds `STORE` and opened the
-store without syncing the directory; the first start then wrote the manifest, log and mark. A power loss later can
-undo the rename, leaving files under `log/` with no `STORE`: `NotAStore`, and the store cannot be opened.
+commit path's operations changed); widened at its review. For the owner's acceptance.
+**Scenario.** (1) Store creation writes `STORE.tmp`, renames it to `STORE` and syncs the directory (`format.md`
+A.12). A process stop after the rename and before that sync, then a restart on the same boot, found `STORE` and
+opened the store without syncing the directory; the first start then wrote the manifest, log and mark. A power loss
+later could undo the rename, leaving files under `log/` with no `STORE`: `NotAStore`, and the store could not be
+opened. (2) A rebuild renames `MANIFEST.new` over `MANIFEST` and then syncs the directory (A.14); a stop between the
+two, a restart on the same boot that appends to the rebuilt manifest, then a power loss could bring the corrupt
+manifest back and lose every record appended since. (3) Creation never synced the store directory's parent, so on a
+file system that does not carry a new directory's entry along with a sync inside it, a power loss could leave no
+store directory at all after acknowledged data (`spec.md` §3 Sync primitive asks for a sync after a create).
 **Decided.** Opening a store whose `STORE` is present syncs the store directory first (`log/src/store.rs`
-`StoreDir::open`; `format.md` A.12 Open), so the rename is durable before anything else is written. One directory sync
-more per open; no format or interface change. Test: `log/tests/writer.rs`
-`opening_a_store_makes_a_creations_rename_durable`.
+`StoreDir::open`; `format.md` A.12 Open), so any rename in it cut short before its directory sync, creation's or a
+rebuild's, is durable before anything else is written: one directory sync more per open. Creation syncs the parent of
+the store directory right after creating it, before anything is created inside (A.12 Creation); a stop before that
+sync leaves no `STORE`, so the next open creates again and syncs it then, and an open of a finished store needs no
+parent sync. Directories above the parent that creation makes are the caller's to make durable. A parent that the
+process cannot open for reading now makes creation fail. No format or interface change. Tests: `log/tests/writer.rs`
+`opening_a_store_makes_the_rename_of_a_creation_stopped_after_it_durable` (a process stop after the rename),
+`opening_a_store_makes_a_creations_rename_durable` (a failed last sync: covered only as far as a later directory sync
+can be trusted, which `spec.md` §3 does not promise, so the stop is the case that counts) and
+`creating_a_store_syncs_the_parent_of_its_directory_first`; `files/tests/rebuild.rs`
+`opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable`. `MemFs` has no directories (directories
+exist by their files), so the loss of the store directory's own entry cannot be simulated: the parent's sync is
+pinned by the operations, not by a power loss.
 
 ## Open at v0.2
 
@@ -1631,7 +1651,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-267 | 6.3c | `recorder` with 6.3c's `FileRecorder`, `sealed` with 6.3b's `seal_segment_described` |
 | Q-268 | 8.3 | Decided by roadmap 8.3c; for the owner's acceptance |
 | Q-265 | 8.1d | Decided by roadmap 8.3c (the driver's side); the store's read-only state and fatal health are 8.1d's |
-| Q-871 | 8.3 | Decided with the Q-630 work: opening a store syncs its directory; for the owner's acceptance |
+| Q-871 | 8.3 | Decided with the Q-630 work and widened at its review: opening a store syncs its directory, creation syncs its parent; for the owner's acceptance |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
