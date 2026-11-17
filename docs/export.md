@@ -98,7 +98,7 @@ where `<s1>/<s2>/<s3>` is the series' display name split at its two `/` (the own
 Reading the bucket: a query reads one file name, here the whole months of the current view, since a folder can also
 hold other views and partial months whose rows would be counted again. Hive-style readers add `site`, `area`,
 `device`, `metric` and `month` columns and guess their types, so an all-digit segment such as `0042` is read as the
-number 42 and `month` as a date. Declare all five as strings:
+number 42. Declare all five as strings:
 
 ```text
 DuckDB:  read_parquet('<root>/**/current.parquet', hive_partitioning = true, hive_types = {'site': VARCHAR, 'area': VARCHAR, 'device': VARCHAR, 'metric': VARCHAR, 'month': VARCHAR})
@@ -106,13 +106,13 @@ pyarrow: pyarrow.dataset.dataset(glob.glob(root + "/**/current.parquet", recursi
 polars:  polars.scan_parquet(root + "/**/current.parquet", hive_partitioning=True, hive_schema={k: polars.String for k in ("site", "area", "device", "metric", "month")})
 ```
 
-A filter on a partition column prunes the folders read: one device across all its metrics, or one metric across
-every device, here with the decoded segment values:
+A filter on a partition column, compared with the decoded segment, prunes the folders read: one area, one device
+across all its metrics, or one metric across every device:
 
 ```text
 DuckDB:  SELECT * FROM read_parquet(...) WHERE device = 'line-1'
          SELECT device, t, value FROM read_parquet(...) WHERE metric = 'power'
-pyarrow: dataset.to_table(filter=pyarrow.compute.field("device") == "line-1")
+pyarrow: dataset.to_table(filter=pyarrow.compute.field("area") == "plant")
 polars:  lazy.filter(polars.col("metric") == "power").collect()
 ```
 
