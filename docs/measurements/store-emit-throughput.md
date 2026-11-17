@@ -131,4 +131,10 @@ shared virtual machine. **Indicative.** Ranges are min–max of the three runs.
   before they took turns on the deliverer's lock. CPU per reading barely changes; the gain is wall time.
 - **16 writers, 2 readings per call:** about 1.3× the calls per second. The callers no longer queue on the
   deliverer's lock for the timers and the read-back after each acknowledgement.
+- The gain needs a second core: the store used 1.93–1.96 cores for one writer after the change against 1.35–1.39
+  before, so on a single core the caller and `kvik-deliver` would take turns again.
+- How far `kvik-deliver` runs behind (a separate probe: four writers, 300 calls of 500 readings each, in-memory files,
+  three runs; **indicative**): at most 3,500 to 6,000 readings behind the last acknowledged position of 600,000, 0 to
+  2,000 behind when the writers stopped, and the first `take_consumer` after the burst took 0.1 to 3 ms. No backlog
+  builds up.
 - A store with a consumer registered behaves as before.
