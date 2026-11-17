@@ -1384,7 +1384,7 @@ tighter budget, `log/tests/scan_bound.rs` (the differential property against the
 **Scenario.** After Q-651, a crafted segment whose bodies are definition entries, each holding up to 65,536 state
 names of one to four bytes (8 bytes of body a name), costs about 5 ns a byte to check: telling the names distinct
 (Q-182) costs a hash per name, about 30 ns on the machine measured, and nothing else in any body costs more than about
-2 ns a byte. Against the bound (264 MiB of bodies at 64 MiB, of which 192 MiB are failed reads that nest such bodies)
+2 ns a byte. Against the bound (264 MiB of bodies at 64 MiB, of which 192 MiB are failed reads of such bodies nested in one another)
 that is about 1.5 s at 64 MiB and 0.4 s at 16 MiB, above the 1 s restart budget; 64 MiB of such definitions kept, each
 checked once, measured 0.36 to 0.55 s. A sort of packed keys costs about the same per name on that machine.
 **Now.** The figures are stated in `format.md`, `design.md` and `SECURITY.md` as the one case above the budget.
