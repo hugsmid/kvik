@@ -21,6 +21,8 @@ const S: i64 = 1_000_000_000;
 const WALL: i64 = 1_767_225_600 * S;
 /// Every series' S; `late` by the reference is more than 20 s behind it.
 const STALENESS: Duration = Duration::from_secs(10);
+/// Every series' lateness bound: readings over an hour old are still decided by the reference.
+const LATENESS: Duration = Duration::from_secs(7_200);
 
 /// The log: every fact queued, with its call and position, shown once the log has completed its call, less the lost
 /// positions.
@@ -128,7 +130,7 @@ fn define(registry: &mut crate::durable::registry::Registry) {
     .staleness(STALENESS);
     let versioned = gauge.clone().versioned(ChangedAtKind::Version);
     for (id, spec) in [(1, gauge.clone()), (2, versioned), (3, gauge)] {
-        let def = definition_of(&spec, id, Duration::from_secs(300)).unwrap();
+        let def = definition_of(&spec, id, LATENESS).unwrap();
         registry.apply(&Entry::Definition(Box::new(def)));
     }
 }
@@ -349,7 +351,12 @@ impl Rig {
 }
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
-    let secs = prop_oneof![6 => -150i64..70, 1 => -420i64..-300, 1 => 60i64..120];
+    let secs = prop_oneof![
+        6 => -150i64..70,
+        1 => -420i64..-300,
+        1 => -4_000i64..-900,
+        1 => 60i64..120
+    ];
     let reading = (1u32..4, secs, 0u8..3, 0u64..3);
     let mask = prop::collection::vec(prop::bool::weighted(0.6), 1..6);
     prop::collection::vec(

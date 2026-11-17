@@ -35,6 +35,21 @@ fn with_observed(mut d: Decider) -> Decider {
     d
 }
 
+/// Series 6, as series 5 but late by the lateness bound only after a day, so that the reference alone decides.
+fn with_observed_for_a_day(mut d: Decider) -> Decider {
+    let spec = SeriesSpec::new(
+        "a/b/energy",
+        Kind::Gauge {
+            value: ValueType::F64,
+        },
+        "W",
+    )
+    .staleness(Duration::from_secs(10));
+    let def = definition_of(&spec, 6, Duration::from_secs(86_400)).unwrap();
+    d.registry.apply(&Entry::Definition(Box::new(def)));
+    d
+}
+
 fn placed(mem: &Mem, call: u64) -> Option<(LogPos, LogPos)> {
     let mut ns = mem
         .facts
@@ -408,5 +423,73 @@ fn a_loss_found_inside_a_range_already_reported_too_wide_forgets_its_facts() {
         d.history.held().revised_keys,
         1,
         "the same damage found again forgets nothing"
+    );
+}
+
+#[test]
+fn a_reference_fact_several_parts_below_the_first_is_found_by_the_doubling_walk() {
+    let mut d = with_observed_for_a_day(decider(History::default()));
+    let mut mem = Mem::default();
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(6, WALL - 3_600 * S, 1.0, None)],
+        Intent::Normal,
+        1,
+    );
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(6, WALL, 1.0, None)],
+        Intent::Normal,
+        2,
+    );
+    settle(&mut d, &mut mem, 3, &[(2, 2)]);
+    let p = commit(
+        &mut d,
+        &mut mem,
+        &[reading(6, WALL - 3_700 * S, 1.0, None)],
+        Intent::Normal,
+        3,
+    );
+    assert!(late(&p));
+    assert_eq!(mem.span_reads, 3, "15, 30 and 60 minutes");
+    assert_eq!(
+        d.history.reference(6),
+        Reference::Exact(Some(WALL - 3_600 * S))
+    );
+}
+
+#[test]
+fn a_reference_fact_found_below_an_incomplete_part_leaves_the_reference_at_most_its_old_value() {
+    let mut d = with_observed_for_a_day(decider(History::default()));
+    let mut mem = Mem::default();
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(6, WALL - 3_600 * S, 1.0, None)],
+        Intent::Normal,
+        1,
+    );
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(6, WALL, 1.0, None)],
+        Intent::Normal,
+        2,
+    );
+    settle(&mut d, &mut mem, 3, &[(2, 2)]);
+    mem.incomplete_from = Some(WALL - 600 * S);
+    let p = one(&d, &mut mem, reading(6, WALL - 3_700 * S, 1.0, None), 3);
+    assert!(late(&p));
+    assert_eq!(
+        p.references,
+        vec![(
+            6,
+            Reference::AtMost {
+                upper: WALL,
+                least: Some(WALL - 3_600 * S)
+            }
+        )]
     );
 }
