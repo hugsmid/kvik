@@ -698,4 +698,30 @@ mod parts_and_lookup {
             assert!(got.facts.is_empty(), "round {round}: {:?}", got.facts);
         }
     }
+
+    #[test]
+    fn a_refresh_and_a_lookup_decode_each_facts_block_once() {
+        let (fs, log) = store(60);
+        log.shutdown().unwrap();
+        let mut r = reader(&fs, 45);
+        crate::facts::FACTS_DECODES.with(|c| c.set(0));
+        let events = r.refresh().unwrap().events;
+        let batches = events
+            .iter()
+            .filter(|e| matches!(e, ReadEvent::Batch(b) if b.recovery().is_none()))
+            .count() as u64;
+        assert!(batches >= 60);
+        assert_eq!(crate::facts::FACTS_DECODES.with(|c| c.get()), batches);
+        let wanted = [Wanted {
+            series_id: 3,
+            from: 0,
+            to: 0,
+        }];
+        let mut l = reader(&fs, 46);
+        crate::facts::FACTS_DECODES.with(|c| c.set(0));
+        let got = l.lookup(&wanted, &|_, _, _| false).unwrap();
+        assert_eq!(got.complete, [true]);
+        let first = crate::facts::FACTS_DECODES.with(|c| c.get());
+        assert!(first <= batches, "{first} decodes for {batches} batches");
+    }
 }

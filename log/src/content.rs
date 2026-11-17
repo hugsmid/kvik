@@ -178,22 +178,32 @@ impl BatchContent {
     /// The content of a complete batch, every body checked (A.5, A.6). Blocks of unknown, skippable type are
     /// skipped; unknown ignorable entries are counted in [`Entry::Ignored`] so that sequences still count.
     pub fn decode(batch: &Batch<'_>) -> Result<Self, BodyError> {
-        let mut items = Vec::new();
-        let mut received_at = None;
+        let mut bodies = Vec::with_capacity(batch.blocks.len());
         for d in &batch.blocks {
             let body = d.block.body;
             match d.block.header.block_type {
-                block_type::FACTS => {
-                    let f = FactsBlock::decode(body)?;
+                block_type::FACTS => bodies.push(DataBody::Facts(FactsBlock::decode(body)?)),
+                block_type::ENTRIES => bodies.push(DataBody::Entries(EntriesBlock::decode(body)?)),
+                _ => {}
+            }
+        }
+        Self::from_bodies(batch.commit.first_sequence, bodies)
+    }
+
+    /// The content of a complete batch whose data blocks of known type decoded to `bodies`, in order.
+    pub(crate) fn from_bodies(first_sequence: u64, bodies: Vec<DataBody>) -> Result<Self, BodyError> {
+        let mut items = Vec::new();
+        let mut received_at = None;
+        for b in bodies {
+            match b {
+                DataBody::Facts(f) => {
                     received_at.get_or_insert(f.received_at);
                     items.extend(f.rows.into_iter().map(Item::Fact));
                 }
-                block_type::ENTRIES => {
-                    let e = EntriesBlock::decode(body)?;
+                DataBody::Entries(e) => {
                     received_at.get_or_insert(e.received_at);
                     items.extend(e.entries.into_iter().map(Item::Entry));
                 }
-                _ => {}
             }
         }
         if items.len() > 1
@@ -204,7 +214,7 @@ impl BatchContent {
             return Err(ContentError::RecoveryNotAlone.into());
         }
         Ok(Self {
-            first_sequence: batch.commit.first_sequence,
+            first_sequence,
             received_at: received_at.unwrap_or(0),
             items,
         })
@@ -235,9 +245,13 @@ impl BatchContent {
     }
 }
 
-/// The checks a complete batch's data block must pass (A.2: "its body passes the checks of its type"), and whether
-/// it holds a recovery entry.
-pub(crate) fn check_block(t: u8, body: &[u8]) -> Result<(DataPrefix, bool), BodyError> {
+/// The checks a complete batch's data block must pass (A.2: "its body passes the checks of its type"), whether it
+/// holds a recovery entry, and with `keep` the body as decoded by those checks.
+pub(crate) fn check_block(
+    t: u8,
+    body: &[u8],
+    keep: bool,
+) -> Result<(DataPrefix, bool, Option<DataBody>), BodyError> {
     let prefix = DataPrefix::decode(t, body).map_err(|_| {
         if body.len() < DATA_PREFIX_LEN || t == block_type::ENTRIES {
             ContentError::Prefix
@@ -245,9 +259,17 @@ pub(crate) fn check_block(t: u8, body: &[u8]) -> Result<(DataPrefix, bool), Body
             ContentError::RowCount(crate::bytes::u32_at(body, 16))
         }
     })?;
-    let recovery = match t {
-        block_type::FACTS => FactsBlock::decode(body).map(|_| false)?,
-        _ => crate::entries::check(body)?.1,
-    };
-    Ok((prefix, recovery))
+    Ok(match (t, keep) {
+        (block_type::FACTS, false) => {
+            FactsBlock::decode(body)?;
+            (prefix, false, None)
+        }
+        (block_type::FACTS, true) => (prefix, false, Some(DataBody::Facts(FactsBlock::decode(body)?))),
+        (_, false) => (prefix, crate::entries::check(body)?.1, None),
+        (_, true) => {
+            let e = EntriesBlock::decode(body)?;
+            let recovery = e.entries.iter().any(Entry::is_recovery);
+            (prefix, recovery, Some(DataBody::Entries(e)))
+        }
+    })
 }

@@ -24,7 +24,7 @@ use crate::content::{BatchContent, Item};
 use crate::facts::FactRow;
 use crate::header::HEADER_LEN;
 use crate::name::SegmentName;
-use crate::scan::{Found, Resume, ScanLimit, Scanner};
+use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner};
 use crate::writer::Position;
 
 /// One series' facts wanted with event time from `from` to `to`, both inclusive.
@@ -284,12 +284,16 @@ fn read_batch_at(
         offset: s.offset,
         last_sequence: Some(s.first.saturating_sub(1)),
     };
-    let mut scanner = Scanner::resume(buf, id, ScanLimit::Mark(s.end), from).ok()?;
+    let mut scanner = Scanner::resume(buf, id, ScanLimit::Mark(s.end), from)
+        .ok()?
+        .keeping_content();
     match scanner.next()? {
         Ok(Found::Batch(b))
             if b.offset == s.offset && b.end() == s.end && b.commit.first_sequence == s.first =>
         {
-            BatchContent::decode(&b).ok()
+            scanner
+                .take_content()
+                .or_else(|| BatchContent::decode(&b).ok())
         }
         _ => None,
     }
@@ -599,79 +603,88 @@ fn scan_new(
             from.offset,
             if last { len } else { to },
         )?;
-        let mut scanner = Scanner::resume(&buf, id, lim, from).ok()?;
-        let mut found = Vec::new();
-        let mut before = Vec::new();
+        let mut scanner = Scanner::resume(&buf, id, lim, from).ok()?.keeping_content();
+        // Each finding is taken as it is read; only a region is held back, since one running to the end of a part
+        // that is not the last may be a batch the part cut.
+        let mut held: Option<(InvalidRegion, Resume)> = None;
+        let mut found = 0usize;
         loop {
-            before.push(scanner.resume_point());
-            match scanner.next() {
+            let before = scanner.resume_point();
+            let x = match scanner.next() {
                 None => break,
                 Some(Err(_)) => return None,
-                Some(Ok(x)) => found.push(x),
+                Some(Ok(x)) => x,
+            };
+            let after = scanner.resume_point();
+            found += 1;
+            if let Some((r, at)) = held.take() {
+                map.regions.push((r.start, r.end));
+                map.resume = Some(at);
             }
+            let b = match x {
+                Found::Region(r) => {
+                    held = Some((r, after));
+                    continue;
+                }
+                Found::Batch(b) => b,
+            };
+            let g = b.commit.generation;
+            if g == query.generation && b.commit.last_sequence > query.last_sequence {
+                map.resume = Some(before);
+                return Some(());
+            }
+            let kept = scanner.take_content();
+            let Some(content) = kept.or_else(|| BatchContent::decode(&b).ok()) else {
+                // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region, so
+                // that every later lookup of the segment is incomplete too.
+                map.regions.push((b.offset, b.end()));
+                map.resume = Some(after);
+                continue;
+            };
+            let (min_t, max_t) = content
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Fact(r) => Some(r.t),
+                    _ => None,
+                })
+                .fold((i64::MAX, i64::MIN), |(a, z), t| (a.min(t), z.max(t)));
+            map.batches.push(Span {
+                offset: b.offset,
+                end: b.end(),
+                generation: g,
+                first: b.commit.first_sequence,
+                last: b.commit.last_sequence,
+                min_t,
+                max_t,
+            });
+            if let [Item::Entry(crate::entries::Entry::Recovery(r))] = content.items.as_slice() {
+                map.recovery = true;
+                let after = Position {
+                    generation: g,
+                    sequence: r.after,
+                };
+                let mut j = 0;
+                facts.retain(|x| {
+                    j += 1;
+                    j <= first || x.position <= after
+                });
+            }
+            query.take(content, g, b.commit.first_sequence, facts);
+            map.resume = Some(after);
         }
-        before.push(scanner.resume_point());
-        // A region running to the end of a part that is not the last may be a batch the part cut.
-        let cut = !last && matches!(found.last(), Some(Found::Region(r)) if r.end == to);
-        if cut && found.len() == 1 {
+        let end = scanner.resume_point();
+        let cut = !last && held.as_ref().is_some_and(|(r, _)| r.end == to);
+        if cut && found == 1 {
             piece = piece.saturating_mul(2);
             continue;
         }
-        let keep = if cut { found.len() - 1 } else { found.len() };
-        for (k, x) in found.into_iter().take(keep).enumerate() {
-            match x {
-                Found::Region(r) => map.regions.push((r.start, r.end)),
-                Found::Batch(b) => {
-                    let g = b.commit.generation;
-                    if g == query.generation && b.commit.last_sequence > query.last_sequence {
-                        map.resume = Some(before[k]);
-                        return Some(());
-                    }
-                    let Ok(content) = BatchContent::decode(&b) else {
-                        // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region,
-                        // so that every later lookup of the segment is incomplete too.
-                        map.regions.push((b.offset, b.end()));
-                        map.resume = Some(before[k + 1]);
-                        continue;
-                    };
-                    let (min_t, max_t) = content
-                        .items
-                        .iter()
-                        .filter_map(|i| match i {
-                            Item::Fact(r) => Some(r.t),
-                            _ => None,
-                        })
-                        .fold((i64::MAX, i64::MIN), |(a, z), t| (a.min(t), z.max(t)));
-                    map.batches.push(Span {
-                        offset: b.offset,
-                        end: b.end(),
-                        generation: g,
-                        first: b.commit.first_sequence,
-                        last: b.commit.last_sequence,
-                        min_t,
-                        max_t,
-                    });
-                    if let [Item::Entry(crate::entries::Entry::Recovery(r))] =
-                        content.items.as_slice()
-                    {
-                        map.recovery = true;
-                        let after = Position {
-                            generation: g,
-                            sequence: r.after,
-                        };
-                        let mut j = 0;
-                        facts.retain(|x| {
-                            j += 1;
-                            j <= first || x.position <= after
-                        });
-                    }
-                    query.take(content, g, b.commit.first_sequence, facts);
-                }
-            }
-            map.resume = Some(before[k + 1]);
+        if let Some((r, at)) = held.filter(|_| !cut) {
+            map.regions.push((r.start, r.end));
+            map.resume = Some(at);
         }
         if last && !cut {
-            map.resume = Some(*before.last().expect("pushed above"));
+            map.resume = Some(end);
             return Some(());
         }
         from = map.resume.unwrap_or(from);

@@ -8,7 +8,7 @@ use crate::block::{
     peek_raw, read_block,
 };
 use crate::body::{COMMIT_LEN, Commit, DataPrefix};
-use crate::content::check_block;
+use crate::content::{DataBody, check_block};
 use crate::content_error::BodyError;
 use crate::crc::Crc32c;
 use crate::error::{Element, EncodeError, FormatError};
@@ -83,7 +83,8 @@ pub(crate) enum BatchFault {
 }
 
 pub(crate) enum BatchRead<'a> {
-    Complete(Batch<'a>),
+    /// The batch, and with `keep` its data bodies as the checks decoded them.
+    Complete(Batch<'a>, Vec<DataBody>),
     Incomplete { fault: BatchFault },
     Refused(FormatError),
 }
@@ -100,7 +101,7 @@ pub(crate) enum Refusal {
 }
 
 /// Reads the batch starting at `o`, accepting it only if it ends at or below `limit` and its first sequence is at
-/// least `min_first`.
+/// least `min_first`; with `keep`, also returns the bodies its checks decoded, so that it is decoded once.
 pub(crate) fn read_batch<'a>(
     bytes: &'a [u8],
     id: &SegmentIdentity,
@@ -108,6 +109,7 @@ pub(crate) fn read_batch<'a>(
     limit: u64,
     min_first: u64,
     refusal: Refusal,
+    keep: bool,
 ) -> BatchRead<'a> {
     let incomplete = |fault| BatchRead::Incomplete { fault };
     let mut crc = Crc32c::new();
@@ -117,6 +119,7 @@ pub(crate) fn read_batch<'a>(
     let mut blocks = Vec::new();
     let mut unknown_critical = None;
     let mut recovery = false;
+    let mut bodies = Vec::new();
     let mut pos = o;
     let commit_block = loop {
         // Sizes are judged on the header, before the body is checksummed: a data block that would take the batch
@@ -144,9 +147,10 @@ pub(crate) fn read_batch<'a>(
             block_type::COMMIT => break b,
             // The body checks of A.5 and A.6; an unknown critical element inside is refused like an unknown
             // critical block.
-            block_type::FACTS | block_type::ENTRIES => match check_block(t, b.body) {
-                Ok((p, r)) => {
+            block_type::FACTS | block_type::ENTRIES => match check_block(t, b.body, keep) {
+                Ok((p, r, body)) => {
                     recovery |= r;
+                    bodies.extend(body);
                     Some(p)
                 }
                 Err(BodyError::Unsupported(element)) => {
@@ -222,11 +226,14 @@ pub(crate) fn read_batch<'a>(
     if recovery && commit.last_sequence != commit.first_sequence {
         return incomplete(BatchFault::Content);
     }
-    BatchRead::Complete(Batch {
-        offset: o,
-        blocks,
-        commit,
-    })
+    BatchRead::Complete(
+        Batch {
+            offset: o,
+            blocks,
+            commit,
+        },
+        bodies,
+    )
 }
 
 /// Whether the blocks from `o` frame a batch, judged on block headers and the 48-byte commit body only: the commit

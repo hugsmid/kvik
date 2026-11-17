@@ -26,7 +26,9 @@ use crate::mark::{
     MARK_LEN, MarkSlot, ResetStamp, SLOT_OFFSETS, encode_mark_file, read_mark, read_slots,
 };
 use crate::name::SegmentName;
-use crate::scan::{HeaderState, ScanLimit, ScanReport, Tail, scan, scan_ignoring_seal};
+use crate::scan::{
+    HeaderState, ScanLimit, ScanReport, Tail, nonzero_end, scan, scan_ignoring_seal, scan_to_end,
+};
 use crate::segment::SealSummary;
 use crate::store::{LEASES_DIR, MANIFEST, MARK, StoreDir, StoreError};
 
@@ -225,15 +227,18 @@ fn scan_segment(
         file_id: name.file_id,
         generation: name.generation,
     };
-    let mut r = scan(&bytes, &id, ScanLimit::End).map_err(StoreError::Unsupported)?;
+    let last_nonzero = nonzero_end(&bytes);
+    let (mut r, mut contents) =
+        scan_to_end(&bytes, &id, last_nonzero).map_err(StoreError::Unsupported)?;
     let mut sealed = r.seal.is_some();
     if sealed && (ignore_seal || !seal_holds(&r)) {
-        r = scan_ignoring_seal(&bytes, &id).map_err(StoreError::Unsupported)?;
+        (r, contents) =
+            scan_ignoring_seal(&bytes, &id, last_nonzero).map_err(StoreError::Unsupported)?;
         sealed = false;
     }
     let mut batches = Vec::new();
-    for b in &r.batches {
-        let content = BatchContent::decode(b).map_err(|_| StoreError::Corrupt("batch content"))?;
+    for (b, content) in r.batches.iter().zip(contents) {
+        let content = content.ok_or(StoreError::Corrupt("batch content"))?;
         batches.push(B {
             offset: b.offset,
             end: b.end(),
@@ -276,7 +281,6 @@ fn scan_segment(
         HeaderState::Valid(h) => Some(h),
         HeaderState::Invalid => None,
     };
-    let last_nonzero = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1) as u64;
     Ok(Seg {
         id,
         path,

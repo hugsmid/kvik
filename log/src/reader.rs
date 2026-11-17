@@ -610,7 +610,9 @@ impl LogReader {
                 path: path.clone(),
                 error,
             };
-            let mut s = Scanner::resume(bytes, &id, limit, from).map_err(refused)?;
+            let mut s = Scanner::resume(bytes, &id, limit, from)
+                .map_err(refused)?
+                .keeping_content();
             view.file_id = file_id;
             view.resume = Some(from);
             loop {
@@ -633,12 +635,16 @@ impl LogReader {
                             view.resume = Some(before);
                             return Ok(false);
                         }
-                        let content =
-                            BatchContent::decode(&b).map_err(|error| ReaderError::Content {
-                                path: path.clone(),
-                                offset: b.offset,
-                                error,
-                            })?;
+                        let content = match s.take_content() {
+                            Some(c) => c,
+                            None => BatchContent::decode(&b).map_err(|error| {
+                                ReaderError::Content {
+                                    path: path.clone(),
+                                    offset: b.offset,
+                                    error,
+                                }
+                            })?,
+                        };
                         let crc = crc32c(&bytes[b.offset as usize..b.end() as usize]);
                         let rb = ReadBatch {
                             file_id,
