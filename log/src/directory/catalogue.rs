@@ -34,14 +34,21 @@ pub struct Catalogue {
     pub generation: u32,
     /// Live sealed log segments by `file_id`.
     pub segments: BTreeMap<u64, Listed>,
-    /// The manifest's valid records: the offset just past each, and its epoch.
-    pub records: BTreeMap<u64, u64>,
+    /// The manifest's valid records: the offset just past each, its epoch and the CRC32C of its block bytes.
+    pub records: BTreeMap<u64, (u64, u32)>,
 }
 
 impl Catalogue {
-    /// The manifest's valid records, from a read of it.
-    pub fn with_manifest(mut self, m: &ManifestRead) -> Self {
-        self.records = m.records.iter().map(|r| (r.end, r.epoch)).collect();
+    /// The manifest's valid records, from a read of `bytes`.
+    pub fn with_manifest(mut self, m: &ManifestRead, bytes: &[u8]) -> Self {
+        self.records = m
+            .records
+            .iter()
+            .map(|r| {
+                let block = crate::bytes::slice(bytes, r.offset, r.end - r.offset).unwrap_or(&[]);
+                (r.end, (r.epoch, crc32c(block)))
+            })
+            .collect();
         self
     }
 
@@ -61,10 +68,11 @@ impl Catalogue {
             })
     }
 
-    /// Whether a root written in store generation `generation` still names a valid manifest record by its offset
-    /// and epoch.
+    /// Whether a root written in store generation `generation` still names a valid manifest record by its offset,
+    /// epoch and content.
     pub fn root_matches(&self, generation: u32, r: &Root) -> bool {
-        generation == self.generation && self.records.get(&r.manifest_end) == Some(&r.epoch)
+        generation == self.generation
+            && self.records.get(&r.manifest_end) == Some(&(r.epoch, r.manifest_crc32c))
     }
 }
 
@@ -117,7 +125,8 @@ pub fn load(
                 Ok((f, (g, crc)))
                     if f.file_id == id
                         && crc == e.body_crc32c
-                        && g.number == e.number
+                        && g.entry() == *e
+                        && super::logdir::contiguous(&g, &root.lost)
                         && cat.group_matches(f.generation, &g) =>
                 {
                     found = Some(g);
@@ -136,7 +145,7 @@ pub fn load(
     }))
 }
 
-fn read_exact_at(f: &dyn crate::fs::FsFile, buf: &mut [u8], at: u64) -> Option<()> {
+pub(crate) fn read_exact_at(f: &dyn crate::fs::FsFile, buf: &mut [u8], at: u64) -> Option<()> {
     let mut done = 0;
     while done < buf.len() {
         match f.read_at(&mut buf[done..], at.checked_add(done as u64)?) {
@@ -177,7 +186,7 @@ pub fn catalogue_from_disk(
     fs: &dyn Fs,
     store_dir: &Path,
     generation: u32,
-    manifest: Option<&ManifestRead>,
+    manifest: Option<(&ManifestRead, &[u8])>,
 ) -> std::io::Result<Catalogue> {
     let log = store_dir.join(crate::store::LOG_DIR);
     let mut segments = BTreeMap::new();
@@ -207,7 +216,7 @@ pub fn catalogue_from_disk(
         records: BTreeMap::new(),
     };
     Ok(match manifest {
-        Some(m) => cat.with_manifest(m),
+        Some((m, bytes)) => cat.with_manifest(m, bytes),
         None => cat,
     })
 }
@@ -266,4 +275,101 @@ pub fn group(segments: Vec<SegmentRecord>) -> Vec<Group> {
         });
     }
     out
+}
+
+/// Bytes a [`Describe`] hashes per call at most.
+pub const DESCRIBE_STEP: u64 = 4 << 20;
+
+/// A sealed segment described a part at a time: its trailer and segment index first, then its SHA-256 over at most
+/// a given number of bytes a call, so that a long segment holds neither the maintenance thread nor memory.
+pub struct Describe {
+    file: Box<dyn crate::fs::FsFile>,
+    record: SegmentRecord,
+    sha: sha2::Sha256,
+    at: u64,
+}
+
+impl std::fmt::Debug for Describe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Describe")
+            .field("file_id", &self.record.file_id)
+            .field("at", &self.at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Describe {
+    /// Reads the segment's trailer and index; `None` if it is not a sealed segment holding a batch.
+    pub fn open(fs: &dyn Fs, path: &Path, id: &crate::batch::SegmentIdentity) -> Option<Self> {
+        use crate::block::{BLOCK_HEADER_LEN, BlockHeader, block_type};
+        use sha2::Digest;
+        let (len, t) = read_trailer(fs, path)?;
+        if t.batch_count == 0 {
+            return None;
+        }
+        let file = fs.open(path, crate::fs::OpenMode::Read).ok()?;
+        let mut index = None;
+        if t.index_offset != 0 {
+            let mut head = [0u8; BLOCK_HEADER_LEN];
+            read_exact_at(&*file, &mut head, t.index_offset)?;
+            let h = BlockHeader::decode(&head)?;
+            let body_len = u64::from(h.body_len);
+            if h.block_type != block_type::SEGMENT_INDEX
+                || t.index_offset
+                    .checked_add(BLOCK_HEADER_LEN as u64 + body_len)?
+                    > len
+            {
+                return None;
+            }
+            let mut body = vec![0u8; usize::try_from(body_len).ok()?];
+            read_exact_at(&*file, &mut body, t.index_offset + BLOCK_HEADER_LEN as u64)?;
+            if crc32c(&body) != h.body_crc32c {
+                return None;
+            }
+            index = crate::body::SegmentIndex::decode(&body).ok();
+        }
+        let record = SegmentRecord {
+            file_id: id.file_id,
+            generation: id.generation,
+            has_entries: index
+                .as_ref()
+                .is_some_and(|i| i.flags & crate::body::INDEX_HAS_ENTRIES != 0),
+            first_sequence: t.first_sequence,
+            last_sequence: t.last_sequence,
+            first_commit_time: t.first_commit_time,
+            last_commit_time: t.last_commit_time,
+            fact_count: index.map_or(0, |i| {
+                i.records.iter().map(|r| u64::from(r.fact_count)).sum()
+            }),
+            len,
+            file_crc32c: t.file_crc32c,
+            sha256: [0; 32],
+        };
+        Some(Describe {
+            file,
+            record,
+            sha: sha2::Sha256::new(),
+            at: 0,
+        })
+    }
+
+    /// Hashes at most `budget` more bytes: `None` if a read failed, `Some(None)` while bytes remain, and the record
+    /// once the whole file is hashed.
+    pub fn step(&mut self, budget: u64) -> Option<Option<SegmentRecord>> {
+        use sha2::Digest;
+        let end = self.record.len.min(self.at.saturating_add(budget.max(1)));
+        let mut buf = vec![0u8; usize::try_from((end - self.at).min(1 << 20)).ok()?];
+        while self.at < end {
+            let n = usize::try_from((end - self.at).min(buf.len() as u64)).ok()?;
+            read_exact_at(&*self.file, &mut buf[..n], self.at)?;
+            self.sha.update(&buf[..n]);
+            self.at += n as u64;
+        }
+        if self.at < self.record.len {
+            return Some(None);
+        }
+        let mut r = self.record.clone();
+        r.sha256 = std::mem::take(&mut self.sha).finalize().into();
+        Some(Some(r))
+    }
 }

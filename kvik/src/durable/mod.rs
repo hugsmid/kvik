@@ -182,12 +182,12 @@ pub(crate) struct Writer {
     limits: Limits,
     log: RwLock<Option<Log>>,
     /// A fault of the start, or of a registry file write (`spec.md` §3 Write or sync failure).
-    own_fault: Mutex<Option<LogFault>>,
+    own_fault: Arc<Mutex<Option<LogFault>>>,
     store_id: [u8; 16],
     decider: Mutex<Decider>,
     /// The slow path's reads of local data, taken after the decision lock (roadmap 11.0).
     local: Mutex<Box<dyn keys::LocalFacts>>,
-    counters: Mutex<Counters>,
+    counters: Arc<Mutex<Counters>>,
     reader: Mutex<Option<Arc<DurableReader>>>,
     acknowledged: Mutex<BTreeSet<Position>>,
     /// Calls queued and not yet known to be acknowledged, by call number (Q-123 (b)).
@@ -338,7 +338,17 @@ impl Writer {
                     source,
                 }
             })?;
-        hook.fold.follow(log.watch());
+        let watch = log.watch();
+        hook.fold.follow(move || watch.mark_synced());
+        let counters = Arc::new(Mutex::new(counters));
+        let own_fault = Arc::new(Mutex::new(start_fault));
+        hook.share(
+            log.watch(),
+            counters.clone(),
+            own_fault.clone(),
+            env.fs.clone(),
+            &dir,
+        );
         if let Some(h) = &hub {
             h.start(log.watch()).map_err(|source| OpenError::Io {
                 path: dir.clone(),
@@ -349,11 +359,11 @@ impl Writer {
             dir,
             limits: config.limits.clone(),
             log: RwLock::new(Some(log)),
-            own_fault: Mutex::new(start_fault),
+            own_fault,
             store_id: descriptor.store_id,
             decider: Mutex::new(decider),
             local: Mutex::new(local),
-            counters: Mutex::new(counters),
+            counters,
             reader: Mutex::new(None),
             acknowledged: Mutex::new(BTreeSet::new()),
             inflight: Mutex::new(BTreeMap::new()),
@@ -363,7 +373,6 @@ impl Writer {
             hub,
             env,
         });
-        let _ = hook.writer.set(Arc::downgrade(&w));
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`
         // Opening). A release whose name is not a valid entry is left out.
         let release = tzdata_name(tz.version());

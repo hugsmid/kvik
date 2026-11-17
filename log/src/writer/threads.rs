@@ -14,15 +14,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::directories::{Directories, DirectoryOptions};
-use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest, seal_described};
+use super::maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
+use super::maint_thread::maint_loop;
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Done, Fault, FaultOp, Halt, IngestQueue,
-    LogStats, LogWriter, Reason, Wait, create_segment,
+    LogStats, LogWriter, Reason, Wait,
 };
 use crate::content::Item;
 use crate::fs::Fs;
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -138,56 +139,56 @@ impl Future for Pending {
 }
 
 #[derive(Debug)]
-struct Front {
-    queue: IngestQueue,
+pub(super) struct Front {
+    pub(super) queue: IngestQueue,
     slots: HashMap<u64, Arc<Slot>>,
-    wake: bool,
-    shutdown: bool,
-    read_only: bool,
-    waiting: Option<Wait>,
+    pub(super) wake: bool,
+    pub(super) shutdown: bool,
+    pub(super) read_only: bool,
+    pub(super) waiting: Option<Wait>,
     /// A caller asked for the mark to be synced now ([`Log::sync_mark`]).
-    mark_sync: bool,
+    pub(super) mark_sync: bool,
 }
 
 #[derive(Debug, Default)]
-struct Maint {
-    request: Option<SegmentRequest>,
-    created: Option<Result<AheadSegment, CreateError>>,
-    jobs: VecDeque<SealJob>,
-    results: Vec<(SealJob, Result<(), SealError>)>,
-    stop: bool,
+pub(super) struct Maint {
+    pub(super) request: Option<SegmentRequest>,
+    pub(super) created: Option<Result<AheadSegment, CreateError>>,
+    pub(super) jobs: VecDeque<SealJob>,
+    pub(super) results: Vec<(SealJob, Result<(), SealError>)>,
+    pub(super) stop: bool,
 }
 
 #[derive(Debug)]
-struct Info {
-    stats: LogStats,
-    reasons: Vec<Reason>,
-    fault: Option<Fault>,
+pub(super) struct Info {
+    pub(super) stats: LogStats,
+    pub(super) reasons: Vec<Reason>,
+    pub(super) fault: Option<Fault>,
     /// Raised at every turn that published something, with `progress_cv` notified.
-    progress: u64,
+    pub(super) progress: u64,
     /// The writer thread has ended.
-    stopped: bool,
+    pub(super) stopped: bool,
 }
 
 #[derive(Debug)]
-struct Shared {
-    front: Mutex<Front>,
-    writer_cv: Condvar,
-    room_cv: Condvar,
-    maint: Mutex<Maint>,
-    maint_cv: Condvar,
-    info: Mutex<Info>,
-    progress_cv: Condvar,
-    halt: Arc<Halt>,
-    fs: Arc<dyn Fs>,
-    clock: Arc<dyn Clock>,
+pub(super) struct Shared {
+    pub(super) front: Mutex<Front>,
+    pub(super) writer_cv: Condvar,
+    pub(super) room_cv: Condvar,
+    pub(super) maint: Mutex<Maint>,
+    pub(super) maint_cv: Condvar,
+    pub(super) info: Mutex<Info>,
+    pub(super) progress_cv: Condvar,
+    pub(super) halt: Arc<Halt>,
+    pub(super) fs: Arc<dyn Fs>,
+    pub(super) clock: Arc<dyn Clock>,
     /// The writer's held batch entries and calls as the last acknowledgements were delivered, and just after.
     #[cfg(test)]
-    held: Mutex<Option<(usize, usize)>>,
+    pub(super) held: Mutex<Option<(usize, usize)>>,
 }
 
 impl Shared {
-    fn wake_writer(&self) {
+    pub(super) fn wake_writer(&self) {
         lock(&self.front).wake = true;
         self.writer_cv.notify_one();
     }
@@ -235,6 +236,26 @@ impl Watch {
     /// As [`Log::stats`].
     pub fn stats(&self) -> LogStats {
         lock(&self.shared.info).stats.clone()
+    }
+
+    /// The last synced mark, without copying the rest of the statistics.
+    pub fn mark_synced(&self) -> super::Position {
+        lock(&self.shared.info).stats.mark_synced
+    }
+
+    /// As [`Log::reasons`].
+    pub fn reasons(&self) -> Vec<Reason> {
+        lock(&self.shared.info).reasons.clone()
+    }
+
+    /// As [`Log::fault`].
+    pub fn fault(&self) -> Option<Fault> {
+        lock(&self.shared.info).fault.clone()
+    }
+
+    /// As [`Log::queue_depth`].
+    pub fn queue_depth(&self) -> usize {
+        lock(&self.shared.front).queue.depth()
     }
 
     /// Asks the writer to sync the mark now rather than at its timer, and waits until the mark on stable storage
@@ -454,6 +475,18 @@ impl Log {
         }
         self.shared.writer_cv.notify_one();
         self.shared.room_cv.notify_all();
+        // Called on one of the log's own threads (the last owner dropped there), it cannot wait for them: they end
+        // on their own and are not joined.
+        let me = Some(std::thread::current().id());
+        let writer = self.writer.as_ref().map(|h| h.thread().id());
+        let maint = self.maint.as_ref().map(|h| h.thread().id());
+        if writer == me || maint == me {
+            lock(&self.shared.maint).stop = true;
+            self.shared.maint_cv.notify_all();
+            self.writer = None;
+            self.maint = None;
+            return Ok(());
+        }
         let w = self.writer.take().map(JoinHandle::join);
         {
             lock(&self.shared.maint).stop = true;
@@ -651,99 +684,6 @@ fn writer_loop(s: &Shared, mut w: LogWriter) -> Result<(), Fault> {
     lock(&s.info).stopped = true;
     s.progress_cv.notify_all();
     r
-}
-
-/// If `kvik-maint` panics: the store turns read-only and the writer is woken, so that it stops writing and its
-/// shutdown does not wait for a seal that will never finish.
-struct MaintGuard<'a>(&'a Shared);
-
-impl Drop for MaintGuard<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.halt.set(Fault {
-                op: FaultOp::Panic,
-                path: Default::default(),
-                kind: io::ErrorKind::Other,
-                message: "the maintenance thread panicked".into(),
-            });
-            self.0.wake_writer();
-        }
-    }
-}
-
-fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
-    let _guard = MaintGuard(s);
-    let mut next: Option<Duration> = dirs.as_ref().map(|_| Duration::ZERO);
-    loop {
-        let mut m = lock(&s.maint);
-        while m.request.is_none() && m.jobs.is_empty() && !m.stop {
-            let now = s.clock.monotonic();
-            match next {
-                Some(t) if t <= now => break,
-                Some(t) => {
-                    m = s
-                        .maint_cv
-                        .wait_timeout(m, t - now)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
-                }
-                None => m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner),
-            }
-        }
-        // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
-        if s.halt.is_set() {
-            m.request = None;
-            m.jobs.clear();
-            if m.stop {
-                return;
-            }
-            next = None;
-            m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
-            drop(m);
-            continue;
-        }
-        if let Some(req) = m.request.take() {
-            drop(m);
-            let r = create_segment(&*s.fs, &req, &s.halt);
-            lock(&s.maint).created = Some(r);
-        } else if let Some(job) = m.jobs.pop_front() {
-            drop(m);
-            let r = seal_described(&*s.fs, &job, &s.halt);
-            if let (Some(d), Ok(rec)) = (dirs.as_mut(), &r) {
-                d.sealed(rec.clone());
-                next = Some(Duration::ZERO);
-            }
-            lock(&s.maint).results.push((job, r.map(|_| ())));
-        } else {
-            let stop = m.stop;
-            drop(m);
-            if let Some(d) = dirs.as_mut() {
-                next = run_directories(s, d, stop);
-            }
-            if stop {
-                return;
-            }
-            continue;
-        }
-        s.wake_writer();
-    }
-}
-
-/// Runs the derived files' due work; asks the writer for a mark sync when a sealed segment waits for one (`spec.md`
-/// §3 Durable mark: a write that would name a position above the last synced mark forces the next mark sync).
-fn run_directories(s: &Shared, d: &mut Directories, stop: bool) -> Option<Duration> {
-    let synced = lock(&s.info).stats.mark_synced;
-    let now = s.clock.monotonic();
-    let after = d.run(synced, now, s.clock.wall());
-    if !stop && d.waits_for(synced) {
-        {
-            let mut f = lock(&s.front);
-            f.mark_sync = true;
-            f.wake = true;
-        }
-        s.writer_cv.notify_one();
-    }
-    after.map(|a| now + a)
 }
 
 #[cfg(test)]

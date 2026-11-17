@@ -48,25 +48,27 @@ struct Gen {
     absent: bool,
     future: bool,
     changed_at: u64,
+    unsynced: bool,
+    kind: u8,
 }
 
 fn gen_fact() -> impl Strategy<Value = Gen> {
     (
-        1u32..=4,
-        -30i64..30,
-        0u8..6,
-        any::<bool>(),
-        any::<bool>(),
-        0u64..4,
+        (1u32..=4, -30i64..30, 0u8..6),
+        (any::<bool>(), any::<bool>(), 0u64..4, any::<bool>(), 0u8..5),
     )
-        .prop_map(|(series, dt, quality, absent, future, changed_at)| Gen {
-            series,
-            dt,
-            quality,
-            absent: absent && quality == 0,
-            future,
-            changed_at,
-        })
+        .prop_map(
+            |((series, dt, quality), (absent, future, changed_at, unsynced, kind))| Gen {
+                series,
+                dt,
+                quality,
+                absent: absent && quality == 0,
+                future,
+                changed_at,
+                unsynced,
+                kind,
+            },
+        )
 }
 
 /// Batches one second apart, each `received_at` its second; event times within half a minute either side, so some
@@ -107,6 +109,7 @@ fn history(batches: &[Vec<Gen>]) -> Vec<ReadBatch> {
                     quality,
                     flags: FactFlags {
                         future: g.future,
+                        unsynced_clock: g.unsynced,
                         ..FactFlags::default()
                     },
                     value: if g.absent {
@@ -115,7 +118,17 @@ fn history(batches: &[Vec<Gen>]) -> Vec<ReadBatch> {
                             scale: 0,
                         }
                     } else {
-                        Value::F64((k as u64) << 8 | u64::from(g.series))
+                        let v = (k as u64) << 8 | u64::from(g.series);
+                        match g.kind {
+                            0 => Value::F64(v),
+                            1 => Value::Decimal {
+                                units: -(v as i64),
+                                scale: (k % 19) as u8,
+                            },
+                            2 => Value::State(v as u16),
+                            3 => Value::Bool(k % 2 == 0),
+                            _ => Value::Text(format!("t{v}")),
+                        }
                     },
                     changed_at: (g.series == 3).then_some(g.changed_at),
                 })
@@ -185,6 +198,18 @@ fn check(entries: &[SeriesEntry], index: &Index, written_at: i64) -> usize {
                 expected,
                 "series {id}"
             );
+            // Value and quality as the fact holds them, unless the entry says to read them at the position.
+            if let Some(c) = e
+                .candidate
+                .filter(|c| c.value != CandidateValue::AtPosition)
+            {
+                let f = index
+                    .series_facts(id)
+                    .find(|s| s.position == c.position)
+                    .unwrap();
+                assert_eq!(Some(c.value), value_of(&f.row.value), "series {id}");
+                assert_eq!(c.quality, f.row.quality, "series {id}");
+            }
         }
         if !e.pending_more {
             let expected = index
@@ -223,9 +248,10 @@ proptest! {
             fold.batch(b);
         }
         let written_at = h.last().unwrap().content.received_at + later * S;
-        let (through, entries) = fold.entries(last, written_at).unwrap();
-        prop_assert_eq!(through, last);
-        check(&entries, &index_of(&h, last), written_at);
+        let e = fold.entries(last, written_at).unwrap();
+        prop_assert_eq!(e.through, last);
+        prop_assert!(e.judged_at >= written_at);
+        check(&e.entries, &index_of(&h, last), e.judged_at);
     }
 
     /// A fold continued from a series directory written part-way (rebuild forward from the previous generation)
@@ -240,16 +266,16 @@ proptest! {
             first.batch(b);
         }
         let w0 = h[cut].content.received_at;
-        let (p0, e0) = first.entries(h[cut].last, w0).unwrap();
+        let e0 = first.entries(h[cut].last, w0).unwrap();
         let continued = SeriesFold::new(last);
-        continued.seed(p0, w0, &e0);
+        continued.seed(e0.through, e0.judged_at, &e0.entries);
         for b in &h {
             continued.batch(b);
         }
         let written_at = h.last().unwrap().content.received_at + 5 * S;
-        let (through, entries) = continued.entries(last, written_at).unwrap();
-        prop_assert_eq!(through, last);
-        check(&entries, &index_of(&h, last), written_at);
+        let e = continued.entries(last, written_at).unwrap();
+        prop_assert_eq!(e.through, last);
+        check(&e.entries, &index_of(&h, last), e.judged_at);
     }
 
     /// Batches above the synced mark wait: the entries are as of the last batch at or below the limit given.
@@ -262,13 +288,13 @@ proptest! {
             fold.batch(b);
         }
         let written_at = h.last().unwrap().content.received_at;
-        let (through, entries) = fold.entries(mid, written_at).unwrap();
-        prop_assert_eq!(through, mid);
-        check(&entries, &index_of(&h, mid), written_at);
+        let e = fold.entries(mid, written_at).unwrap();
+        prop_assert_eq!(e.through, mid);
+        check(&e.entries, &index_of(&h, mid), e.judged_at);
         let last = h.last().unwrap().last;
-        let (through, entries) = fold.entries(last, written_at).unwrap();
-        prop_assert_eq!(through, last);
-        check(&entries, &index_of(&h, last), written_at);
+        let e = fold.entries(last, written_at).unwrap();
+        prop_assert_eq!(e.through, last);
+        check(&e.entries, &index_of(&h, last), e.judged_at);
     }
 }
 
@@ -284,6 +310,8 @@ fn most_candidates_are_sure() {
                     absent: false,
                     future: false,
                     changed_at: k as u64,
+                    unsynced: false,
+                    kind: 0,
                 })
                 .collect()
         })
@@ -295,8 +323,8 @@ fn most_candidates_are_sure() {
         fold.batch(b);
     }
     let written_at = T0 + 31 * S;
-    let (_, entries) = fold.entries(last, written_at).unwrap();
-    assert_eq!(check(&entries, &index_of(&h, last), written_at), 4);
+    let e = fold.entries(last, written_at).unwrap();
+    assert_eq!(check(&e.entries, &index_of(&h, last), e.judged_at), 4);
 }
 
 #[test]
@@ -309,6 +337,8 @@ fn a_void_below_what_was_folded_stops_the_entries() {
             absent: false,
             future: false,
             changed_at: 0,
+            unsynced: false,
+            kind: 0,
         };
         3
     ]]);
@@ -318,4 +348,75 @@ fn a_void_below_what_was_folded_stops_the_entries() {
     }
     fold.void(at(1));
     assert_eq!(fold.entries(at(10), T0), None);
+}
+
+#[test]
+fn a_pending_fact_that_falls_due_after_a_continuation_is_read_at_its_position() {
+    let g = |dt, quality| Gen {
+        series: 1,
+        dt,
+        quality,
+        absent: false,
+        future: true,
+        changed_at: 0,
+        unsynced: false,
+        kind: 0,
+    };
+    // A suspect fact 20 s ahead, then an ordinary fact a second later; a continuation; then 60 s.
+    let h = history(&[vec![g(20, 1)], vec![g(0, 3)]]);
+    let last = h.last().unwrap().last;
+    let whole = SeriesFold::new(last);
+    for b in &h {
+        whole.batch(b);
+    }
+    let w0 = h.last().unwrap().content.received_at;
+    let e0 = whole.entries(last, w0).unwrap();
+    let continued = SeriesFold::new(last);
+    continued.seed(e0.through, e0.judged_at, &e0.entries);
+    let later = w0 + 60 * S;
+    let a = whole.entries(last, later).unwrap().entries[0];
+    let b = continued.entries(last, later).unwrap().entries[0];
+    let (ca, cb) = (a.candidate.unwrap(), b.candidate.unwrap());
+    assert_eq!((ca.t, ca.position), (cb.t, cb.position));
+    assert_eq!(ca.quality, Quality::Suspect);
+    assert_eq!(
+        cb.value,
+        CandidateValue::AtPosition,
+        "the entry held no value for it"
+    );
+}
+
+#[test]
+fn the_fold_follows_the_synced_mark_without_being_asked_for_entries() {
+    let gens: Vec<Vec<Gen>> = (0..10)
+        .map(|_| {
+            vec![Gen {
+                series: 1,
+                dt: 0,
+                quality: 3,
+                absent: false,
+                future: false,
+                changed_at: 0,
+                unsynced: false,
+                kind: 0,
+            }]
+        })
+        .collect();
+    let h = history(&gens);
+    let fold = SeriesFold::new(LogPos::default());
+    let mark = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let m = mark.clone();
+    fold.follow(move || LogPos {
+        generation: 0,
+        sequence: m.load(std::sync::atomic::Ordering::SeqCst),
+    });
+    for b in &h {
+        mark.store(b.last.sequence, std::sync::atomic::Ordering::SeqCst);
+        fold.batch(b);
+        assert!(
+            lock(&fold.fold).queued.is_empty(),
+            "a batch at or below the mark waits"
+        );
+    }
+    assert_eq!(lock(&fold.fold).applied, h.last().unwrap().last);
 }

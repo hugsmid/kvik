@@ -10,7 +10,7 @@ Regenerate only after a deliberate format change: `KVIK_BLESS_GOLDEN=1 cargo tes
 
 | File | Shows |
 |---|---|
-| `logdir.root` | A root (kind 15, file id 5): manifest epoch 4 ending at offset 312, through position 90, two segments in one group, reset stamp (12, `0x5eed`), no C(E), one lost range (20 to 22 in segment 1), no quarantined or compacted files |
+| `logdir.root` | A root (kind 15, file id 5): manifest epoch 4 ending at offset 312 (record CRC32C `0x12345678`), through position 90, two segments in one group, reset stamp (12, `0x5eed`), no C(E), one lost range (20 to 22 in segment 1), no quarantined or compacted files |
 | `logdir.grp` | Group 0 (kind 15, file id 3): segment 1 (positions 1 to 40, with entries) and segment 2 (41 to 90); the root names its body's CRC32C |
-| `series.sdir` | A series directory (kind 16, file id 2) through position 95: series 1 with an `f64` candidate; series 7 orphaned, with an unsure text candidate and a pending fact with more after it |
-| `status.stat` | A status file (kind 17, file id 9): 60 s interval, degraded (disk low), pressure clear, no slots, two counters |
+| `series.sdir` | A series directory (kind 16, file id 2) through position 95, one lost range at or below it, judged at 00:10:01: series 1 with an `f64` candidate; series 7 orphaned, with an unsure text candidate and a pending fact with more after it |
+| `status.stat` | A status file (kind 17, file id 9): 60 s interval, degraded (disk low) and partial, pressure clear, no slots, two counters |

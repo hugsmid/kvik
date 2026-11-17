@@ -1,5 +1,5 @@
 //! The status file (`format.md` A.18, kind 17): the writer's counters, health and pressure flag with their time, for
-//! processes that share no memory with it. It names no position above the last synced mark.
+//! processes that share no memory with it. A file older than twice its interval says nothing about the writer.
 
 use super::{
     DerivedError, Frame, block_type, decode_frame, encode_frame, position_at, put_position, records,
@@ -15,16 +15,20 @@ pub const REASON_LEN: u16 = 4;
 /// A counter record's size in v1.
 pub const COUNTER_LEN: u16 = 16;
 
-/// Health levels (A.18).
+/// Health levels (A.18); a reader shows any other value as "other".
 pub mod health {
-    /// Healthy.
+    /// Healthy, as far as the reasons the file carries go.
     pub const OK: u8 = 0;
     /// Degraded.
     pub const DEGRADED: u8 = 1;
     /// Critical.
     pub const CRITICAL: u8 = 2;
-    /// Fatal: the store is read-only.
-    pub const FATAL: u8 = 3;
+}
+
+/// Status flag bits (A.18).
+pub mod flag {
+    /// The level covers only the reasons the file can carry (until `kvik health`, roadmap 9.0e).
+    pub const PARTIAL: u8 = 1;
 }
 
 /// Counter ids (A.18). Every id is ignorable: a reader skips one it does not know.
@@ -43,18 +47,14 @@ pub mod counter {
     pub const COMMIT_P99_NS: u16 = 6;
     /// Commit latency, largest, nanoseconds.
     pub const COMMIT_MAX_NS: u16 = 7;
-    /// Readings the duplicate rule decided by the slow path.
-    pub const SLOW_PATH: u16 = 8;
     /// Segments sealed by this writer.
     pub const SEALED_SEGMENTS: u16 = 9;
     /// Free bytes.
     pub const DISK_FREE: u16 = 10;
-    /// The batch-sync interval in force, nanoseconds.
-    pub const SYNC_INTERVAL_NS: u16 = 11;
-    /// Reads of the log for delivery that failed and were retried.
-    pub const REFRESH_ERRORS: u16 = 12;
-    /// Invalid regions below the mark that delivery passed over.
-    pub const CORRUPTIONS: u16 = 13;
+    /// Derived-file writes that failed and wait to be tried again.
+    pub const DERIVED_FAILED: u16 = 14;
+    /// Sealed segments the log directory cannot list (unreadable at the writer's start).
+    pub const UNLISTED: u16 = 15;
 }
 
 /// Health reason codes (A.18). A reader shows a code it does not know as "other".
@@ -71,8 +71,6 @@ pub mod reason {
     pub const SEAL_BLOCKED: u16 = 5;
     /// A manifest record was rebuilt.
     pub const MANIFEST_REBUILT: u16 = 6;
-    /// Read-only after a write or sync failure.
-    pub const READ_ONLY: u16 = 7;
     /// Any other reason.
     pub const OTHER: u16 = 0xffff;
 }
@@ -83,15 +81,17 @@ pub struct StatusFile {
     /// The periodic write interval; `None` when only changes are written. A reader ignores a pressure flag older
     /// than twice this.
     pub interval_ns: Option<u64>,
-    /// The last synced mark.
+    /// The last synced mark, diagnostic: a reader reads the mark from `MARK`.
     pub mark_synced: Position,
     /// The health level ([`health`]).
     pub health: u8,
+    /// Flags ([`flag`]).
+    pub flags: u8,
     /// The pressure flag (section 3.4 of the query design; set by roadmap 9.0g, clear before it).
     pub pressure: bool,
     /// When the flag was last set.
     pub pressure_since: Option<i64>,
-    /// The store's query slot count (roadmap 9.0g; 0 before it).
+    /// The store's query slot count (roadmap 9.0g); 0: unknown.
     pub slot_count: u32,
     /// Health reasons ([`reason`]).
     pub reasons: Vec<u16>,
@@ -107,7 +107,8 @@ impl StatusFile {
         put_position(&mut b, self.mark_synced);
         b.push(self.health);
         b.push(u8::from(self.pressure));
-        b.extend_from_slice(&[0; 2]);
+        b.push(self.flags);
+        b.push(0);
         b.extend_from_slice(&self.pressure_since.unwrap_or(0).to_le_bytes());
         b.extend_from_slice(&self.slot_count.to_le_bytes());
         b.extend_from_slice(&(self.reasons.len() as u32).to_le_bytes());
@@ -129,7 +130,7 @@ impl StatusFile {
     /// Decodes a status file (A.18 checks).
     pub fn decode(bytes: &[u8], store_id: &[u8; 16]) -> Result<(Frame, Self), DerivedError> {
         let (frame, body) = decode_frame(bytes, store_id, kind::STATUS, block_type::STATUS)?;
-        if body.len() < PREFIX || body[20] > health::FATAL || body[21] > 1 {
+        if body.len() < PREFIX || body[21] > 1 {
             return Err(DerivedError::Invalid("status body"));
         }
         let (nr, nc) = (u32_at(body, 36), u32_at(body, 40));
@@ -154,6 +155,7 @@ impl StatusFile {
                 interval_ns: (interval != 0).then_some(interval),
                 mark_synced: position_at(body, 8),
                 health: body[20],
+                flags: body[22],
                 pressure: body[21] == 1,
                 pressure_since: (since != 0).then_some(since),
                 slot_count: u32_at(body, 32),
@@ -195,6 +197,7 @@ mod tests {
                 sequence: 12,
             },
             health: health::DEGRADED,
+            flags: flag::PARTIAL,
             pressure: true,
             pressure_since: Some(5),
             slot_count: 1,

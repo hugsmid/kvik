@@ -324,6 +324,8 @@ pub struct Root {
     pub epoch: u64,
     /// The offset just past that record: a reader parses the manifest from here.
     pub manifest_end: u64,
+    /// CRC32C of that record's block bytes, so that the record is matched by content.
+    pub manifest_crc32c: u32,
     /// Every sealed segment with a last position up to this one is listed; at or below the last synced mark.
     pub through: Position,
     /// Sealed segments listed, in all groups.
@@ -347,7 +349,7 @@ impl Root {
         b.extend_from_slice(&self.epoch.to_le_bytes());
         b.extend_from_slice(&self.manifest_end.to_le_bytes());
         b.extend_from_slice(&self.through.generation.to_le_bytes());
-        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&self.manifest_crc32c.to_le_bytes());
         b.extend_from_slice(&self.through.sequence.to_le_bytes());
         b.extend_from_slice(&self.segment_count.to_le_bytes());
         put_stamp(&mut b, self.stamp);
@@ -442,6 +444,7 @@ impl Root {
         let root = Root {
             epoch: u64_at(body, 0),
             manifest_end: u64_at(body, 8),
+            manifest_crc32c: u32_at(body, 20),
             through: Position {
                 generation: u32_at(body, 16),
                 sequence: u64_at(body, 24),
@@ -458,7 +461,7 @@ impl Root {
     }
 
     /// The structural checks of A.18: groups numbered from 0, every group but the last full, counts summing to
-    /// `segment_count`, ascending positions, the last group ending at `through`.
+    /// `segment_count`, each group joining the one before it, the last group ending at `through`.
     fn check(&self) -> Result<(), DerivedError> {
         let bad = || Err(DerivedError::Invalid("root groups"));
         let mut sum: u64 = 0;
@@ -473,11 +476,8 @@ impl Root {
             {
                 return bad();
             }
-            if i > 0 {
-                let p = &self.groups[i - 1];
-                if p.last >= g.first {
-                    return bad();
-                }
+            if i > 0 && !joins(self.groups[i - 1].last, g.first, &self.lost) {
+                return bad();
             }
             sum += u64::from(g.segment_count);
         }
@@ -493,6 +493,32 @@ pub use super::catalogue::{
     Catalogue, Listed, LogDirectory, catalogue_from_disk, group, known_records, load, ordered,
     read_trailer,
 };
+
+/// Whether a segment starting at `next` follows one ending at `prev` with no sealed segment between (A.18
+/// Contiguity): `next` is the position after `prev`, or a lost range covers every position between them, or `next`
+/// starts a later generation.
+pub fn joins(prev: Position, next: Position, lost: &[LostEntry]) -> bool {
+    if next.generation != prev.generation {
+        return next.generation > prev.generation;
+    }
+    if next.sequence <= prev.sequence {
+        return false;
+    }
+    let (from, to) = (prev.sequence + 1, next.sequence - 1);
+    from > to
+        || lost.iter().any(|l| {
+            l.first.generation == prev.generation
+                && l.first.sequence <= from
+                && l.last.sequence >= to
+        })
+}
+
+/// Whether a group's records follow one another with no sealed segment between them.
+pub fn contiguous(g: &Group, lost: &[LostEntry]) -> bool {
+    g.segments
+        .windows(2)
+        .all(|w| joins(w[0].last(), w[1].first(), lost))
+}
 
 #[cfg(test)]
 mod tests {
@@ -543,6 +569,7 @@ mod tests {
         let root = Root {
             epoch: 2,
             manifest_end: 200,
+            manifest_crc32c: 0xabcd,
             through: Position {
                 generation: 0,
                 sequence: 5,

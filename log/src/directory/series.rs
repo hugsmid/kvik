@@ -15,7 +15,7 @@ use crate::writer::Position;
 
 /// An entry's size in v1.
 pub const ENTRY_LEN: u16 = 96;
-const PREFIX: usize = 40;
+const PREFIX: usize = 48;
 
 /// Entry flag bits (A.18).
 pub mod flag {
@@ -37,6 +37,9 @@ pub mod flag {
 /// A candidate's value: inline for fixed-width types; text is read at the candidate's position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CandidateValue {
+    /// Kind 0: value and quality are read from the fact at the candidate's position (a candidate continued from a
+    /// pending fact, whose value the entry did not hold).
+    AtPosition,
     /// Kind 1: an `f64`'s bits.
     F64(u64),
     /// Kind 2: a decimal at its stored scale.
@@ -108,12 +111,12 @@ fn quality_code(q: Quality) -> u8 {
     }
 }
 
+/// A candidate's quality: never bad.
 fn quality_of(c: u8) -> Option<Quality> {
     Some(match c {
         0 => Quality::Good,
         1 => Quality::Estimated,
         2 => Quality::Suspect,
-        3 => Quality::Bad,
         _ => return None,
     })
 }
@@ -138,7 +141,7 @@ impl SeriesEntry {
     fn encode(&self, out: &mut Vec<u8>) {
         let c = self.candidate;
         let (kind, scale, value) = match c.map(|c| c.value) {
-            None => (0u8, 0u8, 0u64),
+            None | Some(CandidateValue::AtPosition) => (0u8, 0u8, 0u64),
             Some(CandidateValue::F64(b)) => (1, 0, b),
             Some(CandidateValue::Decimal { units, scale }) => (2, scale, units as u64),
             Some(CandidateValue::State(s)) => (3, 0, u64::from(s)),
@@ -148,7 +151,13 @@ impl SeriesEntry {
         out.extend_from_slice(&self.series_id.to_le_bytes());
         out.extend_from_slice(&self.flags().to_le_bytes());
         out.push(kind);
-        out.push(c.map_or(0, |c| quality_code(c.quality)));
+        out.push(c.map_or(0, |c| {
+            if c.value == CandidateValue::AtPosition {
+                0
+            } else {
+                quality_code(c.quality)
+            }
+        }));
         out.extend_from_slice(&self.latest_t.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.lateness_reference.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.fact_count.to_le_bytes());
@@ -169,6 +178,7 @@ impl SeriesEntry {
         let has = |bit| f & bit != 0;
         let candidate = if has(flag::CANDIDATE) {
             let value = match b[6] {
+                0 => CandidateValue::AtPosition,
                 1 => CandidateValue::F64(u64_at(b, 64)),
                 2 if b[60] <= 18 => CandidateValue::Decimal {
                     units: i64_at(b, 64),
@@ -213,8 +223,14 @@ impl SeriesEntry {
 pub struct SeriesDirectory {
     /// Complete through this position, at or below the last synced mark: the entries are as of it.
     pub through: Position,
+    /// The lost ranges at or below `through` that the manifest held when it was written: one recorded since makes
+    /// the file no longer a function of the kept log.
+    pub lost: u32,
     /// The mark's reset stamp when it was written.
     pub stamp: Option<ResetStamp>,
+    /// The time the candidates and pending facts are judged at: the later of the write time and every receive time
+    /// the entries cover.
+    pub judged_at: i64,
     /// The entries, in strictly ascending series id.
     pub entries: Vec<SeriesEntry>,
 }
@@ -224,8 +240,9 @@ impl SeriesDirectory {
     pub fn encode(&self, frame: Frame, store_id: [u8; 16]) -> Result<Vec<u8>, EncodeError> {
         let mut b = Vec::with_capacity(PREFIX + self.entries.len() * usize::from(ENTRY_LEN));
         put_position(&mut b, self.through);
-        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&self.lost.to_le_bytes());
         put_stamp(&mut b, self.stamp);
+        b.extend_from_slice(&self.judged_at.to_le_bytes());
         b.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         b.extend_from_slice(&ENTRY_LEN.to_le_bytes());
         b.extend_from_slice(&[0; 2]);
@@ -251,13 +268,13 @@ impl SeriesDirectory {
         let entries = records(
             body,
             PREFIX,
-            u32_at(body, 32),
-            u16_at(body, 36),
+            u32_at(body, 40),
+            u16_at(body, 44),
             usize::from(ENTRY_LEN),
         )?
         .map(SeriesEntry::decode)
         .collect::<Result<Vec<_>, _>>()?;
-        let len = PREFIX + entries.len() * usize::from(u16_at(body, 36));
+        let len = PREFIX + entries.len() * usize::from(u16_at(body, 44));
         if len != body.len() || !entries.windows(2).all(|w| w[0].series_id < w[1].series_id) {
             return Err(DerivedError::Invalid("series entries"));
         }
@@ -265,7 +282,9 @@ impl SeriesDirectory {
             frame,
             SeriesDirectory {
                 through: position_at(body, 0),
+                lost: u32_at(body, 12),
                 stamp: stamp_at(body, 16),
+                judged_at: i64_at(body, 32),
                 entries,
             },
         ))
@@ -317,7 +336,9 @@ mod tests {
             .collect();
         let d = SeriesDirectory {
             through: at(4),
+            lost: 1,
             stamp: None,
+            judged_at: 160,
             entries,
         };
         let frame = Frame {

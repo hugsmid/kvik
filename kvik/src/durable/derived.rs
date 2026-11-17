@@ -9,7 +9,7 @@
 //! [`SeriesEntry::pending_more`]) and a reader finds the fact in force instead.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kvik_log::content::Item;
 use kvik_log::directory::series::{Candidate, CandidateValue, Pending, SeriesEntry};
@@ -17,7 +17,7 @@ use kvik_log::directory::status::{counter, health, reason};
 use kvik_log::entries::{Entry, Versioning};
 use kvik_log::facts::{FactRow, Quality, Value};
 use kvik_log::reader::ReadBatch;
-use kvik_log::writer::{Position as LogPos, SealHook, StatusContent, Watch};
+use kvik_log::writer::{Position as LogPos, SealHook, SeriesEntries, StatusContent, Watch};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -207,6 +207,13 @@ impl State {
             o.is_some_and(|o| o.t == k.t && k.rank(versioned) > o.rank(versioned))
         };
         let same = |o: Option<Kept>| o.is_some_and(|o| o.t == k.t);
+        // A fact ahead continued from a file has no `changed_at` to rank a later version of it by.
+        let unranked = |o: Option<Kept>| o.is_some_and(|o| o.t == k.t && o.changed_at.is_none());
+        if versioned && (unranked(self.pending) || unranked(self.last_ahead)) {
+            self.ahead_lost = true;
+            self.pending_more = true;
+            return;
+        }
         if !good {
             // A kept fact corrected to bad: what lies ahead is no longer bounded.
             if outranks(self.pending) || outranks(self.last_ahead) {
@@ -288,7 +295,7 @@ impl State {
         };
         let pending = e
             .pending
-            .map(|p| kept(p.t, p.position, Quality::Good, CandidateValue::Text));
+            .map(|p| kept(p.t, p.position, Quality::Good, CandidateValue::AtPosition));
         State {
             latest_t: e.latest_t,
             reference: e.lateness_reference,
@@ -333,9 +340,9 @@ struct Fold {
 }
 
 impl Fold {
-    fn apply(&mut self, q: Queued) {
-        self.horizon = self.horizon.max(q.received_at);
-        for (p, item) in &q.items {
+    fn take(&mut self, received_at: i64, last: LogPos, items: &[(LogPos, &Item)]) {
+        self.horizon = self.horizon.max(received_at);
+        for (p, item) in items {
             match item {
                 Item::Entry(Entry::Definition(d)) => {
                     self.defined.insert(d.id, d.versioning != Versioning::None);
@@ -352,22 +359,32 @@ impl Fold {
                 _ => {}
             }
         }
-        self.applied = self.applied.max(q.last);
+        self.applied = self.applied.max(last);
     }
 
     fn drain(&mut self, limit: LogPos) {
         while self.queued.front().is_some_and(|q| q.last <= limit) {
             let q = self.queued.pop_front().expect("looked at above");
-            self.apply(q);
+            let items: Vec<(LogPos, &Item)> = q.items.iter().map(|(p, i)| (*p, i)).collect();
+            self.take(q.received_at, q.last, &items);
         }
     }
 }
 
+/// The writer's last synced mark, as the fold reads it.
+type Synced = Box<dyn Fn() -> LogPos + Send + Sync>;
+
 /// See the module documentation.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct SeriesFold {
     fold: Mutex<Fold>,
-    watch: OnceLock<Watch>,
+    synced: OnceLock<Synced>,
+}
+
+impl std::fmt::Debug for SeriesFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeriesFold").finish_non_exhaustive()
+    }
 }
 
 impl SeriesFold {
@@ -379,7 +396,7 @@ impl SeriesFold {
                 horizon: i64::MIN,
                 ..Fold::default()
             }),
-            watch: OnceLock::new(),
+            synced: OnceLock::new(),
         }
     }
 
@@ -394,20 +411,23 @@ impl SeriesFold {
             .collect();
     }
 
-    /// Follows the writer's synced mark from now on.
-    pub(crate) fn follow(&self, watch: Watch) {
-        let _ = self.watch.set(watch);
+    /// Follows the writer's synced mark from now on, as `synced` reads it.
+    pub(crate) fn follow(&self, synced: impl Fn() -> LogPos + Send + Sync + 'static) {
+        let _ = self.synced.set(Box::new(synced));
     }
 
-    /// A batch the index took, in position order; one at or below what is folded changes only the definitions.
+    /// A batch the index took, in position order. One at or below the synced mark is folded as it is, with nothing
+    /// copied; only one above it waits, and a fact at or below what is folded is neither folded nor kept.
     pub(crate) fn batch(&self, b: &ReadBatch) {
-        let synced = self.watch.get().map(|w| w.stats().mark_synced);
+        let synced = self.synced.get().map(|f| f());
         let mut f = lock(&self.fold);
         if let Some(s) = synced {
             f.synced = f.synced.max(s);
         }
+        let limit = f.synced;
+        f.drain(limit);
         let mut sequence = b.first.sequence;
-        let items = b
+        let items: Vec<(LogPos, &Item)> = b
             .content
             .items
             .iter()
@@ -417,16 +437,24 @@ impl SeriesFold {
                     sequence,
                 };
                 sequence += i.sequences();
-                (p, i.clone())
+                (p, i)
             })
+            .collect();
+        if b.last <= f.synced && f.queued.is_empty() {
+            f.take(b.content.received_at, b.last, &items);
+            return;
+        }
+        let applied = f.applied;
+        let kept = items
+            .into_iter()
+            .filter(|(p, i)| matches!(i, Item::Entry(_)) || *p > applied)
+            .map(|(p, i)| (p, i.clone()))
             .collect();
         f.queued.push_back(Queued {
             last: b.last,
             received_at: b.content.received_at,
-            items,
+            items: kept,
         });
-        let limit = f.synced;
-        f.drain(limit);
     }
 
     /// The index voided everything above `above`.
@@ -438,12 +466,9 @@ impl SeriesFold {
         }
     }
 
-    /// The entries as of a position at or below `limit`, judged at `written_at`.
-    pub(crate) fn entries(
-        &self,
-        limit: LogPos,
-        written_at: i64,
-    ) -> Option<(LogPos, Vec<SeriesEntry>)> {
+    /// The entries as of a position at or below `limit`, judged at the later of `written_at` and every receive
+    /// time folded.
+    pub(crate) fn entries(&self, limit: LogPos, written_at: i64) -> Option<SeriesEntries> {
         let mut f = lock(&self.fold);
         if f.broken {
             return None;
@@ -462,81 +487,131 @@ impl SeriesFold {
                 s.entry(*id, defined.contains_key(id))
             })
             .collect();
-        Some((f.applied, entries))
+        Some(SeriesEntries {
+            through: f.applied,
+            judged_at: horizon,
+            entries,
+        })
     }
+}
+
+/// What the status file is made from, shared with the store: none of it keeps the store alive, so the hook never
+/// holds the last reference to the writer on `kvik-maint`.
+struct Parts {
+    watch: Watch,
+    counters: Arc<Mutex<super::Counters>>,
+    own_fault: Arc<Mutex<Option<kvik_log::writer::Fault>>>,
+    fs: Arc<dyn kvik_log::fs::Fs>,
+    dir: std::path::PathBuf,
 }
 
 /// The seal hook of a durable store.
-#[derive(Debug)]
 pub(crate) struct Hook {
     pub(crate) fold: Arc<SeriesFold>,
-    pub(crate) writer: OnceLock<Weak<super::Writer>>,
+    parts: OnceLock<Parts>,
+}
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hook").finish_non_exhaustive()
+    }
+}
+
+impl Hook {
+    /// Gives the hook what the status file is made from, once the log runs.
+    pub(crate) fn share(
+        &self,
+        watch: Watch,
+        counters: Arc<Mutex<super::Counters>>,
+        own_fault: Arc<Mutex<Option<kvik_log::writer::Fault>>>,
+        fs: Arc<dyn kvik_log::fs::Fs>,
+        dir: &std::path::Path,
+    ) {
+        let _ = self.parts.set(Parts {
+            watch,
+            counters,
+            own_fault,
+            fs,
+            dir: dir.to_path_buf(),
+        });
+    }
+}
+
+impl Parts {
+    /// The reasons the file carries and the level over them (A.18: partial until `kvik health`, roadmap 9.0e).
+    fn health(&self) -> (u8, Vec<u16>) {
+        use kvik_log::writer::Reason as LogReason;
+        let mut reasons: Vec<u16> = self
+            .watch
+            .reasons()
+            .into_iter()
+            .map(|r| match r {
+                LogReason::IngestWaiting(_) => reason::INGEST_WAITING,
+                LogReason::DiskLow { .. } => reason::DISK_LOW,
+                LogReason::DiskCritical { .. } => reason::DISK_CRITICAL,
+                LogReason::SealBlocked { .. } => reason::SEAL_BLOCKED,
+            })
+            .collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        let level = if reasons.contains(&reason::DISK_CRITICAL) {
+            health::CRITICAL
+        } else if reasons.is_empty() {
+            health::OK
+        } else {
+            health::DEGRADED
+        };
+        (level, reasons)
+    }
+
+    fn read_only(&self) -> bool {
+        self.watch.fault().is_some() || lock(&self.own_fault).is_some()
+    }
 }
 
 impl SealHook for Hook {
-    fn series(&self, limit: LogPos, written_at: i64) -> Option<(LogPos, Vec<SeriesEntry>)> {
+    fn series(&self, limit: LogPos, written_at: i64) -> Option<SeriesEntries> {
         self.fold.entries(limit, written_at)
     }
 
-    fn status(&self) -> Option<StatusContent> {
-        let w = self.writer.get()?.upgrade()?;
-        Some(status_of(&w))
+    fn health(&self) -> Option<(u8, bool)> {
+        let p = self.parts.get().filter(|p| !p.read_only())?;
+        Some((p.health().0, false))
     }
-}
 
-/// The status file's content from what the writer holds in memory, without reading the log: the log's reasons and
-/// fault, and the counters of `Stats`.
-fn status_of(w: &super::Writer) -> StatusContent {
-    use kvik_log::writer::Reason as LogReason;
-    let fault = w.fault();
-    let mut reasons: Vec<u16> = w
-        .log()
-        .as_ref()
-        .map(|l| l.reasons())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| match r {
-            LogReason::IngestWaiting(_) => reason::INGEST_WAITING,
-            LogReason::DiskLow { .. } => reason::DISK_LOW,
-            LogReason::DiskCritical { .. } => reason::DISK_CRITICAL,
-            LogReason::SealBlocked { .. } => reason::SEAL_BLOCKED,
+    fn status(&self) -> Option<StatusContent> {
+        let p = self.parts.get().filter(|p| !p.read_only())?;
+        let (level, reasons) = p.health();
+        let st = p.watch.stats();
+        let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let (waited, p50, p99, max) = {
+            let c = lock(&p.counters);
+            let mut sorted: Vec<std::time::Duration> = c.latencies.iter().copied().collect();
+            sorted.sort_unstable();
+            let pct = |q: usize| {
+                sorted
+                    .get((sorted.len() * q / 100).min(sorted.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or_default()
+            };
+            (c.waited, pct(50), pct(99), c.max_latency)
+        };
+        Some(StatusContent {
+            health: level,
+            pressure: false,
+            reasons,
+            counters: vec![
+                (counter::QUEUE_DEPTH, p.watch.queue_depth() as u64),
+                (counter::WAITED_NS, ns(waited)),
+                (counter::BATCHES, st.batches),
+                (counter::SYNCS, st.syncs),
+                (counter::COMMIT_P50_NS, ns(p50)),
+                (counter::COMMIT_P99_NS, ns(p99)),
+                (counter::COMMIT_MAX_NS, ns(max)),
+                (counter::SEALED_SEGMENTS, st.sealed_segments),
+                (counter::DISK_FREE, p.fs.free_space(&p.dir).unwrap_or(0)),
+            ],
         })
-        .collect();
-    if fault.is_some() {
-        reasons.push(reason::READ_ONLY);
-    }
-    reasons.sort_unstable();
-    reasons.dedup();
-    let level = if fault.is_some() {
-        health::FATAL
-    } else if reasons.contains(&reason::DISK_CRITICAL) {
-        health::CRITICAL
-    } else if reasons.is_empty() {
-        health::OK
-    } else {
-        health::DEGRADED
-    };
-    let s = w.stats();
-    let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-    StatusContent {
-        health: level,
-        pressure: false,
-        reasons,
-        counters: vec![
-            (counter::QUEUE_DEPTH, s.ingest.queue_depth as u64),
-            (counter::WAITED_NS, ns(s.ingest.waited)),
-            (counter::BATCHES, s.ingest.batches),
-            (counter::SYNCS, s.ingest.syncs),
-            (counter::COMMIT_P50_NS, ns(s.ingest.commit_latency.p50)),
-            (counter::COMMIT_P99_NS, ns(s.ingest.commit_latency.p99)),
-            (counter::COMMIT_MAX_NS, ns(s.ingest.commit_latency.max)),
-            (counter::SLOW_PATH, s.ingest.slow_path),
-            (counter::SEALED_SEGMENTS, s.log.sealed_segments),
-            (counter::DISK_FREE, s.disk.free),
-            (counter::SYNC_INTERVAL_NS, ns(s.log.sync_interval)),
-            (counter::REFRESH_ERRORS, s.delivery.refresh_errors),
-            (counter::CORRUPTIONS, s.delivery.corruptions),
-        ],
     }
 }
 
@@ -548,24 +623,14 @@ pub(crate) fn hook(
     dir: &std::path::Path,
     store_id: [u8; 16],
 ) -> Arc<Hook> {
-    use kvik_log::directory::series::SeriesDirectory;
-    use kvik_log::directory::{DerivedError, Family, read_latest};
     let fold = SeriesFold::new(writer.stats().mark_synced);
     let start = writer.directory_start();
-    let found = read_latest(fs, dir, Family::Series, |b| {
-        let (f, d) = SeriesDirectory::decode(b, &store_id)?;
-        if start.keeps(f.generation, d.stamp, d.through) {
-            Ok((f, d))
-        } else {
-            Err(DerivedError::Invalid("behind a reset"))
-        }
-    });
-    if let Ok(Some((f, d))) = found {
-        fold.seed(d.through, f.written_at, &d.entries);
+    if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start) {
+        fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
     }
     Arc::new(Hook {
         fold: Arc::new(fold),
-        writer: OnceLock::new(),
+        parts: OnceLock::new(),
     })
 }
 

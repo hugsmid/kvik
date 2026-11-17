@@ -12,7 +12,7 @@ use kvik_log::directory::logdir::{Group, GroupEntry, LostEntry, Root, SegmentRec
 use kvik_log::directory::series::{
     Candidate, CandidateValue, Pending, SeriesDirectory, SeriesEntry,
 };
-use kvik_log::directory::status::{StatusFile, counter, health, reason};
+use kvik_log::directory::status::{StatusFile, counter, flag, health, reason};
 use kvik_log::directory::{Frame, block_type};
 use kvik_log::facts::Quality;
 use kvik_log::header::{FileHeader, kind};
@@ -138,6 +138,7 @@ fn root() -> Root {
     Root {
         epoch: 4,
         manifest_end: 312,
+        manifest_crc32c: 0x1234_5678,
         through: at(90),
         segment_count: 2,
         stamp: Some(ResetStamp {
@@ -171,7 +172,7 @@ fn root_bytes() -> Vec<u8> {
     let r = root();
     let g = &r.groups[0];
     let mut b = Body::default();
-    b.u64(4).u64(312).u32(0).zeros(4).u64(90).u64(2);
+    b.u64(4).u64(312).u32(0).u32(0x1234_5678).u64(90).u64(2);
     b.u64(12).u64(0x5eed);
     b.u32(0).zeros(4).u64(0);
     b.u32(1).u32(1).u32(0).u32(0);
@@ -189,7 +190,9 @@ fn root_bytes() -> Vec<u8> {
 fn series() -> SeriesDirectory {
     SeriesDirectory {
         through: at(95),
+        lost: 1,
         stamp: None,
+        judged_at: T0 + 601 * S,
         entries: vec![
             SeriesEntry {
                 series_id: 1,
@@ -232,7 +235,14 @@ fn series() -> SeriesDirectory {
 
 fn series_bytes() -> Vec<u8> {
     let mut b = Body::default();
-    b.pos(0, 95).zeros(4).u64(0).u64(0).u32(2).u16(96).zeros(2);
+    b.pos(0, 95)
+        .u32(1)
+        .u64(0)
+        .u64(0)
+        .i64(T0 + 601 * S)
+        .u32(2)
+        .u16(96)
+        .zeros(2);
     // Series 1: latest, reference, candidate (bits 0, 1, 2); an f64 of good quality.
     b.u32(1).u16(0b111).u8(1).u8(0);
     b.i64(T0 + 590 * S).i64(T0 + 590 * S).u64(60).u64(0);
@@ -255,6 +265,7 @@ fn status() -> StatusFile {
         interval_ns: Some(60 * S as u64),
         mark_synced: at(95),
         health: health::DEGRADED,
+        flags: flag::PARTIAL,
         pressure: false,
         pressure_since: None,
         slot_count: 0,
@@ -268,7 +279,13 @@ fn status() -> StatusFile {
 
 fn status_bytes() -> Vec<u8> {
     let mut b = Body::default();
-    b.u64(60 * S as u64).pos(0, 95).u8(1).u8(0).zeros(2).i64(0);
+    b.u64(60 * S as u64)
+        .pos(0, 95)
+        .u8(1)
+        .u8(0)
+        .u8(1)
+        .zeros(1)
+        .i64(0);
     b.u32(0).u32(1).u32(2).u16(4).u16(16);
     b.u16(3).zeros(2);
     b.u16(1).zeros(6).u64(12);
@@ -332,7 +349,7 @@ fn golden_files_decode_to_what_they_show_and_encode_again() {
 fn a_longer_record_size_is_read_and_its_tail_ignored() {
     // The status file with 24-byte counter records: a later minor version's longer record (A.8's rule).
     let mut b = Body::default();
-    b.u64(0).pos(0, 3).u8(0).u8(0).zeros(2).i64(0);
+    b.u64(0).pos(0, 3).u8(0).u8(0).u8(0).zeros(1).i64(0);
     b.u32(0).u32(0).u32(1).u16(4).u16(24);
     b.u16(1).zeros(6).u64(5).u64(0xffff_ffff);
     let bytes = file(kind::STATUS, block_type::STATUS, 1, &b.0);

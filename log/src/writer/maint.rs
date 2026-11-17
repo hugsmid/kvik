@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::batch::SegmentIdentity;
 use crate::block::BLOCK_HEADER_LEN;
 use crate::body::{INDEX_HAS_ENTRIES, IndexRecord, SegmentIndex};
-use crate::bytes::{u32_at, u64_at};
+use crate::bytes::u64_at;
 use crate::crc::Crc32c;
 use crate::directory::logdir::SegmentRecord;
 use crate::fs::{Fs, FsFile, OpenMode, is_sharing_error};
@@ -222,20 +222,30 @@ pub enum SealError {
 /// failed although the `.open` name is gone and the `.kvl` name exists took effect and then failed its flush
 /// (`StdFs` on Windows): a failed sync, never retried (`format.md` A.13).
 pub fn seal_segment(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<(), SealError> {
-    seal_described(fs, job, halt).map(|_| ())
+    seal_described(fs, job, halt, false).map(|_| ())
 }
 
-/// [`seal_segment`], returning the sealed segment's log directory record (`format.md` A.18), its SHA-256 computed
-/// in the same pass as `file_crc32c`.
-pub fn seal_described(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, SealError> {
-    let r = seal_inner(fs, job, halt);
+/// [`seal_segment`], returning the sealed segment's log directory record (`format.md` A.18); with `hash`, its
+/// SHA-256 is computed in the same pass as `file_crc32c` (zero otherwise).
+pub fn seal_described(
+    fs: &dyn Fs,
+    job: &SealJob,
+    halt: &Halt,
+    hash: bool,
+) -> Result<SegmentRecord, SealError> {
+    let r = seal_inner(fs, job, halt, hash);
     if let Err(SealError::Fault(f)) = &r {
         halt.set(f.clone());
     }
     r
 }
 
-fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, SealError> {
+fn seal_inner(
+    fs: &dyn Fs,
+    job: &SealJob,
+    halt: &Halt,
+    hash: bool,
+) -> Result<SegmentRecord, SealError> {
     let go = || {
         if halt.is_set() {
             Err(SealError::Halted)
@@ -262,7 +272,9 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, 
             }
             Ok(n) => {
                 crc.update(&buf[..n]);
-                sha.update(&buf[..n]);
+                if hash {
+                    sha.update(&buf[..n]);
+                }
                 at += n as u64;
             }
             Err(e) => return Err(f(FaultOp::Seal, &e)),
@@ -287,10 +299,9 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, 
     })?;
     sha.update(&seal);
     let trailer_offset = u64_at(&seal, seal.len() - 16);
-    let file_crc32c = u32_at(
-        &seal,
-        (trailer_offset - job.end) as usize + BLOCK_HEADER_LEN + 56,
-    );
+    let at = (trailer_offset - job.end) as usize + BLOCK_HEADER_LEN;
+    let file_crc32c = crate::body::Trailer::decode(&seal[at..at + crate::body::TRAILER_LEN])
+        .map_or(0, |t| t.file_crc32c);
     let record = SegmentRecord {
         file_id: job.id.file_id,
         generation: job.id.generation,
@@ -302,7 +313,7 @@ fn seal_inner(fs: &dyn Fs, job: &SealJob, halt: &Halt) -> Result<SegmentRecord, 
         fact_count: job.records.iter().map(|r| u64::from(r.fact_count)).sum(),
         len: job.end + seal.len() as u64,
         file_crc32c,
-        sha256: sha.finalize().into(),
+        sha256: if hash { sha.finalize().into() } else { [0; 32] },
     };
     go()?;
     job.file
@@ -411,7 +422,7 @@ mod tests {
             records: Vec::new(),
             has_entries: false,
         };
-        let record = seal_described(&fs, &job, &halt).unwrap();
+        let record = seal_described(&fs, &job, &halt, true).unwrap();
         let bytes = fs.read(&segment_path(&log_dir, &id, true)).unwrap();
         let seal = scan(&bytes, &id, ScanLimit::End).unwrap().seal.unwrap();
         assert_eq!(seal.start, end);

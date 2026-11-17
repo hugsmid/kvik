@@ -41,6 +41,7 @@
 mod directories;
 mod gather;
 mod maint;
+mod maint_thread;
 mod options;
 mod pacing;
 mod queue;
@@ -57,7 +58,7 @@ use std::time::Duration;
 
 pub use directories::{
     Directories, DirectoryOptions, DirectoryStart, DirectoryStats, STATUS_INTERVAL, SealHook,
-    StatusContent, writer_catalogue,
+    SeriesEntries, StatusContent, kept_series, lost_below, writer_catalogue,
 };
 pub use maint::{AheadSegment, CreateError, SealError, SealJob, SegmentRequest};
 pub use maint::{create_segment, seal_described, seal_segment};
@@ -719,6 +720,8 @@ impl LogWriter {
                 sequence: e.entry.after,
             }),
             segment_size: self.cfg.segment_size,
+            disk_critical: self.cfg.disk_critical,
+            series_bytes: crate::directory::cadence::SERIES_BYTES,
         }
     }
 

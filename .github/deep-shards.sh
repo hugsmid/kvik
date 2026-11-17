@@ -6,8 +6,8 @@
 #   deep-shards.sh check SHARD   checks that each test of SHARD's file is in exactly one shard
 #   deep-shards.sh run SHARD     runs SHARD's tests in release mode (set PROPTEST_CASES)
 #
-# Each table line is: shard name, crate directory, test file in `<crate>/tests`,
-# then libtest name filters. Filters match substrings, so anchor them (`inv09_`,
+# Each table line is: shard name, crate directory, test file in `<crate>/tests`
+# (or `lib` for the crate's own unit tests), then libtest name filters. Filters match substrings, so anchor them (`inv09_`,
 # not `inv9`); none means the whole file. The filter `--rest` selects every test
 # of the file that no other shard of the file selects, so a new test always runs
 # somewhere; give it a shard of its own group if it is slow. Every test file of
@@ -42,9 +42,13 @@ log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
 log-pacing      log   pacing
 log-directories log   directories
+log-dir-crash   log   directories_crash
+log-dir-check   log   directories_check
+log-dir-lookup  log   directories_lookup
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-differential kvik differential
+kvik-fold       kvik  lib         durable::derived::tests::
 kvik-restore-plan kvik restore_plan_model
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
@@ -101,11 +105,17 @@ cargo_test() {
     cargo test --locked --release -p "$(package_of "$crate")" "$@"
 }
 
+# The cargo arguments that select a test file, or the unit tests for `lib`.
+target_of() {
+    if [[ $1 == lib ]]; then echo --lib; else echo "--test $1"; fi
+}
+
 # Names of the tests the arguments select, sorted.
 list() {
     local crate=$1 file=$2
     shift 2
-    cargo_test "$crate" --quiet --test "$file" -- --list "$@" | sed -n 's/: test$//p' | sort
+    # shellcheck disable=SC2046 # the target is two words on purpose
+    cargo_test "$crate" --quiet $(target_of "$file") -- --list "$@" | sed -n 's/: test$//p' | sort
 }
 
 case "${1:-}" in
@@ -116,7 +126,7 @@ matrix)
             { echo "model/tests/$file.rs has no deep shard" >&2; exit 1; }
     done
     for name in $(rows | awk '{ print $1 }'); do
-        [[ -f "$(crate_of "$name")/tests/$(file_of "$name").rs" ]] ||
+        [[ $(file_of "$name") == lib || -f "$(crate_of "$name")/tests/$(file_of "$name").rs" ]] ||
             { echo "shard $name names a missing test file" >&2; exit 1; }
     done
     rows | awk 'BEGIN { printf "[" } { printf "%s\"%s\"", (NR > 1 ? "," : ""), $1 } END { print "]" }'
@@ -124,7 +134,13 @@ matrix)
 check)
     crate=$(crate_of "${2:-}")
     file=$(file_of "$2")
-    all=$(list "$crate" "$file")
+    if [[ $file == lib ]]; then
+        # A crate's unit tests are many; a `lib` shard answers for the tests its filters name.
+        # shellcheck disable=SC2046 # filters are split on spaces on purpose
+        all=$(list "$crate" "$file" $(own_filters "$2"))
+    else
+        all=$(list "$crate" "$file")
+    fi
     [[ -n $all ]] || { echo "no tests listed for $crate/tests/$file.rs" >&2; exit 1; }
     selected=
     for name in $(rows | awk -v c="$crate" -v t="$file" '$2 == c && $3 == t { print $1 }'); do
@@ -144,8 +160,8 @@ check)
 run)
     crate=$(crate_of "${2:-}")
     file=$(file_of "$2")
-    # shellcheck disable=SC2046 # filters are split on spaces on purpose
-    cargo_test "$crate" --test "$file" -- $(filters_of "$2")
+    # shellcheck disable=SC2046 # filters and the target are split on spaces on purpose
+    cargo_test "$crate" $(target_of "$file") -- $(filters_of "$2")
     ;;
 *)
     sed -n '5,7s/^#  *//p' "$0" >&2
