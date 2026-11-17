@@ -255,6 +255,9 @@ pub(crate) struct Deliverer {
     failed: bool,
     stats: DeliveryStats,
     loading: bool,
+    /// Records taken batches put in `items`.
+    #[cfg(test)]
+    records: u64,
 }
 
 impl Deliverer {
@@ -314,6 +317,8 @@ impl Deliverer {
             failed: false,
             stats: DeliveryStats::default(),
             loading: true,
+            #[cfg(test)]
+            records: 0,
         };
         // `now` places the recent window while the log is taken (roadmap 11.0).
         let ctx = Ctx {
@@ -342,6 +347,8 @@ impl Deliverer {
             }
         }
         d.loading = false;
+        // No record is kept while loading: a consumer behind reads its backlog from the log ([`Deliverer::restore_items`]).
+        d.items_from = next(d.head);
         // Lost ranges not described by a recovery entry are reset points: `forget_above` the position before, id
         // its last position (`spec.md` §4 Resync).
         let lost: Vec<_> = d
@@ -618,8 +625,12 @@ impl Deliverer {
                         for name in &names {
                             self.deliver_live(name, &rec);
                         }
+                        self.items.insert(p, Rec::Fact(rec));
+                        #[cfg(test)]
+                        {
+                            self.records += 1;
+                        }
                     }
-                    self.items.insert(p, Rec::Fact(rec));
                 }
                 Item::Entry(e) if matches!(*e, Entry::Ignored { .. }) => {}
                 Item::Entry(e) => {
@@ -638,7 +649,9 @@ impl Deliverer {
                     }
                     let routing = matches!(e, Entry::Routing(_));
                     self.entries.insert(p, e.clone());
-                    self.items.insert(p, Rec::Entry(e));
+                    if !self.loading {
+                        self.items.insert(p, Rec::Entry(e));
+                    }
                     if routing && !self.loading {
                         for name in &names {
                             self.sync_runners(name, ctx.mono);

@@ -225,6 +225,16 @@ mod bounded {
     }
 
     #[test]
+    fn the_open_builds_no_record_and_holds_none() {
+        let (env, dir) = store();
+        let d = open(&env, dir);
+        assert_eq!(d.records, 0);
+        assert!(d.items.is_empty());
+        assert_eq!(d.items_from, next(d.head));
+        assert!(d.head.sequence > 3 * 7_200);
+    }
+
+    #[test]
     fn a_fact_taken_below_the_window_is_judged_outranked_from_the_log() {
         let (env, dir) = store();
         let d = open(&env, dir);
@@ -284,5 +294,61 @@ mod bounded {
         assert!(d.live_fact(3, T0 + 7_200 * S).is_none());
         assert!(d.incomplete.get());
         drop(reader);
+    }
+
+    #[test]
+    fn a_consumer_resumes_over_several_parts_of_the_log_receiving_each_fact_once_in_order() {
+        use crate::consume::{DeliveryKind, Funnel, Select, Start};
+        let env = Env::test(ManualClock::new(Timestamp(T0 + 40_000 * S)));
+        let dir = "resume-parts";
+        let config = || {
+            let mut c = StoreConfig::new(dir, "Etc/UTC")
+                .create_if_missing(true)
+                .env(env.clone());
+            c.log.min_sync_interval = std::time::Duration::ZERO;
+            c
+        };
+        let emit = |s: &Store, from: i64, to: i64| {
+            for chunk in (from..to).collect::<Vec<i64>>().chunks(1_000) {
+                let rs: Vec<Reading> = chunk
+                    .iter()
+                    .flat_map(|&k| {
+                        (1..=2).map(move |id| {
+                            Reading::new(SeriesId(id), Timestamp(T0 + k * S), Value::F64(k as f64))
+                        })
+                    })
+                    .collect();
+                block_on(s.emit(&rs)).unwrap();
+            }
+        };
+        let s = block_on(Store::open(config())).unwrap();
+        block_on(s.define_series(gauge("a/b/one"))).unwrap();
+        block_on(s.define_series(gauge("a/b/two"))).unwrap();
+        let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+        block_on(c.route(Funnel::facts(Select::All))).unwrap();
+        emit(&s, 0, 10);
+        while let Some(d) = c.try_next().unwrap() {
+            block_on(c.confirm(d.id)).unwrap();
+        }
+        drop(c);
+        block_on(s.shutdown()).unwrap();
+        drop(s);
+        let s = block_on(Store::open(config())).unwrap();
+        emit(&s, 10, 36_000);
+        block_on(s.shutdown()).unwrap();
+        drop(s);
+        let s = block_on(Store::open(config())).unwrap();
+        let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+        let mut got = Vec::new();
+        while let Some(d) = c.try_next().unwrap() {
+            if let DeliveryKind::Fact(f) = &d.kind {
+                got.push((f.position, f.series.0, f.t));
+            }
+            block_on(c.confirm(d.id)).unwrap();
+        }
+        assert_eq!(got.len(), 2 * (36_000 - 10));
+        assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!((got[0].1, got[0].2), (1, Timestamp(T0 + 10 * S)));
+        block_on(s.shutdown()).unwrap();
     }
 }
