@@ -22,7 +22,7 @@ use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
     Ack, Call, CallSource, CommitError, EveryCommitReason, FaultOp, IngestQueue, LogWriter,
     MarkSync, MarkSyncMode, Position, Reason, SealJob, StartRule, Wait, WriterConfig,
-    create_segment, seal_segment,
+    create_segment, seal_segment_described,
 };
 use proptest::prelude::*;
 
@@ -184,7 +184,7 @@ impl H {
     /// Runs the seal jobs taken.
     fn seal_run(&mut self) {
         for job in std::mem::take(&mut self.inflight) {
-            let r = seal_segment(&self.fs, &job, &self.w.halt());
+            let r = seal_segment_described(&self.fs, &job, &self.w.halt());
             self.w.seal_done(job, r, self.now);
         }
     }
@@ -952,7 +952,7 @@ fn a_seal_blocked_by_another_handle_finishes_after_its_release() {
     };
     let seal = |w: &mut LogWriter, now: Duration| {
         for job in w.take_seal_jobs(now) {
-            let r = seal_segment(&*fs, &job, &w.halt());
+            let r = seal_segment_described(&*fs, &job, &w.halt());
             w.seal_done(job, r, now);
         }
     };

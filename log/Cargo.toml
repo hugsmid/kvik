@@ -13,11 +13,17 @@ categories = ["database-implementations"]
 
 [dependencies]
 crc = "3.4"
+# The plaintext SHA-256 of a sealed segment (`spec.md` §8 Hashes, `format.md` A.9).
+sha2 = { version = "0.11", default-features = false }
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Free space through `statvfs` without unsafe code (`format.md` A.13).
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+
+[features]
+# A health reason no other crate maps, for testing how a caller reports a reason it does not know (Q-221 (d)).
+unmapped-reason = []
 
 [dev-dependencies]
 # The reference model: the meaning of facts and entries, for the differential test.

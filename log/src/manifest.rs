@@ -4,6 +4,8 @@
 //! layouts are in the `kvik-files` crate, and this reader passes the publish-and-retire, sealed-segment and reserved
 //! (restore, quarantine, tier-move) records over as field lists, taking only their epochs.
 
+use std::collections::BTreeSet;
+
 use crate::block::{BLOCK_HEADER_LEN, encode_block, read_block};
 use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
@@ -28,6 +30,8 @@ pub const RECORD_ACKNOWLEDGEMENT: u8 = 0x24;
 pub const RECORD_REBUILD: u8 = 0x28;
 /// Bytes of a record body before its field list.
 const RECORD_PREFIX: usize = 24;
+/// The bytes of a restore record's field 9 before its file description (`format.md` A.14 `0x25`).
+const RESTORED_FILE_FIXED: usize = 44;
 
 /// A position as written in a record: `(generation, sequence)`, 12 bytes.
 pub type RecordPosition = (u32, u64);
@@ -335,6 +339,40 @@ pub fn encode_initial(store_id: [u8; 16], created_at: i64) -> Vec<u8> {
         .encode()
         .to_vec();
     out.extend(encode_record(RECORD_EMPTY, 1, 0, created_at, None));
+    out
+}
+
+/// The generation and file id of each log segment that valid records name (`format.md` A.14): field 1 of a
+/// sealed-segment record, fields 1 and 2 of a publish-and-retire record and field 9 of a restore record (past its
+/// tier, copy size and copy hash), each a file description of kind 1 (Q-221 (b)). A value too short to hold a kind,
+/// generation and `file_id` names nothing.
+pub fn listed_segments(bytes: &[u8], read: &ManifestRead) -> BTreeSet<(u32, u64)> {
+    let mut out = BTreeSet::new();
+    for r in &read.records {
+        let (named, skip): (&[u16], usize) = match r.record_type {
+            RECORD_SEALED => (&[1], 0),
+            RECORD_PUBLISH => (&[1, 2], 0),
+            RECORD_RESTORE => (&[9], RESTORED_FILE_FIXED),
+            _ => continue,
+        };
+        let Ok(b) = read_block(bytes, r.offset, bytes.len() as u64) else {
+            continue;
+        };
+        let Some(list) = b.body.get(RECORD_PREFIX..).and_then(fields) else {
+            continue;
+        };
+        for (_, v) in list.iter().filter(|(id, _)| named.contains(id)) {
+            let Some(v) = v.get(skip..) else {
+                continue;
+            };
+            if v.first() == Some(&kind::LOG_SEGMENT)
+                && let Some(g) = v.get(4..8).and_then(|b| b.try_into().ok())
+                && let Some(id) = v.get(8..16).and_then(u64_of)
+            {
+                out.insert((u32::from_le_bytes(g), id));
+            }
+        }
+    }
     out
 }
 

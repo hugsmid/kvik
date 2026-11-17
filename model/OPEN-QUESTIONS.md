@@ -48,6 +48,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-210 | §8 Bucket; `api.md` Backup and restore; `format.md` A.17 Probe | Telling a bucket that reports no checksum from another sink failure |
 | Q-211 | §7 Manifest, §8 Generations; `format.md` A.14, A.17 | An uploaded epoch written again after the last two synced records are damaged |
 | Q-212 | §8 Continuous backup, Hashes; `format.md` A.17 | A key already taken by an object that is not the file |
+| Q-220 | §8 Hashes, §7 Manifest; `format.md` A.9, A.14 | Where a log segment's plaintext hash lives, what it covers, and when it is computed |
+| Q-221 | §3 Write or sync failure, §7 Manifest, §8 Corrupt block; `format.md` A.9 | A read that fails while hashing, and sealed segments no record names |
 | Q-270 | §8 Encryption; `format.md` A.17 Reading | Envelope damage that `EnvelopeError` has no variant for |
 | Q-280 | §7 Manifest (rebuild), §8 Continuous backup, Hashes | How a rebuilt manifest queues files for upload again |
 | Q-281 | §8 Hashes; `format.md` A.14 | The copy-verified record (`0x27`): layout and fold |
@@ -1330,6 +1332,105 @@ truncate after an older position.
 **Needed.** Proposed: with no valid slot, a start takes its counter above every counter field it can read in either
 slot, valid or not, or writes both slots.
 
+## Q-220 — Where a log segment's plaintext hash lives, what it covers, and when it is computed
+Recorded by roadmap 6.3b, while computing the plaintext SHA-256 at seal (`kvik-log` `writer::seal_segment_described`).
+**Scenario.** §8 Hashes and the A.14 file description need a log segment's plaintext SHA-256, and A.14 says a file's
+header and trailer carry everything a record says about it. The A.9 trailer has 4 reserved bytes, and no hash can sit
+inside the bytes it covers. A blocked seal (A.13) runs again from step 1. A seal on `kvik-maint` would still hold up
+an acknowledgement if the commit thread waited for it. Restore (Q-290) needs every sealed-segment record to follow the
+lost-range records of the start before its seal.
+**Decided.** (a) The hash is over every byte of the sealed file, header to end marker, and only the file description
+holds it: the trailer is unchanged, so no version rule applies, and a rebuild computes the hash from the file
+(`format.md` A.9, A.14; `spec.md` §7 Manifest). (b) It is computed in the pass that computes `file_crc32c`, on
+`kvik-maint`; the commit thread never waits for it. (c) Once per seal: a blocked seal's retry reuses the seal blocks
+and hash of its first pass. (d) Each `SealedFile` is handed over once (`LogWriter::take_sealed`, `Log::take_sealed`),
+after the `.kvl` name and the directory are synced, with the segment's length, which A.14 does not hold. (e) The
+sealed-segment record is appended after the seal from that description, and the seal does not wait for it. No
+description leaves the writer before the start that preceded it has synced its lost-range records, and a start that
+cannot write one is read-only and hands out none, so a record appended from a description has an epoch above them
+(`format.md` A.14). `log/tests/seal_hash.rs`: `the_hash_is_sha256_of_the_sealed_files_bytes`,
+`a_blocked_seal_reads_and_hashes_its_segment_once`, `the_commit_thread_acknowledges_while_a_seal_is_hashing`;
+`log/tests/seal_describe.rs`: `no_description_leaves_the_writer_before_the_starts_lost_range_records`,
+`a_start_that_cannot_record_a_loss_is_read_only_and_describes_nothing` (step 4),
+`no_description_leaves_the_writer_before_the_gap_below_a_recovery_entry_is_recorded`,
+`a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing` (step 6),
+`no_segment_is_described_after_a_fault`.
+**Needed.** Roadmap 6.3c appends the record from the descriptions (through `StartOptions::sealed`, which still
+refuses until then) with an epoch above the manifest's last, which keeps (e); `From<&SealedFile>` for the `kvik-files`
+file description is 6.3c's.
+
+## Q-221 — A read that fails while hashing, and sealed segments no record names
+Recorded by roadmap 6.3b with Q-220. The spec names write and sync failures (§3) but no read failure outside them.
+**Scenario.** (a) A read of the segment fails during the seal's pass. (b) A start finds sealed segments that no record
+names (§7 Manifest: an unlisted sealed log segment is listed again); until records are appended at seal that is
+every sealed segment, at every start. (c) Such a segment cannot be read whole, its header disagrees with its name,
+its trailer or end marker is not valid, or its `file_crc32c` does not match.
+**Decided (the conservative choice in each case).** (a) As before the hash: the seal fails as a write failure on the
+log (read-only, fatal health; the next start seals it again from step 1), so no segment takes its `.kvl` name
+without a hash. (b) The start does not read them; a segment is named by generation and `file_id`, so a record of
+another generation does not list it. A sealed-segment, a publish-and-retire and a restore record list segments (the
+restore's field 9, set-aside segments included), so a segment a restore placed is not described and listed again in
+the new generation (scenario from the review of roadmap 6.3b: after a restore, earlier generations' segments are named
+only by the `0x25`). The writer hands them out one at a time (`LogWriter::take_unlisted`, run by
+`writer::describe_sealed` on `kvik-maint`), only while no seal is ready or running and the store is writable, outside
+`seals_running` and `sealed_segments`. Once a shutdown begins none is handed out, and one in flight is dropped before
+its next file operation (a read is at most 1 MiB), so neither a start nor a shutdown waits for a description beyond
+the read under way; one not described when the writer stops is found again at the next start (the owner's ruling at
+the review of roadmap 6.3b; scenario: a stop in the first minutes of a run, with every sealed segment still queued,
+waited for a whole segment's read). (c) No description
+(`DescribeError`): the segment stays unnamed, nothing is written and no fault is set; a damaged file's hash is never
+taken as the hash at seal. A failure to open or read it (`DescribeError::Io`: a sharing violation, a descriptor limit,
+a permission, an I/O error that may clear) is retried within the run, 10 s after the first failure and then twice as
+long each time up to 10 minutes (`DESCRIBE_RETRY_INTERVAL`, `DESCRIBE_RETRY_MAX`), at the writer's timer, so never
+in a busy loop: a retry time counts for the writer's next turn only while it could be handed out (none in flight, no
+seal ready or running), and what closes that gate wakes the writer when it ends (scenario from the re-check of
+roadmap 6.3b: a retry due while another description was reading spun the writer loop); the segment stays unlisted meanwhile, and health names it once the wait reaches its cap (Q-640). Only a failed check
+(`NotSealed`, `Invalid`: header, trailer, end marker, `file_crc32c`) is damage: health is degraded by
+`Reason::SegmentDamaged { file_id }` (`api.md` Health; `spec.md` §8 Corrupt block, §11) while the writer runs, and
+raised again at each start until a description succeeds: a damaged unlisted segment is damaged data, held degraded
+like a `data_lost` (Q-124 (a)) but ended by repair, not by an acknowledgement (the owner's rulings on (c), at the
+review of roadmap 6.3b; scenario for the retry: an open refused for a sharing error was reported as a damaged segment
+for the rest of the run, while the same error on a seal is `SealBlocked` and retried, A.13). `log/tests/seal_hash.rs`:
+`a_read_error_while_sealing_is_a_write_failure_on_the_log`; `log/tests/seal_describe.rs`:
+`a_start_describes_every_sealed_segment_no_record_names`,
+`a_start_skips_every_segment_a_record_lists_by_generation_and_id`,
+`no_segment_is_described_while_a_seal_is_ready_or_running`,
+`a_running_log_describes_the_unlisted_segments_on_its_maintenance_thread`,
+`a_shutdown_drops_a_description_in_flight_before_its_next_read`,
+`a_shutdown_that_drops_a_queued_description_still_runs_the_seals_that_follow`,
+`a_start_leaves_a_segment_that_fails_its_checks_unnamed_and_degrades_health_naming_it`,
+`a_description_that_cannot_read_is_retried_after_the_interval_and_succeeds_once_the_fault_clears`,
+`a_due_retry_that_cannot_be_handed_out_does_not_wake_the_writer_at_once`,
+`a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
+`describe_sealed_refuses_each_check_it_makes`,
+`a_sealed_file_with_any_byte_changed_is_never_described`; `files/tests/listed_segments.rs` (the listing against
+the records `kvik-files` encodes,
+`listed_segments_counts_the_segments_a_restore_record_lists_set_aside_ones_included`).
+(d) `kvik_log::writer::Reason` is `#[non_exhaustive]`, like `kvik::Reason`, so a reason the log adds breaks no match
+outside the crate. Scenario (the review of roadmap 6.3b): a branch that matched every log reason stopped compiling
+once `SegmentDamaged` merged, with no textual conflict to warn of it. `kvik` maps those it knows and reports any other
+as `kvik::Reason::Other { reason }`, its debug form, which degrades health: a reason never vanishes from health (the
+lead's ruling at the re-check of roadmap 6.3b; scenario: a reason added to the log but not to `kvik`'s mapping would
+otherwise be dropped silently). `kvik/src/durable/mod.rs`
+`a_log_reason_the_mapping_does_not_name_stays_in_health_with_its_name`, through the `kvik-log` feature
+`unmapped-reason`, which only `kvik`'s tests enable.
+**Needed.** The damaged case handed to §8 Corrupt block (scrub, copy from deep, quarantine), with backup.
+
+## Q-640 — A description that never stops failing to open or read its segment
+Recorded at the review of roadmap 6.3b, with the retry of Q-221 (c); settled by the lead's ruling at its re-check.
+**Scenario.** An unlisted sealed segment's permissions change, or another program holds it open for the whole run.
+Every try of its description fails with `DescribeError::Io`; it is tried again every 10 minutes once the wait reaches
+its cap, and the segment is not listed, so it is not uploaded and a restore ends the restored log at its range (as
+for a damaged one). Silent, the store would report itself healthy throughout.
+**Decided.** A description that keeps failing does not stay silent: from the failure that sets the 10-minute wait
+(`DESCRIBE_RETRY_MAX`), health is degraded by `Reason::SegmentUnreadable { file_id }` (`api.md` Health; `spec.md` §8
+Corrupt block, §11), not `SegmentDamaged`, which stays for failed checks (Q-221 (c)). Retries go on at the cap; the
+reason clears when a read succeeds (with a description, or with a failed check, which raises `SegmentDamaged`
+instead). A restart starts the waits again from 10 s and raises the reason again at the cap. Reason: an unlisted
+segment is never backed up, so a silent indefinite retry is a hidden loss of backup. `log/tests/seal_describe.rs`
+`a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
+`segment_unreadable_clears_when_a_read_succeeds`.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -1342,7 +1443,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1391,6 +1492,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-210 | 8.1c | A sink's report of a missing checksum; recorded by roadmap 8.1a |
 | Q-211 | 6.3d | An uploaded epoch written again after a damaged tail; recorded by roadmap 8.1a |
 | Q-212 | 8.1c | A key taken by other content; recorded by roadmap 8.1a |
+| Q-220 | 6.3c | Plaintext hash at seal; recorded and decided by roadmap 6.3b; settled when the sealed-segment record is appended at seal |
+| Q-221 | 8.1 | Failures while hashing and unlisted segments; recorded and decided by roadmap 6.3b, health for (c) by the owner's ruling; repair of a damaged unlisted segment with backup |
 | Q-270 | 8.1 | Envelope damage mapped onto the existing error variants; recorded by roadmap 8.1b; a `Damaged` variant is the lead's call |
 | Q-280 | 8.1 | Rebuilt manifest and the upload queue; decided by roadmap 8.1c, accepted by the owner |
 | Q-281 | 8.1 | Copy-verified record layout; decided by roadmap 8.1c, field 1 a whole file description by the owner's ruling |
@@ -1643,7 +1746,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-181 | Which zero is the minimum of +0.0 and −0.0 | `spec.md` §5.2, §5.6; `format-tree.md` T.5 (settled at the review of roadmap 7.1a: IEEE total order, −0.0 below +0.0) |
 | Q-182 | A state name declared twice | `spec.md` §2.1 `value type`; `format.md` A.6 field 13 (settled at the review of roadmap 7.1a: names are distinct, a definition repeating one is refused) |
 | Q-108 | A restore from a rebuilt manifest only partly uploaded | §8 Generations (settled by roadmap 8.3a, as the question suggested: a rebuilt manifest counts for a restore only once it is whole in the bucket, its closing empty record, the one without field 100, uploaded; the restore reads from the last such rebuild record up to the next rebuild record, and with none whole it reads the records before the first rebuild record that opens a rebuilt manifest, which the old manifest uploaded before it; records upload in epoch order, so a whole rebuilt manifest is self-contained). Scenario: a rebuild record and some carried records are in the bucket, the rest not; read from the rebuild record, a restore misses files named only by records not yet carried, and their positions become a gap or a set-aside range although the bucket holds the files and the records naming them. A rule keyed on the rebuild record alone reads that truncated list. What a whole rebuilt manifest restores before its files are verified again is Q-295. The selection is `kvik_backup::plan::records_to_read`, which the restore driver applies before the fold (`backup/tests/restore_plan.rs` `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `q108_records_after_a_whole_rebuilt_manifest_are_read_with_it_and_a_later_partial_one_is_not`) |
-| Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, the general case of the rule). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`); a gap that holds a position of a listed segment with no copy is never bridged, since the entry is then not the next restored position. The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The loss side is guaranteed by the log's start, which goes read-only rather than seal without the record. The listing side rests on the sealed-segment record being appended after the start that recorded the gaps, which is roadmap 6.3b's and not yet built (`format.md` A.14): 6.3b must state it as an invariant with a test (no sealed-segment record has an epoch below a lost-range record of the start that preceded its seal), and roadmap 8.4a needs a kill-loop case with a truncated tail, a seal and a restore. Should it fail, the plan ends the log at the gap and sets later data aside: conservative. The hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing`, `the_restored_end_is_the_one_the_spec_walks_to` |
+| Q-290 | The restored end and recovery entries inside segments | §8 Restore step 1 (settled by roadmap 8.3a, the general case of the rule). The plan scans the copied log segments' ranges in the source generation; a gap that recorded lost ranges cover does not end the restored log, nor one followed directly by a recovery entry whose `after` the caller names (`PlanInput::recovery_after`); a gap that holds a position of a listed segment with no copy is never bridged, since the entry is then not the next restored position. The restore driver names none, since the record is written before any file is downloaded, and needs none: a recovery entry's gap is recorded as a lost range (cause 2) by the start that wrote the entry (step 6) or by the next start that can write (step 4), and the segment holding the entry is sealed, and listed by a sealed-segment record, only by a run that could write after that, so the listing has the higher epoch; records upload in epoch order, so a restore that lists the segment has read the loss. Gaps inside a listed segment's range are recorded losses for the same reason (rule 2 regions at step 4), so a segment's range is taken as held. The loss side is guaranteed by the log's start, which goes read-only rather than seal without the record. The listing side rests on the sealed-segment record being appended after the start that recorded the gaps, an invariant roadmap 6.3b states (`format.md` A.14, Q-220 (e): no sealed-segment record has an epoch below a lost-range record of the start that preceded its seal; `log/tests/seal_describe.rs` `no_description_leaves_the_writer_before_the_gap_below_a_recovery_entry_is_recorded`, `a_start_that_cannot_record_the_gap_below_a_recovery_entry_describes_nothing`), and roadmap 8.4a needs a kill-loop case with a truncated tail, a seal and a restore. Should it fail, the plan ends the log at the gap and sets later data aside: conservative. The hook stays for a caller that has read the segments. Scenario: a power loss truncates a tail; the start writes a recovery entry at F above K + 1 and the lost range K + 1 to F − 1; a restore from the records sees a gap between the segment ending at K and the one starting at F. Tests: `backup/tests/restore_plan.rs` `a_gap_a_recorded_loss_covers_does_not_end_the_restored_log_a_partly_covered_one_does`, `a_gap_followed_by_a_recovery_entry_naming_the_position_before_it_does_not_end_the_restored_log`, `a_recovery_entry_in_a_segment_with_no_copy_bridges_nothing`, `the_restored_end_is_the_one_the_spec_walks_to` |
 | Q-293 | What a restore plan lists, places and fetches | §8 Restore steps 1 and 3, Generations; `format.md` A.14 `0x25` (decided by roadmap 8.3a). Every live file with a recorded copy in deep is listed, set-aside files included, and no other file; the copy counts whether or not a fresh check has marked it verified since a rebuild (Q-295). A listed file's tier is the one the source records give it, which is where the restore places it (step 3). The files fetched are every listed log segment (with no tree checkpoint, step 1 downloads the whole sealed log) and every other listed file placed on hot or cold, in ascending position. The restored log is scanned over log segments only: a compacted file holds only some positions of its range, and log segments are never retired by compaction (§7). When the source generation's sequence 1 is not held, the restored end is that of the restore record read, or `0:0` in generation 0. Positions of an earlier generation at or below a carried end that no copied segment or recorded loss holds fail the plan: `NotCopied` when a listed segment without a copy holds them, else `MissingBelowEnd`. Scenario: a store compacted some segments into a current file in deep and lost no segment; the plan fetches the segments, lists the compacted file and leaves it in deep. Tests: `backup/tests/restore_plan.rs` `a_listed_segment_with_no_copy_ends_the_restored_log_and_is_not_named`, `a_compacted_file_on_hot_is_listed_and_fetched_but_never_fills_a_gap`, `a_compacted_file_left_in_deep_is_listed_but_not_fetched`, `a_file_missing_at_or_below_a_carried_end_fails_the_plan`, `the_plan_names_every_copied_file_and_never_one_without_a_copy`, `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark` |
 | Q-295 | A restore from a rebuilt manifest whose files are not yet verified again | §8 Generations, §7 Manifest (the owner's ruling at the review of roadmap 8.3a): a restore plan uses a file's recorded copy in deep (`FileEntry::deep`), not the verified mark. A copy recorded but gone from the bucket since is found when it is fetched, by the hash checks and the lost-object rule (Q-82), and reported as `data_lost`: loud. Leaving it out of a claimed generation would be silent and permanent, since later restores read that generation's records only. "Verified in deep" (Q-280) keeps its meaning for the upload queue only: what roadmap 8.1c must check again or upload again after a rebuild. A carried restore record, like a carried copy-verified record, gives its files' copies and no verified mark. Scenario: segments 1 to 3 (`0:1` to `0:30`) are uploaded and verified; the manifest is rebuilt and its records upload whole; the rebuild clears every mark and the carried records set none; a disaster then strikes before the files are checked again. Read as "verified only", a full restore claims generation 1 with restored end `0:0` and lists no file, and the segments are in no record a later restore reads; with the copy, it restores to `0:30`, as from the old records a moment earlier, so the plan is monotone in the records uploaded across a rebuild. Tests: `backup/tests/restore_plan.rs` `a_recorded_copy_is_restored_from_after_a_rebuild_clears_its_verified_mark`, `q108_a_rebuilt_manifest_only_partly_uploaded_is_not_read`, `the_plan_is_monotone_in_the_records_uploaded`; `kvik/tests/restore_plan_model.rs` (rebuilt manifests); `files/src/catalogue.rs` `a_carried_restore_record_gives_copies_but_no_verified_mark` |
 | Q-39 (f) | A crash while the restore record is written | §8 Restore, Failures and end (settled by roadmap 8.3b: the restore record reaches `MANIFEST` whole: the manifest's header and the record as its first record are written as `MANIFEST.new`, synced and renamed, and the directory synced; a directory holding only `MANIFEST.new` is a restore that did not reach its record, which is removed, and the restore starts again with the next generation, its claim kept. A torn record therefore never reaches `MANIFEST`. `backup/tests/restore.rs`, `a_restore_killed_at_every_file_operation_completes_after_a_restart`, `a_leftover_manifest_before_the_record_is_removed_and_the_next_generation_claimed`) |
@@ -1656,6 +1759,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-271 | Where `format.md` A.17 and the backup interfaces disagree | `format.md` A.17 Keys, Claim marker, Probe (settled as superseded by the owner's ruling: the A.17 merged at roadmap 8.1a already takes the interfaces' forms, (a) other kinds under `files/<kind:2 hex>/` and (b) the 12-byte claim marker (Q-198 (e) and (f)), so `Keys` and `ClaimMarker` stay as they are; part (c), the checksum probe's key, is Q-213, settled by roadmap 8.3b. Scenario: 8.1b was built against an earlier A.17 draft with `data/` and `tree/` prefixes, a 40-byte marker and a checksum probe key `Keys` could not build; the merge of 8.1a and 8.1b ruled the interfaces authoritative before anything was uploaded. `backup/tests/keys.rs`) |
 | Q-320 | Which bytes beyond a same-boot mark make a reset point | `spec.md` §3 Recovery rules 1 and 3, Adoption, first start; `format.md` A.4 (settled by the owner's ruling Q-125, with or without a readable mark: the bytes after the header of an unused segment beyond the mark's segment are reported in a recovery entry's tail before the file is deleted; valid seal blocks are not) |
 | Q-321 | The lowest unsealed segment damaged, zeroed or missing, with no sealed segment below it | `spec.md` §3 Recovery rule 2; `format.md` A.4 (settled after the review of Q-320: with no sealed segment the chain of generation 0 starts at position 1, so the gap below the first segment kept is a recorded `data_lost`) |
+| Q-640 | A description that never stops failing to open or read its segment | `spec.md` §8 Corrupt block, §11; `api.md` Health (settled by the lead's ruling at the re-check of roadmap 6.3b: `SegmentUnreadable` once the retry wait reaches its 10-minute cap, cleared when a read succeeds; an unlisted segment is never backed up, so a silent indefinite retry is a hidden loss of backup) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

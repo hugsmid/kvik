@@ -69,7 +69,7 @@ use kvik_log::scan::{ScanLimit, scan};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
     Ack, Call, Clock, CommitError, IngestQueue, LogWriter, LossKind, MarkSync, StartReport,
-    StartRule, WriterConfig, create_segment, seal_segment,
+    StartRule, WriterConfig, create_segment, seal_segment_described,
 };
 use kvik_model::engine::{
     Config, CrashPoint, Entry as ModelEntry, EntryBody, Fault, Model, WriteOutcome,
@@ -540,7 +540,7 @@ impl Log {
                 w.segment_created(r);
             }
             for job in w.take_seal_jobs(now) {
-                let r = seal_segment(&self.fs, &job, &w.halt());
+                let r = seal_segment_described(&self.fs, &job, &w.halt());
                 w.seal_done(job, r, now);
             }
         }

@@ -377,6 +377,17 @@ input, and by the scrub; not at open and not on reads. A mismatch while every ba
 padding or seal blocks: the segment is copied to a new segment (A.4) and swapped in by one manifest record, with no
 loss report.
 
+**Plaintext hash** (`spec.md` §8 Hashes). A log segment's plaintext SHA-256 is over every byte of the sealed file,
+header to end marker. The trailer has no room for it (4 reserved bytes), so the file description of a manifest record
+(A.14) alone holds it; the trailer is unchanged and no version rule applies. The sealer computes it in the pass that
+computes `file_crc32c`, off the commit thread, once per seal (a blocked seal's retry reuses it). After a start the
+writer computes it, one segment at a time and only while no seal is ready or running, for every sealed segment that
+no record names by generation and `file_id`, after checking the header against the name, the trailer, the end marker
+and `file_crc32c`; a segment that fails a check is left unnamed, degrades health (`SegmentDamaged`, `api.md` Health)
+and is tried again at the next start, and one that cannot be opened or read whole is tried again in the run, after a
+wait that doubles from 10 s to 10 minutes, and degrades health (`SegmentUnreadable`) from the try that sets the
+10-minute wait until a read succeeds (Q-220, Q-221, Q-640).
+
 ## A.10 Durable mark (`log/MARK`, version 3)
 `log/MARK` is 4,224 bytes: two 128-byte slots at offsets 0 and 4,096 (separate sectors). It has no A.1 header. It is
 read and written by positional I/O and never mapped; it is synced on the timer (`mark_sync_interval`, on the writer
@@ -577,7 +588,12 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   outputs and retires its compacted inputs. No epoch lists a compacted file live together with a compacted file it
   names as an input (invariant 14 as the records show it).
 - Sealed log segment (`0x22`): repeated field 1, a sealed log segment's description (kind 1), in strictly ascending
-  order of id, at least one. When it is appended relative to the seal is roadmap 6.3b's.
+  order of id, at least one. It is appended after the seal, never before: from the description the sealer hands over
+  once the `.kvl` name and the directory are synced (A.9 Plaintext hash), and a seal does not wait for it; one lost
+  in a crash is appended again after the next start (`spec.md` §7 Manifest). A description leaves the writer only
+  after the start that preceded the seal has synced every lost-range record it wrote (steps 4 and 6); a start that
+  cannot write one is read-only and hands out none. So no sealed-segment record has an epoch below a lost-range record
+  of the start that preceded its seal (Q-290).
 - Restore (`0x25`, `spec.md` §8 Generations, Restore step 1): 1 generation `u32`, the one the restore claimed, at
   least 1; 2 reset stamp, 16 bytes: sequence `u64`, always 1 (the generation's first position), then nonce `u64`,
   never zero; 3 source generation `u32`, whose records it read, below field 1; 4 restored end (position), in a
@@ -606,9 +622,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
   synced.
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
-  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record
-  with no copy is rebuilt by the writer itself, by the procedure of `spec.md` §7 Manifest (the same as the operator
-  call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
+  class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body; a log segment's
+  hash is computed from its bytes, A.9). A corrupt record with no copy is rebuilt by the writer itself, by the
+  procedure of `spec.md` §7 Manifest (the same as the operator call `rebuild_manifest`, roadmap 6.3): the new manifest is written as `MANIFEST.new`, opened by a rebuild record
   (`0x28`), synced, renamed over `MANIFEST`, and the directory synced; a `MANIFEST.new` left by a crash is removed at
   the next start. The rebuild record is acknowledged by an acknowledgement record carrying the rebuild record's own
   epoch in field 2. The rebuilt manifest carries every valid record of the old one, and the rebuild reconstructs

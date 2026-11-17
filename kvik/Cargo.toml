@@ -38,6 +38,7 @@ kvik-tree = { path = "../tree" }
 thiserror = "2"
 
 [dev-dependencies]
+kvik-log = { path = "../log", features = ["unmapped-reason"] }
 proptest = "1"
 
 [lints]

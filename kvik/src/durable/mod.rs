@@ -1033,14 +1033,7 @@ impl Writer {
         }
         let mut reasons: Vec<Reason> = Vec::new();
         if let Some(log) = self.log().as_ref() {
-            for r in log.reasons() {
-                reasons.push(match r {
-                    LogReason::IngestWaiting(w) => Reason::IngestWaiting(wait_out(w)),
-                    LogReason::DiskLow { free } => Reason::DiskLow { free },
-                    LogReason::DiskCritical { free } => Reason::DiskCritical { free },
-                    LogReason::SealBlocked { file_id } => Reason::SealBlocked { file_id },
-                });
-            }
+            reasons.extend(log.reasons().into_iter().map(health_reason));
         }
         reasons.extend(
             self.losses()
@@ -1312,6 +1305,42 @@ pub(crate) fn interval(
 /// The reader state of a durable reader.
 pub(crate) fn refresh(r: &DurableReader) -> Result<ReaderState, QueryError> {
     r.refresh()
+}
+
+/// A log reason as a health reason; one this version does not name stays visible as [`Reason::Other`] (Q-221 (d)).
+fn health_reason(r: LogReason) -> Reason {
+    match r {
+        LogReason::IngestWaiting(w) => Reason::IngestWaiting(wait_out(w)),
+        LogReason::DiskLow { free } => Reason::DiskLow { free },
+        LogReason::DiskCritical { free } => Reason::DiskCritical { free },
+        LogReason::SealBlocked { file_id } => Reason::SealBlocked { file_id },
+        LogReason::SegmentDamaged { file_id } => Reason::SegmentDamaged { file_id },
+        LogReason::SegmentUnreadable { file_id } => Reason::SegmentUnreadable { file_id },
+        other => Reason::Other {
+            reason: format!("{other:?}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::{LogReason, Reason, health_reason};
+
+    #[test]
+    fn a_log_reason_the_mapping_does_not_name_stays_in_health_with_its_name() {
+        let r = health_reason(LogReason::Unmapped);
+        assert_eq!(
+            r,
+            Reason::Other {
+                reason: "Unmapped".into()
+            }
+        );
+        assert_eq!(r.to_string(), "log reason Unmapped");
+        assert_eq!(
+            health_reason(LogReason::SegmentUnreadable { file_id: 4 }),
+            Reason::SegmentUnreadable { file_id: 4 }
+        );
+    }
 }
 
 #[cfg(test)]
