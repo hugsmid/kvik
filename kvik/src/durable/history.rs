@@ -391,7 +391,8 @@ impl History {
     }
 
     /// Brings the bytes held under the budget: first revised-key entries whose facts the log shows, oldest first,
-    /// then the oldest key of each series' window in turn, which the slow path then reads.
+    /// then the oldest key of each series' window in turn, which the slow path then reads, then revised-key entries
+    /// with facts in flight. Afterwards the bytes held are within the budget.
     fn keep_budget(&mut self) {
         if self.bytes <= self.budget {
             return;
@@ -448,6 +449,22 @@ impl History {
                 }
             }
         }
+        // Last, entries with facts in flight: the log shows the rest, so only those facts stay, in the overlay, and
+        // the key returns to the slow path. Without this a key revised in every call is never evicted (Q-945).
+        let mut tries = self.revised_order.len();
+        while self.bytes > self.budget && tries > 0 {
+            tries -= 1;
+            let Some(key) = self.revised_order.pop_front() else {
+                break;
+            };
+            let Some(facts) = self.revised.remove(&key) else {
+                continue;
+            };
+            self.bytes -= REVISED_ENTRY + facts.iter().map(revised_fact_bytes).sum::<usize>();
+            for k in facts {
+                self.overlay(key, k);
+            }
+        }
     }
 
     /// Forgets a lost range (Q-921): every window is emptied and holds no key at or below its series' latest `t`,
@@ -502,12 +519,6 @@ impl History {
             revised_keys: self.revised.len(),
             revised_facts: self.revised.values().map(Vec::len).sum(),
             overlay: self.pending.values().map(Vec::len).sum(),
-            pinned: self
-                .revised
-                .values()
-                .filter(|facts| facts.iter().any(|k| !self.shown(k)))
-                .map(|facts| REVISED_ENTRY + facts.iter().map(revised_fact_bytes).sum::<usize>())
-                .sum(),
         }
     }
 }
@@ -556,8 +567,6 @@ pub(crate) struct Held {
     pub(crate) revised_keys: usize,
     pub(crate) revised_facts: usize,
     pub(crate) overlay: usize,
-    /// Bytes of revised-key entries holding a fact the log may not show yet, which the budget cannot evict.
-    pub(crate) pinned: usize,
 }
 
 #[cfg(test)]
@@ -694,5 +703,28 @@ mod tests {
         note(&mut h, (1, 35), fact(35, 6, true));
         assert_eq!(h.reference(1), Reference::Exact(Some(35)));
         assert_eq!(h.reference(2), Reference::Exact(None));
+    }
+
+    #[test]
+    fn a_key_revised_in_every_call_is_evicted_once_its_earlier_facts_are_in_the_log() {
+        let budget = 1_000;
+        let mut h = History::with_budget(budget);
+        note(&mut h, (1, 100), fact(100, 0, true));
+        note(
+            &mut h,
+            (1, 5_000_000_000_000),
+            fact(5_000_000_000_000, 0, true),
+        );
+        for call in 1..=10_000u64 {
+            h.readable_below(call);
+            let mut k = fact(100, call, true);
+            k.changed_at = Some(call);
+            let whole = (call == 1).then(|| vec![fact(100, 0, true)]);
+            h.note((1, 100), k, || WINDOW_SPAN, whole);
+            note(&mut h, (2, call as i64), fact(call as i64, call, true));
+            let held = h.held();
+            assert!(held.bytes <= budget, "call {call}: {held:?}");
+            assert!(held.overlay <= 2, "call {call}: {held:?}");
+        }
     }
 }

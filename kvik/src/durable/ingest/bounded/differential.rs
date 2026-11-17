@@ -252,9 +252,7 @@ impl Rig {
         }
         self.bounded.apply(&mut got);
         let held = self.bounded.history.held();
-        if n > 0 {
-            prop_assert!(held.bytes <= self.budget.max(held.pinned), "{held:?}");
-        }
+        prop_assert!(held.bytes <= self.budget, "{held:?}");
         Ok(())
     }
 

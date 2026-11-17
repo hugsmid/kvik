@@ -505,7 +505,10 @@ fn damage_inside_a_loss_reported_too_wide_reaches_the_stores_reader_and_its_repl
     damage(&w, b"WIDE-TWO");
     let lost = data_lost(&s.losses());
     assert_eq!(lost.len(), 1);
-    assert!(lost[0].2 > Some(two), "reported to the mark (Q-937): {lost:?}");
+    assert!(
+        lost[0].2 > Some(two),
+        "reported to the mark (Q-937): {lost:?}"
+    );
     damage(&w, b"WIDE-FOUR");
     assert_eq!(data_lost(&s.losses()).len(), 1);
     let ack = block_on(s.emit(&[note(id, 3, "WIDE-FOUR")])).unwrap();

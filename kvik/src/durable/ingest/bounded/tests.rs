@@ -588,4 +588,43 @@ proptest! {
     }
 }
 
+#[test]
+fn a_key_revised_in_every_call_stays_within_a_tiny_budget_and_its_versions_are_still_decided() {
+    let budget = 1_000;
+    let mut d = decider(History::with_budget(budget));
+    let mut mem = Mem::default();
+    let n = 2_000u64;
+    for call in 1..=n {
+        let readings = [
+            reading(2, T0, 1.0, Some(call)),
+            reading(1, T0 + call as i64 * S, 1.0, None),
+        ];
+        let plan = commit(&mut d, &mut mem, &readings, Intent::Normal, call);
+        assert!(matches!(
+            plan.decisions[0],
+            Decision::Record {
+                outranked: false,
+                ..
+            }
+        ));
+        mem.readable_below = call + 1;
+        d.readable_below(call + 1);
+        let held = d.history.held();
+        assert!(held.bytes <= budget, "call {call}: {held:?}");
+    }
+    let replay = [
+        reading(2, T0, 1.0, Some(n / 2)),
+        reading(2, T0, 2.0, Some(1)),
+    ];
+    let plan = commit(&mut d, &mut mem, &replay, Intent::Normal, n + 1);
+    assert!(matches!(plan.decisions[0], Decision::Duplicate));
+    assert!(matches!(
+        plan.decisions[1],
+        Decision::Record {
+            outranked: true,
+            ..
+        }
+    ));
+}
+
 mod losses;
