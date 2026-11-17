@@ -510,7 +510,10 @@ fn a_returned_batch_truncated_after_a_page_cache_loss_on_the_same_boot_is_voided
     assert_eq!(stamp.sequence, 2);
     assert_ne!(stamp.nonce, 0);
     assert_eq!(u.state.stamp, stamp);
-    assert!(matches!(r.held.items[&2].view(), ItemRef::Entry(Entry::Recovery(_))));
+    assert!(matches!(
+        r.held.items[&2].view(),
+        ItemRef::Entry(Entry::Recovery(_))
+    ));
     r.check_held();
     r.check_caught_up();
 }
@@ -568,7 +571,10 @@ fn long_truncation(from: u64) {
     }
     r.refresh().unwrap();
     assert_eq!(r.held.items.len(), 90);
-    assert!(matches!(r.held.items[&1].view(), ItemRef::Entry(Entry::Recovery(_))));
+    assert!(matches!(
+        r.held.items[&1].view(),
+        ItemRef::Entry(Entry::Recovery(_))
+    ));
     // Every batch from position `from` on is damaged and the mark is lost: the start truncates them all.
     r.kill();
     let m = r.mark().unwrap();

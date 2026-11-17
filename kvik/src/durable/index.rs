@@ -229,7 +229,12 @@ impl Index {
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
-        for id in self.facts.keys().copied().chain(self.summary.iter().map(|(id, _)| id)) {
+        for id in self
+            .facts
+            .keys()
+            .copied()
+            .chain(self.summary.iter().map(|(id, _)| id))
+        {
             self.registry.note_fact(id);
         }
     }
@@ -743,14 +748,24 @@ mod tests {
         assert!(!held.summary_stale());
         for id in 1..=4 {
             assert_eq!(held.latest_t(id), full.latest_t(id), "series {id}");
-            assert_eq!(held.lateness_reference(id), full.lateness_reference(id), "series {id}");
+            assert_eq!(
+                held.lateness_reference(id),
+                full.lateness_reference(id),
+                "series {id}"
+            );
         }
-        assert_eq!((held.latest_t(2), held.lateness_reference(2)), (Some(50), Some(45)));
+        assert_eq!(
+            (held.latest_t(2), held.lateness_reference(2)),
+            (Some(50), Some(45))
+        );
         assert_eq!(held.lateness_reference(1), Some(30));
         // Without a void the summaries are kept exactly as facts are taken.
         let mut plain = Index::without_facts();
         plain.apply(&stream[..3]);
         assert!(!plain.summary_stale());
-        assert_eq!((plain.latest_t(1), plain.lateness_reference(2)), (Some(99), Some(40)));
+        assert_eq!(
+            (plain.latest_t(1), plain.lateness_reference(2)),
+            (Some(99), Some(40))
+        );
     }
 }

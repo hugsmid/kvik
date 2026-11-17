@@ -760,7 +760,9 @@ mod parts_and_lookup {
         let log_bytes: u64 = names(&fs)
             .iter()
             .map(|n| {
-                let p = Path::new("s").join(crate::store::LOG_DIR).join(n.to_string());
+                let p = Path::new("s")
+                    .join(crate::store::LOG_DIR)
+                    .join(n.to_string());
                 crate::scan::nonzero_end(&fs.read(&p).unwrap())
             })
             .sum();
@@ -808,7 +810,10 @@ mod parts_and_lookup {
         }];
         let mut r = reader(&fs, 50);
         let first = r.lookup(&wanted, &|_, _, _| false).unwrap();
-        assert_eq!((first.complete.as_slice(), first.facts.len()), (&[true][..], 1));
+        assert_eq!(
+            (first.complete.as_slice(), first.facts.len()),
+            (&[true][..], 1)
+        );
         let segment = |r: &LogReader| r.read_mark().unwrap().offset;
         log.submit((0..20).map(|i| fact(i, 30, 30)).collect())
             .unwrap()
@@ -820,7 +825,10 @@ mod parts_and_lookup {
         assert_eq!(again.facts, first.facts);
         // The batch holding the key and the one appended, not the segment up to the mark.
         let offset = segment(&r);
-        assert!(allocated < offset, "{allocated} bytes for a segment of {offset}");
+        assert!(
+            allocated < offset,
+            "{allocated} bytes for a segment of {offset}"
+        );
         lookup::BUFFER_BYTES.with(|c| c.set(0));
         let third = r.lookup(&wanted, &|_, _, _| false).unwrap();
         assert_eq!(third.facts, first.facts);
@@ -832,10 +840,14 @@ mod parts_and_lookup {
     fn a_segment_holding_a_recovery_entry_keeps_its_map_and_lookups_stay_exact() {
         let (fs, log) = store(10);
         let before = log.stats().durable.sequence;
-        log.submit(vec![fact(4, 1_000, 1), fact(4, 1_001, 1), fact(5, 1_000, 1)])
-            .unwrap()
-            .wait()
-            .unwrap();
+        log.submit(vec![
+            fact(4, 1_000, 1),
+            fact(4, 1_001, 1),
+            fact(5, 1_000, 1),
+        ])
+        .unwrap()
+        .wait()
+        .unwrap();
         let r = crate::entries::Recovery {
             after: before,
             stamp: None,
@@ -875,7 +887,10 @@ mod parts_and_lookup {
             },
         ];
         let values = |l: &Lookup| -> Vec<(u32, i64, Value)> {
-            l.facts.iter().map(|f| (f.row.series_id, f.row.t, f.row.value.clone())).collect()
+            l.facts
+                .iter()
+                .map(|f| (f.row.series_id, f.row.t, f.row.value.clone()))
+                .collect()
         };
         let mut r = reader(&fs, 51);
         crate::facts::FACTS_DECODES.with(|c| c.set(0));
@@ -892,7 +907,10 @@ mod parts_and_lookup {
             let decoded = crate::facts::FACTS_DECODES.with(|c| c.get());
             assert_eq!(again.complete, first.complete);
             assert_eq!(again.facts, first.facts, "round {round}");
-            assert!(decoded < whole, "round {round}: {decoded} decodes, {whole} for a whole read");
+            assert!(
+                decoded < whole,
+                "round {round}: {decoded} decodes, {whole} for a whole read"
+            );
         }
         let fresh = reader(&fs, 52).lookup(&wanted, &|_, _, _| false).unwrap();
         assert_eq!(fresh.facts, first.facts);

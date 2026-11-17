@@ -281,13 +281,28 @@ fn part(f: &dyn crate::fs::FsFile, len: u64, from: u64, to: u64) -> Option<Vec<u
 
 /// The batch at `s`, read into a buffer of its own length and checked again alone; `None` if it no longer reads as
 /// the same complete batch.
-fn read_batch_at(f: &dyn crate::fs::FsFile, id: &SegmentIdentity, s: &Span) -> Option<BatchContent> {
+fn read_batch_at(
+    f: &dyn crate::fs::FsFile,
+    id: &SegmentIdentity,
+    s: &Span,
+) -> Option<BatchContent> {
     let mut buf = buffer(usize::try_from(s.end - s.offset).ok()?);
     if read_at_full(f, &mut buf, s.offset).ok()? != buf.len() {
         return None;
     }
-    match read_batch_in(&buf, s.offset, id, s.offset, s.end, s.first, Refusal::AtOnce, true) {
-        BatchRead::Complete(b, bodies) if b.end() == s.end && b.commit.first_sequence == s.first => {
+    match read_batch_in(
+        &buf,
+        s.offset,
+        id,
+        s.offset,
+        s.end,
+        s.first,
+        Refusal::AtOnce,
+        true,
+    ) {
+        BatchRead::Complete(b, bodies)
+            if b.end() == s.end && b.commit.first_sequence == s.first =>
+        {
             BatchContent::from_bodies(s.first, bodies).ok()
         }
         _ => None,
@@ -475,8 +490,7 @@ impl LogReader {
         if map.resume.is_some_and(|r| r.offset > len) {
             map = SegmentMap::default();
         }
-        let mut stale =
-            map.batches.iter().any(|s| query.may_hold(s)) && header(&*f, &id).is_none();
+        let mut stale = map.batches.iter().any(|s| query.may_hold(s)) && header(&*f, &id).is_none();
         let mut recoveries = map.recoveries.iter().peekable();
         // In file order, as a scan takes them: it stops at the first batch above the mark's last position.
         for (k, s) in map.batches.iter().enumerate() {
@@ -706,12 +720,20 @@ fn take_complete(
         let min_first = from
             .last_sequence
             .map_or(header_first, |l| l.saturating_add(1));
-        let (b, bodies) =
-            match read_batch_in(&buf, base, id, from.offset, limit, min_first, Refusal::AtOnce, true) {
-                BatchRead::Complete(b, bodies) => (b, bodies),
-                BatchRead::Refused(_) => return None,
-                BatchRead::Incomplete { .. } => break,
-            };
+        let (b, bodies) = match read_batch_in(
+            &buf,
+            base,
+            id,
+            from.offset,
+            limit,
+            min_first,
+            Refusal::AtOnce,
+            true,
+        ) {
+            BatchRead::Complete(b, bodies) => (b, bodies),
+            BatchRead::Refused(_) => return None,
+            BatchRead::Incomplete { .. } => break,
+        };
         let after = Resume {
             offset: b.end(),
             last_sequence: Some(b.commit.last_sequence),

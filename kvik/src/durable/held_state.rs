@@ -138,8 +138,12 @@ fn a_clean_shutdown_writes_the_registry_file_a_full_read_gives_without_reading_t
     let (_, file) = kvik_log::registry::read_latest(&*env.fs, Path::new(dir), &store_id)
         .unwrap()
         .unwrap();
-    let r = super::reader::DurableReader::open(Path::new(dir), &env, std::time::Duration::from_secs(60))
-        .unwrap();
+    let r = super::reader::DurableReader::open(
+        Path::new(dir),
+        &env,
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
     let full = r
         .with(|i, log| Ok(i.registry_file(log.state().durable, file.max_series_id)))
         .unwrap();
@@ -153,8 +157,12 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
     let dir = "held-series";
     let (s, env, bytes) = store(dir, 40);
     block_on(s.retire(SeriesId(3), Timestamp(T0 + 10_000 * S))).unwrap();
-    let r = super::reader::DurableReader::open(Path::new(dir), &env, std::time::Duration::from_secs(60))
-        .unwrap();
+    let r = super::reader::DurableReader::open(
+        Path::new(dir),
+        &env,
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
     bytes.store(0, Ordering::Relaxed);
     let mut held = Vec::new();
     for id in 1..=5 {
@@ -169,7 +177,9 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
     assert!(read < 16 << 10, "{read} bytes of segments read");
     let full: Vec<_> = (1..=5)
         .map(|id| {
-            let info = r.with(|i, _| i.series(&SeriesId(id).into())).map_err(|e| e.to_string());
+            let info = r
+                .with(|i, _| i.series(&SeriesId(id).into()))
+                .map_err(|e| e.to_string());
             let latest = r
                 .with(|i, _| Ok(i.latest_t(id)))
                 .ok()
@@ -180,7 +190,10 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
     assert_eq!(held, full);
     assert_eq!(named.id, SeriesId(2));
     assert_eq!(losses, r.losses().unwrap());
-    assert_eq!(held[0].0.as_ref().unwrap().latest_t, Some(Timestamp(T0 + 1_999 * S)));
+    assert_eq!(
+        held[0].0.as_ref().unwrap().latest_t,
+        Some(Timestamp(T0 + 1_999 * S))
+    );
     block_on(s.shutdown()).unwrap();
     assert_eq!(s.series(SeriesId(1)).unwrap(), full[0].0.clone().unwrap());
 }
@@ -202,8 +215,14 @@ fn summaries_read_in_two_passes_follow_a_recovery_entry_voiding_what_was_taken()
         software: "test".into(),
     };
     let store = StoreDir::open(fs.clone(), Path::new("v"), Some(&new)).unwrap();
-    let w = LogWriter::open(store, WriterConfig::default(), Some([2; 16]), std::time::Duration::ZERO, 0)
-        .unwrap();
+    let w = LogWriter::open(
+        store,
+        WriterConfig::default(),
+        Some([2; 16]),
+        std::time::Duration::ZERO,
+        0,
+    )
+    .unwrap();
     let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
     let fact = |series_id: u32, t: i64| {
         Item::Fact(FactRow {
@@ -216,10 +235,16 @@ fn summaries_read_in_two_passes_follow_a_recovery_entry_voiding_what_was_taken()
         })
     };
     for k in 0..30 {
-        log.submit(vec![fact(1, k), fact(2, 100 + k)]).unwrap().wait().unwrap();
+        log.submit(vec![fact(1, k), fact(2, 100 + k)])
+            .unwrap()
+            .wait()
+            .unwrap();
     }
     let after = log.stats().durable.sequence;
-    log.submit(vec![fact(1, 1_000), fact(3, 7)]).unwrap().wait().unwrap();
+    log.submit(vec![fact(1, 1_000), fact(3, 7)])
+        .unwrap()
+        .wait()
+        .unwrap();
     let r = Recovery {
         after,
         stamp: None,
@@ -230,7 +255,10 @@ fn summaries_read_in_two_passes_follow_a_recovery_entry_voiding_what_was_taken()
         id_floor: 0,
         consumers: Vec::new(),
     };
-    log.submit(vec![Item::from(Entry::Recovery(r))]).unwrap().wait().unwrap();
+    log.submit(vec![Item::from(Entry::Recovery(r))])
+        .unwrap()
+        .wait()
+        .unwrap();
     log.submit(vec![fact(1, 500)]).unwrap().wait().unwrap();
     log.shutdown().unwrap();
     let mut env = Env::test(ManualClock::new(Timestamp(T0)));
@@ -244,7 +272,11 @@ fn summaries_read_in_two_passes_follow_a_recovery_entry_voiding_what_was_taken()
     held.set_summary(super::index::read_summary(open, 7).unwrap());
     for id in 1..=3 {
         assert_eq!(held.latest_t(id), full.latest_t(id), "series {id}");
-        assert_eq!(held.lateness_reference(id), full.lateness_reference(id), "series {id}");
+        assert_eq!(
+            held.lateness_reference(id),
+            full.lateness_reference(id),
+            "series {id}"
+        );
     }
     assert_eq!((held.latest_t(1), held.latest_t(3)), (Some(500), None));
 }

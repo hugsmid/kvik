@@ -225,7 +225,10 @@ impl BatchContent {
     }
 
     /// The content of a complete batch whose data blocks of known type decoded to `bodies`, in order.
-    pub(crate) fn from_bodies(first_sequence: u64, bodies: Vec<DataBody>) -> Result<Self, BodyError> {
+    pub(crate) fn from_bodies(
+        first_sequence: u64,
+        bodies: Vec<DataBody>,
+    ) -> Result<Self, BodyError> {
         let mut items = Vec::new();
         let mut received_at = None;
         for b in bodies {
@@ -298,7 +301,11 @@ pub(crate) fn check_block(
             FactsBlock::decode(body)?;
             (prefix, false, None)
         }
-        (block_type::FACTS, true) => (prefix, false, Some(DataBody::Facts(FactsBlock::decode(body)?))),
+        (block_type::FACTS, true) => (
+            prefix,
+            false,
+            Some(DataBody::Facts(FactsBlock::decode(body)?)),
+        ),
         (_, false) => (prefix, crate::entries::check(body)?.1, None),
         (_, true) => {
             let e = EntriesBlock::decode(body)?;

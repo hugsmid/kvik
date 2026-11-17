@@ -43,8 +43,8 @@ mod maint;
 mod options;
 mod pacing;
 mod queue;
-mod seg_index;
 pub mod recovery;
+mod seg_index;
 pub mod sources;
 mod threads;
 

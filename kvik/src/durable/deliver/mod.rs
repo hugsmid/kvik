@@ -771,10 +771,8 @@ impl Deliverer {
     pub(crate) fn held(&mut self, ctx: &Ctx<'_>) -> bool {
         self.pump(ctx);
         if self.index.summary_stale()
-            && let Ok(s) = super::index::read_summary(
-                || super::start::log_reader(ctx.dir, ctx.env),
-                LOAD_PART,
-            )
+            && let Ok(s) =
+                super::index::read_summary(|| super::start::log_reader(ctx.dir, ctx.env), LOAD_PART)
         {
             self.index.set_summary(s);
         }
@@ -782,7 +780,10 @@ impl Deliverer {
     }
 
     /// What the registry and the summaries of the log taken know about a series ([`Deliverer::held`] first).
-    pub(crate) fn series(&self, key: &crate::series::SeriesKey) -> Result<crate::series::SeriesInfo, Error> {
+    pub(crate) fn series(
+        &self,
+        key: &crate::series::SeriesKey,
+    ) -> Result<crate::series::SeriesInfo, Error> {
         self.index.series(key)
     }
 

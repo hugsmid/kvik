@@ -553,7 +553,9 @@ fn a_remount_within_the_boot_may_lose_one_batch_unless_the_mark_is_synced_at_eve
             assert!(rep.losses.iter().any(|l| l.kind == LossKind::PossibleLoss));
             let p = r.positions();
             assert_eq!(p.len(), 1);
-            assert!(matches!(p.get(&1).map(Item::view), Some(ItemRef::Entry(Entry::Recovery(e))) if e.after == 0));
+            assert!(
+                matches!(p.get(&1).map(Item::view), Some(ItemRef::Entry(Entry::Recovery(e))) if e.after == 0)
+            );
         }
     }
 }
@@ -1543,9 +1545,9 @@ fn kill_loop(cycles: &[Cycle], every: bool, small: bool) {
             if let Some((k, batch, stale)) = owed {
                 let now = r.batches();
                 let kept = now.contains(batch);
-                let entry = now.iter().any(|b| {
-                    b.recovery().is_some_and(|e| e.after == *k)
-                });
+                let entry = now
+                    .iter()
+                    .any(|b| b.recovery().is_some_and(|e| e.after == *k));
                 // The batch beyond the mark may itself be that entry, written by a start whose mark was lost: adopted.
                 let is_entry = batch.recovery().is_some_and(|e| e.after == *k);
                 assert!(
@@ -2418,10 +2420,7 @@ fn cut_everywhere(setup: &dyn Fn() -> (Rig, MarkSlot, BatchContent)) {
             !now.contains(&beyond),
             "cut at {n}: the truncated batch is gone"
         );
-        let entries: Vec<_> = now
-            .iter()
-            .filter_map(|b| b.recovery().cloned())
-            .collect();
+        let entries: Vec<_> = now.iter().filter_map(|b| b.recovery().cloned()).collect();
         assert_eq!(entries.len(), 1, "cut at {n}: one entry, reported once");
         assert_eq!(entries[0].after, m.last_sequence, "cut at {n}");
         assert!(

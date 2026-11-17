@@ -14,10 +14,10 @@
 //! saved points (5.3), windowed operators in funnels, stored summaries (7.x), decimal series, calendar-length
 //! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore (8.x).
 
+mod by_id;
 mod clock;
 mod completion;
 mod consumers;
-mod by_id;
 mod deliver;
 #[cfg(test)]
 mod held_state;
@@ -697,9 +697,7 @@ impl Writer {
 
     /// `f` on the deliverer once it has taken what is acknowledged and its summaries are exact.
     fn held<R>(&self, f: impl FnOnce(&deliver::Deliverer) -> R) -> Option<R> {
-        self.hub
-            .as_ref()?
-            .run_quiet(|d, c| d.held(c).then(|| f(d)))
+        self.hub.as_ref()?.run_quiet(|d, c| d.held(c).then(|| f(d)))
     }
 
     // ----- writing -----

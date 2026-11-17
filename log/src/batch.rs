@@ -85,7 +85,9 @@ pub(crate) enum BatchFault {
 pub(crate) enum BatchRead<'a> {
     /// The batch, and with `keep` its data bodies as the checks decoded them.
     Complete(Batch<'a>, Vec<DataBody>),
-    Incomplete { fault: BatchFault },
+    Incomplete {
+        fault: BatchFault,
+    },
     Refused(FormatError),
 }
 

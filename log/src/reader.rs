@@ -646,13 +646,13 @@ impl LogReader {
                         }
                         let content = match s.take_content() {
                             Some(c) => c,
-                            None => BatchContent::decode(&b).map_err(|error| {
-                                ReaderError::Content {
+                            None => {
+                                BatchContent::decode(&b).map_err(|error| ReaderError::Content {
                                     path: path.clone(),
                                     offset: b.offset,
                                     error,
-                                }
-                            })?,
+                                })?
+                            }
                         };
                         let rb = ReadBatch {
                             file_id,

@@ -571,10 +571,7 @@ impl<'a> Iterator for Scanner<'a> {
     }
 }
 
-pub(crate) fn read_header(
-    bytes: &[u8],
-    id: &SegmentIdentity,
-) -> Result<HeaderState, FormatError> {
+pub(crate) fn read_header(bytes: &[u8], id: &SegmentIdentity) -> Result<HeaderState, FormatError> {
     let Some(h) = FileHeader::decode(bytes) else {
         return Ok(HeaderState::Invalid);
     };
@@ -651,7 +648,15 @@ fn resync<'a>(
         let candidate = chain_end(bytes, o, limit, &mut chains)
             .is_some_and(|c| c.at > o && c.batch_bytes == c.at - o && c.at - o <= MAX_BATCH_DATA);
         if candidate && framing_holds(bytes, id, o, limit) {
-            match read_batch(bytes, id, o, limit, min_first, Refusal::IfBatchVerifies, keep) {
+            match read_batch(
+                bytes,
+                id,
+                o,
+                limit,
+                min_first,
+                Refusal::IfBatchVerifies,
+                keep,
+            ) {
                 BatchRead::Complete(b, bodies) => return Ok(Some((b, bodies))),
                 BatchRead::Refused(e) => return Err(e),
                 BatchRead::Incomplete { .. } => {}
