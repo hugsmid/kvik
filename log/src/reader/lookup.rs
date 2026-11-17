@@ -81,14 +81,17 @@ struct SegmentMap {
     /// Invalid regions met, by start and end offset.
     regions: Vec<(u64, u64)>,
     resume: Option<Resume>,
-    /// A recovery entry was met: what precedes it in the segment may be void (module documentation), so the segment
-    /// is read whole by every lookup.
-    recovery: bool,
+    /// The recovery entries met, by the index of their batch in `batches`, with their `after`: a lookup that reads
+    /// the batches again voids at each what it took above its `after` from the batches before it, as a scan does
+    /// (Q-831).
+    recoveries: Vec<(usize, Position)>,
 }
 
 impl SegmentMap {
     fn bytes(&self) -> usize {
-        64 + self.batches.len() * std::mem::size_of::<Span>() + self.regions.len() * 16
+        64 + self.batches.len() * std::mem::size_of::<Span>()
+            + self.regions.len() * 16
+            + self.recoveries.len() * std::mem::size_of::<(usize, Position)>()
     }
 }
 
@@ -469,14 +472,23 @@ impl LogReader {
         };
         let first = facts.len();
         let mut map = self.caches.take_map(file_id);
-        if map.recovery || map.resume.is_some_and(|r| r.offset > len) {
+        if map.resume.is_some_and(|r| r.offset > len) {
             map = SegmentMap::default();
         }
-        let mut wanted = map.batches.iter().filter(|s| query.may_hold(s)).peekable();
-        let mut stale = wanted.peek().is_some() && header(&*f, &id).is_none();
-        for s in wanted {
+        let mut stale =
+            map.batches.iter().any(|s| query.may_hold(s)) && header(&*f, &id).is_none();
+        let mut recoveries = map.recoveries.iter().peekable();
+        // In file order, as a scan takes them: it stops at the first batch above the mark's last position.
+        for (k, s) in map.batches.iter().enumerate() {
             if stale || (s.generation == query.generation && s.last > query.last_sequence) {
                 break;
+            }
+            if let Some((_, after)) = recoveries.next_if(|(at, _)| *at == k) {
+                void_above(facts, first, *after);
+                continue;
+            }
+            if !query.may_hold(s) {
+                continue;
             }
             match read_batch_at(&*f, &id, s) {
                 Some(content) => query.take(content, s.generation, s.first, facts),
@@ -769,7 +781,7 @@ fn take_found(
             generation: g,
             sequence: r.after,
         };
-        map.recovery = true;
+        map.recoveries.push((map.batches.len() - 1, after));
         void_above(facts, first, after);
     }
     query.take(content, g, b.commit.first_sequence, facts);

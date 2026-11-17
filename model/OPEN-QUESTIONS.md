@@ -72,6 +72,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-753 | §2.3 Live state, §4 Outranked facts, §5.1, §6 Restart and resume | What the deliverer keeps in memory and reads from the log |
 | Q-754 | §7 Readers | The lookup's batch maps in a reader of another process across a reset stamp or generation |
 | Q-755 | §2.4, §3 Recovery rule 2, §8 Corrupt block, §11 Health | Damage found during a run recorded durably as a loss |
+| Q-832 | §5.1, §8 tree checkpoints, §11 `series_stats`, §13 Restart | A start independent of the log's length without tree checkpoints |
+| Q-834 | `format.md` A.9 `file_crc32c`, A.4 Sealing | The seal's file checksum from the block checksums |
+| Q-835 | §3 Order of a start, §11 Health | How much of a start may be deferred past `open` |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1541,6 +1544,71 @@ Corrupt block describes for a sealed segment, with the quarantine and copy), so 
 (health after the restart) and `a_region_a_consumers_read_meets_after_the_open_is_counted`
 (`kvik/tests/slow_path.rs`).
 
+## Q-830 — Whether every poll runs every consumer's timers
+Recorded by the first profiling sweep. **Decided by the lead:** a poll runs only the timers that are due, if that is
+exactly equivalent; otherwise all are kept, with the reason.
+**Scenario.** `Consumer::next` runs `tick` for every consumer before it hands anything out, as the model backend runs
+timers at every call (Q-701 asks the same of `emit`); with 20 condition funnels this was most of a delivery's cost.
+**As built: all are kept.** A threshold or on-change funnel is already evaluated on the timer only when its live-state
+value may have changed since its last evaluation (a fact not yet in force then), which is its only way to change
+state without a fact. A held-for or stale-for funnel is evaluated at every poll, and skipping one that is not due is
+not exactly equivalent: its evaluation reads the live-state value at `now`, which a future, scheduled or interval fact
+coming into force changes without a new fact; when that read cannot reach every fact it rests on, it counts an
+unchecked evaluation (`DeliveryStats::evaluations_unchecked`, counted whether or not it emits) and a read of the log
+(`slow_path`), so skipping it changes those counts; and the deadline that would make it due lives in the reference
+model's `Runner`, which exposes none. What was removed is the per-poll work that changed nothing: runner syncing,
+the copy of each consumer's map, and any evaluation for a consumer with no condition funnel (D1), and the maps of
+funnels a confirmation and a cursor write built when they did not use them (D2).
+**Pinned by.** `a_condition_routed_between_polls_is_evaluated_at_the_next` (`kvik/tests/consumers.rs`); the consumer
+property tests and the differential test against the model.
+
+## Q-831 — A segment holding a recovery entry read whole by every lookup
+Recorded by the first profiling sweep. **Settled by the lead: yes**, provided lookups stay exact.
+**Scenario.** A store once stopped uncleanly holds a recovery entry in its open segment. The entry voids what precedes
+it in the segment above its `after` (§7 Readers), so the lookup's batch map was not trusted and every lookup scanned
+the segment whole: 22 to 32 M instructions per slow reading, under the decision lock.
+**As built.** The map keeps each recovery entry it met with its place among the mapped batches and its `after`. A
+lookup that reads mapped batches again goes through them in file order as a scan does: it stops at the first batch
+above the mark's last position, voids at each entry what it took above the entry's `after` from the batches before
+it, and reads again only the batches whose event times may hold a wanted key. A mapped batch that no longer reads the
+same still drops the map.
+**Pinned by.** `a_segment_holding_a_recovery_entry_keeps_its_map_and_lookups_stay_exact` (voided positions taken again
+by other values of the same keys; later lookups decode fewer batches than a whole read and return what a fresh
+reader's first lookup returns) and `a_recovery_entry_voids_what_precedes_it_at_every_lookup` (unit tests of the log
+reader).
+
+## Q-832 — A start independent of the log's length without tree checkpoints
+Recorded by the first profiling sweep. **Kept with Q-752** for later (the lead's decision), to be settled by roadmap
+7.1b.
+**Scenario.** A sealed segment's index (series, count, least and greatest `t`) says whether it can hold facts of the
+recent windows, so a start could skip old segments; but the per-series counters (`recorded`, `late`, `future`) and
+each batch's commit time are rebuilt from every fact.
+**Open.** Either a small derived file of counters and commit times per sealed segment before 7.1b (a new file, so a
+format matter), or counters that count "since this start" until then (a change to what `series_stats` promises).
+
+## Q-833 — Recovery taking the last sealed segment's last position from its trailer alone
+Recorded by the first profiling sweep. **Declined by the lead.**
+**Scenario.** A start scans the last sealed segment whole, content checks included, and uses only two fields of its
+trailer: 1.7 G instructions and a 64 MiB read per start once a segment is sealed.
+**Decision.** Recovery keeps reading the last sealed segment, so damage there, or an unsupported block in it, is still
+noticed at a start.
+
+## Q-834 — The seal's file checksum from the block checksums
+Recorded by the first profiling sweep, recorded only (the lead's decision). To be looked at by roadmap 6.3b, which
+verifies segments before it publishes compaction outputs.
+**Scenario.** The seal computes `file_crc32c` over a re-read of the segment (3.9 instructions a byte, 0.65 % of the
+process). Combining it from the block checksums the writer computes would remove the read, and with it the last look
+at the bytes before the file is named sealed. Recorded so that it is not done as a tidy-up.
+
+## Q-835 — How much of a start may be deferred past `open`
+Recorded by the first profiling sweep. **Deferred by the lead**: the deliverer's read of the log stays inside `open`.
+To be settled by roadmap 5.6 (delivery looked at as a whole).
+**Scenario.** The deliverer's windows are needed only when a condition funnel or a versioned series asks; with no
+consumer registered its read of the log (about 40 % of a start) could run on `kvik-deliver` after `open` returns, or
+not until a consumer is taken.
+**Open.** That changes when `Health` and the delivery counts become true after a start, and what `Store::consumer`
+costs the first time.
+
 ## Q-710 — The default floor of the batch-sync interval
 
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
@@ -1615,7 +1683,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1689,6 +1757,9 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-753 | 5.6 | The deliverer's recent window and its reads of the log; decided by the lead with roadmap 11.0 |
 | Q-754 | 9.0a | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
 | Q-755 | 6.3b | Damage found during a run recorded durably as a loss; health held degraded meanwhile by the lead's decision at the re-check of roadmap 11.0 |
+| Q-832 | 7.1b | A start that skips old segments; kept with Q-752 by the lead; recorded by the first profiling sweep |
+| Q-834 | 6.3b | The seal's file checksum without the re-read; recorded only, by the lead's decision |
+| Q-835 | 5.6 | The deliverer's read of the log past `open`; deferred by the lead |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
@@ -1943,6 +2014,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-706 | An emit's read-back of its batch when no consumer is registered | `api.md` Health and statistics; `kvik/src/durable/consumers.rs`, `deliver/hub.rs` (settled by the lead: with no consumer registered an emit leaves timers and read-back to the `kvik-deliver` thread, and `refresh_errors` and `corruptions` may lag its return; a flag raised before `take_consumer` pumps keeps what a consumer receives unchanged) |
 | Q-713 | A `min_sync_interval` beyond `u64` nanoseconds | `log/src/writer/pacing.rs` (settled with the review of the adaptive interval: the interval is held in `u64` nanoseconds, so a ceiling above about 584 years counts as 584 years and the schedule cannot overflow) |
 | Q-750 | The duplicate rule's slow path on damage found during a run | `kvik/src/durable/ingest.rs`, `deliver/recent.rs`, `health.rs` (settled by the owner's ruling at the review of roadmap 11.0: recorded and delivered flagged unchecked, counted on their own, health degraded until the next start; ingest never stops; an unrecorded damaged region after it is Q-755) |
+| Q-830 | Whether every poll runs every consumer's timers | `kvik/src/durable/deliver/funnels.rs` (decided by the lead: only timers that are due if exactly equivalent; it is not, since a held-for or stale-for evaluation reads the live state at `now` and counts unchecked evaluations and reads of the log, so all are kept; the per-poll work that changed nothing is removed) |
+| Q-831 | A segment holding a recovery entry read whole by every lookup | `log/src/reader/lookup.rs` (settled by the lead: the batch map is kept with each entry's place and `after`, applied in file order as a scan applies them) |
+| Q-833 | Recovery taking the last sealed segment's last position from its trailer alone | `log/src/writer/recovery.rs` (declined by the lead: recovery keeps reading the last sealed segment, so damage there is still noticed at a start) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

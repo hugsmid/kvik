@@ -827,4 +827,74 @@ mod parts_and_lookup {
         assert!(lookup::BUFFER_BYTES.with(|c| c.get()) < offset / 2);
         log.shutdown().unwrap();
     }
+
+    #[test]
+    fn a_segment_holding_a_recovery_entry_keeps_its_map_and_lookups_stay_exact() {
+        let (fs, log) = store(10);
+        let before = log.stats().durable.sequence;
+        log.submit(vec![fact(4, 1_000, 1), fact(4, 1_001, 1), fact(5, 1_000, 1)])
+            .unwrap()
+            .wait()
+            .unwrap();
+        let r = crate::entries::Recovery {
+            after: before,
+            stamp: None,
+            boot_id: [0; 16],
+            tail_bytes: 0,
+            readable_commits: 0,
+            mark_state: crate::entries::MarkState::Readable,
+            id_floor: 0,
+            consumers: Vec::new(),
+        };
+        log.submit(vec![Item::from(crate::entries::Entry::Recovery(r))])
+            .unwrap()
+            .wait()
+            .unwrap();
+        // The voided positions taken again, by other values of the same keys.
+        log.submit(vec![fact(4, 1_000, 2), fact(4, 1_002, 2)])
+            .unwrap()
+            .wait()
+            .unwrap();
+        for k in 11..20 {
+            log.submit((0..20).map(|i| fact(i, k, k as u64)).collect())
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        log.shutdown().unwrap();
+        let wanted = [
+            Wanted {
+                series_id: 4,
+                from: 1_000,
+                to: 1_002,
+            },
+            Wanted {
+                series_id: 5,
+                from: 1_000,
+                to: 1_000,
+            },
+        ];
+        let values = |l: &Lookup| -> Vec<(u32, i64, Value)> {
+            l.facts.iter().map(|f| (f.row.series_id, f.row.t, f.row.value.clone())).collect()
+        };
+        let mut r = reader(&fs, 51);
+        crate::facts::FACTS_DECODES.with(|c| c.set(0));
+        let first = r.lookup(&wanted, &|_, _, _| false).unwrap();
+        let whole = crate::facts::FACTS_DECODES.with(|c| c.get());
+        assert_eq!(first.complete, [true, true]);
+        assert_eq!(
+            values(&first),
+            vec![(4, 1_000, Value::F64(2)), (4, 1_002, Value::F64(2))]
+        );
+        for round in 0..2 {
+            crate::facts::FACTS_DECODES.with(|c| c.set(0));
+            let again = r.lookup(&wanted, &|_, _, _| false).unwrap();
+            let decoded = crate::facts::FACTS_DECODES.with(|c| c.get());
+            assert_eq!(again.complete, first.complete);
+            assert_eq!(again.facts, first.facts, "round {round}");
+            assert!(decoded < whole, "round {round}: {decoded} decodes, {whole} for a whole read");
+        }
+        let fresh = reader(&fs, 52).lookup(&wanted, &|_, _, _| false).unwrap();
+        assert_eq!(fresh.facts, first.facts);
+    }
 }
