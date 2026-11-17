@@ -62,8 +62,9 @@ are tens to hundreds of milliseconds. Roadmap 2.2 found that each durable sync w
 unbatched small writers multiply, so while readings arrive during syncs, batch syncs start at least the spacing
 (`sync_interval_floor`, 2 ms, capped by `min_sync_interval`) apart and each covers everything that arrived meanwhile
 (spec §3 Group commit, Q-980). A batch with nothing in flight is synced at once, so a lone writer waits only for
-its sync; under load a reading waits at most the spacing plus a sync, inside the p99 budget, and the spacing caps
-host writes from many staggered writers at 500 batch syncs a second. A caller that waits for each acknowledgement
+its sync; under load a reading waits for the spacing or the sync in flight, whichever ends later, then its own
+sync, inside the p99 budget, and the spacing caps host writes from many staggered writers at 500 batch syncs a
+second. A caller that waits for each acknowledgement
 before sending the next is not capped by it: it gets one sync per call (Q-983). A caller who needs lower latency
 under load sets the spacing to 0.
 
