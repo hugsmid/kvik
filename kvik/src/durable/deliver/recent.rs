@@ -101,7 +101,12 @@ impl Recent {
         if t < w.floor {
             return;
         }
-        let at = w.facts.partition_point(|f| tp(f) <= tp(rec));
+        // In-order data goes at the end; only a late fact searches.
+        let at = if w.facts.back().is_none_or(|f| tp(f) <= tp(rec)) {
+            w.facts.len()
+        } else {
+            w.facts.partition_point(|f| tp(f) <= tp(rec))
+        };
         if w.facts.len() >= self.cap && w.facts.len() == w.facts.capacity() {
             w.facts.reserve_exact(1);
         }

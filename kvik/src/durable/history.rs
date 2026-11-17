@@ -258,7 +258,12 @@ impl History {
         }
         if t >= s.floor {
             self.bytes += window_bytes(&known);
-            let at = s.window.partition_point(|(u, _)| *u <= t);
+            // In-order data goes at the end; only a late fact searches.
+            let at = if s.window.back().is_none_or(|(u, _)| *u <= t) {
+                s.window.len()
+            } else {
+                s.window.partition_point(|(u, _)| *u <= t)
+            };
             // At the cap the fact is inserted before the eviction: room for one more, not a doubled queue.
             if s.window.len() >= self.cap && s.window.len() == s.window.capacity() {
                 s.window.reserve_exact(1);
