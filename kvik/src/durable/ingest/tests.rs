@@ -357,6 +357,24 @@ fn a_fact_that_leaves_the_window_before_its_call_is_readable_stays_in_the_overla
     assert_eq!(d.history.held().overlay, 0);
 }
 
+#[test]
+fn a_window_at_its_cap_allocates_one_slot_more_not_twice_as_many() {
+    let mut d = decider(History::with_window(i64::MAX, 64));
+    let mut mem = Mem::default();
+    for k in 0..200 {
+        commit(
+            &mut d,
+            &mut mem,
+            &[reading(1, T0 + k * S, 1.0, None)],
+            Intent::Normal,
+            k as u64 + 1,
+        );
+    }
+    let held = d.history.held();
+    assert_eq!(held.window, 64);
+    assert!(held.capacity <= 65, "{held:?}");
+}
+
 /// One step of a decision history: a call (series, seconds, value, `changed_at`) with revise intent or not, or
 /// every call so far acknowledged.
 #[derive(Clone, Debug)]

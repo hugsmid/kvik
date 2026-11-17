@@ -1246,6 +1246,15 @@ mod tests {
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
 
+    #[test]
+    fn each_side_gets_half_of_window_memory() {
+        let limits = crate::config::Limits {
+            window_memory: 64 << 20,
+            ..crate::config::Limits::default()
+        };
+        assert_eq!(super::window_budget(&limits), 32 << 20);
+    }
+
     /// A pause point right after a call's decision, for the store in the given directory.
     static AFTER_DECISION: Mutex<Option<(PathBuf, Hook)>> = Mutex::new(None);
 

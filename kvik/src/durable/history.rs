@@ -424,6 +424,7 @@ impl History {
         Held {
             bytes: self.bytes,
             window: self.series.values().map(|s| s.window.len()).sum(),
+            capacity: self.series.values().map(|s| s.window.capacity()).sum(),
             series: self.series.len(),
             revised_keys: self.revised.len(),
             revised_facts: self.revised.values().map(Vec::len).sum(),
@@ -438,6 +439,7 @@ impl History {
 pub(crate) struct Held {
     pub(crate) bytes: usize,
     pub(crate) window: usize,
+    pub(crate) capacity: usize,
     pub(crate) series: usize,
     pub(crate) revised_keys: usize,
     pub(crate) revised_facts: usize,

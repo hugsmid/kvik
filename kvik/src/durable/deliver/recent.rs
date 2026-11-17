@@ -207,6 +207,12 @@ impl Recent {
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Slots allocated, over all series.
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.series.values().map(|w| w.facts.capacity()).sum()
+    }
 }
 
 /// The rank of a fact (`spec.md` §2.2): its position, or `(changed_at, position)` in a versioned series.
@@ -504,22 +510,38 @@ mod tests {
     }
 
     #[test]
+    fn a_window_at_its_cap_allocates_one_slot_more_not_twice_as_many() {
+        let mut r = Recent::with_limits(64, usize::MAX);
+        for k in 0..200 {
+            r.note(&rec(1, k * S, k as u64 + 1), || i64::MAX, i64::MAX);
+        }
+        assert_eq!(r.held(), 64);
+        assert!(r.capacity() <= 65, "{}", r.capacity());
+    }
+
+    #[test]
     fn the_windows_stay_within_their_byte_budget() {
         let one = fact_bytes(&rec(1, 0, 1));
         let mut r = Recent::with_limits(1_000, 50 * one);
+        // A span longer than the data: only the budget takes facts out.
         for k in 0..400u64 {
             r.note(
                 &rec((k % 20) as u32, (k / 20) as i64 * S, k + 1),
-                || SPAN,
+                || i64::MAX,
                 i64::MAX,
             );
             assert!(r.bytes() <= 50 * one);
         }
         assert_eq!(r.held(), 50);
-        // Each series keeps its newest facts; what left is below its floor.
+        // Each series keeps its newest facts, all of them from its floor up; what left is below the floor.
         for s in 0..20 {
+            let floor = r.floor(s);
+            assert!(floor > 0 && floor <= 19 * S, "{floor}");
+            assert!(r.key((s, floor - 1)).is_none());
             assert!(r.key((s, 0)).is_none());
-            assert_eq!(r.key((s, 19 * S)).map(|v| v.len()), Some(1));
+            for t in (0..20).map(|k| k * S).filter(|t| *t >= floor) {
+                assert_eq!(r.key((s, t)).map(|v| v.len()), Some(1));
+            }
         }
     }
 }
