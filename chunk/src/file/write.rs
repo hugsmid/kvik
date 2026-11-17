@@ -118,7 +118,7 @@ pub struct Written {
 /// hands the file's own data block bodies back (a compressed XOR payload is a writer's choice, C.10).
 #[derive(Clone, Debug, Default)]
 pub struct Tweaks {
-    /// Bits or'ed into every chunk's directory and index flags.
+    /// Bits set in every chunk's directory and index flags.
     pub chunk_flags: u16,
     /// A plain column added to the first data block.
     pub data_column: Option<(u8, Vec<u8>)>,
@@ -130,6 +130,10 @@ pub struct Tweaks {
     pub trailer_tail: Vec<u8>,
     /// Data block bodies in file order, each used where it is a canonical body of the same rows.
     pub bodies: Vec<Vec<u8>>,
+    /// Batch rows written in place of the held batches, unchecked.
+    pub times_rows: Option<Vec<Batch>>,
+    /// Leaves each chunk's last block out of its directory and index entry, though it is written.
+    pub unrecorded_last_block: bool,
 }
 
 /// Writes one compacted segment.
@@ -210,6 +214,12 @@ impl<W: Write> FileWriter<W> {
         batches: Vec<Batch>,
     ) -> Result<Self, WriteError> {
         description.check().map_err(content)?;
+        if description.inputs.contains(&super::desc::Input {
+            kind: KIND_COMPACTED,
+            file_id: id.file_id,
+        }) {
+            return Err(content("a file named as its own input"));
+        }
         if batches
             .iter()
             .any(|b| b.first_sequence > b.last_sequence || b.commit_time < b.received_at)
@@ -368,7 +378,7 @@ impl<W: Write> FileWriter<W> {
             self.hold(f.position)?;
         }
         let start = self.offset;
-        let mut records = Vec::with_capacity(facts.len().div_ceil(BLOCK_ROWS));
+        let mut records: Vec<BlockRecord> = Vec::with_capacity(facts.len().div_ceil(BLOCK_ROWS));
         for rows in facts.chunks(BLOCK_ROWS) {
             let block = columns(rows);
             let mut body = block.encode()?;
@@ -394,10 +404,14 @@ impl<W: Write> FileWriter<W> {
             });
         }
         let flags = flags | self.tweaks.chunk_flags;
+        let mut recorded = facts.len() as u32;
+        if self.tweaks.unrecorded_last_block && records.len() > 1 {
+            recorded -= u32::from(records.pop().map_or(0, |r| r.row_count));
+        }
         let dir = Directory {
             series_id: s.series_id,
             flags,
-            row_count: facts.len() as u32,
+            row_count: recorded,
             blocks: records,
             summary: Vec::new(),
         };
@@ -430,7 +444,7 @@ impl<W: Write> FileWriter<W> {
             chunk_len: u32::try_from(self.offset - start)
                 .map_err(|_| content("chunk above 4 GiB"))?,
             dir_len: (self.offset - dir_at) as u32,
-            row_count: facts.len() as u32,
+            row_count: recorded,
             dir_crc32c: dh.body_crc32c,
             min_value: raw.min,
             max_value: raw.max,
@@ -531,13 +545,16 @@ impl<W: Write> FileWriter<W> {
         let Some((first, last)) = self.range else {
             return Err(content("a file holds at least one position"));
         };
-        let used: Vec<Batch> = self
-            .batches
-            .iter()
-            .zip(&self.held)
-            .filter(|(_, n)| **n > 0)
-            .map(|(b, _)| *b)
-            .collect();
+        let used: Vec<Batch> = match self.tweaks.times_rows.take() {
+            Some(rows) => rows,
+            None => self
+                .batches
+                .iter()
+                .zip(&self.held)
+                .filter(|(_, n)| **n > 0)
+                .map(|(b, _)| *b)
+                .collect(),
+        };
         let times_offset = self.offset;
         let mut times = Vec::new();
         let mut at = 0;

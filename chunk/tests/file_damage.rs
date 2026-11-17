@@ -445,3 +445,66 @@ fn an_undefined_directory_flag_is_refused_where_the_index_bit_is_defined() {
 
 /// Undefined in a directory, `has_nan` in an index entry.
 const BIT_1: u16 = 1 << 1;
+
+#[test]
+fn a_directory_whose_block_records_do_not_reach_its_end_is_refused() {
+    let mut c = Content::new(kvik_chunk::file::Class::Current);
+    c.batches = batches(1, 1, 3, 4096);
+    let values = (0..4100u64)
+        .map(|i| f64::from_bits(noise(i, 1)))
+        .collect::<Vec<_>>();
+    let facts = values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| f64_fact(1, (1, 1 + i as u64), T0 + i as i64 * SECOND, v))
+        .collect();
+    c.series = vec![kvik_chunk::file::Series {
+        series_id: 1,
+        name: Some("d/a".into()),
+        reach: kvik_chunk::file::Reach::Point,
+        facts,
+        set_aside: vec![],
+    }];
+    c.tweaks.unrecorded_last_block = true;
+    let bytes = c.settle().write().0;
+    let f = open(&bytes);
+    let e = f.series(1).unwrap()[0];
+    assert_eq!(
+        e.row_count, 4096,
+        "the second block is written but not recorded"
+    );
+    let dir = e.chunk_offset + u64::from(e.chunk_len - e.dir_len);
+    assert_eq!(
+        fault(f.read_chunk(&e)),
+        (dir, Fault::Mismatch("block records"))
+    );
+}
+
+#[test]
+fn a_position_no_batch_row_holds_is_invalid_and_never_takes_a_neighbour_row() {
+    let mut c = sample(1);
+    let mut rows = c.used_batches();
+    // Generation 1's second batch (sequences 5 to 8) loses sequence 5, which series 1 holds.
+    rows[1].first_sequence = 6;
+    c.tweaks.times_rows = Some(rows);
+    let bytes = c.write().0;
+    let f = open(&bytes);
+    assert!(matches!(fault(f.batch((1, 5))), (_, Fault::NoBatch(1, 5))));
+    assert!(matches!(
+        fault(read_series(&f, 1)),
+        (_, Fault::NoBatch(1, 5))
+    ));
+    assert!(read_series(&f, 2).is_ok());
+}
+
+#[test]
+fn the_writer_refuses_a_file_named_as_its_own_input() {
+    let c = sample(1);
+    let mut d = c.description.clone();
+    d.inputs = vec![kvik_chunk::file::Input {
+        kind: 2,
+        file_id: c.id.file_id,
+    }];
+    let r = kvik_chunk::file::FileWriter::new(Vec::new(), c.id, 0, &d, c.batches.clone());
+    assert!(matches!(r, Err(kvik_chunk::file::WriteError::Content(_))));
+}
