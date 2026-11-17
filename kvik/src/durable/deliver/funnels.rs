@@ -203,6 +203,8 @@ impl Deliverer {
             TriggerCause::Timer
         };
         for (id, arrived, value, scheduled, unchecked) in work {
+            // Counted whether or not it emits: one that would have fired with the missing facts emits nothing.
+            self.evaluations_unchecked += u64::from(unchecked);
             let Some(rt) = self.consumers.get_mut(name) else {
                 continue;
             };

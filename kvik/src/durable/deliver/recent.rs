@@ -361,7 +361,16 @@ impl Deliverer {
     ) -> Option<Vec<(Stored, bool, bool)>> {
         self.slow.set(self.slow.get() + 1);
         let mut reader = crate::durable::start::log_reader(ctx.dir, ctx.env).ok()?;
-        let read = read_positions(&mut reader, at, to);
+        let read = read_positions(&mut reader, at, to, &mut |file_id, start, end| {
+            // A region the open did not pass over: the consumer misses what it held (Q-750).
+            if !self.damaged.covers(file_id, start, end) {
+                let mut unread = self.unread.borrow_mut();
+                if !unread.covers(file_id, start, end) {
+                    unread.insert(file_id, start, end);
+                    self.regions_unread.set(self.regions_unread.get() + 1);
+                }
+            }
+        });
         let _ = reader.close();
         let out = read?;
         let mut keys: Vec<Key> = out
@@ -394,12 +403,13 @@ impl Deliverer {
     }
 }
 
-/// The facts with positions from `at` up to `to` (not included); `None` if a part of the log could not be read
-/// before `to` was reached.
+/// The facts with positions from `at` up to `to` (not included), each invalid region met given to `region`; `None`
+/// if a part of the log could not be read before `to` was reached.
 fn read_positions(
     reader: &mut kvik_log::reader::LogReader,
     at: LogPos,
     to: LogPos,
+    region: &mut dyn FnMut(u64, u64, u64),
 ) -> Option<Vec<Stored>> {
     let mut out: Vec<Stored> = Vec::new();
     loop {
@@ -433,7 +443,7 @@ fn read_positions(
                     }
                 }
                 ReadEvent::Void { above, .. } => out.retain(|s| s.position <= above),
-                ReadEvent::Corruption { .. } => {}
+                ReadEvent::Corruption { file_id, region: r } => region(file_id, r.start, r.end),
             }
         }
         if !more {

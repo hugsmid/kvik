@@ -77,14 +77,16 @@ The keys roadmap section 4 needs; all may change between opens.
 | `limits.future_tolerance`, `limits.default_lateness_bound` | `Duration` | 60 s, 5 min | |
 | `limits.window_memory` | `u64` bytes | 512 MiB (`WINDOW_MEMORY_DESKTOP`) | ≥ 4 KiB. The recent windows' bytes in all (spec §5.1, Q-751): half for the writer's decision windows and revised-key index, half for the deliverer's windows. Within it each series holds 15 minutes of facts, at most 1,024, and beyond it the oldest keys are read from the log instead (spec §2.4, slow path); decisions do not change. 64 MiB (`WINDOW_MEMORY_MINIMAL`) suits the minimal class. See Memory below |
 
-**Memory** (roadmap 11.0). A store's memory does not grow with the facts it holds. Bounded by configuration:
+**Memory** (roadmap 11.0). A store's memory does not grow with the facts it holds while its consumers confirm what
+they are sent. Bounded by configuration:
 `limits.window_memory` (the counted bytes of window entries and revised-key entries; a window's allocation can hold
 up to as much again while it grows), the ingest queue (`limits.ingest_queue` readings, and the decisions of calls not
 yet acknowledged), consumer queues (`limits.consumer_queue` deliveries each), and per log reader at most one segment's
 bytes while it follows a segment. Bounded by the store's shape: the registry (about 200 bytes a series), each series'
 latest time and lateness reference, one commit time per batch, and the slow path's caches (8 MiB per reader for
-sealed segments' indexes and the maps of their batches). A consumer far behind holds its records from its cursor to
-the last position while it catches up. A start reads the whole log once, a part at a time (Q-752); the public
+sealed segments' indexes and the maps of their batches, also during one lookup; batches read again touch about a
+4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
+cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms. A start reads the whole log once, a part at a time (Q-752); the public
 `Reader` still holds every fact it has read (roadmap 9.0a). Worst case of the slow path, under the decision lock that
 every `emit` and entry call takes: the first read of a segment after a start scans it whole (64 MiB at the default
 `segment_size`, about a second at 60 MB/s), later reads only the batches whose event times may hold the key and those
@@ -388,7 +390,9 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     ManifestRebuilt { epoch: u64 /* the rebuild record's own epoch */, provisional: bool },
     BackupStalled { since: Timestamp, queued_files: u64, error: String }, BackupRefused(BackupRefusal),
     RestoreFailed { file_id: u64, reason: String },
-    LocalDataUnreadable { readings: u64, deliveries: u64 },   // decided without unreadable local data this run (Q-750)
+    LocalDataUnreadable { readings: u64, deliveries: u64, evaluations: u64, regions: u64 },
+        // decided this run without unreadable local data; damaged regions no lost range records, at every start
+        // until repaired or recorded as lost (Q-750, Q-755)
     SetAside(SetAsideReport) }     // information, not degraded (Q-90)
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
@@ -413,7 +417,9 @@ pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskSta
 //            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
 // DeliveryStats { refresh_errors /* reads of the log that failed, tried again */, corruptions /* invalid regions the
 //               delivery reader passed over */, slow_path /* reads of the log for facts outside the deliverer's recent
-//               window */, unchecked /* deliveries flagged `unchecked` */ }   (zero on the model backend)
+//               window */, unchecked /* deliveries flagged `unchecked` */, evaluations_unchecked /* condition
+//               evaluations without every fact they rest on, delivered or not */, regions_unread /* damaged regions a
+//               consumer's read of the log met beyond those the open passed over */ }   (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }

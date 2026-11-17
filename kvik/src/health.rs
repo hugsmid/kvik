@@ -89,13 +89,19 @@ pub enum Reason {
     },
     /// A restore set positions aside; information, not degraded (Q-90).
     SetAside(SetAsideReport),
-    /// Local data could not be read during this run where a decision needed it (spec §2.4, Q-750): readings recorded
-    /// with `unchecked`, and deliveries flagged `unchecked`, since the store was opened. Held until a restart.
+    /// Local data could not be read where a decision needed it (spec §2.4, Q-750), or a damaged region no lost range
+    /// records was passed over. The counts of decisions are this run's; damaged regions are counted at every start
+    /// until each is repaired or recorded as lost (Q-755).
     LocalDataUnreadable {
-        /// Readings recorded unchecked.
+        /// Readings recorded unchecked, this run.
         readings: u64,
-        /// Deliveries flagged unchecked.
+        /// Deliveries flagged unchecked, this run.
         deliveries: u64,
+        /// Condition evaluations made without every fact they rest on, delivered or not, this run.
+        evaluations: u64,
+        /// Damaged regions passed over that no lost range records: those the start passed over, and those met
+        /// since by a consumer's read of the log.
+        regions: u64,
     },
 }
 
@@ -128,9 +134,12 @@ impl fmt::Display for Reason {
             Reason::LocalDataUnreadable {
                 readings,
                 deliveries,
+                evaluations,
+                regions,
             } => write!(
                 f,
-                "local data unreadable: {readings} readings recorded unchecked, {deliveries} deliveries unchecked"
+                "local data unreadable: {readings} readings recorded unchecked, {deliveries} deliveries and \
+                 {evaluations} evaluations unchecked, {regions} damaged regions not recorded as lost"
             ),
         }
     }
@@ -427,6 +436,10 @@ pub struct DeliveryStats {
     pub slow_path: u64,
     /// Deliveries decided without every fact they rest on, flagged `unchecked` (Q-750).
     pub unchecked: u64,
+    /// Condition evaluations made without every fact they rest on, whether or not they delivered (Q-750).
+    pub evaluations_unchecked: u64,
+    /// Damaged regions a consumer's read of the log passed over that the store's start had not (Q-750).
+    pub regions_unread: u64,
 }
 
 /// Per-series statistics.

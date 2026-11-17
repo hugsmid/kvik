@@ -42,6 +42,22 @@ impl Lost {
         self.0.entry(file_id).or_default().push((start, end));
     }
 
+    /// The regions not recorded as lost by any of `recorded` (the manifest's lost ranges, by segment and bytes).
+    pub(crate) fn unrecorded(&self, recorded: &[kvik_log::manifest::LostRange]) -> u64 {
+        let mut n = 0;
+        for (file_id, rs) in &self.0 {
+            for (a, z) in rs {
+                let inside = recorded.iter().any(|l| {
+                    l.file_id == *file_id
+                        && l.offset <= *a
+                        && *z <= l.offset.saturating_add(l.length)
+                });
+                n += u64::from(!inside);
+            }
+        }
+        n
+    }
+
     pub(crate) fn covers(&self, file_id: u64, start: u64, end: u64) -> bool {
         self.0
             .get(&file_id)

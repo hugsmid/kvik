@@ -33,6 +33,8 @@ pub(crate) struct Kept {
     pub(crate) local: Box<dyn LocalFacts>,
     /// The log was read again whole into memory (module documentation).
     pub(crate) read_whole: bool,
+    /// Damaged regions passed over that no lost range of the manifest records (Q-755).
+    pub(crate) unrecorded: u64,
 }
 
 impl Kept {
@@ -44,6 +46,7 @@ impl Kept {
             counters: BTreeMap::new(),
             local: Box::new(Unreadable),
             read_whole: false,
+            unrecorded: 0,
         }
     }
 }
@@ -125,12 +128,14 @@ pub(crate) fn read_kept(
         }
     }
     decider.registry = index.registry().clone();
+    let unrecorded = lost.unrecorded(reader.lost_ranges());
     Ok(Kept {
         index,
         decider,
         counters,
         local: Box::new(LogFacts::new(reader, lost)),
         read_whole: false,
+        unrecorded,
     })
 }
 
@@ -153,12 +158,14 @@ pub(crate) fn read_whole(mut reader: LogReader, budget: usize) -> Result<Kept, R
         }
     }
     let decider = Decider::from_index(&index, budget);
+    let unrecorded = lost.unrecorded(reader.lost_ranges());
     Ok(Kept {
         index,
         decider,
         counters,
         local: Box::new(LogFacts::new(reader, lost)),
         read_whole: true,
+        unrecorded,
     })
 }
 
