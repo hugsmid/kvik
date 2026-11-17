@@ -3,6 +3,7 @@
 //! [`SeriesSpec`] and the definition entry the log carries (`format.md` A.6).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kvik_log::entries::{
@@ -12,6 +13,7 @@ use kvik_log::entries::{
 use kvik_log::facts::ValueType as LogType;
 use kvik_model as km;
 
+use super::read::pmap::PMap;
 use crate::backend::Error;
 use crate::backend::convert;
 use crate::series::{
@@ -50,7 +52,8 @@ impl Series {
 /// The registry: a function of the entries applied to it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Registry {
-    series: BTreeMap<u32, Series>,
+    /// Shared with the views a reader has published (query design §3.5).
+    series: PMap<u32, Arc<Series>>,
     /// Site zones by effective time; of two at one time the later in the log.
     site_zones: BTreeMap<i64, String>,
     tzdata: Option<String>,
@@ -66,26 +69,27 @@ impl Registry {
                 self.highest = self.highest.max(d.id);
                 self.series.insert(
                     d.id,
-                    Series {
+                    Arc::new(Series {
                         spec: spec_of(d),
                         names: vec![d.name.clone()],
                         retired_at: None,
                         def: (**d).clone(),
-                    },
+                    }),
                 );
             }
             Entry::Alias { id, name } => {
                 if let Some(s) = self.series.get_mut(id) {
-                    s.names.push(name.clone());
+                    Arc::make_mut(s).names.push(name.clone());
                 }
             }
             Entry::Retirement { id, t_r } => {
                 if let Some(s) = self.series.get_mut(id) {
-                    s.retired_at = Some(*t_r);
+                    Arc::make_mut(s).retired_at = Some(*t_r);
                 }
             }
             Entry::ParameterChange(p) => {
                 if let Some(s) = self.series.get_mut(&p.id) {
+                    let s = Arc::make_mut(s);
                     match (p.retention_class, p.retention_period) {
                         (Some(0), _) => s.def.retention = Retention::LongTerm,
                         (Some(1), Some(period)) => {
@@ -113,18 +117,17 @@ impl Registry {
 
     /// Every series, retired or not, in id order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Series> {
-        self.series.values()
+        self.series.values().map(|s| &**s)
     }
 
     /// A series by id, retired or not.
     pub(crate) fn get(&self, id: u32) -> Option<&Series> {
-        self.series.get(&id)
+        self.series.get(&id).map(|s| &**s)
     }
 
     /// The live series that carries a name or alias.
     pub(crate) fn resolve(&self, name: &str) -> Option<&Series> {
-        self.series
-            .values()
+        self.iter()
             .find(|s| !s.retired() && s.names.iter().any(|n| n == name))
     }
 

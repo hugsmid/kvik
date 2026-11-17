@@ -1,6 +1,7 @@
 //! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch and
 //! the recovery entries, built from the batches a log reader returns and cut back when it voids what it took
-//! (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
+//! (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one, and its views share its
+//! structure (query design §3.5): a clone copies no entry, and a change copies the nodes it touches.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -14,6 +15,7 @@ use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::registry::RegistryFile;
 use kvik_log::writer::Position as LogPos;
 
+use super::read::pmap::PMap;
 use super::registry::{Registry, Series};
 use crate::backend::Error;
 use crate::health::{LossCause, LossKind, LossReport, MarkState};
@@ -40,12 +42,12 @@ impl Stored {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index {
     /// Registry entries with the receive time of their batch.
-    entries: BTreeMap<LogPos, (i64, Entry)>,
+    entries: PMap<LogPos, (i64, Entry)>,
     registry: Registry,
-    facts: BTreeMap<u32, BTreeMap<(i64, LogPos), Stored>>,
-    /// Each batch's last position and commit time, in log order.
-    commits: Vec<(LogPos, i64)>,
-    recoveries: BTreeMap<LogPos, Recovery>,
+    facts: PMap<u32, PMap<(i64, LogPos), Stored>>,
+    /// Each batch's last position and commit time.
+    commits: PMap<LogPos, i64>,
+    recoveries: PMap<LogPos, Recovery>,
     /// Facts are not kept, only each series' first fact position (roadmap 11.0: the writer's start and the
     /// deliverer need the registry and the commit times, not the facts).
     no_facts: bool,
@@ -169,14 +171,16 @@ impl Index {
                 }
                 Item::Fact(row) => {
                     self.registry.note_fact(row.series_id);
-                    self.facts.entry(row.series_id).or_default().insert(
-                        (row.t, p),
-                        Stored {
-                            position: p,
-                            received_at: b.content.received_at,
-                            row: row.clone(),
-                        },
-                    );
+                    self.facts
+                        .get_or_insert_with(row.series_id, PMap::default)
+                        .insert(
+                            (row.t, p),
+                            Stored {
+                                position: p,
+                                received_at: b.content.received_at,
+                                row: row.clone(),
+                            },
+                        );
                 }
                 Item::Entry(Entry::Ignored { .. }) => {}
                 Item::Entry(e) => {
@@ -189,7 +193,7 @@ impl Index {
             }
             sequence += item.sequences();
         }
-        self.commits.push((b.last, b.commit_time));
+        self.commits.insert(b.last, b.commit_time);
         if let Some(f) = &self.fold {
             f.batch(b);
         }
@@ -203,17 +207,29 @@ impl Index {
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
         self.recoveries.retain(|p, _| keep(p));
-        self.commits.retain(|(p, _)| keep(p));
-        for f in self.facts.values_mut() {
-            f.retain(|(_, p), _| keep(p));
+        self.commits.retain(|p, _| keep(p));
+        if self
+            .facts
+            .values()
+            .any(|f| f.iter().any(|((_, p), _)| !keep(p)))
+        {
+            self.facts = PMap::from_sorted(self.facts.iter().filter_map(|(id, f)| {
+                let mut f = f.clone();
+                f.retain(|(_, p), _| keep(p));
+                (!f.is_empty()).then_some((*id, f))
+            }));
         }
-        self.facts.retain(|_, f| !f.is_empty());
         self.first_fact.retain(|_, p| keep(p));
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
-        for id in self.facts.keys().chain(self.first_fact.keys()) {
+        for id in self
+            .facts
+            .iter()
+            .map(|(id, _)| id)
+            .chain(self.first_fact.keys())
+        {
             self.registry.note_fact(*id);
         }
     }
@@ -232,7 +248,7 @@ impl Index {
             max_series_id: floor.max(self.registry.highest()),
             entries: self
                 .entries
-                .range(..=through)
+                .range(Bound::Unbounded, Bound::Included(&through))
                 .filter(|(p, _)| p.generation == through.generation)
                 .map(|(p, (t, e))| (p.sequence, *t, e.clone()))
                 .collect(),
@@ -241,7 +257,7 @@ impl Index {
 
     /// The facts of a series in `(t, position)` order.
     pub(crate) fn series_facts(&self, id: u32) -> impl Iterator<Item = &Stored> {
-        self.facts.get(&id).into_iter().flat_map(|m| m.values())
+        self.facts.get(&id).into_iter().flat_map(PMap::values)
     }
 
     /// The current facts of a series (the fact of highest rank per `t`, spec §2.2) with `t` from `from` to `to`
@@ -273,18 +289,10 @@ impl Index {
             Bound::Excluded(t) => Bound::Excluded((t, FIRST)),
             Bound::Unbounded => Bound::Unbounded,
         };
-        // An empty or inverted range reads nothing (`BTreeMap::range` panics on one).
-        let empty = match (&lo, &hi) {
-            (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
-                a > b || (a == b && !matches!((&lo, &hi), (Bound::Included(_), Bound::Included(_))))
-            }
-            _ => false,
-        };
-        let facts = self.facts.get(&id).filter(|_| !empty);
-        let mut it: Box<dyn Iterator<Item = &Stored>> = match facts {
+        let mut it: Box<dyn Iterator<Item = &Stored>> = match self.facts.get(&id) {
             None => Box::new(std::iter::empty()),
-            Some(m) if rev => Box::new(m.range((lo, hi)).rev().map(|(_, s)| s)),
-            Some(m) => Box::new(m.range((lo, hi)).map(|(_, s)| s)),
+            Some(m) if rev => Box::new(m.range(lo.as_ref(), hi.as_ref()).rev().map(|(_, s)| s)),
+            Some(m) => Box::new(m.range(lo.as_ref(), hi.as_ref()).map(|(_, s)| s)),
         };
         let mut pending = it.next();
         let rank = move |s: &Stored| (if versioned { s.row.changed_at } else { None }, s.position);
@@ -305,7 +313,7 @@ impl Index {
 
     /// Every series id that has a kept fact.
     pub(crate) fn fact_series(&self) -> impl Iterator<Item = u32> + '_ {
-        self.facts.keys().copied()
+        self.facts.iter().map(|(id, _)| *id)
     }
 
     fn lookup(&self, key: &SeriesKey) -> Result<&Series, Error> {
@@ -325,7 +333,7 @@ impl Index {
     pub(crate) fn latest_t(&self, id: u32) -> Option<i64> {
         self.facts
             .get(&id)
-            .and_then(|m| m.keys().map(|(t, _)| *t).max())
+            .and_then(|m| m.last().map(|((t, _), _)| *t))
     }
 
     /// The lateness reference of an observed series (spec §2.2): the greatest `t` of its facts flagged neither
@@ -363,7 +371,7 @@ impl Index {
         self.commits
             .iter()
             .rev()
-            .find(|(_, t)| *t <= at)
+            .find(|(_, t)| **t <= at)
             .map_or(LogPos::default(), |(p, _)| *p)
     }
 
@@ -444,7 +452,7 @@ impl Index {
         }
         // A recovery entry is a possible loss when it names a non-empty tail, a mark not readable or stale, or a
         // missing or unreadable cursor file; its identity is its own position (`spec.md` §11 Health, §3 step 4).
-        for (p, r) in &self.recoveries {
+        for (p, r) in self.recoveries.iter() {
             if r.tail_bytes == 0
                 && r.readable_commits == 0
                 && r.mark_state == LogMarkState::Readable
@@ -523,6 +531,44 @@ mod tests {
             value: LogValue::F64(v.to_bits()),
             changed_at: None,
         })
+    }
+
+    fn fact_of(series_id: u32, t: i64) -> Item {
+        match fact(t, 1.0) {
+            Item::Fact(row) => Item::Fact(FactRow { series_id, ..row }),
+            other => other,
+        }
+    }
+
+    /// An index of `series` series with one fact each, taken in 64 batches, published, then given one batch with one
+    /// fact: the entries that batch copied.
+    fn copied_by_one_fact(series: u32) -> u64 {
+        let per = series / 64;
+        let mut i = Index::default();
+        for b in 0..64 {
+            let items = (b * per..(b + 1) * per)
+                .map(|id| fact_of(id + 1, 10))
+                .collect();
+            i.apply(&[batch(u64::from(b * per) + 1, items)]);
+        }
+        let published = i.clone();
+        let before = super::super::read::pmap::copied::get();
+        i.apply(&[batch(u64::from(series) + 1, vec![fact_of(series / 2, 20)])]);
+        let copied = super::super::read::pmap::copied::get() - before;
+        assert_eq!(published.series_facts(series / 2).count(), 1);
+        assert_eq!(i.series_facts(series / 2).count(), 2);
+        assert_eq!(i.latest_t(series / 2), Some(20));
+        copied
+    }
+
+    #[test]
+    fn a_refresh_after_a_publish_copies_about_the_same_whatever_the_number_of_series() {
+        use super::super::read::pmap::NODE;
+        let small = copied_by_one_fact(128);
+        let large = copied_by_one_fact(65_536);
+        // One node a level on each path it changes: one level more for 512 times the series.
+        assert!(large <= small + 2 * NODE as u64, "{small} and {large}");
+        assert!(large < 6 * NODE as u64, "{large}");
     }
 
     #[test]

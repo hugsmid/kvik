@@ -80,6 +80,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-852 | §7 Readers, Manifest; `format.md` A.13 | What a reader call reads once caught up (decided, awaiting review) |
 | Q-853 | §7 Readers; `api.md` `ReaderConfig` | `cut_max_age`'s default and bound, and the clock it runs on (decided, awaiting review) |
 | Q-854 | §7 Manifest, Leases; `format.md` A.15 | The highest epoch a reader has read, recorded in its lease (decided by the lead) |
+| Q-900 | §7 Readers; query design §3.5 | How a reader's published views share structure (decided, awaiting review) |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1757,6 +1758,26 @@ there and names its own epoch as before. The design's "the lease file's bytes do
 layout of everything else.
 **Pinned by.** `an_epoch_the_reader_has_read_is_never_used_again_while_an_older_cut_holds_the_lease`
 (`log/tests/reader_calls.rs`); `layout` (`log/src/lease.rs`).
+
+## Q-900 — How a reader's published views share structure
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.5 holds the series directory in reference-counted pages of 1,024 entries and the
+tail as append-only runs, so that a refresh copies only what changed. Until roadmap 9.0c and 9.0f the reader's index
+holds the registry, every kept fact by series, every batch's commit time and the recovery entries; a published view
+must share them, or each refresh copies the whole index.
+**Decision.** Every map of the index (the registry's series, the facts by series and each series' facts by
+`(t, position)`, the entries, the commit times, the recovery entries) is one persistent B-tree with nodes of at most
+64 entries, reference-counted: a published view is a clone that copies no entry, and the next refresh copies only the
+nodes on the paths it changes, one node a level. A level is added per 64-fold growth, so the cost grows with the
+logarithm of the number of series and of a series' length, not with either: one fact after a publish copies 131
+entries at 128 series and 209 at 65,536. Flat pages of 1,024 would copy a whole page per page touched under a root
+that grows with the series, and late facts need ordered inserts that append-only runs do not give; one structure
+serves every map. A void (a reset) builds the maps it changes again, as the index did before. Counting the nodes a
+held view pins against the memory cap comes with the accountant (roadmap 9.0f).
+**Pinned by.** `a_refresh_after_a_publish_copies_about_the_same_whatever_the_number_of_series`
+(`kvik/src/durable/index.rs`); `a_map_and_its_snapshots_read_as_ordered_maps_do`,
+`a_change_to_a_shared_map_copies_one_node_a_level_and_leaves_the_snapshot_as_it_was`
+(`kvik/src/durable/read/pmap.rs`).
 
 ## Q-710 — The default floor of the batch-sync interval
 
