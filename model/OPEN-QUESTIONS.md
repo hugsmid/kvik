@@ -1375,7 +1375,7 @@ reading. The reference model's engine marks the first fact outranked at commit (
 durable backend does, so the adapter is the odd one out; `outranked_on_arrival` differs the same way.
 **Settled by the lead, as proposed:** the adapter takes `outranked`, and so `outranked_on_arrival`, from the engine's
 commit-time judgement, which the model's `CommitReport::outranked` carries (the positions of the facts outranked
-when committed). The differential test `the_durable_backend_decides_as_the_model_does` (`kvik/tests/differential.rs`) no
+when committed). The differential test `the_durable_backend_decides_as_the_model_does` (`kvik/tests/durable_differential.rs`) no
 longer keeps `changed_at` from rising within a call, and also generates calls on two keys of the versioned series
 alone, so that an earlier reading outranked at commit and a later one that becomes current meet often.
 **Pinned by.** `a_reading_outranked_at_commit_stays_outranked_when_a_later_reading_of_its_call_becomes_current`

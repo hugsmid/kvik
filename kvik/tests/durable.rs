@@ -1,6 +1,6 @@
 //! The durable backend: what reaches the log survives crashes and power losses, a reader in another handle sees
 //! what is committed, the series registry is recovered at every start and ids are never assigned twice. The
-//! comparison with the model backend is in `differential.rs`.
+//! comparison with the model backend is in `durable_differential.rs`.
 
 mod common;
 

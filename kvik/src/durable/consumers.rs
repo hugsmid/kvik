@@ -84,7 +84,7 @@ impl Writer {
         let wall = self.env.clock.wall().0;
         kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file).map_err(
             |e| {
-                let f = super::registry_fault(&self.dir, &e);
+                let f = super::open::registry_fault(&self.dir, &e);
                 *lock(&self.own_fault) = Some(f);
                 Error::ReadOnly(e.to_string())
             },
