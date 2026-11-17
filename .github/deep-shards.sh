@@ -152,7 +152,9 @@ check)
     [[ -z $missing ]] || printf 'In no shard of %s:\n%s\n' "$file" "$missing" >&2
     [[ -z $twice ]] || printf 'In more than one shard of %s:\n%s\n' "$file" "$twice" >&2
     [[ -z $missing && -z $twice ]] || exit 1
-    echo "$crate/tests/$file.rs: all $(grep -c . <<<"$all") tests, each in exactly one shard"
+    where=$crate/tests/$file.rs
+    [[ $file == lib ]] && where="$crate unit tests named by $2"
+    echo "$where: all $(grep -c . <<<"$all") tests, each in exactly one shard"
     ;;
 run)
     crate=$(crate_of "${2:-}")
