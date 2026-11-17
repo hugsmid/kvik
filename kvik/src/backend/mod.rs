@@ -416,6 +416,7 @@ impl Slot {
 
     pub(crate) fn define(&mut self, epoch: u64, spec: SeriesSpec) -> Result<SeriesId> {
         self.writable(epoch)?;
+        convert::check_name(&spec.name)?;
         let d = convert::definition(&spec)?;
         let defined = self.model.define_with(
             &spec.name,
@@ -545,6 +546,13 @@ impl Slot {
 
     pub(crate) fn alias(&mut self, epoch: u64, id: SeriesId, name: &str) -> Result<()> {
         self.writable(epoch)?;
+        // An unknown or retired series is reported before the name, as on the durable backend.
+        match self.model.registry().map_err(convert::error)?.get(msid(id)) {
+            None => return Err(Error::UnknownSeries(id.to_string())),
+            Some(d) if d.retired => return Err(Error::Retired(id)),
+            Some(_) => {}
+        }
+        convert::check_name(name)?;
         self.model.rename(msid(id), name).map_err(convert::error)?;
         self.reroute_patterns()
     }

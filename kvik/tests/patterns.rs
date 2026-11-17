@@ -11,8 +11,8 @@ use common::world::{World, drain, gauge, num};
 use common::{block_on, start};
 use kvik::env::{Env, ManualClock};
 use kvik::{
-    Backend, ConsumerError, DefineError, DeliveryKind, Funnel, RouteError, Select, SeriesId, Start,
-    Store, StoreConfig,
+    Backend, ConsumerError, DefineError, DeliveryKind, Funnel, Kind, RouteError, Select, SeriesId,
+    SeriesSpec, Start, Store, StoreConfig, ValueType,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -117,6 +117,47 @@ fn a_name_without_three_non_empty_segments_is_refused_on_both_backends() {
             ["plant/line-1/power", "plant/line-1/watts"],
             "{backend:?}"
         );
+    }
+}
+
+fn invalid_field<T>(r: Result<T, DefineError>) -> Option<(&'static str, String)> {
+    match r {
+        Err(DefineError::Invalid { field, reason }) => Some((field, reason)),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_name_is_at_most_255_bytes_on_both_backends() {
+    let longest = format!("a/b/{}", "c".repeat(251));
+    let over = format!("{longest}c");
+    let mut reasons = Vec::new();
+    for backend in [Backend::Model, Backend::Durable] {
+        let s = store_on(backend);
+        let r = invalid_field(block_on(s.define_series(gauge(&over))));
+        assert_eq!(r.as_ref().map(|r| r.0), Some("name"), "{backend:?} define");
+        reasons.push(r);
+        let id = block_on(s.define_series(gauge(&longest))).unwrap();
+        let r = invalid_field(block_on(s.alias(id, &over)));
+        assert_eq!(r.as_ref().map(|r| r.0), Some("name"), "{backend:?} alias");
+        block_on(s.alias(id, &format!("x/{}", &longest[2..]))).unwrap();
+    }
+    assert_eq!(reasons[0], reasons[1], "the same reason on both backends");
+}
+
+#[test]
+fn a_wrong_name_is_reported_before_a_wrong_unit_on_both_backends() {
+    let spec = SeriesSpec::new(
+        "plant/power",
+        Kind::Gauge {
+            value: ValueType::F64,
+        },
+        "u".repeat(64),
+    );
+    for backend in [Backend::Model, Backend::Durable] {
+        let s = store_on(backend);
+        let r = invalid_field(block_on(s.define_series(spec.clone())));
+        assert_eq!(r.map(|r| r.0), Some("name"), "{backend:?}");
     }
 }
 

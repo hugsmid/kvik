@@ -146,8 +146,18 @@ pub(crate) fn mwait(b: Wait) -> km::engine::Wait {
     }
 }
 
-/// A name without three non-empty `/`-separated segments, at `define_series` or `alias` (spec §2.1 `name`, Q-670).
-pub(crate) fn name_shape(name: &str) -> Result<(), Error> {
+/// The longest name (`format.md` A.6 field 2).
+const MAX_NAME: usize = 255;
+
+/// A name given to `define_series` or `alias`: 1 to 255 bytes, then three non-empty `/`-separated segments (spec
+/// §2.1 `name`, Q-670), checked alike on both backends.
+pub(crate) fn check_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() || name.len() > MAX_NAME {
+        return Err(Error::Invalid {
+            field: "name",
+            reason: "1 to 255 bytes".into(),
+        });
+    }
     if km::registry::name_has_three_segments(name) {
         Ok(())
     } else {
