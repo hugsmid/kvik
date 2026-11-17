@@ -260,3 +260,52 @@ fn in_order_ingest_after_a_loss_and_a_start_over_one_take_no_slow_path() {
     );
     block_on(s.shutdown()).unwrap();
 }
+
+/// Q-925 as proposed, at the store: after a found loss, a reading whose key and lateness reference both lie in damage
+/// no scanning reader has met is recorded unchecked, not late, and counted once in `readings`; one whose reference
+/// alone lies there is counted too.
+#[test]
+fn a_reading_with_its_key_and_reference_unreadable_is_counted_once() {
+    let w = World::new("reference-unread");
+    let mut config = w.config();
+    config.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let g = block_on(
+        s.define_series(
+            gauge("a/b/power")
+                .staleness(std::time::Duration::from_secs(10))
+                .lateness_bound(std::time::Duration::from_secs(3_600)),
+        ),
+    )
+    .unwrap();
+    let bytes = |v: f64| v.to_bits().to_le_bytes();
+    block_on(s.emit(&[num(g, -100, 1_234.5), num(g, -40, 1_235.5)])).unwrap();
+    sealed_with(&w, &bytes(1_235.5));
+    block_on(s.emit(&[num(g, 0, 777.25)])).unwrap();
+    sealed_with(&w, &bytes(777.25));
+    damage(&w, &bytes(777.25));
+    assert_eq!(data_lost(&s.losses()).len(), 1);
+    damage(&w, &bytes(1_234.5));
+    let readings = |s: &Store| match s.health() {
+        Health::Degraded { reasons } => reasons.iter().find_map(|r| match r {
+            Reason::LocalDataUnreadable { readings, .. } => Some(*readings),
+            _ => None,
+        }),
+        _ => None,
+    };
+    // -110: its key outside the damaged segment, its reference facts inside: checked, counted.
+    // -70: its key inside as well: unchecked, counted once.
+    let ack = block_on(s.emit(&[num(g, -110, 6.0), num(g, -70, 5.0)])).unwrap();
+    let unchecked: Vec<bool> = ack
+        .outcomes
+        .iter()
+        .map(|o| match o {
+            Outcome::Recorded { unchecked, .. } => *unchecked,
+            o => panic!("{o:?}"),
+        })
+        .collect();
+    assert_eq!(unchecked, [false, true]);
+    assert_eq!(readings(&s), Some(2));
+    assert_eq!(s.series_stats(g).unwrap().late, 0);
+    block_on(s.shutdown()).unwrap();
+}

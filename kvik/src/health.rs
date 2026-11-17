@@ -116,8 +116,8 @@ pub enum Reason {
     /// records was passed over. The counts of decisions are this run's; damaged regions are counted at every start
     /// until each is repaired or recorded as lost (Q-755).
     LocalDataUnreadable {
-        /// Readings recorded with a check unmade for want of local data, this run: the duplicate check, or the
-        /// lateness reference (Q-925).
+        /// Readings recorded with a check unmade for want of local data, this run: the duplicate check, the
+        /// lateness reference (Q-925), or both, each reading counted once.
         readings: u64,
         /// Deliveries flagged unchecked, this run.
         deliveries: u64,

@@ -90,7 +90,8 @@ pub(crate) struct Plan {
     whole: HashMap<Key, Vec<Known>>,
     /// Lateness references a read of the log settled, in the order settled (Q-924).
     references: Vec<(u32, Reference)>,
-    /// Readings whose lateness reference could not be read: taken as not late (Q-925).
+    /// Readings whose lateness reference could not be read (Q-925) and whose duplicate check was made; one whose
+    /// check was not is counted by its `unchecked`.
     pub(crate) reference_unread: u64,
 }
 
@@ -498,7 +499,8 @@ impl Decider {
                             let read = self.read_reference(local, id, (upper, least), r.t.0, st);
                             references.insert(id, read.state);
                             plan.references.push((id, read.state));
-                            plan.reference_unread += u64::from(read.unread);
+                            // A reading counts once in `readings`, whichever checks went unmade.
+                            plan.reference_unread += u64::from(read.unread && !unreadable);
                             read.late
                         }
                     }
