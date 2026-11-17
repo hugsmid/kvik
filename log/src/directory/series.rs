@@ -296,6 +296,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entries_out_of_order_or_a_bad_candidate_are_invalid() {
+        let e = |id| SeriesEntry {
+            series_id: id,
+            ..SeriesEntry::default()
+        };
+        let frame = Frame {
+            generation: 0,
+            file_id: 1,
+            written_at: 0,
+        };
+        let d = SeriesDirectory {
+            entries: vec![e(2), e(1)],
+            ..SeriesDirectory::default()
+        };
+        assert!(SeriesDirectory::decode(&d.encode(frame, [1; 16]).unwrap(), &[1; 16]).is_err());
+        let mut bad = e(1);
+        bad.candidate = Some(Candidate {
+            t: 0,
+            position: Position::default(),
+            quality: Quality::Bad,
+            value: CandidateValue::Bool(true),
+        });
+        let d = SeriesDirectory {
+            entries: vec![bad],
+            ..SeriesDirectory::default()
+        };
+        assert!(
+            SeriesDirectory::decode(&d.encode(frame, [1; 16]).unwrap(), &[1; 16]).is_err(),
+            "a candidate is never bad"
+        );
+    }
+
+    #[test]
     fn every_value_kind_round_trips() {
         let at = |s| Position {
             generation: 0,

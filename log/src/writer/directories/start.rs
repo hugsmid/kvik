@@ -17,7 +17,7 @@ use crate::name::SegmentName;
 use crate::store::{LOG_DIR, MANIFEST, read_all};
 
 /// Trailers read per step.
-pub const TRAILERS_PER_STEP: usize = 64;
+pub const TRAILERS_PER_STEP: usize = 8;
 /// Group records reused per step.
 pub const REUSED_PER_STEP: usize = 256;
 

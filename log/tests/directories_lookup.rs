@@ -161,3 +161,66 @@ fn a_position_a_derived_file_names_raises_f() {
     let e = r.w.as_ref().unwrap().start_report().entry.clone().unwrap();
     assert_eq!(e.sequence, mark + 41, "F above the derived file's position");
 }
+
+#[test]
+fn a_position_the_root_names_raises_f() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 20, 0);
+    r.settle();
+    let mark = r.durable_mark();
+    // A root whose one group ends 40 above the mark.
+    let at = |s| Position {
+        generation: 0,
+        sequence: s,
+    };
+    let g = Group {
+        number: 0,
+        segments: vec![SegmentRecord {
+            file_id: 1,
+            generation: 0,
+            has_entries: false,
+            first_sequence: 1,
+            last_sequence: mark + 40,
+            first_commit_time: T0,
+            last_commit_time: T0,
+            fact_count: 0,
+            len: 0,
+            file_crc32c: 0,
+            sha256: [0; 32],
+        }],
+    };
+    let root = Root {
+        epoch: 1,
+        manifest_end: 0,
+        manifest_crc32c: 0,
+        through: at(mark + 40),
+        segment_count: 1,
+        stamp: None,
+        compacted_through: None,
+        groups: vec![g.entry()],
+        lost: Vec::new(),
+        quarantined: Vec::new(),
+    };
+    let frame = Frame {
+        generation: 0,
+        file_id: 99,
+        written_at: T0,
+    };
+    directory::write_file(
+        &r.fs,
+        &dir(),
+        Family::Root,
+        99,
+        &root.encode(frame, STORE_ID).unwrap(),
+    )
+    .unwrap();
+    for (_, p) in directory::generations(&r.fs, &dir(), Family::Series) {
+        r.fs.remove_file(&p).unwrap();
+    }
+    r.fs.remove_file(&dir().join("log").join("MARK")).unwrap();
+    r.dirs = None;
+    r.w = None;
+    r.open();
+    let e = r.w.as_ref().unwrap().start_report().entry.clone().unwrap();
+    assert_eq!(e.sequence, mark + 41, "F above the root's position");
+}

@@ -327,9 +327,12 @@ pub fn write_file(
         Err(e) => return Err(e),
     }
     let f = fs.open(&tmp, OpenMode::CreateNew)?;
-    f.write_at(bytes, 0)?;
+    let written = f.write_at(bytes, 0);
     drop(f);
-    fs.rename(&tmp, &dir.join(&name))?;
+    if let Err(e) = written.and_then(|()| fs.rename(&tmp, &dir.join(&name))) {
+        let _ = fs.remove_file(&tmp);
+        return Err(e);
+    }
     for (id, path) in generations(fs, store_dir, family)
         .into_iter()
         .skip(family.kept())

@@ -351,3 +351,182 @@ fn a_seal_handed_over_after_the_files_were_read_is_listed_once() {
     assert!(d.groups.iter().all(Option::is_some));
     assert_eq!(d.segments().cloned().collect::<Vec<_>>(), r.sealed());
 }
+
+#[test]
+fn a_seal_handed_over_after_a_later_one_is_listed_in_its_place() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 300, 0);
+    r.settle();
+    let d = r.dirs.take();
+    ingest(&mut r, 120, 10_000_000);
+    r.settle();
+    r.dirs = d;
+    assert!(r.sealed_records.len() >= 2);
+    // A seal blocked and retried: the later ones are handed over first.
+    let held = r.sealed_records.remove(0);
+    r.settle();
+    let d = r.load().unwrap();
+    assert!(
+        d.root.through < held.first(),
+        "nothing past the segment not yet handed over"
+    );
+    r.sealed_records.push(held.clone());
+    r.settle();
+    let d = r.load().unwrap();
+    assert!(d.segments().any(|s| s.file_id == held.file_id));
+    assert_eq!(d.segments().cloned().collect::<Vec<_>>(), r.sealed());
+}
+
+#[test]
+fn a_family_of_a_newer_version_is_left_alone_and_not_retried() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 300, 0);
+    r.settle();
+    let gens = directory::generations(&r.fs, &dir(), Family::Root);
+    let mut bytes = r.fs.read(&gens[0].1).unwrap();
+    let mut h = kvik_log::header::FileHeader::decode(&bytes).unwrap();
+    h.format_major = 2;
+    bytes[..64].copy_from_slice(&h.encode());
+    rewrite(&r, &gens[0].1, &bytes);
+    r.open();
+    let synced = r.w.as_ref().unwrap().stats().mark_synced;
+    let mut waits = Vec::new();
+    for _ in 0..40 {
+        r.clock.advance(Duration::from_millis(100));
+        let d = r.dirs.as_mut().unwrap();
+        waits.push(d.run(synced, r.clock.monotonic(), r.clock.wall()));
+    }
+    let d = r.dirs.as_ref().unwrap();
+    assert!(d.started());
+    assert_eq!(d.stats().failed, 0, "{waits:?}");
+    assert_eq!(
+        r.fs.read(&gens[0].1).unwrap(),
+        bytes,
+        "the newer file is left as it is"
+    );
+}
+
+#[test]
+fn failed_writes_leave_no_temporary_file_and_back_off() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 300, 0);
+    r.settle();
+    let d = r.dirs.take();
+    ingest(&mut r, 80, 50_000_000);
+    r.settle();
+    r.dirs = d;
+    for rec in r.sealed_records.drain(..) {
+        r.dirs.as_mut().unwrap().sealed(rec);
+    }
+    let synced = r.w.as_ref().unwrap().stats().mark_synced;
+    let tmp = |r: &Rig| {
+        r.derived()
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
+            .count()
+    };
+    // Every rename in `derived/` fails for 20 s of runs every 100 ms.
+    for _ in 0..200 {
+        for _ in 0..4 {
+            r.fs.fail_nth(
+                kvik_log::fs::FaultOp::Rename,
+                "derived",
+                0,
+                std::io::ErrorKind::PermissionDenied,
+            );
+        }
+        r.clock.advance(Duration::from_millis(100));
+        let d = r.dirs.as_mut().unwrap();
+        d.run(synced, r.clock.monotonic(), r.clock.wall());
+    }
+    assert_eq!(tmp(&r), 0, "a failed write removes its temporary file");
+    let failed = r.dirs.as_ref().unwrap().stats().failed;
+    assert!(
+        (3..=12).contains(&failed),
+        "failed writes tried {failed} times"
+    );
+    // Once the device accepts writes again (the planned faults cleared), the next try after the wait catches up.
+    r.fs.restart();
+    r.clock.advance(Duration::from_secs(61));
+    r.settle();
+    assert_eq!(
+        r.load().unwrap().segments().cloned().collect::<Vec<_>>(),
+        r.sealed()
+    );
+}
+
+#[test]
+fn the_first_read_lists_no_segment_above_the_synced_mark() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 300, 0);
+    r.settle();
+    r.dirs = None;
+    let mut k = 0;
+    let synced = loop {
+        ingest(&mut r, 3, 60_000_000 + k * 1_000_000);
+        k += 1;
+        let synced = r.w.as_ref().unwrap().stats().mark_synced;
+        if r.sealed().iter().any(|s| s.last() > synced) {
+            break synced;
+        }
+        assert!(k < 400, "no seal above the synced mark");
+    };
+    let start = r.w.as_ref().unwrap().directory_start();
+    let opts = DirectoryOptions {
+        hook: None,
+        status_interval: None,
+    };
+    let mut d = Directories::new(Arc::new(r.fs.clone()), &dir(), STORE_ID, start, opts);
+    for _ in 0..1_000 {
+        d.run(synced, r.clock.monotonic(), r.clock.wall());
+        if d.started() {
+            break;
+        }
+    }
+    let root = read_latest(&r.fs, &dir(), Family::Root, |b| Root::decode(b, &STORE_ID))
+        .unwrap()
+        .unwrap()
+        .1;
+    assert!(
+        root.through <= synced,
+        "the root names a position above the last synced mark"
+    );
+}
+
+#[test]
+fn a_series_write_covers_the_seals_so_the_next_small_seal_waits() {
+    let mut r = Rig::new(cfg());
+    r.series_bytes = 10 << 10;
+    r.open();
+    ingest(&mut r, 400, 0);
+    r.settle();
+    let first = r.series().unwrap().0.file_id;
+    let writes = |r: &Rig| r.series().unwrap().0.file_id - first;
+    // Each write covers what was sealed, so a write comes about every two seals, not at every seal.
+    let seals = r.sealed().len();
+    ingest(&mut r, 2_000, 10_000_000);
+    r.settle();
+    let more = r.sealed().len() - seals;
+    assert!(
+        writes(&r) as usize * 3 / 2 <= more + 1,
+        "{} writes for {more} seals",
+        writes(&r)
+    );
+    assert!(writes(&r) > 0);
+}
+
+#[test]
+fn a_start_removes_temporary_files_a_crash_left() {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 100, 0);
+    r.settle();
+    let tmp = dir()
+        .join(DERIVED_DIR)
+        .join(format!("{}.tmp", Family::Series.file_name(77)));
+    let f = r.fs.open(&tmp, kvik_log::fs::OpenMode::CreateNew).unwrap();
+    f.write_at(&[1, 2, 3], 0).unwrap();
+    drop(f);
+    r.open();
+    r.settle();
+    assert!(r.fs.read(&tmp).is_none());
+}

@@ -476,3 +476,29 @@ pub fn waiting() -> Rig {
     r.dirs = d;
     r
 }
+
+/// Writes `bytes` over the file at `p`.
+pub fn rewrite(r: &Rig, p: &std::path::Path, bytes: &[u8]) {
+    r.fs.remove_file(p).unwrap();
+    let f = r.fs.open(p, kvik_log::fs::OpenMode::CreateNew).unwrap();
+    f.write_at(bytes, 0).unwrap();
+}
+
+/// The path of a sealed segment.
+pub fn sealed_path(file_id: u64) -> PathBuf {
+    let name = SegmentName {
+        generation: 0,
+        file_id,
+        sealed: true,
+    };
+    dir().join("log").join(name.to_string())
+}
+
+/// A store with more than one group, directories written and the writer stopped.
+pub fn two_groups() -> Rig {
+    let mut r = Rig::new(cfg());
+    ingest(&mut r, 7_000, 0);
+    r.settle();
+    assert!(r.load().unwrap().groups.len() >= 2);
+    r
+}

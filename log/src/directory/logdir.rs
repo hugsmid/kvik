@@ -549,6 +549,16 @@ mod tests {
     }
 
     #[test]
+    fn a_group_whose_records_are_out_of_order_is_invalid() {
+        let g = Group {
+            number: 0,
+            segments: vec![seg(2, 6, 9), seg(1, 1, 5)],
+        };
+        let bytes = g.encode(frame(), [1; 16]).unwrap();
+        assert!(Group::decode(&bytes, &[1; 16]).is_err());
+    }
+
+    #[test]
     fn a_group_round_trips_and_its_entry_names_its_body() {
         let g = Group {
             number: 0,
