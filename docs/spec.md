@@ -676,8 +676,9 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   sealed bytes; the files speed reads up and never change a result. A series directory, or a root, is a function of
   the kept log while its `through` with the reset stamp it records, judged as a saved point (below), is kept or void
   above no lower position; the writer, which judges at each start, keeps one written under the current stamp or with
-  `through` at or below the `after` of the recovery entry its start wrote (Q-776); a lost range recorded at or below
-  a series directory's `through` since it was written makes it no longer one. A part of the log directory whose
+  `through` at or below the `after` of the recovery entry its start wrote (Q-776); a position at or below a series
+  directory's `through` lost since it was written (a new lost range or one extended under its identity) makes it no
+  longer one. A part of the log directory whose
   segments the catalogue no longer describes (a replaced segment, a restore, a manifest rebuild) is not used.
 - **Reset stamp and saved points.** The mark carries the current reset stamp: zero until the first reset, then
   the stamp of the last recovery entry a start wrote (§3 Recovery rules 1 and 3) or of the last restore record (§8

@@ -74,6 +74,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-776 | §7 Derived files, Reset stamp and saved points | When the writer keeps a series directory across a reset |
 | Q-777 | §2.3, §7 Derived files; `format.md` A.18 | The live candidate's write time and what bounded state cannot tell |
 | Q-778 | §7 Derived files; `format.md` A.18 | What the status file holds before the query envelope exists |
+| Q-780 | §8 Generations, Restore; `format.md` A.18 Contiguity | The log directory across a generation change |
 | Q-706 | §4 Delivery; `api.md` Health (`DeliveryStats`) | Whether an emit may leave the read-back of its batch to the delivery thread when no consumer is registered |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
@@ -1541,12 +1542,15 @@ kept log; a file with `through` above 950 would not be.
 can judge at its own start (`DirectoryStart::keeps`): same generation, and the current stamp or a `through` at or
 below the `after` of the recovery entry this start wrote or adopted. A file written under an earlier stamp and kept
 across a start without a reset of its own is therefore dropped at the next start and written again: conservative,
-never wrong. A lost range is not a reset (the stamp does not change), so the file also records how many lost ranges
-at or below its `through` the manifest held (`format.md` A.18): one recorded since drops it, at the writer's start
-(`kept_series`, shared by `kvik`'s seed) and for a reader.
+never wrong. A lost range is not a reset (the stamp does not change), so the file also records how many positions at
+or below its `through` the manifest's lost ranges covered (`format.md` A.18): a position lost since, by a new range
+or by one extended under its identity, drops it, at the writer's start (`kept_series`, shared by `kvik`'s seed) and
+for a reader. Positions rather than ranges, since a loss that grows keeps its identity and a reader sees the ranges
+merged by identity.
 **Pinned by.** `a_reset_below_the_series_directory_invalidates_it_and_one_above_keeps_it`,
 `a_restore_invalidates_every_file_of_the_older_generation`, `a_lost_range_recorded_below_the_series_directory_drops_it`
-(`log/tests/directories_check.rs`).
+(`log/tests/directories_check.rs`); `a_loss_extended_under_its_identity_below_the_series_directory_drops_it`,
+`a_loss_that_grows_only_above_the_series_directory_keeps_it` (`log/tests/directories_faults.rs`).
 
 ## Q-777 — The live candidate's write time and what bounded state cannot tell
 Recorded by roadmap 9.0a. To be settled by roadmap 9.0c, the first reader of the series directory.
@@ -1589,8 +1593,25 @@ group would no longer match and be written again.
 Roadmap 6.3e writes the bit with the removal; what serves those positions then (C(E), the compacted files) stays
 reserved in the root.
 
+## Q-780 — The log directory across a generation change
+Recorded by roadmap 9.0a at its recheck. To be settled by roadmap 8.3, whose restore writes the restore record.
+**Scenario.** After a restore the local log may hold segments of the older generation and then the new one's. A
+sealed segment the start cannot read at the end of the older generation, or at the head of the newer, would be passed
+by `through` if any later generation joined whatever came before it.
+**Decision.** Every generation starts at sequence 1 (§1), so a record starts its generation from 1 or after lost
+ranges from 1; the earlier generation's last record reaches the lowest restored end in force for it, and no
+generation between held a position (`format.md` A.18 Contiguity). The root carries the restored ends of the writer's
+start, as it carries the lost ranges, so a reader checks the same. Until 8.3 the writer runs in generation 0 only
+(`StartOptions::generation` is refused) and the array is empty.
+**Open.** Where a restore leaves the older generation's first segments on no local tier, the first record listed is
+not at sequence 1 and the listing stays empty: 8.3 says whether the restored files are local, or the rule names the
+restore's first restored position instead.
+**Pinned by.** `a_later_generation_joins_from_its_first_position_once_the_earlier_reaches_its_restored_end`,
+`a_skipped_generation_joins_only_when_it_held_no_position`,
+`a_root_carries_its_restored_ends_and_its_first_group_starts_its_generation` (`log/src/directory/logdir.rs`).
+
 ## Q-754 — The lookup's batch maps across a reset stamp or generation
-Recorded by roadmap 11.0. To be settled by roadmap 9.0a, which adds reader processes that look up keys.
+Recorded by roadmap 11.0. To be settled by roadmap 9.0f, which adds reader processes that look up keys.
 **Scenario.** A reader in another process maps a segment's batches by lookup, then the writer restarts after a power
 loss and truncates the tail of that segment (§3 Recovery rule 1, a reset point). The reader's map still names the
 truncated batches.
@@ -1676,7 +1697,7 @@ of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
 the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The store-path quick wins recorded Q-704 to Q-706.
 
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-754; the owner settled Q-750 at its review. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-754; the owner settled Q-750 at its review. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1757,7 +1778,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-777 | 9.0c | The live candidate's write time and the unsure marks of bounded state; recorded by roadmap 9.0a |
 | Q-778 | 9.0g | The status file's health, interval and reserved pressure fields; recorded by roadmap 9.0a |
 | Q-779 | 6.3e | Group numbers once compacted log segments are removed locally; settled at 9.0a's review ("not local" bit); 6.3e writes the bit |
-| Q-754 | 9.0a | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
+| Q-780 | 8.3 | The log directory across a generation change: restored ends in the root; recorded by roadmap 9.0a |
+| Q-754 | 9.0f | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
 
 | Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |

@@ -223,8 +223,8 @@ impl SeriesEntry {
 pub struct SeriesDirectory {
     /// Complete through this position, at or below the last synced mark: the entries are as of it.
     pub through: Position,
-    /// The lost ranges at or below `through` that the manifest held when it was written: one recorded since makes
-    /// the file no longer a function of the kept log.
+    /// The positions at or below `through` that lost ranges covered when it was written ([`crate::writer::lost_below`]):
+    /// more covered since makes the file no longer a function of the kept log.
     pub lost: u32,
     /// The mark's reset stamp when it was written.
     pub stamp: Option<ResetStamp>,
