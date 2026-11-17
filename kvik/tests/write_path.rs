@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::world::{gauge, num};
 use common::{block_on, start};
 use kvik::env::{DirEntry, Env, Fs, FsFile, ManualClock, MemFs, OpenMode};
-use kvik::{LogConfig, SeriesId, Store, StoreConfig};
+use kvik::{LogConfig, Select, SeriesId, Start, Store, StoreConfig};
 use kvik_log::name::SegmentName;
 
 #[derive(Debug, Default)]
@@ -131,6 +131,8 @@ fn snapshot(c: &Mutex<Counts>) -> (u64, u64) {
 #[test]
 fn the_delivery_reader_refreshes_at_most_once_per_batch_sync() {
     let (store, _clock, counts, ids) = counted("once-per-sync", 32);
+    // With a consumer every emit reads its batch back itself (Q-706), as each caller did before.
+    let consumer = block_on(store.consumer("c", Start::Now, Select::None)).unwrap();
     let (l0, s0) = snapshot(&counts);
     for i in 0..50 {
         block_on(store.emit(&[num(ids[0], i, 1.0)])).unwrap();
@@ -163,6 +165,7 @@ fn the_delivery_reader_refreshes_at_most_once_per_batch_sync() {
         l2 - l1,
         s2 - s1
     );
+    drop(consumer);
     block_on(store.shutdown()).unwrap();
 }
 
