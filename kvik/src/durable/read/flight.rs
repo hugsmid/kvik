@@ -290,16 +290,21 @@ mod loom_tests {
         runs: AtomicU64,
     }
 
-    /// A call that reads the mark first; returns that mark, the result and whether its own refresh failed.
-    fn call(w: &World, fail: fn(u64) -> bool) -> (u64, Result<u64, u64>, bool) {
+    /// What a call saw: the mark and the refreshes begun when it began, its result, and whether its own refresh
+    /// failed.
+    type Seen = (u64, u64, Result<u64, u64>, bool);
+
+    /// A call that reads the mark and the refreshes begun first.
+    fn call(w: &World, fail: fn(u64) -> bool) -> Seen {
         let seen = w.mark.load(Ordering::SeqCst);
+        let begun = w.runs.load(Ordering::SeqCst);
         let mut failed_here = false;
         let r = w.flight.get(|_| {
             let r = refresh(&w.mark, &w.busy, &w.runs, fail);
             failed_here = r.is_err();
             r
         });
-        (seen, r.map(|v| *v), failed_here)
+        (seen, begun, r.map(|v| *v), failed_here)
     }
 
     fn world() -> Arc<World> {
@@ -327,7 +332,7 @@ mod loom_tests {
             };
             let mine = call(&w, |_| false);
             writer.join().unwrap();
-            for (seen, r, _) in [mine, other.join().unwrap()] {
+            for (seen, _, r, _) in [mine, other.join().unwrap()] {
                 assert!(r.unwrap() >= seen, "a view read before its call began");
             }
             let current = *w.flight.current().unwrap();
@@ -336,7 +341,7 @@ mod loom_tests {
     }
 
     /// Three calls whose refreshes fail on the runs `fail` names.
-    fn three(fail: fn(u64) -> bool) -> [(u64, Result<u64, u64>, bool); 3] {
+    fn three(fail: fn(u64) -> bool) -> [Seen; 3] {
         let w = world();
         let others: Vec<_> = (0..2)
             .map(|_| {
@@ -352,7 +357,7 @@ mod loom_tests {
     #[test]
     fn only_the_leader_of_a_failed_round_reports_its_error() {
         model(|| {
-            for (seen, r, failed_here) in three(|run| run == 0) {
+            for (seen, _, r, failed_here) in three(|run| run == 0) {
                 match r {
                     Ok(m) => assert!(m >= seen),
                     Err(run) => assert!(
@@ -367,10 +372,11 @@ mod loom_tests {
     #[test]
     fn a_follower_reports_an_error_only_after_two_failed_rounds() {
         model(|| {
-            for (_, r, failed_here) in three(|_| true) {
+            for (_, begun, r, failed_here) in three(|_| true) {
+                // The first round a follower can follow is the run numbered `begun`.
                 let run = r.unwrap_err();
                 assert!(
-                    failed_here || run >= 1,
+                    failed_here || run > begun,
                     "a follower gave up after one failed round"
                 );
             }
