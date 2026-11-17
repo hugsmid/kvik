@@ -235,8 +235,6 @@ pub struct Directories {
     open_written: Option<u32>,
     unwritten: Vec<Group>,
     pending: Vec<SegmentRecord>,
-    /// A sealed segment the start could not read: nothing at or above this `file_id` is listed.
-    hole: Option<u64>,
     root_dirty: bool,
     /// The `through` of a root found valid at the start, which a root written during the start never goes below.
     floor: Position,
@@ -303,7 +301,6 @@ impl Directories {
             open_written: None,
             unwritten: Vec::new(),
             pending: Vec::new(),
-            hole: None,
             root_dirty: false,
             floor: Position::default(),
             series_through: None,
@@ -462,7 +459,7 @@ impl Directories {
                 Some(l) => logdir::joins(l, r.first(), &self.lost),
                 None => r.generation != 0 || logdir::joins(start, r.first(), &self.lost),
             };
-            if !joins || self.hole.is_some_and(|h| r.file_id >= h) {
+            if !joins {
                 keep.push(r);
                 continue;
             }

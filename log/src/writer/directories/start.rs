@@ -176,9 +176,9 @@ impl Directories {
         self.dir.join(LOG_DIR).join(name.to_string())
     }
 
-    fn unreadable(&mut self, file_id: u64) {
+    /// A sealed segment the start cannot read: the gap it leaves holds back every later one (A.18 Contiguity).
+    fn unreadable(&mut self, _file_id: u64) {
         self.stats.unlisted += 1;
-        self.hole = Some(self.hole.map_or(file_id, |h| h.min(file_id)));
     }
 
     fn trailers(&mut self, s: &mut Start) {
