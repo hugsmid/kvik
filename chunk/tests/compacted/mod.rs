@@ -308,7 +308,7 @@ fn value_of(vt: u8, word: u64, scale: u8, flags: u16, k: usize) -> (u64, Vec<u8>
     match vt {
         value_type::F64 => (word, Vec::new(), 0),
         value_type::DECIMAL => {
-            let v = if word % 7 == 0 {
+            let v = if word.is_multiple_of(7) {
                 (word as i64).max(i64::MIN + 1)
             } else {
                 (word % 2_000_001) as i64 - 1_000_000
@@ -445,7 +445,7 @@ pub fn build(s: &Spec) -> (Content, Vec<Position>) {
                 };
                 if s.revision
                     && s.set_aside_every > 0
-                    && facts % usize::from(s.set_aside_every) == 0
+                    && facts.is_multiple_of(usize::from(s.set_aside_every))
                 {
                     series[si].set_aside.push(f);
                 } else {

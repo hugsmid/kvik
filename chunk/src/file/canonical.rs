@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 
 use super::error::FileError;
-use super::read::{CompactedFile, Identity};
+use super::layout::Identity;
+use super::read::CompactedFile;
 use super::stats::Reach;
 use super::write::{Fact, FileWriter, Series, Tweaks, WriteError};
 use super::{Position, parts::SET_ASIDE};

@@ -12,11 +12,11 @@ use kvik_log::entries::{EntriesBlock, Entry};
 use kvik_log::header::FileHeader;
 
 use super::desc::{Class, Description, push_field};
+use super::layout::{Identity, Layout};
 use super::parts::{
     BlockRecord, Directory, IndexEntry, MARKER_LEN, RootRecord, SET_ASIDE, TimesRecord, Trailer,
     encode_index_block, encode_marker, encode_root, encode_times_directory, sort_key,
 };
-use super::read::{Identity, Layout};
 use super::stats::{Reach, bounds};
 use super::times::{Batch, encode_times};
 use super::{

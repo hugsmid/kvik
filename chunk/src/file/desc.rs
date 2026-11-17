@@ -204,7 +204,9 @@ impl Description {
             return Err(Bad::body("description inputs"));
         }
         let inputs = raw
-            .chunks_exact(INPUT_LEN)
+            .as_chunks::<INPUT_LEN>()
+            .0
+            .iter()
             .map(|c| Input {
                 kind: c[0],
                 file_id: u64::from_le_bytes(c[4..12].try_into().unwrap_or_default()),

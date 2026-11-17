@@ -6,15 +6,15 @@ use kvik_log::body::encode_end_marker;
 use kvik_log::crc::crc32c;
 use kvik_log::header::{FileHeader, HEADER_LEN};
 
+use super::access::{Index, check_entry, read_bound, read_header, read_tail};
 use super::desc::Description;
 use super::error::{Fault, FileError};
+use super::layout::{Identity, Layout};
 use super::parts::{
     IndexEntry, IndexTrailer, RootRecord, TRAILER_LEN, TimesRecord, Trailer, decode_root,
     decode_times_directory, u64_at,
 };
-use super::read::{
-    CompactedFile, Identity, Index, Layout, check_entry, read_bound, read_header, read_tail,
-};
+use super::read::CompactedFile;
 use super::source::ReadAt;
 use super::{KIND_INDEX, block_type};
 

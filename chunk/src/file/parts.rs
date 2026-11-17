@@ -645,7 +645,7 @@ impl Trailer {
         .filter(|&o| o != 0);
         let mut prev = 0u64;
         if !at.all(|o| {
-            let ok = o > prev && o % 8 == 0;
+            let ok = o > prev && o.is_multiple_of(8);
             prev = o;
             ok
         }) {

@@ -53,10 +53,12 @@
 //! assert_eq!((rows[1].fact.t, rows[1].received_at, rows[1].commit_time), (20, 50, 60));
 //! ```
 
+mod access;
 mod canonical;
 mod desc;
 mod error;
 mod index;
+mod layout;
 mod parts;
 mod read;
 mod source;
@@ -68,8 +70,9 @@ pub use canonical::{CanonicalError, SeriesInfo, check_canonical};
 pub use desc::{Class, Description, Input, Level};
 pub use error::{Fault, FileElement, FileError};
 pub use index::{IndexObject, extract};
+pub use layout::{EntryRow, Identity, Layout, TimedFact};
 pub use parts::{BlockRecord, Directory, IndexEntry, RootRecord, TimesRecord, Trailer};
-pub use read::{CompactedFile, EntryRow, Identity, Layout, TimedFact};
+pub use read::CompactedFile;
 pub use source::ReadAt;
 pub use stats::{Bounds, Reach};
 pub use times::Batch;
