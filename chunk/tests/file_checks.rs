@@ -581,3 +581,46 @@ fn a_chunk_index_object_whose_segment_record_or_offsets_disagree_is_refused() {
     });
     assert_eq!(object_fault(&b), Fault::Mismatch("trailer offsets"));
 }
+
+#[test]
+fn every_position_of_a_run_of_ignored_entries_is_checked_against_its_batch() {
+    let mut c = Content::new(Class::Current);
+    c.batches = batches(1, 1, 1, 4);
+    c.series = vec![Series {
+        series_id: 1,
+        name: Some("e/a".into()),
+        reach: Reach::Point,
+        facts: vec![f64_fact(1, (1, 1), T0, 1.0)],
+        set_aside: vec![],
+    }];
+    c.entries = (2..=3)
+        .map(|q| {
+            (
+                (1, q),
+                kvik_log::entries::Entry::Retirement { id: 1, t_r: T0 },
+            )
+        })
+        .collect();
+    let mut c = c.settle();
+    let mut rows = c.batches.clone();
+    rows[0].last_sequence = 2;
+    rows.push(Batch {
+        first_sequence: 3,
+        last_sequence: 4,
+        received_at: rows[0].received_at + 1,
+        commit_time: rows[0].commit_time + 1,
+        ..rows[0]
+    });
+    c.tweaks.times_rows = Some(rows);
+    let raw = c.write().0;
+    let b = edit(&raw, block_type::ENTRIES, 0, |e| {
+        assert_eq!(u32_at(e, 16), 2, "both entries in one block");
+        let second = 24 + 8 + (u32_at(e, 28) as usize).div_ceil(8) * 8;
+        e[24] = 0x90;
+        e[second] = 0x90;
+    });
+    assert_eq!(
+        fault(open(&b).unwrap().entries()),
+        Fault::Mismatch("entry receive time")
+    );
+}
