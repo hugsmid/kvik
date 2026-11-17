@@ -261,6 +261,26 @@ mod bounded {
     }
 
     #[test]
+    fn no_routing_registry_file_is_made_before_the_log_is_taken_up_to_its_position() {
+        let (env, dir) = store();
+        let mut d = open(&env, dir);
+        let clocks = Clocks::new(env.clock.clone());
+        let now = T0 + 7_200 * S;
+        let ctx = Ctx {
+            watch: None,
+            env: &env,
+            dir: Path::new(dir),
+            clocks: &clocks,
+            now,
+            wall: now,
+            mono: 0,
+        };
+        let through = d.head;
+        assert!(d.routing_registry_file(&ctx, next(through), 0).is_none());
+        assert!(d.routing_registry_file(&ctx, through, 0).is_some());
+    }
+
+    #[test]
     fn a_fact_taken_below_the_window_is_judged_outranked_from_the_log() {
         let (env, dir) = store();
         let d = open(&env, dir);

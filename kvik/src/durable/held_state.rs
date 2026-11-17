@@ -172,6 +172,26 @@ fn a_clean_shutdown_writes_the_registry_file_a_full_read_gives_without_reading_t
     assert_eq!(file, full);
     assert_eq!(file.entries.len(), 5);
     assert!(read < 16 << 10, "{read} bytes of segments read at shutdown");
+    assert_eq!(
+        s.series(SeriesId(1)).unwrap().latest_t,
+        Some(Timestamp(T0 + 1_999 * S))
+    );
+    assert!(!read_whole(&s));
+}
+
+#[test]
+fn after_a_shutdown_that_could_not_read_the_log_series_comes_from_the_store_reader() {
+    let (s, _env, io) = store("held-closed-failing", 2);
+    io.fail.store(true, Ordering::SeqCst);
+    let late = Reading::new(SeriesId(1), Timestamp(T0 + 5_000 * S), Value::F64(1.0));
+    block_on(s.emit(&[late])).unwrap();
+    block_on(s.shutdown()).unwrap();
+    assert!(s.series(SeriesId(1)).is_err());
+    io.fail.store(false, Ordering::SeqCst);
+    assert_eq!(
+        s.series(SeriesId(1)).unwrap().latest_t,
+        Some(Timestamp(T0 + 5_000 * S))
+    );
 }
 
 #[test]
