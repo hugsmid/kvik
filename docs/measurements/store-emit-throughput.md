@@ -148,3 +148,19 @@ call with 20 late readings over the other calls of the run, and per slow-path re
 Worst case, not measured here: the first read of a segment after a start scans it, 64 MiB at the default
 `segment_size`, a part of 4 MiB at a time (`docs/api.md` Configuration, Memory), under the decision lock that every
 `emit` and entry call takes.
+
+## CPU per reading, with the append path
+At the re-check the windows' ordered insert (a binary search over the window for every fact, at about 900 entries a
+series) was found to cost a third more CPU per reading than the unbounded store; a fact that sorts at or after a
+window's last entry is now appended without a search. CPU time (user and system) of the process for 2,000 series ×
+2,000 calls (4 million readings, no late reading), three alternated rounds, the one-minute load under 3 (shared
+machine, so CPU time rather than wall time is the figure); the integration tests pass on every build. **Indicative.**
+
+| Build | CPU seconds, each round | Mean | Per reading | Wall seconds | Resident at the end |
+|---|---|---|---|---|---|
+| before 11.0 (unbounded) | 15.7, 17.2, 17.6 | 16.8 | 4.2 µs | 16.8–18.6 | 2,089 MiB |
+| bounded, before the append path | 21.7, 22.1, 22.9 | 22.2 | 5.6 µs | 18.3–19.1 | 400 MiB |
+| bounded, with the append path | 13.3, 13.6, 14.4 | 13.8 | 3.4 µs | 13.7–14.4 | 400 MiB |
+
+The append path takes 38 % off the bounded store's CPU and puts it 18 % below the unbounded store's; late facts
+still search.
