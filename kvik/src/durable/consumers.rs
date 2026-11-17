@@ -64,16 +64,23 @@ impl Writer {
 
     /// Writes the registry file again after a routing change (Q-130), so that a start knows every consumer from the
     /// registry file and the unsealed segments: up to the last synced mark, which the change's acknowledgement
-    /// moved past it.
+    /// moved past it. From the deliverer's index once it has taken the log that far; the store's own reader
+    /// otherwise.
     fn write_registry_file(&self) -> Result<(), Error> {
         let Some(st) = self.log().as_ref().map(kvik_log::writer::Log::stats) else {
             return Err(Error::Closed);
         };
-        let file = self
-            .reader()
-            .map_err(|e| Error::Internal(e.to_string()))?
-            .with(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
-            .map_err(|e| Error::Internal(e.to_string()))?;
+        let held = self.hub.as_ref().and_then(|h| {
+            h.run_quiet(|d, c| d.routing_registry_file(c, st.mark_synced, st.max_series_id))
+        });
+        let file = match held {
+            Some(f) => f,
+            None => self
+                .reader()
+                .map_err(|e| Error::Internal(e.to_string()))?
+                .with(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
+                .map_err(|e| Error::Internal(e.to_string()))?,
+        };
         let wall = self.env.clock.wall().0;
         kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file).map_err(
             |e| {

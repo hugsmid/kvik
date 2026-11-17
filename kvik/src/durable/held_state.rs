@@ -3,7 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kvik_log::fs::{DirEntry, Fs, FsFile, MemFs, OpenMode};
 
@@ -17,25 +17,42 @@ use crate::{Store, StoreConfig};
 const T0: i64 = 1_767_225_600_000_000_000;
 const S: i64 = 1_000_000_000;
 
-/// A file system that counts the bytes read from log segments.
+/// What reads of log segments do: the bytes read, and whether they fail.
+#[derive(Debug, Default)]
+struct Io {
+    bytes: AtomicU64,
+    fail: AtomicBool,
+}
+
+impl Io {
+    /// The bytes read since the last call.
+    fn take(&self) -> u64 {
+        self.bytes.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// A file system that counts, or fails, the reads of log segments.
 #[derive(Debug)]
 struct Counting {
     inner: Arc<MemFs>,
-    segment_bytes: Arc<AtomicU64>,
+    io: Arc<Io>,
 }
 
 #[derive(Debug)]
 struct CountingFile {
     inner: Box<dyn FsFile>,
     segment: bool,
-    bytes: Arc<AtomicU64>,
+    io: Arc<Io>,
 }
 
 impl FsFile for CountingFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        if self.segment && self.io.fail.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("a failing read"));
+        }
         let n = self.inner.read_at(buf, offset)?;
         if self.segment {
-            self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+            self.io.bytes.fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok(n)
     }
@@ -65,7 +82,7 @@ impl Fs for Counting {
         Ok(Box::new(CountingFile {
             inner: self.inner.open(path, mode)?,
             segment: kvik_log::name::SegmentName::parse(name).is_some(),
-            bytes: self.segment_bytes.clone(),
+            io: self.io.clone(),
         }))
     }
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
@@ -88,13 +105,13 @@ impl Fs for Counting {
     }
 }
 
-/// A store of four gauges with `calls` calls of 50 readings of each, and the count of segment bytes read.
-fn store(dir: &str, calls: i64) -> (Store, Env, Arc<AtomicU64>) {
+/// A store of four gauges with `calls` calls of 50 readings of each, and its segment reads.
+fn store(dir: &str, calls: i64) -> (Store, Env, Arc<Io>) {
     let mut env = Env::test(ManualClock::new(Timestamp(T0 + calls * 50 * S)));
-    let bytes = Arc::new(AtomicU64::new(0));
+    let io = Arc::new(Io::default());
     env.fs = Arc::new(Counting {
         inner: Arc::new(MemFs::new()),
-        segment_bytes: bytes.clone(),
+        io: io.clone(),
     });
     let mut config = StoreConfig::new(dir, "Etc/UTC")
         .create_if_missing(true)
@@ -122,16 +139,16 @@ fn store(dir: &str, calls: i64) -> (Store, Env, Arc<AtomicU64>) {
             .collect();
         block_on(s.emit(&rs)).unwrap();
     }
-    (s, env, bytes)
+    (s, env, io)
 }
 
 #[test]
 fn a_clean_shutdown_writes_the_registry_file_a_full_read_gives_without_reading_the_log() {
     let dir = "held-registry";
-    let (s, env, bytes) = store(dir, 40);
-    bytes.store(0, Ordering::Relaxed);
+    let (s, env, io) = store(dir, 40);
+    io.take();
     block_on(s.shutdown()).unwrap();
-    let read = bytes.load(Ordering::Relaxed);
+    let read = io.take();
     let store_id = kvik_log::store::read_descriptor(&*env.fs, Path::new(dir))
         .unwrap()
         .store_id;
@@ -155,7 +172,7 @@ fn a_clean_shutdown_writes_the_registry_file_a_full_read_gives_without_reading_t
 #[test]
 fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_log() {
     let dir = "held-series";
-    let (s, env, bytes) = store(dir, 40);
+    let (s, env, io) = store(dir, 40);
     block_on(s.retire(SeriesId(3), Timestamp(T0 + 10_000 * S))).unwrap();
     let r = super::reader::DurableReader::open(
         Path::new(dir),
@@ -163,7 +180,7 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
         std::time::Duration::from_secs(60),
     )
     .unwrap();
-    bytes.store(0, Ordering::Relaxed);
+    io.take();
     let mut held = Vec::new();
     for id in 1..=5 {
         held.push((
@@ -173,7 +190,7 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
     }
     let named = s.series("a/s1/w").unwrap();
     let losses = s.losses();
-    let read = bytes.load(Ordering::Relaxed);
+    let read = io.take();
     assert!(read < 16 << 10, "{read} bytes of segments read");
     let full: Vec<_> = (1..=5)
         .map(|id| {
@@ -279,4 +296,229 @@ fn summaries_read_in_two_passes_follow_a_recovery_entry_voiding_what_was_taken()
         );
     }
     assert_eq!((held.latest_t(1), held.latest_t(3)), (Some(500), None));
+}
+
+#[test]
+fn series_returns_the_read_error_while_the_log_cannot_be_read() {
+    let (s, _env, io) = store("held-failing", 2);
+    let before = s.series(SeriesId(1)).unwrap().latest_t;
+    io.fail.store(true, Ordering::SeqCst);
+    let late = Reading::new(SeriesId(1), Timestamp(T0 + 5_000 * S), Value::F64(1.0));
+    block_on(s.emit(&[late])).unwrap();
+    assert!(s.series(SeriesId(1)).is_err());
+    io.fail.store(false, Ordering::SeqCst);
+    let after = s.series(SeriesId(1)).unwrap().latest_t;
+    assert_eq!(
+        (before, after),
+        (
+            Some(Timestamp(T0 + 99 * S)),
+            Some(Timestamp(T0 + 5_000 * S))
+        )
+    );
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_store_whose_load_meets_a_void_in_a_later_part_answers_as_a_full_read() {
+    use kvik_log::content::Item;
+    use kvik_log::entries::{Entry, MarkState, Recovery};
+    use kvik_log::facts::{FactFlags, FactRow, Quality, Value as LogValue};
+    use kvik_log::store::StoreDir;
+    use kvik_log::writer::{Log, LogWriter, SystemClock, WriterConfig};
+
+    let dir = "held-void-parts";
+    let (s, env, io) = store(dir, 3);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let sd = StoreDir::open(env.fs.clone(), Path::new(dir), None).unwrap();
+    let w = LogWriter::open(
+        sd,
+        WriterConfig::default(),
+        Some([2; 16]),
+        std::time::Duration::ZERO,
+        0,
+    )
+    .unwrap();
+    let log = Log::start(w, Arc::new(SystemClock::default())).unwrap();
+    let fact = |series_id: u32, t: i64, future: bool| {
+        Item::Fact(FactRow {
+            series_id,
+            t: T0 + t * S,
+            quality: Quality::Good,
+            flags: FactFlags {
+                future,
+                ..FactFlags::default()
+            },
+            value: LogValue::F64(1),
+            changed_at: None,
+        })
+    };
+    log.submit(vec![fact(1, 500, false)])
+        .unwrap()
+        .wait()
+        .unwrap();
+    let after = log.stats().durable.sequence;
+    // Voided: the latest facts of series 1 and 2.
+    log.submit(vec![fact(1, 9_000, false), fact(2, 8_000, false)])
+        .unwrap()
+        .wait()
+        .unwrap();
+    let r = Recovery {
+        after,
+        stamp: None,
+        boot_id: [0; 16],
+        tail_bytes: 0,
+        readable_commits: 0,
+        mark_state: MarkState::Readable,
+        id_floor: 0,
+        consumers: Vec::new(),
+    };
+    log.submit(vec![Item::from(Entry::Recovery(r))])
+        .unwrap()
+        .wait()
+        .unwrap();
+    log.submit(vec![fact(1, 700, true), fact(3, 600, false)])
+        .unwrap()
+        .wait()
+        .unwrap();
+    log.shutdown().unwrap();
+    // Parts of two items: the void arrives after the batches it removes were taken.
+    super::deliver::LOAD_PARTS
+        .lock()
+        .unwrap()
+        .push((Path::new(dir).to_path_buf(), 2));
+    let config = StoreConfig::new(dir, "Etc/UTC").env(env.clone());
+    let s = block_on(Store::open(config)).unwrap();
+    let r = super::reader::DurableReader::open(
+        Path::new(dir),
+        &env,
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        for id in 1..=4 {
+            let held = s.series(SeriesId(id)).map_err(|e| e.to_string());
+            let full = r
+                .with(|i, _| i.series(&SeriesId(id).into()))
+                .map_err(|e| e.to_string());
+            assert_eq!(held, full, "series {id}");
+            let latest = s.series_stats(SeriesId(id)).map(|st| st.latest_t);
+            assert_eq!(latest, full.ok().map(|i| i.latest_t), "series {id}");
+        }
+    }
+    let one = s.series(SeriesId(1)).unwrap();
+    assert_eq!(one.latest_t, Some(Timestamp(T0 + 700 * S)));
+    assert_eq!(one.lateness_reference, Some(Timestamp(T0 + 500 * S)));
+    assert_eq!(s.losses(), r.losses().unwrap());
+    io.take();
+    block_on(s.emit(&[Reading::new(
+        SeriesId(2),
+        Timestamp(T0 + 650 * S),
+        Value::F64(2.0),
+    )]))
+    .unwrap();
+    assert_eq!(
+        s.series(SeriesId(2)).unwrap().latest_t,
+        Some(Timestamp(T0 + 650 * S))
+    );
+    assert!(io.take() < 16 << 10, "the summaries are rebuilt once");
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_routing_change_writes_the_registry_file_a_full_read_gives_without_reading_the_log() {
+    use crate::consume::{Funnel, Select, Start};
+    let dir = "held-route";
+    let (s, env, io) = store(dir, 40);
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    io.take();
+    block_on(c.route(Funnel::facts(Select::All))).unwrap();
+    let read = io.take();
+    assert!(read < 16 << 10, "{read} bytes of segments read by a route");
+    let store_id = kvik_log::store::read_descriptor(&*env.fs, Path::new(dir))
+        .unwrap()
+        .store_id;
+    let (_, file) = kvik_log::registry::read_latest(&*env.fs, Path::new(dir), &store_id)
+        .unwrap()
+        .unwrap();
+    let r = super::reader::DurableReader::open(
+        Path::new(dir),
+        &env,
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    let full = r
+        .with(
+            |i, _| Ok(i.registry_file(log_pos(file.generation, file.through), file.max_series_id)),
+        )
+        .unwrap();
+    assert_eq!(file, full);
+    assert!(
+        file.entries
+            .iter()
+            .any(|(_, _, e)| matches!(e, kvik_log::entries::Entry::Routing(_)))
+    );
+    drop(c);
+    block_on(s.shutdown()).unwrap();
+}
+
+fn log_pos(generation: u32, sequence: u64) -> kvik_log::writer::Position {
+    kvik_log::writer::Position {
+        generation,
+        sequence,
+    }
+}
+
+#[test]
+fn losses_after_a_shutdown_are_those_before_it() {
+    let dir = "held-losses";
+    let mut env = Env::test(ManualClock::new(Timestamp(T0 + 1_000 * S)));
+    let mem = Arc::new(MemFs::new());
+    let io = Arc::new(Io::default());
+    env.fs = Arc::new(Counting {
+        inner: mem.clone(),
+        io: io.clone(),
+    });
+    let config = || {
+        StoreConfig::new(dir, "Etc/UTC")
+            .create_if_missing(true)
+            .env(env.clone())
+    };
+    let s = block_on(Store::open(config())).unwrap();
+    let spec = SeriesSpec::new(
+        "a/b/v",
+        Kind::Gauge {
+            value: ValueType::F64,
+        },
+        "W",
+    );
+    block_on(s.define_series(spec)).unwrap();
+    block_on(s.define_series(SeriesSpec::new("a/b/lost", Kind::Text, ""))).unwrap();
+    for k in 0..3 {
+        let r = Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(1.0));
+        block_on(s.emit(&[r])).unwrap();
+    }
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    // Synced bytes of the second definition's batch lost on the disk: a lost range in the manifest.
+    let log_dir = Path::new(dir).join(kvik_log::store::LOG_DIR);
+    let (path, at) = mem
+        .read_dir(&log_dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| log_dir.join(e.name))
+        .find_map(|p| {
+            let b = mem.read(&p)?;
+            let at = b.windows(8).position(|x| x == b"a/b/lost")?;
+            Some((p, at))
+        })
+        .unwrap();
+    mem.poke(&path, at, b"X");
+    let s = block_on(Store::open(config())).unwrap();
+    let before = s.losses();
+    assert!(before.iter().any(|l| l.file_id.is_some()), "{before:?}");
+    block_on(s.shutdown()).unwrap();
+    io.take();
+    assert_eq!(s.losses(), before);
+    assert_eq!(io.take(), 0);
 }

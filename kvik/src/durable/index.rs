@@ -768,4 +768,47 @@ mod tests {
             (Some(99), Some(40))
         );
     }
+
+    #[test]
+    fn a_later_lower_void_bounds_the_facts_an_earlier_higher_one_kept() {
+        let void = |above| ReadEvent::Void {
+            above: LogPos {
+                generation: 0,
+                sequence: above,
+            },
+            cause: VoidCause::Rewritten,
+        };
+        // Positions 4 and 5 survive the void above 5 and not the later one above 3.
+        let stream = vec![
+            batch(1, vec![fact_of(1, 10, false), fact_of(1, 20, false)]),
+            batch(3, vec![fact_of(2, 30, false)]),
+            batch(4, vec![fact_of(1, 40, false), fact_of(2, 50, false)]),
+            batch(6, vec![fact_of(1, 60, false)]),
+            void(5),
+            batch(6, vec![fact_of(3, 1, false)]),
+            void(3),
+            batch(4, vec![fact_of(3, 2, false)]),
+        ];
+        let mut full = Index::default();
+        full.apply(&stream);
+        let mut voids = Vec::new();
+        voids_of(&stream, &mut voids);
+        let mut pass = SummaryPass::new(voids);
+        pass.apply(&stream);
+        let mut held = Index::without_facts();
+        held.apply(&stream);
+        held.set_summary(pass.summary);
+        for id in 1..=3 {
+            assert_eq!(held.latest_t(id), full.latest_t(id), "series {id}");
+            assert_eq!(
+                held.lateness_reference(id),
+                full.lateness_reference(id),
+                "series {id}"
+            );
+        }
+        assert_eq!(
+            (held.latest_t(1), held.latest_t(2), held.latest_t(3)),
+            (Some(20), Some(30), Some(2))
+        );
+    }
 }

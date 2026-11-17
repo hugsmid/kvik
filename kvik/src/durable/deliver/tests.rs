@@ -235,6 +235,32 @@ mod bounded {
     }
 
     #[test]
+    fn no_registry_file_is_made_while_a_batch_up_to_its_position_waits() {
+        let (env, dir) = store();
+        let mut d = open(&env, dir);
+        let through = d.head;
+        assert!(d.registry_file_through(through, through, 0).is_some());
+        let waiting = |last: LogPos| ReadBatch {
+            file_id: 1,
+            offset: 0,
+            first: last,
+            last,
+            commit_time: 0,
+            content: kvik_log::content::BatchContent {
+                first_sequence: last.sequence,
+                received_at: 0,
+                items: Vec::new(),
+            },
+        };
+        d.pending.push_back(waiting(through));
+        assert!(d.registry_file_through(through, through, 0).is_none());
+        d.pending.clear();
+        d.pending.push_back(waiting(next(through)));
+        assert!(d.registry_file_through(through, through, 0).is_some());
+        assert!(d.registry_file_through(next(through), through, 0).is_none());
+    }
+
+    #[test]
     fn a_fact_taken_below_the_window_is_judged_outranked_from_the_log() {
         let (env, dir) = store();
         let d = open(&env, dir);
@@ -350,5 +376,82 @@ mod bounded {
         assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
         assert_eq!((got[0].1, got[0].2), (1, Timestamp(T0 + 10 * S)));
         block_on(s.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn a_condition_a_void_brings_back_into_force_is_evaluated_at_the_next_poll() {
+        use crate::config::LogConfig;
+        use crate::consume::{Condition, ConditionState, DeliveryKind, Funnel, Select, Start};
+        use crate::durable::{Emitted, Writer, tests::wait};
+        use crate::types::Intent;
+
+        let mut env = Env::test(ManualClock::new(Timestamp(T0 + 100 * S)));
+        env.fs = Arc::new(kvik_log::fs::MemFs::new());
+        let log = LogConfig {
+            min_sync_interval: std::time::Duration::ZERO,
+            ..LogConfig::default()
+        };
+        let config = StoreConfig::new("void-runners", "Etc/UTC")
+            .create_if_missing(true)
+            .env(env)
+            .log(log);
+        let w = Writer::open(&config).unwrap();
+        let g = w.define(&gauge("a/b/g")).unwrap();
+        let emit = |secs: i64, v: f64| {
+            let r = Reading::new(g, Timestamp(T0 + secs * S), Value::F64(v));
+            match w.emit(&[r], Intent::Normal, true) {
+                Ok(Emitted::Queued(q)) => {
+                    wait(q).unwrap();
+                }
+                Ok(Emitted::Ready(_)) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        };
+        let drain = || {
+            let mut out = Vec::new();
+            while let Some(d) = w.poll_delivery("c", None).unwrap() {
+                w.confirm("c", d.id).unwrap();
+                out.push(d.kind);
+            }
+            out
+        };
+        w.take_consumer("c", Start::Now, &Select::None).unwrap();
+        w.route("c", &Funnel::facts(Select::Ids(vec![g]))).unwrap();
+        let cond = w
+            .route(
+                "c",
+                &Funnel {
+                    series: Select::Ids(vec![g]),
+                    operator: None,
+                    condition: Some(Condition::above(10.0)),
+                },
+            )
+            .unwrap();
+        w.unroute("c", cond).unwrap();
+        emit(0, 1.0);
+        drain();
+        // The removal is voided: the condition is in force again, without a routing entry being taken.
+        let hub = w.hub.clone().unwrap();
+        hub.run_quiet(|d, _| {
+            let removal = d
+                .entries
+                .iter()
+                .rev()
+                .find(|(_, e)| matches!(e, Entry::Routing(_)))
+                .map(|(p, _)| *p)
+                .unwrap();
+            d.void(before(removal));
+            assert_eq!(d.view().funnels("c").count(), 2);
+        });
+        emit(1, 20.0);
+        let triggers: Vec<_> = drain()
+            .into_iter()
+            .filter_map(|k| match k {
+                DeliveryKind::Trigger(t) => Some((t.funnel, t.state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(triggers, vec![(cond, ConditionState::True)]);
+        w.shutdown().unwrap();
     }
 }

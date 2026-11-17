@@ -58,6 +58,26 @@ use crate::health::{ConsumerStats, DeliveryStats};
 /// Items the open takes from the log at a time.
 const LOAD_PART: usize = 1 << 16;
 
+/// Part sizes tests set for the store in a directory, in place of [`LOAD_PART`].
+#[cfg(test)]
+pub(crate) static LOAD_PARTS: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Items the deliverer's reads of the whole log take at a time.
+fn load_part(dir: &Path) -> usize {
+    #[cfg(test)]
+    if let Some((_, p)) = LOAD_PARTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(d, _)| d == dir)
+    {
+        return *p;
+    }
+    let _ = dir;
+    LOAD_PART
+}
+
 /// How often a consumer's cursor file is written at most, and the timer cadence (`spec.md` §4 Consumer state, §6
 /// Cadence).
 pub(crate) const SECOND: i64 = 1_000_000_000;
@@ -260,6 +280,8 @@ pub(crate) struct Deliverer {
     loading: bool,
     /// The lost ranges the reader held when it was closed.
     closed_lost: Vec<kvik_log::manifest::LostRange>,
+    /// The index held every batch up to the mark the clean shutdown synced when the reader was closed.
+    closed_complete: bool,
     /// Records taken batches put in `items`.
     #[cfg(test)]
     records: u64,
@@ -323,6 +345,7 @@ impl Deliverer {
             stats: DeliveryStats::default(),
             loading: true,
             closed_lost: Vec::new(),
+            closed_complete: false,
             #[cfg(test)]
             records: 0,
         };
@@ -342,7 +365,7 @@ impl Deliverer {
                 .reader
                 .get_mut()
                 .as_mut()
-                .map(|r| r.refresh_some(LOAD_PART))
+                .map(|r| r.refresh_some(load_part(dir)))
                 .transpose()
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let Some((u, more)) = read else { break };
@@ -353,8 +376,6 @@ impl Deliverer {
             }
         }
         d.loading = false;
-        // No record is kept while loading: a consumer behind reads its backlog from the log ([`Deliverer::restore_items`]).
-        d.items_from = next(d.head);
         // Lost ranges not described by a recovery entry are reset points: `forget_above` the position before, id
         // its last position (`spec.md` §4 Resync).
         let lost: Vec<_> = d
