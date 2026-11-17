@@ -560,3 +560,70 @@ pub fn check_round_trip(c: &Content) -> Vec<u8> {
     assert_eq!(o.index().unwrap(), file.index().unwrap());
     bytes
 }
+
+/// A pseudo-random `f64` bit pattern that no decimal or XOR encoding shortens, so value columns stay plain.
+pub fn noise(i: u64, seed: u64) -> u64 {
+    let mut x = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed;
+    x ^= x >> 31;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (x ^ (x >> 29)) & !(0x7FF << 52) | (0x3FF << 52)
+}
+
+/// A current file of two generations of 40 batches each: series 1 and 2 with the same shape (plain values from
+/// `seed`), a decimal series 3, and an alias entry in each generation's first three batches.
+pub fn sample(seed: u64) -> Content {
+    let mut c = Content::new(Class::Current);
+    c.batches = batches(1, 1, 40, 4);
+    c.batches.extend(batches(2, 1, 40, 4));
+    let mut s = [1u32, 2, 3].map(|id| Series {
+        series_id: id,
+        name: Some(format!("plant/{id}")),
+        reach: Reach::Point,
+        facts: Vec::new(),
+        set_aside: Vec::new(),
+    });
+    for (n, b) in c.batches.clone().iter().enumerate() {
+        let g = b.generation;
+        let q = b.first_sequence;
+        let t = T0 + n as i64 * SECOND;
+        s[0].facts.push(f64_fact(
+            1,
+            (g, q),
+            t,
+            f64::from_bits(noise(n as u64, seed)),
+        ));
+        s[1].facts.push(f64_fact(
+            2,
+            (g, q + 1),
+            t,
+            f64::from_bits(noise(n as u64, 77)),
+        ));
+        s[2].facts.push(decimal(3, (g, q + 2), t, n as i64 * 3, 2));
+        if n % 40 < 3 {
+            c.entries.push((
+                (g, q + 3),
+                Entry::Alias {
+                    id: 1,
+                    name: format!("alias/{}", n % 10),
+                },
+            ));
+        }
+    }
+    c.series = s.into_iter().collect();
+    c.settle()
+}
+
+/// The blocks of a file in order, from the description to the trailer: offset, type and length with padding.
+pub fn blocks(bytes: &[u8]) -> Vec<(usize, u8, usize)> {
+    let end = bytes.len() - 16;
+    let mut out = Vec::new();
+    let mut at = 64;
+    while at < end {
+        let body_len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let len = 16 + body_len.div_ceil(8) * 8;
+        out.push((at, bytes[at], len));
+        at += len;
+    }
+    assert_eq!(at, end);
+    out
+}

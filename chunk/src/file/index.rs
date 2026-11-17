@@ -112,6 +112,15 @@ pub struct IndexObject<S: ReadAt> {
     layout: Layout,
 }
 
+impl<S: ReadAt> std::fmt::Debug for IndexObject<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexObject")
+            .field("layout", &self.layout)
+            .field("segment_len", &self.segment_len)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: ReadAt> IndexObject<S> {
     /// Opens a chunk index object whose segment has identity `id`. Its `file_crc32c` is checked at every open (the
     /// file is small), then its blocks in order, each equal to what the segment's trailer binds.
