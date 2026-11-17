@@ -884,7 +884,8 @@ the implementation's:
 - The name is split at `/` (`name_segments`), and each segment escaped as above; a segment holds no `/`, so no
   escaped segment holds `%2F`. Until Q-670 is enforced at definition and alias, `export_partitioned` refuses a series
   whose name has fewer or more than three segments, or an empty one, with `UnsupportedSeries` before it reads a fact
-  or calls `open`, rather than filing it elsewhere (`a_name_without_exactly_three_non_empty_segments_has_no_partition_folder`,
+  or calls `open`, rather than filing it elsewhere
+  (`a_name_without_exactly_three_non_empty_segments_has_no_partition_folder`,
   `a_name_of_other_than_three_segments_or_with_an_empty_one_is_refused`,
   `a_partitioned_export_refuses_a_name_without_three_non_empty_segments_and_opens_nothing_on_both_backends`).
 - `area`, `device` and `metric` join `site`, `series` and `month` as names no file column may take (`docs/export.md`
@@ -1393,8 +1394,9 @@ bytes of escaped segments and the longest partial `as_of` file name, 95 bytes), 
 it only while the caller's own prefix is at most 64 bytes. (b) A series renamed in
 March is filed under its new name from March on, and so is January when it is exported again, so one series' months
 sit in two folders.
-**Now.** The layout is as settled: the folders are the escaped segments of the display name at export time; `kvik.series_id` in every
-file ties a renamed series' folders together; a path the caller cannot create fails in `open` (`ExportError::Open`).
+**Now.** The layout is as settled: the folders are the escaped segments of the display name at export time;
+`kvik.series_id` in every file ties a renamed series' folders together; a path the caller cannot create fails in
+`open` (`ExportError::Open`).
 **Needed.** (a) Whether a long name keeps its full segment (as now), or a shorter form takes its place, such as a
 truncated segment with a hash, which is not reversible. (b) Whether the path should carry the series id as well
 or instead of the name, which a rename does not change but a reader cannot filter by name.

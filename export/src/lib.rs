@@ -5,8 +5,8 @@
 //! at most the open row group ([`ExportOptions::row_group_rows`]) plus one batch ([`ExportOptions::batch_rows`]),
 //! whatever the number of facts; the bound holds end to end once `Reader::facts` streams (today both backends
 //! gather the range first). [`export_partitioned`] writes one file per UTC month in the layout
-//! `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet`. [`read_rows`] reads a file back into
-//! [`ExportRow`]s.
+//! `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/<view>.parquet`. [`read_rows`] reads a file back
+//! into [`ExportRow`]s.
 //!
 //! ```
 //! use kvik_export::{ExportOptions, SeriesSchema, ValueKind, KindName, TimingName, export_rows, read_rows};

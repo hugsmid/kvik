@@ -37,8 +37,8 @@ fn kept(c: u8) -> bool {
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-/// One segment of a series name as one path segment: bytes of `a`–`z`, `0`–`9`, `-` and `_` kept, every other byte as `%XX` in
-/// upper-case hex. Injective even on file systems that fold case, and reversed by [`unescape_segment`].
+/// One segment of a series name as one path segment: bytes of `a`–`z`, `0`–`9`, `-` and `_` kept, every other byte
+/// as `%XX` in upper-case hex. Injective even on file systems that fold case, and reversed by [`unescape_segment`].
 pub fn escape_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for &c in name.as_bytes() {

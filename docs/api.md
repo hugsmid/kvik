@@ -502,7 +502,8 @@ the `kvik-sink` crate. The object keys, the uploaded forms, the claim marker and
 A Parquet export of one series' facts lives in the crate `kvik-export`, outside the core crate:
 `export_series(&reader, id, &ExportOptions, writer)` for one file, `export_partitioned(&reader, id, &ExportOptions,
 open)` for one file per UTC month under `site=<site>/area=<s1>/device=<s2>/metric=<s3>/month=<YYYY-MM>/`, the
-series name's three segments (Q-670); both write `reader.store_id()` into every file. Its schema is export version 1 ([`export.md`](export.md), Q-190 to Q-197).
+series name's three segments (Q-670); both write `reader.store_id()` into every file. Its schema is export version
+1 ([`export.md`](export.md), Q-190 to Q-197).
 
 ## Environment seams (accepted at gate 3.3)
 ```rust
