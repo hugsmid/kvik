@@ -239,8 +239,8 @@ impl StoreDir {
         let top = names(&*fs, dir)?;
         if top.iter().any(|n| n == STORE) {
             let lock = take_lock(&*fs, dir)?;
-            // A creation cut short between its rename and the directory sync may have left `STORE` in the page
-            // cache only (`format.md` A.12 Open).
+            // A creation or a rebuild cut short between its rename and the directory sync may have left `STORE` or
+            // `MANIFEST` in the page cache only (`format.md` A.12 Open, Q-871).
             fs.sync_dir(dir)?;
             let descriptor = StoreDescriptor::decode(&read_all(&*fs, &dir.join(STORE))?)?;
             if top.iter().any(|n| n == MANIFEST_NEW) {
