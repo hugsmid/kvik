@@ -3,23 +3,27 @@
 use super::*;
 
 impl Writer {
+    /// `f` on the deliverer once it has taken what is acknowledged and its summaries are exact.
+    pub(super) fn held<R>(&self, f: impl FnOnce(&deliver::Deliverer) -> R) -> Option<R> {
+        self.hub.as_ref()?.run_quiet(|d, c| d.held(c).then(|| f(d)))
+    }
+
     pub(crate) fn losses(&self) -> Vec<LossReport> {
         self.loss_reports().0
     }
 
     /// Every loss report this process holds, and why the files could not be read, if they could not: the reports
     /// the files hold, then those of the start that could not record them, then those of this process's reads. The
-    /// files' reports come from the loss watch after it caught up (Q-926, Q-927); without one, from the store's own
-    /// reader.
+    /// files' reports come from the loss watch after it caught up (Q-926, Q-927).
     pub(crate) fn loss_reports(&self) -> (Vec<LossReport>, Option<String>) {
         let acked = lock(&self.acknowledged).clone();
-        let watched = lock(&self.watch)
-            .as_mut()
-            .map(|w| match w.catch_up(&self.latch) {
+        let read = {
+            let mut w = lock(&self.watch);
+            match w.catch_up(&self.latch) {
                 Ok(()) => Ok(w.reports()),
                 Err(e) => Err(reader::query_error(&self.dir, e)),
-            });
-        let read = watched.unwrap_or_else(|| self.reader().and_then(|r| r.losses()));
+            }
+        };
         let (read, error) = match read {
             Ok(v) => (v, None),
             Err(e) => (Vec::new(), Some(e.to_string())),
@@ -72,6 +76,27 @@ impl Writer {
         if let Some(error) = error {
             reasons.push(Reason::LossesUnknown { error });
         }
+        // Q-750, Q-755, Q-929: decisions made this run without data that could not be read, and damaged regions no
+        // lost range and no report of the process stands for, from their own counts (not `duplicates_unchecked`,
+        // which a fact on no local tier also raises).
+        let (readings, start_regions) = {
+            let c = lock(&self.counters);
+            (c.unchecked_readings, c.start_regions)
+        };
+        let (delivery, consumer_regions) = self
+            .hub
+            .as_ref()
+            .map(|h| h.run_quiet(|d, _| (d.delivery_stats(), d.regions_unreported())))
+            .unwrap_or_default();
+        let regions = start_regions + consumer_regions;
+        if readings + delivery.unchecked + delivery.evaluations_unchecked + regions > 0 {
+            reasons.push(Reason::LocalDataUnreadable {
+                readings,
+                deliveries: delivery.unchecked,
+                evaluations: delivery.evaluations_unchecked,
+                regions,
+            });
+        }
         match (self.fault(), reasons.is_empty()) {
             (Some(f), _) => Health::ReadOnly {
                 cause: fault_out(&f),
@@ -116,6 +141,8 @@ impl Writer {
                     p99: pct(99),
                     max: c.max_latency,
                 },
+                slow_path: c.slow_path,
+                start_whole: c.start_whole,
             },
             log: LogStats {
                 durable: ls.as_ref().map_or(Position::ORIGIN, |s| pos(s.durable)),
@@ -129,6 +156,8 @@ impl Writer {
                 open_file_id: ls.as_ref().and_then(|s| s.open_file_id),
                 sealed_segments: ls.as_ref().map_or(0, |s| s.sealed_segments),
                 bytes: ls.as_ref().map_or(0, |s| s.bytes),
+                sync_interval: ls.as_ref().map_or(Duration::ZERO, |s| s.sync_interval),
+                sync_time: ls.as_ref().and_then(|s| s.sync_time),
                 manifest_rebuilds: 0,
                 loss_identities_rebuilt: 0,
             },
@@ -149,11 +178,16 @@ impl Writer {
             .get(&id.0)
             .cloned()
             .unwrap_or_default();
-        if let Ok(r) = self.reader() {
-            let _ = r.with(|i, _| {
-                st.latest_t = i.latest_t(id.0).map(Timestamp);
-                Ok(())
-            });
+        match self.held(|d| d.latest_t(id.0)) {
+            Some(t) => st.latest_t = t.map(Timestamp),
+            None => {
+                if let Ok(r) = self.reader() {
+                    let _ = r.with(|i, _| {
+                        st.latest_t = i.latest_t(id.0).map(Timestamp);
+                        Ok(())
+                    });
+                }
+            }
         }
         Some(st)
     }

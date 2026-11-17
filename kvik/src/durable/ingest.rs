@@ -1,71 +1,36 @@
 //! Deciding a call's outcomes before it is committed (spec §2.2 to §2.5): refusals, stamping and flags, values
 //! recorded without one, the duplicate rule and outranked facts. The reference model makes the same decisions
-//! inside its commit, which is not callable on its own; `tests/durable_differential.rs` holds the two backends to
-//! the same outcomes and facts.
+//! inside its commit, which is not callable on its own; this follows it rule by rule, except where the
+//! specification has moved on (the first clause of `late` uses the lateness reference, spec §2.2), and the
+//! differential test in `tests/durable_differential.rs` holds the two backends to the same outcomes.
 //!
 //! Decisions are made in the order calls are queued in the log, against every fact already queued, so a call
-//! sees the calls before it whether or not their sync has returned yet.
+//! sees the calls before it whether or not their sync has returned yet. The facts are found as [`History`] says: in
+//! memory, or for a key outside the recent window and the revised-key index, by the slow path through
+//! [`LocalFacts`], once per call for all such keys.
+//!
+//! A range found lost while the store is open is taken in by [`Decider::settle`] (Q-921 to Q-923); the durable
+//! fixes' decider, which keeps every fact with its position, is the oracle the differential test holds this one to.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 
 use kvik_log::content::Item;
 use kvik_log::entries::{
     IntervalLength as LogInterval, Kind as LogKind, Timing as LogTiming, Versioning,
 };
 use kvik_log::facts::{
-    FactFlags as LogFlags, FactRow, MAX_TEXT_LEN, Quality as LogQuality, Value as LogValue,
-    ValueType as LogType,
+    FactFlags as LogFlags, FactRow, MAX_TEXT_LEN, Value as LogValue, ValueType as LogType,
 };
+
 use kvik_log::writer::Position as LogPos;
 
-use super::index::{Index, quality_in};
-use super::registry::Registry;
+use crate::durable::history::{Facts, History, Key, Known, Reference, span_of};
+use crate::durable::index::{Index, quality_in};
+use crate::durable::keys::LocalFacts;
+use crate::durable::loss::Fresh;
+use crate::durable::registry::Registry;
 use crate::error::Refusal;
 use crate::types::{Intent, Reading, TimeSource, Value};
-
-/// Where a recorded fact is in the log.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum At {
-    /// A fact of the kept log read at the start, at its position.
-    Kept(LogPos),
-    /// The fact with this index among its call's items.
-    Item(u64),
-}
-
-/// A recorded fact as the duplicate rule compares it: value, adapter-supplied quality and `changed_at`.
-#[derive(Clone, Debug, PartialEq)]
-struct Known {
-    value: LogValue,
-    supplied: LogQuality,
-    changed_at: Option<u64>,
-    /// The call that queued it in this process; 0 for a fact of the kept log read at the start.
-    call: u64,
-    at: At,
-    /// Flagged neither `future` nor `unsynced_clock`: it counts for the lateness reference (spec §2.2).
-    reference: bool,
-}
-
-impl Known {
-    fn of(r: &FactRow, call: u64, at: At) -> Self {
-        Known {
-            value: r.value.clone(),
-            supplied: r.quality,
-            changed_at: r.changed_at,
-            call,
-            at,
-            reference: !r.flags.future && !r.flags.unsynced_clock,
-        }
-    }
-
-    /// Identity (spec §2.4): values compare bitwise, a value recorded without one as "no value".
-    fn identical(&self, value: &LogValue, supplied: LogQuality) -> bool {
-        self.supplied == supplied
-            && match (&self.value, value) {
-                (LogValue::Absent { .. }, LogValue::Absent { .. }) => true,
-                (a, b) => a == b,
-            }
-    }
-}
 
 /// The clock at decision time.
 #[derive(Clone, Copy, Debug)]
@@ -93,7 +58,20 @@ pub(crate) enum Decision {
         outranked: bool,
         /// A supplied `Absent` (spec §2.5 `absent_supplied`).
         absent: bool,
+        /// Flagged `late` (spec §2.2).
+        late: bool,
+        /// Flagged `future` (spec §2.2).
+        future: bool,
+        /// Recorded although the duplicate check could not run (spec §2.4 `duplicates_unchecked`, Q-750).
+        unchecked: bool,
     },
+}
+
+/// A recorded fact as [`Decider::apply`] takes it into the state.
+#[derive(Clone, Debug)]
+struct Note {
+    key: Key,
+    known: Known,
 }
 
 /// A call's decisions and the facts it commits.
@@ -104,21 +82,39 @@ pub(crate) struct Plan {
     /// The latest earlier call holding a fact a duplicate matched, if any: the duplicate is final only once that
     /// call is acknowledged (Q-123 (b)).
     pub(crate) depends: Option<u64>,
-    /// The call this plan is for.
-    call: u64,
+    /// Readings decided by the slow path (spec §2.4; roadmap 11.0).
+    pub(crate) slow: u64,
+    /// The plan's facts as the state takes them, so that `items` can be moved into the log.
+    notes: Vec<Note>,
+    /// The complete history the slow path read of each key it read whole.
+    whole: HashMap<Key, Vec<Known>>,
+    /// Lateness references a read of the log settled, in the order settled (Q-924).
+    references: Vec<(u32, Reference)>,
+    /// Readings whose lateness reference could not be read: taken as not late (Q-925).
+    pub(crate) reference_unread: u64,
 }
 
-/// The state decisions are made against: the registry and the history of every key, including calls queued but
-/// not yet acknowledged, less the facts of ranges found lost while the store is open (Q-200).
+/// Q-925, proposal (a): a reading whose lateness reference cannot be read (the read incomplete and no reference fact
+/// found) is not late by the reference's clause. Off, rule (b): the old reference, `upper`, stands and it is late.
+/// Either way it is counted in `LocalDataUnreadable { readings }`.
+const UNREAD_REFERENCE_IS_NOT_LATE: bool = true;
+
+/// The state decisions are made against: the registry and [`History`], including calls queued but not yet
+/// acknowledged.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Decider {
     pub(crate) registry: Registry,
-    history: HashMap<(u32, i64), Vec<Known>>,
-    versions: HashMap<(u32, i64), u64>,
-    reference: HashMap<u32, i64>,
-    /// The first and last positions of each acknowledged call of this process.
-    placed: BTreeMap<u64, (LogPos, LogPos)>,
+    pub(crate) history: History,
+    /// Ranges found lost while the store is open, merged where they overlap or touch (Q-923).
     lost: Vec<(LogPos, LogPos)>,
+}
+
+/// What a read of a series' reference facts found (Q-924).
+struct ReferenceRead {
+    late: bool,
+    state: Reference,
+    /// Incomplete, with no reference fact found (Q-925).
+    unread: bool,
 }
 
 fn reach(observed: bool, interval: Option<&LogInterval>, t: i64) -> i64 {
@@ -138,105 +134,177 @@ fn on_phase(interval: Option<&LogInterval>, t: i64) -> bool {
 }
 
 impl Decider {
-    /// The state of the kept log.
-    pub(crate) fn from_index(index: &Index) -> Self {
+    /// The state of the kept log in a full index (a start whose read of the log was voided part-way).
+    pub(crate) fn from_index(index: &Index, budget: usize) -> Self {
         let mut d = Decider {
             registry: index.registry().clone(),
-            ..Decider::default()
+            history: History::with_budget(budget),
+            lost: Vec::new(),
         };
-        for id in index.fact_series() {
-            for f in index.series_facts(id) {
-                d.note(&f.row, 0, At::Kept(f.position));
-            }
+        let mut facts: Vec<_> = index
+            .fact_series()
+            .flat_map(|id| index.series_facts(id))
+            .collect();
+        facts.sort_by_key(|f| f.position);
+        for f in facts {
+            let id = f.row.series_id;
+            let span = span_of(&d.registry, id);
+            d.note_kept(&f.row, || span);
         }
         d
     }
 
-    fn note(&mut self, r: &FactRow, call: u64, at: At) {
-        let key = (r.series_id, r.t);
+    /// An empty state whose windows and revised-key index hold at most `budget` bytes.
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Decider {
+            registry: Registry::default(),
+            history: History::with_budget(budget),
+            lost: Vec::new(),
+        }
+    }
+
+    /// Takes in a fact of the kept log, read in log order at the start, of a series whose window span `span` gives.
+    pub(crate) fn note_kept(&mut self, r: &FactRow, span: impl FnOnce() -> i64) {
         self.history
-            .entry(key)
-            .or_default()
-            .push(Known::of(r, call, at));
-        if let Some(c) = r.changed_at {
-            let v = self.versions.entry(key).or_insert(c);
-            *v = (*v).max(c);
-        }
-        if !r.flags.future && !r.flags.unsynced_clock {
-            let v = self.reference.entry(r.series_id).or_insert(r.t);
-            *v = (*v).max(r.t);
-        }
+            .note((r.series_id, r.t), Known::of(r, 0), span, None);
     }
 
-    /// Takes a planned call's facts into the state, once it is queued.
-    pub(crate) fn apply(&mut self, plan: &Plan) {
-        for (i, item) in plan.items.iter().enumerate() {
-            if let Item::Fact(r) = item {
-                self.note(r, plan.call, At::Item(i as u64));
-            }
-        }
+    /// Notes that every call below `call` is acknowledged.
+    #[cfg(test)]
+    pub(crate) fn readable_below(&mut self, call: u64) {
+        self.history.readable_below(call);
     }
 
-    /// Notes the positions the log gave an acknowledged call.
-    pub(crate) fn placed(&mut self, call: u64, first: LogPos, last: LogPos) {
-        self.placed.insert(call, (first, last));
-        if self.lost.iter().any(|&(a, b)| first <= b && a <= last) {
-            self.forget_lost();
-        }
-    }
-
-    /// Takes in a range found lost while the store is open: its facts leave every key's history, so a replay of
-    /// one is recorded again (spec §3 Recovery rule 2, Q-200).
-    pub(crate) fn lose(&mut self, first: LogPos, last: LogPos) {
-        self.lost.push((first, last));
-        self.forget_lost();
-    }
-
-    fn position(&self, k: &Known) -> Option<LogPos> {
-        match k.at {
-            At::Kept(p) => Some(p),
-            At::Item(i) => self.placed.get(&k.call).map(|(f, _)| LogPos {
-                generation: f.generation,
-                sequence: f.sequence + i,
-            }),
-        }
-    }
-
-    fn forget_lost(&mut self) {
-        let mut history = std::mem::take(&mut self.history);
-        let mut changed = Vec::new();
-        for (key, ks) in &mut history {
-            let n = ks.len();
-            ks.retain(|k| {
-                !self
-                    .position(k)
-                    .is_some_and(|p| self.lost.iter().any(|&(a, b)| a <= p && p <= b))
-            });
-            if ks.len() != n {
-                changed.push(*key);
-            }
-        }
-        history.retain(|_, ks| !ks.is_empty());
-        self.history = history;
-        let series: BTreeSet<u32> = changed.iter().map(|(id, _)| *id).collect();
-        for key in changed {
-            match self
-                .history
-                .get(&key)
-                .and_then(|ks| ks.iter().filter_map(|k| k.changed_at).max())
-            {
-                Some(c) => self.versions.insert(key, c),
-                None => self.versions.remove(&key),
+    /// Takes in what happened since the last decision (Q-923): `acks` are the calls in flight in call order, each
+    /// with its first and last positions once acknowledged, and `next` the call after them; `fresh` the ranges found
+    /// lost since. The calls seen acknowledged stop at the first still pending, so they are always a prefix; they
+    /// are returned and need no tracking. A call seen acknowledged inside a lost range, or a find that grew the
+    /// regions found (Q-943), forgets what the log shows, once. No range's bounds are trusted (Q-937).
+    pub(crate) fn settle(
+        &mut self,
+        acks: impl IntoIterator<Item = (u64, Option<(LogPos, LogPos)>)>,
+        next: u64,
+        fresh: &[Fresh],
+    ) -> Vec<u64> {
+        let mut seen = Vec::new();
+        let mut readable = next;
+        let mut forget = false;
+        for (call, ack) in acks {
+            let Some((first, last)) = ack else {
+                readable = call;
+                break;
             };
+            forget |= self.lost.iter().any(|&(a, b)| first <= b && a <= last);
+            seen.push(call);
         }
-        for id in &series {
-            self.reference.remove(id);
+        self.history.readable_below(readable);
+        for f in fresh {
+            forget |= f.grew;
+            self.lose(f.first, f.last);
         }
-        for ((id, t), ks) in &self.history {
-            if series.contains(id) && ks.iter().any(|k| k.reference) {
-                let v = self.reference.entry(*id).or_insert(*t);
-                *v = (*v).max(*t);
+        if forget {
+            self.history.forget_shown();
+        }
+        seen
+    }
+
+    fn lose(&mut self, first: LogPos, last: LogPos) {
+        self.lost.push((first, last));
+        self.lost.sort();
+        let mut merged: Vec<(LogPos, LogPos)> = Vec::with_capacity(self.lost.len());
+        for (a, b) in self.lost.drain(..) {
+            match merged.last_mut() {
+                Some((_, z)) if a <= after(*z) => *z = (*z).max(b),
+                _ => merged.push((a, b)),
             }
+        }
+        self.lost = merged;
+    }
+
+    /// Takes a planned call's facts into the state, once it is queued; the same as noting each of its facts in
+    /// order.
+    pub(crate) fn apply(&mut self, plan: &mut Plan) {
+        for (id, r) in std::mem::take(&mut plan.references) {
+            self.history.settle_reference(id, r);
+        }
+        let mut whole = std::mem::take(&mut plan.whole);
+        for n in std::mem::take(&mut plan.notes) {
+            let w = whole.remove(&n.key);
+            let registry = &self.registry;
+            self.history
+                .note(n.key, n.known, || span_of(registry, n.key.0), w);
+        }
+    }
+
+    /// Reads series `id`'s reference facts with `t` at or below `upper`, highest part first, for a reading at `t`
+    /// whose lateness reference is `AtMost { upper, least }` and the clause undecided (Q-924). A part spans the
+    /// series' window span and doubles; the read stops at the first reference fact found, which proves the clause,
+    /// or once no lower reference could. The settled state is exact only when every part read was complete.
+    fn read_reference(
+        &self,
+        local: &mut dyn LocalFacts,
+        id: u32,
+        (upper, least): (i64, Option<i64>),
+        t: i64,
+        staleness: i64,
+    ) -> ReferenceRead {
+        let unchanged = |unread: bool| ReferenceRead {
+            late: unread && !UNREAD_REFERENCE_IS_NOT_LATE,
+            state: Reference::AtMost { upper, least },
+            unread,
+        };
+        // The highest reference for which the clause fails; none when `t + 2S` overflows, and then it never holds.
+        let Some(fails) = t.checked_add(staleness.saturating_mul(2)) else {
+            return unchanged(false);
+        };
+        let floor = fails.saturating_add(1);
+        let mut hi = upper;
+        let mut len = span_of(&self.registry, id).max(1);
+        let mut complete = true;
+        while hi >= floor {
+            let lo = hi.saturating_sub(len - 1).max(floor);
+            let (facts, whole) = local.read_between(id, lo, hi);
+            complete &= whole;
+            let found = facts
+                .iter()
+                .filter(|f| !f.row.flags.future && !f.row.flags.unsynced_clock)
+                .map(|f| f.row.t)
+                .max();
+            if let Some(m) = found {
+                let state = if complete {
+                    Reference::Exact(Some(m))
+                } else {
+                    Reference::AtMost {
+                        upper,
+                        least: least.max(Some(m)),
+                    }
+                };
+                return ReferenceRead {
+                    late: true,
+                    state,
+                    unread: false,
+                };
+            }
+            let Some(next) = lo.checked_sub(1) else {
+                break;
+            };
+            hi = next;
+            len = len.saturating_mul(2);
+        }
+        if !complete {
+            return unchanged(true);
+        }
+        let state = match least {
+            Some(l) if fails <= l => Reference::Exact(Some(l)),
+            _ => Reference::AtMost {
+                upper: fails,
+                least,
+            },
+        };
+        ReferenceRead {
+            late: false,
+            state,
+            unread: false,
         }
     }
 
@@ -287,23 +355,58 @@ impl Decider {
         Ok(value)
     }
 
-    /// Decides a call. Nothing changes until [`Decider::apply`].
+    /// Decides a call, reading the keys the slow path needs through `local`. Nothing changes until
+    /// [`Decider::apply`].
     pub(crate) fn plan(
         &self,
         readings: &[Reading],
         intent: Intent,
         clock: Clock,
         call: u64,
+        local: &mut dyn LocalFacts,
     ) -> Plan {
         let revise = intent == Intent::Revise;
         let mut plan = Plan {
-            call,
+            decisions: Vec::with_capacity(readings.len()),
+            items: Vec::with_capacity(readings.len()),
             ..Plan::default()
         };
-        let mut batch_history: HashMap<(u32, i64), Vec<Known>> = HashMap::new();
-        let mut batch_versions: HashMap<(u32, i64), u64> = HashMap::new();
+        // A reading with revise intent bypasses the check (§2.4) and is never outranked (it is refused on a
+        // versioned series), so it needs no read.
+        let mut slow: Vec<Key> = Vec::new();
+        if !revise {
+            let mut seen = HashSet::new();
+            for r in readings {
+                let key = (r.series.0, r.t.0);
+                if matches!(self.history.facts(key), Facts::Slow(_))
+                    && seen.insert(key)
+                    && self.refusal(r, revise).is_ok()
+                {
+                    slow.push(key);
+                }
+            }
+        }
+        let found = if slow.is_empty() {
+            crate::durable::keys::Found::default()
+        } else {
+            local.at(&slow)
+        };
+        let read: HashMap<Key, Vec<Known>> = slow
+            .iter()
+            .map(|k| {
+                let facts = found.facts.get(k).map_or_else(Vec::new, |fs| {
+                    fs.iter().map(|f| Known::of(&f.row, 0)).collect()
+                });
+                (*k, facts)
+            })
+            .collect();
+        // The call's own facts and lateness reference matter only to a later reading of the same key or series.
+        let (key_repeats, series_repeats) = repeats(readings);
+        let mut batch: HashMap<Key, Vec<Known>> = HashMap::new();
         let mut batch_reference: HashMap<u32, i64> = HashMap::new();
-        for r in readings {
+        let mut references: HashMap<u32, Reference> = HashMap::new();
+        for (k, r) in readings.iter().enumerate() {
+            let (in_batch, series_in_batch) = (key_repeats[k], series_repeats[k]);
             let value = match self.refusal(r, revise) {
                 Ok(v) => v,
                 Err(x) => {
@@ -335,26 +438,32 @@ impl Decider {
                 && observed
                 && reach > clock.wall.saturating_add(clock.future_tolerance);
             let key = (r.series.0, r.t.0);
-            let recorded = self
-                .history
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .chain(batch_history.get(&key).into_iter().flatten());
-            let top = self
-                .versions
-                .get(&key)
-                .copied()
-                .max(batch_versions.get(&key).copied());
+            let (state, unreadable): (Vec<&Known>, bool) = match self.history.facts(key) {
+                Facts::Known(v) => (v, false),
+                Facts::Slow(overlay) if !revise => {
+                    plan.slow += 1;
+                    let mut v: Vec<&Known> = read.get(&key).into_iter().flatten().collect();
+                    v.extend(overlay);
+                    (v, found.unreadable.contains(&key))
+                }
+                Facts::Slow(overlay) => (overlay, false),
+            };
+            let recorded = || {
+                state
+                    .iter()
+                    .copied()
+                    .chain(batch.get(&key).filter(|_| in_batch).into_iter().flatten())
+            };
+            let top = r
+                .changed_at
+                .and_then(|_| recorded().filter_map(|k| k.changed_at).max());
             // The facts this reading duplicates (§2.4); a `changed_at` above every one of its key's is never a
             // duplicate.
             let matched: Vec<&Known> = match r.changed_at {
-                None => recorded
-                    .into_iter()
+                None => recorded()
                     .filter(|k| k.identical(&value, supplied))
                     .collect(),
-                Some(c) if top.is_some_and(|top| c <= top) => recorded
-                    .into_iter()
+                Some(c) if top.is_some_and(|top| c <= top) => recorded()
                     .filter(|k| k.changed_at == Some(c) && k.identical(&value, supplied))
                     .collect(),
                 Some(_) => Vec::new(),
@@ -371,14 +480,28 @@ impl Decider {
             // `late` (§2.2): on an observed series, a fact not flagged `future` earlier than the lateness
             // reference by more than 2 × S; on any series, older than the lateness bound. Neither before the clock
             // is synchronised (§2.5).
-            let reference = self
-                .reference
-                .get(&r.series.0)
-                .copied()
-                .max(batch_reference.get(&r.series.0).copied());
-            let out_of_order = match (reference, d.staleness) {
-                (Some(rf), Some(st)) => {
-                    observed && !future && r.t.0 < rf.saturating_sub(st.saturating_mul(2))
+            let id = r.series.0;
+            let out_of_order = match d.staleness {
+                Some(st) if observed && !future && clock.synced => {
+                    let needs = |rf: i64| r.t.0 < rf.saturating_sub(st.saturating_mul(2));
+                    let in_call = batch_reference.get(&id).filter(|_| series_in_batch);
+                    let state = references
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_else(|| self.history.reference(id));
+                    match state {
+                        _ if in_call.is_some_and(|rf| needs(*rf)) => true,
+                        Reference::Exact(rf) => rf.is_some_and(needs),
+                        Reference::AtMost { least, .. } if least.is_some_and(needs) => true,
+                        Reference::AtMost { upper, .. } if !needs(upper) => false,
+                        Reference::AtMost { upper, least } => {
+                            let read = self.read_reference(local, id, (upper, least), r.t.0, st);
+                            references.insert(id, read.state);
+                            plan.references.push((id, read.state));
+                            plan.reference_unread += u64::from(read.unread);
+                            read.late
+                        }
+                    }
                 }
                 _ => false,
             };
@@ -400,159 +523,65 @@ impl Decider {
                 changed_at: r.changed_at,
             };
             let outranked = r.changed_at.is_some_and(|c| top.is_some_and(|top| c < top));
-            batch_history.entry(key).or_default().push(Known::of(
-                &row,
-                call,
-                At::Item(plan.items.len() as u64),
-            ));
-            if let Some(c) = r.changed_at {
-                let v = batch_versions.entry(key).or_insert(c);
-                *v = (*v).max(c);
+            let known = Known::of(&row, call);
+            if in_batch {
+                batch.entry(key).or_default().push(known.clone());
             }
-            if !future && clock.synced {
+            let raises = !future && clock.synced;
+            if raises && series_in_batch {
                 let v = batch_reference.entry(r.series.0).or_insert(r.t.0);
                 *v = (*v).max(r.t.0);
             }
+            plan.notes.push(Note { key, known });
             plan.decisions.push(Decision::Record {
                 item: plan.items.len(),
                 outranked,
                 absent,
+                late,
+                future,
+                unchecked: unreadable,
             });
             plan.items.push(Item::Fact(row));
         }
+        plan.whole = read
+            .into_iter()
+            .filter(|(k, _)| !found.unreadable.contains(k))
+            .collect();
         plan
     }
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-mod bounded;
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use kvik_log::entries::Entry;
-
-    use super::*;
-    use crate::durable::registry::definition_of;
-    use crate::series::{ChangedAtKind, Kind, SeriesSpec, ValueType};
-    use crate::time::Timestamp;
-    use crate::types::SeriesId;
-
-    const SEC: i64 = 1_000_000_000;
-    const WALL: i64 = 1_000_000 * SEC;
-
-    fn decider(spec: SeriesSpec) -> Decider {
-        let mut d = Decider::default();
-        let def = definition_of(&spec, 1, Duration::from_secs(3600)).unwrap();
-        d.registry.apply(&Entry::Definition(Box::new(def)));
-        d
-    }
-
-    /// An observed gauge with S = 10 s, so `late` by the reference is more than 20 s behind it.
-    fn observed() -> Decider {
-        decider(
-            SeriesSpec::new(
-                "a/b/power",
-                Kind::Gauge {
-                    value: ValueType::F64,
-                },
-                "W",
-            )
-            .staleness(Duration::from_secs(10)),
-        )
-    }
-
-    fn reading(t: i64, v: f64) -> Reading {
-        Reading::new(SeriesId(1), Timestamp(t), Value::F64(v))
-    }
-
-    fn pos(sequence: u64) -> LogPos {
-        LogPos {
-            generation: 0,
-            sequence,
-        }
-    }
-
-    fn plan(d: &Decider, r: Reading, call: u64, synced: bool) -> Plan {
-        let clock = Clock {
-            wall: WALL,
-            synced,
-            future_tolerance: 60 * SEC,
-        };
-        d.plan(&[r], Intent::Normal, clock, call)
-    }
-
-    /// Plans, queues and acknowledges a call of one reading at position `at`.
-    fn record(d: &mut Decider, r: Reading, call: u64, at: u64, synced: bool) {
-        let p = plan(d, r, call, synced);
-        assert!(matches!(p.decisions[0], Decision::Record { .. }));
-        d.apply(&p);
-        d.placed(call, pos(at), pos(at));
-    }
-
-    fn late(p: &Plan) -> bool {
-        match &p.items[..] {
-            [Item::Fact(f)] => f.flags.late,
-            other => panic!("one fact expected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_reading_only_a_lost_version_outranked_is_not_outranked() {
-        let mut d = decider(
-            SeriesSpec::new(
-                "a/b/price",
-                Kind::Gauge {
-                    value: ValueType::F64,
-                },
-                "p",
-            )
-            .versioned(ChangedAtKind::Version),
-        );
-        let t = WALL - 10 * SEC;
-        record(&mut d, reading(t, 1.0).changed_at(1), 1, 1, true);
-        record(&mut d, reading(t, 2.0).changed_at(2), 2, 2, true);
-        d.lose(pos(2), pos(2));
-        let p = plan(&d, reading(t, 3.0).changed_at(1), 3, true);
-        assert_eq!(
-            p.decisions,
-            vec![Decision::Record {
-                item: 0,
-                outranked: false,
-                absent: false
-            }]
-        );
-    }
-
-    #[test]
-    fn a_lost_latest_fact_no_longer_holds_the_lateness_reference() {
-        let mut d = observed();
-        record(&mut d, reading(WALL - 100 * SEC, 1.0), 1, 1, true);
-        record(&mut d, reading(WALL, 2.0), 2, 2, true);
-        assert!(late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
-        d.lose(pos(2), pos(2));
-        assert!(!late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
-        assert!(late(&plan(&d, reading(WALL - 130 * SEC, 3.0), 3, true)));
-    }
-
-    #[test]
-    fn a_call_acknowledged_inside_a_range_already_lost_leaves_the_history() {
-        let mut d = observed();
-        let p = plan(&d, reading(WALL - 5 * SEC, 1.0), 1, true);
-        d.apply(&p);
-        d.lose(pos(4), pos(6));
-        d.placed(1, pos(5), pos(5));
-        let replay = plan(&d, reading(WALL - 5 * SEC, 1.0), 2, true);
-        assert!(matches!(replay.decisions[0], Decision::Record { .. }));
-    }
-
-    #[test]
-    fn a_fact_taken_while_the_clock_is_unsynchronised_leaves_the_lateness_reference_alone() {
-        let mut d = observed();
-        record(&mut d, reading(WALL - 100 * SEC, 1.0), 1, 1, true);
-        record(&mut d, reading(WALL, 2.0), 2, 2, false);
-        assert!(!late(&plan(&d, reading(WALL - 50 * SEC, 3.0), 3, true)));
+/// The position after `p`, in its generation.
+fn after(p: LogPos) -> LogPos {
+    LogPos {
+        generation: p.generation,
+        sequence: p.sequence.saturating_add(1),
     }
 }
+
+/// Per reading, whether another reading of the call has its key, and whether one has its series.
+fn repeats(readings: &[Reading]) -> (Vec<bool>, Vec<bool>) {
+    let mut key = vec![false; readings.len()];
+    let mut series = vec![false; readings.len()];
+    let mut order: Vec<usize> = (0..readings.len()).collect();
+    order.sort_unstable_by_key(|&i| (readings[i].series.0, readings[i].t.0));
+    for w in order.windows(2) {
+        let (a, b) = (&readings[w[0]], &readings[w[1]]);
+        if a.series == b.series {
+            series[w[0]] = true;
+            series[w[1]] = true;
+            if a.t == b.t {
+                key[w[0]] = true;
+                key[w[1]] = true;
+            }
+        }
+    }
+    (key, series)
+}
+
+#[cfg(test)]
+mod differential;
+#[cfg(test)]
+mod oracle;
+#[cfg(test)]
+mod tests;

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use common::block_on;
 use common::durable::{World, damage, data_lost, gauge, history, note, num};
-use kvik::{Health, Kind, LossKind, Position, Reason, SeriesSpec, Store};
+use kvik::{Health, Kind, LossKind, Position, Reason, SeriesId, SeriesSpec, Store};
 
 #[test]
 fn a_batch_damaged_while_the_store_is_open_is_reported_at_once_and_its_replay_recorded() {
@@ -58,9 +58,9 @@ fn a_batch_damaged_while_the_store_is_open_is_reported_at_once_and_its_replay_re
     block_on(s.shutdown()).unwrap();
 }
 
-#[test]
-fn damage_to_a_batch_the_store_has_read_is_found_by_other_readers_and_recorded_at_the_next_start() {
-    let w = World::new("damaged-kept");
+/// The kept log of three notes, written by one run; the store opened again and the second note's batch damaged.
+fn damaged_kept_log(name: &str) -> (World, Store, SeriesId) {
+    let w = World::new(name);
     let s = w.open();
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     for (i, t) in ["KEPT-ONE", "KEPT-TWO", "KEPT-THREE"].iter().enumerate() {
@@ -70,8 +70,39 @@ fn damage_to_a_batch_the_store_has_read_is_found_by_other_readers_and_recorded_a
     drop(s);
     let s = w.open();
     damage(&w, b"KEPT-TWO");
-    // The store read the kept log at its start and does not read it again (Q-200): a reader process finds it.
+    (w, s, id)
+}
+
+/// Q-928 as proposed (the switch in `Latch::note`): the store's own reader reads the kept log at its first query and
+/// finds the damage as any scanning reader does. With the switch off, `losses()` stays empty and the replay is
+/// dropped.
+#[test]
+fn damage_to_the_kept_log_is_found_by_the_stores_first_read_of_it() {
+    let (w, s, id) = damaged_kept_log("damaged-kept-query");
+    assert_eq!(history(&s.reader(), id).len(), 2);
+    let lost = data_lost(&s.losses());
+    assert_eq!(lost.len(), 1);
+    assert!(!lost[0].3);
+    assert_eq!(data_lost(&w.reader().losses()), lost);
+    let ack = block_on(s.emit(&[note(id, 1, "KEPT-TWO")])).unwrap();
+    assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
     assert_eq!(history(&s.reader(), id).len(), 3);
+    block_on(s.shutdown()).unwrap();
+    drop(s);
+    let s = w.open();
+    let lost = data_lost(&s.losses());
+    assert_eq!(lost.len(), 1);
+    assert!(lost[0].3);
+    assert_eq!(history(&s.reader(), id).len(), 3);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-928: with no query, the store reads the kept log only at its start (Q-200), so `losses()` does not find the
+/// damage, a reader process does, and a replay of a fact whose key is in the recent window is dropped until the next
+/// start records the loss.
+#[test]
+fn a_replay_of_a_fact_of_the_damaged_kept_log_is_dropped_while_its_key_is_in_the_window() {
+    let (w, s, id) = damaged_kept_log("damaged-kept-window");
     assert!(data_lost(&s.losses()).is_empty());
     assert_eq!(data_lost(&w.reader().losses()).len(), 1);
     assert_eq!(
@@ -477,11 +508,16 @@ fn two_damaged_neighbours_are_one_loss_as_a_reader_process_reports_it_and_each_r
 /// Waits until the segment holding `text` is sealed.
 fn sealed_with(w: &World, text: &[u8]) {
     for _ in 0..4_000 {
-        let held = w
+        let held: Vec<_> = w
             .segments()
             .into_iter()
-            .find(|(_, b)| b.windows(text.len()).any(|x| x == text));
-        if held.is_some_and(|(p, _)| p.extension().is_some_and(|e| e == "kvl")) {
+            .filter(|(_, b)| b.windows(text.len()).any(|x| x == text))
+            .collect();
+        if !held.is_empty()
+            && held
+                .iter()
+                .all(|(p, _)| p.extension().is_some_and(|e| e == "kvl"))
+        {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -501,16 +537,18 @@ fn damage_inside_a_loss_reported_too_wide_reaches_the_stores_reader_and_its_repl
     for (i, t) in [(2, "WIDE-THREE"), (3, "WIDE-FOUR")] {
         block_on(s.emit(&[note(id, i, t)])).unwrap();
     }
+    sealed_with(&w, b"WIDE-FOUR");
     assert_eq!(history(&s.reader(), id).len(), 4);
+    // Both are the last batch of a sealed segment: the loss watch meets TWO's region first and reports it to the
+    // mark (Q-937), then FOUR's inside that report.
     damage(&w, b"WIDE-TWO");
+    damage(&w, b"WIDE-FOUR");
     let lost = data_lost(&s.losses());
     assert_eq!(lost.len(), 1);
     assert!(
         lost[0].2 > Some(two),
         "reported to the mark (Q-937): {lost:?}"
     );
-    damage(&w, b"WIDE-FOUR");
-    assert_eq!(data_lost(&s.losses()).len(), 1);
     let ack = block_on(s.emit(&[note(id, 3, "WIDE-FOUR")])).unwrap();
     assert_eq!(ack.recorded(), 1, "{:?}", ack.outcomes);
     let shown: Vec<_> = history(&s.reader(), id)

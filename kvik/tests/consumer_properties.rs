@@ -5,6 +5,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::world::{World, gauge, ready, resync};
@@ -82,6 +83,8 @@ fn steps(crashes: bool) -> impl Strategy<Value = Vec<Step>> {
     let step = prop_oneof![
         10 => (0usize..4, any::<u8>()).prop_map(|(i, v)| Step::Emit(i, v)),
         4 => (0u64..3).prop_map(Step::Advance),
+        // Beyond the recent window (15 minutes), so live state and held-for history are read from the log.
+        1 => (1_000u64..3_000).prop_map(Step::Advance),
         1 => Just(Step::Tick),
         4 => (0usize..2, funnel_kind()).prop_map(|(c, k)| Step::Route(c, k)),
         1 => (0usize..2, 0usize..3).prop_map(|(c, n)| Step::Unroute(c, n)),
@@ -226,7 +229,11 @@ fn run(
         match step {
             Step::Emit(i, v) => {
                 let id = ids.get(*i).copied().unwrap_or(SeriesId(999));
-                let value = f64::from(*v % 8) * 15.0;
+                // A bad reading now and then, so that the live-state fact may lie before the recent window.
+                let value = match *v % 9 {
+                    8 => f64::NAN,
+                    k => f64::from(k) * 15.0,
+                };
                 let r = block_on(s.emit(&[Reading::new(id, clock.wall(), Value::F64(value))]));
                 match r {
                     Ok(a) => {
@@ -310,9 +317,13 @@ fn run(
         }
     }
     drop(cs);
+    SLOW.fetch_add(s.stats().delivery.slow_path, Ordering::Relaxed);
     block_on(s.shutdown()).unwrap();
     rec.out
 }
+
+/// The deliverer's reads of the log for facts outside its recent window, over the differential histories.
+static SLOW: AtomicU64 = AtomicU64::new(0);
 
 fn next_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -332,31 +343,48 @@ fn runner() -> TestRunner {
 
 /// Timers run only when the store is called, on both backends, so that both see the same evaluations; condition
 /// sequences start at 1 at every start on both (spec §4 Order).
+/// Half the histories, chosen with each history, run with windows of a few dozen facts (Q-751).
 #[test]
 fn deliveries_follow_the_model_over_restarts() {
+    let smalls = AtomicU64::new(0);
     runner()
-        .run(&steps(false), |history| {
-            let m_clock = ManualClock::new(start());
-            let dir = format!("kvik-test/consumers-differential/{}", next_id());
-            let mut env = Env::test(m_clock.clone());
-            env.background_timers = false;
-            let m_config = StoreConfig::new(&dir, "Europe/London")
-                .create_if_missing(true)
-                .backend(Backend::Model)
-                .env(env);
-            let model = block_on(Store::open(m_config.clone())).unwrap();
-            let m = run(
-                model,
-                &|| block_on(Store::open(m_config.clone())).unwrap(),
-                &m_clock,
-                &history,
-            );
-            let w = World::quiet(&format!("differential-{}", next_id()));
-            let d = run(w.open(), &|| w.open(), &w.clock, &history);
-            prop_assert_eq!(m, d);
-            Ok(())
-        })
+        .run(
+            &(steps(false), prop::bool::weighted(0.5)),
+            |(history, small)| {
+                let m_clock = ManualClock::new(start());
+                let dir = format!("kvik-test/consumers-differential/{}", next_id());
+                let mut env = Env::test(m_clock.clone());
+                env.background_timers = false;
+                let m_config = StoreConfig::new(&dir, "Europe/London")
+                    .create_if_missing(true)
+                    .backend(Backend::Model)
+                    .env(env);
+                let model = block_on(Store::open(m_config.clone())).unwrap();
+                let m = run(
+                    model,
+                    &|| block_on(Store::open(m_config.clone())).unwrap(),
+                    &m_clock,
+                    &history,
+                );
+                let mut w = World::quiet(&format!("differential-{}", next_id()));
+                if small {
+                    w.window_memory = Some(8 << 10);
+                    smalls.fetch_add(1, Ordering::Relaxed);
+                }
+                let d = run(w.open(), &|| w.open(), &w.clock, &history);
+                prop_assert_eq!(m, d);
+                Ok(())
+            },
+        )
         .unwrap();
+    assert!(
+        smalls.into_inner() > 0,
+        "some history runs with small windows"
+    );
+    assert!(
+        SLOW.load(Ordering::Relaxed) > 0,
+        "some history reads facts outside the deliverer's recent window"
+    );
 }
 
 /// What the crash test knows of one consumer.

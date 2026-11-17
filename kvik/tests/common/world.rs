@@ -23,6 +23,8 @@ pub struct World {
     pub background_timers: bool,
     /// The mark sync; every commit unless a test sets an interval.
     pub mark_sync: MarkSync,
+    /// `limits.window_memory`, if not the default.
+    pub window_memory: Option<u64>,
 }
 
 impl World {
@@ -35,6 +37,7 @@ impl World {
             boot_count: 1,
             background_timers: true,
             mark_sync: LogConfig::default().mark_sync,
+            window_memory: None,
         }
     }
 
@@ -54,10 +57,14 @@ impl World {
         log.segment_size = 16 << 20;
         log.min_sync_interval = Duration::ZERO;
         log.mark_sync = self.mark_sync;
-        StoreConfig::new(&self.dir, "Europe/London")
+        let mut config = StoreConfig::new(&self.dir, "Europe/London")
             .create_if_missing(true)
             .env(env)
-            .log(log)
+            .log(log);
+        if let Some(m) = self.window_memory {
+            config.limits.window_memory = m;
+        }
+        config
     }
 
     pub fn open(&self) -> Store {

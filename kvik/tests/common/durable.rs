@@ -107,13 +107,17 @@ pub fn history(r: &Reader, id: SeriesId) -> Vec<Fact> {
 
 /// Damages the bytes of the first segment that holds `text`, in place.
 pub fn damage(w: &World, text: &[u8]) {
-    let (path, bytes) = w
+    let held: Vec<_> = w
         .segments()
         .into_iter()
-        .find(|(_, b)| b.windows(text.len()).any(|x| x == text))
-        .unwrap();
-    let at_text = bytes.windows(text.len()).position(|x| x == text).unwrap();
-    w.fs.poke(&path, at_text, b"X");
+        .filter(|(_, b)| b.windows(text.len()).any(|x| x == text))
+        .collect();
+    assert!(!held.is_empty());
+    // Every copy: a segment being sealed is briefly held twice.
+    for (path, bytes) in held {
+        let at_text = bytes.windows(text.len()).position(|x| x == text).unwrap();
+        w.fs.poke(&path, at_text, b"X");
+    }
 }
 
 pub fn note(id: SeriesId, secs: i64, text: &str) -> Reading {

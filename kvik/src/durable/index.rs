@@ -1,6 +1,6 @@
 //! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch, and
 //! the losses its reads found ([`Finder`]), built from what a log reader returns and cut back when it voids what it
-//! took (`spec.md` §7 Readers). The writer builds one at its start; each reader holds one.
+//! took (`spec.md` §7 Readers). Each reader holds one; the writer's start and the deliverer hold one without facts.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -14,8 +14,10 @@ use kvik_log::reader::{ReadBatch, ReadEvent};
 use kvik_log::registry::RegistryFile;
 use kvik_log::writer::Position as LogPos;
 
+use super::by_id::ById;
 use super::loss::{Find, Finder};
 use super::registry::{Registry, Series};
+use super::summary::Summary;
 use crate::backend::Error;
 use crate::health::{LossCause, LossReport, MarkState};
 use crate::read::View;
@@ -47,6 +49,13 @@ pub(crate) struct Index {
     /// Each batch's last position and commit time, in log order.
     commits: Vec<(LogPos, i64)>,
     finder: Finder,
+    /// Facts are not kept, only each series' [`Summary`] (roadmap 11.0: the writer's start and the deliverer need the
+    /// registry and the commit times, not the facts).
+    no_facts: bool,
+    summary: ById<Summary>,
+    /// A void or a loss removed facts the summaries counted: they are rebuilt by
+    /// [`read_summary`](super::summary::read_summary) before they are used (Q-930).
+    stale: bool,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -143,6 +152,14 @@ pub(crate) fn fact_out(s: &Stored) -> Fact {
 }
 
 impl Index {
+    /// An index that keeps no facts: [`Index::series_facts`] and the calls on facts see none.
+    pub(crate) fn without_facts() -> Self {
+        Index {
+            no_facts: true,
+            ..Index::default()
+        }
+    }
+
     /// Applies what a refresh up to the mark's position `durable` found, in order. Returns the losses it found.
     pub(crate) fn apply(&mut self, events: &[ReadEvent], durable: LogPos) -> Vec<Find> {
         let found = self.finder.apply(events, durable);
@@ -156,7 +173,8 @@ impl Index {
         found
     }
 
-    fn batch(&mut self, b: &ReadBatch) {
+    /// Applies one batch a refresh found.
+    pub(crate) fn batch(&mut self, b: &ReadBatch) {
         let mut sequence = b.first.sequence;
         for item in &b.content.items {
             let p = LogPos {
@@ -164,6 +182,10 @@ impl Index {
                 sequence,
             };
             match item {
+                Item::Fact(row) if self.no_facts => {
+                    self.registry.note_fact(row.series_id);
+                    Summary::note(&mut self.summary, p, row);
+                }
                 Item::Fact(row) => {
                     self.registry.note_fact(row.series_id);
                     self.facts.entry(row.series_id).or_default().insert(
@@ -191,18 +213,37 @@ impl Index {
     fn void(&mut self, above: LogPos) {
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
+        let taken = self.commits.len();
         self.commits.retain(|(p, _)| keep(p));
+        self.stale |= self.no_facts && self.commits.len() != taken;
         for f in self.facts.values_mut() {
             f.retain(|(_, p), _| keep(p));
         }
         self.facts.retain(|_, f| !f.is_empty());
+        self.summary.retain(|_, s| keep(&s.first));
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
             self.registry.apply(e);
         }
-        for id in self.facts.keys() {
-            self.registry.note_fact(*id);
+        for id in self
+            .facts
+            .keys()
+            .copied()
+            .chain(self.summary.iter().map(|(id, _)| id))
+        {
+            self.registry.note_fact(id);
         }
+    }
+
+    /// Whether a void or a loss left the summaries of an index without facts to be rebuilt.
+    pub(crate) fn summary_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Replaces the summaries with those of a read of the kept log that reached at least as far as this index.
+    pub(crate) fn set_summary(&mut self, s: ById<Summary>) {
+        self.summary = s;
+        self.stale = false;
     }
 
     /// The registry of the kept log.
@@ -310,6 +351,9 @@ impl Index {
 
     /// The latest recorded `t` of a series (spec §2.2).
     pub(crate) fn latest_t(&self, id: u32) -> Option<i64> {
+        if self.no_facts {
+            return self.summary.get(id).map(|s| s.latest);
+        }
         self.facts
             .get(&id)
             .and_then(|m| m.keys().map(|(t, _)| *t).max())
@@ -318,6 +362,9 @@ impl Index {
     /// The lateness reference of an observed series (spec §2.2): the greatest `t` of its facts flagged neither
     /// `future` nor `unsynced_clock`.
     pub(crate) fn lateness_reference(&self, id: u32) -> Option<i64> {
+        if self.no_facts {
+            return self.summary.get(id).and_then(|s| s.reference);
+        }
         self.series_facts(id)
             .filter(|s| !s.row.flags.future && !s.row.flags.unsynced_clock)
             .map(|s| s.row.t)
@@ -402,8 +449,12 @@ impl Index {
     }
 
     /// Forgets the facts at positions from `first` to `last`, a range the process found lost after this index took
-    /// it (Q-938).
+    /// it (Q-938); without facts, the summaries are left to be rebuilt (Q-930).
     pub(crate) fn forget(&mut self, first: LogPos, last: LogPos) {
+        if self.no_facts {
+            self.stale = true;
+            return;
+        }
         for f in self.facts.values_mut() {
             f.retain(|(_, p), _| *p < first || last < *p);
         }

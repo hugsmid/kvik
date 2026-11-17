@@ -35,6 +35,7 @@ impl Deliverer {
         let mut states = Vec::new();
         let mut runners = BTreeMap::new();
         let mut emitted = BTreeMap::new();
+        self.incomplete.set(false);
         let latches = self
             .consumers
             .get(name)
@@ -80,6 +81,7 @@ impl Deliverer {
                 condition,
             });
         }
+        let unchecked = self.incomplete.get();
         let Some(rt) = self.consumers.get_mut(name) else {
             return;
         };
@@ -89,7 +91,9 @@ impl Deliverer {
             position,
             funnels: states,
             reset,
+            unchecked,
         });
+        self.unchecked += u64::from(unchecked);
         rt.evaluated = runners.keys().map(|id| (*id, ctx.now)).collect();
         rt.runners = runners;
         rt.emitted = emitted;
@@ -119,7 +123,9 @@ impl Deliverer {
                 return;
             }
             let limit = rt.resume.unwrap_or(self.head);
-            self.restore_items(at);
+            if !self.restore_items(at, ctx) {
+                return;
+            }
             let mut view = match self.consumers.get_mut(name).and_then(|rt| rt.view.take()) {
                 Some((p, v)) if p == at => v,
                 _ => self.view_before(at),
@@ -154,6 +160,7 @@ impl Deliverer {
                                 position: p,
                                 funnels: Vec::new(),
                                 reset: true,
+                                unchecked: false,
                             });
                             rt.reset_open = true;
                         }
@@ -241,7 +248,7 @@ impl Deliverer {
             .map(|(id, r)| (*id, r.state()))
             .collect();
         for (id, state) in changed {
-            self.emit_trigger(name, id, state, TriggerCause::Reattach);
+            self.emit_trigger(name, id, state, TriggerCause::Reattach, false);
         }
     }
 
@@ -290,6 +297,7 @@ impl Deliverer {
         let delivered_at = Timestamp(ctx.now);
         match p {
             Pend::Fact { rec, replayed } => {
+                let unchecked = rec.unchecked;
                 let position = rec.stored.position;
                 let id = DeliveryId::Fact(pos(position));
                 vec![(
@@ -301,6 +309,7 @@ impl Deliverer {
                             replayed,
                             future: rec.stored.row.flags.future,
                             outranked: rec.outranked,
+                            unchecked,
                             ..DeliveryFlags::default()
                         },
                         delivered_at,
@@ -321,6 +330,7 @@ impl Deliverer {
                 state,
                 cause,
                 position,
+                unchecked,
             } => {
                 let id = DeliveryId::Condition {
                     funnel: FunnelId(funnel),
@@ -337,7 +347,10 @@ impl Deliverer {
                             coverage: None,
                             cause,
                         }),
-                        flags: DeliveryFlags::default(),
+                        flags: DeliveryFlags {
+                            unchecked,
+                            ..DeliveryFlags::default()
+                        },
                         delivered_at,
                     },
                     Out {
@@ -355,6 +368,7 @@ impl Deliverer {
                 position,
                 funnels,
                 reset,
+                unchecked,
             } => {
                 let latches: Vec<(u32, LogPos, MState)> = funnels
                     .iter()
@@ -406,7 +420,10 @@ impl Deliverer {
                                     last,
                                     funnels,
                                 }),
-                                flags: DeliveryFlags::default(),
+                                flags: DeliveryFlags {
+                                    unchecked,
+                                    ..DeliveryFlags::default()
+                                },
                                 delivered_at,
                             },
                             Out {

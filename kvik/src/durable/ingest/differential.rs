@@ -8,9 +8,9 @@ use kvik_log::entries::Entry;
 use kvik_log::reader::FoundFact;
 use proptest::prelude::*;
 
+use super::oracle;
 use super::*;
 use crate::durable::history::History;
-use crate::durable::ingest as oracle;
 use crate::durable::keys::Found;
 use crate::durable::registry::definition_of;
 use crate::series::{ChangedAtKind, Kind, SeriesSpec, ValueType};

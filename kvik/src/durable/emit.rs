@@ -42,29 +42,36 @@ impl Writer {
         let started = Instant::now();
         // Decided and queued in call order under the decision lock; a full queue is waited for with no lock held,
         // and the call decided again.
-        let (mut d, call, plan, queued) = loop {
+        let (mut d, call, mut plan, refreshes, queued) = loop {
             let mut d = lock(&self.decider);
-            self.settle(&mut d);
             let call = self.next_call.fetch_add(1, Ordering::SeqCst);
-            let plan = d.plan(readings, intent, clock, call);
+            self.settle(&mut d, call);
+            let mut plan = {
+                let mut local = lock(&self.local);
+                d.plan(readings, intent, clock, call, &mut **local)
+            };
             if plan.items.is_empty() {
-                break (d, call, plan, None);
+                break (d, call, plan, Vec::new(), None);
             }
+            let refreshes = refreshing(&plan);
             // The log's read guard is dropped before an error is mapped, which reads the log's fault again.
+            // The facts are moved into the log; after a wait for room the call is planned again.
+            let len = plan.items.len();
             let r = {
                 let log = self.log();
                 let log = log.as_ref().ok_or(EmitError::Closed)?;
+                let items = std::mem::take(&mut plan.items);
                 if wait {
-                    log.offer(plan.items.clone())
+                    log.offer(items)
                 } else {
-                    log.try_submit(plan.items.clone())
+                    log.try_submit(items)
                 }
             };
             let e = match r {
-                Ok(p) => break (d, call, plan, Some(p)),
+                Ok(p) => break (d, call, plan, refreshes, Some(p)),
                 Err(SubmitError::Busy(LogWait::QueueFull)) if wait => {
                     drop(d);
-                    match self.wait_room(plan.items.len()) {
+                    match self.wait_room(len) {
                         Ok(()) => continue,
                         Err(e) => e,
                     }
@@ -84,7 +91,7 @@ impl Writer {
         if wait {
             self.note_waited(started.elapsed());
         }
-        d.apply(&plan);
+        d.apply(&mut plan);
         // The call is tracked before the decision lock is released, so a later call that duplicates one of its
         // readings always finds it (lock order: decisions, then calls in flight).
         #[cfg(test)]
@@ -92,15 +99,8 @@ impl Writer {
         let mut inflight = lock(&self.inflight);
         let tracked = match queued {
             Some(pending) => {
-                let (clocks, ids) = (self.clocks.clone(), refreshing(&plan));
-                let c = Completion::new(
-                    pending,
-                    Box::new(move || {
-                        for id in ids {
-                            clocks.refresh(id);
-                        }
-                    }),
-                );
+                let (clocks, ids) = (self.clocks.clone(), refreshes);
+                let c = Completion::new(pending, Box::new(move || clocks.refresh(&ids)));
                 inflight.insert(call, c.clone());
                 Some((c, true))
             }
@@ -113,6 +113,8 @@ impl Writer {
         };
         drop(inflight);
         drop(d);
+        #[cfg(test)]
+        pause::at(&self.dir, pause::Point::AfterDecision);
         self.count(readings, &plan);
         let decisions = plan.decisions;
         let Some((completion, own)) = tracked else {
@@ -126,6 +128,8 @@ impl Writer {
                     me.note_latency(started.elapsed());
                 }
                 if r.is_ok() {
+                    #[cfg(test)]
+                    pause::at(&me.dir, pause::Point::AfterAck);
                     me.deliver();
                 }
                 match r {
@@ -141,19 +145,21 @@ impl Writer {
         }))
     }
 
-    /// Takes into the decisions the positions of calls acknowledged since the last decision and the ranges the
-    /// reader of this process found lost. Calls known to be acknowledged need no tracking: a later outcome resting
-    /// on them is final.
-    fn settle(&self, d: &mut Decider) {
-        lock(&self.inflight).retain(|call, c| match c.poll(None) {
-            Poll::Ready(Ok(ack)) => {
-                d.placed(*call, ack.first, ack.last);
-                false
-            }
-            _ => true,
+    /// Takes into the decisions the calls acknowledged since the last decision, in call order up to the first still
+    /// pending, and the ranges the scanning readers of this process found lost (Q-923); `next` is the call being
+    /// decided. Calls known to be acknowledged need no tracking: a later outcome resting on them is final.
+    fn settle(&self, d: &mut Decider, next: u64) {
+        let mut inflight = lock(&self.inflight);
+        let acks = inflight.iter().map(|(call, c)| {
+            let ack = match c.poll(None) {
+                Poll::Ready(Ok(a)) => Some((a.first, a.last)),
+                _ => None,
+            };
+            (*call, ack)
         });
-        for f in self.latch.take_fresh() {
-            d.lose(f.first, f.last);
+        let seen = d.settle(acks, next, &self.latch.take_fresh());
+        for call in seen {
+            inflight.remove(&call);
         }
     }
 
@@ -195,26 +201,32 @@ impl Writer {
 
     fn count(&self, readings: &[Reading], plan: &ingest::Plan) {
         let mut c = lock(&self.counters);
+        c.slow_path += plan.slow;
+        let mut c_unchecked = 0;
         for (r, d) in readings.iter().zip(&plan.decisions) {
             let st = c.series.entry(r.series.0).or_default();
             match d {
                 Decision::Refused(x) => *st.refused.entry(*x).or_insert(0) += 1,
                 Decision::Duplicate => st.duplicates_dropped += 1,
                 Decision::Record {
-                    item,
                     outranked,
                     absent,
+                    late,
+                    future,
+                    unchecked,
+                    ..
                 } => {
                     st.recorded += 1;
+                    st.duplicates_unchecked += u64::from(*unchecked);
+                    c_unchecked += u64::from(*unchecked);
                     st.outranked_on_arrival += u64::from(*outranked);
                     st.absent_supplied += u64::from(*absent);
-                    if let Some(Item::Fact(row)) = plan.items.get(*item) {
-                        st.late += u64::from(row.flags.late);
-                        st.future += u64::from(row.flags.future);
-                    }
+                    st.late += u64::from(*late);
+                    st.future += u64::from(*future);
                 }
             }
         }
+        c.unchecked_readings += c_unchecked + plan.reference_unread;
     }
 }
 
@@ -226,13 +238,16 @@ fn outcomes(decisions: &[Decision], first: Option<kvik_log::writer::Position>) -
             Decision::Refused(x) => Outcome::Refused(*x),
             Decision::Duplicate => Outcome::Duplicate,
             Decision::Record {
-                item, outranked, ..
+                item,
+                outranked,
+                unchecked,
+                ..
             } => {
                 let f = first.unwrap_or_default();
                 Outcome::Recorded {
                     position: Position::new(f.generation, f.sequence + *item as u64),
                     outranked: *outranked,
-                    unchecked: false,
+                    unchecked: *unchecked,
                     rounded: false,
                     out_of_range: false,
                 }

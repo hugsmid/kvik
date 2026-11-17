@@ -112,6 +112,21 @@ pub enum Reason {
         /// Why.
         error: String,
     },
+    /// Local data could not be read where a decision needed it (spec §2.4, Q-750), or a damaged region no lost range
+    /// records was passed over. The counts of decisions are this run's; damaged regions are counted at every start
+    /// until each is repaired or recorded as lost (Q-755).
+    LocalDataUnreadable {
+        /// Readings recorded with a check unmade for want of local data, this run: the duplicate check, or the
+        /// lateness reference (Q-925).
+        readings: u64,
+        /// Deliveries flagged unchecked, this run.
+        deliveries: u64,
+        /// Condition evaluations made without every fact they rest on, delivered or not, this run.
+        evaluations: u64,
+        /// Damaged regions passed over that no lost range records: those the start passed over, and those met
+        /// since by a consumer's read of the log that no loss this process reports stands for (Q-929).
+        regions: u64,
+    },
 }
 
 impl fmt::Display for Reason {
@@ -146,6 +161,16 @@ impl fmt::Display for Reason {
             }
             Reason::SetAside(r) => write!(f, "positions {} to {} set aside", r.first, r.last),
             Reason::LossesUnknown { error } => write!(f, "loss reports unreadable: {error}"),
+            Reason::LocalDataUnreadable {
+                readings,
+                deliveries,
+                evaluations,
+                regions,
+            } => write!(
+                f,
+                "local data unreadable: {readings} readings recorded unchecked, {deliveries} deliveries and \
+                 {evaluations} evaluations unchecked, {regions} damaged regions not recorded as lost"
+            ),
         }
     }
 }
@@ -341,6 +366,13 @@ pub struct IngestStats {
     pub syncs: u64,
     /// Commit latency (zero with the model backend).
     pub commit_latency: Latency,
+    /// Readings the duplicate rule decided by the slow path: at or below the series' latest recorded `t`, outside
+    /// the recent window and the revised-key index, so read from the local log (spec §2.4; zero with the model
+    /// backend).
+    pub slow_path: u64,
+    /// The store's start read the kept log whole into memory, its read in parts having met a part that voids an
+    /// earlier one (Q-752; false with the model backend).
+    pub start_whole: bool,
 }
 
 /// How the mark is synced.
@@ -373,6 +405,10 @@ pub struct LogStats {
     pub sealed_segments: u64,
     /// Bytes in the log (model accounting).
     pub bytes: u64,
+    /// The batch-sync interval in force (spec §3 Group commit); zero with the model backend, which does not sync.
+    pub sync_interval: Duration,
+    /// The smoothed duration of a batch sync; `None` before the first, and with the model backend.
+    pub sync_time: Option<Duration>,
     /// Manifest records rebuilt from local files.
     pub manifest_rebuilds: u64,
     /// Losses a manifest rebuild listed under their first missing position,
@@ -425,6 +461,15 @@ pub struct DeliveryStats {
     pub refresh_errors: u64,
     /// Invalid regions below the durable mark the delivery reader passed over (`spec.md` §3 Recovery rule 2).
     pub corruptions: u64,
+    /// Reads of the local log for facts outside the deliverer's recent window: a key's earlier facts, a series'
+    /// facts before the window, or the records a consumer behind needs.
+    pub slow_path: u64,
+    /// Deliveries decided without every fact they rest on, flagged `unchecked` (Q-750).
+    pub unchecked: u64,
+    /// Condition evaluations made without every fact they rest on, whether or not they delivered (Q-750).
+    pub evaluations_unchecked: u64,
+    /// Damaged regions a consumer's read of the log passed over that the store's start had not (Q-750).
+    pub regions_unread: u64,
 }
 
 /// Per-series statistics.

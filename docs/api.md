@@ -34,7 +34,7 @@ the rest is filled in by the roadmap items named.
 let store = Store::open(
     StoreConfig::new(path, tz)        // tz: the site zone at creation; checked at every later open
         .create_if_missing(true)       // creates only in a missing or empty directory (format.md A.12)
-        .log(LogConfig::default())     // segment size, seal interval, min_sync_interval, batch size, mark sync
+        .log(LogConfig::default())     // segment size, seal interval, sync interval and floor, batch size, mark sync
         .limits(Limits::default())     // queue sizes, series ceiling, disk marks
         .tiers(TierConfig::default())  // cold path, age and fill thresholds
         .env(Env::system()),           // clock, file system, boot identity, tzdata, entropy
@@ -66,7 +66,8 @@ The keys roadmap section 4 needs; all may change between opens.
 |---|---|---|---|
 | `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
-| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: batch syncs are due at least this far apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound. Mark syncs, timed or forced, are not bounded by it |
+| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: the ceiling of the batch-sync interval, and the interval until the first batch sync after a start. Batch syncs are due at least the interval apart (a late start delays later ones only while the load stays at the bound) and start at least half of it after any log sync, and a batch takes in what arrives meanwhile; the first reading after a quiet period is synced at once; 0 disables the bound, whatever the floor. Mark syncs, timed or forced, are not bounded by it |
+| `log.sync_interval_floor` | `Duration` | 2 ms | spec §3 Group commit (Q-710): the least batch-sync interval. Between it and `min_sync_interval` the interval is eight times the smoothed batch-sync duration, so batch syncs run at most 1/`sync_interval_floor` per second over time (500 at the default); at or above `min_sync_interval` the interval is fixed there. Wear ceiling: a batch sync writes at least one 4 KiB page, so a load that never drops below 500 calls a second on a device whose sync takes under 0.25 ms can send about 165 GiB of host writes a day, against 33 GiB at a 10 ms floor (the device's own writes can be more); with the mark synced at every commit (configured, or no boot identity) each batch also brings a mark write and sync, so the figure about doubles; a device whose sync takes 1.25 ms or more stays at `min_sync_interval`. A deployment on flash that is sensitive to wear sets a longer floor, up to `min_sync_interval`. No limits |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact, and the first batch in each segment when it is unflagged (Q-630), force a mark sync at once either way |
 | `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |
@@ -75,6 +76,34 @@ The keys roadmap section 4 needs; all may change between opens.
 | `limits.disk_low` | fraction and bytes | 5 %, 2 GiB | |
 | `limits.disk_critical` | `u64` bytes | 512 MiB | |
 | `limits.future_tolerance`, `limits.default_lateness_bound` | `Duration` | 60 s, 5 min | |
+| `limits.window_memory` | `u64` bytes | 512 MiB (`WINDOW_MEMORY_DESKTOP`) | ≥ 4 KiB. The recent windows' bytes in all (spec §5.1, Q-751): half for the writer's decision windows and revised-key index, half for the deliverer's windows. Within it each series holds 15 minutes of facts, at most 1,024, and beyond it the oldest keys are read from the log instead (spec §2.4, slow path); decisions do not change. 64 MiB (`WINDOW_MEMORY_MINIMAL`) suits the minimal class. See Memory below |
+
+**Memory** (roadmap 11.0). A store's memory does not grow with the facts it holds while its consumers confirm what
+they are sent. Bounded by configuration:
+`limits.window_memory` (the counted bytes of window entries and revised-key entries; a window's allocation can hold
+up to as much again while it grows), the ingest queue (`limits.ingest_queue` readings, and the decisions of calls not
+yet acknowledged), consumer queues (`limits.consumer_queue` deliveries each), and per log reader at most one segment's
+bytes while it follows a segment. Bounded by the store's shape: the registry (about 200 bytes a series), each series'
+latest time and lateness reference, one commit time per batch, and the slow path's caches (8 MiB per reader for
+sealed segments' indexes and the maps of their batches, also during one lookup; a batch read again, or appended
+since, is read into a buffer of its own length, and anything else in a 4 MiB part of a segment at a time). **Outside every bound:** the records kept for a registered consumer from its
+cursor to the last position, which grow for as long as it is down or behind and are freed as it confirms. A start reads the whole log once, a part at a time (Q-752); the public
+`Reader` still holds every fact it has read (roadmap 9.0a), and so does the store's own reader, opened by the first
+`facts`, `at` or `interval` call on a `Store`. `series`, `series_stats` and the registry file written after a
+routing change and at a clean shutdown are answered from the deliverer's held state (registry and per-series
+summaries) once it has taken every batch acknowledged when the call began; otherwise, as when the log cannot be read,
+the store's own reader answers, with its error. `losses` and `health` move the loss watch, a log reader of the
+writer's process that keeps no facts: each call reads the bytes appended since the previous one and the newest batch
+it had read, holding one part of decoded batches and the open segment up to the mark during the call and no segment
+bytes between calls; after a shutdown it reads nothing. Kept per loss or per batch and outside `window_memory`: the
+losses this process found with their regions, the lost ranges the decisions hold, the loss watch's recovery entries
+(one per start) and one commit time per batch.
+After a start whose read of the log was voided part-way (a recovery entry voiding batches taken in an earlier part),
+the summaries are rebuilt once, at the first such call, by two reads of the log in parts that keep no facts; they
+run under the deliverer's lock, so emits with a consumer registered and entry calls wait for them. Worst case of the slow path, under the decision lock that
+every `emit` and entry call takes: the first read of a segment after a start scans it whole (64 MiB at the default
+`segment_size`, about a second at 60 MB/s), later reads only the batches whose event times may hold the key and those
+appended since (`docs/measurements/store-emit-throughput.md`).
 
 Keys of later sections (consumer queue, tiers, tree, leases, backup, `mirror_path`) are listed by their items. One is
 fixed already: `manifest.rebuild_wait` (roadmap 6.3), `RebuildWait::After(Duration)` (default 15 minutes) or
@@ -293,7 +322,8 @@ enum Live { Value(Fact), None, Unknown }
   `Trigger` if it differs from the latched state, or there is none.
 - A delivery carries `id` (a position for a fact delivery; funnel and sequence for a condition delivery, on a fact
   or on the timer, valid until the next resync), `flags` (`replayed`,
-  `future`; on a trigger also `approximate_edges` and `restoring`) and the times needed to judge its age.
+  `future`; on a trigger also `approximate_edges` and `restoring`; on any delivery `unchecked`, when local data it
+  rests on could not be read during this run, spec §2.4, Q-750) and the times needed to judge its age.
 - `start` gives the position before the start (spec §4 Resync): the last position for `Start::Now`, the position
   before the first fact at or after T for `Start::Time(T)`, and for `Start::Position(point)`, which takes a
   `SavedPoint { position, stamp }` (spec §7 Readers, Reset stamp and saved points), the position, or the lower
@@ -356,6 +386,10 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   own window clock, `now`, from its open. It has no instant of the writer's last commit, so it measures the live
   staleness of an observed series in event time, `now − t` of the live-state fact (open: Q-140).
 - `reader.health()` reports what the files hold (loss reports), not the writer's counters.
+- Between calls a reader keeps the bytes of the log segment it follows up to the mark, so that a call reads only
+  what is new: at most one segment's bytes (`segment_size`, 64 MiB by default) per reader handle while it follows a
+  segment. They are freed when it moves to another segment; a whole earlier segment read in one call is freed at
+  the end of that call. The store's own delivery reader holds the same.
 
 ## Reading
 ```rust
@@ -414,6 +448,9 @@ pub enum Reason { DataLost(LossReport), IngestWaiting(Wait), DiskLow { free: u64
     RestoreFailed { file_id: u64, reason: String },
     SetAside(SetAsideReport),      // information, not degraded (Q-90)
     LossesUnknown { error: String },
+    LocalDataUnreadable { readings: u64, deliveries: u64, evaluations: u64, regions: u64 },
+        // decided this run with a check unmade for want of local data (Q-750, Q-925); damaged regions no lost range
+        // and no loss this process reports stands for, at every start until repaired or recorded as lost (Q-755, Q-929)
     StorageSuspect { corruptions: u32, within: Span } }   // repeated corruption (spec §8 Self-repair, Q-247)
 pub enum BackupRefusal { NoConditionalWrites, NoChecksums, OtherStore, WrongKey }
 pub struct SetAsideReport { pub first: Position, pub last: Position, pub facts: u64,
@@ -446,10 +483,19 @@ pub async fn acknowledge_corruptions(&self, ids: &[CorruptionId]) -> Result<(), 
 // acknowledge_corruptions, LossReport.state, Reason::StorageSuspect and the repair.* keys are built with roadmap 8.5c.
 pub async fn acknowledge_manifest_rebuild(&self, epoch: u64) -> Result<(), WriteError>;   // the rebuild record's epoch; spec §7 Manifest
 pub struct ClockJump { pub at: Timestamp, pub by: Span }
-pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats }
-// IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max } }
+pub struct Stats { pub ingest: IngestStats, pub log: LogStats, pub disk: DiskStats, pub clock: ClockStats,
+                   pub delivery: DeliveryStats }
+// IngestStats { queue_depth, waiting: Option<Wait>, waited: Duration, batches, syncs, commit_latency: Latency { p50, p99, max },
+//               slow_path /* readings the duplicate rule read from the local log, spec §2.4 */,
+//               start_whole /* the start read the log whole into memory, Q-752 */ }
 // LogStats { acknowledged: Position, durable: Position, mark_synced: Position, mark_sync: MarkSyncMode /* Interval | EveryCommit { reason } */,
-//            open_file_id, sealed_segments, bytes, manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+//            open_file_id, sealed_segments, bytes, sync_interval: Duration, sync_time: Option<Duration>,
+//            manifest_rebuilds, loss_identities_rebuilt }   ClockStats { jumps, last: Option<ClockJump> }
+// DeliveryStats { refresh_errors /* reads of the log that failed, tried again */, corruptions /* invalid regions the
+//               delivery reader passed over */, slow_path /* reads of the log for facts outside the deliverer's recent
+//               window */, unchecked /* deliveries flagged `unchecked` */, evaluations_unchecked /* condition
+//               evaluations without every fact they rest on, delivered or not */, regions_unread /* damaged regions a
+//               consumer's read of the log met beyond those the open passed over */ }   (zero on the model backend)
 // Roadmap 8.1d and 8.3d add `backup: BackupStats` and `restore: RestoreStats` to Stats:
 // BackupStats { attached, backed_up_through: Option<Position>, queued_files, queued_bytes, queued_records, uploaded_files,
 //               uploaded_bytes, retries }   RestoreStats { restoring, drill, generation, restored_end: Option<Position>, files_left, bytes_left }
@@ -497,6 +543,15 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   between tries has reached its cap of 10 minutes, `SegmentUnreadable` names it until a read succeeds (Q-640). `Other` degrades
   health with a reason from the log that this version of the interface does not name, so none is dropped (Q-221 (d)). A mark synced at every commit (no boot identity, or configured) is
   reported in `LogStats`, not as a health reason, so a platform without a boot identity is not degraded for ever.
+  `LogStats.sync_interval` is the batch-sync interval in force and `sync_time` the smoothed batch-sync duration it
+  follows (`None` before the first batch sync after a start); the model backend, which does not sync, reports zero and
+  `None`.
+- `Stats.delivery` counts what the store's delivery reader met taking the committed log: failed reads of the log,
+  tried again at the next one (`refresh_errors`), invalid regions below the durable mark it passed over
+  (`corruptions`), and reads of the local log for facts outside its recent window (`slow_path`). While no consumer
+  is known to the store (none taken in this run, none named by a cursor file or the log), an `emit` returns without
+  reading its batch back; the `kvik-deliver` thread reads it shortly after. These counts may then lag an emit's
+  return, and `refresh_errors` counts the failed reads, not the calls (Q-706).
 - Clock jumps are statistics, each with its size; they are not a health reason.
 - Every refusal, drop, repeat and delay the specification says is counted appears here. Statistics include, per
   calendar-length interval series, `interval_displaced`, the readings found displaced (spec §5.4), and, per funnel,

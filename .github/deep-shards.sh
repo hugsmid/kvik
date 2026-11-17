@@ -50,8 +50,9 @@ log-pacing      log   pacing
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-patterns   kvik  patterns
+kvik-differential kvik durable_differential --rest
+kvik-differential-small kvik durable_differential small_windows_decide_
 kvik-restore-plan kvik restore_plan_model
-kvik-durable    kvik  durable_differential
 chunk-properties chunk properties
 chunk-fuzz-inputs chunk fuzz_inputs
 files-records   files records
@@ -70,7 +71,8 @@ backup-chain    backup restore_chain_properties
 export-layout   export layout
 log-lookup      log   lib         reader::tests::lookup_properties::
 log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_zero_byte writer::seg_index::tests::
-kvik-bounded    kvik  lib         durable::ingest::bounded::
+kvik-units      kvik  lib         durable::by_id::tests::
+kvik-ingest     kvik  lib         durable::ingest::
 '
 
 cd "$(dirname "$0")/.."

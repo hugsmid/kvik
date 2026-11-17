@@ -126,6 +126,9 @@ impl StoreConfig {
         if self.limits.consumer_queue == 0 {
             return bad("limits.consumer_queue", "at least 1");
         }
+        if self.limits.window_memory < 4 << 10 {
+            return bad("limits.window_memory", "at least 4 KiB");
+        }
         Ok(())
     }
 }
@@ -149,8 +152,11 @@ pub struct LogConfig {
     pub segment_size: u64,
     /// A segment is sealed after this long at the latest (default 5 minutes).
     pub seal_interval: Duration,
-    /// Batch syncs are due at least this far apart (default 10 ms; 0 disables; spec §3 Group commit).
+    /// The ceiling of the batch-sync interval (default 10 ms; 0 disables the bound; spec §3 Group commit).
     pub min_sync_interval: Duration,
+    /// The least batch-sync interval, which adapts to the sync's duration between this and `min_sync_interval`;
+    /// at or above `min_sync_interval` the interval is fixed (default 2 ms; spec §3 Group commit, Q-710).
+    pub sync_interval_floor: Duration,
     /// Largest batch (default 1 MiB; 64 KiB to 8 MiB).
     pub max_batch_bytes: u64,
     /// Mark sync (default every second).
@@ -163,6 +169,7 @@ impl Default for LogConfig {
             segment_size: 64 << 20,
             seal_interval: Duration::from_secs(300),
             min_sync_interval: Duration::from_millis(10),
+            sync_interval_floor: kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR,
             max_batch_bytes: 1 << 20,
             mark_sync: MarkSync::Interval(Duration::from_secs(1)),
         }
@@ -211,7 +218,16 @@ pub struct Limits {
     /// Consumers a store can have; the model backend reserves this many
     /// consumer slots when the store is created (default 64).
     pub max_consumers: usize,
+    /// Bytes the recent windows may hold in all (spec §5.1, Q-751): half for the writer's decision windows and
+    /// revised-key index, half for the deliverer's windows; beyond it the oldest entries are read from the log
+    /// instead. Default [`WINDOW_MEMORY_DESKTOP`]; [`WINDOW_MEMORY_MINIMAL`] suits the minimal hardware class.
+    pub window_memory: u64,
 }
+
+/// The default `limits.window_memory`, for the desktop class (4 or more cores, 8 GB or more).
+pub const WINDOW_MEMORY_DESKTOP: u64 = 512 << 20;
+/// `limits.window_memory` for the minimal class (1 to 3 GB of memory).
+pub const WINDOW_MEMORY_MINIMAL: u64 = 64 << 20;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -224,6 +240,7 @@ impl Default for Limits {
             default_lateness_bound: Duration::from_secs(300),
             consumer_queue: 4_096,
             max_consumers: 64,
+            window_memory: WINDOW_MEMORY_DESKTOP,
         }
     }
 }

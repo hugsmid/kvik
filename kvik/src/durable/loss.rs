@@ -26,6 +26,22 @@ struct State {
     /// Every closed range taken, in the order taken (Q-938).
     closed: Vec<(LogPos, LogPos)>,
     regions: Regions,
+    /// The last position the start read; set once the start is done.
+    kept_head: Option<LogPos>,
+}
+
+/// Q-928, proposal: damage the store's own reader finds in a batch the start had read (the kept log) is a loss like any
+/// other. Off, such a find is not latched: `losses()` does not report it and the decisions are not told, so a replay
+/// of a fact still in the recent window is dropped until the next start records the loss.
+const LATCH_DAMAGE_TO_THE_KEPT_LOG_A_QUERY_FINDS: bool = true;
+
+/// Which reader found a loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FoundBy {
+    /// The reader that answers the store's queries.
+    Query,
+    /// The start, the loss watch or the deliverer.
+    Scan,
 }
 
 /// A lost range for the writer's decisions, and whether its find grew the regions found (Q-943): a find of damage
@@ -48,9 +64,13 @@ impl Latch {
     }
 
     /// Notes losses found by a read.
-    pub(crate) fn note(&self, found: &[Find]) {
+    pub(crate) fn note(&self, found: &[Find], by: FoundBy) {
         let mut s = self.lock();
         for f in found {
+            let in_kept_log = s.kept_head.is_some_and(|h| f.closed.0 <= h);
+            if by == FoundBy::Query && in_kept_log && !LATCH_DAMAGE_TO_THE_KEPT_LOG_A_QUERY_FINDS {
+                continue;
+            }
             let l = &f.report;
             let grew = !s.regions.covers(f.file_id, f.span.0, f.span.1);
             s.regions.insert(f.file_id, f.span.0, f.span.1);
@@ -66,6 +86,14 @@ impl Latch {
             }
             hold(&mut s.found, l);
         }
+    }
+
+    /// Marks the end of the start's read at `head`; the ranges the start found are not for the decisions, which it
+    /// built without them.
+    pub(crate) fn started(&self, head: LogPos) {
+        let mut s = self.lock();
+        s.kept_head = Some(head);
+        s.fresh.clear();
     }
 
     /// The lost ranges found since the last call.

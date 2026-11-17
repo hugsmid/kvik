@@ -27,9 +27,10 @@ impl Writer {
             .ok_or_else(|| Error::ReadOnly("the start could not read the log".into()))
     }
 
-    /// Takes the batches acknowledged since the last call into the consumers' queues.
+    /// Takes the batches acknowledged since the last call into the consumers' queues; with no consumer, left to the
+    /// `kvik-deliver` thread (Q-706).
     pub(crate) fn deliver(&self) {
-        if let Some(h) = &self.hub {
+        if let Some(h) = self.hub.as_ref().filter(|h| h.has_consumers()) {
             h.run(|d, c| d.pump(c));
             h.wait_wakes();
         }
@@ -52,9 +53,10 @@ impl Writer {
     }
 
     /// Runs the timers that are due, before a call is decided, as the model backend runs them; the batches and the
-    /// cursor files are left to the acknowledgement and the `kvik-deliver` thread.
+    /// cursor files are left to the acknowledgement and the `kvik-deliver` thread. With no consumer there is nothing
+    /// to evaluate (Q-706).
     pub(crate) fn run_timers(&self) {
-        if let Some(h) = &self.hub {
+        if let Some(h) = self.hub.as_ref().filter(|h| h.has_consumers()) {
             h.ticked();
             h.run(|d, c| d.tick(c));
         }
@@ -62,16 +64,23 @@ impl Writer {
 
     /// Writes the registry file again after a routing change (Q-130), so that a start knows every consumer from the
     /// registry file and the unsealed segments: up to the last synced mark, which the change's acknowledgement
-    /// moved past it.
+    /// moved past it. From the deliverer's index once it has taken the log that far; the store's own reader
+    /// otherwise.
     fn write_registry_file(&self) -> Result<(), Error> {
         let Some(st) = self.log().as_ref().map(kvik_log::writer::Log::stats) else {
             return Err(Error::Closed);
         };
-        let file = self
-            .reader()
-            .map_err(|e| Error::Internal(e.to_string()))?
-            .with(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
-            .map_err(|e| Error::Internal(e.to_string()))?;
+        let held = self.hub.as_ref().and_then(|h| {
+            h.run_quiet(|d, c| d.routing_registry_file(c, st.mark_synced, st.max_series_id))
+        });
+        let file = match held {
+            Some(f) => f,
+            None => self
+                .reader()
+                .map_err(|e| Error::Internal(e.to_string()))?
+                .with(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
+                .map_err(|e| Error::Internal(e.to_string()))?,
+        };
         let wall = self.env.clock.wall().0;
         kvik_log::registry::write(&*self.env.fs, &self.dir, self.store_id, wall, &file).map_err(
             |e| {
@@ -116,6 +125,9 @@ impl Writer {
             crate::pattern::check(p).map_err(Error::Pattern)?;
         }
         let emits = emits_in(emits);
+        // Before the pumps below (Q-706). A take refused after this leaves the flag raised for the run, which
+        // only costs emits the work they would skip.
+        hub.consumer_coming();
         let mut d = lock(&self.decider);
         let change = hub.run(|dl, c| -> Result<Option<Routing>, Error> {
             dl.pump(c);
@@ -147,9 +159,13 @@ impl Writer {
         }
         drop(d);
         let r = hub.run(|dl, c| {
+            #[cfg(test)]
+            super::pause::at(&self.dir, super::pause::Point::SetUpPump);
             dl.pump(c);
             dl.take(name, start, c)
         })?;
+        #[cfg(test)]
+        super::pause::at(&self.dir, super::pause::Point::TakeSetUp);
         self.flush(r)
     }
 

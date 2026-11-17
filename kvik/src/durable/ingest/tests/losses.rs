@@ -493,3 +493,65 @@ fn a_reference_fact_found_below_an_incomplete_part_leaves_the_reference_at_most_
         )]
     );
 }
+
+#[test]
+fn a_fact_taken_while_the_clock_is_unsynchronised_leaves_the_lateness_reference_alone() {
+    let mut d = with_observed(decider(History::default()));
+    let mut mem = Mem::default();
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(5, WALL - 100 * S, 1.0, None)],
+        Intent::Normal,
+        1,
+    );
+    let unsynced = Clock {
+        synced: false,
+        ..CLOCK
+    };
+    let mut plan = d.plan(
+        &[reading(5, WALL, 2.0, None)],
+        Intent::Normal,
+        unsynced,
+        2,
+        &mut mem,
+    );
+    d.apply(&mut plan);
+    let p = commit(
+        &mut d,
+        &mut mem,
+        &[reading(5, WALL - 50 * S, 3.0, None)],
+        Intent::Normal,
+        3,
+    );
+    assert!(!late(&p));
+}
+
+/// Q-925 as proposed (the switch in `Decider::read_reference`): with rule (b) the reading is late.
+#[test]
+fn a_reading_whose_reference_cannot_be_read_is_not_late_and_is_counted() {
+    let mut d = with_observed(decider(History::default()));
+    let mut mem = Mem::default();
+    commit(
+        &mut d,
+        &mut mem,
+        &[reading(5, WALL, 1.0, None)],
+        Intent::Normal,
+        1,
+    );
+    settle(&mut d, &mut mem, 2, &[(1, 1)]);
+    mem.incomplete_from = Some(WALL - 200 * S);
+    let p = one(&d, &mut mem, reading(5, WALL - 50 * S, 1.0, None), 2);
+    assert!(!late(&p));
+    assert_eq!(p.reference_unread, 1);
+    assert_eq!(
+        p.references,
+        vec![(
+            5,
+            Reference::AtMost {
+                upper: WALL,
+                least: None
+            }
+        )]
+    );
+}

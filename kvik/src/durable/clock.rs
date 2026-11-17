@@ -53,10 +53,17 @@ impl Clocks {
         s.now
     }
 
-    /// Notes a commit that refreshes the live staleness of series `id`.
-    pub(crate) fn refresh(&self, id: u32) {
+    /// Notes a commit that refreshes the live staleness of the series `ids`, all at one instant: one clock read and
+    /// one lock per acknowledged call.
+    pub(crate) fn refresh(&self, ids: &[u32]) {
+        if ids.is_empty() {
+            return;
+        }
         let mono = self.env.monotonic().0;
-        self.lock().refreshed.insert(id, mono);
+        let mut s = self.lock();
+        for &id in ids {
+            s.refreshed.insert(id, mono);
+        }
     }
 
     /// Nanoseconds on the monotonic clock since the last commit that refreshed series `id` in this process.
@@ -66,5 +73,46 @@ impl Clocks {
             .refreshed
             .get(&id)
             .map(|m| i64::try_from(mono.saturating_sub(*m)).unwrap_or(i64::MAX))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::env::Monotonic;
+    use crate::time::Timestamp;
+
+    /// A clock whose monotonic time moves on by a second at every read.
+    #[derive(Debug, Default)]
+    struct Ticking(AtomicU64);
+
+    impl Clock for Ticking {
+        fn wall(&self) -> Timestamp {
+            Timestamp(0)
+        }
+        fn monotonic(&self) -> Monotonic {
+            Monotonic(self.0.fetch_add(1_000_000_000, Ordering::SeqCst))
+        }
+        fn synchronised(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_series_of_one_call_are_refreshed_at_one_instant_with_one_clock_read() {
+        let env = Arc::new(Ticking::default());
+        let c = Clocks::new(env.clone());
+        let before = env.0.load(Ordering::SeqCst);
+        c.refresh(&[7, 3, 7, 5]);
+        assert_eq!(env.0.load(Ordering::SeqCst) - before, 1_000_000_000);
+        let since: Vec<_> = [3, 5, 7]
+            .iter()
+            .map(|id| c.lock().refreshed.get(id).copied())
+            .collect();
+        assert_eq!(since, vec![Some(before); 3]);
+        c.refresh(&[]);
+        assert_eq!(env.0.load(Ordering::SeqCst) - before, 1_000_000_000);
     }
 }

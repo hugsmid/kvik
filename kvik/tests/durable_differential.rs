@@ -1,7 +1,9 @@
-//! The durable backend decides every outcome as the model backend does, over generated histories.
+//! The durable backend decides every outcome as the model backend does, on generated histories that revisit keys
+//! outside the recent window and restart the store (roadmap 11.0).
 
 mod common;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::durable::{World, gauge};
@@ -32,6 +34,8 @@ enum Step {
     Advance(u64),
     /// The clock is reported synchronised or not (spec §2.5).
     Synced(bool),
+    /// The store is shut down and opened again.
+    Restart,
 }
 
 fn specs() -> Vec<SeriesSpec> {
@@ -106,9 +110,10 @@ fn quality(code: u8) -> Quality {
 }
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
+    // Times far apart as well, so that keys leave the recent window (15 minutes) and are met again (roadmap 11.0).
     let reading = (
         0usize..9,
-        -400i64..200,
+        prop_oneof![8 => -400i64..200, 2 => -4_000i64..4_000],
         any::<u8>(),
         any::<u8>(),
         // The bound of a `time` `changed_at` (Q-195) as well as small versions.
@@ -119,9 +124,26 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         ],
         prop::bool::weighted(0.15),
     );
+    // A few keys of the plain gauge and the versioned series, so that duplicates and outranked facts of both meet
+    // within one call, interleaved.
+    let keyed = (
+        prop::sample::select(vec![0usize, 4]),
+        prop::sample::select(vec![0i64, 1, 2, 3, 1_500, 3_000]),
+        0u8..2,
+        0u8..2,
+        0u64..3,
+    )
+        .prop_map(|(i, t, v, q, c)| (i, t, v, q, (i == 4).then_some(c), false));
+    // Calls on two keys of the versioned series alone, so that an earlier reading of a call is often outranked at
+    // commit while a later one becomes current (Q-705).
+    let versions = (prop::sample::select(vec![0i64, 1]), 0u8..2, 0u64..4)
+        .prop_map(|(t, v, c)| (4usize, t, v, 0u8, Some(c), false));
     let step = prop_oneof![
         10 => (prop::collection::vec(reading, 1..6), any::<bool>())
             .prop_map(|(r, rev)| Step::Emit(r, rev)),
+        4 => (prop::collection::vec(keyed, 1..6), prop::bool::weighted(0.2))
+            .prop_map(|(r, rev)| Step::Emit(r, rev)),
+        2 => prop::collection::vec(versions, 2..6).prop_map(|r| Step::Emit(r, false)),
         1 => (0usize..8, -100i64..20).prop_map(|(i, t)| Step::Retire(i, t)),
         1 => (0usize..8, 0usize..ALIASES.len()).prop_map(|(i, n)| Step::Alias(i, n)),
         1 => (0usize..8).prop_map(Step::Define),
@@ -129,8 +151,16 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         1 => (0usize..ZONES.len(), -100i64..100).prop_map(|(z, t)| Step::SiteZone(z, t)),
         2 => (0u64..400).prop_map(Step::Advance),
         1 => prop::bool::weighted(0.7).prop_map(Step::Synced),
+        1 => Just(Step::Restart),
     ];
     prop::collection::vec(step, 1..16)
+}
+
+fn outranked_on_arrival(s: &Store, ids: &[SeriesId]) -> u64 {
+    ids.iter()
+        .filter_map(|id| s.series_stats(*id))
+        .map(|st| st.outranked_on_arrival)
+        .sum()
 }
 
 /// What a history gives on one backend: every result in a comparable form, and per series its facts in each view.
@@ -143,7 +173,13 @@ struct Run {
 /// Runs a history on a store. Positions differ between the backends only by entries that are not facts (the model
 /// writes no recovery or tzdata entry); facts are compared without them, and the as-of views at the positions each
 /// backend gave the same readings.
-fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
+fn run(open: &dyn Fn(&str) -> Store, clock: &ManualClock, history: &[Step]) -> (Run, Store) {
+    // The zone in force: the site-zone entry of the greatest effective time, the later on a tie (spec §5.7).
+    let mut zones: std::collections::BTreeMap<i64, &str> = std::collections::BTreeMap::new();
+    let in_force = |z: &std::collections::BTreeMap<i64, &'static str>| {
+        z.values().next_back().copied().unwrap_or("Europe/London")
+    };
+    let mut s = open(in_force(&zones));
     let mut out = Vec::new();
     let mut ids: Vec<SeriesId> = specs()
         .into_iter()
@@ -168,6 +204,7 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
                         r
                     })
                     .collect();
+                let outranked_before = outranked_on_arrival(&s, &all);
                 let intent = if *revise {
                     Intent::Revise
                 } else {
@@ -187,6 +224,26 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
                     block_on(s.emit_with(&readings, intent))
                 }
                 .unwrap();
+                let outranked_then_current =
+                    rs.iter().zip(&ack.outcomes).enumerate().any(|(k, (r, o))| {
+                        matches!(
+                            o,
+                            Outcome::Recorded {
+                                outranked: true,
+                                ..
+                            }
+                        ) && rs.iter().zip(&ack.outcomes).skip(k + 1).any(|(later, lo)| {
+                            (later.0, later.1) == (r.0, r.1)
+                                && matches!(
+                                    lo,
+                                    Outcome::Recorded {
+                                        outranked: false,
+                                        ..
+                                    }
+                                )
+                        })
+                    });
+                WITHIN_CALL.fetch_add(u64::from(outranked_then_current), Ordering::Relaxed);
                 let outcomes: Vec<String> = ack
                     .outcomes
                     .iter()
@@ -203,6 +260,11 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
                     })
                     .collect();
                 out.push(format!("emit {outcomes:?}"));
+                // Per call: the backends rebuild different counters at a start.
+                out.push(format!(
+                    "outranked_on_arrival +{}",
+                    outranked_on_arrival(&s, &all) - outranked_before
+                ));
             }
             Step::Retire(i, t) => out.push(format!(
                 "retire {:?}",
@@ -240,16 +302,23 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
                         .map_err(|e| e.to_string())
                 ));
             }
-            Step::SiteZone(z, t) => out.push(format!(
-                "zone {:?}",
-                block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)))
-                    .map_err(|e| e.to_string())
-            )),
+            Step::SiteZone(z, t) => {
+                let r = block_on(s.set_site_zone(&ZoneName::new(ZONES[*z]), at(*t)));
+                if r.is_ok() {
+                    zones.insert(*t, ZONES[*z]);
+                }
+                out.push(format!("zone {:?}", r.map_err(|e| e.to_string())));
+            }
             Step::Advance(secs) => {
                 clock.advance(Duration::from_secs(*secs));
                 times.push(clock.wall());
             }
             Step::Synced(on) => clock.set_synchronised(*on),
+            Step::Restart => {
+                block_on(s.shutdown()).unwrap();
+                drop(s);
+                s = open(in_force(&zones));
+            }
         }
     }
     clock.set_synchronised(true);
@@ -291,38 +360,47 @@ fn run(s: &Store, clock: &ManualClock, history: &[Step]) -> Run {
             )
         })
         .collect();
-    Run { out, facts, infos }
+    (Run { out, facts, infos }, s)
 }
 
-/// Runs `history` on both backends and compares what they give.
-fn compare(history: &[Step]) -> Result<(), TestCaseError> {
+/// Runs `history` on both backends and compares what they give; with `small`, the durable store's windows hold a
+/// few dozen facts (`limits.window_memory` of 8 KiB, so that the byte bound sends keys to the slow path, Q-751).
+/// Returns the readings the durable backend decided by the slow path.
+fn compare(history: &[Step], small: bool) -> Result<u64, TestCaseError> {
     let m_clock = ManualClock::new(start());
-    let model = block_on(Store::open(
-        StoreConfig::new(
-            format!("kvik-test/differential/{}", next()),
-            "Europe/London",
-        )
-        .create_if_missing(true)
-        .backend(Backend::Model)
-        .env(Env::test(m_clock.clone())),
-    ))
-    .unwrap();
+    let m_config = StoreConfig::new(
+        format!("kvik-test/differential/{}", next()),
+        "Europe/London",
+    )
+    .create_if_missing(true)
+    .backend(Backend::Model)
+    .env(Env::test(m_clock.clone()));
     let w = World::new("differential");
     let mut config = w.config();
     config.log.min_sync_interval = Duration::ZERO;
-    let durable = block_on(Store::open(config)).unwrap();
-    let m = run(&model, &m_clock, history);
-    let d = run(&durable, &w.clock, history);
+    if small {
+        config.limits.window_memory = 8 << 10;
+    }
+    // A restart opens with the site zone in force (`docs/api.md` Opening).
+    let in_zone = |c: &StoreConfig, z: &str| {
+        let mut c = c.clone();
+        c.time_zone = z.into();
+        block_on(Store::open(c)).unwrap()
+    };
+    let (m, model) = run(&|z| in_zone(&m_config, z), &m_clock, history);
+    let (d, durable) = run(&|z| in_zone(&config, z), &w.clock, history);
+    let slow = durable.stats().ingest.slow_path;
     prop_assert_eq!(&m.out, &d.out);
     prop_assert_eq!(&m.infos, &d.infos);
     prop_assert_eq!(&m.facts, &d.facts);
     block_on(durable.shutdown()).unwrap();
     block_on(model.shutdown()).unwrap();
-    Ok(())
+    Ok(slow)
 }
 
-#[test]
-fn the_durable_backend_decides_as_the_model_does() {
+/// Runs the differential histories, each with small windows when `small` gives true. Returns the histories run with
+/// small windows and with the default, and the readings decided by the slow path.
+fn differential(small: impl Strategy<Value = bool>) -> (u64, u64, u64) {
     // Each case opens a durable store; a quarter of the configured cases keeps the deep run in bounds.
     let cases = (ProptestConfig::default().cases / 4).max(16);
     let mut runner = TestRunner::new(ProptestConfig {
@@ -330,24 +408,62 @@ fn the_durable_backend_decides_as_the_model_does() {
         failure_persistence: None,
         ..ProptestConfig::default()
     });
-    runner.run(&steps(), |history| compare(&history)).unwrap();
+    let (smalls, defaults, slow) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    runner
+        .run(&(steps(), small), |(history, small)| {
+            let n = if small { &smalls } else { &defaults };
+            n.fetch_add(1, Ordering::Relaxed);
+            slow.fetch_add(compare(&history, small)?, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+    (
+        smalls.into_inner(),
+        defaults.into_inner(),
+        slow.into_inner(),
+    )
+}
+
+/// Half the histories, chosen with each history, run with small windows.
+#[test]
+fn the_durable_backend_decides_as_the_model_does() {
+    let (small, default, slow) = differential(prop::bool::weighted(0.5));
+    assert!(small > 0 && default > 0, "{small} small, {default} default");
+    assert!(slow > 0, "some history takes the slow path");
+    assert!(
+        WITHIN_CALL.load(Ordering::Relaxed) > 0,
+        "some call records a reading outranked at commit and then its key's current fact (Q-705)"
+    );
+}
+
+/// Calls of the differential histories holding a reading outranked at commit and a later reading of its key that is
+/// not (Q-705).
+static WITHIN_CALL: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn small_windows_decide_as_the_model_does() {
+    let (small, default, slow) = differential(Just(true));
+    assert_eq!(default, 0);
+    assert!(small > 0 && slow > 0);
 }
 
 #[test]
 fn a_reading_taken_unsynchronised_leaves_the_lateness_reference_in_both_backends() {
     let emit = |t| Step::Emit(vec![(0, t, 0, 0, None, false)], false);
-    compare(&[
-        emit(-100),
-        Step::Synced(false),
-        emit(100),
-        Step::Synced(true),
-        emit(0),
-    ])
+    compare(
+        &[
+            emit(-100),
+            Step::Synced(false),
+            emit(100),
+            Step::Synced(true),
+            emit(0),
+        ],
+        false,
+    )
     .unwrap();
 }
 
 fn next() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Ordering::SeqCst)
 }

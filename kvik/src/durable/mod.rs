@@ -14,6 +14,7 @@
 //! saved points (5.3), windowed operators in funnels, stored summaries (7.x), decimal series, calendar-length
 //! interval series and parameter changes other than the retention class, compaction (6.x), backup and restore (8.x).
 
+mod by_id;
 mod clock;
 mod completion;
 mod consumers;
@@ -21,19 +22,23 @@ mod deliver;
 mod emit;
 mod entries;
 #[cfg(test)]
-#[allow(dead_code)]
+mod held_state;
 mod history;
 mod index;
 mod ingest;
-#[cfg(test)]
-#[allow(dead_code)]
 mod keys;
 mod loss;
 mod open;
+#[cfg(test)]
+mod pause;
 pub(crate) mod reader;
+#[cfg(test)]
+mod registering;
 mod registry;
 mod routing;
+mod start;
 mod status;
+mod summary;
 mod windows;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -177,8 +182,15 @@ pub(crate) fn store_error(dir: &Path, e: StoreError) -> OpenError {
 #[derive(Debug, Default)]
 struct Counters {
     series: BTreeMap<u32, SeriesStats>,
+    /// The start read the kept log whole into memory (Q-752).
+    start_whole: bool,
+    /// Damaged regions the start passed over that no lost range records (Q-755).
+    start_regions: u64,
+    /// Readings recorded unchecked because local data could not be read (Q-750).
+    unchecked_readings: u64,
     waits: BTreeMap<Wait, u64>,
     waited: Duration,
+    slow_path: u64,
     latencies: VecDeque<Duration>,
     max_latency: Duration,
 }
@@ -197,6 +209,8 @@ pub(crate) struct Writer {
     own_fault: Mutex<Option<LogFault>>,
     store_id: [u8; 16],
     decider: Mutex<Decider>,
+    /// The slow path's reads of local data, taken after the decision lock (roadmap 11.0).
+    local: Mutex<Box<dyn keys::LocalFacts>>,
     counters: Mutex<Counters>,
     reader: Mutex<Option<Arc<DurableReader>>>,
     /// Acknowledged `data_lost` identities, each with the range it had then (spec §8 Acknowledging a loss: a range
@@ -212,8 +226,8 @@ pub(crate) struct Writer {
     hub: Option<Arc<deliver::Hub>>,
     /// The losses the scanning readers of this process find (Q-200).
     latch: Arc<Latch>,
-    /// The reader `losses` and `health` move (Q-927); `None` when it could not be opened.
-    watch: Mutex<Option<loss::Watch>>,
+    /// The reader `losses` and `health` move (Q-927).
+    watch: Mutex<loss::Watch>,
     /// The losses the start found and could not record (`spec.md` §3 Order of a start, step 3).
     start_losses: Vec<LossReport>,
 }
@@ -276,9 +290,19 @@ impl Writer {
         Ok(opened)
     }
 
+    /// From the deliverer's held state; the reader of the process only when there is no deliverer or its
+    /// summaries could not be made exact.
     pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, QueryError> {
+        if let Some(r) = self.held(|d| d.series(key)) {
+            return r.map_err(Error::query);
+        }
         self.reader()?.with(|i, _| i.series(key))
     }
+}
+
+/// Each side's share of `limits.window_memory`: the writer's decision windows and the deliverer's windows (Q-751).
+fn window_budget(l: &Limits) -> usize {
+    usize::try_from(l.window_memory / 2).unwrap_or(usize::MAX)
 }
 
 /// Reads of a durable store: the queries a log reader can answer.
@@ -349,4 +373,136 @@ pub(crate) fn interval(
 /// The reader state of a durable reader.
 pub(crate) fn refresh(r: &DurableReader) -> Result<ReaderState, QueryError> {
     r.refresh()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use super::Writer;
+    use super::completion::Emitted;
+    use super::pause::{Gate, Point};
+    use crate::config::{LogConfig, StoreConfig};
+    use crate::env::{Env, ManualClock, MemFs};
+    use crate::error::EmitError;
+    use crate::series::{Kind, SeriesSpec, ValueType};
+    use crate::types::{Intent, Reading, Value};
+
+    #[test]
+    fn each_side_gets_half_of_window_memory() {
+        let limits = crate::config::Limits {
+            window_memory: 64 << 20,
+            ..crate::config::Limits::default()
+        };
+        assert_eq!(super::window_budget(&limits), 32 << 20);
+    }
+
+    /// Runs a future to its end on this thread.
+    pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let mut f = std::pin::pin!(f);
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::park();
+        }
+    }
+
+    /// Polls a queued call to its end on this thread.
+    pub(super) fn wait(mut q: super::Queued) -> Result<crate::types::Ack, EmitError> {
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(r) = q.poll(&mut cx) {
+                return q.finish(r);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A duplicate decided while the original's call has been decided but not yet returned still finds that call
+    /// and waits for it: here the original's sync fails, so neither is acknowledged (Q-123 (b)).
+    #[test]
+    fn a_duplicate_decided_right_after_the_original_waits_for_it() {
+        let fs = MemFs::new();
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(fs.clone());
+        let log = LogConfig {
+            segment_size: 16 << 20,
+            ..LogConfig::default()
+        };
+        let dir = PathBuf::from("durable-unit/decided");
+        let config = StoreConfig::new(&dir, "Europe/London")
+            .create_if_missing(true)
+            .env(env)
+            .log(log);
+        let w = Writer::open(&config).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let id = w.define(&spec).unwrap();
+        let reading = [Reading::new(id, clock.wall(), Value::F64(1.0))];
+
+        // The original's batch sync is held, then fails.
+        let (sync_entered, sync_seen) = mpsc::channel::<()>();
+        let (sync_release, sync_wait) = mpsc::channel::<()>();
+        let sync_wait = Mutex::new(sync_wait);
+        let sync_armed = Arc::new(AtomicBool::new(true));
+        let failing = fs.clone();
+        let armed = sync_armed.clone();
+        fs.set_sync_hook(Some(Arc::new(move |p: &Path| {
+            let in_use = p
+                .to_str()
+                .is_some_and(|p| p.ends_with("-0000000000000001.open"));
+            if in_use && armed.swap(false, Ordering::SeqCst) {
+                sync_entered.send(()).unwrap();
+                sync_wait.lock().unwrap().recv().unwrap();
+                failing.fail_syncs(true);
+            }
+        })));
+        let paused = Gate::new(&dir, Point::AfterDecision);
+
+        let w2 = w.clone();
+        let first = reading.clone();
+        let original = std::thread::spawn(move || match w2.emit(&first, Intent::Normal, false) {
+            Ok(Emitted::Queued(q)) => wait(q),
+            Ok(Emitted::Ready(a)) => Ok(a),
+            Err(e) => Err(e),
+        });
+        paused.reached();
+        // The duplicate, decided now, must wait for the original's call.
+        let duplicate = match w.emit(&reading, Intent::Normal, false) {
+            Ok(Emitted::Queued(q)) => q,
+            Ok(Emitted::Ready(a)) => panic!("acknowledged before the original: {:?}", a.outcomes),
+            Err(e) => panic!("{e:?}"),
+        };
+        paused.release();
+        sync_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the original's sync started");
+        sync_release.send(()).unwrap();
+        assert!(matches!(wait(duplicate), Err(EmitError::OutcomeUnknown(_))));
+        assert!(matches!(
+            original.join().unwrap(),
+            Err(EmitError::OutcomeUnknown(_))
+        ));
+        fs.set_sync_hook(None);
+    }
 }

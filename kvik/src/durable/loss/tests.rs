@@ -198,7 +198,7 @@ fn find(first: u64, last: u64) -> Find {
 #[test]
 fn the_latch_holds_one_report_per_loss_in_order_and_a_bridged_pair_becomes_one() {
     let latch = Latch::default();
-    latch.note(&[find(20, 22), find(5, 6), find(40, 41)]);
+    latch.note(&[find(20, 22), find(5, 6), find(40, 41)], FoundBy::Scan);
     let ids = |l: &Latch| -> Vec<(Position, Option<Position>, Option<Position>)> {
         l.found()
             .iter()
@@ -214,9 +214,9 @@ fn the_latch_holds_one_report_per_loss_in_order_and_a_bridged_pair_becomes_one()
             (p(40), Some(p(40)), Some(p(41)))
         ]
     );
-    latch.note(&[find(21, 23)]);
+    latch.note(&[find(21, 23)], FoundBy::Scan);
     assert_eq!(ids(&latch)[1], (p(20), Some(p(20)), Some(p(23))));
-    latch.note(&[find(23, 40)]);
+    latch.note(&[find(23, 40)], FoundBy::Scan);
     assert_eq!(
         ids(&latch),
         vec![
@@ -232,7 +232,7 @@ fn the_latch_holds_one_report_per_loss_in_order_and_a_bridged_pair_becomes_one()
 fn closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_never() {
     let latch = Latch::default();
     let (mut a, mut b) = (0, 0);
-    latch.note(&[find(5, 6)]);
+    latch.note(&[find(5, 6)], FoundBy::Scan);
     assert_eq!(latch.closed_since(&mut a), vec![(at(5), at(6))]);
     let mut f = Finder::default();
     let empty = f.apply(
@@ -240,8 +240,8 @@ fn closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_never() {
         MARK,
     );
     assert!(empty[0].closed.0 > empty[0].closed.1);
-    latch.note(&empty);
-    latch.note(&[find(9, 9)]);
+    latch.note(&empty, FoundBy::Scan);
+    latch.note(&[find(9, 9)], FoundBy::Scan);
     assert_eq!(latch.closed_since(&mut a), vec![(at(9), at(9))]);
     assert_eq!(
         latch.closed_since(&mut b),
@@ -311,7 +311,11 @@ fn the_watchs_reports_taken_in_parts_equal_a_full_reads_and_it_keeps_no_segment_
     }
     damage(&fs, &dir, b"W-SIX");
 
-    let mut watch = Watch::with_part(log_reader(&dir, &env, Duration::from_secs(60)).unwrap(), 1);
+    let mut watch = Watch::with_part(
+        log_reader(&dir, &env, Duration::from_secs(60)).unwrap(),
+        Finder::default(),
+        1,
+    );
     watch.catch_up(&Latch::default()).unwrap();
     assert_eq!(watch.kept_bytes(), 0);
     let full = DurableReader::open(&dir, &env, Duration::from_secs(60))
@@ -344,7 +348,7 @@ fn a_region_inside_a_report_held_too_wide_still_reaches_the_latch_with_its_close
         ],
         at(7),
     );
-    latch.note(&found);
+    latch.note(&found, FoundBy::Scan);
     assert_eq!(found[0].closed, (at(3), at(4)));
     assert_eq!(found[0].report.last, Some(Position::new(0, 7)));
     let tail = ReadEvent::Corruption {
@@ -368,7 +372,7 @@ fn a_region_inside_a_report_held_too_wide_still_reaches_the_latch_with_its_close
         Some(Position::new(0, 7)),
         "the held report, unchanged"
     );
-    latch.note(&found);
+    latch.note(&found, FoundBy::Scan);
     let mut seen = 1;
     assert_eq!(latch.closed_since(&mut seen), vec![(at(6), at(7))]);
     assert!(latch.covers(2, 300, 364));

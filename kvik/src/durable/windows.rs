@@ -65,6 +65,57 @@ pub(crate) fn params(d: &Definition) -> Params {
     }
 }
 
+/// A current fact as a summarised reading (spec §5.2): `None` for bad quality, which summaries ignore, and for a
+/// state index the series does not declare. A named state is folded by its index.
+pub(crate) fn reading_of(series: &Series, s: &Stored) -> Option<Reading> {
+    let r = &s.row;
+    if r.quality == LogQuality::Bad {
+        return None;
+    }
+    let v = match &r.value {
+        LogValue::F64(bits) => kvik_tree::Value::F64(f64::from_bits(*bits)),
+        LogValue::State(i) => {
+            series.def.state_names.get(usize::from(*i))?;
+            kvik_tree::Value::State(*i)
+        }
+        LogValue::Bool(b) => kvik_tree::Value::Bool(*b),
+        LogValue::Text(t) => kvik_tree::Value::Text(t.clone()),
+        // Decimal series are refused at definition until roadmap 6.x.
+        LogValue::Decimal { .. } | LogValue::Absent { .. } => return None,
+    };
+    Some((r.t, v))
+}
+
+/// Whether a current fact can be a series' live-state fact at `now` (spec §2.3): not bad quality, and for an
+/// observed interval series ended (`t + d ≤ now`).
+pub(crate) fn may_be_live(series: &Series, p: &Params, s: &Stored, now: i64) -> bool {
+    reading_of(series, s).is_some() && p.ready_at(s.row.t) <= now
+}
+
+/// Live state from its fact, with its staleness (spec §5.4): for a scheduled series when `now` is later than its
+/// `t` by more than S; for an observed series when more than S has passed since its last refreshing commit in this
+/// process, or else in event time ([`super::clock`]).
+pub(crate) fn live_with(
+    p: &Params,
+    clocks: &super::clock::Clocks,
+    id: SeriesId,
+    s: &Stored,
+    now: i64,
+) -> Live {
+    let stale = match (p.timing, p.staleness) {
+        (_, None) => false,
+        (km::registry::Timing::Observed, Some(limit)) => match clocks.since_refresh(id.0) {
+            Some(d) => d > limit,
+            None => now.saturating_sub(s.row.t) > limit,
+        },
+        (_, Some(limit)) => now.saturating_sub(s.row.t) > limit,
+    };
+    Live::Value(LiveValue {
+        fact: fact_out(s),
+        stale,
+    })
+}
+
 /// A series of the registry with its summary parameters.
 struct Of<'a> {
     index: &'a Index,
@@ -101,25 +152,8 @@ impl<'a> Of<'a> {
             .current_between(self.id(), versioned, from, to, rev)
     }
 
-    /// A current fact as a summarised reading (spec §5.2): `None` for bad quality, which summaries ignore, and for
-    /// a state index the series does not declare. A named state is folded by its index.
     fn reading(&self, s: &Stored) -> Option<Reading> {
-        let r = &s.row;
-        if r.quality == LogQuality::Bad {
-            return None;
-        }
-        let v = match &r.value {
-            LogValue::F64(bits) => kvik_tree::Value::F64(f64::from_bits(*bits)),
-            LogValue::State(i) => {
-                self.series.def.state_names.get(usize::from(*i))?;
-                kvik_tree::Value::State(*i)
-            }
-            LogValue::Bool(b) => kvik_tree::Value::Bool(*b),
-            LogValue::Text(t) => kvik_tree::Value::Text(t.clone()),
-            // Decimal series are refused at definition until roadmap 6.x.
-            LogValue::Decimal { .. } | LogValue::Absent { .. } => return None,
-        };
-        Some((r.t, v))
+        reading_of(self.series, s)
     }
 
     /// The summarised readings with `t` in `[from, to)`.
@@ -174,12 +208,10 @@ pub(crate) fn live_fact(index: &Index, id: SeriesId, now: i64) -> Result<Option<
     // interval series not yet ready (at most d of event time).
     Ok(of
         .current(Bound::Unbounded, Bound::Included(now), true)
-        .find(|s| of.reading(s).is_some() && p.ready_at(s.row.t) <= now))
+        .find(|s| may_be_live(of.series, p, s, now)))
 }
 
-/// Live state (spec §2.3) in an index at `now`, with its staleness (spec §5.4): for a scheduled series when `now`
-/// is later than its `t` by more than S; for an observed series when more than S has passed since its last
-/// refreshing commit in this process, or else in event time ([`super::clock`]).
+/// Live state (spec §2.3) in an index at `now`, with its staleness ([`live_with`]).
 pub(crate) fn live_in(
     index: &Index,
     clocks: &super::clock::Clocks,
@@ -190,18 +222,7 @@ pub(crate) fn live_in(
         return Ok(Live::None);
     };
     let p = params(&Of::new(index, id)?.series.def);
-    let stale = match (p.timing, p.staleness) {
-        (_, None) => false,
-        (km::registry::Timing::Observed, Some(limit)) => match clocks.since_refresh(id.0) {
-            Some(d) => d > limit,
-            None => now.saturating_sub(s.row.t) > limit,
-        },
-        (_, Some(limit)) => now.saturating_sub(s.row.t) > limit,
-    };
-    Ok(Live::Value(LiveValue {
-        fact: fact_out(s),
-        stale,
-    }))
+    Ok(live_with(&p, clocks, id, s, now))
 }
 
 /// Live state (spec §2.3, §5.4) at the reader's `now` ([`live_in`]).

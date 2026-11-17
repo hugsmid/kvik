@@ -26,11 +26,15 @@ impl Regions {
         spans.insert(a, z);
     }
 
-    /// The regions no lost range of `recorded` (the manifest's, by segment and bytes) holds whole (Q-755).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn unrecorded(&self, recorded: &[kvik_log::manifest::LostRange]) -> u64 {
+    /// The regions no lost range of `recorded` (the manifest's, by segment and bytes) holds whole, in segments other
+    /// than `standing` (those of losses the start found and could not record, Q-929), as Q-755 counts them.
+    pub(crate) fn unrecorded(
+        &self,
+        recorded: &[kvik_log::manifest::LostRange],
+        standing: &[u64],
+    ) -> u64 {
         let mut n = 0;
-        for (file_id, spans) in &self.0 {
+        for (file_id, spans) in self.0.iter().filter(|(f, _)| !standing.contains(f)) {
             for (a, z) in spans {
                 let inside = recorded.iter().any(|l| {
                     l.file_id == *file_id
@@ -41,6 +45,13 @@ impl Regions {
             }
         }
         n
+    }
+
+    /// Every span of the union, by segment and offset.
+    pub(crate) fn spans(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.0
+            .iter()
+            .flat_map(|(f, spans)| spans.iter().map(move |(a, z)| (*f, *a, *z)))
     }
 
     /// Whether the union holds the whole span `start..end` of segment `file_id`.
@@ -103,14 +114,27 @@ mod tests {
         };
         let mut r = Regions::default();
         r.insert(3, 64, 400);
-        assert_eq!(r.unrecorded(&[]), 1);
-        assert_eq!(r.unrecorded(&[range(3, 64, 336)]), 0);
+        assert_eq!(r.unrecorded(&[], &[]), 1);
+        assert_eq!(r.unrecorded(&[range(3, 64, 336)], &[]), 0);
         assert_eq!(
-            r.unrecorded(&[range(3, 64, 335)]),
+            r.unrecorded(&[range(3, 64, 335)], &[]),
             1,
             "ends short of the region"
         );
-        assert_eq!(r.unrecorded(&[range(3, 72, 400)]), 1, "starts after it");
-        assert_eq!(r.unrecorded(&[range(4, 64, 336)]), 1, "another segment");
+        assert_eq!(
+            r.unrecorded(&[range(3, 72, 400)], &[]),
+            1,
+            "starts after it"
+        );
+        assert_eq!(
+            r.unrecorded(&[range(4, 64, 336)], &[]),
+            1,
+            "another segment"
+        );
+        assert_eq!(
+            r.unrecorded(&[], &[3]),
+            0,
+            "a start loss in its segment stands for it"
+        );
     }
 }

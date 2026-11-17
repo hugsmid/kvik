@@ -74,6 +74,15 @@ macro_rules! by_backend {
 }
 
 impl Store {
+    /// The writer of a durable store.
+    #[cfg(test)]
+    pub(crate) fn writer(&self) -> Option<&Arc<durable::Writer>> {
+        match &self.inner {
+            StoreInner::Durable(d) => Some(d),
+            StoreInner::Model(_) => None,
+        }
+    }
+
     fn dir_path(&self) -> &Path {
         by_backend!(self, m => m.shared.dir(), d => d.dir())
     }

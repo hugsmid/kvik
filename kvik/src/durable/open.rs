@@ -46,24 +46,34 @@ impl Writer {
         })?;
         let start_fault = writer.fault().cloned();
         let start_losses = start_losses(&writer, env.boot.current());
-        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let latch = Arc::new(Latch::default());
-        // The kept log, read once by the reader this process keeps: the registry and the history of every key.
-        let reader =
-            DurableReader::open_with(&dir, &env, READER_LEASE, clocks.clone(), latch.clone())?;
-        let index = reader
-            .with(|i, _| Ok(i.clone()))
+        // The kept log, read once in parts: the registry, the decision state, the counters and the losses passed over
+        // (roadmap 11.0, design §3.5); its reader then becomes the loss watch.
+        let kept = match start::log_reader(&dir, &env) {
+            Ok(r) => start::read_kept(
+                r,
+                || start::log_reader(&dir, &env),
+                start::PART,
+                window_budget(&config.limits),
+                &latch,
+            )
             .map_err(|e| OpenError::Io {
                 path: dir.clone(),
                 source: io::Error::other(e.to_string()),
-            })?;
-        // The loss watch, at the kept log's head; a catch-up that fails here is tried again at the first ask.
-        let mut watch = reader::log_reader(&dir, &env, READER_LEASE)
-            .ok()
-            .map(loss::Watch::new);
-        if let Some(w) = watch.as_mut() {
-            let _ = w.catch_up(&latch);
-        }
+            })?,
+            Err(e) => return Err(reader::open_error(&dir, e)),
+        };
+        let start::Kept {
+            index,
+            decider,
+            counters: series_counters,
+            local,
+            read_whole,
+            passed,
+            recorded,
+            watch,
+        } = kept;
+        let standing: Vec<u64> = start_losses.iter().filter_map(|l| l.file_id).collect();
         // The site zone in force must be the configured one (`docs/api.md` Opening).
         let tz = env.tz.current();
         let canonical = |z: &str| tz.canonical(z).unwrap_or_else(|| z.to_string());
@@ -78,20 +88,16 @@ impl Writer {
             });
         }
         let tzdata_in_force = index.registry().tzdata(&descriptor.tzdata).to_string();
-        let mut counters = Counters::default();
-        // Orphaned facts belong to no series (spec §2.1).
-        for id in index
-            .fact_series()
-            .filter(|id| index.registry().get(*id).is_some())
-        {
-            let st = counters.series.entry(id).or_default();
-            for f in index.series_facts(id) {
-                st.recorded += 1;
-                st.late += u64::from(f.row.flags.late);
-                st.future += u64::from(f.row.flags.future);
-            }
-        }
-        // Q-33: the file must equal the kept log up to the last synced mark, with the writer's id floor.
+        let counters = Counters {
+            series: series_counters,
+            start_whole: read_whole,
+            start_regions: passed.unrecorded(&recorded, &standing),
+            ..Counters::default()
+        };
+        // The derived check of the registry file (Q-33, as far as roadmap 5.1 reaches): the registry is rebuilt from
+        // the kept log at every start, and the file, which must equal what the kept log gives up to the last synced
+        // mark, is written again whenever it does not. Its id floor is the writer's, which recovery folded in from
+        // the mark, the kept log, its recovery entries and the file read, so a lost definition's id stays assigned.
         let mut start_fault = start_fault;
         if start_fault.is_none() {
             let stats = writer.stats();
@@ -107,6 +113,7 @@ impl Writer {
             }
         }
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
+        let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let hub = match deliver::Deliverer::open(
             &dir,
             &env,
@@ -114,6 +121,8 @@ impl Writer {
             descriptor.store_id,
             config.limits.consumer_queue,
             config.limits.max_consumers,
+            window_budget(&config.limits),
+            latch.clone(),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
@@ -140,9 +149,10 @@ impl Writer {
             log: RwLock::new(Some(log)),
             own_fault: Mutex::new(start_fault),
             store_id: descriptor.store_id,
-            decider: Mutex::new(Decider::from_index(&index)),
+            decider: Mutex::new(decider),
+            local: Mutex::new(local),
             counters: Mutex::new(counters),
-            reader: Mutex::new(Some(Arc::new(reader))),
+            reader: Mutex::new(None),
             acknowledged: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
             next_call: AtomicU64::new(1),
@@ -186,16 +196,17 @@ impl Writer {
             return Ok(());
         };
         let hub_fault = || self.hub.as_ref().and_then(|h| lock(&h.fault).clone());
-        // The registry file again, up to the mark the clean shutdown synced, while the store's lock is held.
+        // The registry file again, up to the mark the clean shutdown synced, while the store's lock is held: from the
+        // deliverer's index once it has taken the log up to that mark.
         let shut = log.shutdown_then(|w| {
             if lock(&self.own_fault).is_some() || hub_fault().is_some() {
                 return Ok(());
             }
             let floor = w.stats().max_series_id;
-            let file = self.reader().ok().and_then(|r| {
-                r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
-                    .ok()
-            });
+            let mut file = None;
+            if let Some(h) = &self.hub {
+                h.run(|d, c| file = d.registry_file(c, floor));
+            }
             match file {
                 Some(file) => kvik_log::registry::write(
                     &*self.env.fs,
@@ -208,6 +219,8 @@ impl Writer {
                 None => Ok(()),
             }
         });
+        // The loss watch gives up its reader; its reports stay (design §3.2).
+        lock(&self.watch).close();
         // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
         if let Some(h) = &self.hub {
             h.closed.store(true, Ordering::SeqCst);
@@ -298,6 +311,7 @@ fn writer_config(config: &StoreConfig) -> WriterConfig {
         segment_size: l.segment_size,
         seal_interval: l.seal_interval,
         min_sync_interval: l.min_sync_interval,
+        sync_interval_floor: l.sync_interval_floor,
         max_batch_bytes: l.max_batch_bytes,
         mark_sync: match l.mark_sync {
             MarkSync::Interval(d) => LogMarkSync::Interval(d),
