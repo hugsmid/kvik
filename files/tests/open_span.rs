@@ -52,10 +52,10 @@ fn q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_name
     .unwrap();
     let rb = p.rebuild_record().unwrap();
     assert_eq!(rb.gaps, [(last, None)]);
-    // The crafted images name epochs up to `last` + 2,000; the span's length leaves room for more (Q-872).
+    // The crafted images name epochs up to `last` + 2,000, and the span's length leaves room for more after them
+    // (Q-872).
     let room = (bytes.len() as u64 - valid_end) / 40;
-    assert!(room > 2_000);
-    assert_eq!(p.rebuild_epoch, last + room + 1);
+    assert_eq!(p.rebuild_epoch, last + 2_000 + room + 1);
     assert_eq!(rb.presumed_epoch, last + 1);
     let g = Gap {
         after: last,
@@ -183,11 +183,30 @@ fn q872_a_hidden_record_far_above_the_spans_length_still_bounds_the_rebuilds_epo
     let img = read(&bytes, &STORE_ID).unwrap();
     let span = img.corrupt[0];
     assert_eq!((span.after_epoch, span.named_epoch), (last, far));
-    assert!(last + (bytes.len() as u64 - valid_end) / 40 < far);
-    assert_eq!(span.epoch_ceiling(), far);
+    let room = (bytes.len() as u64 - valid_end) / 40;
+    assert!(last + room < far);
+    assert_eq!(span.epoch_ceiling(), far + room);
     let (rebuild_epoch, epochs) = rebuilt_epochs(&bytes, &h);
-    assert_eq!(rebuild_epoch, far + 1);
+    assert_eq!(rebuild_epoch, far + room + 1);
     assert!(epochs.iter().all(|&e| e > far));
+}
+
+/// Q-872: a record after a jumped one that damage has made unreadable is covered: the span's length is counted above
+/// the jumped record's epoch, not above the last valid one.
+#[test]
+fn q872_a_damaged_record_after_a_jumped_one_is_below_the_rebuilds_epochs() {
+    let h = store();
+    let far = h.records.last().unwrap().epoch + 1_000_000;
+    let (mut bytes, _, _) = crafted_with_hidden(&h, &[far, far + 1]);
+    let damaged = bytes.len() - 8;
+    bytes[damaged] ^= 1;
+    let img = read(&bytes, &STORE_ID).unwrap();
+    let span = img.corrupt[0];
+    assert_eq!(span.named_epoch, far, "the damaged record is not named");
+    assert!(span.epoch_ceiling() > far + 1);
+    let (rebuild_epoch, epochs) = rebuilt_epochs(&bytes, &h);
+    assert!(rebuild_epoch > far + 1);
+    assert!(epochs.iter().all(|&e| e > far + 1));
 }
 
 /// Q-650, Q-174: a span with no later record may hold any number of records, so a loss that no valid record names

@@ -601,11 +601,11 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
      Where two corrupt records leave an identity unknown, the loss is listed under its first missing position,
      unacknowledged, and the rebuild record counts it.
   4. Writes the new manifest as `MANIFEST.new` (`format.md` A.12), opened by a rebuild record that carries, per file
-     kind, a `file_id` floor above every id seen (`format.md` A.14), with epochs above
-     every epoch named by a valid record and by any lease file, and above every epoch a corrupt span with no later
-     record may hold (`format.md` A.14, Q-872); syncs it; renames it over the old file while no handle
-     holds that open (§3 Sync primitive); syncs the directory. A `MANIFEST.new` left by a crash is removed at the
-     next start.
+     kind, a `file_id` floor above every id seen (`format.md` A.14), with epochs above every epoch named by a valid
+     record and by any lease file, and above the epochs a corrupt span with no later record is taken to hold
+     (`format.md` A.14; Q-872 says the one case that bound cannot cover); syncs it; renames it over the old file while
+     no handle holds that open (§3 Sync primitive); syncs the directory. A `MANIFEST.new` left by a crash is removed at
+     the next start.
   A rebuilt manifest takes no file as verified in another tier until it has been verified there again (§7 inputs
   kept, §8).
   The rebuild is reported: health is degraded (`manifest_rebuilt`) until the rebuild is acknowledged, and rebuilds are

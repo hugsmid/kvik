@@ -66,6 +66,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-872 | §7 Manifest step 4; `format.md` A.14 | The epochs a rebuild takes above a corrupt span with no later record |
+| Q-873 | `format.md` A common rules (Scan bound); `design.md` Budgets; `SECURITY.md` | The time of the header walk on a crafted file |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1373,10 +1374,10 @@ ignored tests):
 Measured, before and after: nested facts images over every window of a 64 MiB segment 0.90 s and 0.22 s; 64 MiB of
 batches whose rows share one text value, after damage, 1.85 s and 0.10 s; a 16 MiB manifest window of rejected records
 0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh (0.13 s with Q-872's pass); per byte checked, about 0.5 ns
-for facts and at most about 2.3 ns for entries, every type small and large (Q-870). So against the bound a crafted 64
-MiB segment costs at most about 0.6 s, 16 MiB about 0.17 s, and a crafted manifest at most about 0.09 s per 16 MiB at a
-start and 0.15 s at a refresh: inside the 1 s budget. `format.md` A common rules (scan bound), `design.md` Budgets and
-`SECURITY.md` state the figures.
+for facts and at most about 2.9 ns for entries, every type small and large (Q-870). So against the bound a crafted 64
+MiB segment costs at most about 0.8 s in body checks, 16 MiB about 0.22 s, and a crafted manifest at most about 0.09 s
+per 16 MiB at a start and 0.15 s at a refresh: inside the 1 s budget. The header walk is bounded in count only; its time
+is Q-873. `format.md` A common rules (scan bound), `design.md` Budgets and `SECURITY.md` state the figures.
 Natural damage is unchanged: the verdicts are the same and the window rule is untouched. Tests:
 `log/tests/body_check.rs` (each check against its decoder, the text table against `std::str::from_utf8`, and
 `state_names_at_the_limit_are_told_distinct_and_past_it_refused`), `log/tests/batch_assembly.rs`
@@ -1412,10 +1413,12 @@ in index order, the order facts and exports use. The check is made cheaper inste
    per-process random seed and multiplier, so no input is slow on purpose. A probe run over 128 slots ends in a sort,
    so the worst case stays `n log n` whatever the keys.
 Measured (release build, one shared 4-core cloud machine, the best of three runs; `log/tests/crafted_files.rs`
-`crafted_worst_cases_timed` builds every entry type, small and large, and reports the dearest): the dearest body is
-now a definition of 65,536 state names of 3 bytes, 2.1 to 2.3 ns a byte; small definitions about 1 ns (gauge 1.1,
-two-name states 0.9), small routing entries 1.0, every other entry at most about 1.3, facts 0.4. So a crafted segment
-costs at most about 0.6 s at 64 MiB and 0.17 s at 16 MiB, inside the budget. `format.md` A common rules (scan bound),
+`crafted_worst_cases_timed` builds every entry type, small and large, short names ASCII and not, and reports the
+dearest): the dearest body is now a definition of 65,536 state names of two 4-byte characters (8 bytes, hashed), 2.8 to
+3.1 ns a byte; other short names 2.0 to 2.9 (one 4-byte character, a letter and a 3-byte character, and 3, 4 and 8 ASCII
+bytes); small definitions about 1 ns (gauge 1.1, two-name states 0.9), small routing entries 1.0, every other entry at
+most about 1.3, facts 0.4. So the body checks of a crafted segment cost at most about 0.8 s at 64 MiB and 0.22 s at 16
+MiB, inside the budget; the header walk, which this does not count, is Q-873. `format.md` A common rules (scan bound),
 `design.md` Budgets and `SECURITY.md` state the figures. Tests: `log/tests/body_check.rs`
 `state_names_are_checked_as_a_plain_reference_checks_them` (a sort as the reference, both sides of the pairwise limit)
 and `state_names_at_the_limit_are_told_distinct_and_past_it_refused`; `log/src/entries/definition.rs`
@@ -1431,20 +1434,41 @@ epoch and the leases. A span with no later record (Q-650) has no later epoch, so
 valid epoch + 1: the epochs of records the span may hold, synced and perhaps uploaded under
 `manifest/<generation>/<epoch>`. The rebuilt records at those epochs are then not uploaded, or meet another record
 under their key, and a restore reads a chain without the rebuild.
-**Decided.** Such a span bounds the rebuild's epochs from above with the higher of two figures
-(`kvik_files::image::CorruptSpan::epoch_ceiling`): the highest epoch above the last valid one that a checksum-valid
-record image starting in the span names, whether or not its fields pass (`named_epoch`; the search now also visits
-the passed part of a window for this, with checksums and no field checks, so the window rule's bound on body checks
-is unchanged), and the last valid epoch plus the records of 40 bytes, the shortest record, that the span's length
-could hold, for records there that damage has also made unreadable. Epochs normally rise by one a record; after a
-start they may jump above a lease (`format.md` A.14), which names an epoch a reader saw, and the record images give
-that case. A crafted image may name a very high epoch and use up the epochs left, which a crafted valid record can do
-already. Cost: the passed part's headers and checksums, about 0.13 s at a refresh for a crafted 16 MiB window (0.10 s
-before). `spec.md` §7 Manifest step 4 and `format.md` A.14 say so. Tests: `files/tests/open_span.rs`
-`q872_a_rebuild_takes_no_epoch_of_a_valid_record_hidden_in_an_open_span` (the review's probe),
-`q872_a_hidden_record_far_above_the_spans_length_still_bounds_the_rebuilds_epochs` and
+**Decided.** Such a span bounds the rebuild's epochs from above (`kvik_files::image::CorruptSpan::epoch_ceiling`): the
+higher of the last valid epoch and the highest epoch above it that a checksum-valid record image starting in the span
+names, whether or not its fields pass (`named_epoch`; the search now also visits the passed part of a window for this,
+with checksums and no field checks, so the window rule's bound on body checks is unchanged), plus the records of 40
+bytes, the shortest record, that the span's length could hold, for records after it that damage has made unreadable. The
+two add, as a record after a named one that jumped may be damaged. Epochs normally rise by one a record; after a start
+they may jump above a lease (`format.md` A.14), which names an epoch a reader saw, and the record images give that case.
+Not covered: a record that itself jumped above a lease and is damaged, with no whole record after it, is named by
+nothing and lies above the length bound; the rebuild may then take its epoch again, as a torn tail reuses the epochs of
+the records it drops, and the upload meets the earlier record under that key. A crafted image may name a very high epoch
+and use up the epochs left, which a crafted valid record can do already. Cost: the passed part's headers and checksums,
+about 0.13 s at a refresh for a crafted 16 MiB window (0.10 s before). `spec.md` §7 Manifest step 4 and `format.md` A.14
+say so. Tests: `files/tests/open_span.rs` `q872_a_rebuild_takes_no_epoch_of_a_valid_record_hidden_in_an_open_span` (the
+review's probe), `q872_a_hidden_record_far_above_the_spans_length_still_bounds_the_rebuilds_epochs`,
+`q872_a_damaged_record_after_a_jumped_one_is_below_the_rebuilds_epochs` and
 `q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span` (the length bound);
 `files/src/image.rs` `a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`.
+
+## Q-873 — The time of the header walk on a crafted file
+Recorded at the re-check of the Q-651 ruling; older than it (the same at `524a5cb`). A technical decision: the
+published promise is kept.
+**Scenario.** The scan bound (`format.md` A, common rules) counts header reads and checksummed bytes, and Q-651 bounds
+the time of body checks. A file can hold a valid block header every 8 bytes, each naming a plausible length and a
+body checksum that does not hold (4 free bytes a header make the next one valid). No body is checked and no read
+fails, so the window rule never applies, and the counts stay inside the bound (about 3 header reads per 8 bytes of the
+16 allowed). Measured at the re-check (release build, one shared 4-core cloud machine): a 64 MiB segment 7.75 s
+(16 MiB 1.5 to 1.7 s; 0.31 s when every block is of the commit type), a 16 MiB manifest 1.15 to 1.33 s with either
+reader: about 0.3 µs a header read in the segment, each following a length to another part of the file, and 0.65 µs a
+candidate in the manifest, the CRC shift of `PrefixCrc::range`. The 1 s restart budget is exceeded.
+**Now.** `format.md`, `design.md` Budgets and `SECURITY.md` state these figures beside the body checks' and say the
+walk is bounded in count, not yet in time.
+**Decided.** The header walk is to be bounded in time so that every crafted file fits the 1 s restart budget, keeping
+the promise, by roadmap 4.9e before gate 4.9 (for example a cheaper checksum shift, a table per length class, fewer
+header reads per offset, or a budget of header reads per window that damage cannot reach). Not done with the Q-651
+fix round: it is more than a small change, and its acceptance rule must be shown again against damage.
 
 ## Open at v0.2
 
@@ -1458,7 +1482,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -1526,6 +1550,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
+| Q-873 | 4.9e | Decided at the re-check of the Q-651 ruling: the header walk is bounded in time so that every crafted file fits the 1 s restart budget, by roadmap 4.9e before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1777,7 +1802,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-231 | The bounded scan's cost on undamaged segments | `format.md` common rules (Scan bound); `design.md` Budgets (settled by the owner's ruling after roadmap 4.9d: undamaged segments take a cheap path, the bounded path runs only once damage is found, and a crafted file must not be able to force the slow path repeatedly. Scenario: on a full, undamaged 64 MiB segment in a release build the bounded scan took 170 ms with 280,000 small batches and 76 ms with 15,000 large ones, against 56 ms and 29 ms for the reference scan, with restarts measured at 0.39–0.74 s against the 1 s budget. Implemented: a scan reads each batch at a boundary once with direct checksums until the first boundary read that finds no complete batch; from there to the end of that scan it uses the prefix table and the remembered verdicts. The switch is one way, so a crafted file costs at most one failed direct read per scan (at most a batch) before the bounded path, and the bytes checksummed stay within 2L plus that read. After: 52 ms and 32 ms on the same segments, equal to the reference. `log/src/scan/tests.rs` `an_undamaged_segment_is_read_in_one_pass_of_direct_reads`; the crafted-file tests of Q-110 and the differential property are unchanged) |
 | Q-650 | A manifest search that passes a window and finds no later record | `spec.md` §7 Manifest; `format.md` A.14 (settled by the owner's ruling: the passed bytes are a corrupt span with no later record, kept and repaired by a copy or a rebuild; the rebuild record's field 7 writes its `before` as 0; see the question) |
 | Q-651 | The crafted-file worst case against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by the owner's ruling: each kept body checked once and cheaper body checks with the same verdicts, measured inside the budget; see the question) |
-| Q-870 | Definitions and short state names against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled as a technical decision with no format change: fields split once and found by an index, state names keyed and told distinct by a randomised table that sorts after a long probe run; every entry type measured at most about 2.3 ns a byte, a crafted 64 MiB segment about 0.6 s; see the question) |
+| Q-870 | Definitions and short state names against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled as a technical decision with no format change: fields split once and found by an index, state names keyed and told distinct by a randomised table that sorts after a long probe run; every entry type measured at most about 2.9 ns a byte, the body checks of a crafted 64 MiB segment about 0.8 s; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

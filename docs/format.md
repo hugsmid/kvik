@@ -60,11 +60,15 @@ specified here before the roadmap item that writes it.
   and found by their id, state names are told distinct by a table of their keys under a per-process random hash (with
   a sort once a probe run grows long, so no input costs more than `n log n`), and a manifest record's fields are read
   in one pass that keeps none of a rejected record's (Q-651, Q-870). Measured (release build, one shared 4-core cloud
-  machine, the best of three runs, every entry type small and large): at most about 2.3 ns a byte, for definitions of
-  65,536 state names of 3 bytes, about 1 ns for small definitions, at most about 1.3 ns for every other entry and
-  about 0.5 ns for facts, so a crafted segment costs at most about 0.6 s at 64 MiB and 0.17 s at 16 MiB, against 29 to
-  170 ms for an undamaged one. A crafted manifest costs at most about 0.09 s per 16 MiB for the start's reader and
-  0.15 s for the whole-file reader (Q-651). An undamaged segment is read in one pass of direct checksums; the bounded
+  machine, the best of three runs, every entry type small and large): at most about 2.9 ns a byte, for definitions of
+  65,536 state names of two 4-byte characters, 2.2 to 2.6 ns for other short names, about 1 ns for small definitions,
+  at most about 1.3 ns for every other entry and about 0.5 ns for facts, so the body checks of a crafted segment cost
+  at most about 0.8 s at 64 MiB and 0.22 s at 16 MiB, against 29 to 170 ms for an undamaged one; those of a crafted
+  manifest at most about 0.09 s per 16 MiB for the start's reader and 0.15 s for the whole-file reader (Q-651). The
+  header reads are bounded in count, not yet in time: a file holding a valid block header every 8 bytes, each with a
+  body checksum that does not hold, checks no body and fails no read, and measured 7.75 s for a 64 MiB segment and
+  1.2 to 1.3 s for a 16 MiB manifest. Bounding that walk to the restart budget is roadmap 4.9e (Q-873). An undamaged
+  segment is read in one pass of direct checksums; the bounded
   reading starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231).
   Apart from the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
 
@@ -642,9 +646,10 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   scan bound), the search passes the rest of that window: a valid record beyond it makes the passed bytes part of the
   corrupt span; with none, the passed bytes and everything after them are a corrupt span with no later record, kept
   and never truncated, and repaired by a copy or a rebuild like any corrupt record (Q-650): a copy is written before
-  the span's bytes, which stay after it, and a rebuild takes its epochs above every epoch a checksum-valid record
-  image starting in the span names and above the last valid epoch before it plus the records of 40 bytes, the
-  shortest, that the span could hold (Q-872). Damage does not reach the window rule, so a torn tail is never reported
+  the span's bytes, which stay after it (so with n copies in the bucket the span is settled over n reads, each writing
+  the manifest again), and a rebuild takes its epochs above the higher of the last valid epoch before the span and
+  every epoch a checksum-valid record image starting in it names, plus the records of 40 bytes, the shortest, that the
+  span could hold (Q-872). Damage does not reach the window rule, so a torn tail is never reported
   this way.
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body). A corrupt record

@@ -379,22 +379,20 @@ fn entry_cases() -> Vec<(String, Entry, usize)> {
     let name = |k: usize, len: usize| -> Vec<u8> {
         (0..len).map(|d| 0x21 + (k >> (6 * d) & 63) as u8).collect()
     };
-    let states = |n: usize, len: usize| -> Entry {
+    // `n` state names, the `k`th made by `make`, in an order no sort finds sorted.
+    let states_of = |n: usize, make: &dyn Fn(usize) -> Vec<u8>| -> Entry {
         let mut d = definition(1, "s", "");
         d.1[2].1 = vec![3];
         d.1[3].1 = vec![3];
         let at = d.1.iter().position(|(f, _)| *f == 14).unwrap();
         d.1.splice(
             at..at,
-            (0..n).map(|k| {
-                (
-                    13u16,
-                    name(k.wrapping_mul(40_503) % n.next_power_of_two(), len),
-                )
-            }),
+            (0..n).map(|k| (13u16, make(k.wrapping_mul(40_503) % n.next_power_of_two()))),
         );
         d
     };
+    let states = |n: usize, len: usize| states_of(n, &|k| name(k, len));
+    let utf8 = |c: u32| char::from_u32(c).unwrap().to_string().into_bytes();
     let counter = {
         let mut d = definition(1, "c", "kWh");
         d.1[2].1 = vec![2];
@@ -499,6 +497,39 @@ fn entry_cases() -> Vec<(String, Entry, usize)> {
             "definitions of 65,536 63-byte state names",
             states(65_536, 63),
             1,
+        ),
+        (
+            "definitions of 65,536 4-byte state names",
+            states(65_536, 4),
+            4,
+        ),
+        (
+            "definitions of 65,536 8-byte state names",
+            states(65_536, 8),
+            4,
+        ),
+        (
+            "definitions of 65,536 state names of one 4-byte character",
+            states_of(65_536, &|k| utf8(0x1_0000 + k as u32)),
+            4,
+        ),
+        (
+            "definitions of 65,536 state names of a letter and a 3-byte character",
+            states_of(65_536, &|k| {
+                [vec![b'a' + (k % 2) as u8], utf8(0x800 + (k / 2) as u32)].concat()
+            }),
+            4,
+        ),
+        (
+            "definitions of 65,536 state names of two 4-byte characters",
+            states_of(65_536, &|k| {
+                [
+                    utf8(0x1_0000 + (k % 256) as u32),
+                    utf8(0x1_0000 + (k / 256) as u32),
+                ]
+                .concat()
+            }),
+            4,
         ),
         ("parameter changes", change, 100_000),
         ("aliases", alias(1, "a"), 100_000),

@@ -51,11 +51,12 @@ impl CorruptSpan {
     }
 
     /// An epoch no record the span may hold exceeds (Q-872): below `before_epoch`; for a span with no later record,
-    /// the higher of `named_epoch` and `after_epoch` plus the records its length could hold.
+    /// the higher of `named_epoch` and `after_epoch`, plus the records its length could hold, as records after a named
+    /// one may be unreadable.
     pub fn epoch_ceiling(&self) -> u64 {
         self.before_epoch.unwrap_or_else(|| {
             let room = (self.end.saturating_sub(self.offset)) / MIN_RECORD_LEN;
-            self.named_epoch.max(self.after_epoch.saturating_add(room))
+            self.named_epoch.max(self.after_epoch).saturating_add(room)
         })
     }
 }
