@@ -1646,6 +1646,65 @@ fn rec() -> Entry {
     })
 }
 
+/// Q-651: past damage, a boundary read's batch is read without checking its bodies again, and a recovery entry that
+/// is not alone in its batch is still found there, from the entry headers.
+#[test]
+fn after_damage_a_recovery_entry_not_alone_is_still_invalid_content() {
+    let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
+    f.extend_from_slice(&[0xFF; 8]);
+    let at = f.len() as u64;
+    f.extend(
+        entries_batch(1, T0, &[alias(1, "a")])
+            .encode(&ID, at, 0)
+            .unwrap(),
+    );
+    let bad_at = f.len() as u64;
+    let mut b = BatchBuilder::new();
+    b.push(
+        block_type::ENTRIES,
+        EntriesBlock {
+            first_sequence: 2,
+            received_at: T0,
+            entries: vec![
+                rec(),
+                Entry::Alias {
+                    id: 1,
+                    name: "a".into(),
+                },
+            ],
+        }
+        .encode()
+        .unwrap(),
+    )
+    .unwrap();
+    f.extend(b.encode(&ID, bad_at, 0).unwrap());
+    let alone_at = f.len() as u64;
+    let alone = BatchContent {
+        first_sequence: 10,
+        received_at: T0,
+        items: vec![Item::Entry(rec())],
+    };
+    f.extend(alone.builder().unwrap().encode(&ID, alone_at, 0).unwrap());
+    f.resize(f.len() + 64, 0);
+    let r = scan(&f, &ID, ScanLimit::End).unwrap();
+    let kept: Vec<u64> = r.batches.iter().map(|b| b.offset).collect();
+    assert_eq!(kept, [at, alone_at]);
+    assert_eq!(
+        r.regions
+            .iter()
+            .map(|g| (g.start, g.end, g.cause))
+            .collect::<Vec<_>>(),
+        [
+            (
+                kvik_log::header::HEADER_LEN as u64,
+                at,
+                LossCause::Corruption
+            ),
+            (bad_at, alone_at, LossCause::InvalidContent)
+        ]
+    );
+}
+
 #[test]
 fn a_recovery_entry_is_alone_in_its_batch() {
     let c = BatchContent {
