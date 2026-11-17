@@ -11,8 +11,9 @@ headers are read per 8 bytes. Candidates read in full and rejected may check at 
 with the damage around it. Each kept body is checked once. A crafted log segment can therefore cost a start up to
 about 0.6 s at 64 MiB, a crafted manifest up to about 0.15 s per 16 MiB (measured on a shared 4-core cloud machine),
 within the 1 s restart budget, whether it reaches the store directory or a bucket the store reads from, whatever its
-bodies hold (Q-870). The fuzz targets of the log segment and the manifest check these counts. Working memory, beyond the file and the read's
-results, is bounded by about one window. Write access to the store directory can still destroy or alter data.
+bodies hold (Q-870). The fuzz targets of the log segment and the manifest check these counts. Working memory, beyond
+the file and the read's results, is bounded by about one window. Write access to the store directory can still
+destroy or alter data.
 
 ## Reporting a vulnerability
 Please report suspected vulnerabilities privately through GitHub's private vulnerability reporting: open the
