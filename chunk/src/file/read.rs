@@ -215,8 +215,7 @@ impl<S: ReadAt> CompactedFile<S> {
     /// A chunk's directory, bound to its index entry: the same series, row count and flags, its block records
     /// laid end to end from the chunk's first byte to the directory.
     pub fn directory(&self, e: &IndexEntry) -> Result<Directory, FileError> {
-        let end = e.chunk_offset + u64::from(e.chunk_len);
-        let at = end - u64::from(e.dir_len);
+        let (at, end) = chunk_span(e)?;
         let (h, body) = read_bound(
             &self.src,
             at,
@@ -259,9 +258,15 @@ impl<S: ReadAt> CompactedFile<S> {
         d: &Directory,
         i: usize,
     ) -> Result<(Block, Vec<u8>), FileError> {
-        let r = d.blocks[i];
-        let at = e.chunk_offset + u64::from(r.offset);
-        let limit = e.chunk_offset + u64::from(e.chunk_len - e.dir_len);
+        let (limit, _) = chunk_span(e)?;
+        let r = *d
+            .blocks
+            .get(i)
+            .ok_or(FileError::invalid(limit, Fault::Mismatch("block records")))?;
+        let at = e
+            .chunk_offset
+            .checked_add(u64::from(r.offset))
+            .ok_or(FileError::invalid(limit, Fault::Mismatch("block records")))?;
         let (h, body) = read_bound(&self.src, at, block_type::DATA, Some(r.body_crc32c), limit)?;
         if h.body_len != r.body_len {
             return Err(FileError::invalid(at, Fault::BlockLength));
@@ -449,8 +454,9 @@ impl<S: ReadAt> CompactedFile<S> {
                             Fault::Mismatch("entry receive time"),
                         ));
                     }
-                    let end = s
-                        .checked_add(n - 1)
+                    let end = n
+                        .checked_sub(1)
+                        .and_then(|k| s.checked_add(k))
                         .ok_or(FileError::invalid(here, Fault::Mismatch("entry position")))?;
                     prev = Some((g, end));
                     count += n;
@@ -470,4 +476,16 @@ impl<S: ReadAt> CompactedFile<S> {
         }
         Ok(out)
     }
+}
+
+/// The offsets of a chunk's directory block and of the chunk's end.
+fn chunk_span(e: &IndexEntry) -> Result<(u64, u64), FileError> {
+    e.chunk_offset
+        .checked_add(u64::from(e.chunk_len))
+        .filter(|_| e.dir_len < e.chunk_len)
+        .map(|end| (end - u64::from(e.dir_len), end))
+        .ok_or(FileError::invalid(
+            e.chunk_offset,
+            Fault::Mismatch("chunk index entry"),
+        ))
 }
