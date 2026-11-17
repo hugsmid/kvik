@@ -1419,8 +1419,10 @@ costs at most about 0.6 s at 64 MiB and 0.17 s at 16 MiB, inside the budget. `fo
 `design.md` Budgets and `SECURITY.md` state the figures. Tests: `log/tests/body_check.rs`
 `state_names_are_checked_as_a_plain_reference_checks_them` (a sort as the reference, both sides of the pairwise limit)
 and `state_names_at_the_limit_are_told_distinct_and_past_it_refused`; `log/src/entries/definition.rs`
-`the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict`; the field index is checked
-against a linear search by a debug assertion.
+`the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict`,
+`packed_keys_tell_apart_names_that_differ_in_length_or_any_one_byte` and
+`a_short_name_of_invalid_utf8_is_refused_on_both_sides_of_the_pairwise_limit`; the field index is checked against a
+linear search by a debug assertion.
 
 ## Q-872 — The epochs a rebuild takes above a corrupt span with no later record
 Recorded at the review of the Q-650 ruling. For the owner's acceptance.

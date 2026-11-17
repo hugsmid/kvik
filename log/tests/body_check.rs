@@ -217,11 +217,11 @@ fn state_names_at_the_limit_are_told_distinct_and_past_it_refused() {
     }
 }
 
-/// A state name for the reference property: short and long names from a small alphabet, so that some repeat, and
-/// names that are invalid by length or UTF-8.
+/// A state name for the reference property: short and long names from a small alphabet, so that some repeat by
+/// chance, and names that are invalid by length or UTF-8.
 fn state_name() -> impl Strategy<Value = Vec<u8>> {
     let from = |len: std::ops::Range<usize>| {
-        prop::collection::vec(prop::sample::select(b"ab".to_vec()), len)
+        prop::collection::vec(prop::sample::select(b"abcd".to_vec()), len)
     };
     prop_oneof![
         4 => from(1..4),

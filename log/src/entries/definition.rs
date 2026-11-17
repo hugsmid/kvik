@@ -299,6 +299,25 @@ mod tests {
         }
     }
 
+    /// A short name of invalid UTF-8 is refused among more names than are compared pairwise, as among fewer.
+    #[test]
+    fn a_short_name_of_invalid_utf8_is_refused_on_both_sides_of_the_pairwise_limit() {
+        for n in [PAIRWISE, PAIRWISE + 1, 100] {
+            for bad in [
+                &[0xC3][..],
+                &[b'a', 0xFF],
+                &[0xE2, 0x82],
+                &[b'a', b'b', b'c', 0x80, b'd', b'e', b'f'],
+            ] {
+                let mut names: Vec<Vec<u8>> =
+                    (0..n).map(|k| format!("n{k}").into_bytes()).collect();
+                assert!(Names::default().valid(&fields(&names)), "{n}");
+                names[n / 2] = bad.to_vec();
+                assert!(!Names::default().valid(&fields(&names)), "{n} {bad:?}");
+            }
+        }
+    }
+
     /// The sort that ends a long probe run, and the one that settles equal hashed keys, give the table's verdict.
     #[test]
     fn the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict() {
