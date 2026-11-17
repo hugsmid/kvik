@@ -1,6 +1,6 @@
-//! The bounded decider under a tiny memory cap against DF's decider, which keeps every fact with its position (the
-//! oracle), through calls, acknowledgements polled in any order and losses found while open. The fake log removes
-//! exactly the lost positions, so this proves the decision state and nothing about regions.
+//! The bounded decider under a tiny memory cap against the durable fixes' decider, which keeps every fact with its
+//! position (the oracle), through calls, acknowledgements polled in any order and losses found while open. The fake
+//! log removes exactly the lost positions, so this proves the decision state and nothing about regions.
 
 use std::time::Duration;
 

@@ -9,8 +9,8 @@
 //! memory, or for a key outside the recent window and the revised-key index, by the slow path through
 //! [`LocalFacts`], once per call for all such keys.
 //!
-//! A range found lost while the store is open is taken in by [`Decider::settle`] (Q-921 to Q-923); DF's decider,
-//! which keeps every fact with its position, is the oracle the differential test holds this one to.
+//! A range found lost while the store is open is taken in by [`Decider::settle`] (Q-921 to Q-923); the durable
+//! fixes' decider, which keeps every fact with its position, is the oracle the differential test holds this one to.
 
 use std::collections::{HashMap, HashSet};
 
