@@ -749,9 +749,9 @@ model's `f64::min` may pick the other zero, which compares equal; the tree's tes
 folds states by index, so it counts a transition and splits the time in state between two keys; the model folds by
 name, counting no transition and one key. The two backends' `transitions` and time-in-state then differ for the same
 facts.
-**Settled at the review of roadmap 7.1a:** the names of a state series are distinct. A definition declaring a name
-twice is refused by both backends (`kvik/tests/api.rs` `a_state_name_declared_twice_is_refused`), and a definition
-entry carrying one is invalid content in the log (`format.md` A.6 field 13; `log/tests/entries_checks.rs`), so index and name
+**Settled at the review of roadmap 7.1a:** the names of a state series are distinct. A definition declaring a name twice
+is refused by both backends (`kvik/tests/api.rs` `a_state_name_declared_twice_is_refused`), and a definition entry
+carrying one is invalid content in the log (`format.md` A.6 field 13; `log/tests/entries_checks.rs`), so index and name
 count the same transitions (`spec.md` §2.1 `value type`).
 
 ## Q-190 — The Parquet export schema as a user contract
@@ -1371,11 +1371,11 @@ ignored tests):
    copies no field and gathers no ignorable field until the record's checks hold, keeps a field its type does not
    repeat at most twice, and finds an undefined field in the same pass, with the error it gave before.
 Measured, before and after: nested facts images over every window of a 64 MiB segment 0.90 s and 0.22 s; 64 MiB of
-batches whose rows share one text value, after damage, 1.85 s and 0.10 s; a 16 MiB manifest window of rejected
-records 0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh (0.13 s with Q-872's pass); per byte checked, about 0.5 ns for facts and at
-most about 2.3 ns for entries, every type small and large (Q-870). So against the bound a crafted 64 MiB segment
-costs at most about 0.6 s, 16 MiB about 0.17 s, and a crafted manifest at most about 0.09 s per 16 MiB at a start and
-0.15 s at a refresh: inside the 1 s budget. `format.md` A common rules (scan bound), `design.md` Budgets and
+batches whose rows share one text value, after damage, 1.85 s and 0.10 s; a 16 MiB manifest window of rejected records
+0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh (0.13 s with Q-872's pass); per byte checked, about 0.5 ns
+for facts and at most about 2.3 ns for entries, every type small and large (Q-870). So against the bound a crafted 64
+MiB segment costs at most about 0.6 s, 16 MiB about 0.17 s, and a crafted manifest at most about 0.09 s per 16 MiB at a
+start and 0.15 s at a refresh: inside the 1 s budget. `format.md` A common rules (scan bound), `design.md` Budgets and
 `SECURITY.md` state the figures.
 Natural damage is unchanged: the verdicts are the same and the window rule is untouched. Tests:
 `log/tests/body_check.rs` (each check against its decoder, the text table against `std::str::from_utf8`, and
