@@ -97,8 +97,9 @@ pub enum MarkSync {
     EveryCommit,
     /// On the timer (`mark_sync_interval`), which the model fires when
     /// [`Model::sync_mark_file`] is called; at once after a batch holding an
-    /// entry that is not a fact, by recovery, and before a write that would
-    /// name a position above the last synced mark.
+    /// entry that is not a fact and after the first batch in a segment
+    /// (Q-630), by recovery, and before a write that would name a position
+    /// above the last synced mark.
     Timed,
 }
 

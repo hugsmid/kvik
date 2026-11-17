@@ -237,7 +237,7 @@ A.10) is treated as a different boot. The rules apply in this order:
    by step 4 below; neither makes the store read-only. Its positions are not reused. A lost range is a reset point
    for consumers (§4 Resync). Because the first batch in a segment is acknowledged only once a synced mark names it
    (Commit), a segment holding acknowledged batches that is damaged, zeroed or missing whole leaves a valid mark
-   naming a position in it or in a later segment, so its loss is a `data_lost` from that anchor at least up to the
+   naming a position in it or in a later segment, while the mark is readable, so its loss is a `data_lost` from that anchor at least up to the
    mark's position, also when it was the only unsealed segment and no other source names a position (Q-630);
    positions acknowledged above the durable mark and lost with it are a reset point under rule 1 or 3, as for any
    tail beyond the mark.

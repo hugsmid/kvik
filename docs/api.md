@@ -206,9 +206,9 @@ store.emit_with(&readings, Intent::Revise).await?;
   most `min(65,536, limits.ingest_queue)` readings and 8 MiB plain-encoded (`EmitError::TooLarge` otherwise; the
   caller splits). Several calls may share a batch. Calls from different tasks are ordered by commit.
 - Outcomes are decided at commit (a retirement committed while a reading waits refuses it). `emit` and `Pending`
-  resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
-  the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
-  a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
+  resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact or the
+  first batch in a segment (Q-630), after the mark sync, which the writer forces at once. Batches resolve in commit
+  order, so a batch committed after such a batch also waits for that one mark sync (spec §3 Commit).
 - **An acknowledgement means durable**, for every outcome. A call none of whose readings is recorded writes no
   batch; if one of them is a duplicate of a reading queued by an earlier call that is not yet acknowledged, the call
   resolves only when that earlier call does, with its result: its outcomes if that call is acknowledged, its error

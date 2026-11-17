@@ -2,8 +2,8 @@
 //! funnels, latches and durable cursors.
 //!
 //! Everything is read from the committed log. A [`Deliverer`] holds its own log reader and takes each batch, in
-//! commit order, once it is acknowledged (a batch holding an entry that is not a fact once the mark is synced past
-//! it, and every later batch behind it). Taking a batch applies its entries to the routing table and registry,
+//! commit order, once it is acknowledged (a batch holding an entry that is not a fact, or the first batch in a
+//! segment (Q-630), once the mark is synced past it, and every later batch behind it). Taking a batch applies its entries to the routing table and registry,
 //! enqueues its facts for the live consumers whose fact funnels select them, and evaluates their condition funnels
 //! ([`funnels`]) as the reference model does (`kvik_model::condition`), on the live state of roadmap 5.4. A consumer
 //! that is behind (resuming after a restart, or whose queue filled) reads the log from its position with the routes
