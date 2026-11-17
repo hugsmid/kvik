@@ -1,7 +1,7 @@
 //! Block framing: the 16-byte block header and its body (`format.md` A.2).
 
 use crate::bytes::{put, slice, u32_at};
-use crate::crc::crc32c;
+use crate::crc::{crc32c, header_crc32c};
 use crate::error::EncodeError;
 
 /// Length of a block header.
@@ -78,14 +78,14 @@ impl BlockHeader {
         b[1] = self.flags;
         put(&mut b, 4, &self.body_len.to_le_bytes());
         put(&mut b, 8, &self.body_crc32c.to_le_bytes());
-        let crc = crc32c(&b[..12]);
+        let crc = header_crc32c(&b);
         put(&mut b, 12, &crc.to_le_bytes());
         b
     }
 
     /// The header in `b`, or `None` if its checksum does not match. Nothing else is judged.
     pub fn decode(b: &[u8; BLOCK_HEADER_LEN]) -> Option<Self> {
-        if u32_at(b, 12) != crc32c(&b[..12]) {
+        if u32_at(b, 12) != header_crc32c(b) {
             return None;
         }
         Some(Self {

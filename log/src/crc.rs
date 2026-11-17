@@ -58,7 +58,28 @@ const fn mul(a: u32, mut b: u32) -> u32 {
 }
 
 /// `x^(8 · 2^k)` modulo the polynomial, for `k` in `0..64`.
-static BYTE_POWERS: [u32; 64] = {
+static BYTE_POWERS: [u32; 64] = POWERS;
+
+/// Hex digits of a shift length that [`SHIFT_TABLES`] covers: lengths below 4 GiB.
+const SHIFT_DIGITS: usize = 8;
+
+/// `x^(8 · len)` modulo the polynomial.
+const fn byte_power(len: u64) -> u32 {
+    // 1 in the reflected bit order.
+    let mut p = 1 << 31;
+    let mut n = len;
+    let mut k = 0;
+    while n != 0 {
+        if n & 1 != 0 {
+            p = mul(POWERS[k], p);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    p
+}
+
+const POWERS: [u32; 64] = {
     // x^8 in the reflected bit order.
     let mut t = [0u32; 64];
     t[0] = 1 << 23;
@@ -70,9 +91,76 @@ static BYTE_POWERS: [u32; 64] = {
     t
 };
 
+/// Nibble tables of multiplication by `x^(8 · d · 16^k)`, for `k` in `0..SHIFT_DIGITS` and `d` in `1..16`: a shift
+/// applies one per non-zero hex digit of its length, at most 8 lookups each (Q-873).
+static SHIFT_TABLES: [[[[u32; 16]; 8]; 15]; SHIFT_DIGITS] = {
+    let mut t = [[[[0u32; 16]; 8]; 15]; SHIFT_DIGITS];
+    let mut k = 0;
+    while k < SHIFT_DIGITS {
+        let mut d = 1;
+        while d < 16 {
+            let a = byte_power((d as u64) << (4 * k));
+            let mut nib = 0;
+            while nib < 8 {
+                let mut bit = 0;
+                let mut cols = [0u32; 4];
+                while bit < 4 {
+                    cols[bit] = mul(a, 1 << (4 * nib + bit));
+                    bit += 1;
+                }
+                let mut v = 1;
+                while v < 16 {
+                    let low = v & (v - 1);
+                    t[k][d - 1][nib][v] =
+                        t[k][d - 1][nib][low] ^ cols[(v ^ low).trailing_zeros() as usize];
+                    v += 1;
+                }
+                nib += 1;
+            }
+            d += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+fn apply(t: &[[u32; 16]; 8], p: u32) -> u32 {
+    let n = |i: u32| ((p >> (4 * i)) & 15) as usize;
+    (t[0][n(0)] ^ t[1][n(1)])
+        ^ (t[2][n(2)] ^ t[3][n(3)])
+        ^ ((t[4][n(4)] ^ t[5][n(5)]) ^ (t[6][n(6)] ^ t[7][n(7)]))
+}
+
 /// The CRC32C that `crc` (of some bytes `a`) contributes to the CRC32C of `a` followed by `len` more bytes:
-/// `crc32c(a ‖ b) = crc32c_shift(crc32c(a), b.len()) ^ crc32c(b)`. Costs O(log `len`) and reads no bytes.
+/// `crc32c(a ‖ b) = crc32c_shift(crc32c(a), b.len()) ^ crc32c(b)`. Reads no bytes: below 4 GiB, at most 8 table
+/// applications (Q-873).
 pub fn crc32c_shift(crc: u32, len: u64) -> u32 {
+    let mut p = crc;
+    let mut n = len;
+    for table in &SHIFT_TABLES {
+        if n == 0 {
+            return p;
+        }
+        let d = (n & 15) as usize;
+        if d != 0 {
+            p = apply(&table[d - 1], p);
+        }
+        n >>= 4;
+    }
+    let mut k = 4 * SHIFT_DIGITS;
+    while n != 0 {
+        if n & 1 != 0 {
+            p = mul(BYTE_POWERS[k], p);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    p
+}
+
+/// [`crc32c_shift`] by squaring, one bit of `len` at a time: the reference for its tables.
+#[doc(hidden)]
+pub fn crc32c_shift_by_squaring(crc: u32, len: u64) -> u32 {
     let mut p = crc;
     let mut n = len;
     let mut k = 0;
@@ -84,6 +172,17 @@ pub fn crc32c_shift(crc: u32, len: u64) -> u32 {
         k += 1;
     }
     p
+}
+
+/// CRC32C of the first 12 bytes of a block header: one slice-by-8 step and one slice-by-4 step.
+pub(crate) fn header_crc32c(b: &[u8; 16]) -> u32 {
+    #[cfg(test)]
+    BYTES_HASHED.with(|c| c.set(c.get() + 12));
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&b[..8]);
+    let reg = step8(!0, first) ^ u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+    let x = |i: u32| ((reg >> (8 * i)) & 0xFF) as usize;
+    !(SLICES[3][x(0)] ^ SLICES[2][x(1)] ^ SLICES[1][x(2)] ^ SLICES[0][x(3)])
 }
 
 /// Slice-by-8 tables for the register update of [`PrefixCrc`].
@@ -237,6 +336,55 @@ mod tests {
         c.update(b"1234");
         c.update(b"56789");
         assert_eq!(c.finish(), crc32c(b"123456789"));
+    }
+
+    #[test]
+    fn the_table_shift_equals_the_shift_by_squaring_for_every_digit_and_beyond_4_gib() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for k in 0..64 {
+            for d in 0..16u64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let len = (d << (4 * (k % 16))) | (x >> (64 - k.max(1)));
+                let crc = x as u32;
+                assert_eq!(
+                    crc32c_shift(crc, len),
+                    crc32c_shift_by_squaring(crc, len),
+                    "{len}"
+                );
+            }
+        }
+        for len in [
+            0,
+            1,
+            7,
+            8,
+            15,
+            16,
+            255,
+            256,
+            u64::from(u32::MAX),
+            1 << 32,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                crc32c_shift(!0, len),
+                crc32c_shift_by_squaring(!0, len),
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_checksum_equals_crc32c_of_the_first_12_bytes() {
+        let mut b = [0u8; 16];
+        for i in 0..4096u32 {
+            for (j, v) in b.iter_mut().enumerate() {
+                *v = (i.wrapping_mul(2_654_435_761) >> (j % 24)) as u8 ^ (j as u8).wrapping_mul(37);
+            }
+            assert_eq!(header_crc32c(&b), crc32c(&b[..12]));
+        }
     }
 
     #[test]
