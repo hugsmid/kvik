@@ -97,7 +97,7 @@ writer's process that keeps no facts: each call reads the bytes appended since t
 it had read, holding one part of decoded batches and the open segment up to the mark during the call and no segment
 bytes between calls; after a shutdown it reads nothing. Kept per loss or per batch and outside `window_memory`: the
 losses this process found with their regions, the lost ranges the decisions hold, the loss watch's recovery entries
-(one per start) and one commit time per batch.
+(one per start) and one commit time per batch. A key whose versions outgrow a quarter of the decision budget is read whole from the log at each of its calls, that read held for the call.
 After a start whose read of the log was voided part-way (a recovery entry voiding batches taken in an earlier part),
 the summaries are rebuilt once, at the first such call, by two reads of the log in parts that keep no facts; they
 run under the deliverer's lock, so emits with a consumer registered and entry calls wait for them. Worst case of the slow path, under the decision lock that

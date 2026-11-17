@@ -413,6 +413,23 @@ impl History {
                 self.revised_order.push_back(key);
             }
         }
+        // Next, an entry holding more than a quarter of the budget, facts in flight or not: a key revised in every
+        // call would otherwise grow until no window holds a fact, and every other series take the slow path (Q-945).
+        let mut tries = self.revised_order.len();
+        while self.bytes > self.budget && tries > 0 {
+            tries -= 1;
+            let Some(key) = self.revised_order.pop_front() else {
+                break;
+            };
+            let large = self.revised.get(&key).is_some_and(|f| {
+                REVISED_ENTRY + f.iter().map(revised_fact_bytes).sum::<usize>() > self.budget / 4
+            });
+            if large {
+                self.evict_revised(key);
+            } else {
+                self.revised_order.push_back(key);
+            }
+        }
         let mut idle = 0;
         while self.bytes > self.budget && idle < self.order.len() {
             self.cursor = (self.cursor + 1) % self.order.len();
@@ -457,13 +474,18 @@ impl History {
             let Some(key) = self.revised_order.pop_front() else {
                 break;
             };
-            let Some(facts) = self.revised.remove(&key) else {
-                continue;
-            };
-            self.bytes -= REVISED_ENTRY + facts.iter().map(revised_fact_bytes).sum::<usize>();
-            for k in facts {
-                self.overlay(key, k);
-            }
+            self.evict_revised(key);
+        }
+    }
+
+    /// Removes a revised-key entry; its facts in flight stay in the overlay and the key returns to the slow path.
+    fn evict_revised(&mut self, key: Key) {
+        let Some(facts) = self.revised.remove(&key) else {
+            return;
+        };
+        self.bytes -= REVISED_ENTRY + facts.iter().map(revised_fact_bytes).sum::<usize>();
+        for k in facts {
+            self.overlay(key, k);
         }
     }
 
@@ -725,6 +747,62 @@ mod tests {
             let held = h.held();
             assert!(held.bytes <= budget, "call {call}: {held:?}");
             assert!(held.overlay <= 2, "call {call}: {held:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_revised_in_every_call_beyond_the_budget_leaves_the_other_series_windows_and_reads_only_itself()
+     {
+        for budget in [1_000usize, 100_000] {
+            let mut h = History::with_budget(budget);
+            for id in 10..30u32 {
+                for k in 0..10i64 {
+                    h.note(
+                        (id, 1_000 + k),
+                        fact(1_000 + k, 0, true),
+                        || WINDOW_SPAN,
+                        None,
+                    );
+                }
+            }
+            note(&mut h, (1, 100), fact(100, 0, true));
+            note(
+                &mut h,
+                (1, 5_000_000_000_000),
+                fact(5_000_000_000_000, 0, true),
+            );
+            let before = h.held();
+            let in_memory: Vec<u32> = (10..30u32)
+                .filter(|&id| matches!(h.facts((id, 1_009)), Facts::Known(v) if !v.is_empty()))
+                .collect();
+            assert!(!in_memory.is_empty());
+            let mut log: Vec<Known> = vec![fact(100, 0, true)];
+            for call in 1..=2_000u64 {
+                h.readable_below(call);
+                let mut k = fact(100, call, true);
+                k.changed_at = Some(call);
+                // Only the hot key is read, and at most its whole history (Q-945).
+                let whole = match h.facts((1, 100)) {
+                    Facts::Slow(_) => Some(log.clone()),
+                    Facts::Known(_) => None,
+                };
+                assert!(whole.as_ref().is_none_or(|w| w.len() as u64 <= call));
+                h.note((1, 100), k.clone(), || WINDOW_SPAN, whole);
+                k.call = 0;
+                log.push(k);
+                let held = h.held();
+                assert!(held.bytes <= budget, "{held:?}");
+                assert!(
+                    held.window + 3 >= before.window,
+                    "call {call}: {before:?} then {held:?}"
+                );
+                for &id in &in_memory {
+                    assert!(
+                        matches!(h.facts((id, 1_009)), Facts::Known(v) if !v.is_empty()),
+                        "series {id} at call {call}"
+                    );
+                }
+            }
         }
     }
 }
