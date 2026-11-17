@@ -7,7 +7,7 @@ use std::path::Path;
 
 use common::block_on;
 use common::durable::{World, damage, data_lost, gauge, history, note, num};
-use kvik::{Health, Kind, LossKind, Position, Reason, SeriesId, SeriesSpec, Store};
+use kvik::{Health, Kind, LossKind, Position, Reason, Select, SeriesId, SeriesSpec, Start, Store};
 
 #[test]
 fn a_batch_damaged_while_the_store_is_open_is_reported_at_once_and_its_replay_recorded() {
@@ -56,6 +56,38 @@ fn a_batch_damaged_while_the_store_is_open_is_reported_at_once_and_its_replay_re
     block_on(s.acknowledge_losses(&[lost_at])).unwrap();
     assert!(matches!(s.health(), Health::Ok));
     block_on(s.shutdown()).unwrap();
+}
+
+/// The deliverer as the only finder: nothing polls `losses()` or `health()`, nothing queries, before the replay.
+#[test]
+fn the_deliverer_alone_finds_damage_to_the_newest_batch_and_its_replay_is_recorded() {
+    for consumer in [true, false] {
+        let w = World::new(&format!("deliverer-finds-{consumer}"));
+        let s = w.open();
+        let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+        let c = consumer.then(|| block_on(s.consumer("c", Start::Now, Select::None)).unwrap());
+        block_on(s.emit(&[note(id, 0, "DV-ONE")])).unwrap();
+        block_on(s.emit(&[note(id, 1, "DV-TWO")])).unwrap();
+        damage(&w, b"DV-TWO");
+        block_on(s.emit(&[note(id, 2, "DV-THREE")])).unwrap();
+        // With no consumer the `kvik-deliver` thread takes the batch, woken by the writer's progress.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ack = block_on(s.emit(&[note(id, 1, "DV-TWO")])).unwrap();
+        assert!(
+            matches!(
+                ack.outcomes[..],
+                [kvik::Outcome::Recorded {
+                    unchecked: false,
+                    ..
+                }]
+            ),
+            "consumer {consumer}: {:?}",
+            ack.outcomes
+        );
+        assert_eq!(data_lost(&s.losses()).len(), 1);
+        drop(c);
+        block_on(s.shutdown()).unwrap();
+    }
 }
 
 /// The kept log of three notes, written by one run; the store opened again and the second note's batch damaged.
