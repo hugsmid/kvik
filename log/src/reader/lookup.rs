@@ -628,7 +628,8 @@ fn scan_new(
                         return Some(());
                     }
                     let Ok(content) = BatchContent::decode(&b) else {
-                        // Kept as a region, so that every later lookup of the segment is incomplete too.
+                        // A guard: the scanner ran the same body checks, so a complete batch decodes. Kept as a region,
+                        // so that every later lookup of the segment is incomplete too.
                         map.regions.push((b.offset, b.end()));
                         map.resume = Some(before[k + 1]);
                         continue;
