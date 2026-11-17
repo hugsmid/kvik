@@ -745,6 +745,19 @@ impl Deliverer {
         }
     }
 
+    /// The registry file's content up to the mark the writer last synced (`format.md` A.16), once every batch up to it
+    /// is taken; `None` if the log could not be read that far.
+    pub(crate) fn registry_file(
+        &mut self,
+        ctx: &Ctx<'_>,
+        floor: u32,
+    ) -> Option<kvik_log::registry::RegistryFile> {
+        self.pump(ctx);
+        let through = self.reader.get_mut().as_ref()?.state().durable;
+        let reached = ctx.watch.is_none_or(|w| through >= w.stats().mark_synced);
+        (reached && self.pending.is_empty()).then(|| self.index.registry_file(through, floor))
+    }
+
     /// Closes the log reader (its lease is deleted).
     pub(crate) fn close(&mut self) {
         if let Some(r) = self.reader.get_mut().take() {

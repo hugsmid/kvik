@@ -18,6 +18,8 @@ mod clock;
 mod completion;
 mod consumers;
 mod deliver;
+#[cfg(test)]
+mod held_state;
 mod history;
 mod index;
 mod ingest;
@@ -445,12 +447,15 @@ impl Writer {
         };
         let floor = log.stats().max_series_id;
         let shut = log.shutdown();
-        // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
+        // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken. The registry
+        // file's content comes from the deliverer's index once it has taken the log up to that mark.
+        let mut file = None;
         if let Some(h) = &self.hub {
             h.closed.store(true, Ordering::SeqCst);
             if shut.is_ok()
                 && let Err(e) = h.run(|d, c| {
                     let r = d.flush_all(c);
+                    file = d.registry_file(c, floor);
                     d.close();
                     r
                 })
@@ -469,10 +474,6 @@ impl Writer {
             return Err(WriteError::ReadOnly(fault_out(&f)));
         }
         // The registry file again, up to the mark the clean shutdown synced.
-        let file = self.reader().ok().and_then(|r| {
-            r.with(|i, log| Ok(i.registry_file(log.state().durable, floor)))
-                .ok()
-        });
         if let Some(file) = file {
             let wall = self.env.clock.wall().0;
             if let Err(e) =
