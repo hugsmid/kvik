@@ -169,9 +169,11 @@ let info = store.series(id)?;                 // also by name
 These calls, and route changes, resolve only after the durable mark has been synced past their entry (spec §3
 Commit). The writer forces that mark sync at once rather than waiting for the timed interval, so each call waits for
 one mark sync, not for up to the interval. A name has exactly three `/`-separated segments, none empty (spec §2.1
-`name`): `define_series` and `alias` refuse a name of another shape with `DefineError::Invalid { field: "name", .. }`,
-on both backends (Q-670). A store whose log holds such a name from before the rule opens; the series stays readable
-and writable by id, and an alias of the right shape gives it a name patterns can select. Defining a series that already exists with the same specification
+`name`): `define_series` and `alias` refuse a name of another shape, on both backends, with
+`DefineError::Invalid { field: "name", .. }` (Q-670). A store whose log holds such a name from before the rule
+opens; the series stays readable and writable by id, and an alias of the right shape gives it a name patterns can
+select.
+Defining a series that already exists with the same specification
 returns its id. A different kind, value type or unit, or a lower scale, under the same name is an error; the caller
 retires and defines anew. A higher scale is set with `raise_scale`, which appends a scale raise entry (spec §2.1
 `decimal scale`); it fails with `ScaleNotRaised` unless the new scale is higher, and with `ScaleOverflow` if the
