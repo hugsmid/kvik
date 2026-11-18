@@ -17,6 +17,8 @@ publish = false
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+# Set only for the model-checker tests of `kvik` (Q-901).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kvik_loom)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

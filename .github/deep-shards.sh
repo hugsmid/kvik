@@ -77,6 +77,8 @@ log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_ze
 kvik-units      kvik  lib         durable::by_id::tests::
 kvik-ingest     kvik  lib         durable::ingest::
 kvik-fold       kvik  lib         durable::derived::tests::
+kvik-pmap       kvik  lib         durable::read::pmap::
+kvik-views      kvik  lib         durable::read::tests::concurrent_calls_
 '
 
 cd "$(dirname "$0")/.."

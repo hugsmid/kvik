@@ -97,6 +97,11 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-852 | §7 Readers, Manifest; `format.md` A.13 | What a reader call reads once caught up (decided, awaiting review) |
 | Q-853 | §7 Readers; `api.md` `ReaderConfig` | `cut_max_age`'s default and bound, and the clock it runs on (decided, awaiting review) |
 | Q-854 | §7 Manifest, Leases; `format.md` A.15 | The highest epoch a reader has read, recorded in its lease (decided by the lead) |
+| Q-900 | §7 Readers; query design §3.5 | How a reader's published views share structure (decided, awaiting review) |
+| Q-901 | query design §3.5 Verified by | The model checker for the single-flight refresh (decided, awaiting review) |
+| Q-902 | §7 Readers; query design §3.5 | The single-flight refresh: rounds, followers and a leader's error (decided, awaiting review) |
+| Q-903 | §7 Readers, Leases; query design §3.3, §3.5 | A call's cut when calls share views (decided, awaiting review) |
+| Q-904 | query design §3.5; roadmap 9.0b2 | The recent window's shard locks, left for the first query that reads the recent window |
 | Q-751 | §5.1, §11, §13 | The recent windows' memory: per series and store-wide |
 | Q-752 | §2.4 revised-key index, §5.1, §8 tree checkpoints, §13 Restart | A start's time and the revised-key index before tree checkpoints exist |
 | Q-753 | §2.3 Live state, §4 Outranked facts, §5.1, §6 Restart and resume | What the deliverer keeps in memory and reads from the log |
@@ -2590,6 +2595,122 @@ layout of everything else.
 **Pinned by.** `an_epoch_the_reader_has_read_is_never_used_again_while_an_older_cut_holds_the_lease`
 (`log/tests/reader_calls.rs`); `layout` (`log/src/lease.rs`).
 
+## Q-900 — How a reader's published views share structure
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.5 holds the series directory in reference-counted pages of 1,024 entries and the
+tail as append-only runs, so that a refresh copies only what changed. Until roadmap 9.0c and 9.0f the reader's index
+holds the registry, every kept fact by series, every batch's commit time and the recovery entries; a published view
+must share them, or each refresh copies the whole index.
+**Decision.** Every map of the index (the registry's series, the facts by series and each series' facts by
+`(t, position)`, the entries, the commit times, the recovery entries) is one persistent B-tree with nodes of at most
+64 entries, reference-counted: a published view is a clone that copies no entry, and the next refresh copies only the
+nodes on the paths it changes, one node a level. A level is added per 64-fold growth, so the cost grows with the
+logarithm of the number of series and of a series' length, not with either. One fact alone in a refresh after a
+publish, with 20 facts a series, costs the map 104 entries copied, 13,000 bytes and 10 allocations at 128 series, and
+170 entries, 14,040 bytes and 12 allocations at 16,384 (its own allocations, counted by the map: a node is allocated
+once, with room for the entry an insert adds, two allocations a node); each further series touched costs about one
+leaf of its facts and one of the directory. A range is read lazily from both ends, so the last fact before a time is
+one descent whatever the series' length. Flat pages of 1,024 would copy a whole page per page touched under a root
+that grows with the series, and late facts need ordered inserts that append-only runs do not give; one structure
+serves every map. A void (a reset) builds the maps it changes again, as the index did before. Counting the nodes a
+held view pins against the memory cap comes with the accountant (roadmap 9.0f).
+**Pinned by.** `a_refresh_after_a_publish_costs_about_the_same_whatever_the_number_of_series`,
+`a_live_read_visits_a_path_whatever_the_length_of_the_series` (`kvik/src/durable/index.rs`);
+`a_map_and_its_snapshots_read_as_ordered_maps_do`,
+`a_change_to_a_shared_map_copies_one_node_a_level_and_leaves_the_snapshot_as_it_was`,
+`a_copied_node_takes_the_insert_that_follows_without_growing`, `a_range_read_from_either_end_visits_a_path_not_the_map`
+(`kvik/src/durable/read/pmap.rs`).
+
+## Q-901 — The model checker for the single-flight refresh
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.5 verifies the view swap and the single-flight refresh under a model checker for
+interleavings, a dev-dependency on the stable toolchain. The workspace had none.
+**Decision.** loom 0.7.2 (MIT), a dev-dependency only under `cfg(kvik_loom)`: normal and test builds neither compile
+nor link it (it is in `Cargo.lock`, as every target-specific dependency is). Under `--cfg kvik_loom` the flight's mutex
+and condition variable are loom's, and only `durable::read::flight::loom_tests` run so, in their own CI job
+(`model-check`, release build, the cfg in `RUSTFLAGS`), with at most three preemptions unless loom's environment sets
+another bound; two tests run four calls, so that a round's end that wakes one waiter of three fails them. loom rather than shuttle: it explores every interleaving within the bound instead of a random sample,
+which a wait-and-wake protocol needs; shuttle's randomised search is the fallback if the state space outgrows it. The
+flight is generic over its view, so the checked code is the code the reader runs. 0.7.3 was nine days old when this
+was built and is not taken.
+**Pinned by.** `every_call_gets_a_view_read_after_it_began_and_refreshes_never_overlap`,
+`four_calls_all_end_with_a_view_read_after_they_began`, `only_the_leader_of_a_failed_round_reports_its_error`, `a_follower_reports_an_error_only_after_two_failed_rounds`
+(`kvik/src/durable/read/flight.rs`, under `--cfg kvik_loom`).
+
+## Q-902 — The single-flight refresh: rounds, followers and a leader's error
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** The query design §3.5: calls that arrive together share one mark read; a call that began after a refresh
+started joins the next one, so every call sees the mark as of its start; a follower gets the leader's result, and on
+the leader's error retries once itself.
+**Decision.** Refreshes run in numbered rounds, never two at once. A call needs the first round that begins after it
+does: the next one if a round runs, else one it leads at once; it returns the view of that round or of a later one.
+The leader runs the refresh on its own thread, outside the flight's lock, and returns its own result, error included.
+A follower whose round failed takes part in the next round to end, leading it if none runs, and reports that round's
+error if it fails too: refreshes are serialised, so followers that retry together share one round as any calls do,
+and "retries once itself" is read as one more round. A round that succeeds or unwinds clears the error, so a follower
+never reports the error of a round that failed before it began; a leader that unwinds ends its round with no result
+and its followers go on to the next. Every call that reports a round's error gets the same error, an I/O error with
+its operating-system code. The view a round supersedes is freed after the flight's lock is released. The refresh is outside every budget by construction; the budgets come with roadmap 9.0g.
+**Pinned by.** `calls_that_arrive_during_a_refresh_share_the_next_one`,
+`a_follower_leads_once_more_after_its_leaders_error_and_the_leader_reports_it`,
+`a_follower_whose_second_round_fails_too_reports_that_error`,
+`a_round_whose_leader_panics_ends_and_its_follower_leads_the_next`,
+`a_follower_after_unwound_rounds_reports_no_error_of_a_round_before_it_began`, and the loom tests of Q-901
+(`kvik/src/durable/read/flight.rs`); `concurrent_calls_equal_sequential_ones_at_the_same_cuts`,
+`many_calls_of_every_kind_from_many_threads_across_a_power_loss_and_a_restart` (`kvik/src/durable/read/tests.rs`).
+
+## Q-903 — A call's cut when calls share views
+Recorded and decided by roadmap 9.0b2 (technical). To be confirmed at its review.
+**Scenario.** Roadmap 9.0b1 took a cut of the log reader per call under the call-long lock and checked it at the end
+with `LogReader::check_cut`, which renews a due lease. With no lock across a call, a call that took or checked a cut of
+the log reader would wait for whatever refresh runs.
+**Decision.** A view holds one cut of the log reader, taken by the refresh that publishes it and released once the view
+is superseded and no call holds it, by the end of the next call or the next refresh. A call's cut is its view's. Its
+check needs no lock: the cut has ended if a lease was found gone or changed since the view was taken (a refresh that
+finds the current view's cut ended that way ends every view), or once `cut_max_age` has passed since the refresh that
+took it began. Later refreshes do not renew a call's age, so calls running together end as each would alone. A call
+as old as half `lease_refresh` also checks its cut through the log reader under its lock, which renews a due lease and
+finds one the writer deleted (9.0b1's review, S2): at most one wait for a refresh, for such a call only. The lease
+therefore names the lowest epoch of the live views: after an epoch change it names the old one until the old view is
+released and the lease next rewritten, and `ReaderState.epoch` shows that; which epoch that field means is still
+9.0c's (Q-853).
+**Notes for 9.0c (9.0b2's review, findings 6 and 7).** The superseded view's cut is released at the end of the call
+that led the round, but the lease is rewritten only by the next refresh: a reader that answers one call just after a
+retirement and then sleeps names the old epoch until the writer expires its lease, an hour later, where 9.0b1 named
+the new epoch at that call. It only keeps files longer, and `highest_read` is still written before anything is read
+under the new epoch. 9.0c may let the release renew the lease when the epoch it names would change. Second, a call
+younger than half `lease_refresh` is not checked through the log reader, which is safe while calls read memory only:
+a lone call that runs to a `cut_max_age` above 45 minutes ends with a lease up to 75 minutes old; its check then finds
+the lease gone and reports `CutExpired`, but once a call's work reads files it can meet a removed file first. 9.0c
+renews the lease during a call that reads files, or caps `cut_max_age` at the expiry less half `lease_refresh`.
+**Pinned by.** `a_call_that_outlives_cut_max_age_ends_with_cut_expired_and_releases_its_cut`,
+`the_stores_own_reads_call_once_more_after_a_cut_ends_and_then_report_it` (`kvik/src/durable/read/cut.rs`);
+`a_call_runs_while_another_call_holds_its_view_and_each_view_keeps_its_cut_until_released`,
+`a_lease_another_calls_refresh_finds_gone_ends_a_call_in_flight`,
+`a_call_as_old_as_half_lease_refresh_renews_the_lease_at_its_check_and_finds_it_gone`,
+`a_long_calls_check_that_finds_the_lease_gone_ends_the_views_of_other_calls_in_flight`
+(`kvik/src/durable/read/tests.rs`); `a_calls_cut_ages_from_the_start_of_the_refresh_that_published_its_view`
+(`kvik/src/durable/read/cut.rs`).
+
+## Q-904 — The recent window's shard locks
+Recorded and decided by roadmap 9.0b2 (technical). To be settled by roadmap 9.0c.
+**Scenario.** The query design §3.5: the recent window is not in a view; in the writer's process a query copies the
+rows it needs for one series under that series' shard lock (at most 1,024 facts, filtered to its cut), and the
+decision path holds a shard lock only for its own insert. The roadmap row of 9.0b2 lists the shard locks.
+**Decision.** They are built with the first query that reads the recent window: the latest values in the writer's
+process (roadmap 9.0c, S1). No query reads it yet. Every read of the writer's process goes through its own reader,
+and the recent window (`kvik/src/durable/history.rs`) is the decider's, under the decider's lock. It records each
+fact's call, not its position, so a copy filtered to a cut needs the position recorded at queueing, and its eviction
+for the store-wide budget walks every series, which locks per series must not serialise: both change the decision
+path, and only a reader of the window can test them. What 9.0b2 does for the promise they serve (the commit path takes
+no lock a query holds across a read): no call holds a lock during its work, so the writer's own reads (the registry
+file after a routing change, read under the decider's lock, and at shutdown) never wait for another call's work. They
+wait for at most two refreshes: the one running when they arrive and the one they need. Each reads the bytes appended
+since the last once the store's reader has caught up, but the first refresh of a reader just opened reads the whole
+log, so a routing change soon after the store's reader is first used waits for that read under the decider's lock.
+**Note for 9.0c.** The shard locks are built so that no read of the decision path runs under the decider's lock.
+**Pinned by.** Nothing yet; 9.0c's tests.
+
 ## Q-760 — A stored `changed_at` of kind `time` above `i64::MAX`
 
 **Scenario.** Since Q-195 (a) ingest refuses a `changed_at` above `i64::MAX` on a series of `changed_at kind` `time`.
@@ -2859,7 +2980,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|

@@ -76,6 +76,21 @@ jobs:
       - run: cargo run --locked -p kvik --example quickstart
       - run: cargo test --locked -p kvik --features jiff
 
+  model-check:
+    # The single-flight refresh of the durable reader under the loom model checker (Q-901): its tests alone, with the
+    # cfg that gives `durable::read::flight` loom's locks; nothing else is built with it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: loom
+      - run: cargo test -p kvik --lib --locked --release durable::read::flight::loom_tests
+        env:
+          RUSTFLAGS: -D warnings --cfg kvik_loom
+
   spike:
     # The encoding spike (roadmap 2.1) and the commit-path spike (roadmap
     # 2.2) are outside the default members; their tests run here, on one OS.

@@ -30,7 +30,7 @@
 //!
 //! A call's file work does not grow with the log (query design §3.1): one read of the mark (a second one only after a
 //! pass that took something, the check above), the manifest checked by path and parsed only past what the reader
-//! holds ([`manifest`]), the open segment's new bytes, the last batch read again, and no directory listing once the
+//! holds (`manifest`), the open segment's new bytes, the last batch read again, and no directory listing once the
 //! reader has caught up: later segments are opened by name, with a listing only if one is not found.
 //!
 //! The lease (`format.md` A.15, `spec.md` §7 Readers) names the lowest manifest epoch among the reader's live cuts
@@ -479,6 +479,11 @@ impl LogReader {
     /// The lease file's path.
     pub fn lease_path(&self) -> &Path {
         &self.lease_path
+    }
+
+    /// The `lease_refresh` and `cut_max_age` in force, bounded as [`LogReader::open`] bounds them.
+    pub fn ages(&self) -> (Duration, Duration) {
+        (self.cfg.lease_refresh, self.cfg.cut_max_age)
     }
 
     /// Re-reads the mark, the manifest and the batches appended since the last refresh, below the mark only, and

@@ -1,6 +1,8 @@
 //! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch, and
 //! the losses its reads found ([`Finder`]), built from what a log reader returns and cut back when it voids what it
-//! took (`spec.md` §7 Readers). Each reader holds one; the writer's start and the deliverer hold one without facts.
+//! took (`spec.md` §7 Readers). Each reader holds one, and its views share its structure (query design §3.5): a
+//! clone copies no entry, and a change copies the nodes it touches. The writer's start and the deliverer hold one
+//! without facts.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -16,6 +18,7 @@ use kvik_log::writer::Position as LogPos;
 
 use super::by_id::ById;
 use super::loss::{Find, Finder};
+use super::read::pmap::PMap;
 use super::registry::{Registry, Series};
 use super::summary::Summary;
 use crate::backend::Error;
@@ -43,11 +46,11 @@ impl Stored {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index {
     /// Registry entries with the receive time of their batch.
-    entries: BTreeMap<LogPos, (i64, Entry)>,
+    entries: PMap<LogPos, (i64, Entry)>,
     registry: Registry,
-    facts: BTreeMap<u32, BTreeMap<(i64, LogPos), Stored>>,
-    /// Each batch's last position and commit time, in log order.
-    commits: Vec<(LogPos, i64)>,
+    facts: PMap<u32, PMap<(i64, LogPos), Stored>>,
+    /// Each batch's last position and commit time.
+    commits: PMap<LogPos, i64>,
     finder: Finder,
     /// Facts are not kept, only each series' [`Summary`] (roadmap 11.0: the writer's start and the deliverer need the
     /// registry and the commit times, not the facts).
@@ -195,14 +198,16 @@ impl Index {
                 }
                 Item::Fact(row) => {
                     self.registry.note_fact(row.series_id);
-                    self.facts.entry(row.series_id).or_default().insert(
-                        (row.t, p),
-                        Stored {
-                            position: p,
-                            received_at: b.content.received_at,
-                            row: row.clone(),
-                        },
-                    );
+                    self.facts
+                        .get_or_insert_with(row.series_id, PMap::default)
+                        .insert(
+                            (row.t, p),
+                            Stored {
+                                position: p,
+                                received_at: b.content.received_at,
+                                row: row.clone(),
+                            },
+                        );
                 }
                 Item::Entry(e) if matches!(**e, Entry::Ignored { .. }) => {}
                 Item::Entry(e) => {
@@ -213,7 +218,7 @@ impl Index {
             }
             sequence += item.sequences();
         }
-        self.commits.push((b.last, b.commit_time));
+        self.commits.insert(b.last, b.commit_time);
         if let Some(f) = &self.fold {
             f.batch(b);
         }
@@ -227,12 +232,19 @@ impl Index {
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
         let taken = self.commits.len();
-        self.commits.retain(|(p, _)| keep(p));
+        self.commits.retain(|p, _| keep(p));
         self.stale |= self.no_facts && self.commits.len() != taken;
-        for f in self.facts.values_mut() {
-            f.retain(|(_, p), _| keep(p));
+        if self
+            .facts
+            .values()
+            .any(|f| f.iter().any(|((_, p), _)| !keep(p)))
+        {
+            self.facts = PMap::from_sorted(self.facts.iter().filter_map(|(id, f)| {
+                let mut f = f.clone();
+                f.retain(|(_, p), _| keep(p));
+                (!f.is_empty()).then_some((*id, f))
+            }));
         }
-        self.facts.retain(|_, f| !f.is_empty());
         self.summary.retain(|_, s| keep(&s.first));
         self.registry = Registry::default();
         for (_, e) in self.entries.values() {
@@ -240,8 +252,8 @@ impl Index {
         }
         for id in self
             .facts
-            .keys()
-            .copied()
+            .iter()
+            .map(|(id, _)| *id)
             .chain(self.summary.iter().map(|(id, _)| id))
         {
             self.registry.note_fact(id);
@@ -273,7 +285,7 @@ impl Index {
             max_series_id: floor.max(self.registry.highest()),
             entries: self
                 .entries
-                .range(..=through)
+                .range(Bound::Unbounded, Bound::Included(&through))
                 .filter(|(p, _)| p.generation == through.generation)
                 .map(|(p, (t, e))| (p.sequence, *t, e.clone()))
                 .collect(),
@@ -282,7 +294,7 @@ impl Index {
 
     /// The facts of a series in `(t, position)` order.
     pub(crate) fn series_facts(&self, id: u32) -> impl Iterator<Item = &Stored> {
-        self.facts.get(&id).into_iter().flat_map(|m| m.values())
+        self.facts.get(&id).into_iter().flat_map(PMap::values)
     }
 
     /// The current facts of a series (the fact of highest rank per `t`, spec §2.2) with `t` from `from` to `to`
@@ -314,18 +326,10 @@ impl Index {
             Bound::Excluded(t) => Bound::Excluded((t, FIRST)),
             Bound::Unbounded => Bound::Unbounded,
         };
-        // An empty or inverted range reads nothing (`BTreeMap::range` panics on one).
-        let empty = match (&lo, &hi) {
-            (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
-                a > b || (a == b && !matches!((&lo, &hi), (Bound::Included(_), Bound::Included(_))))
-            }
-            _ => false,
-        };
-        let facts = self.facts.get(&id).filter(|_| !empty);
-        let mut it: Box<dyn Iterator<Item = &Stored>> = match facts {
+        let mut it: Box<dyn Iterator<Item = &Stored>> = match self.facts.get(&id) {
             None => Box::new(std::iter::empty()),
-            Some(m) if rev => Box::new(m.range((lo, hi)).rev().map(|(_, s)| s)),
-            Some(m) => Box::new(m.range((lo, hi)).map(|(_, s)| s)),
+            Some(m) if rev => Box::new(m.range(lo.as_ref(), hi.as_ref()).rev().map(|(_, s)| s)),
+            Some(m) => Box::new(m.range(lo.as_ref(), hi.as_ref()).map(|(_, s)| s)),
         };
         let mut pending = it.next();
         let rank = move |s: &Stored| (if versioned { s.row.changed_at } else { None }, s.position);
@@ -346,7 +350,7 @@ impl Index {
 
     /// Every series id that has a kept fact.
     pub(crate) fn fact_series(&self) -> impl Iterator<Item = u32> + '_ {
-        self.facts.keys().copied()
+        self.facts.iter().map(|(id, _)| *id)
     }
 
     fn lookup(&self, key: &SeriesKey) -> Result<&Series, Error> {
@@ -369,7 +373,7 @@ impl Index {
         }
         self.facts
             .get(&id)
-            .and_then(|m| m.keys().map(|(t, _)| *t).max())
+            .and_then(|m| m.last().map(|((t, _), _)| *t))
     }
 
     /// The lateness reference of an observed series (spec §2.2): the greatest `t` of its facts flagged neither
@@ -410,7 +414,7 @@ impl Index {
         self.commits
             .iter()
             .rev()
-            .find(|(_, t)| *t <= at)
+            .find(|(_, t)| **t <= at)
             .map_or(LogPos::default(), |(p, _)| *p)
     }
 
@@ -468,10 +472,17 @@ impl Index {
             self.stale = true;
             return;
         }
-        for f in self.facts.values_mut() {
-            f.retain(|(_, p), _| *p < first || last < *p);
+        if self
+            .facts
+            .values()
+            .any(|f| f.iter().any(|((_, p), _)| first <= *p && *p <= last))
+        {
+            self.facts = PMap::from_sorted(self.facts.iter().filter_map(|(id, f)| {
+                let mut f = f.clone();
+                f.retain(|(_, p), _| *p < first || last < *p);
+                (!f.is_empty()).then_some((*id, f))
+            }));
         }
-        self.facts.retain(|_, f| !f.is_empty());
     }
 }
 
@@ -484,7 +495,12 @@ mod tests {
     use kvik_log::reader::VoidCause;
     use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
 
+    use std::sync::Arc;
+
+    use super::super::read::pmap::NODE;
+    use super::super::read::pmap::count::{self, Counts};
     use super::*;
+    use crate::env::ManualClock;
     use crate::series::{Kind, SeriesSpec, ValueType};
 
     fn batch(first: u64, items: Vec<Item>) -> ReadEvent {
@@ -534,6 +550,104 @@ mod tests {
             value: LogValue::F64(v.to_bits()),
             changed_at: None,
         })
+    }
+
+    fn fact_of(series_id: u32, t: i64) -> Item {
+        match fact(t, 1.0) {
+            Item::Fact(row) => Item::Fact(FactRow { series_id, ..row }),
+            other => other,
+        }
+    }
+
+    /// An index of `series` series with 20 facts each in 80 batches, published, then given one batch with one fact: what that
+    /// batch cost the map.
+    fn cost_of_one_fact(series: u32) -> Counts {
+        let mut i = Index::default();
+        let mut next = 1;
+        for t in 0..20 {
+            // Four batches each, so the commit times' map is the same size whatever the series.
+            for ids in (1..=series).collect::<Vec<_>>().chunks(series as usize / 4) {
+                let items: Vec<_> = ids.iter().map(|id| fact_of(*id, t)).collect();
+                let n = items.len() as u64;
+                i.apply(&[batch(next, items)], MARK);
+                next += n;
+            }
+        }
+        let published = i.clone();
+        let ((), c) = count::during(|| {
+            i.apply(&[batch(next, vec![fact_of(series / 2, 20)])], MARK);
+        });
+        assert_eq!(published.series_facts(series / 2).count(), 20);
+        assert_eq!(i.series_facts(series / 2).count(), 21);
+        assert_eq!(i.latest_t(series / 2), Some(20));
+        c
+    }
+
+    #[test]
+    fn a_refresh_after_a_publish_costs_about_the_same_whatever_the_number_of_series() {
+        let small = cost_of_one_fact(128);
+        let large = cost_of_one_fact(16_384);
+        // One node a level on each path it changes: one level more for 128 times the series, and a root that grows.
+        assert!(
+            large.copied <= small.copied + 2 * NODE as u64,
+            "{small:?} {large:?}"
+        );
+        assert!(
+            large.allocations <= small.allocations + 2,
+            "{small:?} {large:?}"
+        );
+        assert!(
+            large.bytes <= small.bytes + 2 * 1_024,
+            "{small:?} {large:?}"
+        );
+        assert!(
+            large.allocations <= 16 && large.bytes <= 24 * 1_024,
+            "{large:?}"
+        );
+    }
+
+    /// An index of one gauge with `n` facts at seconds 1 to `n`: what a live-state read at the end costs the map.
+    fn cost_of_live(n: i64) -> Counts {
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let def =
+            super::super::registry::definition_of(&spec, 1, Duration::from_secs(300)).unwrap();
+        let mut i = Index::default();
+        i.apply(
+            &[batch(
+                1,
+                vec![Item::Entry(Box::new(Entry::Definition(Box::new(def))))],
+            )],
+            MARK,
+        );
+        let mut next = 2;
+        for first in (1..=n).step_by(10_000) {
+            let items: Vec<_> = (first..(first + 10_000).min(n + 1))
+                .map(|t| fact(t * 1_000_000_000, t as f64))
+                .collect();
+            let len = items.len() as u64;
+            i.apply(&[batch(next, items)], MARK);
+            next += len;
+        }
+        let clocks = super::super::clock::Clocks::new(Arc::new(ManualClock::new(Timestamp(0))));
+        let now = (n + 1) * 1_000_000_000;
+        let (live, c) =
+            count::during(|| super::super::windows::live_in(&i, &clocks, SeriesId(1), now));
+        assert!(matches!(live, Ok(crate::read::Live::Value(_))), "{live:?}");
+        c
+    }
+
+    #[test]
+    fn a_live_read_visits_a_path_whatever_the_length_of_the_series() {
+        let (short, long) = (cost_of_live(1_000), cost_of_live(200_000));
+        assert!(long.visited <= short.visited + 4, "{short:?} {long:?}");
+        assert_eq!(long.allocations, short.allocations, "{short:?} {long:?}");
+        assert!(long.visited <= 16, "{long:?}");
     }
 
     #[test]
@@ -593,6 +707,11 @@ mod tests {
         );
         assert!(i.registry().get(1).is_none());
         assert_eq!(i.series_facts(1).count(), 0);
+        assert_eq!(
+            i.fact_series().count(),
+            0,
+            "a series the void emptied is gone"
+        );
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //! while it runs, with the stamp rule of its call kind (spec §7 Readers).
 //!
 //! - A materialised call (`live`, `at`, `window`, `buckets`, `calendar`, `interval`, `series`, and `facts` until it
-//!   streams, roadmap 9.0f) refreshes, holds its cut for the call and ends it at its return. A pass the log reader
-//!   discarded because the mark's reset stamp changed while it read is read once more, under the new cut; a second
-//!   such change is [`QueryError::CutExpired`] (Q-850).
+//!   streams, roadmap 9.0f) runs under the cut of the view a refresh published after it began, which the view holds
+//!   until it is superseded and no call holds it (Q-903). A pass the log reader discarded because the mark's reset
+//!   stamp changed while it read is read once more, under the new cut; a second such change is
+//!   [`QueryError::CutExpired`] (Q-850).
 //! - A cut held across calls (a snapshot, roadmap 9.0c; an iteration, 9.0f) ends with `CutExpired` once its epoch was
 //!   last found current `cut_max_age` ago or a renewal found the lease gone or changed; the lease names the lowest
 //!   epoch of the live cuts.
@@ -243,7 +244,28 @@ mod tests {
         });
         assert!(matches!(slow, Err(QueryError::CutExpired)), "{slow:?}");
         assert_eq!(facts(&r).unwrap(), 2);
-        assert_eq!(r.cuts_held(), 0);
+        assert_eq!(r.cuts_held(), 1, "the current view's alone");
+    }
+
+    #[test]
+    fn a_calls_cut_ages_from_the_start_of_the_refresh_that_published_its_view() {
+        let rig = Rig::new("cut-began");
+        let r = rig.reader();
+        let during = rig.clock.clone();
+        *rig.fs.hook.lock().unwrap() = (
+            0,
+            Some(HookBox(Box::new(move |_: &MemFs, n: u32| {
+                if n == 0 {
+                    during.advance(MAX_AGE / 2 + Duration::from_secs(1));
+                }
+            }))),
+        );
+        let clock = rig.clock.clone();
+        let call = r.with(|_, _| {
+            clock.advance(MAX_AGE / 2);
+            Ok(())
+        });
+        assert!(matches!(call, Err(QueryError::CutExpired)), "{call:?}");
     }
 
     #[test]

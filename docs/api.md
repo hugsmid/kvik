@@ -391,6 +391,10 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   under it then, or under a cut whose lease a renewal found gone or changed (a reader stopped for over
   an hour), ends with `CutExpired` and the caller starts again. A call whose pass is discarded because the reset
   stamp changed while it read reads once more under the new cut; a second change is `CutExpired` too (Q-850).
+- Calls on one reader from several threads run at once. Calls that arrive together share one read of the mark; a call
+  that arrives while one runs waits for the next, so it still sees the mark as of its start; no call holds a lock
+  while it computes its result, so none waits for another's work (Q-902). A call's cut is that of the view the shared
+  read published, and its `cut_max_age` runs from that read, not renewed during the call (Q-903).
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
   (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
   reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its
