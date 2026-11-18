@@ -490,3 +490,60 @@ fn a_loss_latched_while_a_call_waits_for_room_is_taken_in_when_it_plans_again() 
     wait(Emitted::Queued(filled));
     fs.set_sync_hook(None);
 }
+
+/// Q-938 with published views: the round that publishes the next view forgets the ranges the latch took from the
+/// index the view is cloned from, while a view a call still holds keeps what it was published with.
+#[test]
+fn a_latched_range_leaves_the_next_view_and_a_view_held_since_keeps_it() {
+    let fs = MemFs::new();
+    let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+    let mut env = Env::test(clock.clone());
+    env.fs = Arc::new(fs.clone());
+    let dir = PathBuf::from("durable-unit/views");
+    let config = StoreConfig::new(&dir, "Etc/UTC")
+        .create_if_missing(true)
+        .env(env);
+    let w = Writer::open(&config).unwrap();
+    let id = w
+        .define(&SeriesSpec::new("a/b/note", Kind::Text, ""))
+        .unwrap();
+    for (i, t) in ["V-ONE", "V-TWO", "V-THREE"].iter().enumerate() {
+        let r = Reading::new(id, Timestamp(i as i64), Value::Text((*t).into()));
+        wait(w.emit(&[r], Intent::Normal, true).unwrap());
+    }
+    let r = w.reader().unwrap();
+    let all = crate::time::TimeRange::new(Timestamp(i64::MIN), Timestamp(i64::MAX));
+    let count = move |r: &DurableReader| {
+        r.with(|i, _| i.facts(id, all, crate::read::View::History))
+            .unwrap()
+            .len()
+    };
+    let (entered, entered_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let held = {
+        let r = r.clone();
+        std::thread::spawn(move || {
+            r.with(|i, _| {
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                i.facts(id, all, crate::read::View::History)
+            })
+            .unwrap()
+            .len()
+        })
+    };
+    entered_rx.recv().unwrap();
+    damage(&fs, &dir, b"V-TWO");
+    assert_eq!(data_lost_count(&w.losses()), 1, "the loss watch finds it");
+    assert_eq!(count(&r), 2, "the next view no longer shows it");
+    release.send(()).unwrap();
+    assert_eq!(held.join().unwrap(), 3, "the held view as published");
+    w.shutdown().unwrap();
+}
+
+fn data_lost_count(losses: &[crate::health::LossReport]) -> usize {
+    losses
+        .iter()
+        .filter(|l| l.kind == LossKind::DataLost)
+        .count()
+}
