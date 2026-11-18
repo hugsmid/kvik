@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{ReaderConfig, StoreConfig};
+use crate::config::{LogConfig, ReaderConfig, StoreConfig};
 use crate::durable::tests::block_on;
-use crate::env::{Env, ManualClock, MemFs};
+use crate::env::{Env, FixedBootId, ManualClock, MemFs};
 use crate::read::{
     Answer, Appended, Live, LiveEvent, LiveId, LiveOptions, Part, Query, Selection, UpdateBatch,
     Updated,
@@ -22,7 +22,9 @@ pub(super) struct World {
     pub(super) clock: ManualClock,
     pub(super) env: Env,
     pub(super) fs: MemFs,
+    pub(super) boot: FixedBootId,
     pub(super) dir: PathBuf,
+    pub(super) log: LogConfig,
 }
 
 impl World {
@@ -31,11 +33,15 @@ impl World {
         let mut env = Env::test(clock.clone());
         let fs = MemFs::new();
         env.fs = Arc::new(fs.clone());
+        let boot = FixedBootId::new(Some([1; 16]));
+        env.boot = Arc::new(boot.clone());
         World {
             clock,
             env,
             fs,
+            boot,
             dir: PathBuf::from(format!("live/{name}")),
+            log: LogConfig::default(),
         }
     }
 
@@ -43,9 +49,53 @@ impl World {
         block_on(Store::open(
             StoreConfig::new(&self.dir, "Europe/London")
                 .create_if_missing(true)
-                .env(self.env.clone()),
+                .env(self.env.clone())
+                .log(self.log.clone()),
         ))
         .unwrap()
+    }
+
+    /// The bytes of the log's segment files, with their paths.
+    pub(super) fn segments(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.fs
+            .paths()
+            .into_iter()
+            .filter(|p| {
+                p.starts_with(self.dir.join("log"))
+                    && p.extension().is_some_and(|e| e == "open" || e == "kvl")
+            })
+            .filter_map(|p| Some((p.clone(), self.fs.read(&p)?)))
+            .collect()
+    }
+
+    /// Damages `text` in every segment file that holds it.
+    pub(super) fn damage(&self, text: &[u8]) {
+        let mut found = false;
+        for (p, b) in self.segments() {
+            if let Some(at) = b.windows(text.len()).position(|w| w == text) {
+                self.fs.poke(&p, at, b"X");
+                found = true;
+            }
+        }
+        assert!(found);
+    }
+
+    /// Every fact the store holds in position order, as a reader opened now reads them.
+    pub(super) fn history(&self) -> Vec<Fact> {
+        let r = self.reader();
+        let mut all: Vec<Fact> = Vec::new();
+        for id in 1.. {
+            let Ok(f) = r.facts(
+                SeriesId(id),
+                Timestamp(i64::MIN)..Timestamp(i64::MAX),
+                crate::read::View::History,
+            ) else {
+                break;
+            };
+            all.extend(f.map(Result::unwrap));
+        }
+        all.sort_by_key(|f| f.position);
+        all
     }
 
     pub(super) fn reader(&self) -> Reader {
