@@ -66,7 +66,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-872 | §7 Manifest step 4; `format.md` A.14 | The epochs a rebuild takes above a corrupt span with no later record |
-| Q-970 | `format.md` A common rules (Scan bound); `design.md` Budgets; `SECURITY.md` | How the header walk's time and the body checks' add up against the 1 s restart budget |
+| Q-970 | `format.md` A common rules (Scan bound); `design.md` Budgets; `SECURITY.md` | What a start is promised on a crafted or damaged file, against the 1 s restart budget |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1463,51 +1463,81 @@ fails, so the window rule never applies, and the counts stay inside the bound (a
 (16 MiB 1.5 to 1.7 s; 0.31 s when every block is of the commit type), a 16 MiB manifest 1.15 to 1.33 s with either
 reader: about 0.3 µs a header read in the segment, each following a length to another part of the file, and 0.65 µs a
 candidate in the manifest, the CRC shift of `PrefixCrc::range`. The 1 s restart budget is exceeded.
-**Settled by roadmap 4.9e: the walk is bounded in time; the published promise is kept.** Resynchronisation reads each
-8-byte step's header once, a batch ahead of the candidates, and keeps a 4-byte entry per step in a ring indexed by
-offset (8 MiB): no chain, a commit block naming a start, or the first chain node past the step's block. The ring is
-filled 4 MiB of steps at a time from the highest down, a step taking its successor's entry when the successor lies in
-the same block and a pass after each block giving its ends to the earlier entries whose chains enter it. A step is a
-candidate exactly when its entry names it, which is the walked condition (distinct candidates' chains are disjoint),
-so framing and the read in full take each header once. The tail's commit search reads a header only where a commit
-block starts, a header the ring found valid is read again without its checksum, a boundary read keeps no links for a
-batch it keeps, and `crc32c_shift` takes at most eight lookups in nibble tables below 4 GiB, so a manifest step reads
-one header and takes at most one checksum. Verdicts are those of the walked chains, and the window rule is untouched.
-Measured (release build, one shared 4-core cloud machine, the best of five), before and after, 64 MiB: a valid header
-every 8 bytes 5.7 s and 0.24 s (16 MiB 1.2 s and 0.05 s), commit blocks naming data headers 3.1 s and 0.21 s,
-candidates whose framing holds 0.8 s and 0.23 s, chains of empty skippable blocks read in full 1.1 s and 0.34 s, kept
-batches of them after damage 0.76 s and 0.36 s, kept batches of the dearest entries after damage 0.20 s; a 16 MiB
-manifest with a header every 8 bytes 0.84 to 0.89 s and 0.15 to 0.18 s with either reader. How these add up to the
-budget is Q-970. Tests: `log/tests/scan_bound.rs` (deep shard)
-`crafted_header_runs_give_the_reports_the_walked_chains_give`
-(random and damaged runs of headers against `legacy::scan_with_walked_links`, the chains walked and remembered as
-before, at ring spans down to 8 bytes) and `chain_ends_find_the_candidates_a_plain_walk_finds`, and every existing
-property of that file against the walked chains too, with
-`a_critical_block_of_exactly_the_limit_found_by_resynchronisation_refuses_the_segment`,
+**Settled by roadmap 4.9e: the walk is bounded in header reads per byte; its time is measured, and what a start is
+promised is Q-970.** Resynchronisation reads each 8-byte step's header at most once, a batch ahead of the candidates,
+and keeps a 4-byte entry per step in a ring indexed by offset (8 MiB): no chain, a commit block naming a start, or the
+first chain node past the step's block. The ring is filled 4 MiB of steps at a time from the highest down, a step
+taking its successor's entry when the successor lies in the same block and a pass after each block giving its ends to
+the earlier entries whose chains enter it. A step is a candidate exactly when its entry names it, which is the walked
+condition, and distinct candidates' chains are disjoint (each ends at the one commit block that names it). A boundary
+read that keeps no batch keeps a 4-byte verdict per block it walked in a ring indexed by offset (4 MiB, a batch and 64
+KiB of steps) and its stop's event, so each block is judged once and remembering costs one store a block; a candidate
+on such a chain is read from those verdicts: one whose read would fail at the remembered stop takes its framing only,
+and is charged the facts and entries body bytes that framing and the read in full would have checked; one whose stop
+is a commit block is read in full without its bodies checked again, and charged likewise if it keeps no batch. A
+header found valid once damage is found is remembered in a bitmap by offset and read again without its checksum; the
+tail's commit search reads a header only where a commit block starts; `crc32c_shift` takes at most eight lookups in
+nibble tables below 4 GiB, so a manifest step reads one header and takes at most one checksum. The argument: a header
+checksum is taken at most once per 8-byte step, and only at a step whose type and length could belong to a batch, plus
+once more for the headers of the one direct read that found the damage (the bitmap spans 16 MiB from the lowest offset
+the scan still asks about, and every read lies within 12.1 MiB of it); and a block's header is read at most eight
+times: once by the chain ends, three times by a candidate (framing once, the read in full twice), twice by a boundary
+read and twice more by the read of the batch it keeps, plus twice by the commit search at a commit block. Verdicts are
+those of the walked chains and the reference scan, and the window rule and the charges are unchanged. Measured
+(release build, one shared 4-core cloud machine, the best of five, the worst at most 40 % above it, and runs at other
+hours up to 30 % slower again; a header read costs about 20 to 31 ns with the rest of the scan's work), 64 MiB: a
+valid header every 8 bytes 0.25 s (16 MiB 0.06 s; 5.7 s before), commit blocks naming data headers 0.25 s (3.1 s),
+candidates whose framing holds 0.25 to 0.27 s, chains of empty skippable blocks read in full 0.35 to 0.43 s, batches
+of them kept after damage 0.39 to 0.57 s (at a boundary 0.54 s), a boundary read that fails at the end of a chain of
+500,000 such blocks the candidate then reads in full 0.35 s (2.0 s before), the same chain a batch the candidate keeps
+0.61 s, the dearest built, chains of 4,096 blocks 0.30 to 0.42 s, 8-byte bodies whose every step is a plausible header
+0.28 to 0.37 s, batches of state names whose every step is a plausible header, each body checked and each step
+checksummed, 0.31 s, kept batches of the dearest entries 0.26 s; undamaged batches of 500,000 empty blocks 0.26 s,
+most of it building the report; a 16 MiB manifest with a header every 8 bytes 0.20 to 0.28 s with either reader (0.84
+to 0.89 s before). Tests: `log/tests/header_walk.rs`
+`files_longer_than_the_ring_take_one_header_checksum_and_a_few_reads_a_plausible_step` (header checksums within the
+plausible steps and header reads per plausible step on ten shapes of 24 MiB, against the walked chains),
+`a_candidate_on_a_chain_a_boundary_read_rejected_is_charged_what_reading_it_checks` (the charge equals the walked
+chains', which read the candidate in full), `a_header_at_every_step_has_each_header_read_once`,
+`commits_naming_data_headers_have_each_header_read_once`,
+`framed_candidates_check_no_body_and_agree_with_the_walked_chains` and the ignored `crafted_header_walks_timed` and
+`stacked_passes_timed`; `log/tests/scan_differential.rs` (deep shard: crafted and damaged segments against the
+reference scan, and longer than the rings against the walked chains); `log/tests/scan_bound.rs` (deep shard)
+`crafted_header_runs_give_the_reports_the_walked_chains_give` and `chain_ends_find_the_candidates_a_plain_walk_finds`,
+with `a_critical_block_of_exactly_the_limit_found_by_resynchronisation_refuses_the_segment`,
 `a_commit_block_alone_at_the_first_damage_is_a_readable_commit_of_the_tail`,
 `a_header_failing_its_checksum_a_ring_above_a_valid_one_is_not_taken_as_valid` and
-`a_boundary_read_a_ring_above_the_valid_headers_checks_the_header_checksum`; `log/tests/header_walk.rs`
-`a_header_at_every_step_has_each_header_read_once`, `commits_naming_data_headers_have_each_header_read_once` and
-`framed_candidates_check_no_body_and_agree_with_the_walked_chains` (at the bound: at most one header read a step), and
-the ignored `crafted_header_walks_timed`; `log/src/crc.rs`
+`a_boundary_read_a_ring_above_the_valid_headers_checks_the_header_checksum`; `log/src/scan/tests.rs`
+`the_chain_ends_forget_a_start_a_ring_below_what_they_read`,
+`the_valid_header_ring_holds_only_aligned_starts_from_its_base`, `a_header_read_again_must_fit_below_the_limit_asked`
+and `boundary_reads_ending_at_one_invalid_body_check_it_once`; `log/src/crc.rs`
 `the_table_shift_equals_the_shift_by_squaring_for_every_digit_and_beyond_4_gib`; `files/src/image.rs`
-`a_header_at_every_step_takes_one_checksum_a_step_in_both_readers` and the ignored `crafted_manifests_timed`; the
-fuzz harness asserts the scan equals the walked chains on every input.
+`a_header_at_every_step_takes_one_checksum_a_step_in_both_readers` and the ignored `crafted_manifests_timed`; the fuzz
+harness asserts the scan equals the walked chains on every input.
 
-## Q-970 — How the header walk's time and the body checks' add up against the 1 s restart budget
-Recorded by roadmap 4.9e. A technical decision, for the owner's acceptance.
-**Scenario.** The published body-check figure of a crafted 64 MiB segment, about 0.8 s, prices all 264 MiB of the
-bound's bodies at the dearest entry's 2.97 ns a byte. The dearest header walk built, a valid header every 8 bytes,
-costs 0.24 s with no body checked. Added as they stand, 1.04 s, over the budget.
-**Decided.** Count the 264 MiB as two parts. The failed reads and the direct read (200 MiB) are reached only through
-bodies that overlap, so at the dearest rate they cost at most about 0.62 s. The rest is one pass over the file's own
-64 MiB: the header walk, candidates read in full without a body check, the tail's commit blocks, and kept batches with
-their bodies, whose dearest shapes built measured 0.20 to 0.36 s. Bound: about 0.98 s at 64 MiB, and about 0.3 s at 16
-MiB; a manifest sums its parts as before, at most about 0.35 s per 16 MiB. No one file reaches both dearest parts at
-once: the dearest body's 8-byte steps have length words far above the limit and are passed before any checksum, and
-the walk-heavy shapes check little body. The margin is small, about 2 %. Not chosen: a smaller failed-read budget,
-which changes the window rule. `format.md` A common rules (scan bound), `design.md` Budgets and `SECURITY.md` state
-the figures.
+## Q-970 — What a start is promised on a crafted or damaged file, against the 1 s restart budget
+Recorded by roadmap 4.9e. For the owner.
+**Scenario.** The work of a scan is bounded per byte (`format.md` A, common rules; Q-110, Q-651, Q-873), but not its
+time: a header read costs about 20 to 31 ns and a body byte checked at most about 2.9 ns on one machine, and the
+bounds allow more of both than any file built so far uses. Bodies: at most 264 MiB checked for a 64 MiB segment,
+priced at the dearest entry 0.8 s, while the dearest file built to the body bound measured 0.22 s. Header reads: at
+most one checksum per 8-byte step and eight reads per block, which for 16-byte blocks and the measured cost per read is
+about 1 s at 64 MiB before any body is checked, while the dearest file built measured 0.61 s (a boundary read failing
+at the end of a chain of 500,000 empty blocks that a candidate then keeps; best of five, the worst 0.63 s, other runs up
+to 0.79 s on a busier machine). An earlier statement that no one file reaches both dearest parts is withdrawn: batches
+of state names whose every 8-byte step is a plausible header pay a body check and a header checksum per step (0.31 s),
+and no argument excludes a file that stacks overlapping bodies on the header reads.
+**What is promised now, and only this.** Per file: one crafted or damaged 64 MiB log segment, the default
+`log.segment_size`, measured at 0.25 to 0.61 s on one shared 4-core cloud machine (release build, best of five); a
+16 MiB manifest at about 0.3 to 0.4 s with its body checks. The work is linear in the file's length, so a segment of
+`segment_size` costs about that times `segment_size / 64 MiB` (16 MiB about a quarter; the 1 GiB maximum about 16
+times, some 10 s), and a start that reads several crafted files pays for each. None of this is a bound in seconds.
+**Asked of the owner.** (a) Whether the restart budget's promise for crafted files is this measured, per-file figure at
+the default segment size, or a bound in seconds, which needs either a smaller failed-read budget or fewer header reads
+per block (each changes `format.md` A); (b) whether a larger `log.segment_size` should carry a warning, or a cap, for
+stores that read files from a bucket others can write; (c) whether a start that meets several crafted files may exceed
+the budget. Until then the documents state the measured figures as measured. `format.md` A common rules (scan
+bound), `design.md` Budgets and `SECURITY.md` state them.
 
 ## Open at v0.2
 
@@ -1589,7 +1619,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
 | Q-322 | 5.6 | Gate; recorded from the kill loop's sweep at the review of Q-320; the kill loop fails on it rarely until settled |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
-| Q-970 | 4.9 | Decided by roadmap 4.9e: the 1 s figure counts the overlapping bodies at the dearest rate and one pass over the file's own bytes at its dearest measured shape; for the owner's acceptance |
+| Q-970 | 4.9 | Gate; recorded by roadmap 4.9e: the scan's work is bounded per byte and its time measured per file at the default segment size; the owner chooses what a start is promised |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -1842,7 +1872,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-650 | A manifest search that passes a window and finds no later record | `spec.md` §7 Manifest; `format.md` A.14 (settled by the owner's ruling: the passed bytes are a corrupt span with no later record, kept and repaired by a copy or a rebuild; the rebuild record's field 7 writes its `before` as 0; see the question) |
 | Q-651 | The crafted-file worst case against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by the owner's ruling: each kept body checked once and cheaper body checks with the same verdicts, measured inside the budget; see the question) |
 | Q-870 | Definitions and short state names against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled as a technical decision with no format change: fields split once and found by an index, state names keyed and told distinct by a randomised table that sorts after a long probe run; every entry type measured at most about 2.9 ns a byte, the body checks of a crafted 64 MiB segment about 0.8 s; see the question) |
-| Q-873 | The time of the header walk on a crafted file | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by roadmap 4.9e as a technical decision with no format change: each step's header read once and the chain ends kept in a ring, so no chain is walked twice; a crafted 64 MiB segment at most about 0.98 s, a 16 MiB manifest about 0.35 s, how the parts add up being Q-970; see the question) |
+| Q-873 | The time of the header walk on a crafted file | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by roadmap 4.9e as a technical decision with no format change: once damage is found a header checksum at most once per 8-byte step and a block's header read at most eight times, the chain ends and a boundary read's verdicts kept in rings by offset; time measured, the dearest crafted 64 MiB segment built 0.61 s; what a start is promised is Q-970; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

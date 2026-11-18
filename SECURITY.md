@@ -9,13 +9,15 @@ Every file of a store is read as untrusted input, and a reader's work on a file 
 headers are read per 8 bytes. Candidates read in full and rejected may check at most 16 MiB of body per window (8 MiB
 in a log segment, 16 MiB in the manifest); past that the rest of the window is passed as damaged, and reported with
 the damage around it. Each kept body is checked once, so the body checks of a crafted log segment cost a start up to
-about 0.8 s at 64 MiB, and those of a crafted manifest up to about 0.15 s per 16 MiB (measured on a shared 4-core
-cloud machine), whatever its bodies hold (Q-870). The header walk is bounded in time too: each 8-byte step's header
-is read once and no chain of headers is walked twice, so a crafted log segment costs a start at most about 0.98 s at
-64 MiB in all (a valid block header every 8 bytes about 0.24 s, 7.8 s before), and a crafted manifest at most about
-0.35 s per 16 MiB, within the 1 s restart budget whether the file reaches the store directory or a bucket the store
-reads from (Q-873, Q-970). The fuzz targets of the log segment and the manifest check these counts. Working memory,
-beyond the file and the read's results, is bounded by about one window. Write access to the store directory can still
+about 0.8 s at 64 MiB, and those of a crafted manifest up to about 0.15 s per 16 MiB, priced at the dearest rate
+measured on a shared 4-core cloud machine, whatever its bodies hold (Q-870). The header walk is bounded in reads
+(Q-873): once damage is found a block header's checksum is taken at most once per 8 bytes and each block's header is
+read at most eight times. Its time is measured, not proven: the dearest crafted 64 MiB log segments built cost a start
+about 0.25 to 0.61 s, and a crafted manifest about 0.2 to 0.3 s per 16 MiB for its header walk, on the same machine;
+the cost grows linearly with `log.segment_size` and with the number of crafted files a start reads. What is promised
+against the 1 s restart budget, whether a file reaches the store directory or a bucket the store reads from, is an
+open question (Q-970). The fuzz targets of the log segment and the manifest check these counts. Working memory, beyond
+the file and the read's results, is bounded by about two windows. Write access to the store directory can still
 destroy or alter data.
 
 ## Reporting a vulnerability

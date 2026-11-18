@@ -79,19 +79,19 @@ not reach that budget. Each kept body is checked once, and the checks keep nothi
 (Q-651). Measured in a release build on one shared 4-core cloud machine, against the bound (264 MiB of bodies for a 64
 MiB segment): the body checks of a crafted segment cost at most about 0.8 s at 64 MiB and 0.22 s at 16 MiB, and those of
 a crafted manifest about 0.09 s per 16 MiB at a start and 0.15 s at a refresh, within the 1 s restart budget. The header
-walk is bounded in time too (Q-873): each 8-byte step's header is read once, where its chain of block headers comes to
-is kept in a ring of 4-byte entries, and a step is a candidate exactly when that entry names it, so no chain is walked
-twice. The failed reads and the direct read (200 MiB of the bound's bodies, about 0.6 s) are reached only through
-overlapping bodies; the rest of a crafted segment's cost is one pass over its own bytes, whose dearest shapes built
-measured 0.20 to 0.36 s for 64 MiB (a valid block header every 8 bytes 0.24 s, 7.75 s before). So a crafted segment
-costs at most about 0.98 s at 64 MiB and 0.3 s at 16 MiB, and a crafted manifest at most about 0.35 s per 16 MiB (its
-header walk 0.15 to 0.18 s, 1.2 to 1.3 s before): within the budget (Q-970). Files built to the body bound measured 0.22
-s (nested facts images over every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches whose rows share
-one text value, after damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records; 0.15 s before) at
-a start. Every entry type, small and large, costs at most about 2.9 ns a byte to check, a definition of 65,536 state
-names of two 4-byte characters being the dearest (definitions of short names 5.2 to 5.7 ns before; small definitions and
-routing entries 3 to 5.5 ns before, about 1 ns now), so nested entries bodies over the bound cost at most about 0.8 s at
-64 MiB (Q-870).
+walk is bounded in reads per byte (Q-873): once damage is found a header checksum is taken at most once per 8-byte step,
+and a block's header is read at most eight times, each block judged once by the boundary reads and each step's chain
+end kept in a ring of 4-byte entries. Time is measured, not bounded: a header read costs about 20 to 31 ns, and the
+dearest crafted 64 MiB segments built cost 0.25 to 0.61 s (best of five, the worst up to 40 % above; a boundary read
+failing at the end of a chain of 500,000 empty blocks that the candidate then keeps is the dearest, 2.0 s before for the
+failing chain alone), undamaged batches of the same blocks 0.26 s; a crafted manifest's header walk 0.20 to 0.28 s per
+16 MiB (1.2 to 1.3 s before). What a start is promised against the budget is Q-970. Files built to the body bound
+measured 0.22 s (nested facts images over every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches
+whose rows share one text value, after damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records;
+0.15 s before) at a start. Every entry type, small and large, costs at most about 2.9 ns a byte to check, a
+definition of 65,536 state names of two 4-byte characters being the dearest (definitions of short names 5.2 to 5.7 ns
+before; small definitions and routing entries 3 to 5.5 ns before, about 1 ns now), so nested entries bodies over the
+bound cost at most about 0.8 s at 64 MiB (Q-870).
 
 **Memory.** Sealing uses memory independent of `segment_size`: the sealer reads the segment 1 MiB at a time to
 compute its checksum (`format.md` A.9).
