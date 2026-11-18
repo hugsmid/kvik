@@ -428,8 +428,9 @@ fn an_undamaged_segment_is_read_in_one_pass_of_direct_reads() {
     let r = r.unwrap();
     assert_eq!(r.batches.len() as u64, k);
     assert!(matches!(r.tail, Some(Tail::Clean { .. })));
-    // Each of the two blocks of a batch: its header peeked, then read once.
+    // Each of the two blocks of a batch: its header peeked, then read once, its checksum taken once.
     assert!(stats.headers_visited <= 4 * k + 2, "{stats:?}");
+    assert!(stats.header_checksums <= 2 * k + 2, "{stats:?}");
     assert!(stats.bytes_checksummed <= len, "{stats:?} for {len} bytes");
     let bodies: usize = r.batches.iter().map(|b| b.blocks[0].block.body.len()).sum();
     assert_eq!(stats.bytes_body_checked, bodies as u64);
@@ -552,6 +553,9 @@ fn the_valid_header_ring_holds_only_aligned_starts_from_its_base() {
     }
     v.mark(ring + 68);
     assert!(!v.holds(ring + 68));
+    // A start a ring above the base is not marked over the one it would share a bit with.
+    v.mark(2 * ring + 128);
+    assert!(!v.holds(ring + 128));
     v.move_to(ring + 72);
     assert!(!v.holds(ring + 64));
 }
@@ -563,13 +567,32 @@ fn a_header_read_again_must_fit_below_the_limit_asked() {
     let mut reads = Reads::new(&b);
     assert!(reads.peek(64, 256).is_some());
     assert!(reads.peek(64, 72).is_none());
-    assert!(reads.block(64, 72).is_err());
+    assert_eq!(
+        reads.block(64, 72).err(),
+        Some(crate::block::BlockFault::Header)
+    );
     let mut reads = Reads::new(&b);
     let mut v = reads::Valid::new((1 << 10) - 1);
     v.mark(64);
     reads.valid = Some(v);
     assert!(reads.peek(64, 72).is_none());
     assert!(reads.peek(64, 256).is_some());
+    assert_eq!(reads.stats().header_checksums, 0);
+}
+
+#[test]
+fn a_header_is_checksummed_once_when_read_twice_in_turn_and_counted() {
+    let mut b = vec![0u8; 256];
+    put_header(&mut b, 64, 0x50, 0);
+    put_header(&mut b, 80, 0x50, 0);
+    let mut reads = Reads::new(&b);
+    assert!(reads.block(64, 256).is_ok());
+    assert_eq!(reads.stats().header_checksums, 1);
+    assert!(reads.peek(80, 256).is_some());
+    assert!(reads.block(80, 256).is_ok());
+    assert_eq!(reads.stats().header_checksums, 2);
+    assert!(reads.block(64, 256).is_ok());
+    assert_eq!(reads.stats().header_checksums, 3);
 }
 
 /// [`chained_images`] whose chain ends in an entries block whose checksum holds and whose body fails its checks.
@@ -608,4 +631,34 @@ fn boundary_reads_ending_at_one_invalid_body_check_it_once() {
             "{stats:?}: kept {kept}, the invalid body {invalid}"
         );
     }
+}
+
+#[test]
+fn a_failed_boundary_read_s_stop_is_forgotten_once_the_scan_has_passed_it() {
+    let (mut b, id) = chain(0);
+    b.truncate(HEADER_LEN);
+    b.extend_from_slice(&[0xFF; 8]);
+    let units = 24u64;
+    for j in 0..units {
+        b.resize(((j + 1) << 20) as usize, 0);
+        let at = b.len() as u64;
+        b.extend_from_slice(&alias_batch(&id, j + 1, at));
+        encode_block(0x50, FLAG_SKIPPABLE, &[], &mut b).unwrap();
+        let at = b.len() as u64;
+        encode_block(0x50, FLAG_SKIPPABLE, &[1; 8], &mut b).unwrap();
+        b[at as usize + 8] ^= 1;
+    }
+    b.resize(b.len() + 64, 0);
+    let mut s = Scanner::new(&b, &id, ScanLimit::End).unwrap();
+    let mut regions = 0;
+    for f in &mut s {
+        regions += u64::from(matches!(f, Ok(Found::Region(_))));
+    }
+    assert_eq!(regions, units);
+    // The stops below the last read, less 64 KiB, are forgotten: at most a batch of them remain.
+    assert!(
+        s.walks.events() <= 10,
+        "{} stops remembered",
+        s.walks.events()
+    );
 }

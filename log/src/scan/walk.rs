@@ -52,6 +52,7 @@ pub(crate) enum Remembered {
 
 /// Ring slots: the batch a walk reaches beyond its start and the 64 KiB the ring's base lags behind the start.
 const SLOTS: u64 = (MAX_BATCH_DATA + (1 << 16)) / 8 + 1;
+const _: () = assert!(8 * SLOTS > MAX_BATCH_DATA + (1 << 16));
 /// A slot whose stop is in [`Walks::events`]; a block that passes is `steps << 1`, steps ≥ 1.
 const AT: u32 = 1;
 
@@ -113,6 +114,11 @@ fn judge(reads: &mut Reads<'_>, p: u64, o: u64, limit: u64) -> Judged {
 }
 
 impl Walks {
+    #[cfg(test)]
+    pub(crate) fn events(&self) -> usize {
+        self.events.len()
+    }
+
     fn slot(p: u64) -> usize {
         ((p / 8) % SLOTS) as usize
     }

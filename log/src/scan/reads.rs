@@ -173,9 +173,8 @@ pub(crate) struct Reads<'a> {
     checksums: u64,
     body: u64,
     pub(crate) failed: FailedReads,
-    /// The last two valid headers read, with their offsets: a candidate's framing and its read in full ask for the
-    /// same headers in turn.
-    recent: [Option<(u64, BlockHeader, [u8; BLOCK_HEADER_LEN])>; 2],
+    /// The last valid header read, with its offset: a block read asks for the header its size test just read.
+    recent: Option<(u64, BlockHeader, [u8; BLOCK_HEADER_LEN])>,
     pub(crate) valid: Option<Valid>,
     /// An empty list of blocks whose memory a batch read takes and gives back if it keeps no batch.
     pub(crate) spare: Vec<DataBlock<'a>>,
@@ -192,7 +191,7 @@ impl<'a> Reads<'a> {
             checksums: 0,
             body: 0,
             failed: FailedReads::new(MAX_BATCH_DATA),
-            recent: [None; 2],
+            recent: None,
             valid: None,
             spare: Vec::new(),
         }
@@ -252,6 +251,9 @@ impl<'a> Reads<'a> {
         limit: u64,
     ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         self.headers += 1;
+        if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
+            return None;
+        }
         match self.recent_at(offset, limit) {
             Some(found) => Some(found),
             None => self.checksum_header(offset, limit),
@@ -290,20 +292,20 @@ impl<'a> Reads<'a> {
     ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         self.checksums += 1;
         let found = peek_raw(self.bytes, offset, limit)?;
-        self.recent = [Some((offset, found.0, found.1)), self.recent[0]];
+        self.recent = Some((offset, found.0, found.1));
         if let Some(v) = &mut self.valid {
             v.mark(offset);
         }
         Some(found)
     }
 
-    /// A header read again: one of the last two, or one found valid since damage, taken without its checksum.
+    /// A header read again: the last one, or one found valid since damage, taken without its checksum.
     #[inline]
     fn recent_at(&self, offset: u64, limit: u64) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
             return None;
         }
-        if let Some(r) = self.recent.iter().flatten().find(|r| r.0 == offset) {
+        if let Some(r) = self.recent.filter(|r| r.0 == offset) {
             return Some((r.1, r.2));
         }
         if !self.valid.as_ref().is_some_and(|v| v.holds(offset)) {
@@ -339,13 +341,7 @@ impl<'a> Reads<'a> {
             Some((h, raw)) => read_body(bytes, offset, limit, h, raw, crc),
             None => {
                 self.checksums += 1;
-                let b = read_block_with(bytes, offset, limit, crc);
-                if b.is_ok()
-                    && let Some(v) = &mut self.valid
-                {
-                    v.mark(offset);
-                }
-                b
+                read_block_with(bytes, offset, limit, crc)
             }
         }
     }

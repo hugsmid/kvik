@@ -470,6 +470,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_range_has_the_checksum_of_no_bytes_wherever_it_lies() {
+        let bytes: Vec<u8> = (0..64u32).map(|i| (i * 11 + 3) as u8).collect();
+        let mut t = PrefixCrc::new(&bytes);
+        assert_eq!(t.range(16, 32), Some(crc32c(&bytes[16..48])));
+        for at in [0, 5, 16, 40, 64] {
+            assert_eq!(t.range(at, 0), Some(crc32c(&[])), "{at}");
+        }
+        assert_eq!(t.range(72, 0), None);
+    }
+
+    #[test]
     fn a_range_off_an_8_byte_boundary_is_checksummed_directly_and_counted() {
         let bytes: Vec<u8> = (0..64u32).map(|i| (i * 7 + 5) as u8).collect();
         let mut t = PrefixCrc::new(&bytes);

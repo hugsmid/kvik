@@ -10,7 +10,7 @@ use kvik_log::body::{COMMIT_LEN, Commit};
 use kvik_log::crc::crc32c;
 use kvik_log::header::{FileHeader, HEADER_LEN, kind};
 use kvik_log::manifest::read_manifest_with_stats;
-use kvik_log::scan::{ScanLimit, ScanStats, legacy, scan_with_stats};
+use kvik_log::scan::{ScanLimit, ScanStats, Tail, legacy, scan_with_stats};
 use support::*;
 
 /// 8 MiB: a batch's data and a segment window.
@@ -414,7 +414,7 @@ fn push_framed(f: &mut Vec<u8>, blocks: &[(u8, u8, Vec<u8>, Option<u32>)], seq: 
 }
 
 /// After damage, units in windows of their own: a kept one-row batch, a skippable block, and a batch image of a facts
-/// block and `n` empty skippable blocks whose framing holds, which the boundary read after the kept batch walks and
+/// block and `n` skippable blocks of 8 bytes whose framing holds, which the boundary read after the kept batch walks and
 /// rejects and whose first block is then a candidate. `stop` 0: a last skippable block with a wrong body checksum;
 /// 1: a last facts block whose body fails its checks; 2: no last block, and a sequence below the kept one.
 fn charged_candidates(len: usize, n: usize, stop: u8) -> Vec<u8> {
@@ -430,9 +430,9 @@ fn charged_candidates(len: usize, n: usize, stop: u8) -> Vec<u8> {
             facts_body(seq + 1, T0, &[(1, T0, 1.0)]),
             None,
         )];
-        blocks.extend((0..n).map(|_| (0x90, FLAG_SKIPPABLE, Vec::new(), None)));
+        blocks.extend((0..n).map(|_| (0x90, FLAG_SKIPPABLE, vec![7; 8], None)));
         match stop {
-            0 => blocks.push((0x90, FLAG_SKIPPABLE, Vec::new(), Some(1))),
+            0 => blocks.push((0x90, FLAG_SKIPPABLE, vec![7; 8], Some(1))),
             1 => {
                 let mut body = facts_body(seq + 1, T0, &[(1, T0, 1.0)]);
                 body[16] = 2;
@@ -445,6 +445,34 @@ fn charged_candidates(len: usize, n: usize, stop: u8) -> Vec<u8> {
     }
     f.resize(len, 0);
     f
+}
+
+/// After damage, commit blocks packed over 512 KiB and, 16 MiB above them (a ring of chain ends), empty skippable
+/// blocks over as much, in a torn tail: a commit bit kept from a ring below would send the tail's commit search to
+/// read the header of every fourth skippable block again.
+fn commits_a_ring_below_blocks() -> (Vec<u8>, u64) {
+    let x = 1usize << 20;
+    let mut f = damaged_start();
+    f.resize(x, 0);
+    let mut commits = 0;
+    while f.len() < x + (512 << 10) {
+        let c = Commit {
+            generation: ID.generation,
+            block_count: 1,
+            first_sequence: 1,
+            last_sequence: 1,
+            commit_time: 0,
+            batch_bytes: 0,
+            batch_crc32c: 0,
+        };
+        encode_block(block_type::COMMIT, 0, &c.encode(), &mut f).unwrap();
+        commits += 1;
+    }
+    f.resize(x + (16 << 20), 0);
+    while f.len() < x + (16 << 20) + (512 << 10) {
+        f.extend_from_slice(&skippable(&[], None));
+    }
+    (f, commits)
 }
 
 /// The 8-byte steps whose header the chain ends checksum: a type and length that could be part of a batch.
@@ -710,6 +738,10 @@ fn a_candidate_on_a_chain_a_boundary_read_rejected_is_charged_what_reading_it_ch
             "stop {stop}"
         );
         assert!(stats.failed_bytes_peak > 0, "stop {stop}");
+        assert!(
+            stats.bytes_body_checked < walked_stats.bytes_body_checked,
+            "stop {stop}"
+        );
         // Per block: the chain ends' read, the boundary read's two, and the candidate's framing, or for a batch
         // image whose blocks all pass, its read in full.
         let reads = [4, 4, 5][usize::from(stop)];
@@ -718,4 +750,17 @@ fn a_candidate_on_a_chain_a_boundary_read_rejected_is_charged_what_reading_it_ch
             "stop {stop}: {stats:?}"
         );
     }
+}
+
+#[test]
+fn the_tail_s_commit_search_reads_no_header_again_for_a_commit_a_ring_below() {
+    let (f, commits) = commits_a_ring_below_blocks();
+    let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
+    let r = r.unwrap();
+    assert!(matches!(&r.tail, Some(Tail::Torn { commits: c, .. }) if c.len() as u64 == commits));
+    let plausible = plausible_steps(&f);
+    assert!(
+        stats.headers_visited <= plausible + 2 * commits + 256,
+        "{stats:?}: {plausible} plausible steps, {commits} commit blocks"
+    );
 }

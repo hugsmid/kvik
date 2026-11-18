@@ -8,7 +8,7 @@ use crate::batch::{
 };
 use crate::block::{BLOCK_HEADER_LEN, block_type};
 use crate::body::{COMMIT_LEN, Commit};
-use crate::bytes::{slice, u64_at};
+use crate::bytes::{slice, u32_at, u64_at};
 use crate::error::FormatError;
 
 use super::ends::{Ends, SPAN};
@@ -95,7 +95,12 @@ impl CommitSearch {
 
 /// One step of the commit search at `o`: past the commit block if one is readable there, else 8 bytes on.
 fn commit_step(reads: &mut Reads<'_>, o: u64, limit: u64, out: &mut Vec<ReadableCommit>) -> u64 {
-    // Type and length are tested on the header before the body checksum is computed.
+    // Type and length are tested on the header's bytes before its checksum is computed.
+    let commit_like = slice(reads.bytes, o, 8)
+        .is_some_and(|w| w[0] == block_type::COMMIT && u32_at(w, 4) as usize == COMMIT_LEN);
+    if !commit_like {
+        return o + 8;
+    }
     if reads
         .peek(o, limit)
         .is_some_and(|h| h.block_type == block_type::COMMIT && h.body_len as usize == COMMIT_LEN)

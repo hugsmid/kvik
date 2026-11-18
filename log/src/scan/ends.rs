@@ -118,9 +118,9 @@ impl Ends {
             self.slots = vec![0; (self.mask + 1) as usize];
             self.commits = vec![0; (self.mask as usize + 1).div_ceil(64)];
         }
-        let mut valid = reads.valid.take().unwrap_or_else(|| Valid::new(self.mask));
-        valid.move_to(self.base);
-        reads.valid = Some(valid);
+        if reads.valid.is_none() {
+            reads.valid = Some(Valid::new(self.mask));
+        }
         while self.ahead < want {
             let start = self.ahead.max(o).next_multiple_of(8);
             let end = start.saturating_add(self.span).min(limit);
