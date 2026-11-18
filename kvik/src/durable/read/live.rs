@@ -3,8 +3,8 @@
 //! view the reader published, or at a position inside its round when a `Tail` meets its row limit (Q-1014). Nothing
 //! runs between calls: the writer's process waits on the writer's progress, a reader process polls the mark.
 //!
-//! A `Latest` judges again only the series whose facts or entries the batch brings, those due by time alone and, when
-//! a call refreshed live staleness, every series it shows; a reset or a loss opens it again. A `Tail` delivers the
+//! A `Latest` judges again only the series whose facts or entries the batch brings, those due by time alone and those
+//! a call refreshed the live staleness of since the last batch; a reset or a loss opens it again. A `Tail` delivers the
 //! facts its selection takes as known at each fact's position (Q-895); a reset, a loss and a lag are events, never
 //! silence (Q-1011, Q-1013).
 
@@ -84,6 +84,8 @@ pub(crate) struct Session {
     last_poll: Option<Duration>,
     progress: u64,
     refreshes: u64,
+    /// When the last batch was computed, on the reader's monotonic clock.
+    judged: Duration,
     /// The manifest's lost ranges at the last batch.
     recorded: Vec<(LogPos, LogPos)>,
 }
@@ -229,6 +231,7 @@ impl Session {
             last_poll: None,
             progress: 0,
             refreshes: 0,
+            judged: Duration::ZERO,
             recorded: Vec::new(),
         }
     }
@@ -391,6 +394,7 @@ impl Session {
         self.at = next.at;
         self.recorded = next.recorded;
         self.refreshes = next.refreshes;
+        self.judged = mono;
         if next.idle {
             self.leave();
         } else {
@@ -461,14 +465,24 @@ impl Session {
             now,
         };
         let registry = at_cut.registry();
-        let refreshed = refreshes != self.refreshes;
+        let refreshed: BTreeSet<u32> = if refreshes == self.refreshes {
+            BTreeSet::new()
+        } else {
+            let since = u64::try_from(self.judged.as_nanos()).unwrap_or(u64::MAX);
+            r.clocks().refreshed_since(since).into_iter().collect()
+        };
         for (id, read) in reads.iter_mut() {
             let mut mine = Vec::new();
             match read {
                 Read::Tail(t) => tail(&at_cut, (*id, t), &walk, lagged, &mut mine),
-                Read::Latest(l) => {
-                    latest_read(&at_cut, &registry, l, &walk, (lagged, refreshed), &mut mine)?
-                }
+                Read::Latest(l) => latest_read(
+                    &at_cut,
+                    &registry,
+                    l,
+                    &walk,
+                    (lagged, &refreshed),
+                    &mut mine,
+                )?,
             }
             mine.sort_by_key(event_rank);
             events.extend(mine.into_iter().map(|e| (*id, e)));
@@ -622,13 +636,13 @@ fn tail(
 }
 
 /// Brings `Latest` `l` to the batch's cut: opened again after a reset or a loss, else its membership when entries
-/// came and the members the batch touched, due by time, or whose staleness a refresh may have changed.
+/// came and the members the batch touched, due by time, or `refreshed` (their live staleness).
 fn latest_read(
     at: &At<'_>,
     registry: &Registry,
     l: &mut LatestRead,
     w: &Walk,
-    (lagged, refreshed): (bool, bool),
+    (lagged, refreshed): (bool, &BTreeSet<u32>),
     out: &mut Vec<LiveEvent>,
 ) -> Result<(), QueryError> {
     let reopen = !l.opened || w.reset.is_some() || !w.gaps.is_empty();
@@ -695,7 +709,7 @@ fn latest_read(
             .iter()
             .filter(|id| {
                 w.touched.contains(&id.0)
-                    || refreshed
+                    || refreshed.contains(&id.0)
                     || l.due.get(id).is_some_and(|d| *d <= at.now)
             })
             .copied(),

@@ -76,6 +76,16 @@ impl Clocks {
         self.lock().refreshes
     }
 
+    /// The series refreshed at or after monotonic instant `since` (nanoseconds).
+    pub(crate) fn refreshed_since(&self, since: u64) -> Vec<u32> {
+        self.lock()
+            .refreshed
+            .iter()
+            .filter(|(_, m)| **m >= since)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Nanoseconds on the monotonic clock since the last commit that refreshed series `id` in this process.
     pub(crate) fn since_refresh(&self, id: u32) -> Option<i64> {
         let mono = self.env.monotonic().0;
