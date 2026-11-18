@@ -381,6 +381,72 @@ fn plausible_entries_after_damage(len: usize) -> Vec<u8> {
     f
 }
 
+/// A batch image at the end of `f` whose framing and `batch_crc32c` hold: `blocks` of a type, flags, body and body
+/// checksum (the right one if `None`), and a commit block of sequences `seq`.
+fn push_framed(f: &mut Vec<u8>, blocks: &[(u8, u8, Vec<u8>, Option<u32>)], seq: u64) {
+    let o = f.len();
+    let mut d = ID.store_id.to_vec();
+    d.extend_from_slice(&ID.file_id.to_le_bytes());
+    d.extend_from_slice(&(o as u64).to_le_bytes());
+    for (t, flags, body, crc) in blocks {
+        let h = BlockHeader {
+            block_type: *t,
+            flags: *flags,
+            body_len: body.len() as u32,
+            body_crc32c: crc.unwrap_or_else(|| crc32c(body)),
+        }
+        .encode();
+        d.extend_from_slice(&h[..12]);
+        f.extend_from_slice(&h);
+        f.extend_from_slice(body);
+        f.resize(f.len().next_multiple_of(8), 0);
+    }
+    let commit = Commit {
+        generation: ID.generation,
+        block_count: blocks.len() as u32,
+        first_sequence: seq,
+        last_sequence: seq,
+        commit_time: 0,
+        batch_bytes: (f.len() - o) as u64,
+        batch_crc32c: crc32c(&d),
+    };
+    encode_block(block_type::COMMIT, 0, &commit.encode(), f).unwrap();
+}
+
+/// After damage, units in windows of their own: a kept one-row batch, a skippable block, and a batch image of a facts
+/// block and `n` empty skippable blocks whose framing holds, which the boundary read after the kept batch walks and
+/// rejects and whose first block is then a candidate. `stop` 0: a last skippable block with a wrong body checksum;
+/// 1: a last facts block whose body fails its checks; 2: no last block, and a sequence below the kept one.
+fn charged_candidates(len: usize, n: usize, stop: u8) -> Vec<u8> {
+    let mut f = damaged_start();
+    let mut seq = 2;
+    while f.len() + 2 * W as usize <= len {
+        f.resize(f.len().next_multiple_of(W as usize) + 4_096, 0xFF);
+        push_one_row(&mut f, seq);
+        f.extend_from_slice(&skippable(&[], None));
+        let mut blocks = vec![(
+            block_type::FACTS,
+            0,
+            facts_body(seq + 1, T0, &[(1, T0, 1.0)]),
+            None,
+        )];
+        blocks.extend((0..n).map(|_| (0x90, FLAG_SKIPPABLE, Vec::new(), None)));
+        match stop {
+            0 => blocks.push((0x90, FLAG_SKIPPABLE, Vec::new(), Some(1))),
+            1 => {
+                let mut body = facts_body(seq + 1, T0, &[(1, T0, 1.0)]);
+                body[16] = 2;
+                blocks.push((block_type::FACTS, 0, body, None));
+            }
+            _ => {}
+        }
+        push_framed(&mut f, &blocks, if stop == 2 { 1 } else { seq + 1 });
+        seq += 2;
+    }
+    f.resize(len, 0);
+    f
+}
+
 /// The 8-byte steps whose header the chain ends checksum: a type and length that could be part of a batch.
 fn plausible_steps(f: &[u8]) -> u64 {
     let mut n = 0;
@@ -629,4 +695,27 @@ fn stacked_passes_timed() {
     );
     let f = undamaged_batches(len, 500_000);
     timed("undamaged batches of 500000 empty skippable blocks", &f);
+}
+
+#[test]
+fn a_candidate_on_a_chain_a_boundary_read_rejected_is_charged_what_reading_it_checks() {
+    for stop in 0..3 {
+        let f = charged_candidates(5 * W as usize, 1_000, stop);
+        let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
+        let (walked, walked_stats) = legacy::scan_with_walked_links(&f, &ID, ScanLimit::End);
+        assert_eq!(r, walked, "stop {stop}");
+        assert_eq!(r.unwrap().regions.len(), 3, "stop {stop}");
+        assert_eq!(
+            stats.failed_bytes_peak, walked_stats.failed_bytes_peak,
+            "stop {stop}"
+        );
+        assert!(stats.failed_bytes_peak > 0, "stop {stop}");
+        // Per block: the chain ends' read, the boundary read's two, and the candidate's framing, or for a batch
+        // image whose blocks all pass, its read in full.
+        let reads = [4, 4, 5][usize::from(stop)];
+        assert!(
+            stats.headers_visited <= reads * 3 * 1_003 + 200,
+            "stop {stop}: {stats:?}"
+        );
+    }
 }
