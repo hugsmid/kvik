@@ -75,7 +75,8 @@ impl World {
                 p.starts_with(Path::new(&self.dir).join("log"))
                     && p.extension().is_some_and(|e| e == "open" || e == "kvl")
             })
-            // A seal renames a segment between the listing and the read; the callers look again.
+            // A seal renames a segment between the listing and the read; a caller that needs the file fails or looks
+            // again.
             .filter_map(|p| {
                 let b = self.fs.read(&p)?;
                 Some((p, b))

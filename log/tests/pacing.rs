@@ -758,14 +758,27 @@ fn the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the
     *lock(&clock.0) = START;
     let w = LogWriter::open(store, cfg, Some([9; 16]), START, T0).unwrap();
     let log = Log::start(w, clock.clone()).unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    // A call held wrongly fails here rather than waiting for ever on a clock nobody moves.
+    let settled = |mut p: kvik_log::writer::Pending, what: &str| {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let std::task::Poll::Ready(r) = std::pin::Pin::new(&mut p).poll(&mut cx) {
+                return r.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
     for k in 0..BURST {
-        log.submit(vec![fact(T0 + k as i64)])
-            .unwrap()
-            .wait()
-            .unwrap();
+        let p = log.submit(vec![fact(T0 + k as i64)]).unwrap();
+        settled(
+            p,
+            "each call of the burst completes with the clock standing still",
+        );
     }
     let mut held = log.submit(vec![fact(T0 + BURST as i64)]).unwrap();
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     for _ in 0..20 {
         assert!(
             std::pin::Pin::new(&mut held).poll(&mut cx).is_pending(),
@@ -774,6 +787,9 @@ fn the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the
         std::thread::sleep(Duration::from_millis(5));
     }
     *lock(&clock.0) = START + interval;
-    held.wait().unwrap();
+    settled(
+        held,
+        "the call past the burst completes once the clock moves one interval",
+    );
     log.shutdown().unwrap();
 }

@@ -8,7 +8,8 @@ use std::path::Path;
 use common::block_on;
 use common::durable::{World, damage, data_lost, gauge, history, note, num};
 use kvik::{
-    Health, Kind, LossKind, Position, Reason, Select, SeriesId, SeriesSpec, Start, Store, Value,
+    Health, Kind, LossKind, Position, QueryError, Reason, Select, SeriesId, SeriesSpec, Start,
+    Store, Value, View,
 };
 
 #[test]
@@ -597,9 +598,9 @@ fn losses_unknown(h: &Health) -> bool {
     matches!(h, Health::Degraded { reasons } if reasons.iter().any(|x| matches!(x, Reason::LossesUnknown { .. })))
 }
 
-/// The segment a caught-up loss watch stands in, holding the newest batch it returned, removed with no record naming
-/// the removal: nothing removes such a segment yet, so the watch reports `LossesUnknown` at every call rather than
-/// reading on as if nothing were lost (Q-951).
+/// The segment a caught-up loss watch and the query reader stand in, holding the newest batch each returned, removed
+/// with no record naming the removal: nothing removes such a segment yet, so the watch reports `LossesUnknown` and a
+/// query fails as `NotAvailable` at every call rather than reading on as if nothing were lost (Q-951).
 #[test]
 fn a_watch_whose_segment_is_removed_reports_losses_unknown() {
     let w = World::new("unpolled-watch");
@@ -612,6 +613,7 @@ fn a_watch_whose_segment_is_removed_reports_losses_unknown() {
     block_on(s.emit(&[note(id, 1, "UW-ONE")])).unwrap();
     sealed_with(&w, b"UW-ONE");
     assert!(data_lost(&s.losses()).is_empty());
+    assert_eq!(history(&s.reader(), id).len(), 2);
     block_on(s.emit(&[note(id, 2, "UW-TWO")])).unwrap();
     sealed_with(&w, b"UW-TWO");
     let (path, _) = w
@@ -622,6 +624,18 @@ fn a_watch_whose_segment_is_removed_reports_losses_unknown() {
     kvik::env::Fs::remove_file(&*w.fs, &path).unwrap();
     for _ in 0..2 {
         assert!(losses_unknown(&s.health()), "{:?}", s.health());
+        let read = s
+            .reader()
+            .facts(
+                id,
+                common::at(-1_000_000)..common::at(1_000_000),
+                View::History,
+            )
+            .and_then(|f| f.collect::<Result<Vec<_>, _>>());
+        assert!(
+            matches!(read, Err(QueryError::NotAvailable { .. })),
+            "{read:?}"
+        );
     }
     block_on(s.shutdown()).unwrap();
 }

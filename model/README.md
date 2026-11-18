@@ -20,7 +20,7 @@ computation for exact equality.
 
 The model does not yet follow every rule of the specification; [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) lists where
 it differs, and the open questions in the specification itself. It has no timing: group commit's schedule and its
-adaptive batch-sync interval are tested on the log crate's writer (`log/tests/cadence.rs`, `log/tests/pacing.rs`).
+sync budget (`spec.md` §3 Group commit) are tested on the log crate's writer (`log/tests/pacing.rs`).
 
 ## Tests
 

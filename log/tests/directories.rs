@@ -204,10 +204,25 @@ impl SealHook for Broken {
     }
 }
 
-#[test]
-fn a_series_directory_the_hook_cannot_give_backs_off_and_counts_no_failed_write() {
-    let fs = MemFs::new();
-    let hook = Arc::new(Broken::default());
+/// A hook that gives a series directory one position past the limit it is told, and counts the times it is asked.
+#[derive(Debug, Default)]
+struct Ahead(std::sync::atomic::AtomicU64);
+
+impl SealHook for Ahead {
+    fn series(&self, limit: Position, written_at: i64) -> Option<SeriesEntries> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(SeriesEntries {
+            through: Position {
+                sequence: limit.sequence + 1,
+                ..limit
+            },
+            judged_at: written_at,
+            entries: Vec::new(),
+        })
+    }
+}
+
+fn hooked(hook: Arc<dyn SealHook>) -> Directories {
     let start = DirectoryStart {
         generation: 0,
         stamp: None,
@@ -218,27 +233,74 @@ fn a_series_directory_the_hook_cannot_give_backs_off_and_counts_no_failed_write(
         restored: Vec::new(),
     };
     let opts = DirectoryOptions {
-        hook: Some(hook.clone()),
+        hook: Some(hook),
         status_interval: None,
     };
-    let mut d = Directories::new(Arc::new(fs.clone()), &dir(), STORE_ID, start, opts);
-    let r = seal(Position::default(), 4096);
-    d.sealed(r.clone());
-    let mut now = Duration::ZERO;
+    Directories::new(Arc::new(MemFs::new()), &dir(), STORE_ID, start, opts)
+}
+
+/// Ten minutes of runs a second apart with the mark synced through `synced`, then the times `asked` says the hook was
+/// asked: a series directory that is never written backs off, and counter 14 counts none of it (Q-991).
+fn ten_minutes_without_a_series_write(
+    d: &mut Directories,
+    synced: Position,
+    from: Duration,
+    asked: impl Fn() -> u64,
+) {
+    let before = (asked(), d.stats().written, d.series_through());
+    let mut now = from;
     for _ in 0..600 {
-        d.run(r.last(), now, T0);
+        d.run(synced, now, T0);
         now += Duration::from_secs(1);
     }
-    let asked = hook.0.load(std::sync::atomic::Ordering::SeqCst);
+    let asked = asked() - before.0;
     assert!(
         (2..=20).contains(&asked),
         "asked {asked} times in ten minutes"
     );
+    assert_eq!(d.series_through(), before.2, "no series directory written");
     assert_eq!(d.stats().failed, 0, "no derived-file write failed");
     assert!(
-        d.stats().written > 0,
+        d.stats().written > before.1,
         "the log directory is written meanwhile"
     );
+}
+
+#[test]
+fn a_series_directory_the_hook_cannot_give_backs_off_and_counts_no_failed_write() {
+    let broken = Arc::new(Broken::default());
+    let mut d = hooked(broken.clone());
+    let r = seal(Position::default(), 4096);
+    d.sealed(r.clone());
+    ten_minutes_without_a_series_write(&mut d, r.last(), Duration::ZERO, || {
+        broken.0.load(std::sync::atomic::Ordering::SeqCst)
+    });
+
+    let ahead = Arc::new(Ahead::default());
+    let mut d = hooked(ahead.clone());
+    d.sealed(r.clone());
+    ten_minutes_without_a_series_write(&mut d, r.last(), Duration::ZERO, || {
+        ahead.0.load(std::sync::atomic::Ordering::SeqCst)
+    });
+
+    let behind = Arc::new(Behind::default());
+    *behind.0.lock().unwrap() = r.last();
+    let mut d = hooked(behind.clone());
+    d.sealed(r.clone());
+    let mut now = Duration::ZERO;
+    while d.series_through().is_none() {
+        assert!(
+            now < Duration::from_secs(10),
+            "the first series directory is written"
+        );
+        d.run(r.last(), now, T0);
+        now += Duration::from_secs(1);
+    }
+    let next = seal(r.last(), 4096);
+    d.sealed(next.clone());
+    ten_minutes_without_a_series_write(&mut d, next.last(), now, || {
+        behind.1.load(std::sync::atomic::Ordering::SeqCst)
+    });
 }
 
 /// The uncovered sealed bytes of `seals`, as a reader counts them: those above the series directory's `through`.
@@ -321,6 +383,11 @@ fn uncovered_bytes_stay_bounded_through_the_directories_at_any_rate() {
                     .sum();
                 prop_assert!(uncovered(&all, &d, synced) <= SERIES_BYTES);
                 prop_assert!(uncovered(&all, &d, r.last()) <= SERIES_BYTES + waiting);
+                prop_assert_eq!(
+                    d.stats().failed,
+                    0,
+                    "a hook behind the seals counts no failed write (Q-991)"
+                );
             }
             Ok(())
         })
@@ -356,10 +423,16 @@ fn a_hook_behind_the_seals_is_asked_again_after_a_growing_wait_and_then_written(
     assert_eq!(d.series_through(), None);
     let asked = hook.1.load(std::sync::atomic::Ordering::SeqCst);
     assert!((3..=10).contains(&asked), "asked {asked} times");
+    assert_eq!(
+        d.stats().failed,
+        0,
+        "a hook behind the seals counts no failed write (Q-991)"
+    );
     *hook.0.lock().unwrap() = r.last();
     now += Duration::from_secs(120);
     d.run(r.last(), now, T0);
     assert_eq!(d.series_through(), Some(r.last()));
+    assert_eq!(d.stats().failed, 0);
 }
 
 #[test]
