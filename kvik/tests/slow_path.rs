@@ -290,6 +290,53 @@ fn a_fact_whose_earlier_facts_cannot_be_read_is_delivered_unchecked() {
     block_on(s.shutdown()).unwrap();
 }
 
+/// The deliverer's reads of a key skip a region the process has found lost: the fact that outranked a later version is
+/// gone, so the later version is delivered checked.
+#[test]
+fn a_fact_whose_earlier_facts_were_found_lost_is_delivered_checked() {
+    let w = World::new("delivered-after-a-loss");
+    let mut config = w.config();
+    config.log.seal_interval = Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let v = block_on(s.define_series(gauge("site/price/now").versioned(ChangedAtKind::Version)))
+        .unwrap();
+    let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
+    block_on(c.route(Funnel::facts(Select::Ids(vec![v])))).unwrap();
+    sealed(&w, 1);
+    let version = |secs, value, c| Reading {
+        changed_at: Some(c),
+        ..num(v, secs, value)
+    };
+    block_on(s.emit(&[version(0, 1.0, 5)])).unwrap();
+    let facts = sealed(&w, 2)
+        .into_iter()
+        .max_by_key(|p| file_id(p))
+        .unwrap();
+    w.clock.advance(Duration::from_secs(3_600));
+    block_on(s.emit(&[version(3_600, 2.0, 5)])).unwrap();
+    sealed(&w, 3);
+    drain(&mut c);
+    let bytes = w.fs.read(&facts).unwrap();
+    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    assert_eq!(s.losses().len(), 1);
+    let ack = block_on(s.emit(&[version(0, 3.0, 3)])).unwrap();
+    assert!(matches!(
+        ack.outcomes[0],
+        Outcome::Recorded {
+            unchecked: false,
+            ..
+        }
+    ));
+    let delivered: Vec<_> = drain(&mut c)
+        .into_iter()
+        .filter(|d| matches!(d.kind, DeliveryKind::Fact(_)))
+        .collect();
+    assert_eq!(delivered.len(), 1);
+    assert!(!delivered[0].flags.unchecked && !delivered[0].flags.outranked);
+    assert_eq!(s.stats().delivery.unchecked, 0);
+    block_on(s.shutdown()).unwrap();
+}
+
 #[test]
 fn a_restart_across_several_parts_of_the_log_decides_as_before() {
     let w = World::new("restart-in-parts");

@@ -293,6 +293,15 @@ mod tests {
             .map(|k| Reading::new(SeriesId(1), Timestamp(T0 + k * S), Value::F64(k as f64)))
             .collect();
         block_on(s.emit(&readings)).unwrap();
+        // A batch to damage, and one after it.
+        for (k, v) in [(3_100, 0.123_456_789), (3_200, 2.0)] {
+            block_on(s.emit(&[Reading::new(
+                SeriesId(1),
+                Timestamp(T0 + k * S),
+                Value::F64(v),
+            )]))
+            .unwrap();
+        }
         // A power loss: the next start writes a recovery entry.
         fs.crash_after(0);
         drop(s);
@@ -301,10 +310,22 @@ mod tests {
         let last = Reading::new(SeriesId(1), Timestamp(T0 + 4_000 * S), Value::F64(1.0));
         block_on(s.emit(&[last])).unwrap();
         block_on(s.shutdown()).unwrap();
+        let mark = 0.123_456_789f64.to_bits().to_le_bytes();
+        let (path, bytes) = fs
+            .paths()
+            .into_iter()
+            .filter(|p| p.starts_with(dir.join("log")))
+            .filter_map(|p| fs.read(&p).map(|b| (p, b)))
+            .find(|(_, b)| b.windows(8).any(|x| x == mark))
+            .unwrap();
+        let i = bytes.windows(8).position(|x| x == mark).unwrap();
+        fs.poke(&path, i, &[bytes[i] ^ 0xFF]);
         let open = || log_reader(dir, &env);
-        let latch = Arc::new(Latch::default());
-        let parts = read_kept(open().unwrap(), open, 100, usize::MAX, &latch).unwrap();
-        let whole = read_whole(open().unwrap(), open, usize::MAX, &latch).unwrap();
+        let (in_parts, at_once) = (Arc::new(Latch::default()), Arc::new(Latch::default()));
+        let parts = read_kept(open().unwrap(), open, 100, usize::MAX, &in_parts).unwrap();
+        let whole = read_whole(open().unwrap(), open, usize::MAX, &at_once).unwrap();
+        assert_eq!(in_parts.found().len(), 1);
+        assert_eq!(in_parts.found(), at_once.found());
         assert!(whole.read_whole && !parts.read_whole);
         assert_eq!(parts.counters, whole.counters);
         assert_eq!(parts.decider.history.held(), whole.decider.history.held());

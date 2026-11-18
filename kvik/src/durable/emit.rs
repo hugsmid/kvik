@@ -433,4 +433,42 @@ mod tests {
         *BEFORE_TRACKING.lock().unwrap() = None;
         fs.set_sync_hook(None);
     }
+
+    /// The calls in flight are a memory bound: a call taken in as acknowledged is no longer tracked.
+    #[test]
+    fn acknowledged_calls_are_no_longer_tracked_once_a_later_call_settles() {
+        let fs = MemFs::new();
+        let clock = ManualClock::new("2026-01-05T12:00:00Z".parse().unwrap());
+        let mut env = Env::test(clock.clone());
+        env.fs = Arc::new(fs);
+        let dir = PathBuf::from("durable-unit/inflight");
+        let config = StoreConfig::new(&dir, "Europe/London")
+            .create_if_missing(true)
+            .env(env);
+        let w = Writer::open(&config).unwrap();
+        let spec = SeriesSpec::new(
+            "a/b/c",
+            Kind::Gauge {
+                value: ValueType::F64,
+            },
+            "W",
+        );
+        let id = w.define(&spec).unwrap();
+        let emit = |k: u64| {
+            let t = clock.wall() + Duration::from_millis(k);
+            match w.emit(
+                &[Reading::new(id, t, Value::F64(k as f64))],
+                Intent::Normal,
+                false,
+            ) {
+                Ok(Emitted::Queued(q)) => wait(q).unwrap(),
+                r => panic!("{:?}", r.map(|_| ())),
+            };
+        };
+        for k in 0..50 {
+            emit(k);
+        }
+        emit(50);
+        assert!(w.inflight.lock().unwrap().len() <= 1);
+    }
 }
