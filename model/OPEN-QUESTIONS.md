@@ -1476,10 +1476,12 @@ on such a chain is read from those verdicts: one whose read would fail at the re
 and is charged the facts and entries body bytes that framing and the read in full would have checked; one whose stop
 is a commit block is read in full without its bodies checked again, and charged likewise if it keeps no batch. A
 header found valid once damage is found is remembered in a bitmap by offset and read again without its checksum; the
-tail's commit search reads a header only where a commit block starts; `crc32c_shift` takes at most eight lookups in
+tail's commit search reads a header only where the chain ends did not and its bytes name a commit block of the commit
+length; `crc32c_shift` takes at most eight lookups in
 nibble tables below 4 GiB, so a manifest step reads one header and takes at most one checksum. The argument: a header
 checksum is taken at most once per 8-byte step, and only at a step whose type and length could belong to a batch, plus
-once more for the headers of the one direct read that found the damage (the bitmap spans 16 MiB from the lowest offset
+once more for the headers of the one direct read that found the damage and for the block where each boundary read
+stops (the bitmap spans 16 MiB from the lowest offset
 the scan still asks about, and every read lies within 12.1 MiB of it); and a block's header is read at most eight
 times: once by the chain ends, three times by a candidate (framing once, the read in full twice), twice by a boundary
 read and twice more by the read of the batch it keeps, plus twice by the commit search at a commit block. Verdicts are

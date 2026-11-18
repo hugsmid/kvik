@@ -76,7 +76,8 @@ specified here before the roadmap item that writes it.
   found valid is remembered in a bitmap by offset and read again without its checksum, and a CRC shift costs at most
   eight lookups in nibble tables, so a manifest step reads one header and takes at most one checksum. So once damage
   is found a header checksum is taken at most once per 8-byte step, and only where the type and length could be part
-  of a batch, plus once more for the headers of the direct read that found the damage; a block's header is read at
+  of a batch, plus once more for the headers of the direct read that found the damage and for the block where each
+  boundary read stops; a block's header is read at
   most eight times: once by the chain ends, three times by a candidate (its framing and its read in full), twice by a
   boundary read and twice more by the read of the batch it keeps, and twice by the tail's commit search at a commit
   block. Measured (release build, one shared 4-core cloud machine, the best of five runs, the worst at most 40 %
