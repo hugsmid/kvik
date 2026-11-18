@@ -412,19 +412,20 @@ fn summary(r: &Result<ScanReport<'_>, FormatError>) -> String {
     }
 }
 
-/// The scan of `f` to its end and to `mark` keeps the bound and gives the walked chains' report, and the reference
-/// scan's when `reference`, and below 1 MiB that of chain ends found in small blocks; a torn tail's commit blocks are
-/// a plain search's.
+/// The scan of `f` to its end and to `mark` keeps the bound and gives the walked chains' report and charges, and the
+/// reference scan's report when `reference`, and below 1 MiB that of chain ends found in small blocks; a torn tail's
+/// commit blocks are a plain search's.
 fn check(f: &[u8], mark: u64, reference: bool) {
     let len = f.len() as u64;
     for limit in [ScanLimit::End, ScanLimit::Mark(mark)] {
         let (new, stats) = scan_with_stats(f, &ID, limit);
         assert!(stats.within_bound(len), "{limit:?}: {stats:?}");
         let new_s = summary(&new);
+        let (walked, walked_stats) = legacy::scan_with_walked_links(f, &ID, limit);
+        assert_eq!(new_s, summary(&walked), "{limit:?}: walked");
         assert_eq!(
-            new_s,
-            summary(&legacy::scan_with_walked_links(f, &ID, limit).0),
-            "{limit:?}: walked"
+            stats.failed_bytes_peak, walked_stats.failed_bytes_peak,
+            "{limit:?}: the walked chains' charges"
         );
         if reference {
             assert_eq!(
