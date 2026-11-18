@@ -99,3 +99,76 @@ pub fn equivalent_canonical(a: &[u8], b: &[u8]) -> bool {
                     && stream(x.1, x.2).is_some_and(|s| Some(s) == stream(y.1, y.2)))
         })
 }
+
+/// The identity a file's own header claims, so that a fuzzed file reaches the checks after the header.
+fn claimed_identity(data: &[u8]) -> crate::file::Identity {
+    let h = kvik_log::header::FileHeader::decode(data);
+    crate::file::Identity {
+        store_id: h.map_or([0; 16], |h| h.store_id),
+        generation: h.map_or(0, |h| h.generation),
+        file_id: h.map_or(0, |h| h.file_id),
+    }
+}
+
+/// Feeds `data` to the compacted segment reader on every path it has, and to the canonical checks; a file that
+/// opens extracts to a chunk index object that opens with the same layout and index.
+pub fn decode_compacted(data: &[u8]) {
+    use crate::file::{CompactedFile, IndexObject, Reach, SeriesInfo, check_canonical, extract};
+    let id = claimed_identity(data);
+    let Ok(f) = CompactedFile::open(data, &id, None) else {
+        return;
+    };
+    let layout = f.layout();
+    assert!(CompactedFile::open(data, &id, Some(&layout)).is_ok());
+    if let Ok(index) = f.index() {
+        for e in index.iter().take(64) {
+            if let Ok(rows) = f.read_chunk(e) {
+                assert_eq!(rows.len(), e.row_count as usize);
+            }
+            let _ = f.series(e.series_id);
+        }
+        if let Ok(object) = extract(&f, [1; 32]) {
+            let o = IndexObject::open(object.as_slice(), &id).expect("an extraction opens");
+            assert_eq!(o.layout(), &layout);
+            assert_eq!(o.index().ok().as_ref(), Some(&index));
+        }
+    }
+    let _ = f.entries();
+    let _ = f.batches();
+    let t = f.trailer();
+    for at in [i64::MIN, t.first_commit_time, t.last_commit_time, i64::MAX] {
+        let _ = f.as_of(at);
+    }
+    let _ = check_canonical(data, &id, &|_| SeriesInfo {
+        name: None,
+        reach: Reach::Point,
+    });
+}
+
+/// Feeds `data` to the chunk index object reader.
+pub fn decode_index_object(data: &[u8]) {
+    let id = claimed_identity(data);
+    if let Ok(o) = crate::file::IndexObject::open(data, &id)
+        && let Ok(index) = o.index()
+    {
+        for e in index.iter().take(64) {
+            let _ = o.series(e.series_id);
+        }
+    }
+}
+
+/// Feeds `data` to every body decoder of a compacted segment and a chunk index object.
+pub fn decode_file_bodies(data: &[u8]) {
+    crate::file::fuzz_bodies(data);
+}
+
+/// Re-seals `data` as a compacted segment and feeds it to [`decode_compacted`], so that edits get past the
+/// checksum chain to the checks behind it.
+pub fn decode_compacted_resealed(data: &[u8]) {
+    decode_compacted(&crate::file::reseal::reseal_segment(data));
+}
+
+/// Re-seals `data` as a chunk index object and feeds it to [`decode_index_object`].
+pub fn decode_index_object_resealed(data: &[u8]) {
+    decode_index_object(&crate::file::reseal::reseal_index_object(data));
+}

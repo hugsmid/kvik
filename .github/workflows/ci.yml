@@ -139,9 +139,10 @@ jobs:
     # invariants file is split by invariant number into 8 shards, each other
     # property-test file of the model, and the property, fuzz-input, batch,
     # model-differential, model-histories, writer, recovery and reader tests of kvik-log, the property and
-    # fuzz-input tests of kvik-chunk, the windows and durable-backend differentials of kvik, the record,
-    # manifest, rebuild and fuzz-input tests of kvik-files, the property and fuzz-input tests of kvik-tree, the
-    # envelope, fuzz-input and key tests of kvik-backup, and the layout tests of kvik-export, is one shard
+    # fuzz-input tests of kvik-chunk and its compacted-file properties, the windows and durable-backend
+    # differentials of kvik, the record, manifest, rebuild and fuzz-input tests of kvik-files, the property and
+    # fuzz-input tests of kvik-tree, the envelope, fuzz-input and key tests of kvik-backup, and the layout tests of
+    # kvik-export, is one shard
     # (.github/deep-shards.sh).
     # Each job first checks that the shards of its file select every test exactly once.
     #

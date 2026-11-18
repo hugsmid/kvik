@@ -1051,6 +1051,7 @@ A full rebuild from the log is the last resort.
 Every file below has an A.1 header and is self-describing (A.14). Parquet is the export format only, so A.1 applies
 to every stored file.
 
+- **Compacted segment (`kind = 2`) and chunk index (`kind = 14`)** are laid out in [`format-compacted.md`](format-compacted.md) (roadmap 6.2a1), which wins where the two outlines below differ.
 - **Compacted segment (`kind = 2`).** Per-series chunks (one series, one time range) holding either current
   facts or revisions, each with its position range and a summary, followed by an index and a trailer in the
   style of A.9. Roadmap 2.1 decided the encodings: delta with frame-of-reference bit-packing per 128 values for `t`,

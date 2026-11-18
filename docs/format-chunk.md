@@ -1,17 +1,17 @@
 # kvik file format, v1: chunk block bodies and column encodings
 
-The body of one block of a compacted chunk (`format.md` Part B, compacted segment), with the column encodings decided
+The body of one block of a compacted chunk (`format-compacted.md` B.1), with the column encodings decided
 by roadmap 2.1 ([`measurements/2.1-chunk-encodings.md`](measurements/2.1-chunk-encodings.md)). Written by roadmap
 6.1 and implemented by the `kvik-chunk` crate. The common rules of `format.md` Part A apply; where this document and
 `spec.md` differ, `spec.md` wins.
 
 ## C.1 Scope
 A chunk holds the facts of one series for one time range, current facts or revisions (`spec.md` §7), in blocks of at
-most 4,096 rows. This document lays out one block's body. The chunk around it (its header, the A.2 framing of its
-blocks, the directory of first and last `t`, the summary), the index, the per-batch `received_at` table, the trailer
-and the self-description fields are laid out by roadmap 6.2, which may reuse the encodings below for its own
-columns. A block is checked on its own; that each stored scale is at most the series' scale in force, and other rules
-that need the series, are checked by roadmap 6.2.
+most 4,096 rows. This document lays out one block's body. The chunk around it (the A.2 framing of its blocks, its
+directory of first and last `t`, the summary), the index, the per-batch commit-time table, the trailer and the
+self-description fields are laid out in [`format-compacted.md`](format-compacted.md) (roadmap 6.2a1), whose
+commit-time table reuses the body shape and encodings below. A block is checked on its own; that each stored scale is
+at most the series' scale in force, and other rules that need the series, are checked by roadmap 6.2.
 
 ## C.2 Block body
 | Offset | Size | Field |

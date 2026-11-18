@@ -1,7 +1,7 @@
 [package]
 name = "kvik-chunk"
 version = "0.1.0"
-description = "Column encodings of kvik's compacted chunks: delta bit-packing, scaled decimals with exceptions, XOR, run-length"
+description = "Compacted segments of kvik: column encodings (delta bit-packing, scaled decimals with exceptions, XOR, run-length), chunks, the chunk index and the commit-time table"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,21 @@ keywords = ["time-series", "storage", "embedded", "compression"]
 categories = ["database-implementations", "compression"]
 
 [dependencies]
+# File header, block framing, entries bodies and the end marker of a compacted segment (`docs/format-compacted.md`).
+kvik-log = { path = "../log" }
 thiserror = "2"
 # The compressed XOR fallback (`docs/format-chunk.md`); the level and library measured in roadmap 2.1.
 zstd = { version = "0.14", default-features = false }
 
+[features]
+# Writer departures that make files a v1 writer never writes, for golden files and the reader's tests.
+tweaks = []
+
 [dev-dependencies]
+kvik-chunk = { path = ".", features = ["tweaks"] }
 proptest = "1"
+# The plaintext hash a chunk index object carries (`docs/format-compacted.md` B.2).
+sha2 = "0.11"
 
 [lints]
 workspace = true
