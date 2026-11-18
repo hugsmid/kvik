@@ -162,7 +162,8 @@ fn read_batch_with<'a>(
     read_batch_framed(reads, id, o, limit, min_first, refusal, judged, None)
 }
 
-/// `framed`, if given, is set to the facts and entries body bytes once the framing holds.
+/// [`read_blocks`] into the scan's spare list of blocks, which a read that keeps no batch hands back, so a long
+/// failed read does not allocate its list again.
 #[allow(clippy::too_many_arguments)]
 fn read_batch_framed<'a>(
     reads: &mut Reads<'a>,
@@ -174,12 +175,44 @@ fn read_batch_framed<'a>(
     judged: bool,
     framed: Option<&mut u64>,
 ) -> BatchRead<'a> {
+    let mut blocks = std::mem::take(&mut reads.spare);
+    blocks.clear();
+    let r = read_blocks(
+        reads,
+        id,
+        o,
+        limit,
+        min_first,
+        refusal,
+        judged,
+        framed,
+        &mut blocks,
+    );
+    if !matches!(r, BatchRead::Complete(_)) {
+        blocks.clear();
+        reads.spare = blocks;
+    }
+    r
+}
+
+/// `framed`, if given, is set to the facts and entries body bytes once the framing holds.
+#[allow(clippy::too_many_arguments)]
+fn read_blocks<'a>(
+    reads: &mut Reads<'a>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+    refusal: Refusal,
+    judged: bool,
+    framed: Option<&mut u64>,
+    blocks: &mut Vec<DataBlock<'a>>,
+) -> BatchRead<'a> {
     let incomplete = |fault| BatchRead::Incomplete { fault };
     let mut crc = Crc32c::new();
     crc.update(&id.store_id);
     crc.update(&id.file_id.to_le_bytes());
     crc.update(&o.to_le_bytes());
-    let mut blocks = Vec::new();
     let mut unknown_critical = None;
     let mut recovery = false;
     let mut pos = o;
@@ -308,7 +341,7 @@ fn read_batch_framed<'a>(
     }
     BatchRead::Complete(Batch {
         offset: o,
-        blocks,
+        blocks: std::mem::take(blocks),
         commit,
     })
 }

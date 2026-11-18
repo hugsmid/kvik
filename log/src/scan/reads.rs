@@ -1,6 +1,6 @@
 //! The block reads of one scan, and their count (`format.md` A, common rules: scan bound; Q-110).
 
-use crate::batch::MAX_BATCH_DATA;
+use crate::batch::{DataBlock, MAX_BATCH_DATA};
 use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, MAX_BODY_LEN, RawBlock, peek_raw, read_block_with,
     read_body,
@@ -177,6 +177,8 @@ pub(crate) struct Reads<'a> {
     /// same headers in turn.
     recent: [Option<(u64, BlockHeader, [u8; BLOCK_HEADER_LEN])>; 2],
     pub(crate) valid: Option<Valid>,
+    /// An empty list of blocks whose memory a batch read takes and gives back if it keeps no batch.
+    pub(crate) spare: Vec<DataBlock<'a>>,
 }
 
 impl<'a> Reads<'a> {
@@ -192,6 +194,7 @@ impl<'a> Reads<'a> {
             failed: FailedReads::new(MAX_BATCH_DATA),
             recent: [None; 2],
             valid: None,
+            spare: Vec::new(),
         }
     }
 
