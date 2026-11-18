@@ -510,6 +510,62 @@ fn opening_a_store_makes_a_creations_rename_durable() {
     }
 }
 
+/// Q-871, format A.12 Open: a creation stopped by a process stop right after its rename, before the directory sync,
+/// leaves `STORE` in the page cache only; the next open syncs the directory, so a later power loss never leaves the
+/// store's files without `STORE`.
+#[test]
+fn opening_a_store_makes_the_rename_of_a_creation_stopped_after_it_durable() {
+    let ops_to_rename = {
+        let fs = MemFs::new();
+        StoreDir::open(Arc::new(fs.clone()), &dir(), Some(&new_store())).unwrap();
+        fs.ops().iter().position(|o| o.op == MemOp::Rename).unwrap() + 1
+    };
+    for seed in 0..64 {
+        let fs = MemFs::new();
+        let afs: Arc<dyn Fs> = Arc::new(fs.clone());
+        fs.crash_after(ops_to_rename);
+        assert!(StoreDir::open(afs.clone(), &dir(), Some(&new_store())).is_err());
+        fs.restart();
+        assert!(fs.read(&dir().join("STORE")).is_some());
+        let store = StoreDir::open(afs.clone(), &dir(), Some(&new_store())).unwrap();
+        let mut w = LogWriter::open(store, cfg(), Some(BOOT), Duration::ZERO, T0).unwrap();
+        w.shutdown(Duration::ZERO).unwrap();
+        drop(w);
+        fs.power_loss_partial(seed);
+        fs.restart();
+        assert!(
+            StoreDir::open(afs, &dir(), Some(&new_store())).is_ok(),
+            "seed {seed}"
+        );
+    }
+}
+
+/// Q-871, format A.12 Creation: the store directory's own entry is made durable by a sync of its parent before
+/// anything is created in it. `MemFs` has no directories, so this pins the sync, not the loss it prevents.
+#[test]
+fn creating_a_store_syncs_the_parent_of_its_directory_first() {
+    for (store, parent) in [("store", "."), ("data/store", "data")] {
+        let fs = MemFs::new();
+        StoreDir::open(Arc::new(fs.clone()), Path::new(store), Some(&new_store())).unwrap();
+        let ops = fs.ops();
+        assert_eq!(
+            (ops[0].op, ops[0].path.as_path()),
+            (MemOp::SyncDir, Path::new(parent)),
+            "{store}"
+        );
+        assert!(ops[1..].iter().all(|o| o.path != Path::new(parent)));
+        // Opening it again syncs the store directory alone.
+        fs.clear_ops();
+        drop(StoreDir::open(Arc::new(fs.clone()), Path::new(store), None).unwrap());
+        assert!(fs.ops().iter().all(|o| o.path != Path::new(parent)));
+    }
+    // A failed parent sync names the parent.
+    let fs = MemFs::new();
+    fs.fail_nth(MemOp::SyncDir, "data", 0, io::ErrorKind::PermissionDenied);
+    let e = StoreDir::open(Arc::new(fs), Path::new("data/store"), Some(&new_store())).unwrap_err();
+    assert!(e.to_string().contains("syncing data, the parent"), "{e}");
+}
+
 #[test]
 fn group_commit_coalesces_under_load_and_adds_no_delay_after_a_quiet_period() {
     let mut h = H::new(cfg());

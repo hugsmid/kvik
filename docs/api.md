@@ -264,9 +264,9 @@ store.emit_with(&readings, Intent::Revise).await?;
   `Durability::Written` goes into a flagged batch, and `emit` and `Pending` resolve once it is written, after any
   default-level sync already in flight; every `Recorded` outcome carries the level it was acknowledged at, here
   `Written`. Any other call resolves at the default level, its outcomes say `Synced`: `emit` and `Pending`
-  resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact, after
-  the mark sync, which the writer forces at once. Batches resolve in commit order, so a batch of facts committed after
-  a batch holding any other entry also waits for that one mark sync (spec §3 Commit).
+  resolve after the batch's sync and the mark update, and, for a batch holding an entry that is not a fact or the
+  first batch in a segment (Q-630), after the mark sync, which the writer forces at once. Batches resolve in commit
+  order, so a batch committed after such a batch also waits for that one mark sync (spec §3 Commit).
 - **An acknowledgement means durable at its level**, for every outcome: after the sync for `Synced`, in the
   operating system's cache for `Written` (`LogStats.durable` says how far the sync has reached). A call none of whose readings is recorded writes no
   batch; if one of them is a duplicate of a reading queued by an earlier call that is not yet acknowledged, the call

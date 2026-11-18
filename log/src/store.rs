@@ -209,6 +209,24 @@ pub(crate) fn read_all(fs: &dyn Fs, path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Makes a store directory's entry in its parent durable, after the directory is created by any path (`format.md`
+/// A.12, Q-871); a directory of one component has `.` as its parent. The error names the parent.
+pub fn sync_parent(fs: &dyn Fs, dir: &Path) -> io::Result<()> {
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs.sync_dir(parent).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "syncing {}, the parent of the store directory: {e}",
+                parent.display()
+            ),
+        )
+    })
+}
+
 fn take_lock(fs: &dyn Fs, dir: &Path) -> Result<Box<dyn FsFile>, StoreError> {
     let path = dir.join(LOCK);
     let f = match fs.open(&path, OpenMode::ReadWrite) {
@@ -239,8 +257,8 @@ impl StoreDir {
         let top = names(&*fs, dir)?;
         if top.iter().any(|n| n == STORE) {
             let lock = take_lock(&*fs, dir)?;
-            // A creation cut short between its rename and the directory sync may have left `STORE` in the page
-            // cache only (`format.md` A.12 Open).
+            // A creation or a rebuild cut short between its rename and the directory sync may have left `STORE` or
+            // `MANIFEST` in the page cache only (`format.md` A.12 Open, Q-871).
             fs.sync_dir(dir)?;
             let descriptor = StoreDescriptor::decode(&read_all(&*fs, &dir.join(STORE))?)?;
             if top.iter().any(|n| n == MANIFEST_NEW) {
@@ -282,6 +300,8 @@ impl StoreDir {
         };
         let store_bytes = descriptor.encode()?;
         fs.create_dir_all(dir)?;
+        // A stop before this sync leaves no `STORE`, so the next open creates again and syncs it then.
+        sync_parent(&*fs, dir)?;
         let lock = take_lock(&*fs, dir)?;
         for n in left
             .iter()

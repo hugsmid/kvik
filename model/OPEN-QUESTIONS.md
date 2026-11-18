@@ -113,7 +113,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-834 | `format.md` A.9 `file_crc32c`, A.4 Sealing | The seal's file checksum from the block checksums |
 | Q-835 | §3 Order of a start, §11 Health | How much of a start may be deferred past `open` |
 | Q-836 | §3 Recovery rule 2, §7 Readers, §11 Health | Facts a damaged recovery entry voided read again as live |
-| Q-871 | `format.md` A.12 Open | A store creation cut short between its rename and the directory sync |
+| Q-871 | `format.md` A.12 Creation and Open | Store directory entries a stop or a power loss can undo |
 | Q-925 | §2.2 `late`, §11 Health; `api.md` Health | `late` when the lateness reference cannot be read |
 | Q-928 | §3 Recovery rule 2, §11 Health (Q-200) | Damage to a batch of the kept log that the store's own reader finds at a query |
 | Q-937 | §3 Recovery rule 2; `api.md` Health | A damaged last batch of a sealed segment reported as lost to the head of the log |
@@ -2034,8 +2034,13 @@ commit path: `docs/measurements/4.8-commit-latency.md`, Q-630 note. Tests: `log/
 `the_only_segment_lost_before_the_timed_mark_sync_is_a_recorded_lost_range_from_the_anchor`,
 `the_first_batch_in_each_segment_forces_exactly_one_mark_sync` (mark syncs counted through `MemFs`) and
 `a_cursor_past_the_lost_only_segment_gives_data_lost_from_the_generations_first_position` (now two ranges: up to the
-mark by corruption, above it by the entry's gap). Tests whose scenario needed a first batch beyond the mark now
-commit one batch first (`log/tests/recovery.rs`, `log/tests/writer.rs`, `log/tests/threads.rs`).
+mark by corruption, above it by the entry's gap), and
+`losing_a_rolled_segment_before_the_timed_mark_sync_is_data_lost_at_the_marks_position_in_every_generation` (the
+segment after a timed seal). Tests whose scenario needed a first batch beyond the mark now commit one batch first
+(`log/tests/recovery.rs`, `log/tests/writer.rs`, `log/tests/threads.rs`). The log-against-model differentials run the
+model with its mark synced at every commit (`log/tests/model_histories.rs`, header), so they do not see the rule; the
+model's side rests on `model/tests/rules.rs` `s3_the_first_batch_in_a_segment_syncs_the_mark`, and matching the two
+timers stays the follow-up that file names.
 
 ## Q-640 — A description that never stops failing to open or read its segment
 Recorded at the review of roadmap 6.3b, with the retry of Q-221 (c); settled by the lead's ruling at its re-check.
@@ -3039,18 +3044,37 @@ withholds the earlier facts of its segment until it is repaired.
 **Pinned by.** `a_recovery_entry_mapped_before_its_batch_was_damaged_keeps_voiding_for_that_reader`
 (`log/src/reader/tests/lookup_properties.rs`), which asserts today's refresh.
 
-## Q-871 — A store creation cut short between its rename and the directory sync
-Recorded by the implementation of the Q-630 ruling (the crash sweep of
-`log/tests/recovery.rs` `a_crash_while_creating_the_store_or_in_its_first_start_is_recovered` found it once the
-commit path's operations changed). For the owner's acceptance.
-**Scenario.** Store creation writes `STORE.tmp`, renames it to `STORE` and syncs the directory (`format.md` A.12). A
-process stop after the rename and before that sync, then a restart on the same boot, finds `STORE` and opened the
-store without syncing the directory; the first start then wrote the manifest, log and mark. A power loss later can
-undo the rename, leaving files under `log/` with no `STORE`: `NotAStore`, and the store cannot be opened.
+## Q-871 — Store directory entries a stop or a power loss can undo
+Recorded by the implementation of the Q-630 ruling (the crash sweep of `log/tests/recovery.rs`
+`a_crash_while_creating_the_store_or_in_its_first_start_is_recovered` found it once the commit path's operations
+changed); widened at its review and re-check. A technical decision.
+**Scenario.** (1) Store creation writes `STORE.tmp`, renames it to `STORE` and syncs the directory (`format.md` A.12). A
+process stop after the rename and before that sync, then a restart on the same boot, found `STORE` and opened the store
+without syncing the directory; the first start then wrote the manifest, log and mark. A power loss later could undo the
+rename, leaving files under `log/` with no `STORE`: `NotAStore`, and the store could not be opened. (2) A rebuild
+renames `MANIFEST.new` over `MANIFEST` and then syncs the directory (A.14); a stop between the two, a restart on the
+same boot that appends to the rebuilt manifest, then a power loss could bring the corrupt manifest back and lose every
+record appended since. (3) Creation never synced the store directory's parent, so on a file system that does not carry a
+new directory's entry along with a sync inside it, a power loss could leave no store directory at all after acknowledged
+data (`spec.md` §3 Sync primitive asks for a sync after a create); a restore that creates the store directory
+(`backup/src/restore/local.rs` `write_manifest`) never synced it either.
 **Decided.** Opening a store whose `STORE` is present syncs the store directory first (`log/src/store.rs`
-`StoreDir::open`; `format.md` A.12 Open), so the rename is durable before anything else is written. One directory sync
-more per open; no format or interface change. Test: `log/tests/writer.rs`
-`opening_a_store_makes_a_creations_rename_durable`.
+`StoreDir::open`; `format.md` A.12 Open), so any rename in it cut short before its directory sync, creation's or a
+rebuild's, is durable before anything else is written: one directory sync more per open. Every way a store directory
+comes into existence syncs its parent right after creating it, before anything is created inside
+(`kvik_log::store::sync_parent`, whose error names the parent): creation (A.12 Creation), where a stop before that sync
+leaves no `STORE` and the next open creates again and syncs it then, and a restore, before it writes its manifest, where
+a stop before it leaves the directory empty, so the restore starts again and syncs it then. So an open of a finished
+store needs no parent sync. Directories above the parent that creation makes are the caller's to make durable. A parent
+that the process cannot open for reading now makes creation and a restore fail, with the parent named. No format or
+interface change. Tests: `log/tests/writer.rs` `opening_a_store_makes_the_rename_of_a_creation_stopped_after_it_durable`
+(a process stop after the rename), `opening_a_store_makes_a_creations_rename_durable` (a failed last sync: covered only
+as far as a later directory sync can be trusted, which `spec.md` §3 does not promise, so the stop is the case that
+counts) and `creating_a_store_syncs_the_parent_of_its_directory_first` (with the error naming the parent);
+`backup/src/restore/local.rs` `a_restore_syncs_the_parent_of_the_store_directory_it_creates_first`;
+`files/tests/rebuild.rs` `opening_the_store_makes_the_rename_of_a_rebuild_stopped_after_it_durable`. `MemFs` has no
+directories (directories exist by their files), so the loss of the store directory's own entry cannot be simulated: the
+parent's sync is pinned by the operations, not by a power loss.
 
 ## Q-925 — `late` when the lateness reference cannot be read
 Recorded by the design that reconciles the durable fixes with bounded decision history. **OWNER.**
@@ -3341,7 +3365,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-834 | 6.3b | The seal's file checksum without the re-read; recorded only, by the lead's decision |
 | Q-835 | 5.6 | The deliverer's read of the log past `open`; deferred by the lead |
 | Q-836 | 6.3b | Facts a damaged recovery entry voided read again as live; with Q-755; recorded at the re-check of the first profiling sweep |
-| Q-871 | 8.3 | Decided with the Q-630 work: opening a store syncs its directory; for the owner's acceptance |
+| Q-871 | 8.3 | Decided with the Q-630 work and widened at its review and re-check: opening a store syncs its directory; creation and a restore sync its parent |
 | Q-925 | 5.1 | **OWNER**; gates the merge of the bounded decider into the engine; built to proposal (a) behind one switch |
 | Q-928 | 5.1 | **OWNER**; gates the same merge; built to the proposal behind one switch |
 | Q-951 | 6.3b | A sealed segment missing with no record naming its removal: `SegmentMissing` for a caught-up reader that stood in it (option (a), applied); every other reader and the next start silent until the removal records; for the owner (a loss-reporting promise) |

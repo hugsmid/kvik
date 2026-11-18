@@ -566,12 +566,15 @@ while it exists; a new file is created only when none exists.
   at creation (ASCII, at most 15 bytes); `0x8001` creating software version (ignorable). The store id is the
   header's. The site-zone and tzdata entries (A.6) override fields 1 and 2 from their positions, so positions start
   at 1 with the application's entries (`spec.md` §5.7). A restore copies `STORE` unchanged.
-- **Creation** (only in a directory that does not exist or is empty): create the directory and `LOCK`, take the
-  lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and the
-  directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
-  store only once `STORE` exists. The first start creates the mark (`spec.md` §3).
+- **Creation** (only in a directory that does not exist or is empty): create the directory and sync its parent, so the
+  store's own entry is durable (directories above the parent that creation made are the caller's), create `LOCK` and
+  take the lock; create `log/`, `cursors/`, `leases/`; create `MANIFEST` (header and one empty record) and sync it and
+  the directories; **last**, write `STORE.tmp`, sync it, rename it to `STORE` and sync the directory. A directory is a
+  store only once `STORE` exists. The first start creates the mark (`spec.md` §3). A restore that creates the store
+  directory syncs its parent the same way before it writes the manifest (`spec.md` §8 Restore, Q-871).
 - **Open.** `STORE` valid: sync the directory (a creation cut short between the rename and that sync may have left
-  `STORE` in the page cache only), then open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
+  `STORE` in the page cache only, as may a rebuild cut short between renaming `MANIFEST.new` and its directory sync,
+  A.14), then open. No `STORE`, and every name present is one that creation makes (`LOCK`, `MANIFEST`,
   `STORE.tmp`, and the directories `log/`, `cursors/` and `leases/`, empty): a creation that did not finish; remove
   what it left and create again. No `STORE` and any other name, a file under `log/` included: `NotAStore` (never
   created over; a directory part-way

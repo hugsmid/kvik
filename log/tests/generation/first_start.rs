@@ -479,3 +479,64 @@ fn a_crash_at_every_operation_of_init_generation_and_the_first_start() {
         }
     }
 }
+
+/// Q-630: a segment sealed by time, then two batches in the next (the first forces the mark sync, the second is
+/// beyond the durable mark), a power loss, and that segment removed or zeroed: the loss is `data_lost` at the mark's
+/// position, recorded, in generation 0 and in a restored generation.
+#[test]
+fn losing_a_rolled_segment_before_the_timed_mark_sync_is_data_lost_at_the_marks_position_in_every_generation()
+ {
+    for generation in [0u32, 1] {
+        for zeroed in [false, true] {
+            let ctx = format!("generation {generation}, zeroed {zeroed}");
+            let mut r = if generation == 0 {
+                Rig::on(MemFs::new(), lazy(), None)
+            } else {
+                restored(lazy()).0
+            };
+            r.open();
+            for k in 0..3 {
+                r.submit(vec![fact(5, k)]);
+                r.drain();
+            }
+            r.timed_seal();
+            for k in 3..5 {
+                r.submit(vec![fact(5, k)]);
+                r.drain();
+            }
+            let own: Vec<_> = r
+                .segments()
+                .into_iter()
+                .filter(|s| s.0.generation == generation)
+                .map(|s| s.0.sealed)
+                .collect();
+            assert_eq!(own[..2], [true, false], "{ctx}: {own:?}");
+            let durable = read_mark(&r.fs.read_durable(&log_path("MARK")).unwrap(), &STORE_ID)
+                .unwrap()
+                .unwrap()
+                .1;
+            assert_eq!(durable.last_sequence, 4, "{ctx}");
+            assert_eq!(r.mark().last_sequence, 5, "{ctx}");
+            lose_unsealed(&mut r, generation, zeroed);
+            r.boot += 1;
+            let rep = r.open();
+            let lost: Vec<_> = rep
+                .losses
+                .iter()
+                .map(|l| (l.kind, l.cause, l.first, l.last))
+                .collect();
+            let e = rep.entry.as_ref().expect("a recovery entry");
+            assert!(
+                lost.contains(&(LossKind::DataLost, LossCause::Corruption, Some(4), Some(4))),
+                "{ctx}: {lost:?}"
+            );
+            assert_eq!((e.entry.after, e.sequence), (4, 5), "{ctx}");
+            let recorded: Vec<_> = r
+                .lost_ranges()
+                .into_iter()
+                .map(|(g, l)| (g, l.first.1, l.last.1))
+                .collect();
+            assert_eq!(recorded, vec![(generation, 4, 4)], "{ctx}");
+        }
+    }
+}

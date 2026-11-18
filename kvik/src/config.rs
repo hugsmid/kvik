@@ -137,7 +137,8 @@ impl StoreConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MarkSync {
-    /// On a timer (`mark_sync_interval`).
+    /// On a timer (`mark_sync_interval`), and at once for a batch holding an entry that is not a fact or the first
+    /// batch in a segment (Q-630).
     Interval(Duration),
     /// At every commit.
     EveryCommit,
