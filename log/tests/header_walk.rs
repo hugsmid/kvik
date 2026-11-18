@@ -764,3 +764,32 @@ fn the_tail_s_commit_search_reads_no_header_again_for_a_commit_a_ring_below() {
         "{stats:?}: {plausible} plausible steps, {commits} commit blocks"
     );
 }
+
+/// Damage, `stretch` bytes of empty skippable blocks, among which no candidate starts, then `batches` one-row
+/// batches.
+fn batches_after_a_stretch(stretch: usize, batches: u64) -> Vec<u8> {
+    let mut f = damaged_start();
+    let empty = skippable(&[], None);
+    while f.len() < stretch {
+        f.extend_from_slice(&empty);
+    }
+    (0..batches).for_each(|s| push_one_row(&mut f, 2 + s));
+    f
+}
+
+#[test]
+fn a_candidate_free_stretch_past_the_valid_ring_adds_no_checksum_to_the_batches_after_it() {
+    let sums = |stretch, batches| {
+        let f = batches_after_a_stretch(stretch, batches);
+        let (r, stats) = scan_with_stats(&f, &ID, ScanLimit::End);
+        assert_eq!(r.unwrap().batches.len() as u64, batches);
+        stats.header_checksums
+    };
+    let short = sums(64 << 10, 1_000) - sums(64 << 10, 0);
+    let long = sums(20 << 20, 1_000) - sums(20 << 20, 0);
+    // A few steps where the stretch meets the first batch differ; a second checksum per batch would add 2,000.
+    assert!(
+        (short..=short + 8).contains(&long),
+        "{long} after the long stretch, {short} after the short one"
+    );
+}
