@@ -79,13 +79,14 @@ not reach that budget. Each kept body is checked once, and the checks keep nothi
 (Q-651). Measured in a release build on one shared 4-core cloud machine, against the bound (264 MiB of bodies for a 64
 MiB segment): the body checks of a crafted segment cost at most about 0.8 s at 64 MiB and 0.22 s at 16 MiB, and those of
 a crafted manifest about 0.09 s per 16 MiB at a start and 0.15 s at a refresh, within the 1 s restart budget. The header
-walk is bounded in reads per byte (Q-873): once damage is found a header checksum is taken at most once per 8-byte step,
-and a block's header is read at most eight times, each block judged once by the boundary reads and each step's chain
-end kept in a ring of 4-byte entries. Time is measured, not bounded: a header read costs about 20 to 31 ns, and the
-dearest crafted 64 MiB segments built cost 0.25 to 0.61 s (best of five, the worst up to 40 % above; a boundary read
-failing at the end of a chain of 500,000 empty blocks that the candidate then keeps is the dearest, 2.0 s before for the
-failing chain alone), the same blocks undamaged 0.25 to 0.37 s; a crafted manifest's header walk 0.19 to 0.30 s per
-16 MiB (1.2 to 1.3 s before). What a start is promised against the budget is Q-970. Files built to the body bound
+walk is bounded in reads per byte (Q-873): once damage is found a header checksum is taken at most twice per 8-byte step
+(once by the chain ends and once by a torn tail's commit search), and a block's header is read at most eight times, each
+block judged once by the boundary reads and each step's chain end kept in a ring of 4-byte entries. Time is measured,
+not bounded: a header read costs about 20 to 31 ns, and the dearest crafted 64 MiB segments built cost 0.25 to 0.61 s
+(best of five, the worst up to 40 % above; a boundary read failing at the end of a chain of 500,000 empty blocks that
+the candidate then keeps is the dearest, 2.0 s before for the failing chain alone), the same blocks undamaged 0.25 to
+0.37 s; a crafted manifest's header walk 0.19 to 0.30 s per 16 MiB (1.2 to 1.3 s before). What a start is promised
+against the budget is Q-970. Files built to the body bound
 measured 0.22 s (nested facts images over every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches
 whose rows share one text value, after damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records;
 0.15 s before) at a start. Every entry type, small and large, costs at most about 2.9 ns a byte to check, a

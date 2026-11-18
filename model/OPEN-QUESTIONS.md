@@ -1476,15 +1476,16 @@ on such a chain is read from those verdicts: one whose read would fail at the re
 and is charged the facts and entries body bytes that framing and the read in full would have checked; one whose stop
 is a commit block is read in full without its bodies checked again, and charged likewise if it keeps no batch. A
 header found valid once damage is found is remembered in a bitmap by offset and read again without its checksum; the
-tail's commit search reads a header only where the chain ends did not and its bytes name a commit block of the commit
-length; `crc32c_shift` takes at most eight lookups in
-nibble tables below 4 GiB, so a manifest step reads one header and takes at most one checksum. The argument: a header
-checksum is taken at most once per 8-byte step, and only at a step whose type and length could belong to a batch, plus
-once more for the headers of the one direct read that found the damage and for the block where each boundary read
-stops (the bitmap spans 16 MiB from the lowest offset
-the scan still asks about, and every read lies within 12.1 MiB of it); and a block's header is read at most eight
-times: once by the chain ends, three times by a candidate (framing once, the read in full twice), twice by a boundary
-read and twice more by the read of the batch it keeps, plus twice by the commit search at a commit block. Verdicts are
+tail's commit search reads a header only where the chain ends did not find it valid and its bytes name a commit block of
+the commit length; `crc32c_shift` takes at most eight lookups in nibble tables below 4 GiB, so a manifest step reads one
+header and takes at most one checksum. The argument: a header checksum is taken at most twice per 8-byte step, once by
+the chain ends at a step whose type and length could belong to a batch and once by a torn tail's commit search at a step
+whose bytes name a commit block of the commit length (a header that fails its checksum is not remembered, so a torn tail
+of such steps takes two a step), plus once more for the headers of the one direct read that found the damage and for the
+block where each boundary read stops (the bitmap spans 16 MiB from the lowest offset the scan still asks about, and
+every read lies within 12.1 MiB of it); and a block's header is read at most eight times: once by the chain ends, three
+times by a candidate (framing once, the read in full twice), twice by a boundary read and twice more by the read of the
+batch it keeps, plus twice by the commit search at a commit block. Verdicts are
 those of the walked chains and the reference scan, and the window rule and the charges are unchanged. Measured
 (release build, one shared 4-core cloud machine, the best of five, the worst at most 40 % above it, and runs at other
 hours up to 30 % slower again; a header read costs about 20 to 31 ns with the rest of the scan's work), 64 MiB: a
@@ -1523,7 +1524,7 @@ Recorded by roadmap 4.9e. For the owner.
 time: a header read costs about 20 to 31 ns and a body byte checked at most about 2.9 ns on one machine, and the
 bounds allow more of both than any file built so far uses. Bodies: at most 264 MiB checked for a 64 MiB segment,
 priced at the dearest entry 0.8 s, while the dearest file built to the body bound measured 0.22 s. Header reads: at
-most one checksum per 8-byte step and eight reads per block, which for 16-byte blocks and the measured cost per read is
+most two checksums per 8-byte step and eight reads per block, which for 16-byte blocks and the measured cost per read is
 about 1 s at 64 MiB before any body is checked, while the dearest file built measured 0.61 s (a boundary read failing
 at the end of a chain of 500,000 empty blocks that a candidate then keeps; best of five, the worst 0.63 s, other runs up
 to 0.79 s on a busier machine). An earlier statement that no one file reaches both dearest parts is withdrawn: batches
@@ -1874,7 +1875,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-650 | A manifest search that passes a window and finds no later record | `spec.md` §7 Manifest; `format.md` A.14 (settled by the owner's ruling: the passed bytes are a corrupt span with no later record, kept and repaired by a copy or a rebuild; the rebuild record's field 7 writes its `before` as 0; see the question) |
 | Q-651 | The crafted-file worst case against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by the owner's ruling: each kept body checked once and cheaper body checks with the same verdicts, measured inside the budget; see the question) |
 | Q-870 | Definitions and short state names against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled as a technical decision with no format change: fields split once and found by an index, state names keyed and told distinct by a randomised table that sorts after a long probe run; every entry type measured at most about 2.9 ns a byte, the body checks of a crafted 64 MiB segment about 0.8 s; see the question) |
-| Q-873 | The time of the header walk on a crafted file | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by roadmap 4.9e as a technical decision with no format change: once damage is found a header checksum at most once per 8-byte step and a block's header read at most eight times, the chain ends and a boundary read's verdicts kept in rings by offset; time measured, the dearest crafted 64 MiB segment built 0.61 s; what a start is promised is Q-970; see the question) |
+| Q-873 | The time of the header walk on a crafted file | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by roadmap 4.9e as a technical decision with no format change: once damage is found a header checksum at most twice per 8-byte step (the chain ends, and a torn tail's commit search) and a block's header read at most eight times, the chain ends and a boundary read's verdicts kept in rings by offset; time measured, the dearest crafted 64 MiB segment built 0.61 s; what a start is promised is Q-970; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

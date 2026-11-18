@@ -75,13 +75,14 @@ specified here before the roadmap item that writes it.
   disjoint. A boundary read that keeps no batch keeps a 4-byte verdict per block it walked in a second ring, so each
   block is judged once and a candidate on such a chain takes only its framing, or only its read in full. A header
   found valid is remembered in a bitmap by offset and read again without its checksum, and a CRC shift costs at most
-  eight lookups in nibble tables, so a manifest step reads one header and takes at most one checksum. So once damage
-  is found a header checksum is taken at most once per 8-byte step, and only where the type and length could be part
-  of a batch, plus once more for the headers of the direct read that found the damage and for the block where each
-  boundary read stops; a block's header is read at
-  most eight times: once by the chain ends, three times by a candidate (its framing and its read in full), twice by a
-  boundary read and twice more by the read of the batch it keeps, and twice by the tail's commit search at a commit
-  block. Measured (release build, one shared 4-core cloud machine, the best of five runs, the worst at most 40 %
+  eight lookups in nibble tables, so a manifest step reads one header and takes at most one checksum. So once damage is
+  found a header checksum is taken at most twice per 8-byte step, once by the chain ends where the type and length could
+  be part of a batch and once by a torn tail's commit search where the bytes name a commit block of the commit length (a
+  header that fails its checksum is not remembered), plus once more for the headers of the direct read that found the
+  damage and for the block where each boundary read stops; a block's header is read at most eight times: once by the
+  chain ends, three times by a candidate (its framing and its read in full), twice by a boundary read and twice more by
+  the read of the batch it keeps, and twice by the tail's commit search at a commit block. Measured (release build, one
+  shared 4-core cloud machine, the best of five runs, the worst at most 40 %
   above it; runs at other hours up to 30 % slower again): a header read costs about 20 to 31 ns with the rest of the
   scan's work, and the dearest crafted 64 MiB segments built cost 0.25 to 0.61 s: a valid header every 8 bytes 0.25
   s (5.7 s before), commit blocks naming data headers 0.24 s, candidates whose framing holds 0.25 to 0.27 s, chains

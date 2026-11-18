@@ -1,14 +1,15 @@
 //! A differential test of the bounded scan (`format.md` A, common rules: scan bound; Q-110, Q-873) on crafted and
 //! damaged segments: small ones against the reference scan, which checksums every body directly and reads every
 //! boundary in full, and ones longer than the rings of the chain ends and the valid headers against the walked chains;
-//! a torn tail's commit blocks against a plain search.
+//! a torn tail's commit blocks against a plain search, and the header checksums of a torn tail of failing commit-like
+//! steps.
 
 mod support;
 
 use kvik_log::FormatError;
 use kvik_log::batch::MAX_BATCH_DATA;
 use kvik_log::block::{BlockHeader, FLAG_SKIPPABLE, block_type};
-use kvik_log::body::Commit;
+use kvik_log::body::{COMMIT_LEN, Commit};
 use kvik_log::crc::crc32c;
 use kvik_log::header::HEADER_LEN;
 use kvik_log::scan::{ScanLimit, ScanReport, Tail, legacy, scan_with_stats};
@@ -637,4 +638,35 @@ fn a_boundary_read_a_ring_above_a_valid_header_gives_the_reports_of_the_referenc
         assert!(rep.batches.iter().all(|b| b.offset != t as u64));
         assert!(rep.batches.len() >= 6, "{}", rep.batches.len());
     }
+}
+
+/// An invalid header, a damaged word, then a torn tail whose every 8-byte step reads as a commit block header of the
+/// commit length and fails its checksum.
+fn commit_like_steps(len: usize) -> Vec<u8> {
+    let mut f = vec![0u8; HEADER_LEN + 8];
+    f[HEADER_LEN..].fill(0xFF);
+    while f.len() < len {
+        f.extend_from_slice(&[block_type::COMMIT, 0, 0, 0, COMMIT_LEN as u8, 0, 0, 0]);
+    }
+    f
+}
+
+#[test]
+fn a_torn_tail_of_failing_commit_like_steps_takes_two_header_checksums_a_step_and_one_to_a_mark() {
+    let f = commit_like_steps(1 << 20);
+    let steps = (f.len() - HEADER_LEN) as u64 / 8;
+    check(&f, f.len() as u64, true);
+    let (r, end) = scan_with_stats(&f, &ID, ScanLimit::End);
+    assert!(matches!(r.unwrap().tail, Some(Tail::Torn { commits, .. }) if commits.is_empty()));
+    let (_, mark) = scan_with_stats(&f, &ID, ScanLimit::Mark(f.len() as u64));
+    // The chain ends checksum each step once; the tail's commit search, absent below a mark, once more.
+    assert!(
+        end.header_checksums <= 2 * steps,
+        "{end:?} for {steps} steps"
+    );
+    assert!(mark.header_checksums <= steps, "{mark:?} for {steps} steps");
+    assert_eq!(
+        (end.header_checksums, mark.header_checksums),
+        (262_120, 131_064)
+    );
 }
