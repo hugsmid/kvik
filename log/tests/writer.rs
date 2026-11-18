@@ -21,7 +21,7 @@ use kvik_log::scan::{ScanLimit, SealState, scan};
 use kvik_log::store::{NewStore, StoreDir, StoreError};
 use kvik_log::writer::{
     Ack, Call, CallSource, CommitError, EveryCommitReason, FaultOp, IngestQueue, LogWriter,
-    MarkSync, MarkSyncMode, Position, Reason, SealJob, StartRule, Wait, WriterConfig,
+    MarkSync, MarkSyncMode, Position, Reason, SYNC_BURST, SealJob, StartRule, Wait, WriterConfig,
     create_segment, seal_segment_described,
 };
 use proptest::prelude::*;
@@ -31,7 +31,6 @@ const BOOT: [u8; 16] = [9; 16];
 const T0: i64 = 1_767_225_600_000_000_000;
 const MS: Duration = Duration::from_millis(1);
 const US: Duration = Duration::from_micros(1);
-const FLOOR: Duration = kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR;
 
 fn dir() -> PathBuf {
     PathBuf::from("store")
@@ -513,7 +512,7 @@ fn opening_a_store_makes_a_creations_rename_durable() {
 }
 
 #[test]
-fn group_commit_keeps_the_floor_only_while_calls_wait_and_adds_no_delay_after_a_quiet_period() {
+fn group_commit_syncs_at_once_within_the_budget_then_batches_until_its_refill() {
     let mut h = H::new(cfg());
     h.maint = false;
     let q = h.q.clone();
@@ -536,28 +535,41 @@ fn group_commit_keeps_the_floor_only_while_calls_wait_and_adds_no_delay_after_a_
         "the first call after a quiet period is synced at once"
     );
     fs.set_sync_hook(None);
-    let mut ids = vec![arrivals.lock().unwrap()[0].0];
+    let during = arrivals.lock().unwrap()[0].0;
+    assert!(
+        !h.done.contains_key(&during),
+        "not covered by the sync it arrived during"
+    );
+    h.advance(100 * US);
+    h.step();
+    assert!(h.done[&during].is_ok());
+    for _ in 2..SYNC_BURST {
+        h.advance(100 * US);
+        let c = h.submit(vec![fact(2, T0, 0)]);
+        h.step();
+        assert!(h.done[&c].is_ok(), "inside the budget's burst");
+    }
+    // The budget is spent: calls wait for its refill, one sync per interval (the ceiling: no clock), and form one batch.
+    let mut ids = Vec::new();
     for _ in 0..5 {
         h.advance(100 * US);
         ids.push(h.submit(vec![fact(1, T0, 0), fact(2, T0, 0)]));
-        let next = h.step();
-        assert_eq!(next, Some(FLOOR), "a call waited as the sync returned");
+        assert_eq!(h.step(), Some(Duration::from_millis(10)));
     }
-    assert_eq!(h.done.len(), 1);
-    h.advance(FLOOR - 500 * US);
+    assert!(ids.iter().all(|i| !h.done.contains_key(i)));
+    h.advance(Duration::from_millis(10) - h.now);
     h.step();
     assert!(ids.iter().all(|i| h.done[i].is_ok()));
-    assert_eq!(h.w.stats().batches, 2, "six calls in one batch");
-    assert_eq!(h.w.stats().syncs, 2);
-    // Nothing waited as that sync returned: the next call is synced in the step it arrives, inside the floor.
-    h.advance(100 * US);
+    assert_eq!(
+        h.w.stats().batches,
+        SYNC_BURST + 1,
+        "five calls in one batch"
+    );
+    // A quiet period refills the budget: the next call is synced in the step it arrives.
+    h.advance(Duration::from_secs(1));
     let b = h.submit(vec![fact(3, T0, 0)]);
     h.step();
     assert!(h.done[&b].is_ok());
-    h.advance(Duration::from_secs(1));
-    let c = h.submit(vec![fact(4, T0, 0)]);
-    h.step();
-    assert!(h.done[&c].is_ok());
     for (id, items) in arrivals.lock().unwrap().iter() {
         h.calls.insert(*id, items.clone());
     }
@@ -1352,10 +1364,10 @@ proptest! {
                 }
                 Op::Advance(ms) => h.advance(MS * ms as u32),
                 Op::Step => {
-                    // A turn that asks to run again at once makes progress: within two more turns at the same
-                    // time, the writer has nothing left to do now.
+                    // A turn that asks to run again at once makes progress: within the budget's burst of batch
+                    // syncs and two more turns at the same time, the writer has nothing left to do now.
                     let mut next = h.step();
-                    for _ in 0..2 {
+                    for _ in 0..SYNC_BURST as usize + 2 {
                         if next.is_some_and(|t| t <= h.now) {
                             next = h.step();
                         }

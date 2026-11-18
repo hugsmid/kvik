@@ -76,7 +76,7 @@ use crate::lease::LeaseTable;
 use crate::mark::{MarkSlot, SLOT_OFFSETS};
 use crate::segment::{SealSummary, SealedFile};
 use crate::store::{LEASES_DIR, MARK, StoreDir, StoreError};
-use pacing::SyncPace;
+use pacing::{Budget, SyncPace};
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -97,6 +97,8 @@ pub const MAX_CALL_ENTRIES: usize = 65_536;
 const DAY_NS: i64 = 86_400_000_000_000;
 /// The default `log.sync_interval_floor` (Q-710, Q-981).
 pub const DEFAULT_SYNC_INTERVAL_FLOOR: Duration = Duration::from_millis(2);
+/// The batch syncs the sync-rate budget holds: how many may start back to back after a quiet period (Q-985).
+pub const SYNC_BURST: u64 = pacing::BURST;
 
 /// When the mark file is synced (`api.md` `log.mark_sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,11 +117,11 @@ pub struct WriterConfig {
     pub segment_size: u64,
     /// `log.seal_interval`: a segment in use this long is sealed, if it holds a batch.
     pub seal_interval: Duration,
-    /// `log.min_sync_interval`: caps the spacing of batch syncs under load; zero means back to back (spec §3 Group
-    /// commit, Q-981).
+    /// `log.min_sync_interval`: the ceiling of the batch-sync interval, and the interval before the first sample;
+    /// zero disables the sync-rate budget (spec §3 Group commit, Q-981).
     pub min_sync_interval: Duration,
-    /// `log.sync_interval_floor`: the least time between the starts of two batch syncs when calls were waiting as
-    /// the first returned; zero means back to back (spec §3 Group commit, Q-710, Q-981).
+    /// `log.sync_interval_floor`: the least batch-sync interval; at or above `min_sync_interval` the interval is
+    /// fixed (spec §3 Group commit, Q-710, Q-981).
     pub sync_interval_floor: Duration,
     /// `log.max_batch_bytes`: 64 KiB to 8 MiB.
     pub max_batch_bytes: u64,
@@ -493,9 +495,9 @@ pub struct LogStats {
     pub mark_syncs: u64,
     /// The highest series id assigned.
     pub max_series_id: u32,
-    /// The spacing of batch syncs under load (spec §3 Group commit, Q-981).
+    /// The batch-sync interval in force: the budget refills one batch sync per interval (spec §3 Group commit).
     pub sync_interval: Duration,
-    /// The smoothed duration of a batch sync; `None` before the first sample (Q-984).
+    /// The smoothed duration of a batch sync; `None` before the first sample (Q-712).
     pub sync_time: Option<Duration>,
 }
 
@@ -583,11 +585,9 @@ pub struct LogWriter {
     last_commit_time: i64,
     max_series_id: u32,
     intervals: HashMap<u32, IntervalLength>,
-    /// When the previous batch sync started (spec §3 Group commit, Q-980).
-    last_batch_start: Option<Duration>,
-    /// Calls were waiting as the previous batch sync returned, so the next keeps the spacing (Q-980).
-    batch_waited: bool,
-    /// Times batch syncs for `LogStats::sync_time`; with none, no sample is taken.
+    /// The sync-rate budget (spec §3 Group commit, Q-980).
+    budget: Budget,
+    /// Times batch syncs for the interval; with none, the interval stays at `min_sync_interval`.
     sync_clock: Option<Arc<dyn Clock>>,
     pace: SyncPace,
     fault: Option<Fault>,
@@ -695,7 +695,8 @@ impl LogWriter {
                 syncs: 0,
                 mark_syncs: 0,
                 max_series_id: r.max_series_id,
-                sync_interval: pacing::spacing(cfg.sync_interval_floor, cfg.min_sync_interval),
+                sync_interval: SyncPace::default()
+                    .interval(cfg.sync_interval_floor, cfg.min_sync_interval),
                 sync_time: None,
             },
             fs,
@@ -722,8 +723,7 @@ impl LogWriter {
             last_commit_time: r.last_commit_time,
             max_series_id: r.max_series_id,
             intervals: r.intervals,
-            last_batch_start: None,
-            batch_waited: false,
+            budget: Budget::default(),
             sync_clock: None,
             pace: SyncPace::default(),
             fault: r.fault,
@@ -819,24 +819,22 @@ impl LogWriter {
         r
     }
 
-    /// Times each batch sync on `clock` for `LogStats::sync_time` (Q-984); [`Log::start`] passes its clock.
+    /// Times each batch sync on `clock`, so that the interval follows the device (spec §3 Group commit, Q-712);
+    /// [`Log::start`] passes its clock.
     pub fn set_sync_clock(&mut self, clock: Arc<dyn Clock>) {
         self.sync_clock = Some(clock);
     }
 
-    /// The spacing of batch syncs under load: `min(sync_interval_floor, min_sync_interval)` (Q-981).
+    /// The batch-sync interval in force: `min_sync_interval` before the first sample (Q-712).
     pub fn sync_interval(&self) -> Duration {
-        pacing::spacing(self.cfg.sync_interval_floor, self.cfg.min_sync_interval)
+        self.pace
+            .interval(self.cfg.sync_interval_floor, self.cfg.min_sync_interval)
     }
 
-    /// The earliest time the next batch sync may start: at once, unless calls were waiting as the previous batch
-    /// sync returned; then the spacing after it started (spec §3 Group commit, Q-980).
+    /// The earliest time the next batch sync may start: at once while the sync-rate budget holds a sync, else when
+    /// its refill reaches one (spec §3 Group commit, Q-980).
     pub fn sync_ready_at(&self) -> Duration {
-        pacing::ready_at(
-            self.last_batch_start,
-            self.batch_waited,
-            self.sync_interval(),
-        )
+        self.budget.ready_at(self.sync_interval())
     }
 
     fn fail(&mut self, op: FaultOp, path: &Path, e: &io::Error) {
@@ -1087,17 +1085,12 @@ impl LogWriter {
             if !disk_wait && !source.is_empty() && now >= self.sync_ready_at() {
                 let calls = source.take(self.cfg.max_batch_bytes);
                 let mut back = Vec::new();
-                let started = self.stats.batches;
                 match self.commit(calls, now, wall, &mut back) {
                     Some(done) => step.done = done,
                     None => self.waiting = Some(Wait::NoSegment),
                 }
                 if !back.is_empty() {
                     source.put_back(back);
-                }
-                // Read before any call of this batch is acknowledged, so a caller waiting on one is not counted.
-                if self.stats.batches > started {
-                    self.batch_waited = !source.is_empty();
                 }
             }
         }
@@ -1244,7 +1237,7 @@ impl LogWriter {
             self.fail(FaultOp::Sync, &p, &e);
             return;
         }
-        // Not a batch sync: it takes no part in the pacing (Q-982).
+        // Not a batch sync: it spends nothing of the budget (Q-982).
         self.stats.syncs += 1;
         self.roll_to(next);
     }
@@ -1385,7 +1378,7 @@ impl LogWriter {
         if self.halted() {
             return Some(Self::unknown(calls));
         }
-        self.last_batch_start = Some(now);
+        self.budget.spend(now, self.sync_interval());
         self.stats.syncs += 1;
         let seg = next
             .as_ref()
@@ -1399,6 +1392,7 @@ impl LogWriter {
         if let (Some(c), Some(b)) = (&self.sync_clock, before) {
             self.pace
                 .sample(pacing::nanos(c.monotonic().saturating_sub(b)));
+            self.stats.sync_interval = self.sync_interval();
             self.stats.sync_time = self.pace.estimate();
         }
         let last = content.last_sequence();

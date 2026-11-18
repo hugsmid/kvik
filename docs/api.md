@@ -34,7 +34,7 @@ the rest is filled in by the roadmap items named.
 let store = Store::open(
     StoreConfig::new(path, tz)        // tz: the site zone at creation; checked at every later open
         .create_if_missing(true)       // creates only in a missing or empty directory (format.md A.12)
-        .log(LogConfig::default())     // segment size, seal interval, min_sync_interval, batch size, mark sync
+        .log(LogConfig::default())     // segment size, seal interval, sync interval bounds, batch size, mark sync
         .limits(Limits::default())     // queue sizes, series ceiling, disk marks
         .tiers(TierConfig::default())  // cold path, age and fill thresholds
         .env(Env::system()),           // clock, file system, boot identity, tzdata, entropy
@@ -66,7 +66,8 @@ The keys roadmap section 4 needs; all may change between opens.
 |---|---|---|---|
 | `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
-| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: caps the spacing of batch syncs, so the spacing is `min(sync_interval_floor, min_sync_interval)`; 0 means back to back. The spacing holds only between a batch sync that returned with readings waiting and the next one; a writer with nothing in flight waits for no timer (Q-980 to Q-983). The floor, 2 ms, is the log writer's `sync_interval_floor` and not yet a store key (Q-981). Mark syncs, timed or forced, take no part in it |
+| `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: the ceiling of the batch-sync interval, and the interval before the first sample; 0 disables the sync budget, so batch syncs run back to back. Mark syncs, timed or forced, spend nothing of the budget |
+| `log.sync_interval_floor` | `Duration` | 2 ms | spec §3 Group commit: the least batch-sync interval. Any window holds at most its length over the interval, plus four, batch syncs, so at most 1/floor a second over time: 500 at the default, about 173 GiB of host writes a day at 4 KiB a sync if sustained; a deployment on flash that is sensitive to wear sets a longer floor, with `min_sync_interval` at least as long. At or above `min_sync_interval` the interval is fixed at it (Q-710, Q-981, Q-985) |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact, and the first batch in each segment when it is unflagged (Q-630), force a mark sync at once either way |
 | `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |

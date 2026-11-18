@@ -149,9 +149,12 @@ pub struct LogConfig {
     pub segment_size: u64,
     /// A segment is sealed after this long at the latest (default 5 minutes).
     pub seal_interval: Duration,
-    /// Caps the spacing of batch syncs under load, which is at most the log's 2 ms floor (default 10 ms; 0 means
-    /// back to back; spec §3 Group commit, Q-981).
+    /// The ceiling of the batch-sync interval (default 10 ms; 0 disables the sync-rate budget; spec §3 Group
+    /// commit, Q-981).
     pub min_sync_interval: Duration,
+    /// The least batch-sync interval: batch syncs run at most one per floor over time, plus a burst of four
+    /// (default 2 ms; at or above `min_sync_interval` the interval is fixed; spec §3 Group commit, Q-710, Q-981).
+    pub sync_interval_floor: Duration,
     /// Largest batch (default 1 MiB; 64 KiB to 8 MiB).
     pub max_batch_bytes: u64,
     /// Mark sync (default every second).
@@ -164,6 +167,7 @@ impl Default for LogConfig {
             segment_size: 64 << 20,
             seal_interval: Duration::from_secs(300),
             min_sync_interval: Duration::from_millis(10),
+            sync_interval_floor: Duration::from_millis(2),
             max_batch_bytes: 1 << 20,
             mark_sync: MarkSync::Interval(Duration::from_secs(1)),
         }

@@ -18,8 +18,8 @@ use kvik_log::name::SegmentName;
 use kvik_log::scan::{ScanLimit, scan};
 use kvik_log::store::{NewStore, StoreDir};
 use kvik_log::writer::{
-    Ack, Call, CallSource, CommitError, DEFAULT_SYNC_INTERVAL_FLOOR, IngestQueue, LogWriter, Wait,
-    WriterConfig, create_segment, seal_segment_described,
+    Ack, Call, CallSource, CommitError, IngestQueue, LogWriter, Wait, WriterConfig, create_segment,
+    seal_segment_described,
 };
 
 const STORE_ID: [u8; 16] = [7; 16];
@@ -325,37 +325,42 @@ fn fnv(bytes: &[u8], mut h: u64) -> u64 {
 }
 
 #[test]
-fn calls_put_back_keep_the_floor_and_a_turn_that_commits_nothing_leaves_it_as_it_was() {
+fn calls_put_back_follow_at_once_while_the_budget_holds_and_a_turn_that_commits_nothing_spends_nothing()
+ {
     let mut h = H::with_min_sync(Duration::from_millis(10));
-    let mut g = h.greedy(vec![
-        facts(1, T0, 3, 0),
-        vec![recovery()],
-        facts(2, T0, 2, 9),
-    ]);
+    h.maint = false;
+    let mut g = h.greedy(vec![facts(1, T0, 3, 0), vec![recovery()]]);
     assert_eq!(h.step(&mut g), 1);
     assert_eq!(
         h.w.sync_ready_at(),
-        h.now + DEFAULT_SYNC_INTERVAL_FLOOR,
-        "calls put back were waiting as the sync returned (Q-982)"
+        Duration::ZERO,
+        "the budget still holds syncs"
     );
-    while !g.is_empty() {
-        h.step(&mut g);
+    assert_eq!(h.step(&mut g), 1);
+    for s in 2..4 {
+        h.submit(facts(s, T0, 1, 0));
+        assert_eq!(h.step_queue(), 1);
     }
-    assert_eq!(h.w.sync_ready_at(), Duration::ZERO);
-    h.maint = false;
-    for series in 3.. {
+    // No clock: one sync per 10 ms. Four syncs a millisecond apart leave three tenths of one; each round below
+    // refills one and spends one, so the budget holds 1.3 syncs as each large call comes and a turn that spent one
+    // would leave it short.
+    for series in 4.. {
         assert!(series < 12, "a roll found no segment ahead");
+        h.now += Duration::from_millis(9);
         let mut big = h.greedy(vec![facts(series, T0, BIG, 255)]);
         if h.step(&mut big) == 0 {
+            g = big;
             break;
         }
     }
     assert_eq!(h.w.waiting(), Some(Wait::NoSegment));
-    assert_eq!(
-        h.w.sync_ready_at(),
-        Duration::ZERO,
-        "a turn that commits nothing leaves the spacing as it was"
+    assert!(
+        h.w.sync_ready_at() <= h.now,
+        "a turn that commits nothing spends nothing of the budget"
     );
+    h.maint = true;
+    h.run_maint();
+    assert_eq!(h.step(&mut g), 1);
 }
 
 #[test]

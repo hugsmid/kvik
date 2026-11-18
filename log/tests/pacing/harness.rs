@@ -12,7 +12,8 @@ use kvik_log::facts::{FactFlags, FactRow, Quality, Value};
 use kvik_log::fs::{DirEntry, Fs, FsFile, MemFs, OpenMode};
 use kvik_log::store::{MARK, NewStore, StoreDir};
 use kvik_log::writer::{
-    Call, CallSource, Clock, IngestQueue, LogWriter, MarkSync, WriterConfig, create_segment,
+    Call, CallSource, Clock, IngestQueue, LogWriter, MarkSync, SYNC_BURST, WriterConfig,
+    create_segment,
 };
 use proptest::prelude::*;
 
@@ -160,8 +161,17 @@ impl Setup {
             ..Self::base()
         }
     }
-    /// The spacing the writer keeps under load (Q-981).
-    pub fn spacing(&self) -> Duration {
+    /// The interval for a smoothed sync time `d`: eight times it within `[min(floor, ceiling), ceiling]`, the
+    /// ceiling with none (Q-712, Q-713).
+    pub fn interval(&self, d: Option<Duration>) -> Duration {
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let c = ns(self.ceiling);
+        Duration::from_nanos(d.map_or(c, |d| {
+            ns(d).saturating_mul(8).clamp(ns(self.floor).min(c), c)
+        }))
+    }
+    /// The least interval the writer can be in: the floor capped by the ceiling.
+    pub fn least_interval(&self) -> Duration {
         self.floor.min(self.ceiling)
     }
     pub fn config(&self) -> WriterConfig {
@@ -484,7 +494,7 @@ pub fn simulate(s: &mut Sim, h: &History) -> Schedule {
         s.arrive(t);
     }
     let (mut free, mut next) = (s.clock.monotonic(), None);
-    for _ in 0..100 * h.calls.len() + 100 {
+    for _ in 0..20 * h.calls.len() + 100 {
         if s.pending.is_empty() && s.q.is_empty() {
             let at = |m: &BTreeMap<u64, Duration>| s.ids.iter().map(|id| m[id]).collect();
             return Schedule {
@@ -502,34 +512,54 @@ pub fn simulate(s: &mut Sim, h: &History) -> Schedule {
 }
 
 /// The reference schedule of spec §3 Group commit (Q-980): a batch sync starts as soon as the writer turns with a
-/// call queued, unless calls were waiting as the previous batch sync returned; then not before `spacing` after
-/// that sync started. It takes every call queued, and its calls are acknowledged as it returns. Driven as
+/// call queued and the budget holds a sync; the budget holds `SYNC_BURST` syncs, refills at one per interval
+/// (counted in billionths of a sync, rounded down) and starts full; the interval follows the smoothed sync time
+/// when `clocked`. A batch sync takes every call queued, and its calls are acknowledged as it returns. Driven as
 /// [`simulate`] drives the writer.
-pub fn reference(h: &History, spacing: Duration) -> Schedule {
+pub fn reference(h: &History, setup: Setup, clocked: bool) -> Schedule {
+    const UNIT: u128 = 1_000_000_000;
+    let full = u128::from(SYNC_BURST) * UNIT;
+    let ns = |d: Duration| u128::from(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     let n = h.calls.len();
-    let ready = |last: Option<Duration>, waited: bool| match last {
-        Some(s) if waited => s.saturating_add(spacing),
-        _ => Duration::ZERO,
+    let (mut d, mut left, mut since) = (None::<u64>, full, Duration::ZERO);
+    let interval = |d: Option<u64>| ns(setup.interval(d.map(Duration::from_nanos)));
+    let ready = |left: u128, since: Duration, i: u128| {
+        if i == 0 || left >= UNIT {
+            Duration::ZERO
+        } else {
+            let wait = ((UNIT - left) * i).div_ceil(UNIT);
+            since.saturating_add(Duration::from_nanos(
+                u64::try_from(wait).unwrap_or(u64::MAX),
+            ))
+        }
     };
     let (mut starts, mut covered, mut acked) =
         (Vec::new(), vec![Duration::ZERO; n], vec![Duration::ZERO; n]);
     let (mut taken, mut free, mut next) = (0, Duration::ZERO, None);
-    let (mut last, mut waited) = (None, false);
     while taken < n {
         let at = next_turn(h, free, next);
         free = at;
         let queued = h.arrived(at);
-        if queued > taken && at >= ready(last, waited) {
-            let end = at + h.sync(starts.len());
+        let i = interval(d);
+        if queued > taken && at >= ready(left, since, i) {
+            let now = (ns(at - since) * UNIT)
+                .checked_div(i)
+                .map_or(full, |refill| (left + refill).min(full));
+            left = now.saturating_sub(UNIT);
+            since = at;
+            let sync = h.sync(starts.len());
+            let end = at + sync;
             covered[taken..queued].fill(at);
             acked[taken..queued].fill(end);
             taken = queued;
             starts.push(at);
-            last = Some(at);
             free = end;
-            waited = h.arrived(end) > taken;
+            if clocked {
+                let x = u64::try_from(ns(sync)).unwrap();
+                d = Some(d.filter(|&e| x < e).map_or(x, |e| e - (e - x) / 8));
+            }
         }
-        next = (h.arrived(free) > taken).then(|| ready(last, waited).max(at));
+        next = (h.arrived(free) > taken).then(|| ready(left, since, interval(d)).max(at));
     }
     Schedule {
         starts,
@@ -631,14 +661,22 @@ pub fn saturated(setup: Setup, n: usize, sync: impl Fn(usize) -> Duration) -> Si
 }
 
 /// A lone writer in a closed loop: each call arrives `turnaround` after the previous one is acknowledged and wakes
-/// the writer at once; batch syncs take `sync`.
+/// the writer at once, which then turns at each deadline until it is acknowledged; batch syncs take `sync`.
 pub fn lone_writer(setup: Setup, n: usize, sync: Duration, turnaround: Duration) -> Sim {
     let mut s = Sim::new(setup);
     let mut at = START;
     for _ in 0..n {
         s.arrive(at);
-        let (_, busy) = s.turn(at, sync);
-        at += busy + turnaround;
+        let done = s.acked.len();
+        loop {
+            assert!(s.turns.len() < 10 * n + 100, "the writer stopped syncing");
+            let (next, busy) = s.turn(at, sync);
+            if s.acked.len() > done {
+                at += busy + turnaround;
+                break;
+            }
+            at = timed(next, at + busy, Duration::ZERO).unwrap();
+        }
     }
     s
 }

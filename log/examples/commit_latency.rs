@@ -457,12 +457,16 @@ impl Setup {
             every_commit: true,
         },
     ];
-    /// The spacing of batch syncs under load: `min_sync_interval` where the floor is at or above it, else the floor.
+    /// `min_sync_interval`, with the floor where the interval adapts.
     fn interval(&self) -> String {
         if self.floor >= self.min_sync {
             format!("{} ms", self.min_sync.as_millis())
         } else {
-            format!("floor {} ms", self.floor.as_millis())
+            format!(
+                "adaptive {}–{} ms",
+                self.floor.as_millis(),
+                self.min_sync.as_millis()
+            )
         }
     }
     fn label(&self) -> String {
@@ -523,8 +527,8 @@ fn wait_until(t: Instant) {
     }
 }
 
-/// How late a 5 ms sleep wakes, p50 and max of 50, in ms. The writer waits on timers too (the floor under load,
-/// the timed mark sync), so slack added by the operating system shows in the results.
+/// How late a 5 ms sleep wakes, p50 and max of 50, in ms. The writer waits on timers too (the refill of the sync
+/// budget, the timed mark sync), so slack added by the operating system shows in the results.
 fn timer_slack() -> String {
     let mut v: Vec<u64> = (0..50)
         .map(|_| {
@@ -1168,7 +1172,7 @@ fn main() {
         out,
         "\n## Throughput and syncs\n\n\
          | Load | Interval | Mark sync |{rh} Seconds | Calls/s | Readings/s | Log syncs/s | Readings per batch | \
-         Calls per batch | Spacing | Sync time at end | Mark syncs | Sealed | Batch sync p50 | p99 | max | \
+         Calls per batch | Interval at end | Sync time at end | Mark syncs | Sealed | Batch sync p50 | p99 | max | \
          Mark sync p50 | max |\n\
          |---|---|---|{rs}---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );

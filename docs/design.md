@@ -20,9 +20,10 @@ direction and budgets. The rules are in [`spec.md`](spec.md).
 
 ## Intended shape
 1. **Log.** Readings are validated, stamped and appended to the log in batches; a batch is synced before
-   anything else sees it (group commit; no timer delays a batch with nothing in flight; while readings wait,
-   batch syncs start at least the spacing, default 2 ms, apart), except a batch of series at the faster
-   durability level, seen once written, its sync starting within `max_unsynced` (spec §2.1 `durability`).
+   anything else sees it (group commit; a batch with nothing in flight is synced at once while the sync budget
+   holds a sync, and batch syncs run at most one per interval, at least 2 ms, plus a burst of four), except a
+   batch of series at the faster durability level, seen once written, its sync starting within `max_unsynced`
+   (spec §2.1 `durability`).
 2. **Delivery.** Only after its acknowledgement (the sync, or the write at the faster level), funnels deliver to
    consumers and live state updates. A funnel is a route
    compiled from configuration: series selection, optional windowed operator, condition, consumer. A consumer
@@ -59,14 +60,18 @@ footprint is small for embedded use, and decoding is fast for large scans. Parqu
 the mark synced at every commit (it has no verified boot identity), and is held neither to these budgets nor to the
 durability guarantees of spec §3 Sync primitive. The relaxed figure is enough, as device and human reaction times in automation
 are tens to hundreds of milliseconds. Roadmap 2.2 found that each durable sync writes a minimum amount, which
-unbatched small writers multiply, so while readings arrive during syncs, batch syncs start at least the spacing
-(`sync_interval_floor`, 2 ms, capped by `min_sync_interval`) apart and each covers everything that arrived meanwhile
-(spec §3 Group commit, Q-980). A batch with nothing in flight is synced at once, so a lone writer waits only for
-its sync; under load a reading waits for the spacing or the sync in flight, whichever ends later, then its own
-sync, inside the p99 budget, and the spacing caps host writes from many staggered writers at 500 batch syncs a
-second. A caller that waits for each acknowledgement
-before sending the next is not capped by it: it gets one sync per call (Q-983). A caller who needs lower latency
-under load sets the spacing to 0.
+unbatched small writers multiply, so batch syncs draw on a sync budget (spec §3 Group commit, Q-980): four syncs,
+refilled at one per interval, eight times the smoothed sync time between `sync_interval_floor` (2 ms) and
+`min_sync_interval` (10 ms). It caps host writes for every load, staggered writers included, at 500 batch syncs a
+second on a fast device and 100 on one whose sync takes 1.25 ms or more. Under the budget's rate a batch with
+nothing in flight is synced at once, so a lone writer or staggered callers wait only for their own sync; above it,
+readings queue and the sync at each refill covers all of them, so a reading waits for up to one interval and then
+its sync. The p50 ≤ 5 ms budget therefore holds under the budget's rate wherever the sync itself is well inside
+5 ms, and above that rate only while half the interval plus the sync stays under 5 ms: on the NVMe target (sync
+about 1.1 ms, interval about 8.8 ms) a load above about 110 batch syncs a second, such as one writer that waits
+for each acknowledgement, lies outside the p50 budget (Q-983). The p99 holds while an interval plus two syncs stays
+under 20 ms. A caller who needs lower latency at high rates lowers the floor or sets `min_sync_interval` to 0,
+which disables the budget, at the cost in host writes of spec §13.
 
 **Size.** [Roadmap 2.1](measurements/2.1-chunk-encodings.md) measured the own encoding 8–14 % smaller than Parquet
 with ALP for decimal `f64` data, about 1 % for the same series declared as scaled `i64`, and larger than Parquet's

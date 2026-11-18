@@ -290,6 +290,7 @@ fn writer_config(config: &StoreConfig) -> WriterConfig {
         segment_size: l.segment_size,
         seal_interval: l.seal_interval,
         min_sync_interval: l.min_sync_interval,
+        sync_interval_floor: l.sync_interval_floor,
         max_batch_bytes: l.max_batch_bytes,
         mark_sync: match l.mark_sync {
             MarkSync::Interval(d) => LogMarkSync::Interval(d),
@@ -300,5 +301,31 @@ fn writer_config(config: &StoreConfig) -> WriterConfig {
         disk_low_bytes: lim.disk_low.bytes,
         disk_critical: lim.disk_critical,
         ..WriterConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_store_passes_both_pacing_keys_to_the_log_with_the_logs_defaults() {
+        let mut config = StoreConfig::default();
+        assert_eq!(
+            writer_config(&config).sync_interval_floor,
+            kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR
+        );
+        assert_eq!(
+            writer_config(&config).min_sync_interval,
+            WriterConfig::default().min_sync_interval
+        );
+        config.log.sync_interval_floor = Duration::from_millis(50);
+        config.log.min_sync_interval = Duration::from_millis(100);
+        let w = writer_config(&config);
+        assert_eq!(
+            (w.sync_interval_floor, w.min_sync_interval),
+            (Duration::from_millis(50), Duration::from_millis(100))
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Batch-sync pacing (spec §3 Group commit, Q-980 to Q-984): the synchronous writer core driven with explicit times,
+//! Batch-sync pacing (spec §3 Group commit, Q-980 to Q-985): the synchronous writer core driven with explicit times,
 //! a manual clock that each sync advances by a scripted duration from the file system's sync hook, and calls that
 //! arrive by that clock while a sync is in flight, against a reference schedule written out on its own.
 
@@ -16,8 +16,10 @@ use kvik_log::content::Item;
 use kvik_log::entries::Entry;
 use kvik_log::fs::{FaultOp, MemFs};
 use kvik_log::store::{MARK, NewStore, StoreDir};
-use kvik_log::writer::{Clock, Log, LogWriter, MarkSync, WriterConfig};
+use kvik_log::writer::{Clock, Log, LogWriter, MarkSync, SYNC_BURST, SystemClock, WriterConfig};
 use proptest::prelude::*;
+
+const BURST: usize = SYNC_BURST as usize;
 
 /// The batch sync each call's covering start names, by index into `starts`.
 fn batch_of(s: &Schedule, call: usize) -> usize {
@@ -27,12 +29,39 @@ fn batch_of(s: &Schedule, call: usize) -> usize {
         .unwrap()
 }
 
+/// Whether any `count` consecutive batch syncs of `starts` span less than `count - BURST` intervals.
+fn over_budget(starts: &[Duration], interval: Duration) -> Option<(usize, usize)> {
+    for i in 0..starts.len() {
+        for j in i + BURST..starts.len() {
+            if starts[j] - starts[i] < interval * (j + 1 - i - BURST) as u32 {
+                return Some((i, j));
+            }
+        }
+    }
+    None
+}
+
+/// A sync time, and a floor and ceiling with the floor at most the ceiling and the ceiling above zero.
+fn arb_device() -> impl Strategy<Value = (Duration, Duration, Duration)> {
+    (arb_sync(), 0u64..=20, 1u64..=20)
+        .prop_map(|(d, f, c)| (d, US * (500 * f.min(2 * c)) as u32, MS * c as u32))
+}
+
 proptest! {
+    #![proptest_config(ProptestConfig { max_shrink_time: 20_000, ..ProptestConfig::default() })]
+
     #[test]
     fn the_writer_agrees_with_the_reference_schedule((floor, ceiling) in arb_bounds(), h in arb_history()) {
         let setup = Setup { floor, ceiling, ..Setup::base() };
         let (_, got) = run(setup, &h);
-        prop_assert_eq!(got, reference(&h, setup.spacing()));
+        prop_assert_eq!(got, reference(&h, setup, true));
+    }
+
+    #[test]
+    fn without_a_clock_the_writer_agrees_with_the_reference_at_the_ceiling((floor, ceiling) in arb_bounds(), h in arb_history()) {
+        let setup = Setup { floor, ceiling, ..Setup::unclocked() };
+        let (_, got) = run(setup, &h);
+        prop_assert_eq!(got, reference(&h, setup, false));
     }
 
     #[test]
@@ -48,33 +77,39 @@ proptest! {
     }
 
     #[test]
-    fn under_load_batch_syncs_start_at_least_the_spacing_apart(
+    fn batch_syncs_in_any_window_stay_within_the_least_interval_and_the_burst(
         (floor, ceiling) in arb_bounds(),
         h in arb_history(),
     ) {
         let setup = Setup { floor, ceiling, ..Setup::base() };
         let (s, _) = run(setup, &h);
-        for k in 1..s.starts.len() {
-            if s.waited[k - 1] {
-                let gap = s.starts[k] - s.starts[k - 1];
-                prop_assert!(gap >= setup.spacing(), "syncs {} and {} are {:?} apart", k - 1, k, gap);
-            }
-        }
+        prop_assert_eq!(over_budget(&s.starts, setup.least_interval()), None);
     }
 
     #[test]
-    fn a_batch_sync_after_one_that_returned_with_nothing_waiting_starts_at_the_first_turn_that_sees_its_call(
-        (floor, ceiling) in arb_bounds(),
+    fn on_a_steady_device_batch_syncs_in_any_window_stay_within_its_interval_and_the_burst(
+        (d, floor, ceiling) in arb_device(),
         h in arb_history(),
     ) {
-        let (s, got) = run(Setup { floor, ceiling, ..Setup::base() }, &h);
-        for k in 0..s.starts.len() {
-            if k > 0 && s.waited[k - 1] {
-                continue;
-            }
-            let first = got.covered.iter().position(|c| *c == s.starts[k]).unwrap();
-            let seen = s.turns.iter().find(|t| **t >= h.calls[first].0).unwrap();
-            prop_assert_eq!(s.starts[k], *seen, "sync {}", k);
+        let setup = Setup { floor, ceiling, ..Setup::base() };
+        let h = History { syncs: vec![d], ..h };
+        let (s, _) = run(setup, &h);
+        prop_assert_eq!(over_budget(&s.starts, setup.interval(Some(d))), None);
+    }
+
+    #[test]
+    fn a_lone_writer_under_budget_is_never_delayed(
+        (d, floor, ceiling) in arb_device(),
+        extra in 0u64..3_000,
+        n in 1usize..60,
+    ) {
+        let setup = Setup { floor, ceiling, ..Setup::base() };
+        let turnaround = setup.interval(Some(d)).saturating_sub(d) + US * extra as u32;
+        let s = lone_writer(setup, n, d, turnaround);
+        let mut at = START;
+        for (k, id) in s.ids.iter().enumerate() {
+            prop_assert_eq!(s.covered[id], at, "call {} waited", k);
+            at = s.acked[id] + turnaround;
         }
     }
 
@@ -106,7 +141,9 @@ proptest! {
             largest = largest.max(d);
             let est = s.w.stats().sync_time.unwrap();
             prop_assert!(d <= est && est <= largest, "after sync {}: {:?} of {:?}", k, est, d);
-            prop_assert_eq!(s.w.stats().sync_interval, FLOOR);
+            let i = s.w.stats().sync_interval;
+            prop_assert_eq!(i, s.w.sync_interval());
+            prop_assert_eq!(i, Setup::base().interval(Some(est)));
             at += Duration::from_secs(1);
         }
     }
@@ -176,13 +213,63 @@ fn no_call_is_acknowledged_before_its_batch_is_on_stable_storage() {
     assert!(s.w.stats().batches < 41, "calls shared batch syncs");
 }
 
+/// Batch syncs a second for `per_sec` evenly staggered calls of one reading, none waiting for another, each batch
+/// sync taking `sync`, over one second.
+fn staggered(per_sec: u32, sync: Duration) -> (usize, Vec<Duration>) {
+    let period = Duration::from_secs(1) / per_sec;
+    let (s, waits) = periodic(Setup::base(), per_sec as usize, period, sync);
+    (s.starts.len(), waits)
+}
+
 #[test]
-fn the_calls_that_arrive_during_a_sync_form_the_next_batch_at_the_floor_or_as_it_returns() {
-    for (floor, sync, second) in [
-        (Duration::ZERO, MS, START + MS),
-        (FLOOR, MS, START + FLOOR),
-        (FLOOR, 3 * MS, START + 3 * MS),
+fn staggered_callers_get_a_sync_each_under_budget_and_share_syncs_at_its_rate_above_it() {
+    let (syncs, waits) = staggered(400, 130 * US);
+    assert_eq!(syncs, 400, "under 1/floor every call is synced on its own");
+    assert!(waits.iter().all(|w| *w == WAKE));
+    for (per_sec, sync, budget) in [
+        (1_000, 130 * US, 500),
+        (4_000, 130 * US, 500),
+        (10_000, 130 * US, 500),
+        (800, 1_100 * US, 114),
+        (2_000, 1_100 * US, 114),
+        (150, 5 * MS, 100),
+        (1_000, 5 * MS, 100),
     ] {
+        let (syncs, waits) = staggered(per_sec, sync);
+        assert!(
+            syncs <= budget + BURST && syncs + 2 >= budget,
+            "{per_sec} calls/s, sync {sync:?}: {syncs} batch syncs"
+        );
+        assert!(
+            waits
+                .iter()
+                .all(|w| *w <= WAKE + Setup::base().interval(Some(sync))),
+            "{per_sec} calls/s, sync {sync:?}: {:?}",
+            waits.iter().max()
+        );
+    }
+}
+
+#[test]
+fn slow_devices_keep_the_ceiling_of_the_fixed_schedule() {
+    for d in [1_250 * US, 5 * MS, 10 * MS] {
+        let s = saturated(Setup::base(), 40, |_| d);
+        assert_eq!(s.w.sync_interval(), CEILING, "sync {d:?}");
+        let gaps: Vec<_> = s.starts[BURST + 2..]
+            .windows(2)
+            .map(|p| p[1] - p[0])
+            .collect();
+        assert!(
+            gaps.iter()
+                .all(|g| *g >= CEILING && *g <= CEILING + 50 * US),
+            "sync {d:?}: {gaps:?}"
+        );
+    }
+}
+
+#[test]
+fn the_calls_that_arrive_during_a_sync_form_one_batch_as_it_returns_while_the_budget_holds() {
+    for (floor, sync) in [(Duration::ZERO, MS), (FLOOR, MS), (FLOOR, 3 * MS)] {
         let mut s = Sim::new(Setup {
             floor,
             ..Setup::base()
@@ -193,6 +280,7 @@ fn the_calls_that_arrive_during_a_sync_form_the_next_batch_at_the_floor_or_as_it
         }
         let (next, busy) = s.turn(START, sync);
         assert_eq!(s.acked[&a], START + sync);
+        let second = START + sync;
         assert_eq!(timed(next, START + busy, Duration::ZERO), Some(second));
         s.turn(second, sync);
         assert_eq!(s.w.stats().batches, 2, "floor {floor:?}, sync {sync:?}");
@@ -201,95 +289,100 @@ fn the_calls_that_arrive_during_a_sync_form_the_next_batch_at_the_floor_or_as_it
 }
 
 #[test]
-fn under_load_batch_syncs_start_the_floor_apart_or_as_the_previous_one_returns() {
+fn a_spent_budget_holds_arrivals_for_the_next_refill_and_they_form_one_batch() {
+    let mut s = Sim::new(Setup::base());
+    let mut at = START;
+    for _ in 0..BURST {
+        s.arrive(at);
+        let (_, busy) = s.turn(at, FAST);
+        at += busy;
+    }
+    assert_eq!(s.starts.len(), BURST);
+    let interval = s.w.sync_interval();
+    assert_eq!(interval, FLOOR);
+    let ready = s.w.sync_ready_at();
+    assert!(ready > at && ready <= START + interval, "{ready:?}");
+    for k in 0..5u32 {
+        s.arrive(at + 100 * US * k);
+        let (next, _) = s.turn(at + 100 * US * k, FAST);
+        assert_eq!(next, Some(ready));
+    }
+    s.turn(ready, FAST);
+    assert_eq!(s.starts.len(), BURST + 1);
+    assert!(s.ids[BURST..].iter().all(|id| s.covered[id] == ready));
+}
+
+#[test]
+fn a_lone_writer_above_budget_runs_at_one_sync_per_interval_after_the_burst() {
+    let s = lone_writer(Setup::base(), 40, FAST, Duration::ZERO);
+    for (k, id) in s.ids.iter().take(BURST).enumerate() {
+        assert_eq!(
+            s.covered[id],
+            START + FAST * k as u32,
+            "call {k} of the burst"
+        );
+    }
+    let gaps: Vec<_> = s.starts[BURST + 1..]
+        .windows(2)
+        .map(|p| p[1] - p[0])
+        .collect();
+    assert!(gaps.iter().all(|g| *g == FLOOR), "{gaps:?}");
+}
+
+#[test]
+fn under_load_batch_syncs_run_at_the_interval_or_as_the_previous_one_returns() {
     let gaps = |s: &Sim| {
-        s.starts[5..]
+        s.starts[BURST + 2..]
             .windows(2)
             .map(|p| p[1] - p[0])
             .collect::<Vec<_>>()
     };
-    let at_floor = saturated(Setup::base(), 40, |_| FAST);
+    let fast = saturated(Setup::base(), 40, |_| FAST);
     assert!(
-        gaps(&at_floor).iter().all(|g| *g == FLOOR + 50 * US),
-        "a timed wake 50 µs late: {:?}",
-        gaps(&at_floor)
+        gaps(&fast).iter().all(|g| *g == FLOOR),
+        "a timed wake 50 µs late is caught up from the budget: {:?}",
+        gaps(&fast)
     );
-    let slow = saturated(Setup::base(), 40, |_| 3 * MS);
+    let zero_floor = saturated(
+        Setup {
+            floor: Duration::ZERO,
+            ..Setup::base()
+        },
+        40,
+        |_| FAST,
+    );
+    assert_eq!(zero_floor.w.sync_interval(), 8 * FAST);
+    assert!(gaps(&zero_floor).iter().all(|g| *g == 8 * FAST));
+    let slow = saturated(Setup::base(), 40, |_| 20 * MS);
     assert!(
-        gaps(&slow).iter().all(|g| *g == 3 * MS),
+        gaps(&slow).iter().all(|g| *g == 20 * MS),
         "{:?}",
         gaps(&slow)
     );
 }
 
 #[test]
-fn a_zero_floor_starts_each_batch_sync_under_load_as_the_previous_one_returns() {
-    for (floor, ceiling) in [(Duration::ZERO, CEILING), (FLOOR, Duration::ZERO)] {
+fn a_zero_ceiling_starts_each_batch_sync_under_load_as_the_previous_one_returns() {
+    for floor in [Duration::ZERO, FLOOR] {
         let s = saturated(
             Setup {
                 floor,
-                ceiling,
+                ceiling: Duration::ZERO,
                 ..Setup::base()
             },
             40,
             |_| FAST,
         );
-        assert!(s.waited.iter().all(|w| *w));
         assert!(
             s.starts.windows(2).all(|p| p[1] - p[0] == FAST),
-            "{floor:?} under {ceiling:?}"
+            "{floor:?}"
         );
         assert_eq!(s.w.stats().sync_interval, Duration::ZERO);
     }
 }
 
 #[test]
-fn a_lone_writer_waits_for_no_timer() {
-    for turnaround in [Duration::ZERO, 10 * US] {
-        let s = lone_writer(Setup::base(), 50, FAST, turnaround);
-        assert_eq!(s.starts.len(), 50);
-        for (k, id) in s.ids.iter().enumerate() {
-            let arrival = START + (FAST + turnaround) * k as u32;
-            assert_eq!(s.covered[id], arrival, "call {k} waited");
-            assert_eq!(s.acked[id], arrival + FAST, "call {k}");
-        }
-        assert!(
-            s.waited.iter().all(|w| !w),
-            "nothing waits as a lone writer's sync returns"
-        );
-    }
-}
-
-#[test]
-fn the_floor_does_not_apply_after_a_batch_sync_that_returned_with_nothing_waiting() {
-    let mut s = Sim::new(Setup::base());
-    s.push();
-    s.turn(START, FAST);
-    let at = START + FAST + 10 * US;
-    assert!(at < START + FLOOR);
-    s.arrive(at);
-    s.turn(at, FAST);
-    assert_eq!(s.starts, [START, at]);
-}
-
-#[test]
-fn calls_arriving_after_a_sync_returned_with_others_waiting_join_them_at_the_floor() {
-    let mut s = Sim::new(Setup::base());
-    s.push();
-    for t in [50 * US, 100 * US, 500 * US, MS] {
-        s.arrive(START + t);
-    }
-    let (next, _) = s.turn(START, FAST);
-    assert_eq!(next, Some(START + FLOOR));
-    s.turn(START + 500 * US, FAST);
-    assert_eq!(s.starts, [START], "not before the floor");
-    s.turn(START + FLOOR, FAST);
-    assert_eq!(s.starts, [START, START + FLOOR]);
-    assert!(s.ids[1..].iter().all(|id| s.covered[id] == START + FLOOR));
-}
-
-#[test]
-fn a_floor_above_the_ceiling_spaces_batch_syncs_at_the_ceiling() {
+fn a_floor_above_the_ceiling_fixes_the_interval_at_the_ceiling() {
     let s = saturated(
         Setup {
             floor: 20 * MS,
@@ -300,16 +393,16 @@ fn a_floor_above_the_ceiling_spaces_batch_syncs_at_the_ceiling() {
     );
     assert_eq!(s.w.stats().sync_interval, CEILING);
     assert!(
-        s.starts[1..]
+        s.starts[BURST + 1..]
             .windows(2)
-            .all(|p| p[1] - p[0] == CEILING + 50 * US)
+            .all(|p| p[1] - p[0] == CEILING)
     );
 }
 
 #[test]
-fn calls_further_apart_than_a_sync_are_each_synced_at_once_clocked_or_not() {
+fn calls_further_apart_than_the_interval_are_each_synced_at_once_clocked_or_not() {
     for setup in [Setup::base(), Setup::unclocked()] {
-        for (period, sync) in [(5 * MS, FAST), (10 * MS, 2 * MS), (MS, 900 * US)] {
+        for (period, sync) in [(10 * MS, FAST), (10 * MS, 2 * MS), (25 * MS, 20 * MS)] {
             let (_, waits) = periodic(setup, 200, period, sync);
             assert!(
                 waits.iter().all(|w| *w == WAKE),
@@ -387,17 +480,26 @@ fn a_timed_seal_delays_only_a_call_arriving_during_its_sync_and_by_no_more_than_
 }
 
 #[test]
-fn a_device_slower_than_the_floor_syncs_back_to_back_under_load() {
-    let s = saturated(Setup::base(), 30, |_| 20 * MS);
-    assert!(s.starts.windows(2).all(|p| p[1] - p[0] == 20 * MS));
-}
-
-#[test]
-fn after_a_stall_the_next_batch_starts_as_it_returns_and_the_floor_holds_at_once() {
-    let s = saturated(Setup::base(), 60, |k| if k == 40 { 25 * MS } else { FAST });
-    assert_eq!(s.starts[41] - s.starts[40], 25 * MS);
-    assert_eq!(s.starts[42] - s.starts[41], FLOOR + 50 * US);
-    assert_eq!(s.w.stats().sync_time.map(|t| t > FAST), Some(true));
+fn a_25_ms_stall_holds_the_ceiling_until_the_estimate_falls_and_the_floor_returns_within_45_syncs()
+{
+    let s = saturated(Setup::base(), 120, |k| if k == 40 { 25 * MS } else { FAST });
+    assert_eq!(
+        s.starts[41] - s.starts[40],
+        25 * MS,
+        "the next batch starts as the stall returns"
+    );
+    assert_eq!(over_budget(&s.starts, FLOOR), None);
+    assert!(
+        s.starts[42..]
+            .windows(2)
+            .take(20)
+            .all(|p| p[1] - p[0] > FLOOR)
+    );
+    let back = s.starts[41..]
+        .windows(2)
+        .position(|p| p[1] - p[0] == FLOOR)
+        .unwrap();
+    assert!(back <= 45, "{back}");
 }
 
 #[test]
@@ -456,7 +558,7 @@ fn a_mark_sync_leaves_the_estimate_alone() {
 }
 
 #[test]
-fn a_seal_sync_neither_spaces_the_next_batch_nor_moves_the_estimate() {
+fn a_seal_sync_spends_nothing_of_the_budget_and_leaves_the_estimate_alone() {
     let mut s = Sim::new(Setup {
         seal: Duration::from_secs(2),
         ..Setup::base()
@@ -478,23 +580,27 @@ fn a_seal_sync_neither_spaces_the_next_batch_nor_moves_the_estimate() {
         "the seal synced the next segment"
     );
     assert_eq!(s.w.stats().sync_time, Some(FAST));
-    let after = seal_at + FAST + 10 * US;
-    s.arrive(after);
-    s.turn(after, FAST);
-    assert_eq!(s.starts.last(), Some(&after));
+    let mut t = seal_at + FAST + 10 * US;
+    for k in 0..BURST {
+        s.arrive(t);
+        s.turn(t, FAST);
+        assert_eq!(s.starts.last(), Some(&t), "sync {k} after the seal");
+        t += FAST;
+    }
 }
 
 #[test]
-fn after_an_open_the_first_call_is_synced_at_once_and_no_sync_time_is_known() {
+fn after_an_open_the_first_call_is_synced_at_once_and_the_interval_is_the_ceiling_until_a_sample() {
     let s = saturated(Setup::base(), 20, |_| FAST);
     let at = s.clock.monotonic() + Duration::from_secs(1);
     let mut s = s.reopen(at);
-    assert_eq!(s.w.stats().sync_interval, FLOOR);
+    assert_eq!(s.w.stats().sync_interval, CEILING);
     assert_eq!(s.w.stats().sync_time, None);
     s.push();
     s.turn(at, FAST);
     assert_eq!(s.starts, [at]);
     assert_eq!(s.w.stats().sync_time, Some(FAST));
+    assert_eq!(s.w.stats().sync_interval, FLOOR);
 }
 
 #[test]
@@ -532,7 +638,7 @@ fn log_start_times_batch_syncs_on_its_clock() {
     log.submit(vec![fact(T0)]).unwrap().wait().unwrap();
     let stats = log.stats();
     assert_eq!(stats.sync_time, Some(500 * US));
-    assert_eq!(stats.sync_interval, FLOOR);
+    assert_eq!(stats.sync_interval, 4 * MS);
     log.shutdown().unwrap();
 }
 
@@ -544,7 +650,7 @@ fn the_default_floor_is_2_ms_under_a_10_ms_ceiling() {
 }
 
 #[test]
-fn a_spacing_near_the_largest_duration_schedules_without_overflow() {
+fn an_interval_near_the_largest_duration_schedules_without_overflow() {
     let top = Duration::from_nanos(u64::MAX);
     let s = saturated(
         Setup {
@@ -552,19 +658,63 @@ fn a_spacing_near_the_largest_duration_schedules_without_overflow() {
             ceiling: Duration::MAX,
             ..Setup::base()
         },
-        1,
+        BURST,
         |_| FAST,
     );
     assert_eq!(s.w.stats().sync_interval, top);
-    assert_eq!(s.w.sync_ready_at(), START + top);
+    assert!(s.w.sync_ready_at() > START + top / 2);
     let mut s = Sim::new(Setup {
         ceiling: Duration::MAX,
         ..Setup::base()
     });
-    assert_eq!(s.w.stats().sync_interval, FLOOR);
+    assert_eq!(s.w.stats().sync_interval, top);
     s.push();
     s.turn(START, FAST);
+    assert_eq!(s.w.stats().sync_interval, FLOOR);
     s.arrive(START + MS);
     s.turn(START + MS, FAST);
     assert_eq!(s.starts, [START, START + MS]);
+}
+
+#[test]
+fn the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the_next_for_its_refill()
+ {
+    let fs = MemFs::new();
+    let new = NewStore {
+        store_id: [7; 16],
+        created_at: T0,
+        site_zone: "Etc/UTC".into(),
+        tzdata: "2026a".into(),
+        software: "kvik test".into(),
+    };
+    let store = StoreDir::open(Arc::new(fs.clone()), &PathBuf::from("store"), Some(&new)).unwrap();
+    let interval = Duration::from_millis(400);
+    let cfg = Setup {
+        floor: interval,
+        ceiling: interval,
+        ..Setup::base()
+    }
+    .config();
+    let clock = Arc::new(SystemClock::default());
+    let w = LogWriter::open(store, cfg, Some([9; 16]), clock.monotonic(), T0).unwrap();
+    let log = Log::start(w, clock).unwrap();
+    let waits: Vec<_> = (0..=BURST)
+        .map(|k| {
+            let t = std::time::Instant::now();
+            log.submit(vec![fact(T0 + k as i64)])
+                .unwrap()
+                .wait()
+                .unwrap();
+            t.elapsed()
+        })
+        .collect();
+    log.shutdown().unwrap();
+    assert!(
+        waits[..BURST].iter().all(|w| *w < interval / 4),
+        "the burst waited: {waits:?}"
+    );
+    assert!(
+        waits[BURST] >= interval / 2,
+        "the call past the burst: {waits:?}"
+    );
 }
