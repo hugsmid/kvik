@@ -2,9 +2,7 @@
 //!
 //! All checksums go through this module, so the implementation can be swapped in one place.
 
-use std::collections::VecDeque;
-
-use crc::{CRC_32_ISCSI, Crc, Digest, Table};
+use crc::{CRC_32_ISCSI, Crc, Table};
 
 static CASTAGNOLI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI);
 
@@ -24,9 +22,10 @@ thread_local! {
     pub(crate) static BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// An incremental CRC32C over several slices.
+/// An incremental CRC32C over several slices: short slices, such as the header fields a batch checksum covers, by
+/// slice-by-8 steps on the register, long ones by the crate's tables.
 #[derive(Clone)]
-pub struct Crc32c(Digest<'static, u32, Table<16>>);
+pub struct Crc32c(u32);
 
 impl Default for Crc32c {
     fn default() -> Self {
@@ -37,19 +36,31 @@ impl Default for Crc32c {
 impl Crc32c {
     /// A digest of nothing yet.
     pub fn new() -> Self {
-        Self(CASTAGNOLI.digest())
+        Self(!0)
     }
 
     /// Adds `bytes`.
     pub fn update(&mut self, bytes: &[u8]) {
         #[cfg(test)]
         BYTES_HASHED.with(|c| c.set(c.get() + bytes.len() as u64));
-        self.0.update(bytes);
+        if bytes.len() >= 64 {
+            let mut d = CASTAGNOLI.digest_with_initial(self.0.reverse_bits());
+            d.update(bytes);
+            self.0 = !d.finalize();
+            return;
+        }
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &w in words {
+            self.0 = step8(self.0, w);
+        }
+        for &b in rest {
+            self.0 = (self.0 >> 8) ^ SLICES[0][((self.0 ^ u32::from(b)) & 0xFF) as usize];
+        }
     }
 
     /// The CRC32C of everything added.
     pub fn finish(self) -> u32 {
-        self.0.finalize()
+        !self.0
     }
 }
 
@@ -68,7 +79,28 @@ const fn mul(a: u32, mut b: u32) -> u32 {
 }
 
 /// `x^(8 · 2^k)` modulo the polynomial, for `k` in `0..64`.
-static BYTE_POWERS: [u32; 64] = {
+static BYTE_POWERS: [u32; 64] = POWERS;
+
+/// Hex digits of a shift length that [`SHIFT_TABLES`] covers: lengths below 4 GiB.
+const SHIFT_DIGITS: usize = 8;
+
+/// `x^(8 · len)` modulo the polynomial.
+const fn byte_power(len: u64) -> u32 {
+    // 1 in the reflected bit order.
+    let mut p = 1 << 31;
+    let mut n = len;
+    let mut k = 0;
+    while n != 0 {
+        if n & 1 != 0 {
+            p = mul(POWERS[k], p);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    p
+}
+
+const POWERS: [u32; 64] = {
     // x^8 in the reflected bit order.
     let mut t = [0u32; 64];
     t[0] = 1 << 23;
@@ -80,9 +112,76 @@ static BYTE_POWERS: [u32; 64] = {
     t
 };
 
+/// Nibble tables of multiplication by `x^(8 · d · 16^k)`, for `k` in `0..SHIFT_DIGITS` and `d` in `1..16`: a shift
+/// applies one per non-zero hex digit of its length, at most 8 lookups each (Q-873).
+static SHIFT_TABLES: [[[[u32; 16]; 8]; 15]; SHIFT_DIGITS] = {
+    let mut t = [[[[0u32; 16]; 8]; 15]; SHIFT_DIGITS];
+    let mut k = 0;
+    while k < SHIFT_DIGITS {
+        let mut d = 1;
+        while d < 16 {
+            let a = byte_power((d as u64) << (4 * k));
+            let mut nib = 0;
+            while nib < 8 {
+                let mut bit = 0;
+                let mut cols = [0u32; 4];
+                while bit < 4 {
+                    cols[bit] = mul(a, 1 << (4 * nib + bit));
+                    bit += 1;
+                }
+                let mut v = 1;
+                while v < 16 {
+                    let low = v & (v - 1);
+                    t[k][d - 1][nib][v] =
+                        t[k][d - 1][nib][low] ^ cols[(v ^ low).trailing_zeros() as usize];
+                    v += 1;
+                }
+                nib += 1;
+            }
+            d += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+fn apply(t: &[[u32; 16]; 8], p: u32) -> u32 {
+    let n = |i: u32| ((p >> (4 * i)) & 15) as usize;
+    (t[0][n(0)] ^ t[1][n(1)])
+        ^ (t[2][n(2)] ^ t[3][n(3)])
+        ^ ((t[4][n(4)] ^ t[5][n(5)]) ^ (t[6][n(6)] ^ t[7][n(7)]))
+}
+
 /// The CRC32C that `crc` (of some bytes `a`) contributes to the CRC32C of `a` followed by `len` more bytes:
-/// `crc32c(a ‖ b) = crc32c_shift(crc32c(a), b.len()) ^ crc32c(b)`. Costs O(log `len`) and reads no bytes.
+/// `crc32c(a ‖ b) = crc32c_shift(crc32c(a), b.len()) ^ crc32c(b)`. Reads no bytes: below 4 GiB, at most 8 table
+/// applications (Q-873).
 pub fn crc32c_shift(crc: u32, len: u64) -> u32 {
+    let mut p = crc;
+    let mut n = len;
+    for table in &SHIFT_TABLES {
+        if n == 0 {
+            return p;
+        }
+        let d = (n & 15) as usize;
+        if d != 0 {
+            p = apply(&table[d - 1], p);
+        }
+        n >>= 4;
+    }
+    let mut k = 4 * SHIFT_DIGITS;
+    while n != 0 {
+        if n & 1 != 0 {
+            p = mul(BYTE_POWERS[k], p);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    p
+}
+
+/// [`crc32c_shift`] by squaring, one bit of `len` at a time: the reference for its tables.
+#[doc(hidden)]
+pub fn crc32c_shift_by_squaring(crc: u32, len: u64) -> u32 {
     let mut p = crc;
     let mut n = len;
     let mut k = 0;
@@ -94,6 +193,17 @@ pub fn crc32c_shift(crc: u32, len: u64) -> u32 {
         k += 1;
     }
     p
+}
+
+/// CRC32C of the first 12 bytes of a block header: one slice-by-8 step and one slice-by-4 step.
+pub(crate) fn header_crc32c(b: &[u8; 16]) -> u32 {
+    #[cfg(test)]
+    BYTES_HASHED.with(|c| c.set(c.get() + 12));
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&b[..8]);
+    let reg = step8(!0, first) ^ u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+    let x = |i: u32| ((reg >> (8 * i)) & 0xFF) as usize;
+    !(SLICES[3][x(0)] ^ SLICES[2][x(1)] ^ SLICES[1][x(2)] ^ SLICES[0][x(3)])
 }
 
 /// Slice-by-8 tables for the register update of [`PrefixCrc`].
@@ -145,8 +255,11 @@ fn step8(reg: u32, word: [u8; 8]) -> u32 {
 #[derive(Clone)]
 pub struct PrefixCrc<'a> {
     bytes: &'a [u8],
+    /// The offset of `sums[front]`.
     base: u64,
-    sums: VecDeque<u32>,
+    sums: Vec<u32>,
+    /// Entries forgotten at the front of `sums`, dropped once they are half of it.
+    front: usize,
     reg: u32,
     checksummed: u64,
 }
@@ -155,7 +268,7 @@ impl std::fmt::Debug for PrefixCrc<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixCrc")
             .field("base", &self.base)
-            .field("entries", &self.sums.len())
+            .field("entries", &(self.sums.len() - self.front))
             .field("checksummed", &self.checksummed)
             .finish()
     }
@@ -167,7 +280,8 @@ impl<'a> PrefixCrc<'a> {
         Self {
             bytes,
             base: 0,
-            sums: VecDeque::new(),
+            sums: Vec::new(),
+            front: 0,
             reg: !0,
             checksummed: 0,
         }
@@ -180,14 +294,18 @@ impl<'a> PrefixCrc<'a> {
 
     /// Drops the table below `offset`; ranges starting below it cost their whole length again.
     pub fn forget_below(&mut self, offset: u64) {
-        while self.sums.len() > 1 && self.base < offset {
-            self.sums.pop_front();
-            self.base += 8;
+        let live = (self.sums.len() - self.front) as u64;
+        let k = (offset.saturating_sub(self.base).div_ceil(8)).min(live.saturating_sub(1));
+        self.front += k as usize;
+        self.base += 8 * k;
+        if self.front > 4_096 && 2 * self.front > self.sums.len() {
+            self.sums.drain(..self.front);
+            self.front = 0;
         }
     }
 
     fn top(&self) -> u64 {
-        self.base + 8 * (self.sums.len() as u64).saturating_sub(1)
+        self.base + 8 * ((self.sums.len() - self.front) as u64).saturating_sub(1)
     }
 
     /// CRC32C of the `len` bytes at `start`, or `None` if they do not lie in the file.
@@ -196,27 +314,36 @@ impl<'a> PrefixCrc<'a> {
         if end > self.bytes.len() as u64 {
             return None;
         }
+        if len == 0 {
+            return Some(0);
+        }
         if !start.is_multiple_of(8) {
             self.checksummed += len;
             return Some(crc32c(crate::bytes::slice(self.bytes, start, len)?));
         }
         let aligned = start + (len & !7);
-        if self.sums.is_empty() || start < self.base {
+        if self.sums.len() == self.front || start < self.base {
             self.base = start;
             self.sums.clear();
-            self.sums.push_back(0);
+            self.front = 0;
+            self.sums.push(0);
             self.reg = !0;
         }
-        while self.top() < aligned {
-            let at = self.top();
-            let word = crate::bytes::slice(self.bytes, at, 8)?;
-            self.reg = step8(self.reg, word.try_into().ok()?);
-            self.sums.push_back(!self.reg);
-            self.checksummed += 8;
+        let top = self.top();
+        if top < aligned {
+            let words = crate::bytes::slice(self.bytes, top, aligned - top)?;
+            self.sums.reserve(words.len() / 8);
+            let mut reg = self.reg;
+            for &word in words.as_chunks::<8>().0 {
+                reg = step8(reg, word);
+                self.sums.push(!reg);
+            }
+            self.reg = reg;
+            self.checksummed += aligned - top;
             #[cfg(test)]
-            BYTES_HASHED.with(|c| c.set(c.get() + 8));
+            BYTES_HASHED.with(|c| c.set(c.get() + aligned - top));
         }
-        let index = |o: u64| ((o - self.base) / 8) as usize;
+        let index = |o: u64| self.front + ((o - self.base) / 8) as usize;
         let head =
             self.sums[index(aligned)] ^ crc32c_shift(self.sums[index(start)], aligned - start);
         let tail = end - aligned;
@@ -250,6 +377,75 @@ mod tests {
     }
 
     #[test]
+    fn incremental_over_short_and_long_slices_in_any_order_equals_whole() {
+        let bytes: Vec<u8> = (0..4_096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        for cuts in [
+            &[0usize, 1, 9, 73, 80, 200, 1_000][..],
+            &[5, 6, 70, 71, 140, 4_000],
+            &[64, 128, 129],
+        ] {
+            let mut c = Crc32c::new();
+            let mut at = 0;
+            for &cut in cuts.iter().chain(&[bytes.len()]) {
+                c.update(&bytes[at..cut]);
+                at = cut;
+            }
+            assert_eq!(c.finish(), crc32c(&bytes), "{cuts:?}");
+        }
+    }
+
+    #[test]
+    fn the_table_shift_equals_the_shift_by_squaring_for_every_digit_and_beyond_4_gib() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for k in 0..64 {
+            for d in 0..16u64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let len = (d << (4 * (k % 16))) | (x >> (64 - k.max(1)));
+                let crc = x as u32;
+                assert_eq!(
+                    crc32c_shift(crc, len),
+                    crc32c_shift_by_squaring(crc, len),
+                    "{len}"
+                );
+            }
+        }
+        for len in [
+            0,
+            1,
+            7,
+            8,
+            15,
+            16,
+            255,
+            256,
+            u64::from(u32::MAX),
+            1 << 32,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                crc32c_shift(!0, len),
+                crc32c_shift_by_squaring(!0, len),
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_checksum_equals_crc32c_of_the_first_12_bytes() {
+        let mut b = [0u8; 16];
+        for i in 0..4096u32 {
+            for (j, v) in b.iter_mut().enumerate() {
+                *v = (i.wrapping_mul(2_654_435_761) >> (j % 24)) as u8 ^ (j as u8).wrapping_mul(37);
+            }
+            assert_eq!(header_crc32c(&b), crc32c(&b[..12]));
+        }
+    }
+
+    #[test]
     fn rising_ranges_enter_each_byte_into_the_table_once() {
         let bytes: Vec<u8> = (0..1u32 << 16).map(|i| (i * 7 + 3) as u8).collect();
         let mut t = PrefixCrc::new(&bytes);
@@ -271,6 +467,27 @@ mod tests {
         t.forget_below(64);
         assert_eq!(t.range(64, 32), Some(crc32c(&bytes[64..96])));
         assert_eq!(t.checksummed(), 128);
+    }
+
+    #[test]
+    fn forgetting_below_an_unaligned_offset_drops_the_step_below_it() {
+        let bytes: Vec<u8> = (0..256u32).map(|i| (i * 13 + 1) as u8).collect();
+        let mut t = PrefixCrc::new(&bytes);
+        assert_eq!(t.range(0, 128), Some(crc32c(&bytes[..128])));
+        t.forget_below(61);
+        assert_eq!(t.range(56, 32), Some(crc32c(&bytes[56..88])));
+        assert_eq!(t.checksummed(), 128 + 32);
+    }
+
+    #[test]
+    fn an_empty_range_has_the_checksum_of_no_bytes_wherever_it_lies() {
+        let bytes: Vec<u8> = (0..64u32).map(|i| (i * 11 + 3) as u8).collect();
+        let mut t = PrefixCrc::new(&bytes);
+        assert_eq!(t.range(16, 32), Some(crc32c(&bytes[16..48])));
+        for at in [0, 5, 16, 40, 64] {
+            assert_eq!(t.range(at, 0), Some(crc32c(&[])), "{at}");
+        }
+        assert_eq!(t.range(72, 0), None);
     }
 
     #[test]

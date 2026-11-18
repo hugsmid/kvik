@@ -49,6 +49,7 @@ log-seal-describe log seal_describe
 log-scan-bound  log   scan_bound
 log-pacing      log   pacing
 log-directories log   directories
+log-scan-differential log scan_differential
 log-body-check  log   body_check
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties

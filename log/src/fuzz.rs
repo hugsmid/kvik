@@ -72,6 +72,12 @@ pub fn decode_all(data: &[u8]) {
     ];
     let (end, stats) = scan_with_stats(data, &id, ScanLimit::End);
     assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+    // The chain ends read ahead find the candidates the walked chains find (Q-873).
+    let walked = crate::scan::legacy::scan_with_walked_links(data, &id, ScanLimit::End).0;
+    assert!(
+        end == walked,
+        "the chain ends and the walked chains disagree"
+    );
     if let Ok(r) = end {
         check(&r, len, true);
         if let Some(s) = &r.seal {
@@ -97,6 +103,11 @@ pub fn decode_all(data: &[u8]) {
     for m in marks {
         let (r, stats) = scan_with_stats(data, &id, ScanLimit::Mark(m));
         assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+        let walked = crate::scan::legacy::scan_with_walked_links(data, &id, ScanLimit::Mark(m)).0;
+        assert!(
+            r == walked,
+            "the chain ends and the walked chains disagree below {m}"
+        );
         if let Ok(r) = r {
             check(&r, m, false);
         }

@@ -50,9 +50,8 @@ again; nothing after a gate starts before it is passed. Items that do not depend
   (p50 above 5 ms at exactly 100 × 1 Hz) and a cold start on the target for Q-116 (n) (warm: 0.39–0.74 s); (2) the owner's decisions
   on Q-111 (call limit in `api.md`), Q-115 (e) (`space()` seam), (j) (Windows wording) and
   (n) (a byte bound on the ingest queue, an ingest wait at 8 blocked seals), Q-116 (k) (full disk after a power
-  loss), the Q-52 (b) macOS and Windows wording and the Q-86 (b) `chattr +C` sentence; (3) roadmap 4.9e: the
-  header walk of the segment scan and the manifest search bounded in time, so that every crafted file fits the 1 s
-  restart budget (Q-873)
+  loss), the Q-52 (b) macOS and Windows wording, the Q-86 (b) `chattr +C` sentence and Q-970 (what a start is
+  promised on a crafted or damaged file)
 
 ## 5. Delivery
 - [ ] 5.1 Series registry; the `kvik` crate on the durable log: writing, and `facts`, series lookup and `refresh` for

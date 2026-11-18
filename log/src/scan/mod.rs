@@ -10,6 +10,7 @@ use crate::error::{Element, FormatError};
 use crate::header::{FileHeader, HEADER_LEN, kind};
 use crate::setaside::SetAside;
 
+mod ends;
 #[doc(hidden)]
 pub mod legacy;
 mod reads;
@@ -331,7 +332,7 @@ fn collect_inner<'a>(
     let stats = s.stats();
     let report = ScanReport {
         header: s.header,
-        tail: s.tail().cloned(),
+        tail: s.tail().is_some().then(|| s.tail.take()).flatten(),
         seal: s.seal,
         batches,
         regions,
@@ -359,7 +360,7 @@ pub enum Found<'a> {
 
 /// A scan of one log segment as an iterator of [`Found`] items, resumable from a [`Resume`] point: a reader
 /// that tails a segment as the mark moves, or a large segment, reads each part once.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Scanner<'a> {
     bytes: &'a [u8],
     id: SegmentIdentity,
@@ -643,6 +644,7 @@ impl<'a> Iterator for Scanner<'a> {
             area_end,
             min_first,
             search.as_mut(),
+            &self.walks,
             self.keep,
         );
         match found {

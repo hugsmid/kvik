@@ -1,10 +1,12 @@
 //! The block reads of one scan, and their count (`format.md` A, common rules: scan bound; Q-110).
 
-use crate::batch::MAX_BATCH_DATA;
+use crate::batch::{DataBlock, MAX_BATCH_DATA};
 use crate::block::{
     BLOCK_HEADER_LEN, BlockFault, BlockHeader, MAX_BODY_LEN, RawBlock, peek_raw, read_block_with,
+    read_body,
 };
 use crate::body::{COMMIT_LEN, DataPrefix};
+use crate::bytes::{slice, u32_at};
 use crate::content::{DataBody, check_block};
 use crate::content_error::BodyError;
 use crate::crc::{PrefixCrc, crc32c};
@@ -52,8 +54,11 @@ impl FailedReads {
     /// Where the search goes on from `offset`: `offset` itself, or the end of its window once failed reads starting
     /// in it have checked [`FAILED_READ_BUDGET`] bytes of body.
     pub fn next_from(&self, offset: u64) -> u64 {
+        if self.charged < FAILED_READ_BUDGET {
+            return offset;
+        }
         let w = offset / self.window;
-        if w == self.current && self.charged >= FAILED_READ_BUDGET {
+        if w == self.current {
             (w + 1).saturating_mul(self.window)
         } else {
             offset
@@ -71,8 +76,10 @@ impl FailedReads {
 pub struct ScanStats {
     /// Bytes run through CRC32C, block header checksums excluded.
     pub bytes_checksummed: u64,
-    /// Block headers read and checked (each a 12-byte checksum).
+    /// Block headers read and checked.
     pub headers_visited: u64,
+    /// Of those, the headers whose 12-byte checksum was computed; one read again from the scan's memory takes none.
+    pub header_checksums: u64,
     /// Body bytes passed to the checks of their type (A.5, A.6; a manifest record's fields, A.14).
     pub bytes_body_checked: u64,
     /// The most body bytes checked by failed reads starting in one window ([`FailedReads`]).
@@ -108,6 +115,54 @@ impl ScanStats {
     }
 }
 
+/// The starts whose block header the scan read and found valid once damage was found, a bit each in a ring indexed by
+/// offset (Q-873): a header read there again is taken without its checksum.
+#[derive(Clone, Debug)]
+pub(crate) struct Valid {
+    bits: Vec<u64>,
+    base: u64,
+    mask: u64,
+}
+
+impl Valid {
+    /// A ring of `mask + 1` starts, a power of two.
+    pub(crate) fn new(mask: u64) -> Self {
+        Self {
+            bits: vec![0; (mask as usize + 1).div_ceil(64)],
+            base: 0,
+            mask,
+        }
+    }
+
+    #[inline]
+    fn index(&self, p: u64) -> Option<usize> {
+        (p.is_multiple_of(8) && p >= self.base && (p - self.base) / 8 <= self.mask)
+            .then_some(((p >> 3) & self.mask) as usize)
+    }
+
+    pub(crate) fn mark(&mut self, p: u64) {
+        if let Some(i) = self.index(p) {
+            self.bits[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn holds(&self, p: u64) -> bool {
+        self.index(p)
+            .is_some_and(|i| self.bits[i / 64] & (1 << (i % 64)) != 0)
+    }
+
+    /// Forgets the starts below `o`.
+    pub(crate) fn move_to(&mut self, o: u64) {
+        let n = (o.saturating_sub(self.base) / 8).min(self.mask + 1);
+        for k in 0..n {
+            let i = (((self.base >> 3) + k) & self.mask) as usize;
+            self.bits[i / 64] &= !(1 << (i % 64));
+        }
+        self.base = self.base.max(o);
+    }
+}
+
 /// Reads blocks of one file, taking body checksums from a prefix table, or directly for the reference scan.
 #[derive(Clone, Debug)]
 pub(crate) struct Reads<'a> {
@@ -115,8 +170,14 @@ pub(crate) struct Reads<'a> {
     sums: Option<PrefixCrc<'a>>,
     direct: u64,
     headers: u64,
+    checksums: u64,
     body: u64,
     pub(crate) failed: FailedReads,
+    /// The last valid header read, with its offset: a block read asks for the header its size test just read.
+    recent: Option<(u64, BlockHeader, [u8; BLOCK_HEADER_LEN])>,
+    pub(crate) valid: Option<Valid>,
+    /// An empty list of blocks whose memory a batch read takes and gives back if it keeps no batch.
+    pub(crate) spare: Vec<DataBlock<'a>>,
 }
 
 impl<'a> Reads<'a> {
@@ -127,8 +188,12 @@ impl<'a> Reads<'a> {
             sums: None,
             direct: 0,
             headers: 0,
+            checksums: 0,
             body: 0,
             failed: FailedReads::new(MAX_BATCH_DATA),
+            recent: None,
+            valid: None,
+            spare: Vec::new(),
         }
     }
 
@@ -143,6 +208,7 @@ impl<'a> Reads<'a> {
         ScanStats {
             bytes_checksummed: self.direct + self.sums.as_ref().map_or(0, PrefixCrc::checksummed),
             headers_visited: self.headers,
+            header_checksums: self.checksums,
             bytes_body_checked: self.body,
             failed_bytes_peak: self.failed.peak(),
         }
@@ -165,29 +231,105 @@ impl<'a> Reads<'a> {
         check_block(t, body, keep)
     }
 
+    /// Forgets the prefix table and the valid headers below `offset`, which the scan does not ask about again.
     pub(crate) fn forget_below(&mut self, offset: u64) {
         if let Some(t) = &mut self.sums {
             t.forget_below(offset);
         }
+        if let Some(v) = &mut self.valid {
+            v.move_to(offset);
+        }
     }
 
+    #[inline]
     pub(crate) fn peek(&mut self, offset: u64, limit: u64) -> Option<BlockHeader> {
         self.peek_raw(offset, limit).map(|(h, _)| h)
     }
 
+    #[inline]
     pub(crate) fn peek_raw(
         &mut self,
         offset: u64,
         limit: u64,
     ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         self.headers += 1;
-        peek_raw(self.bytes, offset, limit)
+        if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
+            return None;
+        }
+        match self.recent_at(offset, limit) {
+            Some(found) => Some(found),
+            None => self.checksum_header(offset, limit),
+        }
+    }
+
+    /// [`Reads::peek`] for the chain ends, which read each start once: a header found valid before, else checksummed
+    /// and remembered.
+    #[inline]
+    pub(crate) fn peek_ahead(&mut self, offset: u64, limit: u64) -> Option<BlockHeader> {
+        self.headers += 1;
+        if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
+            return None;
+        }
+        if self.valid.as_ref().is_some_and(|v| v.holds(offset)) {
+            let raw = slice(self.bytes, offset, BLOCK_HEADER_LEN as u64)?;
+            return Some(BlockHeader {
+                block_type: raw[0],
+                flags: raw[1],
+                body_len: u32_at(raw, 4),
+                body_crc32c: u32_at(raw, 8),
+            });
+        }
+        self.checksums += 1;
+        let (h, _) = peek_raw(self.bytes, offset, limit)?;
+        if let Some(v) = &mut self.valid {
+            v.mark(offset);
+        }
+        Some(h)
+    }
+
+    fn checksum_header(
+        &mut self,
+        offset: u64,
+        limit: u64,
+    ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
+        self.checksums += 1;
+        let found = peek_raw(self.bytes, offset, limit)?;
+        self.recent = Some((offset, found.0, found.1));
+        if let Some(v) = &mut self.valid {
+            v.mark(offset);
+        }
+        Some(found)
+    }
+
+    /// A header read again: the last one, or one found valid since damage, taken without its checksum.
+    #[inline]
+    fn recent_at(&self, offset: u64, limit: u64) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
+        if offset.checked_add(BLOCK_HEADER_LEN as u64)? > limit {
+            return None;
+        }
+        if let Some(r) = self.recent.filter(|r| r.0 == offset) {
+            return Some((r.1, r.2));
+        }
+        if !self.valid.as_ref().is_some_and(|v| v.holds(offset)) {
+            return None;
+        }
+        let raw: [u8; BLOCK_HEADER_LEN] = slice(self.bytes, offset, BLOCK_HEADER_LEN as u64)?
+            .try_into()
+            .ok()?;
+        let header = BlockHeader {
+            block_type: raw[0],
+            flags: raw[1],
+            body_len: u32_at(&raw, 4),
+            body_crc32c: u32_at(&raw, 8),
+        };
+        Some((header, raw))
     }
 
     pub(crate) fn block(&mut self, offset: u64, limit: u64) -> Result<RawBlock<'a>, BlockFault> {
         self.headers += 1;
-        let (sums, direct) = (&mut self.sums, &mut self.direct);
-        read_block_with(self.bytes, offset, limit, |at, body| {
+        let known = self.recent_at(offset, limit);
+        let (bytes, sums, direct) = (self.bytes, &mut self.sums, &mut self.direct);
+        let crc = |at, body: &[u8]| {
             let len = body.len() as u64;
             match sums.as_mut().and_then(|t| t.range(at, len)) {
                 Some(c) => c,
@@ -196,6 +338,13 @@ impl<'a> Reads<'a> {
                     crc32c(body)
                 }
             }
-        })
+        };
+        match known {
+            Some((h, raw)) => read_body(bytes, offset, limit, h, raw, crc),
+            None => {
+                self.checksums += 1;
+                read_block_with(bytes, offset, limit, crc)
+            }
+        }
     }
 }
