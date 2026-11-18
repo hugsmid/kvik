@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kvik_log::content::Item;
+use kvik_log::directory::Family;
 use kvik_log::directory::series::{Candidate, CandidateValue, Pending, SeriesEntry};
 use kvik_log::directory::status::{counter, health, reason};
 use kvik_log::entries::{Entry, Versioning};
@@ -412,6 +413,13 @@ impl SeriesFold {
         let _ = self.latch.set(latch);
     }
 
+    /// Whether a lost range reached what the fold took, as of now.
+    pub(crate) fn broken(&self) -> bool {
+        let mut f = lock(&self.fold);
+        self.take_losses(&mut f);
+        f.broken
+    }
+
     fn take_losses(&self, f: &mut Fold) {
         let Some(latch) = self.latch.get() else {
             return;
@@ -608,6 +616,10 @@ impl SealHook for Hook {
         self.fold.entries(limit, written_at)
     }
 
+    fn series_void(&self) -> bool {
+        self.fold.broken()
+    }
+
     fn health(&self) -> Option<(u8, bool)> {
         let p = self.parts.get().filter(|p| !p.read_only())?;
         Some((p.health().0, false))
@@ -650,9 +662,10 @@ impl SealHook for Hook {
 }
 
 /// The seal hook of a store opening: its fold continues from the newest series directory that is still a function of
-/// the kept log (A.18 Validation, as the writer applies it), or starts empty. A file is not continued when the start
-/// met a region at or below its `through` that no lost range of the manifest holds (`latch`, `recorded`): its
-/// counts include facts the store reports lost. The fold then watches `latch` for losses found later.
+/// the kept log (A.18 Validation, as the writer applies it), or starts empty. A file is not continued, and the series
+/// directories are removed, when the start met a region at or below its `through` that no lost range of the manifest
+/// holds (`latch`, `recorded`): its counts include facts the store reports lost. The fold then watches `latch` for
+/// losses found later.
 pub(crate) fn hook(
     writer: &kvik_log::writer::LogWriter,
     fs: &dyn kvik_log::fs::Fs,
@@ -663,10 +676,13 @@ pub(crate) fn hook(
 ) -> Arc<Hook> {
     let fold = SeriesFold::new(writer.stats().mark_synced);
     let start = writer.directory_start();
-    if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start)
-        && !lost_since(&latch.found(), recorded, d.through)
-    {
-        fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
+    if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start) {
+        if !lost_since(&latch.found(), recorded, d.through) {
+            fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
+        } else if kvik_log::directory::remove_family(fs, dir, Family::Series).is_err() {
+            // The declined file must not stay the newest: the writer removes it once the fold is broken.
+            lock(&fold.fold).broken = true;
+        }
     }
     fold.watch_losses(latch.clone());
     Arc::new(Hook {

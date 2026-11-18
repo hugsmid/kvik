@@ -245,6 +245,86 @@ fn damage(w: &World, v: f64) {
     }
 }
 
+/// Waits until every log segment holding the eight bytes of `v` is sealed: a seal writes the segment from the
+/// writer's own bytes, so damage to an open one would not last.
+fn wait_sealed_with(w: &World, v: f64) {
+    let bytes = v.to_bits().to_le_bytes();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let held: Vec<_> =
+            w.fs.paths()
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "open" || e == "kvl"))
+                .filter(|p| {
+                    w.fs.read(p)
+                        .is_some_and(|b| b.windows(8).any(|x| x == bytes))
+                })
+                .collect();
+        if !held.is_empty()
+            && held
+                .iter()
+                .all(|p| p.extension().is_some_and(|e| e == "kvl"))
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the value was not sealed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A series directory written before a fact it counts is found lost is removed in the run, with no batch after the
+/// find: the store then idles and seals by time, and no file on disk counts a fact it reports lost (A.18).
+#[test]
+fn a_series_directory_counting_a_fact_found_lost_is_removed_while_the_store_idles() {
+    let w = World::new("derived-lost-left");
+    let s = open(&w);
+    let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
+    emit(&s, &[num(g, 0, 1_111.5)]);
+    let lost = emit(&s, &[num(g, 1, 2_222.5)]);
+    wait_sealed_with(&w, 2_222.5);
+    let d = wait_for(&w, lost);
+    check(&s, &d, &[g]);
+    damage(&w, 2_222.5);
+    assert_eq!(data_lost(&s), 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(d) = series_dir(&w) {
+        assert!(
+            Instant::now() < deadline,
+            "a series directory through {} is left",
+            d.through.sequence
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    block_on(s.shutdown()).unwrap();
+}
+
+/// After a restart over a region in a sealed segment, which no lost range records, a query that meets the region
+/// before the first new file stops neither it nor the fold: a reader that meets a region already latched hands on no
+/// range for it again. A broken fold removes its files, so the run's file still being there shows the fold whole,
+/// whichever came first.
+#[test]
+fn a_query_before_the_first_series_directory_after_a_restart_does_not_stop_it() {
+    let w = World::new("derived-query-first");
+    let s = open(&w);
+    let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
+    emit(&s, &[num(g, 0, 1_111.5)]);
+    let lost = emit(&s, &[num(g, 1, 2_222.5)]);
+    wait_sealed_with(&w, 2_222.5);
+    wait_for(&w, lost);
+    emit(&s, &[num(g, 2, 3_333.5)]);
+    damage(&w, 2_222.5);
+    block_on(s.shutdown()).unwrap();
+    let s = open(&w);
+    let all = Timestamp(0)..Timestamp(i64::MAX);
+    assert_eq!(s.reader().facts(g, all, View::History).unwrap().count(), 2);
+    emit(&s, &[num(g, 3, 4_444.5)]);
+    wait_for(&w, 1);
+    std::thread::sleep(Duration::from_secs(2));
+    let d = series_dir(&w).expect("the run's series directory is still there");
+    check(&s, &d, &[g]);
+    block_on(s.shutdown()).unwrap();
+}
+
 /// A fact the process finds lost after the deliverer folded it: no series directory written afterwards counts it, so
 /// none is written in the run (A.18: a file is a function of the kept log only while nothing at or below `through` is
 /// lost since).
@@ -278,7 +358,8 @@ fn a_fact_found_lost_while_open_is_never_counted_by_a_series_directory_of_the_ru
 }
 
 /// A series directory through a position the next start finds lost, in a sealed segment no lost range records, is
-/// not continued: the reopened store's next file agrees with what it shows.
+/// not continued and is removed at the open: no file on disk counts the lost fact, and the reopened store's first
+/// file agrees with what it shows.
 #[test]
 fn a_series_directory_through_a_region_the_start_meets_is_not_continued() {
     let w = World::new("derived-lost-start");
@@ -286,18 +367,19 @@ fn a_series_directory_through_a_region_the_start_meets_is_not_continued() {
     let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
     emit(&s, &[num(g, 0, 1_111.5)]);
     let lost = emit(&s, &[num(g, 1, 2_222.5)]);
-    wait_sealed(&w, 1);
+    wait_sealed_with(&w, 2_222.5);
     wait_for(&w, lost);
     emit(&s, &[num(g, 2, 3_333.5)]);
     damage(&w, 2_222.5);
-    let all = Timestamp(0)..Timestamp(i64::MAX);
-    assert_eq!(s.reader().facts(g, all, View::History).unwrap().count(), 2);
-    assert_eq!(data_lost(&s), 1);
     block_on(s.shutdown()).unwrap();
+    assert!(series_dir(&w).is_some());
     let s = open(&w);
-    assert_eq!(data_lost(&s), 1, "the start meets the region again");
-    let last = emit(&s, &[num(g, 3, 4_444.5)]);
-    let d = wait_for(&w, last);
+    if let Some(d) = series_dir(&w) {
+        check(&s, &d, &[g]);
+    }
+    assert_eq!(data_lost(&s), 1, "the start meets the region");
+    emit(&s, &[num(g, 3, 4_444.5)]);
+    let d = wait_for(&w, 1);
     check(&s, &d, &[g]);
     block_on(s.shutdown()).unwrap();
 }

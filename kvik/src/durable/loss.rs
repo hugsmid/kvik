@@ -23,7 +23,7 @@ struct State {
     found: Vec<LossReport>,
     /// Lost ranges the writer's decisions have not yet taken in.
     fresh: Vec<Fresh>,
-    /// Every closed range taken, in the order taken (Q-938).
+    /// Every closed range taken, in the order taken, once per region (Q-938).
     closed: Vec<(LogPos, LogPos)>,
     regions: Regions,
     /// The last position the start read; set once the start is done.
@@ -92,7 +92,8 @@ impl Latch {
                     grew,
                 });
             }
-            if f.closed.0 <= f.closed.1 {
+            // A region met again holds no fact a reader still took: its closed range was handed on when first met.
+            if grew && f.closed.0 <= f.closed.1 {
                 s.closed.push(f.closed);
             }
             hold(&mut s.found, l);

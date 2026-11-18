@@ -250,21 +250,26 @@ fn off_the_kept_log_rule_drops_only_a_query_find_at_or_below_the_head_the_start_
     }
 }
 
+/// A closed range is handed out once per reader and only when its region is met for the first time: a region met
+/// again, by any reader, holds no fact a reader still took.
 #[test]
-fn closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_never() {
+fn closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_or_a_region_met_again_never() {
     let latch = Latch::default();
     let (mut a, mut b) = (0, 0);
     latch.note(&[find(5, 6)], FoundBy::Scan);
     assert_eq!(latch.closed_since(&mut a), vec![(at(5), at(6))]);
     let mut f = Finder::default();
     let empty = f.apply(
-        &[batch(1, 2), region(100, Some(2), None), batch(3, 1)],
+        &[batch(1, 2), region(200, Some(2), None), batch(3, 1)],
         MARK,
     );
     assert!(empty[0].closed.0 > empty[0].closed.1);
     latch.note(&empty, FoundBy::Scan);
     latch.note(&[find(9, 9)], FoundBy::Scan);
     assert_eq!(latch.closed_since(&mut a), vec![(at(9), at(9))]);
+    latch.note(&[find(9, 9)], FoundBy::Query);
+    latch.note(&[find(5, 6)], FoundBy::Scan);
+    assert!(latch.closed_since(&mut a).is_empty());
     assert_eq!(
         latch.closed_since(&mut b),
         vec![(at(5), at(6)), (at(9), at(9))]

@@ -78,6 +78,12 @@ pub trait SealHook: Send + Sync {
     /// `None` when they cannot be given yet.
     fn series(&self, limit: Position, written_at: i64) -> Option<SeriesEntries>;
 
+    /// Whether the series directories on disk can no longer be vouched for: they are removed, once (A.18: a file is a
+    /// function of the kept log only while nothing at or below its `through` is lost since).
+    fn series_void(&self) -> bool {
+        false
+    }
+
     /// The health level and pressure flag now, looked at once a second; cheap.
     fn health(&self) -> Option<(u8, bool)> {
         self.status().map(|s| (s.health, s.pressure))
@@ -279,6 +285,7 @@ pub struct Directories {
     floor: Position,
     // The series directory.
     series_through: Option<Position>,
+    series_removed: bool,
     uncovered: Uncovered,
     seen: Position,
     recent: VecDeque<u64>,
@@ -342,6 +349,7 @@ impl Directories {
             root_dirty: false,
             floor: Position::default(),
             series_through: None,
+            series_removed: false,
             uncovered: Uncovered::default(),
             seen: Position::default(),
             recent: VecDeque::new(),
@@ -599,6 +607,13 @@ impl Directories {
         }
         if self.root_dirty && !self.write_log_directory(now, wall) {
             soon(self.retry_in(Work::LogDirectory, now).unwrap_or(RETRY));
+        }
+        if !self.series_removed && self.call(|h| Some(h.series_void())) == Some(true) {
+            self.series_removed =
+                directory::remove_family(&*self.fs, &self.dir, Family::Series).is_ok();
+            if !self.series_removed {
+                soon(RETRY);
+            }
         }
         if self.opts.hook.is_some() && !self.refused.contains(&Family::Series) {
             let since = self.series_at.map(|t| now.saturating_sub(t));
