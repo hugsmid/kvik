@@ -7,7 +7,7 @@ impl Deliverer {
     pub(super) fn take_events(&mut self, events: Vec<ReadEvent>, durable: LogPos) {
         let found = self.finder.apply(&events, durable);
         if !found.is_empty() {
-            self.latch.note(&found, FoundBy::Scan);
+            self.latch.note(&found);
         }
         for e in events {
             match e {

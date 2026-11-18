@@ -274,10 +274,7 @@ mod tests {
         let mut scan = reader();
         let u = scan.refresh().unwrap();
         let latch = Arc::new(Latch::default());
-        latch.note(
-            &super::super::loss::Finder::default().apply(&u.events, u.state.durable),
-            super::super::loss::FoundBy::Scan,
-        );
+        latch.note(&super::super::loss::Finder::default().apply(&u.events, u.state.durable));
         assert_eq!(latch.found().len(), 1);
         let keys = [(1, 10), (1, 20)];
 

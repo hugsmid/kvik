@@ -275,9 +275,10 @@ A.10) is treated as a different boot. The rules apply in this order:
    region that overlaps a loss already found or recorded grows that loss under its identity, as in step 4; the
    grown loss is not recorded until a record covers it, and needs a new acknowledgement (§8 Acknowledging a loss).
    Once the writer's process has found it, the facts it held are in no key's history (§2.4), so a replay of one is
-   recorded again. Accepted limit: damage to an older batch the writer's process has read (the kept log, read at its
-   start, included) is found by other readers and by the next start; until that start a replay of a fact it took is
-   acknowledged as a duplicate although the fact is gone (Q-200).
+   recorded again. Accepted limit: damage to a batch the writer's process has already read is not found by `losses()`
+   or `health()` unless it is the newest; it is found when a query of that process reads it (Q-928); until then a
+   replay of a fact still in the recent window is dropped, and one outside it is recorded unchecked (Q-750). Other
+   readers and the next start find it (Q-200).
    Because the first batch in a segment, when unflagged, is acknowledged only once a synced
    mark names it (Commit), such a segment holding acknowledged batches that is damaged, zeroed or missing whole leaves
    a valid mark naming a position in it or in a later segment, while the mark is readable, so its loss is a

@@ -50,7 +50,7 @@ use kvik_model::condition::{ConditionState as MState, Runner};
 use super::LogClock;
 use super::clock::Clocks;
 use super::index::{Index, Stored, pos};
-use super::loss::{Finder, FoundBy, Latch as LossLatch, Regions};
+use super::loss::{Finder, Latch as LossLatch, Regions};
 use super::routing::{View, funnel_out};
 use crate::backend::Error;
 use crate::consume::{Delivery, Funnel, FunnelId, ResyncCause, TriggerCause};

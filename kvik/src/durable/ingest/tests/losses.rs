@@ -527,7 +527,6 @@ fn a_fact_taken_while_the_clock_is_unsynchronised_leaves_the_lateness_reference_
     assert!(!late(&p));
 }
 
-/// Q-925 as proposed (the switch in `Decider::read_reference`): with rule (b) the reading is late.
 #[test]
 fn a_reading_whose_reference_cannot_be_read_is_not_late_and_is_counted() {
     let mut d = with_observed(decider(History::default()));

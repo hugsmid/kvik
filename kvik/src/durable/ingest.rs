@@ -95,11 +95,6 @@ pub(crate) struct Plan {
     pub(crate) reference_unread: u64,
 }
 
-/// Q-925, proposal (a): a reading whose lateness reference cannot be read (the read incomplete and no reference fact
-/// found) is not late by the reference's clause. Off, rule (b): the old reference, `upper`, stands and it is late.
-/// Either way it is counted in `LocalDataUnreadable { readings }`. The tests it flips are listed in Q-925.
-const UNREAD_REFERENCE_IS_NOT_LATE: bool = true;
-
 /// The state decisions are made against: the registry and [`History`], including calls queued but not yet
 /// acknowledged.
 #[derive(Clone, Debug, Default)]
@@ -250,7 +245,7 @@ impl Decider {
         staleness: i64,
     ) -> ReferenceRead {
         let unchanged = |unread: bool| ReferenceRead {
-            late: unread && !UNREAD_REFERENCE_IS_NOT_LATE,
+            late: false,
             state: Reference::AtMost { upper, least },
             unread,
         };
@@ -292,6 +287,7 @@ impl Decider {
             hi = next;
             len = len.saturating_mul(2);
         }
+        // Q-925: a reference that cannot be read leaves the reading not late; it is counted as unread.
         if !complete {
             return unchanged(true);
         }

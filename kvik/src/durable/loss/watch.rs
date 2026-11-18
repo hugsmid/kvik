@@ -4,7 +4,7 @@
 use kvik_log::manifest::LostRange;
 use kvik_log::reader::{LogReader, ReaderError};
 
-use super::{Finder, FoundBy, Latch};
+use super::{Finder, Latch};
 use crate::health::LossReport;
 
 /// Items a catch-up takes from the log at a time.
@@ -95,7 +95,7 @@ fn read(
         recorded.extend_from_slice(reader.lost_ranges());
         let found = finder.apply(&u.events, u.state.durable);
         if !found.is_empty() {
-            latch.note(&found, FoundBy::Scan);
+            latch.note(&found);
         }
         if !more {
             return Ok(());

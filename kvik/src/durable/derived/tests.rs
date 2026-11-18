@@ -533,7 +533,7 @@ fn found(h: &[ReadBatch], lost: usize, start: u64) -> Vec<crate::durable::loss::
 /// arrives), leaves the fold whole; a loss found at a batch it folded stops it (Q-952).
 #[test]
 fn a_loss_found_ahead_of_the_fold_leaves_it_whole_and_one_behind_it_stops_it() {
-    use crate::durable::loss::{FoundBy, Latch};
+    use crate::durable::loss::Latch;
     let one = Gen {
         series: 1,
         dt: 0,
@@ -551,15 +551,15 @@ fn a_loss_found_ahead_of_the_fold_leaves_it_whole_and_one_behind_it_stops_it() {
     for b in &h[..4] {
         fold.batch(b);
     }
-    latch.note(&found(&h, 6, 600), FoundBy::Scan);
+    latch.note(&found(&h, 6, 600));
     for (k, b) in h.iter().enumerate().skip(4) {
         if k != 6 {
             fold.batch(b);
         }
     }
     assert!(fold.entries(h.last().unwrap().last, T0).is_some());
-    latch.note(&found(&h, 6, 600), FoundBy::Query);
+    latch.note(&found(&h, 6, 600));
     assert!(fold.entries(h.last().unwrap().last, T0).is_some());
-    latch.note(&found(&h, 2, 200), FoundBy::Scan);
+    latch.note(&found(&h, 2, 200));
     assert!(fold.entries(h.last().unwrap().last, T0).is_none());
 }

@@ -24,7 +24,7 @@ use super::history::span_of;
 use super::index::Index;
 use super::ingest::Decider;
 use super::keys::{LocalFacts, LogFacts};
-use super::loss::{Finder, FoundBy, Latch, Regions, Watch};
+use super::loss::{Finder, Latch, Regions, Watch};
 use crate::env::Env;
 use crate::health::SeriesStats;
 
@@ -95,7 +95,7 @@ pub(crate) fn read_kept(
         let (u, more) = reader.refresh_some(part)?;
         let found = finder.apply(&u.events, u.state.durable);
         if !found.is_empty() {
-            latch.note(&found, FoundBy::Scan);
+            latch.note(&found);
         }
         for e in u.events {
             match e {
@@ -124,7 +124,7 @@ pub(crate) fn read_kept(
     decider.registry = index.registry().clone();
     let recorded = reader.lost_ranges().to_vec();
     reader.release_bytes();
-    latch.started(reader.state().durable);
+    latch.started();
     Ok(Kept {
         counters: defined(counters, &index),
         index,
@@ -149,7 +149,7 @@ pub(crate) fn read_whole(
     let mut finder = Finder::default();
     let found = finder.apply(&events, update.state.durable);
     if !found.is_empty() {
-        latch.note(&found, FoundBy::Scan);
+        latch.note(&found);
     }
     let mut index = Index::default();
     index.apply(&events, update.state.durable);
@@ -169,7 +169,7 @@ pub(crate) fn read_whole(
     let decider = Decider::from_index(&index, budget);
     let recorded = reader.lost_ranges().to_vec();
     reader.release_bytes();
-    latch.started(reader.state().durable);
+    latch.started();
     Ok(Kept {
         counters: defined(counters, &index),
         index,

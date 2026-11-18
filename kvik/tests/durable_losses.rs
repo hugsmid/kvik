@@ -108,9 +108,8 @@ fn damaged_kept_log(name: &str) -> (World, Store, SeriesId) {
     (w, s, id)
 }
 
-/// Q-928 as proposed (the switch in `Latch::note`): the store's own reader reads the kept log at its first query and
-/// finds the damage as any scanning reader does. With the switch off, `losses()` stays empty and the replay is
-/// dropped.
+/// Q-928: the store's own reader reads the kept log at its first query and finds the damage as any scanning reader
+/// does.
 #[test]
 fn damage_to_the_kept_log_is_found_by_the_stores_first_read_of_it() {
     let (w, s, id) = damaged_kept_log("damaged-kept-query");

@@ -14,7 +14,7 @@ use kvik_log::reader::{LogReader, ReaderConfig as LogReaderConfig, ReaderError};
 
 use super::clock::Clocks;
 use super::index::{Index, pos};
-use super::loss::{FoundBy, Latch};
+use super::loss::Latch;
 use super::read::cut;
 use super::read::flight::Flight;
 use super::read::view::{Cuts, View};
@@ -190,7 +190,7 @@ fn take(
         }
         let found = index.apply(&update.events, update.state.durable);
         if !found.is_empty() {
-            latch.note(&found, FoundBy::Query);
+            latch.note(&found);
         }
         if !more {
             return Ok(Ok(()));
