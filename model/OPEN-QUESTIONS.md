@@ -2390,9 +2390,6 @@ thread ran at most 3,500 to 6,000 readings behind the last acknowledged position
 `the_delivery_counters_reach_the_same_counts_with_or_without_a_consumer` (`kvik/tests/emit_without_consumers.rs`).
 
 ## Q-710 — The default floor of the batch-sync interval
-Recorded by the adaptive interval of the log writer; entered here as the owner ruled it, with the change that landed
-it. The measurement note it cites, `docs/measurements/4.8-adaptive-sync-interval.md`, is on that change's line and
-not in this tree.
 
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
 `log.min_sync_interval` (spec §3 Group commit). With a floor of 2 ms a fast device waits about 2 ms instead of 10,

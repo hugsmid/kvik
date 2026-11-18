@@ -590,6 +590,48 @@ fn a_seal_sync_spends_nothing_of_the_budget_and_leaves_the_estimate_alone() {
 }
 
 #[test]
+fn the_forced_mark_syncs_of_a_segments_first_batch_and_of_entries_spend_nothing_of_the_budget() {
+    let mut s = Sim::new(Setup {
+        seal: Duration::from_secs(2),
+        ..Setup::base()
+    });
+    let mut at = START;
+    while s.starts.len() < 30 {
+        s.push();
+        s.turn(at, FAST);
+        at += 5 * MS;
+    }
+    let (seal_at, _) = s.turn(at, FAST);
+    let seal_at = seal_at.unwrap();
+    s.turn(seal_at, FAST);
+    let (marks, batches) = (s.w.stats().mark_syncs, s.starts.len());
+    // The budget refills while idle; then the first batch of the new segment (Q-630) and every other batch, which holds
+    // an alias, force a mark sync each.
+    let mut t = seal_at + Duration::from_secs(1);
+    for k in 0..BURST {
+        if k % 2 == 0 {
+            s.push();
+        } else {
+            s.push_items(vec![Item::from(Entry::Alias {
+                id: k as u32,
+                name: format!("a{k}"),
+            })]);
+        }
+        s.turn(t, FAST);
+        assert_eq!(s.starts.last(), Some(&t), "batch {k}");
+        t += FAST;
+    }
+    assert_eq!(s.w.stats().mark_syncs, marks + 1 + (BURST / 2) as u64);
+    s.push();
+    s.turn(t, FAST);
+    assert_eq!(
+        s.starts.len(),
+        batches + BURST,
+        "the batch syncs alone spent the budget"
+    );
+}
+
+#[test]
 fn after_an_open_the_first_call_is_synced_at_once_and_the_interval_is_the_ceiling_until_a_sample() {
     let s = saturated(Setup::base(), 20, |_| FAST);
     let at = s.clock.monotonic() + Duration::from_secs(1);
