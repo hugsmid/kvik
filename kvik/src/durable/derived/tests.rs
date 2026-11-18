@@ -2,7 +2,8 @@ use std::ops::Bound;
 use std::time::Duration;
 
 use kvik_log::content::BatchContent;
-use kvik_log::facts::{FactFlags, ValueType as LogType};
+use kvik_log::directory::series::CandidateValue;
+use kvik_log::facts::{FactFlags, FactRow, Quality, Value, ValueType as LogType};
 use kvik_log::reader::ReadEvent;
 use proptest::prelude::*;
 
