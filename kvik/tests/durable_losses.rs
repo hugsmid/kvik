@@ -590,3 +590,39 @@ fn damage_inside_a_loss_reported_too_wide_reaches_the_stores_reader_and_its_repl
     assert_eq!(shown.len(), 3, "{shown:?}");
     block_on(s.shutdown()).unwrap();
 }
+
+/// A loss watch not polled across the removal of the segment it stands in, as retention or compaction removes one:
+/// the log reader passes over a segment no listing holds (Q-852), so the watch reads on from the segments present,
+/// reports no loss for the removed positions and still finds damage written after them (Q-927).
+#[test]
+fn an_unpolled_watch_reads_on_past_the_removal_of_the_segment_it_stands_in() {
+    let w = World::new("unpolled-watch");
+    let mut config = w.config();
+    config.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    block_on(s.emit(&[note(id, 0, "UW-ZERO")])).unwrap();
+    sealed_with(&w, b"UW-ZERO");
+    block_on(s.emit(&[note(id, 1, "UW-ONE")])).unwrap();
+    sealed_with(&w, b"UW-ONE");
+    assert!(data_lost(&s.losses()).is_empty());
+    block_on(s.emit(&[note(id, 2, "UW-TWO")])).unwrap();
+    sealed_with(&w, b"UW-TWO");
+    block_on(s.emit(&[note(id, 3, "UW-THREE")])).unwrap();
+    let (path, _) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(6).any(|x| x == b"UW-ONE"))
+        .unwrap();
+    kvik::env::Fs::remove_file(&*w.fs, &path).unwrap();
+    for _ in 0..2 {
+        assert!(s.losses().is_empty());
+        assert!(matches!(s.health(), Health::Ok), "{:?}", s.health());
+    }
+    block_on(s.emit(&[note(id, 4, "UW-FOUR")])).unwrap();
+    // A seal writes the segment from the writer's own bytes: the damage is made once it is sealed.
+    sealed_with(&w, b"UW-FOUR");
+    damage(&w, b"UW-FOUR");
+    assert_eq!(data_lost(&s.losses()).len(), 1);
+    block_on(s.shutdown()).unwrap();
+}
