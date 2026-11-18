@@ -207,8 +207,10 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
     let (mut later, _, lt, mut later_held) = watched(&r, LiveOptions::default());
     note(&w, &s, id, -3, "LATE-ONE");
     let lost = note(&w, &s, id, -2, "LATE-TWO");
+    // The newest batch is checked again at every refresh and would be a reset; the one before it is not.
+    note(&w, &s, id, -1, "LATE-THREE");
     poll(&w, &mut session, &mut held).unwrap();
-    assert_eq!(held[&t].tail.len(), 2);
+    assert_eq!(held[&t].tail.len(), 3);
     w.damage(b"LATE-TWO");
     // A call that reads facts builds the fact index from the whole log and meets the damage (Q-938).
     let read: Vec<Fact> = r
@@ -216,13 +218,14 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(read.len(), 1);
+    assert_eq!(read.len(), 2);
     let b = poll(&w, &mut session, &mut held).unwrap();
+    assert!(held[&t].resets.is_empty(), "{b:?}");
     assert!(
         held[&t].gaps.iter().any(|(a, z)| *a <= lost && lost <= *z),
         "{b:?}"
     );
-    assert_eq!(held[&t].tail.len(), 1);
+    assert_eq!(held[&t].tail.len(), 2);
     assert!(
         b.events
             .iter()
@@ -232,7 +235,7 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
     // A session that takes the fact and the loss in one batch is never sent the fact.
     let b = later.next(Duration::ZERO).unwrap().unwrap();
     apply(&mut later_held, &b);
-    assert_eq!(later_held[&lt].tail.len(), 1, "{b:?}");
+    assert_eq!(later_held[&lt].tail.len(), 2, "{b:?}");
     assert!(later_held[&lt].tail.iter().all(|f| f.position != lost));
     block_on(s.shutdown()).unwrap();
 }
@@ -316,7 +319,13 @@ fn a_slow_tail_gets_lagged_to_the_mark_and_the_shared_tail_stays_within_its_back
     poll(&w, &mut session, &mut held).unwrap();
     assert_eq!(held[&t].lagged.len(), 2);
     assert_eq!(held[&t].tail.len(), 1);
-    assert!(d.hub().held().0 <= 51);
+    assert!(
+        d.hub().peak() <= 51,
+        "{} facts held at once",
+        d.hub().peak()
+    );
+    // Caught up, the reader keeps nothing.
+    assert_eq!(d.hub().held(), (0, 0, 0));
     block_on(s.shutdown()).unwrap();
 }
 

@@ -83,6 +83,9 @@ pub(crate) struct Collector {
     bytes: u64,
     cap: (u64, u64),
     whole: bool,
+    /// The most facts it held at once.
+    #[cfg(test)]
+    most: u64,
 }
 
 impl Collector {
@@ -93,6 +96,10 @@ impl Collector {
             }
             self.rows += 1;
             self.bytes += p.bytes();
+            #[cfg(test)]
+            {
+                self.most = self.most.max(self.rows);
+            }
             if self.rows > self.cap.0 || self.bytes > self.cap.1 {
                 self.whole = false;
                 self.pieces.retain(Piece::kept_when_trimmed);
@@ -161,6 +168,9 @@ struct State {
     next_sub: u64,
     rows: u64,
     bytes: u64,
+    /// The most facts held at once, collectors included.
+    #[cfg(test)]
+    peak: u64,
 }
 
 /// See the module documentation.
@@ -194,6 +204,8 @@ impl Hub {
             bytes: 0,
             cap,
             whole: true,
+            #[cfg(test)]
+            most: 0,
         })
     }
 
@@ -213,6 +225,10 @@ impl Hub {
             sub.idle |= now.saturating_sub(sub.polled) > idle_after;
         }
         if let Some(c) = c {
+            #[cfg(test)]
+            {
+                s.peak = s.peak.max(s.rows + c.most);
+            }
             s.rows += c.rows;
             s.bytes += c.bytes;
             s.rounds.push_back(Arc::new(Round {
@@ -304,11 +320,17 @@ impl Hub {
         trim(&mut s);
     }
 
-    /// Facts and bytes held, for the memory tests.
+    /// Facts and bytes held and rounds kept, for the memory tests.
     #[cfg(test)]
     pub(crate) fn held(&self) -> (u64, u64, usize) {
         let s = self.lock();
         (s.rows, s.bytes, s.rounds.len())
+    }
+
+    /// The most facts held at once, while a refresh read included.
+    #[cfg(test)]
+    pub(crate) fn peak(&self) -> u64 {
+        self.lock().peak
     }
 }
 
