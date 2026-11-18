@@ -463,6 +463,46 @@ pub struct Snapshot;   // live(id), series(key), losses(), state(), now(); owned
   resets since (spec §7 Readers): kept, void above a position, or unknown (start again). Built with roadmap 5.3.
 - A query engine integration (a table provider) is layered on these calls and is not part of the core crate.
 
+### Live reads (roadmap 9.0d)
+
+```rust
+pub fn session(&self) -> LiveSession;                                            // default pacing
+pub fn session_with(&self, o: SessionOptions) -> Result<LiveSession, QueryError>;
+pub struct SessionOptions { pub min_batch_interval: Duration, pub poll_interval: Duration }  // 200 ms ≥ 20; 100 ms ≥ 10
+pub enum Query { Latest(Selection), Tail { sel: Selection } }                     // #[non_exhaustive]
+pub struct Selection { pub select: Vec<Select> }                                  // #[non_exhaustive]
+pub struct LiveOptions { pub max_rows: usize, pub max_backlog_rows: u64, pub max_backlog_bytes: u64 }  // 10,000; 1,000,000; 64 MiB
+impl LiveSession { pub fn open(&mut self, q: Query, o: LiveOptions) -> Result<LiveId, QueryError>;
+                   pub fn cancel(&mut self, id: LiveId) -> bool;
+                   pub fn next(&mut self, timeout: Duration) -> Result<Option<UpdateBatch>, QueryError>; }
+pub struct UpdateBatch { pub durable: Position, pub now: Timestamp, pub events: Vec<(LiveId, LiveEvent)> }
+pub enum LiveEvent { Opened(Answer), Appended(Appended), Updated(Updated), Reset { above }, Gap { first, last },
+                     Lagged { from, to }, Joined { series, info, index, part }, Left { series }, Closed(CloseReason) }
+pub fn select(&self, s: &Selection) -> Result<Vec<SeriesId>, QueryError>;      // on Snapshot: the static members
+```
+- A live read is a query opened in a session: its `Opened` is the result at the cut of the next batch, then each
+  batch brings every live read of the session to one durable position and one `now`. `next` computes the batch when
+  called (no thread, no queue) and returns one only when an event changed; batches are at least `min_batch_interval`
+  apart. The writer's process is woken when the writer publishes; a reader process reads the mark once a poll
+  interval (Q-1010, Q-1015). Within a batch a live read's events come `Reset`, `Gap` or `Lagged`, `Opened`, `Joined`
+  and `Left`, then `Updated` and `Appended`, then `Closed`.
+- `Latest` holds each selected series' live state, as `Snapshot::live` gives it at the batch's cut and `now`:
+  `Updated` replaces one, `Joined` inserts a series at `index` of the selection's order and `Left` removes one (a
+  definition, a name given, a retirement; Q-1012). A result that changes with `now` alone (a value falling due,
+  staleness passing) is updated at its due time with no new fact.
+- `Tail` delivers the facts of the selected series in position order as they become durable, chosen by what was
+  known at each fact's position (Q-895), from the cut of its `Opened`; it has no static read and opens at that cut
+  only (from a time with roadmap 9.0f, from a saved point with 5.3). At most `max_rows` facts per batch: the batch's
+  cut stops there for every live read of the session (Q-1014). A consumer more than `max_backlog_*` behind the mark
+  gets `Lagged { from, to }` and continues at the mark; the facts between may be read statically (Q-1013).
+- Nothing is silently wrong (Q-1011): a reset is `Reset { above }` (drop what is held above it) and a fresh `Opened`;
+  positions found lost, by the session's read, by another read of the process or recorded by a start, are
+  `Gap { first, last }` (drop what is held between them; a `Latest` is opened again). An error of the shared read,
+  such as `NotAvailable` for a segment that cannot be read (Q-951), is returned by every `next` it lasts (Q-1016).
+- A session not polled for `cut_max_age` is closed: its next call returns `Closed(Idle)` for each live read. Dropping
+  the session cancels them all. The model backend computes each batch again from its head; it has no resets or
+  losses and no pacing.
+
 ## Health and statistics (types accepted at gate 3.3)
 ```rust
 pub enum Health { Ok, Degraded { reasons: Vec<Reason> }, ReadOnly { cause: Fault, reasons: Vec<Reason> } }

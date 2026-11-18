@@ -84,6 +84,7 @@ kvik-fold       kvik  lib         durable::derived::tests::
 kvik-pmap       kvik  lib         durable::read::pmap::
 kvik-views      kvik  lib         durable::read::tests::concurrent_calls_
 kvik-latest     kvik  lib         durable::read::latest::tests::
+kvik-live       kvik  lib         durable::read::live::differential::
 '
 
 cd "$(dirname "$0")/.."
