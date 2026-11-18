@@ -76,8 +76,10 @@ impl FailedReads {
 pub struct ScanStats {
     /// Bytes run through CRC32C, block header checksums excluded.
     pub bytes_checksummed: u64,
-    /// Block headers read and checked (each a 12-byte checksum).
+    /// Block headers read and checked.
     pub headers_visited: u64,
+    /// Of those, the headers whose 12-byte checksum was computed; one read again from the scan's memory takes none.
+    pub header_checksums: u64,
     /// Body bytes passed to the checks of their type (A.5, A.6; a manifest record's fields, A.14).
     pub bytes_body_checked: u64,
     /// The most body bytes checked by failed reads starting in one window ([`FailedReads`]).
@@ -133,7 +135,7 @@ impl Valid {
     }
 
     fn index(&self, p: u64) -> Option<usize> {
-        (p >= self.base && (p - self.base) / 8 <= self.mask)
+        (p.is_multiple_of(8) && p >= self.base && (p - self.base) / 8 <= self.mask)
             .then_some(((p >> 3) & self.mask) as usize)
     }
 
@@ -166,6 +168,7 @@ pub(crate) struct Reads<'a> {
     sums: Option<PrefixCrc<'a>>,
     direct: u64,
     headers: u64,
+    checksums: u64,
     body: u64,
     pub(crate) failed: FailedReads,
     /// The last two valid headers read, with their offsets: a candidate's framing and its read in full ask for the
@@ -182,6 +185,7 @@ impl<'a> Reads<'a> {
             sums: None,
             direct: 0,
             headers: 0,
+            checksums: 0,
             body: 0,
             failed: FailedReads::new(MAX_BATCH_DATA),
             recent: [None; 2],
@@ -200,6 +204,7 @@ impl<'a> Reads<'a> {
         ScanStats {
             bytes_checksummed: self.direct + self.sums.as_ref().map_or(0, PrefixCrc::checksummed),
             headers_visited: self.headers,
+            header_checksums: self.checksums,
             bytes_body_checked: self.body,
             failed_bytes_peak: self.failed.peak(),
         }
@@ -237,6 +242,7 @@ impl<'a> Reads<'a> {
     ) -> Option<(BlockHeader, [u8; BLOCK_HEADER_LEN])> {
         self.headers += 1;
         self.recent_at(offset, limit).or_else(|| {
+            self.checksums += 1;
             let found = peek_raw(self.bytes, offset, limit)?;
             self.recent = [Some((offset, found.0, found.1)), self.recent[0]];
             Some(found)
@@ -282,7 +288,10 @@ impl<'a> Reads<'a> {
         };
         match known {
             Some((h, raw)) => read_body(bytes, offset, limit, h, raw, crc),
-            None => read_block_with(bytes, offset, limit, crc),
+            None => {
+                self.checksums += 1;
+                read_block_with(bytes, offset, limit, crc)
+            }
         }
     }
 }

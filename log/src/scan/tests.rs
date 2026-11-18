@@ -282,7 +282,15 @@ fn walked_chains_longer_than_a_batch_remember_at_most_a_batch_of_block_starts() 
     reads.use_table();
     let mut chains = Chains::walked();
     let found = chains
-        .resync(&mut reads, &id, HEADER_LEN as u64, len, 1, None)
+        .resync(
+            &mut reads,
+            &id,
+            HEADER_LEN as u64,
+            len,
+            1,
+            None,
+            &Walks::default(),
+        )
         .unwrap();
     assert!(found.is_none());
     let bound = ((crate::batch::MAX_BATCH_DATA + (1 << 16)) / 128 + 16) as usize;

@@ -265,7 +265,7 @@ pub enum Found<'a> {
 
 /// A scan of one log segment as an iterator of [`Found`] items, resumable from a [`Resume`] point: a reader
 /// that tails a segment as the mark moves, or a large segment, reads each part once.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Scanner<'a> {
     bytes: &'a [u8],
     id: SegmentIdentity,
@@ -508,6 +508,7 @@ impl<'a> Iterator for Scanner<'a> {
             area_end,
             min_first,
             search.as_mut(),
+            &self.walks,
         );
         match found {
             Err(e) => {

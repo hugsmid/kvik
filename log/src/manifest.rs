@@ -233,6 +233,7 @@ impl<'a> Search<'a> {
         ScanStats {
             bytes_checksummed: self.sums.checksummed(),
             headers_visited: self.headers,
+            header_checksums: self.headers,
             bytes_body_checked: self.body,
             failed_bytes_peak: self.failed.peak(),
         }

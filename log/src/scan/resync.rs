@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::batch::{
-    Batch, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, framing_holds, read_batch,
+    Batch, BatchRead, MAX_BATCH_DATA, Refusal, SegmentIdentity, framing, framing_holds, read_batch,
+    read_remembered_batch,
 };
 use crate::block::{BLOCK_HEADER_LEN, block_type};
 use crate::body::{COMMIT_LEN, Commit};
@@ -11,6 +12,7 @@ use crate::bytes::{slice, u64_at};
 use crate::error::FormatError;
 
 use super::ends::{Ends, SPAN};
+use super::walk::{Remembered, Walks};
 use super::{ReadableCommit, Reads};
 
 /// Where a chain of block headers ends in a commit block: its offset and the `batch_bytes` it claims.
@@ -168,6 +170,7 @@ impl Chains {
         limit: u64,
         min_first: u64,
         mut commits: Option<&mut CommitSearch>,
+        walks: &Walks,
     ) -> Result<Option<Batch<'a>>, FormatError> {
         let mut o = start + 8;
         while o + (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
@@ -215,7 +218,25 @@ impl Chains {
                         })
                 }
             };
-            if candidate && framing_holds(reads, id, o, limit) {
+            // On a chain a failed boundary read walked, a candidate's read fails at the same stop, or reads blocks
+            // already judged: it is charged the bodies `framing_holds` and `read_batch` would check (Q-873).
+            let remembered = (candidate && self.ends.is_some())
+                .then(|| walks.remembered(reads, o))
+                .flatten();
+            if let Some(Remembered::Fails { stop, extra }) = remembered {
+                if let Some(data) = framing(reads, id, o, limit, stop)
+                    && data + extra > 0
+                {
+                    reads.failed.charge(o, data + extra);
+                }
+            } else if let Some(Remembered::Commit) = remembered {
+                match read_remembered_batch(reads, id, o, limit, min_first) {
+                    (BatchRead::Complete(b), _) => return Ok(Some(b)),
+                    (BatchRead::Refused(e), _) => return Err(e),
+                    (BatchRead::Incomplete { .. }, 0) => {}
+                    (BatchRead::Incomplete { .. }, bytes) => reads.failed.charge(o, bytes),
+                }
+            } else if candidate && framing_holds(reads, id, o, limit) {
                 let before = reads.body_checked();
                 match read_batch(reads, id, o, limit, min_first, Refusal::IfBatchVerifies) {
                     BatchRead::Complete(b) => return Ok(Some(b)),

@@ -121,6 +121,35 @@ pub(crate) fn read_judged_batch<'a>(
     read_batch_with(reads, id, o, limit, min_first, Refusal::AtOnce, true)
 }
 
+/// [`read_judged_batch`] of a resynchronisation candidate whose blocks up to its commit block a boundary read has
+/// judged, each passing; with the facts and entries body bytes that [`framing_holds`] and then [`read_batch`] would
+/// have checked and not kept, which the caller charges (Q-873).
+pub(crate) fn read_remembered_batch<'a>(
+    reads: &mut Reads<'a>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+) -> (BatchRead<'a>, u64) {
+    let mut framed = 0;
+    let r = read_batch_framed(
+        reads,
+        id,
+        o,
+        limit,
+        min_first,
+        Refusal::IfBatchVerifies,
+        true,
+        Some(&mut framed),
+    );
+    let failed = if matches!(r, BatchRead::Complete(_)) {
+        0
+    } else {
+        framed
+    };
+    (r, failed)
+}
+
 fn read_batch_with<'a>(
     reads: &mut Reads<'a>,
     id: &SegmentIdentity,
@@ -129,6 +158,21 @@ fn read_batch_with<'a>(
     min_first: u64,
     refusal: Refusal,
     judged: bool,
+) -> BatchRead<'a> {
+    read_batch_framed(reads, id, o, limit, min_first, refusal, judged, None)
+}
+
+/// `framed`, if given, is set to the facts and entries body bytes once the framing holds.
+#[allow(clippy::too_many_arguments)]
+fn read_batch_framed<'a>(
+    reads: &mut Reads<'a>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+    refusal: Refusal,
+    judged: bool,
+    framed: Option<&mut u64>,
 ) -> BatchRead<'a> {
     let incomplete = |fault| BatchRead::Incomplete { fault };
     let mut crc = Crc32c::new();
@@ -223,6 +267,18 @@ fn read_batch_with<'a>(
     if !framing_holds {
         return incomplete(BatchFault::Disagreement);
     }
+    if let Some(framed) = framed {
+        *framed = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.block.header.block_type,
+                    block_type::FACTS | block_type::ENTRIES
+                )
+            })
+            .map(|b| u64::from(b.block.header.body_len))
+            .sum();
+    }
     if let Some(refused) = unknown_critical {
         return BatchRead::Refused(refused);
     }
@@ -267,37 +323,47 @@ pub(crate) fn framing_holds(
     o: u64,
     limit: u64,
 ) -> bool {
+    framing(reads, id, o, limit, o).is_some()
+}
+
+/// [`framing_holds`], with the body bytes of the facts and entries blocks that start below `stop` when it holds.
+pub(crate) fn framing(
+    reads: &mut Reads<'_>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    stop: u64,
+) -> Option<u64> {
     let mut crc = Crc32c::new();
     crc.update(&id.store_id);
     crc.update(&id.file_id.to_le_bytes());
     crc.update(&o.to_le_bytes());
     let mut pos = o;
     let mut count: u64 = 0;
+    let mut data = 0;
     loop {
-        let Some((h, raw)) = reads.peek_raw(pos, limit) else {
-            return false;
-        };
+        let (h, raw) = reads.peek_raw(pos, limit)?;
         match h.block_type {
             block_type::COMMIT => {
                 if h.body_len as usize != COMMIT_LEN {
-                    return false;
+                    return None;
                 }
-                let Ok(b) = reads.block(pos, limit) else {
-                    return false;
-                };
-                let Ok(c) = Commit::decode(b.body) else {
-                    return false;
-                };
-                return count >= 1
+                let b = reads.block(pos, limit).ok()?;
+                let c = Commit::decode(b.body).ok()?;
+                return (count >= 1
                     && u64::from(c.block_count) == count
                     && c.batch_bytes == pos - o
                     && c.generation == id.generation
-                    && c.batch_crc32c == crc.finish();
+                    && c.batch_crc32c == crc.finish())
+                .then_some(data);
             }
-            block_type::SEGMENT_INDEX | block_type::TRAILER => return false,
-            _ => {
+            block_type::SEGMENT_INDEX | block_type::TRAILER => return None,
+            t => {
                 if pos - o + h.block_len() > MAX_BATCH_DATA {
-                    return false;
+                    return None;
+                }
+                if pos < stop && matches!(t, block_type::FACTS | block_type::ENTRIES) {
+                    data += u64::from(h.body_len);
                 }
                 crc.update(&raw[..12]);
                 count += 1;

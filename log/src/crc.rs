@@ -304,6 +304,9 @@ impl<'a> PrefixCrc<'a> {
         if end > self.bytes.len() as u64 {
             return None;
         }
+        if len == 0 {
+            return Some(0);
+        }
         if !start.is_multiple_of(8) {
             self.checksummed += len;
             return Some(crc32c(crate::bytes::slice(self.bytes, start, len)?));
