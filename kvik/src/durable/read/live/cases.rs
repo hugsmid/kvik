@@ -90,9 +90,14 @@ fn a_reset_voids_what_the_tail_holds_above_it_and_opens_latest_again() {
     let open = r.snapshot().unwrap().state().durable;
     for k in 0..40 {
         note(&w, &s, id, k - 40, &format!("RS-{k:02}"));
+        if k == 19 {
+            poll(&w, &mut session, &mut held).unwrap();
+        }
+        // The shared tail keeps for the session what other calls read: the next batch brings these facts and the
+        // reset together.
+        r.refresh().unwrap();
     }
-    poll(&w, &mut session, &mut held).unwrap();
-    assert_eq!(held[&t].tail.len(), 40);
+    assert_eq!(held[&t].tail.len(), 20);
     // The power goes with the mark unsynced and the newest batch torn: the start truncates the tail there and
     // assigns its positions again (spec §3 Recovery rule 3).
     w.fs.crash_after(0);
@@ -199,6 +204,7 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     let r = w.reader();
     let (mut session, l, t, mut held) = watched(&r, LiveOptions::default());
+    let (mut later, _, lt, mut later_held) = watched(&r, LiveOptions::default());
     note(&w, &s, id, -3, "LATE-ONE");
     let lost = note(&w, &s, id, -2, "LATE-TWO");
     poll(&w, &mut session, &mut held).unwrap();
@@ -223,6 +229,11 @@ fn a_loss_another_read_finds_after_delivery_is_a_gap_that_takes_the_fact_back() 
             .any(|(k, e)| *k == l && matches!(e, LiveEvent::Opened(_)))
     );
     latest_is_static(&r, &held[&l]);
+    // A session that takes the fact and the loss in one batch is never sent the fact.
+    let b = later.next(Duration::ZERO).unwrap().unwrap();
+    apply(&mut later_held, &b);
+    assert_eq!(later_held[&lt].tail.len(), 1, "{b:?}");
+    assert!(later_held[&lt].tail.iter().all(|f| f.position != lost));
     block_on(s.shutdown()).unwrap();
 }
 
@@ -306,6 +317,27 @@ fn a_slow_tail_gets_lagged_to_the_mark_and_the_shared_tail_stays_within_its_back
     assert_eq!(held[&t].lagged.len(), 2);
     assert_eq!(held[&t].tail.len(), 1);
     assert!(d.hub().held().0 <= 51);
+    block_on(s.shutdown()).unwrap();
+}
+
+#[test]
+fn a_tail_lags_by_its_own_limit_while_another_session_keeps_the_shared_tail() {
+    let w = World::new("lagged-own");
+    let s = w.open();
+    let id = block_on(s.define_series(gauge("a/b/power"))).unwrap();
+    let r = w.reader();
+    let (mut slow, _, t, mut held) = watched(&r, LiveOptions::default().max_backlog(50, 1 << 30));
+    let (mut patient, _, pt, mut patient_held) = watched(&r, LiveOptions::default());
+    for k in 0..200 {
+        emit(&w, &s, id, f64::from(k));
+        r.refresh().unwrap();
+    }
+    assert!(r.durable().unwrap().unwrap().hub().held().0 >= 200);
+    poll(&w, &mut patient, &mut patient_held).unwrap();
+    assert_eq!(patient_held[&pt].tail.len(), 200);
+    poll(&w, &mut slow, &mut held).unwrap();
+    assert_eq!(held[&t].lagged.len(), 1);
+    assert!(held[&t].tail.is_empty());
     block_on(s.shutdown()).unwrap();
 }
 
@@ -446,10 +478,21 @@ fn a_reading_is_in_a_batch_within_the_poll_interval_in_a_reader_process_and_at_o
     w.clock.advance(Duration::from_millis(1));
     let b = sessions[1].next(Duration::ZERO).unwrap().unwrap();
     assert_eq!(kinds(&b), ["appended"]);
-    // Quiet: no batch, however often it is called.
+    // Batches are at least the batch interval apart: a reading just after one waits for it.
+    emit(&w, &s, id, 2.0);
+    assert!(sessions[0].next(Duration::ZERO).unwrap().is_some());
+    emit(&w, &s, id, 3.0);
+    assert!(sessions[0].next(Duration::ZERO).unwrap().is_none());
+    w.clock.advance(Duration::from_millis(20));
+    assert!(sessions[0].next(Duration::ZERO).unwrap().is_some());
     w.clock.advance(Duration::from_millis(500));
-    for x in &mut sessions {
-        assert!(x.next(Duration::ZERO).unwrap().is_none());
+    assert!(sessions[1].next(Duration::ZERO).unwrap().is_some());
+    // Quiet: no batch, however often it is called.
+    for _ in 0..3 {
+        w.clock.advance(Duration::from_millis(500));
+        for x in &mut sessions {
+            assert!(x.next(Duration::ZERO).unwrap().is_none());
+        }
     }
     block_on(s.shutdown()).unwrap();
 }
