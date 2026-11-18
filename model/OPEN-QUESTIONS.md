@@ -2119,6 +2119,7 @@ forbidding struct expressions outside the crate (every test and benchmark builds
 `..WriterConfig::default()`; no literal in the tree names every field). The log crate is not published.
 `kvik::LogConfig` and `kvik::LogStats` are `#[non_exhaustive]` already and take the new key and statistics
 compatibly.
+**Since.** Q-981 adds the floor to `kvik::LogConfig`; `kvik::LogStats` does not carry the two statistics (Q-984).
 
 ## Q-712 — The constants of the adaptive interval
 
