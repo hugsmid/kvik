@@ -3143,14 +3143,16 @@ bounded decision history), for review.
 once; the batch it then keeps is read without checking its bodies again (Q-651). A scan keeping content (recovery's
 scan to the end, a reader's pass) needs each kept body decoded, which that read no longer did.
 **Decided.** When content is kept, the judged read decodes each facts and entries body of its batch once every
-check of the batch holds (`log/src/batch.rs` `read_judged_batch`), so a read that keeps no batch decodes nothing; the
-boundary read keeps its cheaper check. The decode is the content asked for, not a check, so `ScanStats` counts it
+check of the batch holds (`log/src/batch.rs` `read_judged_batch`, and `read_remembered_batch` for a candidate on a
+chain a boundary read walked, Q-873), so a read that keeps no batch decodes nothing; the boundary read keeps its
+cheaper check. The decode is the content asked for, not a check, so `ScanStats` counts it
 nowhere and a scan keeping content counts what one without counts; a body kept after damage costs one check and one
 decode, as before Q-651, and failed reads stay as cheap as Q-651 made them.
 A decode that fails where the check passed would be a verdict the two disagree on, which Q-651's property rules out;
 it ends the batch as invalid content.
 **Pinned by.** `log/src/scan/tests.rs` `batches_kept_after_damage_keep_their_content_with_each_body_checked_once`; the
-segment fuzz target compares a scan keeping content with one that does not, findings, content and counts.
+segment fuzz target and `log/tests/scan_differential.rs` compare a scan keeping content with one that does not:
+findings, content and counts.
 
 ## Q-810 — What the manifest's layout of a compacted file may repeat from the file
 Recorded by roadmap 6.2a1. **Settled by the lead** at its review.

@@ -10,9 +10,12 @@ use kvik_log::FormatError;
 use kvik_log::batch::MAX_BATCH_DATA;
 use kvik_log::block::{BlockHeader, FLAG_SKIPPABLE, block_type};
 use kvik_log::body::{COMMIT_LEN, Commit};
+use kvik_log::content::BatchContent;
 use kvik_log::crc::crc32c;
 use kvik_log::header::HEADER_LEN;
-use kvik_log::scan::{ScanLimit, ScanReport, Tail, legacy, scan_with_stats};
+use kvik_log::scan::{
+    Found, ScanLimit, ScanReport, ScanStats, Scanner, Tail, legacy, scan_with_stats,
+};
 use kvik_log::segment::SegmentImage;
 use proptest::prelude::*;
 use support::*;
@@ -413,14 +416,49 @@ fn summary(r: &Result<ScanReport<'_>, FormatError>) -> String {
     }
 }
 
+/// A scan of `f` that keeps the content its checks decode, as recovery and the readers run it (Q-990): its findings,
+/// with each batch's content checked against [`BatchContent::decode`], and its counts.
+fn kept(f: &[u8], limit: ScanLimit) -> (String, ScanStats) {
+    let Ok(s) = Scanner::new(f, &ID, limit) else {
+        return (String::new(), ScanStats::default());
+    };
+    let mut s = s.keeping_content();
+    let mut found = Vec::new();
+    while let Some(x) = s.next() {
+        if let Ok(Found::Batch(b)) = &x {
+            assert_eq!(
+                s.take_content().ok_or(()),
+                BatchContent::decode(b).map_err(|_| ()),
+                "{limit:?}: kept content at {}",
+                b.offset
+            );
+        }
+        found.push(format!("{x:?}"));
+    }
+    (format!("{found:?}"), s.stats())
+}
+
 /// The scan of `f` to its end and to `mark` keeps the bound and gives the walked chains' report and charges, and the
-/// reference scan's report when `reference`, and below 1 MiB that of chain ends found in small blocks; a torn tail's
-/// commit blocks are a plain search's.
+/// reference scan's report when `reference`, and below 1 MiB that of chain ends found in small blocks; a scan keeping
+/// content finds and counts what one without does; a torn tail's commit blocks are a plain search's.
 fn check(f: &[u8], mark: u64, reference: bool) {
     let len = f.len() as u64;
     for limit in [ScanLimit::End, ScanLimit::Mark(mark)] {
         let (new, stats) = scan_with_stats(f, &ID, limit);
         assert!(stats.within_bound(len), "{limit:?}: {stats:?}");
+        let mut plain = Scanner::new(f, &ID, limit).ok();
+        let plain_found = plain.as_mut().map_or(String::new(), |s| {
+            format!(
+                "{:?}",
+                s.by_ref().map(|x| format!("{x:?}")).collect::<Vec<_>>()
+            )
+        });
+        let plain_stats = plain.map_or(ScanStats::default(), |s| s.stats());
+        assert_eq!(
+            kept(f, limit),
+            (plain_found, plain_stats),
+            "{limit:?}: kept"
+        );
         let new_s = summary(&new);
         let (walked, walked_stats) = legacy::scan_with_walked_links(f, &ID, limit);
         assert_eq!(new_s, summary(&walked), "{limit:?}: walked");
