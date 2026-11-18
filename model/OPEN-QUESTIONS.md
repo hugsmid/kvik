@@ -3360,7 +3360,8 @@ continue a directory written as the writer's fold gives it at any batch boundary
 `a_reader_started_after_a_position_returns_exactly_the_batches_above_it`,
 `a_started_reader_reads_only_the_segments_from_the_one_holding_the_next_position`,
 `a_start_after_is_refused_after_a_refresh_and_for_another_generation_or_a_position_above_the_mark`,
-`a_recovery_entry_at_or_below_the_start_voids_nothing_the_start_passes_over`.
+`a_recovery_entry_at_or_below_the_start_voids_nothing_the_start_passes_over`;
+`kvik/src/durable/read/latest/cases.rs` `a_series_directory_under_another_reset_stamp_is_not_continued`.
 
 ## Q-1004 — What a reader finds in the log because the state cannot tell
 Decided by the lead with roadmap 9.0c, for review.
@@ -3380,6 +3381,7 @@ lookup and renewed only by lookups; a lookup under another reset stamp or genera
 ends with `CutExpired`.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs`
 `a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_costs_one_search_per_call`,
+`a_candidate_above_the_readers_now_is_not_live`,
 `future_and_outranked_facts_are_live_only_when_current_and_due_with_no_search`,
 `a_quiet_series_candidate_is_read_once_with_every_other_unmet_one`,
 `a_text_candidate_in_a_maximal_batch_is_read_whole_from_its_position`,
@@ -3407,6 +3409,7 @@ itself holds no fact it folded and breaks nothing. So a reader never shows a fac
 the rule Q-952 sets for the writer's fold. Cost: after such a fault the reader holds every fact until reopened.
 **Pinned by.** `kvik/src/durable/read/latest/cases.rs`
 `a_loss_found_while_open_breaks_the_state_shows_the_loss_and_never_the_lost_fact`,
+`a_loss_found_in_a_batch_already_folded_breaks_the_state_and_one_the_pass_finds_does_not`,
 `damage_under_a_directorys_candidate_never_shows_the_lost_fact`; `kvik/tests/durable_losses_open.rs`
 `a_loss_found_while_open_decides_as_a_restart_over_it_does`.
 

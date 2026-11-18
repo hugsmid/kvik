@@ -333,6 +333,16 @@ pub(super) fn write_directory(
     dir: &Path,
     k: usize,
 ) -> Option<kvik_log::writer::Position> {
+    write_directory_under(env, dir, k, None)
+}
+
+/// [`write_directory`], recording `stamp` in place of the mark's reset stamp when given.
+pub(super) fn write_directory_under(
+    env: &Env,
+    dir: &Path,
+    k: usize,
+    stamp: Option<kvik_log::mark::ResetStamp>,
+) -> Option<kvik_log::writer::Position> {
     let store_id = kvik_log::store::read_descriptor(&*env.fs, dir)
         .unwrap()
         .store_id;
@@ -371,7 +381,7 @@ pub(super) fn write_directory(
     let d = SeriesDirectory {
         through: e.through,
         lost: 0,
-        stamp: (st.stamp != Default::default()).then_some(st.stamp),
+        stamp: stamp.or((st.stamp != Default::default()).then_some(st.stamp)),
         judged_at: e.judged_at,
         entries: e.entries,
     };

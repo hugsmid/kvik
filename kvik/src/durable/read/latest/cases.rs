@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use kvik_log::directory::Family;
 use kvik_log::directory::series::SeriesDirectory;
 
-use super::tests::{Rig, S, plain, write_directory};
+use super::tests::{Rig, S, plain, write_directory, write_directory_under};
 use crate::config::LogConfig;
 use crate::durable::reader::DurableReader;
 use crate::env::Fs;
@@ -364,4 +364,74 @@ fn damage_under_a_directorys_candidate_never_shows_the_lost_fact() {
         d.seeded() && d.footprint().1,
         "seeded, then answered from a fact index"
     );
+}
+
+#[test]
+fn a_candidate_above_the_readers_now_is_not_live() {
+    let mut rig = Rig::new("behind");
+    rig.emit(&[(0, -90, 0, 0, 0), (0, -4, 1, 0, 0)], false);
+    // A reader whose clock is a minute behind the writer's.
+    let mut env = rig.env.clone();
+    env.clock = Arc::new(crate::env::ManualClock::new(rig.at(-60)));
+    let r = Reader::open(crate::config::ReaderConfig::new(&rig.dir).env(env)).unwrap();
+    let Live::Value(v) = r.live(rig.ids[0]).unwrap() else {
+        panic!("a live value");
+    };
+    assert_eq!(v.fact.value, Value::F64(1.0), "{v:?}");
+    assert_eq!(durable(&r).searches(), 1);
+}
+
+#[test]
+fn a_loss_found_in_a_batch_already_folded_breaks_the_state_and_one_the_pass_finds_does_not() {
+    let mut rig = Rig::new("folded");
+    let id: SeriesId = rig.ids[2];
+    rig.emit_readings(&[rig.note(-30, "NOTE-AAA")], Intent::Normal);
+    rig.emit_readings(&[rig.note(-20, "NOTE-BBB")], Intent::Normal);
+    rig.emit(&[(0, -4, 0, 0, 0)], false);
+    let store = rig.store.take().unwrap();
+    let own = store.reader();
+    assert_eq!(text(&own.live(id).unwrap()), Some("NOTE-BBB"));
+    for p in rig.segments() {
+        let bytes = rig.fs.read(&p).unwrap();
+        if let Some(at) = bytes.windows(8).position(|w| w == b"NOTE-BBB") {
+            rig.fs.poke(&p, at, b"X");
+        }
+    }
+    // The loss watch finds it; the store's own reader read the batch before it was damaged.
+    let lost =
+        |l: Vec<crate::LossReport>| l.iter().filter(|l| l.kind == LossKind::DataLost).count();
+    assert_eq!(lost(store.losses()), 1);
+    assert_eq!(text(&own.live(id).unwrap()), Some("NOTE-AAA"));
+    assert!(
+        durable(&own).footprint().1,
+        "the broken state answers from a fact index"
+    );
+    let fresh = rig.reader();
+    assert_eq!(text(&fresh.live(id).unwrap()), Some("NOTE-AAA"));
+    assert_eq!(lost(fresh.losses()), 1);
+    assert!(
+        !durable(&fresh).footprint().1,
+        "a range its own pass found breaks nothing"
+    );
+    rig.store = Some(store);
+}
+
+#[test]
+fn a_series_directory_under_another_reset_stamp_is_not_continued() {
+    let mut rig = Rig::new("stamp");
+    rig.emit(&[(0, -4, 0, 0, 0)], false);
+    rig.shut();
+    let other = kvik_log::mark::ResetStamp {
+        sequence: 1,
+        nonce: 7,
+    };
+    write_directory_under(&rig.env, &rig.dir, usize::MAX, Some(other)).unwrap();
+    let r = rig.reader();
+    rig.agrees(&r, 0);
+    assert!(!durable(&r).seeded());
+    write_directory(&rig.env, &rig.dir, usize::MAX).unwrap();
+    let r = rig.reader();
+    rig.agrees(&r, 0);
+    assert!(durable(&r).seeded());
+    rig.reopen();
 }

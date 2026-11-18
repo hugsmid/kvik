@@ -265,8 +265,8 @@ impl Latest {
     }
 
     /// What the state tells of series `id`'s live fact at `now` (spec §2.3): the candidate once the facts ahead
-    /// that fell due are promoted, unless it may not be the live fact (A.18 bit 3), lies above `now` (a clock
-    /// step back, A.18), or is an observed interval reading not yet ready.
+    /// that fell due are promoted, unless it may not be the live fact (A.18 bit 3) or is not ready at `now`: above
+    /// it (a reader's clock behind the writer's, A.18), or an observed interval reading not yet ended.
     pub(crate) fn judge(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Judged {
         let Some(h) = self.series.get(&id) else {
             return Judged::None;
@@ -278,7 +278,8 @@ impl Latest {
         }
         match st.candidate() {
             None => Judged::None,
-            Some(c) if c.t > now || p.ready_at(c.t) > now => Judged::Unsure,
+            // `ready_at(t)` is never before `t`.
+            Some(c) if p.ready_at(c.t) > now => Judged::Unsure,
             Some(c) => match h.rows.iter().find(|r| r.position == c.position) {
                 Some(r) => Judged::Fact(r.clone()),
                 None => Judged::Row(c),
