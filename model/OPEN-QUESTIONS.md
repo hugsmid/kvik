@@ -2490,8 +2490,9 @@ older facts, and the read of them (Q-924) meets damage no scanning reader has re
 finds no reference fact. The first clause of `late` cannot be decided: the facts that would decide it are neither in
 memory nor readable.
 **Now.** The engine's decider takes the clause as not met and counts the reading in `readings`
-(`Plan::reference_unread`); the switch is `UNREAD_REFERENCE_IS_NOT_LATE` in `kvik/src/durable/ingest.rs`, and rule (b)
-flips `a_reading_whose_reference_cannot_be_read_is_not_late_and_is_counted` and
+(`Plan::reference_unread`), once whichever checks went unmade; the switch is `UNREAD_REFERENCE_IS_NOT_LATE` in
+`kvik/src/durable/ingest.rs`, and rule (b) flips two tests, no more:
+`a_reading_whose_reference_cannot_be_read_is_not_late_and_is_counted` and
 `a_reference_fact_an_incomplete_read_finds_proves_lateness_and_none_found_is_not_late_and_counted`
 (`kvik/src/durable/ingest/tests/losses.rs`). The field's rustdoc and `docs/api.md` name the wider meaning. **Proposed.** (a) as now: the fact may lack a `late` flag the durable fixes would have set;
 (b) the old reference stands: the fact may carry one they would not have set. Either way the reading is counted in
@@ -2516,8 +2517,14 @@ and `a_replay_of_a_fact_of_the_damaged_kept_log_is_dropped_while_its_key_is_in_t
 half, unchanged).
 **The switch.** `LATCH_DAMAGE_TO_THE_KEPT_LOG_A_QUERY_FINDS` in `kvik/src/durable/loss.rs` (`Latch::note`): off, a
 range the store's own reader finds whose first position is at or below the last position the start read is not
-latched, so `losses()` stays empty and the replay is dropped; the first of the two tests then fails as written. The
-old test's "three facts shown" cannot be met either way.
+latched, so `losses()` stays empty and the replay is dropped. Off, three tests fail as written:
+`damage_to_the_kept_log_is_found_by_the_stores_first_read_of_it`, the `Kept` place of
+`a_loss_found_while_open_decides_as_a_restart_over_it_does` (`kvik/tests/durable_losses_open.rs`) and
+`a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_it` (`kvik/tests/slow_path.rs`), whose
+process reports the region by a query of the kept log; the second test above passes either way. What the switch
+leaves alone when off (finds by the scanning readers, finds above the kept log's head) is pinned by
+`off_the_kept_log_rule_drops_only_a_query_find_at_or_below_the_head_the_start_set` (`kvik/src/durable/loss/tests.rs`).
+The old test's "three facts shown" cannot be met either way.
 
 ## Q-937 — A damaged last batch of a sealed segment reported as lost to the head of the log
 Recorded by the design that reconciles the durable fixes with bounded decision history (by reading, not run).

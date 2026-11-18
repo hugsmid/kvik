@@ -261,8 +261,8 @@ fn in_order_ingest_after_a_loss_and_a_start_over_one_take_no_slow_path() {
     block_on(s.shutdown()).unwrap();
 }
 
-/// Q-925 as proposed, at the store: after a found loss, a reading whose key and lateness reference both lie in damage
-/// no scanning reader has met is recorded unchecked, not late, and counted once in `readings`; one whose reference
+/// The Q-925 count at the store, under either rule: after a found loss, a reading whose key and lateness reference both
+/// lie in damage no scanning reader has met is recorded unchecked and counted once in `readings`; one whose reference
 /// alone lies there is counted too.
 #[test]
 fn a_reading_with_its_key_and_reference_unreadable_is_counted_once() {
@@ -306,6 +306,5 @@ fn a_reading_with_its_key_and_reference_unreadable_is_counted_once() {
         .collect();
     assert_eq!(unchecked, [false, true]);
     assert_eq!(readings(&s), Some(2));
-    assert_eq!(s.series_stats(g).unwrap().late, 0);
     block_on(s.shutdown()).unwrap();
 }

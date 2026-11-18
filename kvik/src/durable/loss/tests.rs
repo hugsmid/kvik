@@ -229,6 +229,27 @@ fn the_latch_holds_one_report_per_loss_in_order_and_a_bridged_pair_becomes_one()
 }
 
 #[test]
+fn off_the_kept_log_rule_drops_only_a_query_find_at_or_below_the_head_the_start_set() {
+    let latch = Latch::default();
+    let (below, at_head, above) = (find(5, 6), find(10, 11), find(20, 21));
+    let head = || latch.lock().kept_head;
+    assert!(
+        latches(head(), &below, FoundBy::Query, false),
+        "before the start is done"
+    );
+    latch.started(at(10));
+    assert_eq!(head(), Some(at(10)));
+    assert!(!latches(head(), &below, FoundBy::Query, false));
+    assert!(!latches(head(), &at_head, FoundBy::Query, false));
+    assert!(latches(head(), &above, FoundBy::Query, false));
+    for f in [&below, &at_head, &above] {
+        assert!(latches(head(), f, FoundBy::Scan, false));
+        assert!(latches(head(), f, FoundBy::Query, true));
+        assert!(latches(head(), f, FoundBy::Scan, true));
+    }
+}
+
+#[test]
 fn closed_ranges_are_handed_out_once_per_reader_and_an_empty_one_never() {
     let latch = Latch::default();
     let (mut a, mut b) = (0, 0);

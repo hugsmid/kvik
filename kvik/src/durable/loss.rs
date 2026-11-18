@@ -32,8 +32,15 @@ struct State {
 
 /// Q-928, proposal: damage the store's own reader finds in a batch the start had read (the kept log) is a loss like any
 /// other. Off, such a find is not latched: `losses()` does not report it and the decisions are not told, so a replay
-/// of a fact still in the recent window is dropped until the next start records the loss.
+/// of a fact still in the recent window is dropped until the next start records the loss. The tests it flips are
+/// listed in Q-928.
 const LATCH_DAMAGE_TO_THE_KEPT_LOG_A_QUERY_FINDS: bool = true;
+
+/// Whether a find is latched, given the kept log's head and the Q-928 rule.
+fn latches(kept_head: Option<LogPos>, f: &Find, by: FoundBy, kept_log_rule: bool) -> bool {
+    let in_kept_log = kept_head.is_some_and(|h| f.closed.0 <= h);
+    kept_log_rule || by == FoundBy::Scan || !in_kept_log
+}
 
 /// Which reader found a loss.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +74,12 @@ impl Latch {
     pub(crate) fn note(&self, found: &[Find], by: FoundBy) {
         let mut s = self.lock();
         for f in found {
-            let in_kept_log = s.kept_head.is_some_and(|h| f.closed.0 <= h);
-            if by == FoundBy::Query && in_kept_log && !LATCH_DAMAGE_TO_THE_KEPT_LOG_A_QUERY_FINDS {
+            if !latches(
+                s.kept_head,
+                f,
+                by,
+                LATCH_DAMAGE_TO_THE_KEPT_LOG_A_QUERY_FINDS,
+            ) {
                 continue;
             }
             let l = &f.report;
