@@ -158,7 +158,8 @@ impl At<'_> {
         }
     }
 
-    /// When `live`, series `id`'s state, may change with no new fact: a fact falling due or its staleness passing.
+    /// When series `id`, whose live state is `live`, may change with no new fact: a fact falling due or its
+    /// staleness passing.
     fn due(&self, registry: &Registry, id: SeriesId, live: &Live) -> Option<i64> {
         let s = registry.get(id.0)?;
         let p = windows::params(&s.def);
@@ -314,10 +315,10 @@ impl Session {
             }
             let wait = left.min(self.opts.poll_interval);
             match &self.watch {
-                Some(w) => {
+                Some(w) if !w.stopped() => {
                     w.wait_progress(self.progress, wait);
                 }
-                None => std::thread::sleep(wait),
+                _ => std::thread::sleep(wait),
             }
         }
     }
@@ -357,11 +358,12 @@ impl Session {
             };
         let due = self.due().is_some_and(|d| d <= r.now());
         let refreshed = r.clocks().refreshes() != self.refreshes;
-        let current = if poll {
+        // Rounds other calls ran since the last batch serve it with no read of the mark, while their cut is live.
+        let current = if poll || due || refreshed {
             None
         } else {
             r.current()
-                .filter(|v| v.round() > self.at.0 || due || refreshed)
+                .filter(|v| v.round() > self.at.0 && r.check(v).is_ok())
         };
         let v = match current {
             Some(v) => v,
