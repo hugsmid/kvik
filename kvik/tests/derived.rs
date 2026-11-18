@@ -299,11 +299,9 @@ fn a_series_directory_counting_a_fact_found_lost_is_removed_while_the_store_idle
 }
 
 /// After a restart over a region in a sealed segment, which no lost range records, a query that meets the region
-/// before the first new file stops neither it nor the fold: a reader that meets a region already latched hands on no
-/// range for it again. A broken fold removes its files, so the run's file still being there shows the fold whole,
-/// whichever came first.
+/// again hands on no second loss, and the run writes no series directory (Q-1002), whichever came first.
 #[test]
-fn a_query_before_the_first_series_directory_after_a_restart_does_not_stop_it() {
+fn a_query_meeting_a_region_the_start_met_adds_no_loss_and_the_run_writes_no_series_directory() {
     let w = World::new("derived-query-first");
     let s = open(&w);
     let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
@@ -317,12 +315,28 @@ fn a_query_before_the_first_series_directory_after_a_restart_does_not_stop_it() 
     let s = open(&w);
     let all = Timestamp(0)..Timestamp(i64::MAX);
     assert_eq!(s.reader().facts(g, all, View::History).unwrap().count(), 2);
+    assert_eq!(data_lost(&s), 1);
     emit(&s, &[num(g, 3, 4_444.5)]);
-    wait_for(&w, 1);
-    std::thread::sleep(Duration::from_secs(2));
-    let d = series_dir(&w).expect("the run's series directory is still there");
-    check(&s, &d, &[g]);
+    no_series_directory_after_a_seal(&w);
+    assert_eq!(data_lost(&s), 1);
     block_on(s.shutdown()).unwrap();
+}
+
+/// Waits for a seal after the call, then for the directories' work after it: none of the run's series directories
+/// is on disk.
+fn no_series_directory_after_a_seal(w: &World) {
+    let sealed =
+        w.fs.paths()
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "kvl"))
+            .count();
+    wait_sealed(w, sealed + 1);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        series_dir(w).is_none(),
+        "{:?}",
+        series_dir(w).map(|d| d.through)
+    );
 }
 
 /// A fact the process finds lost after the deliverer folded it: no series directory written afterwards counts it, so
@@ -360,8 +374,11 @@ fn a_fact_found_lost_while_open_is_never_counted_by_a_series_directory_of_the_ru
 /// A series directory through a position the next start finds lost, in a sealed segment no lost range records, is
 /// not continued and is removed at the open: no file on disk counts the lost fact, and the reopened store's first
 /// file agrees with what it shows.
+/// A region the start meets in a sealed segment, which no lost range records, lies below every series directory the
+/// run could write: none is continued or written, so a reader process reads the log whole and reports the loss
+/// (Q-952, Q-1002).
 #[test]
-fn a_series_directory_through_a_region_the_start_meets_is_not_continued() {
+fn a_run_over_a_region_the_start_meets_and_no_lost_range_records_writes_no_series_directory() {
     let w = World::new("derived-lost-start");
     let s = open(&w);
     let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
@@ -374,12 +391,42 @@ fn a_series_directory_through_a_region_the_start_meets_is_not_continued() {
     block_on(s.shutdown()).unwrap();
     assert!(series_dir(&w).is_some());
     let s = open(&w);
-    if let Some(d) = series_dir(&w) {
-        check(&s, &d, &[g]);
-    }
     assert_eq!(data_lost(&s), 1, "the start meets the region");
     emit(&s, &[num(g, 3, 4_444.5)]);
-    let d = wait_for(&w, 1);
-    check(&s, &d, &[g]);
+    no_series_directory_after_a_seal(&w);
+    let r = kvik::Reader::open(kvik::ReaderConfig::new(&w.dir).env(w.config().env)).unwrap();
+    let lost: Vec<_> = r
+        .losses()
+        .into_iter()
+        .filter(|l| l.kind == kvik::LossKind::DataLost)
+        .collect();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert_eq!(r.live(g).unwrap(), s.reader().live(g).unwrap());
+    block_on(s.shutdown()).unwrap();
+}
+
+/// Q-1001: a series defined during the run is in a registry file before any series directory covers its
+/// definition, so that a reader takes the registry from the file and the log above the directory's `through`.
+#[test]
+fn a_series_directory_never_covers_an_entry_the_registry_file_lacks() {
+    let w = World::new("derived-registry-cover");
+    let s = open(&w);
+    let g = block_on(s.define_series(gauge("site/dev/m0"))).unwrap();
+    emit(&s, &[num(g, 0, 1.0)]);
+    block_on(s.shutdown()).unwrap();
+    let s = open(&w);
+    let late = block_on(s.define_series(gauge("site/dev/m1"))).unwrap();
+    let last = emit(&s, &[num(late, 1, 2.0)]);
+    wait_sealed(&w, 1);
+    let d = wait_for(&w, last);
+    let (_, file) = kvik_log::registry::read_latest(&*w.fs, Path::new(&w.dir), &store_id(&w))
+        .unwrap()
+        .unwrap();
+    let defined = file.entries.iter().find_map(|(seq, _, e)| match e {
+        kvik_log::entries::Entry::Definition(def) if def.id == late.0 => Some(*seq),
+        _ => None,
+    });
+    let defined = defined.expect("the late definition is in the registry file");
+    assert!(defined <= d.through.sequence && defined <= file.through);
     block_on(s.shutdown()).unwrap();
 }

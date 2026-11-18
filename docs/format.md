@@ -825,7 +825,9 @@ hot tier: `registry/<generation>-<file_id>.reg`.
   rebuilds the registry from the kept log and checks the file against it (the Derived check, Q-33): the file must
   hold exactly the kept log's registry entries up to the last synced mark, with an id floor at least the writer's;
   if it does not, it is written again from the kept log, with the writer's id floor, so the id of a lost definition
-  stays assigned. The writer writes it again at clean shutdown, after the last mark sync. Until log segments can leave
+  stays assigned. The writer writes it again at clean shutdown, after the last mark sync, after a routing change, and before
+  a series directory (A.18) whose `through` is at or above an entry the file does not hold, up to that `through`
+  (Q-1001), so a reader continuing a series directory takes every entry at or below it from the file. Until log segments can leave
   the hot tier (roadmap 8.1) or be compacted (6.x), the kept log holds every registry entry, so the file is checked,
   never trusted over the log.
 

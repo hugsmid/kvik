@@ -232,6 +232,8 @@ pub(crate) struct Writer {
     watch: Mutex<loss::Watch>,
     /// The losses the start found and could not record (`spec.md` §3 Order of a start, step 3).
     start_losses: Vec<LossReport>,
+    /// The registry file's `through` as last written, and the lock of every write of the file (Q-1001).
+    registry_written: derived::RegistryWritten,
     /// What attaching a bucket warns of under this configuration (Q-970).
     bucket_warning: Option<String>,
 }

@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kvik_log::content::Item;
-use kvik_log::directory::Family;
 use kvik_log::directory::series::SeriesEntry;
 use kvik_log::directory::status::{counter, health, reason};
 use kvik_log::entries::{Entry, Versioning};
@@ -52,6 +51,8 @@ struct Fold {
     synced: LogPos,
     /// The latch's closed ranges already looked at.
     closed_seen: usize,
+    /// The highest position of an entry taken that changes the registry.
+    last_entry: Option<LogPos>,
 }
 
 impl Fold {
@@ -62,6 +63,9 @@ impl Fold {
                 Item::Entry(e) => {
                     if let Entry::Definition(d) = &**e {
                         self.defined.insert(d.id, d.versioning != Versioning::None);
+                    }
+                    if !matches!(**e, Entry::Ignored { .. }) {
+                        self.last_entry = self.last_entry.max(Some(*p));
                     }
                 }
                 Item::Fact(f) if *p > self.applied => {
@@ -145,6 +149,11 @@ impl SeriesFold {
                 f.broken = true;
             }
         }
+    }
+
+    /// The highest position of an entry taken that changes the registry.
+    pub(crate) fn last_entry(&self) -> Option<LogPos> {
+        lock(&self.fold).last_entry
     }
 
     /// Continues from a series directory found valid: its entries as of `through`, written at `written_at`.
@@ -258,7 +267,17 @@ struct Parts {
 pub(crate) struct Hook {
     pub(crate) fold: Arc<SeriesFold>,
     parts: OnceLock<Parts>,
+    /// Makes the registry file cover every entry up to the position given, the last entry taken being the second
+    /// (Q-1001): whether it does.
+    registry: OnceLock<RegistryCover>,
 }
+
+/// See [`Hook::registry`].
+type RegistryCover = Box<dyn Fn(LogPos, LogPos) -> bool + Send + Sync>;
+
+/// The `through` of the registry file this process last wrote or found current, under the lock that every write of
+/// the file takes, so that the newest file is never one computed before another (Q-1001).
+pub(crate) type RegistryWritten = Arc<Mutex<Option<LogPos>>>;
 
 impl std::fmt::Debug for Hook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -326,9 +345,26 @@ impl Parts {
     }
 }
 
+impl Hook {
+    /// Gives the hook what makes the registry file cover the entries a series directory covers (Q-1001).
+    pub(crate) fn registry(&self, cover: impl Fn(LogPos, LogPos) -> bool + Send + Sync + 'static) {
+        let _ = self.registry.set(Box::new(cover));
+    }
+}
+
 impl SealHook for Hook {
+    /// No series directory names a position at or above an entry the registry file does not hold (Q-1001): a reader
+    /// takes the registry from the file and the log above the directory's `through`.
     fn series(&self, limit: LogPos, written_at: i64) -> Option<SeriesEntries> {
-        self.fold.entries(limit, written_at)
+        let e = self.fold.entries(limit, written_at)?;
+        match self.fold.last_entry() {
+            None => Some(e),
+            Some(entry) => self
+                .registry
+                .get()
+                .is_some_and(|cover| cover(e.through, entry))
+                .then_some(e),
+        }
     }
 
     fn series_void(&self) -> bool {
@@ -377,10 +413,9 @@ impl SealHook for Hook {
 }
 
 /// The seal hook of a store opening: its fold continues from the newest series directory that is still a function of
-/// the kept log (A.18 Validation, as the writer applies it), or starts empty. A file is not continued, and the series
-/// directories are removed, when the start met a region at or below its `through` that no lost range of the manifest
-/// holds (`latch`, `recorded`): its counts include facts the store reports lost. The fold then watches `latch` for
-/// losses found later.
+/// the kept log (A.18 Validation, as the writer applies it), or starts empty. When the start met a region that no lost
+/// range of the manifest holds (`latch`, `recorded`), the run writes no series directory and removes those on disk
+/// (Q-952, Q-1002). The fold then watches `latch` for losses found later.
 pub(crate) fn hook(
     writer: &kvik_log::writer::LogWriter,
     fs: &dyn kvik_log::fs::Fs,
@@ -391,18 +426,22 @@ pub(crate) fn hook(
 ) -> Arc<Hook> {
     let fold = SeriesFold::new(writer.stats().mark_synced);
     let start = writer.directory_start();
-    if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start) {
-        if !lost_since(&latch.found(), recorded, d.through) {
-            fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
-        } else if kvik_log::directory::remove_family(fs, dir, Family::Series).is_err() {
-            // The declined file must not stay the newest: the writer removes it once the fold is broken.
-            lock(&fold.fold).broken = true;
-        }
+    let end = LogPos {
+        generation: u32::MAX,
+        sequence: u64::MAX,
+    };
+    if lost_since(&latch.found(), recorded, end) {
+        // Below every series directory this run could write: none is written, and those on disk are removed, so that
+        // no reader continuing one passes over the loss unreported (Q-1002).
+        lock(&fold.fold).broken = true;
+    } else if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start) {
+        fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
     }
     fold.watch_losses(latch.clone());
     Arc::new(Hook {
         fold: Arc::new(fold),
         parts: OnceLock::new(),
+        registry: OnceLock::new(),
     })
 }
 
