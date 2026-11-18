@@ -527,7 +527,11 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   grows that loss under its identity, `recorded` false and not acknowledged until a record and a new acknowledgement
   cover its whole range. When the loss reports cannot be read (the
   mark or the manifest unreadable), `losses()` returns those the process already holds and health is at least
-  `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A `DataLost` holds health `Degraded` until it is closed (spec §8
+  `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A sealed segment that disappears with no
+  manifest record naming its removal is a loss only where a reader of the process had read from it: that reader's
+  next call fails (`LossesUnknown` for `losses()` and `health()`, `NotAvailable` for a query). A reader that had not,
+  a reader process opened later and the next start pass over it, and its positions are reported by none of them
+  (Q-951, open). A `DataLost` holds health `Degraded` until it is closed (spec §8
   Self-repair): restored in full from a copy, its re-send stage ended (`repair_done`, `repair.resend_wait`), or by
   `acknowledge_losses`, which with `repair.acknowledge = Manual` is the only way once the re-send stage has ended. A
   `PossibleLoss` is listed by `losses()`, counted, never degrades, has no state and needs no acknowledgement (spec §8

@@ -409,6 +409,38 @@ fn a_reader_takes_every_acknowledged_batch_and_nothing_above_the_mark() {
     assert_eq!(u.state.durable.sequence, m.last_sequence);
 }
 
+/// The segment holding the newest batch a caught-up reader returned, gone with no record naming its removal, is
+/// `SegmentMissing`, not a void: nothing removes such a segment yet (Q-951). A seal only renames it.
+#[test]
+fn a_caught_up_reader_whose_newest_batch_segment_is_gone_reports_it_missing() {
+    let mut r = Rig::new(WriterConfig {
+        seal_interval: Duration::from_secs(1),
+        segment_size: 1 << 20,
+        ..cfg()
+    });
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    let first = r.mark().unwrap().file_id;
+    for _ in 0..200 {
+        r.step();
+        r.clock.advance(10 * MS);
+    }
+    r.submit(items(2, 100));
+    r.drain();
+    assert!(r.mark().unwrap().file_id > first);
+    let name = SegmentName {
+        generation: 0,
+        file_id: first,
+        sealed: true,
+    };
+    r.fs.remove_file(&log_path(&name.to_string())).unwrap();
+    assert!(matches!(
+        r.refresh(),
+        Err(ReaderError::SegmentMissing { file_id }) if file_id == first
+    ));
+}
+
 #[test]
 fn a_reader_follows_segment_rolls_and_seals() {
     let mut r = Rig::new(WriterConfig {

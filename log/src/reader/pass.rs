@@ -244,6 +244,13 @@ impl LogReader {
         if self.still_reads(last)? {
             return Ok(());
         }
+        // The segment of a batch returned below a mark read is gone: no removal is recorded yet (retention and
+        // compaction, roadmap 6.3b), and recovery deletes only segments holding no batch in use (Q-951).
+        if self.open_segment(last.segment)?.is_none() {
+            return Err(ReaderError::SegmentMissing {
+                file_id: last.file_id,
+            });
+        }
         let mut keep = 0;
         for fp in &view.recent {
             if !self.still_reads(fp)? {

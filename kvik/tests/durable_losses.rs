@@ -593,13 +593,15 @@ fn damage_inside_a_loss_reported_too_wide_reaches_the_stores_reader_and_its_repl
     block_on(s.shutdown()).unwrap();
 }
 
-/// A loss watch not polled across the removal of the segment it stands in: the log reader passes over a segment no
-/// listing holds and voids what it took from it, so the watch reads on from the segments present and still finds
-/// damage written after them (Q-927, Q-950). The rule is for a removal a manifest record names, as retention and
-/// compaction will write; none removes a segment yet. This removal has no record, and today no reader reports its
-/// positions lost (Q-951, for the owner).
+fn losses_unknown(h: &Health) -> bool {
+    matches!(h, Health::Degraded { reasons } if reasons.iter().any(|x| matches!(x, Reason::LossesUnknown { .. })))
+}
+
+/// The segment a caught-up loss watch stands in, holding the newest batch it returned, removed with no record naming
+/// the removal: nothing removes such a segment yet, so the watch reports `LossesUnknown` at every call rather than
+/// reading on as if nothing were lost (Q-951).
 #[test]
-fn an_unpolled_watch_reads_on_past_the_removal_of_the_segment_it_stands_in() {
+fn a_watch_whose_segment_is_removed_reports_losses_unknown() {
     let w = World::new("unpolled-watch");
     let mut config = w.config();
     config.log.seal_interval = std::time::Duration::from_millis(20);
@@ -612,7 +614,36 @@ fn an_unpolled_watch_reads_on_past_the_removal_of_the_segment_it_stands_in() {
     assert!(data_lost(&s.losses()).is_empty());
     block_on(s.emit(&[note(id, 2, "UW-TWO")])).unwrap();
     sealed_with(&w, b"UW-TWO");
-    block_on(s.emit(&[note(id, 3, "UW-THREE")])).unwrap();
+    let (path, _) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(6).any(|x| x == b"UW-ONE"))
+        .unwrap();
+    kvik::env::Fs::remove_file(&*w.fs, &path).unwrap();
+    for _ in 0..2 {
+        assert!(losses_unknown(&s.health()), "{:?}", s.health());
+    }
+    block_on(s.shutdown()).unwrap();
+}
+
+/// A segment no caught-up reader of the process stands in, removed with no record naming the removal, is passed
+/// over: a caught-up reader opens segments by name and skips one no listing holds (Q-852), as it must for a segment
+/// recovery deleted holding no batch in use. The watch reads on and still finds damage written after it; the removed
+/// positions are reported by no reader (Q-951, for the owner).
+#[test]
+fn a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found() {
+    let w = World::new("passed-over");
+    let mut config = w.config();
+    config.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    block_on(s.emit(&[note(id, 0, "UW-ZERO")])).unwrap();
+    sealed_with(&w, b"UW-ZERO");
+    assert!(data_lost(&s.losses()).is_empty());
+    block_on(s.emit(&[note(id, 1, "UW-ONE")])).unwrap();
+    sealed_with(&w, b"UW-ONE");
+    block_on(s.emit(&[note(id, 2, "UW-TWO")])).unwrap();
+    sealed_with(&w, b"UW-TWO");
     let (path, _) = w
         .segments()
         .into_iter()
@@ -631,9 +662,10 @@ fn an_unpolled_watch_reads_on_past_the_removal_of_the_segment_it_stands_in() {
     block_on(s.shutdown()).unwrap();
 }
 
-/// After the void of a removed segment, a damaged region at the head of the next segment takes its first position
-/// from the void, so the loss is reported from the removed segment's first position; with no batch after it in its
-/// segment it runs to the mark read, past the intact batch that follows. Too wide, never too narrow (Q-951).
+/// After a removed segment the watch passed over, a damaged region at the head of the next segment takes its first
+/// position from the last batch read before it, so the loss is reported from the removed segment's first position;
+/// with no batch after it in its segment it runs to the mark read, past the intact batch that follows. Too wide, never
+/// too narrow (Q-951).
 #[test]
 fn a_region_after_a_removed_segment_is_reported_from_the_removed_positions() {
     let w = World::new("removed-then-region");
@@ -650,7 +682,7 @@ fn a_region_after_a_removed_segment_is_reported_from_the_removed_positions() {
                 .unwrap(),
         );
         sealed_with(&w, t.as_bytes());
-        if k == 1 {
+        if k == 0 {
             assert!(data_lost(&s.losses()).is_empty());
         }
     }
