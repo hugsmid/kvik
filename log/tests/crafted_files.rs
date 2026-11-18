@@ -11,6 +11,7 @@ use kvik_log::crc::{crc32c, crc32c_shift};
 use kvik_log::header::{FileHeader, HEADER_LEN, kind};
 use kvik_log::manifest::{
     ManifestError, RECORD_EMPTY, RECORD_LOST_RANGE, encode_record, read_manifest_with_stats,
+    read_records_with_stats,
 };
 use kvik_log::scan::{FAILED_READ_BUDGET as BUDGET, ScanLimit, Tail, legacy, scan_with_stats};
 use support::*;
@@ -239,9 +240,14 @@ fn full_crafted_windows_stay_within_the_budget_and_a_smoke_ceiling() {
 /// A manifest whose first record is damaged, then `m` records of type `t` sharing one list of `g` empty fields of id
 /// `field`: record `k` starts inside a field of every record before it. Each has a valid checksum and no field 1.
 fn crafted_manifest(m: u64, g: u64, t: u8, field: u16) -> Vec<u8> {
-    let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+    let f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
         .encode()
         .to_vec();
+    crafted_after(f, 1_000, m, g, t, field)
+}
+
+/// [`crafted_manifest`]'s damaged record and crafted records after `f`, the crafted epochs from `epoch`.
+fn crafted_after(mut f: Vec<u8>, epoch: u64, m: u64, g: u64, t: u8, field: u16) -> Vec<u8> {
     f.extend_from_slice(&[0xFF; 8]);
     let base = f.len() as u64;
     let e = (base + 48 * m + 4 * g).div_ceil(8) * 8;
@@ -254,7 +260,7 @@ fn crafted_manifest(m: u64, g: u64, t: u8, field: u16) -> Vec<u8> {
     for k in (0..m).rev() {
         let p = base + 48 * k;
         let body = p + 16;
-        put(&mut f, body, &(1_000 + k).to_le_bytes());
+        put(&mut f, body, &(epoch + k).to_le_bytes());
         if k > 0 {
             put(&mut f, p - 8, &field.to_le_bytes());
             put(&mut f, p - 6, &44u16.to_le_bytes());
@@ -297,6 +303,30 @@ fn a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_i
     let (r, stats) = read_manifest_with_stats(&f, &[9; 16]);
     assert_eq!(r, Err(ManifestError::Corrupt(HEADER_LEN as u64)));
     assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
+}
+
+/// The failed reads' charges and the search's probes name the same window when a reader parses only a tail from a
+/// base that is not a multiple of the window.
+#[test]
+fn a_crafted_manifest_tail_read_from_inside_a_window_charges_the_window_it_probes() {
+    let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+        .encode()
+        .to_vec();
+    let mut epoch = 0;
+    while (f.len() as u64) < MW + MW / 2 {
+        epoch += 1;
+        f.extend(encode_record(RECORD_EMPTY, epoch, 0, 0, None));
+    }
+    let base = f.len() as u64;
+    assert!(base % MW != 0);
+    let f = crafted_after(f, epoch + 1, 2_000, 100_000, RECORD_LOST_RANGE, 0x8001);
+    let (whole, whole_stats) = read_manifest_with_stats(&f, &[9; 16]);
+    let whole = whole.unwrap();
+    assert_eq!((whole.records.len() as u64, whole.valid_end), (epoch, base));
+    let (tail, stats) = read_records_with_stats(&f[base as usize..], base, epoch);
+    assert_eq!(tail, Ok((Vec::new(), base)));
+    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
+    assert_eq!(stats.failed_bytes_peak, whole_stats.failed_bytes_peak);
 }
 
 #[test]

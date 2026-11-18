@@ -333,7 +333,18 @@ pub fn read_records(
     base: u64,
     last_epoch: u64,
 ) -> Result<(Vec<Record>, u64), ManifestError> {
-    records_in(&mut Search::new(tail, base), last_epoch)
+    read_records_with_stats(tail, base, last_epoch).0
+}
+
+/// [`read_records`], with the work it did; the failed reads' budget applies per window of file offsets.
+pub fn read_records_with_stats(
+    tail: &[u8],
+    base: u64,
+    last_epoch: u64,
+) -> (Result<(Vec<Record>, u64), ManifestError>, ScanStats) {
+    let mut search = Search::new(tail, base);
+    let r = records_in(&mut search, last_epoch);
+    (r, search.stats())
 }
 
 fn records_in(
