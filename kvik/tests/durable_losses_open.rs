@@ -18,6 +18,9 @@ enum Place {
     Middle,
     /// A batch of the kept log, damaged after a restart: the store's own reader, at its first query (Q-928).
     Kept,
+    /// Any batch, each the last of a sealed segment: the store's own reader at its first query, or the loss watch at
+    /// `losses()`. A loss's `last` is left out: the bound of a damaged last batch differs by reader (Q-937).
+    Sealed { query: bool },
 }
 
 /// How a store meets the damage.
@@ -44,39 +47,50 @@ fn text(k: usize) -> String {
     format!("NOTE-{k:03}")
 }
 
-fn open(w: &World, small: bool) -> Store {
+fn open(w: &World, small: bool, sealed: bool) -> Store {
     let mut config = w.config();
+    if sealed {
+        config.log.seal_interval = std::time::Duration::from_millis(20);
+    }
     if small {
         config.limits.window_memory = 4 << 10;
     }
     block_on(Store::open(config)).unwrap()
 }
 
-fn restart(w: &World, s: Store, small: bool) -> Store {
+fn restart(w: &World, s: Store, small: bool, sealed: bool) -> Store {
     block_on(s.shutdown()).unwrap();
     drop(s);
-    open(w, small)
+    open(w, small, sealed)
 }
 
 fn run(name: &str, n: usize, at: usize, place: Place, meets: Meets, small: bool) -> Seen {
     let w = World::new(name);
-    let mut s = open(&w, small);
+    let sealed = matches!(place, Place::Sealed { .. });
+    let mut s = open(&w, small, sealed);
     let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
     for k in 0..n {
         block_on(s.emit(&[note(id, k as i64, &text(k))])).unwrap();
+        if sealed {
+            sealed_with(&w, text(k).as_bytes());
+        }
     }
     if matches!(place, Place::Kept) {
-        s = restart(&w, s, small);
+        s = restart(&w, s, small, sealed);
     }
     damage(&w, text(at).as_bytes());
     if meets != Meets::Restart {
         match place {
-            Place::Newest => assert_eq!(data_lost(&s.losses()).len(), 1),
-            Place::Middle | Place::Kept => assert_eq!(history(&s.reader(), id).len(), n - 1),
+            Place::Newest | Place::Sealed { query: false } => {
+                assert_eq!(data_lost(&s.losses()).len(), 1)
+            }
+            Place::Middle | Place::Kept | Place::Sealed { query: true } => {
+                assert_eq!(history(&s.reader(), id).len(), n - 1)
+            }
         }
     }
     if meets != Meets::Open {
-        s = restart(&w, s, small);
+        s = restart(&w, s, small, sealed);
     }
     let mut outcomes = Vec::new();
     for k in (0..n).chain([n + 10]) {
@@ -89,7 +103,10 @@ fn run(name: &str, n: usize, at: usize, place: Place, meets: Meets, small: bool)
     let losses = s
         .losses()
         .iter()
-        .map(|l| format!("{:?} {:?} {:?} {:?}", l.kind, l.identity, l.first, l.last))
+        .map(|l| {
+            let last = if sealed { None } else { l.last };
+            format!("{:?} {:?} {:?} {:?}", l.kind, l.identity, l.first, last)
+        })
         .collect();
     let info = s.series(id).unwrap();
     let series = format!("{:?} {:?}", info.latest_t, info.lateness_reference);
@@ -105,9 +122,13 @@ fn compare(n: usize, at: usize, place: Place, small: bool) -> Result<(), TestCas
     let at = match place {
         Place::Newest => n - 1,
         Place::Middle => at % (n - 1),
-        Place::Kept => at % n,
+        Place::Kept | Place::Sealed { .. } => at % n,
     };
-    let name = |m: &str| format!("loss-open-{place:?}-{n}-{at}-{small}-{m}");
+    let place_name: String = format!("{place:?}")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let name = |m: &str| format!("loss-open-{place_name}-{n}-{at}-{small}-{m}");
     let open = run(&name("open"), n, at, place, Meets::Open, small);
     let then = run(&name("then"), n, at, place, Meets::OpenThenRestart, small);
     let restarted = run(&name("restart"), n, at, place, Meets::Restart, small);
@@ -122,7 +143,7 @@ fn compare(n: usize, at: usize, place: Place, small: bool) -> Result<(), TestCas
 }
 
 /// Three stores per case, compared on outcomes and flags (positions left out), on `losses()` apart from `recorded`
-/// and on `series()`: one finds the loss while open, one finds it and restarts, one restarts without finding it.
+/// (and `last` with sealed segments, Q-937) and on `series()`: one finds the loss while open, one finds it and restarts, one restarts without finding it.
 #[test]
 fn a_loss_found_while_open_decides_as_a_restart_over_it_does() {
     let cases = (ProptestConfig::default().cases / 8).max(8);
@@ -131,7 +152,12 @@ fn a_loss_found_while_open_decides_as_a_restart_over_it_does() {
         failure_persistence: None,
         ..ProptestConfig::default()
     });
-    let place = prop_oneof![Just(Place::Newest), Just(Place::Middle), Just(Place::Kept)];
+    let place = prop_oneof![
+        Just(Place::Newest),
+        Just(Place::Middle),
+        Just(Place::Kept),
+        any::<bool>().prop_map(|query| Place::Sealed { query }),
+    ];
     runner
         .run(
             &(3usize..9, 0usize..8, place, any::<bool>()),
