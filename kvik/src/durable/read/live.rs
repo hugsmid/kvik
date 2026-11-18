@@ -192,7 +192,8 @@ impl At<'_> {
 /// A batch and the session's state after it, kept once the batch's cut proved live.
 struct Next {
     batch: Option<UpdateBatch>,
-    reads: BTreeMap<LiveId, Read>,
+    /// `None` when nothing changed.
+    reads: Option<BTreeMap<LiveId, Read>>,
     at: (u64, usize),
     recorded: Vec<(LogPos, LogPos)>,
     refreshes: u64,
@@ -390,7 +391,9 @@ impl Session {
         let live = r.end(v);
         let next = out?;
         live?;
-        self.reads = next.reads;
+        if let Some(reads) = next.reads {
+            self.reads = reads;
+        }
         self.at = next.at;
         self.recorded = next.recorded;
         self.refreshes = next.refreshes;
@@ -417,9 +420,27 @@ impl Session {
         let taken = r.hub().take(sub, v.round(), mono);
         let refreshes = r.clocks().refreshes();
         let recorded = recorded(v);
+        let now = r.now();
+        let quiet = !taken.idle
+            && !taken.lagged
+            && taken.backlog == (0, 0)
+            && taken.rounds.iter().all(|x| x.pieces.is_empty())
+            && refreshes == self.refreshes
+            && recorded == self.recorded
+            && self.reads.values().all(Read::opened)
+            && self.due().is_none_or(|d| d > now);
+        if quiet {
+            return Ok(Next {
+                batch: None,
+                reads: None,
+                at: (v.round(), 0),
+                recorded,
+                refreshes,
+                idle: false,
+            });
+        }
         let mut reads = self.reads.clone();
         let mut events: Vec<(LiveId, LiveEvent)> = Vec::new();
-        let now = r.now();
         if taken.idle {
             for id in std::mem::take(&mut reads).into_keys() {
                 events.push((id, LiveEvent::Closed(CloseReason::Idle)));
@@ -431,7 +452,7 @@ impl Session {
             };
             return Ok(Next {
                 batch: Some(b),
-                reads,
+                reads: Some(reads),
                 at: self.at,
                 recorded,
                 refreshes,
@@ -494,7 +515,7 @@ impl Session {
         });
         Ok(Next {
             batch,
-            reads,
+            reads: Some(reads),
             at,
             recorded,
             refreshes,

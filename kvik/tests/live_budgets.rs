@@ -176,6 +176,22 @@ fn tail_while_writing_timed() {
     let tail = Query::Tail { sel: all() };
     let latest = Query::Latest(all());
     let other = Reader::open(ReaderConfig::new(&dir)).unwrap();
+    let mut runs = Vec::new();
+    for _ in 0..RUNS {
+        let mut total = Duration::ZERO;
+        for _ in 0..POLLS {
+            std::thread::sleep(Duration::from_millis(11));
+            let began = Instant::now();
+            other.refresh().unwrap();
+            total += began.elapsed();
+        }
+        runs.push(total.as_secs_f64() * 1e6 / POLLS as f64);
+    }
+    best_and_spread(
+        "a reader process's refresh finding nothing new, for comparison",
+        "µs",
+        &runs,
+    );
     empty_polls(
         "a reader process, Tail",
         &other,
