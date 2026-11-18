@@ -22,6 +22,12 @@ pub mod kind {
     pub const STORE: u8 = 7;
     /// A reader's lease file (A.15).
     pub const LEASE: u8 = 8;
+    /// The log directory, root and groups (A.18).
+    pub const LOG_DIRECTORY: u8 = 15;
+    /// The series directory (A.18).
+    pub const SERIES_DIRECTORY: u8 = 16;
+    /// The status file (A.18).
+    pub const STATUS: u8 = 17;
 }
 
 /// A file header. Reserved bytes are written as zero and not read.

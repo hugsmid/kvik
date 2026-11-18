@@ -92,6 +92,20 @@ pub trait FsFile: Send + Sync + fmt::Debug {
     /// handle holds it (spec §3 Single writer). Released when the file is
     /// dropped.
     fn try_lock_exclusive(&self) -> io::Result<bool>;
+    /// The file's identity where the platform gives one; `None` otherwise. A file renamed over another has a new
+    /// identity at that path.
+    fn identity(&self) -> io::Result<Option<FileIdentity>> {
+        Ok(None)
+    }
+}
+
+/// A file's identity: on Unix, its device and inode numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    /// The device.
+    pub device: u64,
+    /// The file on that device.
+    pub inode: u64,
 }
 
 /// The operating system's file system through `std::fs`.
@@ -207,6 +221,15 @@ impl FsFile for StdFile {
     }
     fn len(&self) -> io::Result<u64> {
         Ok(self.0.metadata()?.len())
+    }
+    #[cfg(unix)]
+    fn identity(&self) -> io::Result<Option<FileIdentity>> {
+        use std::os::unix::fs::MetadataExt;
+        let m = self.0.metadata()?;
+        Ok(Some(FileIdentity {
+            device: m.dev(),
+            inode: m.ino(),
+        }))
     }
     fn try_lock_exclusive(&self) -> io::Result<bool> {
         match self.0.try_lock() {
@@ -349,6 +372,8 @@ enum Change {
 
 #[derive(Debug, Default)]
 struct MemData {
+    /// Its identity: unique per created file in this process.
+    id: u64,
     path: PathBuf,
     bytes: Vec<u8>,
     durable: Vec<u8>,
@@ -715,7 +740,9 @@ impl Fs for MemFs {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "file exists"));
             }
             (OpenMode::CreateNew, None) => {
+                static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let d = Arc::new(Mutex::new(MemData {
+                    id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     path: path.to_path_buf(),
                     ..MemData::default()
                 }));
@@ -921,6 +948,12 @@ impl FsFile for MemFile {
     }
     fn len(&self) -> io::Result<u64> {
         Ok(lock(&self.data).bytes.len() as u64)
+    }
+    fn identity(&self) -> io::Result<Option<FileIdentity>> {
+        Ok(Some(FileIdentity {
+            device: 0,
+            inode: lock(&self.data).id,
+        }))
     }
     fn try_lock_exclusive(&self) -> io::Result<bool> {
         let mut held = lock(&self.holds_lock);

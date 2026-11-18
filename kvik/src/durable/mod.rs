@@ -19,6 +19,7 @@ mod clock;
 mod completion;
 mod consumers;
 mod deliver;
+mod derived;
 mod emit;
 mod entries;
 #[cfg(test)]
@@ -31,6 +32,7 @@ mod loss;
 mod open;
 #[cfg(test)]
 mod pause;
+mod read;
 pub(crate) mod reader;
 #[cfg(test)]
 mod registering;
@@ -206,12 +208,12 @@ pub(crate) struct Writer {
     limits: Limits,
     log: RwLock<Option<Log>>,
     /// A fault of the start, or of a registry file write (`spec.md` §3 Write or sync failure).
-    own_fault: Mutex<Option<LogFault>>,
+    own_fault: Arc<Mutex<Option<LogFault>>>,
     store_id: [u8; 16],
     decider: Mutex<Decider>,
     /// The slow path's reads of local data, taken after the decision lock (roadmap 11.0).
     local: Mutex<Box<dyn keys::LocalFacts>>,
-    counters: Mutex<Counters>,
+    counters: Arc<Mutex<Counters>>,
     reader: Mutex<Option<Arc<DurableReader>>>,
     /// Acknowledged `data_lost` identities, each with the range it had then (spec §8 Acknowledging a loss: a range
     /// that grows needs a new acknowledgement, and acknowledging none writes nothing).
@@ -278,7 +280,7 @@ impl Writer {
             DurableReader::open_with(
                 &self.dir,
                 &self.env,
-                READER_LEASE,
+                (READER_LEASE, READER_LEASE),
                 self.clocks.clone(),
                 self.latch.clone(),
             )

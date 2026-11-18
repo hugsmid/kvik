@@ -168,7 +168,8 @@ pub enum DefineError { Ceiling { limit }, NameInUse, Conflict { field }, Invalid
     UnknownSeries, Retired, ScaleNotRaised { current: u8 }, ScaleOverflow { largest_magnitude: i64 }, Write(WriteError) }
 pub enum QueryError { UnknownSeries, DetailNotLocal { local_from: Option<Timestamp> }, AggregateRefused { reason },
     UnknownZone, NotAvailable { reason }, LostRange { id: Position }, MarkUnreadable, UnsupportedFormat { file }, Corrupt { file },
-    Io { path, source } }
+    Io { path, source },
+    CutExpired }                   // the read's cut ended first (Reader processes); nothing returned; start again
 ```
 Funnel compilation errors are `ConsumerError::Route` (a funnel refused, spec §4 and §6 Cadence),
 `ConsumerError::Pattern(RouteError)` (a name pattern refused, Consuming), and `ConsumerError::RouteCycle` (a route
@@ -365,8 +366,8 @@ pub enum RouteError { TooLong { len: usize }, Segments { found: usize }, EmptySe
 
 ## Reader processes (accepted at gate 3.3)
 ```rust
-pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min }; blocking
-pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease
+pub fn Reader::open(cfg: ReaderConfig) -> Result<Reader, OpenError>;   // { dir, env, lease_refresh: 30 min, cut_max_age: 30 min }; blocking
+pub fn refresh(&self) -> Result<ReaderState, QueryError>;              // re-reads mark, manifest tail and new entries; renews the lease when due
 pub fn store_id(&self) -> [u8; 16];   // added for the export (Q-196): the id read at open; no file read, no lease renewal
 pub struct ReaderState { pub durable: Position, pub epoch: u64, pub generation: u32, pub stamp: ResetStamp, pub lease_renewed_at: Timestamp }
 pub struct ResetStamp { pub sequence: u64, pub nonce: u64 }      // zero before any reset (spec §7 Readers)
@@ -375,11 +376,21 @@ pub fn check(&self, point: SavedPoint) -> Result<PointCheck, QueryError>;   // r
 pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
 ```
 - Every read call first reads the mark and the entries appended since the reader's last call, so it sees data up to
-  the mark at call time. The lease is written at open and renewed by any call once half of `lease_refresh` has
-  passed, or by `refresh()`; a long iteration renews it as it advances. A reader idle past the expiry takes a new
-  epoch on its next call. There is no background task. `store_id` is the exception: an additive item (Q-196), it
-  returns the store id (`format.md` A.1) read with the descriptor at open and reads nothing. On the model backend it
-  is drawn from the environment's entropy at creation and kept while the process lives.
+  the mark at call time, and runs under that cut: the manifest epoch, the durable position and the reset stamp
+  (spec §7 Readers). A call's file work does not grow with the store's age: one read of the mark (two after a pass
+  that took something), the manifest checked by path and read only past what the reader holds, the new bytes, and no
+  directory listing once the reader has caught up. The lease names the lowest epoch of the reader's live cuts and
+  records the highest epoch read; it is written at open, and by any call when either would change or once half of
+  `lease_refresh` has passed; a long
+  iteration renews it as it advances. A reader idle past the expiry takes a new epoch on its next call. There is no
+  background task. `store_id` is the exception: an additive item (Q-196), it returns the store id (`format.md` A.1)
+  read with the descriptor at open and reads nothing. On the model backend it is drawn from the environment's entropy
+  at creation and kept while the process lives.
+- A cut lives at most `cut_max_age` (default 30 minutes; at most an hour, the grace period of retired files; zero is
+  refused with `OpenError::Config`) from the last manifest check that found its epoch current; a read still running
+  under it then, or under a cut whose lease a renewal found gone or changed (a reader stopped for over
+  an hour), ends with `CutExpired` and the caller starts again. A call whose pass is discarded because the reset
+  stamp changed while it read reads once more under the new cut; a second change is `CutExpired` too (Q-850).
 - Roadmap 5.1 ships `facts`, series lookup and `refresh` for reader processes, on the reader process of `kvik-log`
   (roadmap 4.6). Roadmap 5.4 adds `live`, windows, `buckets` and calendar results, evaluated from the facts the
   reader holds (a tree checkpoint plus the log since it serves them from roadmap 7.1). A reader process keeps its

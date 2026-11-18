@@ -28,10 +28,18 @@
 //! what is new: at most one segment's bytes per reader handle while it follows a segment. A whole-file read of an
 //! earlier segment is freed when the refresh ends, and the kept bytes are freed when another segment is followed.
 //!
-//! The reader names in its lease (`format.md` A.15) the manifest epoch it took: it writes the lease at open,
-//! renews it at every [`LogReader::refresh`], which takes the manifest's current epoch, and through
-//! [`LogReader::keep_alive`] once half of `lease_refresh` has passed. Renewal opens the lease by path, so a lease
-//! the writer deleted as expired is created again (with a new epoch). The lease is deleted on close.
+//! A call's file work does not grow with the log (query design §3.1): one read of the mark (a second one only after a
+//! pass that took something, the check above), the manifest checked by path and parsed only past what the reader
+//! holds ([`manifest`]), the open segment's new bytes, the last batch read again, and no directory listing once the
+//! reader has caught up: later segments are opened by name, with a listing only if one is not found.
+//!
+//! The lease (`format.md` A.15, `spec.md` §7 Readers) names the lowest manifest epoch among the reader's live cuts
+//! ([`LogReader::hold`]) and the epoch of the pass it is about to read, and records the highest epoch the reader has
+//! read. It is written at open, and later only when either would change or half of `lease_refresh` has passed, by a
+//! refresh, by [`LogReader::keep_alive`] or by [`LogReader::check_cut`]. A cut lives at most `cut_max_age` from the
+//! last manifest check that found its epoch current. Renewal opens the lease by path, so a lease the writer deleted as
+//! expired is created again; a lease found gone or changed since the reader wrote it ends every cut first. The lease
+//! is deleted on close.
 //!
 //! ```
 //! use std::path::Path;
@@ -73,21 +81,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::batch::SegmentIdentity;
 use crate::content::BatchContent;
 use crate::content_error::BodyError;
 use crate::crc::crc32c;
 use crate::error::FormatError;
 use crate::fs::Fs;
-use crate::header::HEADER_LEN;
-use crate::lease::{LEASE_EXPIRY, LEASE_REFRESH, LeaseSlot, lease_name};
+use crate::lease::{CutEnd, Cuts, LEASE_EXPIRY, LEASE_LEN, LEASE_REFRESH, LeaseSlot, lease_name};
 use crate::manifest::{LostRange, ManifestError};
 use crate::mark::{MarkSlot, ResetStamp};
-use crate::scan::{Found, InvalidRegion, Resume, ScanLimit, Scanner, set_aside};
+use crate::name::SegmentName;
+use crate::scan::{InvalidRegion, Resume};
 use crate::setaside::SetAside;
 use crate::store::{LEASES_DIR, LOG_DIR, StoreError, read_descriptor};
 use crate::writer::{Clock, Position};
-use files::read_part;
+use manifest::HeldManifest;
 
 /// How many times a reader reads the mark again when neither slot is valid (`format.md` A.10).
 pub const MARK_RETRIES: u32 = 8;
@@ -116,10 +123,13 @@ pub struct ReaderConfig {
     /// The restored ends in force, from the latest restore record: set-aside batches are skipped (`spec.md` §8
     /// Restore step 1).
     pub set_aside: SetAside,
+    /// The longest a cut lives (`spec.md` §7 Readers); at most [`LEASE_EXPIRY`], the grace period: a longer value
+    /// is taken as that, and zero as the default.
+    pub cut_max_age: Duration,
 }
 
 impl ReaderConfig {
-    /// A configuration with the default `lease_refresh` of 30 minutes.
+    /// A configuration with the default `lease_refresh` and `cut_max_age` of 30 minutes.
     pub fn new(
         dir: impl Into<PathBuf>,
         fs: Arc<dyn Fs>,
@@ -135,6 +145,7 @@ impl ReaderConfig {
             reader_id,
             lease_refresh: LEASE_REFRESH,
             set_aside: SetAside::default(),
+            cut_max_age: LEASE_REFRESH,
         }
     }
 }
@@ -184,6 +195,9 @@ pub enum ReaderError {
         /// Its file id.
         file_id: u64,
     },
+    /// The cut checked has ended (`spec.md` §7 Readers).
+    #[error("the cut has ended: {0:?}")]
+    CutEnded(CutEnd),
     /// A file operation failed.
     #[error("{path}: {source}")]
     Io {
@@ -206,7 +220,7 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> ReaderError + '_ {
 pub struct ReaderState {
     /// The mark's position when last read: nothing above it has been returned since.
     pub durable: Position,
-    /// The manifest epoch the lease names.
+    /// The manifest epoch the lease names: the lowest of the live cuts' and the last pass's.
     pub epoch: u64,
     /// The mark's generation.
     pub generation: u32,
@@ -288,11 +302,30 @@ pub struct Update {
     pub state: ReaderState,
     /// What it found since the last refresh.
     pub events: Vec<ReadEvent>,
+    /// The mark had another reset stamp, or had moved backwards, after the pass: it was discarded and nothing changed
+    /// (`spec.md` §7 Readers).
+    pub discarded: bool,
+}
+
+/// A cut of the log (query design §3.2): the manifest epoch whose files it reads, the durable position and the reset
+/// stamp it was read under. Its lease protects it until it is released, expires or ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Cut {
+    /// Its id in this reader.
+    pub id: u64,
+    /// The manifest epoch.
+    pub epoch: u64,
+    /// The durable position.
+    pub durable: Position,
+    /// The reset stamp.
+    pub stamp: ResetStamp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Fingerprint {
     file_id: u64,
+    /// The segment's name when the batch was read.
+    segment: SegmentName,
     /// The batch's offset and end.
     offset: u64,
     end: u64,
@@ -307,8 +340,10 @@ struct Fingerprint {
 #[derive(Clone, Debug, Default)]
 struct View {
     generation: Option<u32>,
-    /// The segment being read (0 before the first) and the point in it; `None` from its start.
+    /// The segment being read (0 before the first), its name's generation, and the point in it; `None` from its
+    /// start.
     file_id: u64,
+    segment_generation: u32,
     resume: Option<Resume>,
     taken: Position,
     recent: VecDeque<Fingerprint>,
@@ -340,11 +375,19 @@ pub struct LogReader {
     log_dir: PathBuf,
     lease_path: PathBuf,
     lease: LeaseSlot,
+    /// The lease file as last written.
+    image: Option<[u8; LEASE_LEN]>,
     renewed_at: Duration,
+    cuts: Cuts,
+    /// The last manifest check.
+    checked_at: Duration,
+    manifest: HeldManifest,
     state: ReaderState,
     view: View,
     lost: Vec<LostRange>,
     scratch: Scratch,
+    /// The manifest's lost ranges changed since [`LogReader::lost_ranges`] last took them.
+    lost_stale: bool,
     /// What [`LogReader::lookup`] keeps of sealed segments' indexes and of segments' batches.
     caches: lookup::Caches,
     closed: bool,
@@ -356,6 +399,10 @@ impl LogReader {
     /// [`LogReader::refresh`] returns the log from its start.
     pub fn open(mut cfg: ReaderConfig) -> Result<Self, ReaderError> {
         cfg.lease_refresh = cfg.lease_refresh.min(LEASE_REFRESH);
+        if cfg.cut_max_age.is_zero() {
+            cfg.cut_max_age = LEASE_REFRESH;
+        }
+        cfg.cut_max_age = cfg.cut_max_age.min(LEASE_EXPIRY);
         let store_id = read_descriptor(&*cfg.fs, &cfg.dir)?.store_id;
         let log_dir = cfg.dir.join(LOG_DIR);
         let lease_path = cfg.dir.join(LEASES_DIR).join(lease_name(&cfg.reader_id));
@@ -366,13 +413,18 @@ impl LogReader {
             refresh_counter: 0,
             boot_id: cfg.boot_id.unwrap_or_default(),
             created_at: wall,
+            highest_read: 0,
         };
         let mut r = Self {
             store_id,
             log_dir,
             lease_path,
             lease,
+            image: None,
             renewed_at: now,
+            cuts: Cuts::default(),
+            checked_at: now,
+            manifest: HeldManifest::default(),
             state: ReaderState {
                 durable: Position::default(),
                 epoch: 0,
@@ -383,14 +435,16 @@ impl LogReader {
             view: View::default(),
             lost: Vec::new(),
             scratch: Scratch::default(),
+            lost_stale: false,
             caches: lookup::Caches::default(),
             closed: false,
             cfg,
         };
         let mark = r.read_mark()?;
-        let (epoch, lost) = r.read_manifest()?;
-        r.renew(epoch, mark.generation)?;
-        r.lost = lost;
+        r.take_manifest()?;
+        r.renew(r.manifest.epoch, mark.generation)?;
+        r.lost = r.manifest.lost.clone();
+        r.lost_stale = false;
         r.state.durable = Position {
             generation: mark.generation,
             sequence: mark.last_sequence,
@@ -428,7 +482,7 @@ impl LogReader {
     }
 
     /// Re-reads the mark, the manifest and the batches appended since the last refresh, below the mark only, and
-    /// renews the lease naming the manifest's current epoch (`api.md` `refresh`). On an error nothing the reader
+    /// renews the lease when due (module documentation; `api.md` `refresh`). On an error nothing the reader
     /// holds changes and nothing it found is lost: the next refresh finds it again.
     pub fn refresh(&mut self) -> Result<Update, ReaderError> {
         self.refresh_inner(None).map(|(u, _)| u)
@@ -443,9 +497,14 @@ impl LogReader {
 
     fn refresh_inner(&mut self, budget: Option<usize>) -> Result<(Update, bool), ReaderError> {
         let mark = self.read_mark()?;
-        let (epoch, lost) = self.read_manifest()?;
+        self.take_manifest()?;
+        let epoch = self.manifest.epoch;
         // The lease names the epoch before any file is read under it (`spec.md` §7 Readers).
-        let renewed = self.renew_slot(epoch, mark.generation)?;
+        let renewed = if self.renewal_due(epoch) {
+            Some(self.renew_slot(epoch, mark.generation)?)
+        } else {
+            None
+        };
         let mut view = self.view.clone();
         let mut events = Vec::new();
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -455,12 +514,18 @@ impl LogReader {
         }
         self.scratch = scratch;
         // The lease was written whatever the log held: keep its state.
-        self.commit_lease(renewed);
+        if let Some(r) = renewed {
+            self.commit_lease(r);
+        }
         let more = read?;
+        let took = !events.is_empty()
+            || (view.file_id, view.resume, view.taken)
+                != (self.view.file_id, self.view.resume, self.view.taken);
         // A mark with another reset stamp, or one that moved backwards, while the files were read: a start may have
         // rewritten what was read under the first one. Discard the pass; the next refresh checks what it holds and
-        // reads again.
-        if let Ok(again) = self.read_mark()
+        // reads again. A pass that took nothing has nothing to discard.
+        if took
+            && let Ok(again) = self.read_mark()
             && behind(&again, &mark)
         {
             if self.scratch.whole.take().is_some() {
@@ -471,12 +536,16 @@ impl LogReader {
                 Update {
                     state: self.state,
                     events: Vec::new(),
+                    discarded: true,
                 },
                 true,
             ));
         }
         self.view = view;
-        self.lost = lost;
+        if self.lost_stale {
+            self.lost = self.manifest.lost.clone();
+            self.lost_stale = false;
+        }
         self.state.durable = if more {
             self.view.taken
         } else {
@@ -491,26 +560,10 @@ impl LogReader {
             Update {
                 state: self.state,
                 events,
+                discarded: false,
             },
             more,
         ))
-    }
-
-    /// Renews the lease if half of `lease_refresh` has passed since it was written, keeping its epoch, or, once
-    /// the lease may have expired, with the manifest's current epoch. Returns whether it wrote the lease. A read
-    /// call that does not refresh calls this (`api.md` Reader processes).
-    pub fn keep_alive(&mut self) -> Result<bool, ReaderError> {
-        let elapsed = self.cfg.clock.monotonic().saturating_sub(self.renewed_at);
-        if elapsed < self.cfg.lease_refresh / 2 {
-            return Ok(false);
-        }
-        let epoch = if elapsed >= LEASE_EXPIRY {
-            self.read_manifest()?.0
-        } else {
-            self.lease.epoch
-        };
-        self.renew(epoch, self.state.generation)?;
-        Ok(true)
     }
 
     /// Closes the reader and deletes its lease.
@@ -521,264 +574,6 @@ impl LogReader {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io_err(&self.lease_path)(e)),
         }
-    }
-
-    fn read_log(
-        &self,
-        view: &mut View,
-        mark: &MarkSlot,
-        events: &mut Vec<ReadEvent>,
-        scratch: &mut Scratch,
-        budget: Option<usize>,
-    ) -> Result<bool, ReaderError> {
-        let mut items = 0usize;
-        // A new generation: everything taken is void and the log is read again from its start (Q-118 (c)).
-        match view.generation {
-            Some(g) if g != mark.generation => {
-                if view.taken != Position::default() {
-                    events.push(ReadEvent::Void {
-                        above: Position::default(),
-                        cause: VoidCause::Generation {
-                            from: g,
-                            to: mark.generation,
-                        },
-                    });
-                }
-                *view = View::default();
-            }
-            _ => {}
-        }
-        view.generation = Some(mark.generation);
-        self.check_recent(view, events)?;
-        let mut names = self.segments()?;
-        // Segments of earlier generations are sealed and read whole, whichever segment the mark names (Q-268).
-        names.retain(|n| {
-            n.file_id > 0
-                && n.file_id >= view.file_id
-                && (n.file_id <= mark.file_id || n.generation < mark.generation)
-        });
-        if mark.file_id > 0
-            && mark.file_id >= view.file_id
-            && names.last().is_none_or(|n| n.file_id != mark.file_id)
-        {
-            // Renamed between the listing and now, or gone.
-            match self.find_segment(mark.file_id)? {
-                Some(n) => names.push(n),
-                None => {
-                    return Err(ReaderError::SegmentMissing {
-                        file_id: mark.file_id,
-                    });
-                }
-            }
-        }
-        for name in names {
-            let file_id = name.file_id;
-            let limit = if file_id == mark.file_id {
-                ScanLimit::Mark(mark.offset)
-            } else {
-                ScanLimit::End
-            };
-            let resumed = if file_id == view.file_id {
-                view.resume
-            } else {
-                None
-            };
-            let from = resumed.unwrap_or(Resume {
-                offset: HEADER_LEN as u64,
-                last_sequence: None,
-            });
-            if let ScanLimit::Mark(m) = limit {
-                let m = m.max(HEADER_LEN as u64);
-                // The mark is behind the point reached in its segment, or at it: nothing new is below it. At it, the
-                // pass that reached that point checked the header.
-                if from.offset > m || (resumed.is_some() && from.offset == m) {
-                    break;
-                }
-            }
-            // An earlier segment that is gone would leave its positions unread: an error, as for the mark's.
-            let Some((n, f)) = self.open_segment(name)? else {
-                return Err(ReaderError::SegmentMissing { file_id });
-            };
-            let path = self.log_dir.join(n.to_string());
-            let len = match limit {
-                ScanLimit::Mark(m) => m,
-                ScanLimit::End => f.len().map_err(io_err(&path))?,
-            };
-            if len > MAX_SEGMENT_FILE {
-                return Err(ReaderError::TooLong { path, len });
-            }
-            let whole = matches!(limit, ScanLimit::End);
-            let follows = (!whole).then_some(file_id);
-            let kept = whole && resumed.is_some() && scratch.whole == Some(file_id);
-            scratch.whole = None;
-            if !kept {
-                if scratch.file_id != follows {
-                    scratch.bytes = Vec::new();
-                }
-                scratch.file_id = follows;
-                read_part(&mut scratch.bytes, &*f, from.offset, len, whole)
-                    .map_err(io_err(&path))?;
-            }
-            let bytes = &scratch.bytes[..];
-            let id = SegmentIdentity {
-                store_id: self.store_id,
-                file_id,
-                generation: n.generation,
-            };
-            let refused = |error| ReaderError::Unsupported {
-                path: path.clone(),
-                error,
-            };
-            let mut s = Scanner::resume(bytes, &id, limit, from)
-                .map_err(refused)?
-                .keeping_content();
-            view.file_id = file_id;
-            view.resume = Some(from);
-            loop {
-                let before = s.resume_point();
-                let Some(found) = s.next() else { break };
-                match found.map_err(refused)? {
-                    Found::Region(region) => {
-                        if view.regions.insert((file_id, region.start, region.end)) {
-                            events.push(ReadEvent::Corruption { file_id, region });
-                        }
-                    }
-                    Found::Batch(b) if set_aside(&b, &self.cfg.set_aside) => {}
-                    Found::Batch(b) => {
-                        let g = b.commit.generation;
-                        let last = Position {
-                            generation: g,
-                            sequence: b.commit.last_sequence,
-                        };
-                        // Never above the mark's last position, from any segment.
-                        if g == mark.generation && last.sequence > mark.last_sequence {
-                            view.resume = Some(before);
-                            fingerprint(&mut view.recent, bytes);
-                            return Ok(false);
-                        }
-                        let content = match s.take_content() {
-                            Some(c) => c,
-                            None => {
-                                BatchContent::decode(&b).map_err(|error| ReaderError::Content {
-                                    path: path.clone(),
-                                    offset: b.offset,
-                                    error,
-                                })?
-                            }
-                        };
-                        let rb = ReadBatch {
-                            file_id,
-                            offset: b.offset,
-                            first: Position {
-                                generation: g,
-                                sequence: b.commit.first_sequence,
-                            },
-                            last,
-                            commit_time: b.commit.commit_time,
-                            content,
-                        };
-                        // Reading only moves forward past batches not read before, or past the last batch that
-                        // still reads the same, so every entry met is applied: one written again at the offset
-                        // of an earlier one (adopted, Q-117) still removed what followed.
-                        if let Some(r) = rb.recovery() {
-                            let after = Position {
-                                generation: g,
-                                sequence: r.after,
-                            };
-                            if after < view.taken {
-                                events.push(ReadEvent::Void {
-                                    above: after,
-                                    cause: VoidCause::Recovery { entry: rb.first },
-                                });
-                                view.taken = after;
-                                view.recent.retain(|f| f.last <= after);
-                            }
-                        }
-                        if last > view.taken {
-                            view.taken = last;
-                            view.recent.push_back(Fingerprint {
-                                file_id,
-                                offset: b.offset,
-                                end: b.end(),
-                                crc: None,
-                                first: rb.first,
-                                last,
-                            });
-                            if view.recent.len() > RECENT {
-                                view.recent.pop_front();
-                            }
-                            items += rb.content.items.len();
-                            events.push(ReadEvent::Batch(rb));
-                        }
-                    }
-                }
-                view.resume = Some(s.resume_point());
-                if budget.is_some_and(|b| items >= b) {
-                    fingerprint(&mut view.recent, bytes);
-                    if whole {
-                        scratch.whole = Some(file_id);
-                    }
-                    return Ok(true);
-                }
-            }
-            fingerprint(&mut view.recent, bytes);
-        }
-        Ok(false)
-    }
-
-    /// Checks that the last batch returned still reads the same. If not, voids what was taken above the last
-    /// remembered batch that does, and reads again from there; with none left, from the start of the oldest
-    /// remembered batch's segment, where every recovery entry is applied again: the one the truncating start wrote
-    /// voids the rest, and an earlier one may void batches that are intact, which are then returned again
-    /// (`spec.md` §3 Recovery).
-    fn check_recent(
-        &self,
-        view: &mut View,
-        events: &mut Vec<ReadEvent>,
-    ) -> Result<(), ReaderError> {
-        let Some(last) = view.recent.back() else {
-            return Ok(());
-        };
-        if self.still_reads(last)? {
-            return Ok(());
-        }
-        let mut keep = 0;
-        for fp in &view.recent {
-            if !self.still_reads(fp)? {
-                break;
-            }
-            keep += 1;
-        }
-        let oldest = view.recent[0];
-        let above = match keep {
-            0 => Position {
-                generation: oldest.first.generation,
-                sequence: oldest.first.sequence.saturating_sub(1),
-            },
-            k => view.recent[k - 1].last,
-        };
-        if above < view.taken {
-            events.push(ReadEvent::Void {
-                above,
-                cause: VoidCause::Rewritten,
-            });
-            view.taken = above;
-        }
-        view.recent.truncate(keep);
-        match view.recent.back() {
-            Some(fp) => {
-                view.file_id = fp.file_id;
-                view.resume = Some(Resume {
-                    offset: fp.end,
-                    last_sequence: Some(fp.last.sequence),
-                });
-            }
-            None => {
-                view.file_id = oldest.file_id;
-                view.resume = None;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -807,7 +602,10 @@ fn behind(b: &MarkSlot, a: &MarkSlot) -> bool {
 }
 
 mod files;
+mod lease;
 mod lookup;
+mod manifest;
+mod pass;
 #[cfg(test)]
 mod tests;
 

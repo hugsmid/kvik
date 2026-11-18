@@ -85,6 +85,18 @@ fn a_reader_at_the_writers_durable_position_only_renews_its_lease_when_due() {
         .unwrap()
         .unwrap();
     assert_eq!(u.events.len(), 1);
+    assert_eq!(
+        counter(&fs, &r),
+        at + 1,
+        "a refresh writes the lease only when its epoch changes or half of lease_refresh passed"
+    );
+    *clock.0.lock().unwrap() += Duration::from_millis(1_100);
+    log.submit(alias(3)).unwrap().wait().unwrap();
+    assert!(
+        read_new(&mut r, Some(log.stats().durable))
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(counter(&fs, &r), at + 2);
     log.shutdown().unwrap();
 }
@@ -130,6 +142,73 @@ mod bounded {
             },
             "W",
         )
+    }
+
+    /// A manual clock whose next wall-clock read, once armed, takes its value, reports it and then waits to be let go:
+    /// the pause between a clock read and what follows it.
+    #[derive(Debug)]
+    struct Paused {
+        clock: ManualClock,
+        armed: std::sync::atomic::AtomicBool,
+        read: std::sync::mpsc::SyncSender<()>,
+        go: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::env::Clock for Paused {
+        fn wall(&self) -> Timestamp {
+            let v = crate::env::Clock::wall(&self.clock);
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.read.try_send(());
+                let _ = self.go.lock().unwrap().recv();
+            }
+            v
+        }
+        fn monotonic(&self) -> crate::env::Monotonic {
+            crate::env::Clock::monotonic(&self.clock)
+        }
+        fn synchronised(&self) -> bool {
+            crate::env::Clock::synchronised(&self.clock)
+        }
+    }
+
+    /// A call that waits for the deliverer while the clock moves acts at the time after its wait: a condition runner
+    /// created with a time from before the wait would fire early.
+    #[test]
+    fn a_call_that_waits_for_the_deliverer_acts_at_the_time_after_its_wait() {
+        let (mut env, dir) = store();
+        let clock = ManualClock::new(Timestamp(T0 + 7_200 * S));
+        let (read_tx, read_rx) = std::sync::mpsc::sync_channel(1);
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        let paused = Arc::new(Paused {
+            clock: clock.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            read: read_tx,
+            go: Mutex::new(go_rx),
+        });
+        env.clock = paused.clone();
+        let d = open(&env, dir);
+        let clocks = Arc::new(Clocks::new(env.clock.clone()));
+        let hub = Hub::new(d, env.clone(), Path::new(dir), clocks);
+        let held = hub.hold();
+        paused
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let h = hub.clone();
+        let call = std::thread::spawn(move || h.run_quiet(|_, c| c.wall));
+        // A call that reads the clock before it takes the deliverer is paused in that read now, its value taken; one
+        // that reads it after cannot have read it yet, and the wait only bounds how long this test gives the first.
+        let _read_early = read_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        clock.advance(std::time::Duration::from_secs(2_602));
+        go_tx.send(()).unwrap();
+        drop(held);
+        let wall = call.join().unwrap();
+        assert_eq!(
+            wall,
+            clock.wall().0,
+            "the call acted with a clock read before it waited"
+        );
     }
 
     /// A store holding two hours of one reading a second on a gauge (1), a versioned series (2) and a gauge (3) whose
@@ -189,6 +268,7 @@ mod bounded {
             64,
             usize::MAX,
             Arc::default(),
+            None,
         )
         .unwrap()
     }

@@ -56,6 +56,8 @@ pub(crate) struct Index {
     /// A void or a loss removed facts the summaries counted: they are rebuilt by
     /// [`read_summary`](super::summary::read_summary) before they are used (Q-930).
     stale: bool,
+    /// Told of every batch taken and every void, for the series directory (`format.md` A.18).
+    fold: Option<std::sync::Arc<super::derived::SeriesFold>>,
 }
 
 pub(crate) fn pos(p: LogPos) -> Position {
@@ -160,6 +162,11 @@ impl Index {
         }
     }
 
+    /// Hands every batch taken from now on, and every void, to `fold`.
+    pub(crate) fn set_fold(&mut self, fold: std::sync::Arc<super::derived::SeriesFold>) {
+        self.fold = Some(fold);
+    }
+
     /// Applies what a refresh up to the mark's position `durable` found, in order. Returns the losses it found.
     pub(crate) fn apply(&mut self, events: &[ReadEvent], durable: LogPos) -> Vec<Find> {
         let found = self.finder.apply(events, durable);
@@ -207,10 +214,16 @@ impl Index {
             sequence += item.sequences();
         }
         self.commits.push((b.last, b.commit_time));
+        if let Some(f) = &self.fold {
+            f.batch(b);
+        }
     }
 
     /// Forgets everything above `above` and rebuilds the registry from what is left.
     fn void(&mut self, above: LogPos) {
+        if let Some(f) = &self.fold {
+            f.void(above);
+        }
         let keep = |p: &LogPos| *p <= above;
         self.entries.retain(|p, _| keep(p));
         let taken = self.commits.len();

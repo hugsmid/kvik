@@ -47,6 +47,7 @@ log-reader      log   reader
 log-seal-describe log seal_describe
 log-scan-bound  log   scan_bound
 log-pacing      log   pacing
+log-directories log   directories
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-patterns   kvik  patterns
@@ -74,6 +75,7 @@ log-lookup      log   lib         reader::tests::lookup_properties::
 log-units       log   lib         scan::tests::nonzero_end_finds_the_last_non_zero_byte writer::seg_index::tests::
 kvik-units      kvik  lib         durable::by_id::tests::
 kvik-ingest     kvik  lib         durable::ingest::
+kvik-fold       kvik  lib         durable::derived::tests::
 '
 
 cd "$(dirname "$0")/.."
@@ -142,7 +144,13 @@ matrix)
 check)
     crate=$(crate_of "${2:-}")
     file=$(file_of "$2")
-    all=$(list "$crate" "$file")
+    if [[ $file == lib ]]; then
+        # A crate's unit tests are many; a `lib` shard answers for the tests its filters name.
+        # shellcheck disable=SC2046 # filters are split on spaces on purpose
+        all=$(list "$crate" "$file" $(own_filters "$2"))
+    else
+        all=$(list "$crate" "$file")
+    fi
     [[ -n $all ]] || { echo "no tests listed for $crate/tests/$file.rs" >&2; exit 1; }
     selected=
     for name in $(rows | awk -v c="$crate" -v t="$file" '$2 == c && $3 == t { print $1 }'); do

@@ -38,6 +38,7 @@
 //! log.shutdown().unwrap();
 //! ```
 
+mod directories;
 mod gather;
 mod generation;
 mod maint;
@@ -56,9 +57,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+pub use directories::{
+    Directories, DirectoryOptions, DirectoryStart, DirectoryStats, GROUPS_PER_STEP,
+    REUSED_PER_STEP, STATUS_INTERVAL, SealHook, SeriesEntries, StatusContent, TRAILERS_PER_STEP,
+    kept_series, lost_below, writer_catalogue,
+};
 pub use generation::init_generation;
 pub use maint::{AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest};
-pub use maint::{create_segment, describe_sealed, seal_segment, seal_segment_described};
+pub use maint::{
+    create_segment, describe_sealed, directory_record, seal_segment, seal_segment_described,
+};
 pub use options::{GenerationStart, SealListener, StartOptions};
 pub use queue::{CallSource, IngestQueue, QueueFull};
 pub use recovery::{EntryReport, FoundLoss, LossKind, StartReport, StartRule};
@@ -755,6 +763,24 @@ impl LogWriter {
     /// The fault that made the store read-only, if any.
     pub fn fault(&self) -> Option<&Fault> {
         self.fault.as_ref()
+    }
+
+    /// What the derived files are checked and written against after this start (`format.md` A.18).
+    pub fn directory_start(&self) -> DirectoryStart {
+        let stamp = self.mark_slot.stamp;
+        DirectoryStart {
+            generation: self.generation,
+            stamp: (stamp.nonce != 0).then_some(stamp),
+            reset_after: self.report.entry.as_ref().map(|e| Position {
+                generation: self.generation,
+                sequence: e.entry.after,
+            }),
+            segment_size: self.cfg.segment_size,
+            disk_critical: self.cfg.disk_critical,
+            series_bytes: crate::directory::cadence::SERIES_BYTES,
+            // Generation 0 only until roadmap 8.3 (`StartOptions::generation` is refused), so no restore is in force.
+            restored: Vec::new(),
+        }
     }
 
     /// The read-only flag to pass to [`create_segment`] and [`seal_segment`].

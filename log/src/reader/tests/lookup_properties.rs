@@ -3,9 +3,11 @@ use std::collections::BTreeSet;
 use proptest::prelude::*;
 
 use super::*;
+use crate::batch::SegmentIdentity;
 use crate::entries::{Entry, MarkState, Recovery};
 use crate::facts::{FactFlags, FactRow, Quality, Value};
 use crate::name::SegmentName;
+use crate::scan::{Found, ScanLimit, Scanner};
 use crate::store::{NewStore, StoreDir};
 use crate::writer::{Log, LogWriter, SystemClock, WriterConfig};
 

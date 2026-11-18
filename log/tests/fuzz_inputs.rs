@@ -81,3 +81,53 @@ proptest! {
         decode_all(&data);
     }
 }
+
+fn derived_seeds() -> Vec<Vec<u8>> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden-derived");
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x != "md"))
+        .collect();
+    files.sort();
+    files.into_iter().map(|p| fs::read(p).unwrap()).collect()
+}
+
+#[test]
+fn every_derived_golden_file_and_every_prefix_of_one() {
+    for g in derived_seeds() {
+        for k in 0..=g.len() {
+            kvik_log::fuzz::decode_derived(&g[..k]);
+        }
+    }
+}
+
+proptest! {
+    #[test]
+    fn mutated_derived_files(
+        which in any::<prop::sample::Index>(),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..8),
+        fix_crc in any::<bool>(),
+    ) {
+        let seeds = derived_seeds();
+        let mut data = seeds[which.index(seeds.len())].clone();
+        for (at, v) in edits {
+            let i = at.index(data.len());
+            data[i] = v;
+        }
+        // With the checksums made right again, the edits reach the body checks.
+        if fix_crc && data.len() >= 80 {
+            let crc = |b: &[u8]| kvik_log::crc::crc32c(b).to_le_bytes();
+            let h = crc(&data[..60]);
+            data[60..64].copy_from_slice(&h);
+            let len = u32::from_le_bytes(data[68..72].try_into().unwrap()) as usize;
+            if let Some(body) = data.get(80..80 + len) {
+                let b = crc(body);
+                data[72..76].copy_from_slice(&b);
+            }
+            let bh = crc(&data[64..76]);
+            data[76..80].copy_from_slice(&bh);
+        }
+        kvik_log::fuzz::decode_derived(&data);
+    }
+}

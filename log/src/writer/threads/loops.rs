@@ -1,11 +1,14 @@
-//! The loops of `kvik-writer` and `kvik-maint`, and what each does if it panics.
+//! The loops of `kvik-writer` and `kvik-maint`, and what each does if it panics. `kvik-maint` takes one piece of work
+//! at a time (segment creation, a seal, a description, a step of the derived files), so a request or a seal never
+//! waits behind more than one step of the derived files.
 
 use std::io;
 use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::super::maint::describe_sealed_until;
+use super::super::directories::Directories;
+use super::super::maint::{describe_sealed_until, directory_record};
 use super::super::{
     CallSource, CommitError, Done, Fault, FaultOp, LogWriter, Wait, create_segment,
     seal_segment_described,
@@ -212,8 +215,9 @@ impl Drop for MaintGuard<'_> {
     }
 }
 
-pub(super) fn maint_loop(s: &Shared) {
+pub(super) fn maint_loop(s: &Shared, mut dirs: Option<Directories>) {
     let _guard = MaintGuard(s);
+    let mut next: Option<Duration> = dirs.as_ref().map(|_| Duration::ZERO);
     loop {
         let mut m = lock(&s.maint);
         loop {
@@ -224,7 +228,18 @@ pub(super) fn maint_loop(s: &Shared) {
             if m.request.is_some() || !m.jobs.is_empty() || m.describe.is_some() || m.stop {
                 break;
             }
-            m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
+            let now = s.clock.monotonic();
+            match next {
+                Some(t) if t <= now => break,
+                Some(t) => {
+                    m = s
+                        .maint_cv
+                        .wait_timeout(m, t - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+                None => m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner),
+            }
         }
         // After a fault no file operation starts (`spec.md` §3 Write or sync failure); dropped work stays as it is.
         if s.halt.is_set() {
@@ -234,6 +249,7 @@ pub(super) fn maint_loop(s: &Shared) {
             if m.stop {
                 return;
             }
+            next = None;
             m = s.maint_cv.wait(m).unwrap_or_else(PoisonError::into_inner);
             drop(m);
             continue;
@@ -245,6 +261,10 @@ pub(super) fn maint_loop(s: &Shared) {
         } else if let Some(job) = m.jobs.pop_front() {
             drop(m);
             let r = seal_segment_described(&*s.fs, &job, &s.halt);
+            if let (Some(d), Ok(sealed)) = (dirs.as_mut(), &r) {
+                d.sealed(directory_record(&job, sealed, true));
+                next = Some(Duration::ZERO);
+            }
             lock(&s.maint).results.push((job, r));
         } else if let Some((dir, id)) = m.describe.take() {
             drop(m);
@@ -253,8 +273,38 @@ pub(super) fn maint_loop(s: &Shared) {
                 lock(&s.maint).described = Some(r);
             }
         } else {
-            return;
+            let stop = m.stop;
+            drop(m);
+            if let Some(d) = dirs.as_mut() {
+                if stop {
+                    let synced = lock(&s.info).stats.mark_synced;
+                    d.finish(synced, s.clock.monotonic(), s.clock.wall());
+                    return;
+                }
+                next = run_directories(s, d);
+            }
+            if stop {
+                return;
+            }
+            continue;
         }
         s.wake_writer();
     }
+}
+
+/// Runs the derived files' due work; asks the writer for a mark sync when a sealed segment waits for one (`spec.md`
+/// §3 Durable mark: a write that would name a position above the last synced mark forces the next mark sync).
+fn run_directories(s: &Shared, d: &mut Directories) -> Option<Duration> {
+    let synced = lock(&s.info).stats.mark_synced;
+    let now = s.clock.monotonic();
+    let after = d.run(synced, now, s.clock.wall());
+    if d.waits_for(synced) {
+        {
+            let mut f = lock(&s.front);
+            f.mark_sync = true;
+            f.wake = true;
+        }
+        s.writer_cv.notify_one();
+    }
+    after.map(|a| now + a)
 }

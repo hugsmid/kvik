@@ -22,3 +22,10 @@ path = "fuzz_targets/segment.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "derived"
+path = "fuzz_targets/derived.rs"
+test = false
+doc = false
+bench = false

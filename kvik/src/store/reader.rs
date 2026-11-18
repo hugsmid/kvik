@@ -27,6 +27,12 @@ impl Reader {
     /// [`OpenError::NotAStore`]); with the durable backend it reads the
     /// directory on `config.env`'s file system, in this process or another.
     pub fn open(config: ReaderConfig) -> Result<Reader, OpenError> {
+        if config.cut_max_age.is_zero() {
+            return Err(OpenError::Config {
+                key: "cut_max_age",
+                reason: "must be above zero".into(),
+            });
+        }
         let inner = match config.backend {
             Backend::Model => {
                 ReaderInner::Model(backend::find(&config.dir).map_err(|e| e.open(&config.dir))?)
@@ -35,6 +41,7 @@ impl Reader {
                 &config.dir,
                 &config.env,
                 config.lease_refresh,
+                config.cut_max_age,
             )?)),
         };
         Ok(Reader { inner })
@@ -72,7 +79,7 @@ impl Reader {
     }
 
     /// Re-reads the mark, the manifest tail and the new entries, and renews
-    /// the lease.
+    /// the lease when its epoch changes or half of `lease_refresh` has passed.
     pub fn refresh(&self) -> Result<ReaderState, QueryError> {
         self.on(
             |s| s.with(|s| s.refresh()).map_err(|e| e.query()),

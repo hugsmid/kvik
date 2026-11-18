@@ -306,6 +306,7 @@ impl Deliverer {
         max_consumers: usize,
         window_budget: usize,
         latch: Arc<LossLatch>,
+        fold: Option<Arc<super::derived::SeriesFold>>,
     ) -> io::Result<Deliverer> {
         let mut id = [0u8; 16];
         env.entropy.fill(&mut id);
@@ -358,6 +359,9 @@ impl Deliverer {
             #[cfg(test)]
             records: 0,
         };
+        if let Some(f) = fold {
+            d.index.set_fold(f);
+        }
         // `now` places the recent window while the log is taken (roadmap 11.0).
         let ctx = Ctx {
             watch: None,

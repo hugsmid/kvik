@@ -164,6 +164,7 @@ fn a_clean_shutdown_writes_the_registry_file_a_full_read_gives_without_reading_t
         Path::new(dir),
         &env,
         std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
     )
     .unwrap();
     let full = r
@@ -202,6 +203,7 @@ fn series_losses_and_statistics_answer_as_a_full_read_does_without_reading_the_l
     let r = super::reader::DurableReader::open(
         Path::new(dir),
         &env,
+        std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(60),
     )
     .unwrap();
@@ -431,6 +433,7 @@ fn a_store_whose_load_meets_a_void_in_a_later_part_answers_as_a_full_read() {
         Path::new(dir),
         &env,
         std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
     )
     .unwrap();
     for _ in 0..2 {
@@ -486,6 +489,7 @@ fn a_routing_change_writes_the_registry_file_a_full_read_gives_without_reading_t
     let r = super::reader::DurableReader::open(
         Path::new(dir),
         &env,
+        std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(60),
     )
     .unwrap();

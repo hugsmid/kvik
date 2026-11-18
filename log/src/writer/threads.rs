@@ -15,6 +15,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::directories::{Directories, DirectoryOptions};
 use super::maint::{AheadSegment, CreateError, DescribeError, SealError, SealJob, SegmentRequest};
 use super::{
     Ack, Call, CallError, CallSource, CommitError, Fault, Halt, IngestQueue, LogStats, LogWriter,
@@ -248,6 +249,26 @@ impl Watch {
         lock(&self.shared.info).stats.clone()
     }
 
+    /// The last synced mark, without copying the rest of the statistics.
+    pub fn mark_synced(&self) -> super::Position {
+        lock(&self.shared.info).stats.mark_synced
+    }
+
+    /// As [`Log::reasons`].
+    pub fn reasons(&self) -> Vec<Reason> {
+        lock(&self.shared.info).reasons.clone()
+    }
+
+    /// As [`Log::fault`].
+    pub fn fault(&self) -> Option<Fault> {
+        lock(&self.shared.info).fault.clone()
+    }
+
+    /// As [`Log::queue_depth`].
+    pub fn queue_depth(&self) -> usize {
+        lock(&self.shared.front).queue.depth()
+    }
+
     /// Asks the writer to sync the mark now rather than at its timer, and waits until the mark on stable storage
     /// names at least the durable position at the call (`spec.md` §3 Durable mark: a file that would name a
     /// position above the last synced mark waits for the next mark sync or forces one). Returns the last synced
@@ -323,7 +344,27 @@ pub struct Log {
 
 impl Log {
     /// Starts `kvik-writer` and `kvik-maint` on an opened writer.
-    pub fn start(mut writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+    pub fn start(writer: LogWriter, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        Self::start_with(writer, clock, None)
+    }
+
+    /// [`Log::start`], with `kvik-maint` also writing the derived files (`format.md` A.18) as `dirs` says.
+    pub fn start_with(
+        mut writer: LogWriter,
+        clock: Arc<dyn Clock>,
+        dirs: Option<DirectoryOptions>,
+    ) -> io::Result<Self> {
+        let dirs = dirs.map(|opts| {
+            let start = writer.directory_start();
+            let store = writer.store();
+            Directories::new(
+                store.fs().clone(),
+                store.dir(),
+                store.descriptor().store_id,
+                start,
+                opts,
+            )
+        });
         writer.set_sync_clock(clock.clone());
         let cfg = writer.config().clone();
         let shared = Arc::new(Shared {
@@ -359,7 +400,7 @@ impl Log {
         let s = shared.clone();
         let maint = std::thread::Builder::new()
             .name("kvik-maint".into())
-            .spawn(move || maint_loop(&s))?;
+            .spawn(move || maint_loop(&s, dirs))?;
         let s = shared.clone();
         let w = std::thread::Builder::new()
             .name("kvik-writer".into())
@@ -518,6 +559,18 @@ impl Log {
         }
         self.shared.writer_cv.notify_one();
         self.shared.room_cv.notify_all();
+        // Called on one of the log's own threads (the last owner dropped there), it cannot wait for them: they end
+        // on their own and are not joined.
+        let me = Some(std::thread::current().id());
+        let writer = self.writer.as_ref().map(|h| h.thread().id());
+        let maint = self.maint.as_ref().map(|h| h.thread().id());
+        if writer == me || maint == me {
+            lock(&self.shared.maint).stop = true;
+            self.shared.maint_cv.notify_all();
+            self.writer = None;
+            self.maint = None;
+            return (Ok(()), None);
+        }
         let w = self.writer.take().map(JoinHandle::join);
         {
             lock(&self.shared.maint).stop = true;

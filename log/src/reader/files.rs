@@ -1,16 +1,14 @@
-//! A reader's file access: the mark, the manifest, the lease and the segments.
+//! A reader's file access: the mark, the lease and the segments.
 
 use std::io;
 
 use super::{Fingerprint, LogReader, MARK_RETRIES, ReaderError, io_err};
 use crate::crc::crc32c;
 use crate::fs::{FsFile, OpenMode};
-use crate::header::{FileHeader, HEADER_LEN, kind};
-use crate::lease::{LeaseSlot, SLOT_OFFSET};
-use crate::manifest::{LostRange, read_manifest};
+use crate::header::HEADER_LEN;
 use crate::mark::{MARK_LEN, MarkSlot, read_mark};
 use crate::name::SegmentName;
-use crate::store::{MANIFEST, MARK, read_all};
+use crate::store::MARK;
 
 /// A segment opened by name, under the extension it was found with.
 pub(super) type OpenSegment = (SegmentName, Box<dyn FsFile>);
@@ -31,57 +29,6 @@ impl LogReader {
             }
         }
         Err(ReaderError::MarkUnreadable)
-    }
-
-    pub(super) fn read_manifest(&self) -> Result<(u64, Vec<LostRange>), ReaderError> {
-        let path = self.cfg.dir.join(MANIFEST);
-        let bytes = read_all(&*self.cfg.fs, &path).map_err(io_err(&path))?;
-        let m = read_manifest(&bytes, &self.store_id).map_err(ReaderError::Manifest)?;
-        Ok((m.last_epoch(), m.lost_ranges().cloned().collect()))
-    }
-
-    pub(super) fn renew(&mut self, epoch: u64, generation: u32) -> Result<(), ReaderError> {
-        let s = self.renew_slot(epoch, generation)?;
-        self.commit_lease(s);
-        Ok(())
-    }
-
-    /// Writes the lease with the next counter, by path; creates it again if the writer deleted it.
-    pub(super) fn renew_slot(&self, epoch: u64, generation: u32) -> Result<LeaseSlot, ReaderError> {
-        let slot = LeaseSlot {
-            epoch,
-            refresh_counter: self.lease.refresh_counter + 1,
-            ..self.lease
-        };
-        let fs = &*self.cfg.fs;
-        let path = &self.lease_path;
-        match fs.open(path, OpenMode::ReadWrite) {
-            // The slot alone, in place, when the header is the lease's own; else the whole file.
-            Ok(f) => {
-                let mut h = [0u8; HEADER_LEN];
-                let ok = read_at_full(&*f, &mut h, 0).is_ok_and(|n| n == HEADER_LEN)
-                    && FileHeader::decode(&h)
-                        .is_some_and(|h| h.kind == kind::LEASE && h.store_id == self.store_id);
-                if ok {
-                    f.write_at(&slot.encode(), SLOT_OFFSET as u64)
-                } else {
-                    f.write_at(&slot.encode_file(self.store_id, generation), 0)
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs
-                .open(path, OpenMode::CreateNew)
-                .and_then(|f| f.write_at(&slot.encode_file(self.store_id, generation), 0)),
-            Err(e) => Err(e),
-        }
-        .map_err(io_err(path))?;
-        Ok(slot)
-    }
-
-    pub(super) fn commit_lease(&mut self, slot: LeaseSlot) {
-        self.lease = slot;
-        self.renewed_at = self.cfg.clock.monotonic();
-        self.state.lease_renewed_at = self.cfg.clock.wall();
-        self.state.epoch = slot.epoch;
     }
 
     /// The segments of the log by file id, under either extension; none for a missing directory.
@@ -126,12 +73,10 @@ impl LogReader {
         Ok(self.segments()?.into_iter().find(|n| n.file_id == file_id))
     }
 
-    /// Whether the batch at `fp` still reads the same: the same bytes at the same place.
+    /// Whether the batch at `fp` still reads the same: the same bytes at the same place, in the segment it was read
+    /// from under either extension.
     pub(super) fn still_reads(&self, fp: &Fingerprint) -> Result<bool, ReaderError> {
-        let Some(name) = self.find_segment(fp.file_id)? else {
-            return Ok(false);
-        };
-        let Some((n, f)) = self.open_segment(name)? else {
+        let Some((n, f)) = self.open_segment(fp.segment)? else {
             return Ok(false);
         };
         let path = self.log_dir.join(n.to_string());

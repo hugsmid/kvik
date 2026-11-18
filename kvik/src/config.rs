@@ -282,6 +282,10 @@ pub struct ReaderConfig {
     pub env: Env,
     /// How often the lease is renewed at the latest (default 30 minutes).
     pub lease_refresh: Duration,
+    /// The longest a read holds its cut, counted from the last check that found its epoch current (spec §7
+    /// Readers; default 30 minutes, at most an hour, zero refused): a read held longer ends with
+    /// [`QueryError::CutExpired`](crate::QueryError::CutExpired).
+    pub cut_max_age: Duration,
 }
 
 impl ReaderConfig {
@@ -292,6 +296,7 @@ impl ReaderConfig {
             backend: Backend::Durable,
             env: Env::system(),
             lease_refresh: Duration::from_secs(30 * 60),
+            cut_max_age: Duration::from_secs(30 * 60),
         }
     }
 
@@ -310,6 +315,12 @@ impl ReaderConfig {
     /// Sets the lease refresh interval.
     pub fn lease_refresh(mut self, d: Duration) -> Self {
         self.lease_refresh = d;
+        self
+    }
+
+    /// Sets the longest a read holds its cut.
+    pub fn cut_max_age(mut self, d: Duration) -> Self {
+        self.cut_max_age = d;
         self
     }
 }

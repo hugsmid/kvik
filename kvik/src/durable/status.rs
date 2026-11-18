@@ -182,7 +182,7 @@ impl Writer {
             Some(t) => st.latest_t = t.map(Timestamp),
             None => {
                 if let Ok(r) = self.reader() {
-                    let _ = r.with(|i, _| {
+                    let _ = r.with_again(|i, _| {
                         st.latest_t = i.latest_t(id.0).map(Timestamp);
                         Ok(())
                     });

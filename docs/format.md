@@ -2,8 +2,8 @@
 
 Byte-level rules for the files kvik writes. The semantics are in [`spec.md`](spec.md); where the two differ,
 `spec.md` wins and this document is wrong. Part A (common rules, log segments, the durable mark, the store layout,
-the platform operations, the manifest framing, cursor and lease files, the registry file, the deep tier's objects)
-is complete enough to implement. Part B (compacted segments and the remaining files) is an outline; each file is
+the platform operations, the manifest framing, cursor and lease files, the registry file, the deep tier's objects, the
+derived files) is complete enough to implement. Part B (compacted segments and the remaining files) is an outline; each file is
 specified here before the roadmap item that writes it.
 
 ## A. Common rules
@@ -66,12 +66,12 @@ specified here before the roadmap item that writes it.
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 4 | `magic` | ASCII `KVIK` |
-| 4 | 1 | `kind` | 1 log segment, 2 compacted segment, 3 manifest, 4 cursor, 5 registry, 6 tree, 7 store descriptor, 8 lease; reserved and laid out by their roadmap items: 9 calendar, 10 revised-key index, 11 version index, 12 local restore record, 13 checkpoint bundle, 14 chunk index |
+| 4 | 1 | `kind` | 1 log segment, 2 compacted segment, 3 manifest, 4 cursor, 5 registry, 6 tree, 7 store descriptor, 8 lease; reserved and laid out by their roadmap items: 9 calendar, 10 revised-key index, 11 version index, 12 local restore record, 13 checkpoint bundle, 14 chunk index; derived files (A.18): 15 log directory, 16 series directory, 17 status file |
 | 5 | 1 | `format_major` | 1 |
 | 6 | 2 | `format_minor` | 0 |
 | 8 | 4 | `flags` | reserved |
 | 12 | 4 | `generation` | |
-| 16 | 8 | `file_id` | unique per store and kind (A.12) |
+| 16 | 8 | `file_id` | unique per store and kind (A.12); for the derived files, per family (A.18) |
 | 24 | 8 | `base_sequence` | log: sequence of the first entry this file may hold (for a segment opened by a recovery batch, its F, `spec.md` §3); 0 while a segment created ahead of use is not yet in use (A.4); otherwise 0 |
 | 32 | 8 | `created_at` | |
 | 40 | 16 | `store_id` | random, fixed for the life of a store; must equal the store descriptor's (A.12); a file with a different id is refused |
@@ -287,7 +287,7 @@ and ignorable rule.
 | 0 | 8 | `first_sequence` |
 | 8 | 8 | `received_at` (the batch's) |
 | 16 | 4 | `entry_count` |
-| 20 | 4 | reserved |
+| 20 | 4 | CRC32C of that manifest record's block bytes: the record is matched by content |
 | 24 | … | entries |
 
 Each entry: `entry_type: u8`, reserved 3 bytes, `length: u32`, then `length` bytes of fields, padded to 8. Fields
@@ -495,13 +495,19 @@ while it exists; a new file is created only when none exists.
   a gap before a recovery entry, and with an adopted recovery entry followed by the rest of a torn tail; corruption
   inside a segment with a kept batch after it; each seal state of A.4; a mark with one torn slot; a stale mark below
   acknowledged batches after a power loss; flagged batches beyond a same-boot mark, then an unflagged one (A.7); a block with an unknown ignorable and an unknown critical element; the
-  store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file.
+  store descriptor; a manifest with a torn tail and one with a corrupt middle record; a registry file; a log
+  directory root and group, a series directory and a status file (A.18).
 - A fuzz target for the block reader and for each body decoder, the mark, manifest record, cursor, lease and registry
   file decoders included: no input may cause a panic or an out-of-bounds read; nothing is allocated from a declared count or
   length before it is checked against the body, and decoded output is bounded by the row and entry limits. The
   segment and manifest targets also check the scan bound (common rules).
 - Truncation at every byte offset of a batch, a recovery batch included: the reader returns exactly the complete
   batches before it.
+- Derived files (A.18): a rebuilt file equals the live one; a crash at every write leaves the previous generation or
+  the new one, and the writer ends where an uninterrupted run would; a replaced segment, a restore, a reset, a lost
+  range and a manifest rebuild each invalidate only the part they touch, through a new start of the writer as well
+  as in the checks; the listing is contiguous, also after a late seal and an unreadable segment at the start; no file names a position above the last synced mark; a lookup
+  located through them equals a full scan; uncovered sealed bytes stay within the allowance at any ingest rate.
 
 ## A.12 Directory layout, store descriptor, names and lock
 ```
@@ -514,6 +520,8 @@ while it exists; a new file is created only when none exists.
 <dir>/cursors/<consumer name>.cur            kind 4 (A.15)
 <dir>/leases/<reader_id:32 hex>.lease        kind 8 (A.15)
 <dir>/registry/<generation:8 hex>-<file_id:16 hex>.reg   kind 5 (A.16)
+<dir>/derived/logdir-<file_id:16 hex>.root  kinds 15–17 (A.18): log directory root and groups, series directory, status file
+<dir>/derived/logdir-<group:8 hex>-<file_id:16 hex>.grp | series-<file_id:16 hex>.sdir | status-<file_id:16 hex>.stat
 <dir>/tree/, data/, quarantine/              reserved for kinds 2, 6 and 9–14; laid out by roadmap 6.2, 7.1 and 8.1
 ```
 - Hex is lower-case and zero-padded to the stated width; extensions are lower-case. Readers match names exactly and
@@ -581,7 +589,7 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   `epoch: u64`, `generation: u32`, reserved `u32`, `written_at: i64`, then a field list (A.6 framing). **Every**
   record, empty and lost-range records included, takes an epoch strictly above the previous record's (the first
   record, written when the store is created, takes epoch 1): the previous + 1, or after a start the next above every
-  epoch named by the last valid record and by any lease file (`spec.md`
+  epoch named by the last valid record and by any lease file, in its `epoch` or `highest_read` (A.15; `spec.md`
   §7 Manifest).
 - Record types: `0x20` empty; `0x23` lost range; `0x24` acknowledgement (repeated field 1: identity, first, last, as
   positions; field 2: the epoch of a rebuild record acknowledged; field 3: outcome `u8`, 1 restored in full, 2 re-send
@@ -726,9 +734,11 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   file passes 16 MiB the writer writes `<name>.cur.new` with the current state, syncs it, renames it over the old one
   and syncs the directory.
 - **Lease**, `leases/<reader_id>.lease`, kind 8, 128 bytes: an A.1 header (`file_id` 0, the generation at
-  creation) then one slot rewritten in place with one positional write: 64 `epoch: u64`; 72 `refresh_counter: u64`; 80
+  creation) then one slot rewritten in place with one positional write: 64 `epoch: u64` (the lowest epoch of the reader's live
+  cuts, `spec.md` §7 Readers); 72 `refresh_counter: u64`; 80
   `boot_id` (16 bytes); 96 `created_at: i64`;
-  104 reserved (20 bytes); 124 `crc32c` over bytes 64..124. `reader_id` is 16 random bytes per reader handle. A lease
+  104 `highest_read: u64`, the highest manifest epoch the reader has read, 0 from a reader that does not write it;
+  112 reserved (12 bytes); 124 `crc32c` over bytes 64..124. `reader_id` is 16 random bytes per reader handle. A lease
   is never synced (it is void on another boot). An invalid lease counts as holding epoch 0 until it expires; a zero
   `boot_id` is honoured until expiry. The reader deletes its lease on close; the writer deletes void and expired
   ones.
@@ -859,6 +869,183 @@ and labels are ASCII without a terminator.
   key: a damaged object. The ciphertext SHA-256 that `put` sends and the bucket reports (`spec.md` §8 Hashes) is
   over the whole object.
 
+## A.18 Derived files: log directory (`kind = 15`), series directory (`kind = 16`), status file (`kind = 17`)
+Files the writer derives from the log so that another process finds sealed segments, per-series state and the
+writer's counters without scanning the log (`spec.md` §7 Derived files). Each is an A.1 header and exactly **one
+block** (A.2) that ends the file; nothing else follows. Header: `generation` the store generation its positions
+belong to; `file_id` its generation within its family (below); `base_sequence` 0; `created_at` its write time.
+
+| Block type | File | Body |
+|---:|---|---|
+| `0x50` | log directory root | below |
+| `0x51` | log directory group | below |
+| `0x52` | series directory | below |
+| `0x53` | status file | below |
+
+- **Names** (A.12), under `derived/`: `logdir-<file_id:16 hex>.root`; `logdir-<group:8 hex>-<file_id:16 hex>.grp`;
+  `series-<file_id:16 hex>.sdir`; `status-<file_id:16 hex>.stat`. Each name stem is a **family** (each group number
+  its own); `file_id` is unique per family, not per kind (A.1), rises by one per successful write, and a header whose
+  `file_id` differs from its name is invalid.
+- **Fixed-size records.** Every record array carries a count and a `record_size`; a reader uses `record_size`,
+  ignores a record's tail beyond the fields it knows (A.8's rule) and refuses a `record_size` below the v1 size, or
+  zero, with a non-zero count. Positions are 12 bytes (common rules); a reset stamp is 16 bytes as A.10 bytes
+  84..100, a zero nonce meaning none.
+- **Checks.** The header valid, of this store and kind; one valid block of the family's type; nothing after it; the
+  record arrays inside the body and filling it exactly; the checks below. A file that fails one is **invalid**. A
+  block of another known derived type, or an unknown skippable one, is invalid; an unknown type without `skippable`
+  or a newer `format_major` is a version refusal (common rules).
+- **Writing.** Written whole to `<name>.tmp`, renamed to its name, **never synced**; then every generation of the
+  family older than the previous one is removed (the status file keeps none; a full group keeps only the generation
+  the root names). A write that fails removes its temporary file, is counted (status counter 14) and is tried again
+  under the same `file_id` after a wait that doubles from 100 ms to a minute; none is tried while free space is below
+  `limits.disk_critical`. The log directory, the series directory, the status file and the start's listings each
+  wait on their own failures, so one that keeps failing holds back no other. It never makes the store read-only, and neither does a seal hook that fails. A writer
+  removes `*.tmp` files of these families at its start, and writes nothing more after the store turns read-only. No
+  derived file names a position above the last synced mark (`spec.md` §3 Durable mark): a sealed segment is listed
+  only once the mark on stable storage is past it, also at the start, and the writer forces that mark sync. On
+  Windows a rename that a reader's handle refuses is retried at the next write.
+- **The start's work** (the writer's): the files there are, then two small reads of each sealed segment's trailer,
+  then a read of each segment no valid group record describes, in steps between creating and sealing segments. A
+  step is one of: the listing of `derived/` with the manifest, the root and the series directory; at most 8 group
+  files; the listing of `log/`; at most 8 trailers; at most 256 reused records, or at most 4 MiB hashed of one
+  segment. The two listings and the manifest are read whole (after a year at the defaults, about 400 group files and
+  some 100,000 names in `log/`). Its worst case (a first start, a restore, a lost `derived/`)
+  reads every kept segment once in the background; ingest does not wait for it, a shutdown does not finish it, and
+  until it ends the files there are stand (a root written meanwhile never goes below one found valid).
+- **Reading.** The newest generation of a family that is valid (and, for the root, matches the catalogue, below);
+  failing that the previous one; failing both, the family is absent. A reader treats a missing, invalid or behind
+  file as absent; a version refusal is an error for that file. The derived files are never backed up.
+- **Sources of F.** The highest position of the current generation that a valid root (`through`) or series directory
+  (`through`) names is a source of F (`spec.md` §3 Recovery rule 3); the status file names none. A file of a newer
+  version is passed over there, and the writer writes none of that family and does not try to.
+
+**Root body** (104 bytes, then the arrays in this order):
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | `epoch`: the manifest record the root is complete through |
+| 8 | 8 | `manifest_end`: the offset just past that record; a reader parses the manifest from here |
+| 16 | 4 | `through`'s generation |
+| 20 | 4 | CRC32C of that manifest record's block bytes: the record is matched by content |
+| 24 | 8 | `through`'s sequence: every sealed segment whose last position is at or below `through` is listed; at or below the last synced mark |
+| 32 | 8 | `segment_count`: segments listed in all groups |
+| 40 | 16 | the mark's reset stamp when written |
+| 56 | 16 | C(E): generation `u32`, reserved `u32`, sequence `u64`; zero for none (reserved for roadmap 6.3e) |
+| 72 | 4 × 5 | counts: groups, lost ranges, quarantined files, compacted files, restored ends |
+| 92 | 2 × 5 | `record_size` of each, in the same order: 72, 40, 16, in v1 0, and 16 |
+| 102 | 2 | reserved |
+
+Group entry (72): 0 `number` `u32`; 4 `segment_count` `u32`; 8 first and 16 last segment's `file_id`; 24 first
+position; 36 last position; 48 first and 56 last commit time; 64 residence `u8` (1 hot; 8.1 adds the others), 3
+reserved; 68 the group file body's CRC32C, which names the generation of the group this root was written with.
+Lost range (40): 0 first, 12 last position; 24 `file_id`; 32 cause `u8` (A.14 field 7), 7 reserved: the manifest's
+lost ranges as of `epoch`. Quarantined file (16): 0 kind `u8`, 3 reserved, 4 generation `u32`, 8 `file_id`; none
+until roadmap 8.1 lays out the quarantine record. Compacted files: reserved (roadmap 6.3e may use them or leave the
+catalogue to the manifest's publish record); count 0 in v1. Restored end (16): 0 the restore's generation `u32`; 4
+the generation and 8 the sequence `u64` of the end it restored: the restored ends in force (`spec.md` §8
+Generations, the restore record's own and those it carries); none in generation 0 (roadmap 8.3 fills them). The
+epoch, `manifest_end`, lost ranges and restored ends are those of the writer's start; the manifest changes only at a
+start today (Q-704), and a reader parses it from `manifest_end` (Q-775). Checks: groups numbered from 0, each with 1
+to 256 segments and all but the last with 256, the first group starting its generation and each joining the one
+before it (Contiguity, below), the counts summing to `segment_count`, and the last group's last position equal to
+`through` (zero with no group); restored ends in strictly ascending order of the restore's generation, each end in a
+generation below it.
+
+**Group body** (16 bytes, then the records): 0 `number` `u32`; 4 count `u32`, at most 256; 8 `record_size` `u16`
+(104 in v1); 10 reserved (6). Group *n* holds the sealed segments `256n` to `256n + 255`, counted in position order;
+a full group's membership never changes: a segment removed locally (Q-745) keeps its record, with flag bit 1 "not
+local" (Q-779, laid out by roadmap 6.3e). Segment record (104): 0 `file_id`; 8 generation `u32`; 12 flags `u8` (bit 0
+`has_entries`, A.8; bit 1 reserved as above), 3 reserved; 16
+first and 24 last sequence; 32 first and 40 last commit time (A.9); 48 fact count (the sum of the segment index's
+counts); 56 the file's length; 64 the trailer's `file_crc32c`, 4 reserved; 72 SHA-256 of the whole file (32). Checks:
+records in strictly ascending position, each segment's last above the previous one's, first at or below last in
+sequence and commit time.
+
+**Contiguity.** Sealed segments follow one another, so a log directory has no hole. The first record starts its
+generation: its first sequence is 1, or the lost ranges the root lists cover every sequence below it. Within a
+generation each record's first sequence is the previous record's last + 1, or the lost ranges cover every position
+between (adjacent ranges joining). A record of a later generation joins one of an earlier generation only when it
+starts its generation as the first record does, a restored end in the root for the earlier generation, of a restore
+in a generation above it up to the later one, is at or below the earlier record's last position (the lowest such end
+where there are several; positions past it are set aside), and no restored end of that span names a position in a
+generation between them. A group whose records do not join, and a root whose groups do not, are invalid. The writer never lets `through` pass a sealed segment it has not listed: a seal handed over late holds the
+later ones back, and a sealed segment the start cannot read ends the listing below it (status counter 15).
+
+**Validation against the catalogue.** A group is used only while every record names a live sealed segment of the
+catalogue with the same `file_id`, generation and last sequence and the same plaintext hash (the manifest's file
+description, A.14); until the manifest lists sealed log segments (roadmap 6.3b) the writer compares the length and
+`file_crc32c` that the segment's trailer gives instead (Q-775). A root is used only while its header's generation is
+the store's and the manifest holds a valid record ending at `manifest_end` with epoch `epoch` and that CRC32C. A group
+is that root's only if its body CRC32C, number, count and first and last position are those of the root's entry. So a segment replaced
+under a group (A.9, §8 Corrupt block) invalidates that group alone, a restore every file of the older generation,
+and a manifest rebuild, which renumbers records, the root alone; a group file whose body CRC32C is not the one the
+root names is not that root's. A part not used is read from the segments by a reader and rebuilt by the writer.
+
+**Series directory body** (48 bytes, then the entries): 0 `through` (12); 12 `lost` `u32`, the positions of `through`'s
+generation at or below it that the root's lost ranges (the manifest's, merged by identity) covered when it was
+written, saturating at `u32::MAX`; 16 the mark's reset stamp when written; 32 `judged_at` `i64`, the
+time the candidates and pending facts are judged at (the later of the write time and every `received_at` the entries
+cover); 40 count `u32`; 44 `record_size` `u16` (96 in v1); 46 reserved. Entries are in strictly ascending series id
+and hold the series' state as of `through` (`spec.md` §7 Derived files). A file is a function of the kept log only
+while no position at or below `through` has been lost since (more covered now than `lost`, a loss extended under its
+identity included) and `lost` is not saturated: a reader and the writer drop it otherwise. A candidate whose `t` is above the reader's `now` (after a clock step back) is found again by
+`at(series, now)`. The series directory advances only while the writer's process takes every durable batch (its
+deliverer's index); a refresh it skips (Q-704) delays it, never falsifies it.
+
+| Offset | Size | Entry field (96 bytes) |
+|---:|---:|---|
+| 0 | 4 | `series_id` |
+| 4 | 2 | flags: bit 0 `latest_t` present; 1 `lateness_reference` present; 2 candidate present; 3 candidate unsure; 4 pending fact present; 5 more pending facts may exist |
+| 6 | 1 | the candidate's value kind: 0 read at the position (value and quality: a candidate continued from a pending fact), 1 `f64`, 2 decimal, 3 state, 4 boolean, 5 text (read at the candidate's position) |
+| 7 | 1 | the candidate's adapter-supplied quality (A.5 codes, never bad; 0 for kind 0) |
+| 8 | 8 | latest recorded `t` (`spec.md` §2.2) |
+| 16 | 8 | lateness reference (§2.2) |
+| 24 | 8 | fact count |
+| 32 | 8 | orphaned facts (§2.1): facts of an id with no definition as of `through` |
+| 40 | 8 | the **live candidate**'s `t`: the latest current fact (§2.3) that is not bad and not ahead of the write time |
+| 48 | 12 | its position |
+| 60 | 1 | its decimal scale; 3 reserved |
+| 64 | 8 | its value: `f64` bits, decimal units (`i64`), state index, boolean 0 or 1; 0 for text |
+| 72 | 8 | the **next pending fact**'s `t`: the earliest good current fact ahead of the write time |
+| 80 | 12 | its position; 4 reserved |
+
+Checks: a known value kind and a quality up to 2 when the candidate is present (0 for kind 0), a decimal scale at most 18, a state
+index that fits `u16`, a boolean 0 or 1. Bit 3 means the candidate may not be the live fact (it was corrected to bad,
+or a fact ahead that the entry does not name may have fallen due): a reader finds the fact in force instead (§2.3
+`at`), counted. Bit 5 means facts ahead may exist that the entry does not name: once the named one falls due, a
+reader finds the next. Fields whose flag is clear are zero.
+
+**Status file body** (48 bytes, then the arrays): 0 the periodic interval in nanoseconds (0: written on a change of
+health or pressure only); 8 the last synced mark (12), diagnostic: a reader reads the mark from `MARK`; 20 health
+`u8` (0 ok, 1 degraded, 2 critical; a reader shows any other value as "other"); 21 pressure flag `u8` (0 or 1; set by
+roadmap 9.0g, 0 before it); 22 flags `u8` (bit 0 **partial**: the level covers only the reasons the file carries, set
+until `kvik health`, roadmap 9.0e, adds the rest); 23 reserved; 24 when the flag was last set (0 for never); 32 the
+store's query slot count `u32` (roadmap 9.0g; 0 is unknown); 36 reason count `u32`; 40 counter count `u32`; 44 reason
+`record_size` `u16` (4); 46 counter `record_size` `u16` (16). Reason (4): code `u16`, 2 reserved; codes 1 data lost,
+2 ingest waiting, 3 disk low, 4 disk critical, 5 seal blocked, 6 manifest rebuilt, `0xffff` other (codes 1 and 6 are
+not written before roadmap 9.0e). Counter (16): id `u16`, 6 reserved, value `u64`, in strictly ascending id; ids 1
+queue depth, 2 time waited (ns), 3 batches, 4 syncs, 5 to 7 commit latency p50, p99 and largest (ns), 9 sealed
+segments, 10 free bytes, 14 derived-file writes that failed, 15 sealed segments the log directory cannot list; 8 and
+11 to 13 are unassigned. Every reason code and counter id is ignorable. A file older, by `created_at`, than twice
+its interval (or with no interval) says nothing about the writer: it may have stopped, crashed or turned read-only,
+after which it writes no file; a reader ignores its pressure flag and its level.
+
+**Cadence** (the writer's; a reader relies only on the allowance). The log directory: the open group and the root at
+each seal, once the mark is synced past it. The series directory: once the sealed bytes it does not cover, plus the
+largest of the last 16 seals, would pass 32 MiB, and otherwise at least every 15 minutes; so between writes they stay
+at most 32 MiB, and while a due write waits for the mark sync (or for the deliverer to take the batches) at most 32
+MiB plus the seals since. Segments that seal by size (the default 64 MiB) are covered at every seal; small timed
+seals at the 15-minute rule. A reader whose uncovered sealed bytes pass its 64 MiB allowance waits one mark-sync
+interval and tries again before `DirectoryUnavailable` (Q-773). The cadence holds while one seal (its read, CRC32C
+and SHA-256) takes less time than a segment takes to fill. The status file: every 60 s and at once on a change of
+health or pressure (looked at once a second).
+
+**Crash and rebuild.** The files are unsynced, so after a power cut the newest may be invalid or absent. The writer
+keeps the previous generation and rebuilds forward from it: a group's records are reused wherever they still match
+the catalogue and only segments no valid group lists are read again; the series directory is continued from the
+newest one that is still a function of the kept log (`spec.md` §7 Derived files), with the facts above its `through`.
+A full rebuild from the log is the last resort.
+
 ## B. Outline of the remaining files (not yet normative)
 
 Every file below has an A.1 header and is self-describing (A.14). Parquet is the export format only, so A.1 applies
@@ -891,4 +1078,5 @@ to every stored file.
   of a decimal series carries its `u8` scale (`spec.md` §5.6). Roadmap 7.1a laid out a stored node's bytes in
   [`format-tree.md`](format-tree.md); the file, levels and checkpoint are written by roadmap 7.1b.
 
-Each is specified in this document before the roadmap section that implements it.
+Each is specified in this document before the roadmap section that implements it. The derived files of roadmap 9.0a
+(log directory, series directory, status file) are normative in A.18.

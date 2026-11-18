@@ -112,6 +112,7 @@ impl Writer {
                 start_fault = Some(registry_fault(&dir, &e));
             }
         }
+        let hook = derived::hook(&writer, &*env.fs, &dir, descriptor.store_id);
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
         let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let hub = match deliver::Deliverer::open(
@@ -123,6 +124,7 @@ impl Writer {
             config.limits.max_consumers,
             window_budget(&config.limits),
             latch.clone(),
+            Some(hook.fold.clone()),
         ) {
             Ok(d) => Some(deliver::Hub::new(d, env.clone(), &dir, clocks.clone())),
             Err(_) if start_fault.is_some() => None,
@@ -133,10 +135,24 @@ impl Writer {
                 });
             }
         };
-        let log = Log::start(writer, clock).map_err(|source| OpenError::Io {
-            path: dir.clone(),
-            source,
-        })?;
+        let log =
+            Log::start_with(writer, clock, Some(derived::options(&hook))).map_err(|source| {
+                OpenError::Io {
+                    path: dir.clone(),
+                    source,
+                }
+            })?;
+        let watch_log = log.watch();
+        hook.fold.follow(move || watch_log.mark_synced());
+        let counters = Arc::new(Mutex::new(counters));
+        let own_fault = Arc::new(Mutex::new(start_fault));
+        hook.share(
+            log.watch(),
+            counters.clone(),
+            own_fault.clone(),
+            env.fs.clone(),
+            &dir,
+        );
         if let Some(h) = &hub {
             h.start(log.watch()).map_err(|source| OpenError::Io {
                 path: dir.clone(),
@@ -147,11 +163,11 @@ impl Writer {
             dir,
             limits: config.limits.clone(),
             log: RwLock::new(Some(log)),
-            own_fault: Mutex::new(start_fault),
+            own_fault,
             store_id: descriptor.store_id,
             decider: Mutex::new(decider),
             local: Mutex::new(local),
-            counters: Mutex::new(counters),
+            counters,
             reader: Mutex::new(None),
             acknowledged: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),

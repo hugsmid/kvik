@@ -189,9 +189,11 @@ fn decode_lost(list: &[(u16, &[u8])]) -> Option<LostRange> {
 }
 
 /// The record reads of one manifest read: body checksums from a prefix table asked at rising offsets, so a read
-/// checksums at most twice the file (`format.md` A, common rules: scan bound).
+/// checksums at most twice the file (`format.md` A, common rules: scan bound). `bytes` start at file offset `base`;
+/// the failed reads' windows are in file offsets.
 struct Search<'a> {
     bytes: &'a [u8],
+    base: u64,
     sums: PrefixCrc<'a>,
     headers: u64,
     body: u64,
@@ -199,9 +201,10 @@ struct Search<'a> {
 }
 
 impl<'a> Search<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    fn new(bytes: &'a [u8], base: u64) -> Self {
         Self {
             bytes,
+            base,
             sums: PrefixCrc::new(bytes),
             headers: 0,
             body: 0,
@@ -243,14 +246,14 @@ impl<'a> Search<'a> {
         let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
         self.body += body.len() as u64;
         let Some(list) = fields(&body[RECORD_PREFIX..]) else {
-            self.failed.charge(at, body.len() as u64);
+            self.failed.charge(self.base + at, body.len() as u64);
             return Ok(None);
         };
         let lost = match t {
             RECORD_LOST_RANGE => match decode_lost(&list) {
                 Some(l) => Some(l),
                 None => {
-                    self.failed.charge(at, body.len() as u64);
+                    self.failed.charge(self.base + at, body.len() as u64);
                     return Ok(None);
                 }
             },
@@ -265,7 +268,7 @@ impl<'a> Search<'a> {
             _ if b.header.skippable() => None,
             _ => {
                 return Err(ManifestError::Unsupported(FormatError::Unsupported {
-                    offset: at,
+                    offset: self.base + at,
                     element: Element::BlockType(t),
                 }));
             }
@@ -293,7 +296,7 @@ pub fn read_manifest_with_stats(
     bytes: &[u8],
     store_id: &[u8; 16],
 ) -> (Result<ManifestRead, ManifestError>, ScanStats) {
-    let mut search = Search::new(bytes);
+    let mut search = Search::new(&bytes[HEADER_LEN.min(bytes.len())..], HEADER_LEN as u64);
     let r = read_all(bytes, store_id, &mut search);
     (r, search.stats())
 }
@@ -313,10 +316,36 @@ fn read_all(
     if h.kind != kind::MANIFEST || &h.store_id != store_id {
         return Err(ManifestError::Header);
     }
+    let (records, valid_end) = records_in(search, 0)?;
+    Ok(ManifestRead {
+        valid_end,
+        torn: (bytes.len() as u64) > valid_end,
+        records,
+    })
+}
+
+/// Reads the records in `tail`, the bytes of a manifest from file offset `base` (the end of a valid record, or
+/// the header's end) to its end, as [`read_manifest`] reads them past that point: each valid with an epoch above
+/// the one before, the first above `last_epoch`. Returns the records, with file offsets, and the file offset just
+/// past the last; an invalid record followed by a valid one of a higher epoch is corrupt (`spec.md` §7 Manifest).
+pub fn read_records(
+    tail: &[u8],
+    base: u64,
+    last_epoch: u64,
+) -> Result<(Vec<Record>, u64), ManifestError> {
+    records_in(&mut Search::new(tail, base), last_epoch)
+}
+
+fn records_in(
+    search: &mut Search<'_>,
+    last_epoch: u64,
+) -> Result<(Vec<Record>, u64), ManifestError> {
+    let len = search.bytes.len() as u64;
+    let base = search.base;
     let mut records: Vec<Record> = Vec::new();
-    let mut at = HEADER_LEN as u64;
-    while at < bytes.len() as u64 {
-        let min = records.last().map_or(0, |r| r.epoch);
+    let mut at = 0u64;
+    while at < len {
+        let min = records.last().map_or(last_epoch, |r| r.epoch);
         match search.record_at(at, min)? {
             Some(r) => {
                 at = r.end;
@@ -325,28 +354,28 @@ fn read_all(
             None => break,
         }
     }
-    let valid_end = at.min(bytes.len() as u64);
+    let valid_end = at.min(len);
     // Search forward for a valid record of a higher epoch: if there is one, the invalid record was synced. Past
     // the failed reads' budget of a window, the rest of it is passed as damaged (`format.md` A, common rules: scan
     // bound).
-    let min = records.last().map_or(0, |r| r.epoch);
+    let min = records.last().map_or(last_epoch, |r| r.epoch);
     let mut probe = valid_end + 8;
-    while probe + (BLOCK_HEADER_LEN as u64) <= bytes.len() as u64 {
-        let next = search.failed.next_from(probe);
+    while probe + (BLOCK_HEADER_LEN as u64) <= len {
+        let next = search.failed.next_from(base + probe) - base;
         if next != probe {
             probe = next;
             continue;
         }
         if search.record_at(probe, min)?.is_some() {
-            return Err(ManifestError::Corrupt(valid_end));
+            return Err(ManifestError::Corrupt(base + valid_end));
         }
         probe += 8;
     }
-    Ok(ManifestRead {
-        valid_end,
-        torn: (bytes.len() as u64) > valid_end,
-        records,
-    })
+    for r in &mut records {
+        r.offset += base;
+        r.end += base;
+    }
+    Ok((records, base + valid_end))
 }
 
 fn push_field(out: &mut Vec<u8>, id: u16, value: &[u8]) {

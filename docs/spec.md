@@ -288,7 +288,8 @@ A.10) is treated as a different boot. The rules apply in this order:
    (rule 1): any remaining invalid tail is torn. Let K be the **last kept position**: the higher of the last kept
    batch's last position and the end of a lost range found at the tail under rule 2. Let F = 1 + the highest
    sequence of the current generation among K and every position named by a local cursor file, manifest record or
-   derived file. Recovery writes a **recovery entry** at F, alone in its batch, at the next write position (after
+   derived file (the registry file, `format.md` A.16, and the files of A.18).
+   Recovery writes a **recovery entry** at F, alone in its batch, at the next write position (after
    the kept bytes or after the lost region at the tail; in a new segment when the open one is full): `after` = K, a
    new **reset stamp** (the sequence F and a random nonce, never zero; the mark carries it from then on), the
    boot id, the tail's length in bytes up to the last non-zero byte, the readable commit blocks in it (the tail reported
@@ -623,7 +624,8 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   writer appends an empty record when it needs one, and at once after a restore record. What a dropped record
   described is found again: an unlisted compaction output is discarded (§9 row 10), an unlisted sealed log segment
   is listed again, a lost range is found again by the scan or the scrub, an acknowledgement is given again. New
-  epochs continue above every epoch named by the last valid record and by any lease file. A corrupt record is
+  epochs continue above every epoch named by the last valid record and by any lease file, as its epoch or as the
+  highest epoch its reader has read (Readers). A corrupt record is
   fetched from deep (by generation and epoch) or from the mirror path, verified, written again in place over the
   corrupt bytes and synced; where that cannot be done, the manifest is rewritten to a new file and renamed while no
   handle holds the old one open (§3 Sync primitive). Every file is self-describing: its header and trailer carry
@@ -663,7 +665,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
      unacknowledged, and the rebuild record counts it.
   4. Writes the new manifest as `MANIFEST.new` (`format.md` A.12), opened by a rebuild record that carries, per file
      kind, a `file_id` floor above every id seen (`format.md` A.14), with epochs above
-     every epoch named by a valid record and by any lease file; syncs it; renames it over the old file while no handle
+     every epoch named by a valid record and by any lease file (as above); syncs it; renames it over the old file while no handle
      holds that open (§3 Sync primitive); syncs the directory. A `MANIFEST.new` left by a crash is removed at the
      next start.
   A rebuilt manifest takes no file as verified in another tier until it has been verified there again (§7 inputs
@@ -706,24 +708,46 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
 - **Retired files** are removed locally only after the grace period (1 hour of the writer's monotonic clock since the
   later of the retirement record and the writer's start), once the files that replaced them are verified in another
   tier, and when no live reader lease names an older epoch.
-- **Leases:** a lease file holds the epoch, the boot id (from the same source as the mark's) and a refresh counter
-  that the reader increments at every refresh. The writer expires a lease when its counter has not changed for
+- **Leases:** a lease file holds the epoch, the highest epoch the reader has read, the boot id (from the same source
+  as the mark's) and a refresh counter that the reader increments at every renewal. The writer expires a lease when its counter has not changed for
   1 hour of the writer's monotonic clock since the writer first observed that value; at writer start, every lease of
   the current boot counts as first observed then. A lease is void only when both boot ids are non-zero and differ.
   The writer looks at leases at its own turns, at most once a minute, with no timer of its own: a late look only
   makes an expiry later.
-- **Readers** take an epoch, write a lease file naming it, and refresh both at least every 30 minutes. A reader
-  needs nothing from the writer's memory: it reads via the manifest, the documented layout, tree files and log
-  segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
-  `after`; it compares the mark's reset stamp before and after reading, and discards what it read if the stamp
-  changed meanwhile. A reader reads nothing without a renewed lease: if the lease write fails, the open or refresh
-  returns the error. Positions are read in order, so a reader that cannot read a file returns the error for that
-  file and reads nothing at or past it until it can. A manifest record a reader cannot take an epoch from is an
-  error of the manifest for the reader. Accepted residuals: a reader may read a mark that is not yet synced (from
+- **Readers** read under cuts: a cut is the manifest epoch whose files it reads, with the durable position and reset
+  stamp it was taken at. A reader's lease names the lowest epoch of its live cuts and records the highest epoch the reader
+  has read, written before any file is read under a higher one; the reader renews it at least every 30 minutes and at
+  the check of a held cut; a cut ends `cut_max_age` (`api.md` `ReaderConfig`; at most the grace period of Retired
+  files) after the last manifest check that found its epoch current; a lease found gone or changed ends every cut. A reader needs nothing from the writer's memory: it reads via
+  the manifest, the documented layout, tree files and log segments up to the durable mark. A reader that reads a recovery entry (§3) voids what it took above the entry's
+  `after`; it compares the mark's reset stamp before and after a pass that took something (a batch, a void, a
+  region or a moved resume point; a pass that took nothing has nothing to discard, Q-851), and discards what it read
+  if the stamp changed meanwhile; a call with a materialised result then reads once more under the new cut, and a second change
+  ends it with `CutExpired` (Q-850). A reader reads nothing without a lease, renewed within `lease_refresh`, that names an epoch at or below
+  its cut's: if a lease write that a call needs fails, the call returns the error. Positions are read in order, so a reader catching up (a consumer, a live read's tail) that
+  cannot read a file returns the error for that file and reads nothing at or past it until it can; a query (roadmap
+  9.0f) returns the error only if the file's segment index (`format.md` A.8) lists one of its series or the file has
+  entries, or the index cannot be read either, and otherwise passes over it. A manifest record a reader cannot take an epoch from is an
+  error of the manifest for the reader. A reader parses only records appended past those it holds (Q-852), so one
+  that has parsed the manifest keeps serving after an earlier record is damaged, from what it read of the valid
+  records, until the manifest is rebuilt or the reader opens again. Accepted residuals: a reader may read a mark that is not yet synced (from
   the page cache, before a start's sync of it or after that sync failed); the new reset stamp of the start that then
   truncates voids what it took. Corruption events reported by a pass that a start overtook (it truncated and wrote
   past the old mark before the reader read the mark again) may be wrong; the next refresh's check of the last batch
   still finds the rewrite.
+- **Derived files** (`format.md` A.18): the log directory (the sealed segments, with their sequence and commit-time
+  ranges, checked against the catalogue), the series directory (per series, as of a position: the latest recorded
+  `t`, the lateness reference, counts, the live candidate and the next pending fact) and the status file (the
+  writer's counters, health and pressure flag). Only the writer writes them, on its maintenance thread; they are
+  checksummed, renamed into place and never synced or backed up, and none names a position above the last synced
+  mark. A reader treats a missing, invalid or behind one as absent and reads the log instead, up to an allowance of
+  sealed bytes; the files speed reads up and never change a result. A series directory, or a root, is a function of
+  the kept log while its `through` with the reset stamp it records, judged as a saved point (below), is kept or void
+  above no lower position; the writer, which judges at each start, keeps one written under the current stamp or with
+  `through` at or below the `after` of the recovery entry its start wrote (Q-776); a position at or below a series
+  directory's `through` lost since it was written (a new lost range or one extended under its identity) makes it no
+  longer one. A part of the log directory whose
+  segments the catalogue no longer describes (a replaced segment, a restore, a manifest rebuild) is not used.
 - **Reset stamp and saved points.** The mark carries the current reset stamp: zero until the first reset, then
   the stamp of the last recovery entry a start wrote (§3 Recovery rules 1 and 3) or of the last restore record (§8
   Generations; its sequence is the restored generation's first position, its nonce fresh). A position kept for later

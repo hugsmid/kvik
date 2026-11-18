@@ -1,8 +1,8 @@
 //! Reader leases (`format.md` A.15, `spec.md` §7 Leases): the 128-byte lease file a reader process writes and
 //! renews, and the writer's view of the lease files it finds.
 //!
-//! A reader names in its lease the manifest epoch it took; the writer keeps what a live lease may still read. Each
-//! lease carries a refresh counter that the reader increments at every renewal. The writer expires a lease whose
+//! A reader names in its lease the lowest manifest epoch of its live cuts ([`Cuts`]); the writer keeps what a live
+//! lease may still read. Each lease carries a refresh counter that the reader increments at every renewal. The writer expires a lease whose
 //! counter has not changed for [`LEASE_EXPIRY`] of the writer's monotonic clock since the writer first observed
 //! that value, and treats a lease of another boot as void; it deletes void and expired leases. A lease is never
 //! synced.
@@ -14,7 +14,7 @@
 //! ```
 //! use kvik_log::lease::{LeaseSlot, lease_name, parse_lease_name};
 //!
-//! let slot = LeaseSlot { epoch: 3, refresh_counter: 1, boot_id: [9; 16], created_at: 10 };
+//! let slot = LeaseSlot { epoch: 3, refresh_counter: 1, boot_id: [9; 16], created_at: 10, highest_read: 4 };
 //! let file = slot.encode_file([1; 16], 0);
 //! assert_eq!(LeaseSlot::decode_file(&file, &[1; 16]), Some(slot));
 //! // A lease of another store is invalid.
@@ -57,6 +57,9 @@ pub struct LeaseSlot {
     pub boot_id: [u8; 16],
     /// When the reader created the lease, nanoseconds since the Unix epoch.
     pub created_at: i64,
+    /// The highest manifest epoch the reader has read, which may be above `epoch` while an older cut is live; 0 from
+    /// a reader that does not write it (`spec.md` §7 Manifest: new epochs continue above it).
+    pub highest_read: u64,
 }
 
 impl LeaseSlot {
@@ -74,6 +77,7 @@ impl LeaseSlot {
         put(b, 72, &self.refresh_counter.to_le_bytes());
         put(b, 80, &self.boot_id);
         put(b, 96, &self.created_at.to_le_bytes());
+        put(b, 104, &self.highest_read.to_le_bytes());
         let crc = crc32c(&b[64..124]);
         put(b, 124, &crc.to_le_bytes());
     }
@@ -106,6 +110,7 @@ impl LeaseSlot {
             refresh_counter: u64_at(b, 72),
             boot_id,
             created_at: i64_at(b, 96),
+            highest_read: u64_at(b, 104),
         })
     }
 }
@@ -179,12 +184,12 @@ pub fn read_leases(
     Ok(out)
 }
 
-/// The highest epoch any valid lease file in `dir` names, void ones included; 0 if none. New manifest epochs after
-/// a start continue above it (`spec.md` §7 Manifest, `format.md` A.14).
+/// The highest epoch any valid lease file in `dir` names or records as read, void ones included; 0 if none. New
+/// manifest epochs after a start continue above it (`spec.md` §7 Manifest, `format.md` A.14, A.15).
 pub fn highest_epoch(fs: &dyn Fs, dir: &Path, store_id: &[u8; 16]) -> io::Result<u64> {
     Ok(read_leases(fs, dir, store_id)?
         .into_iter()
-        .filter_map(|(_, l)| l.map(|l| l.epoch))
+        .filter_map(|(_, l)| l.map(|l| l.epoch.max(l.highest_read)))
         .max()
         .unwrap_or(0))
 }
@@ -319,6 +324,102 @@ impl LeaseTable {
     }
 }
 
+/// Why a reader's cut ended (query design §3.3, `spec.md` §7 Readers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CutEnd {
+    /// Held for `cut_max_age` or longer.
+    Expired,
+    /// A renewal found the lease gone or changed: the epoch may have been unprotected.
+    LeaseLost,
+    /// Not a cut of this reader, or released.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeldCut {
+    epoch: u64,
+    /// The last manifest check that found its epoch current.
+    current_at: Duration,
+    lost: bool,
+}
+
+/// A reader's live cuts (`spec.md` §7 Readers): its lease names the lowest epoch among them, a cut lives at most
+/// `max_age` of the reader's monotonic clock from the last manifest check that found its epoch current, and a lease
+/// found gone or changed ends every cut.
+#[derive(Clone, Debug, Default)]
+pub struct Cuts {
+    next: u64,
+    held: BTreeMap<u64, HeldCut>,
+}
+
+impl Cuts {
+    /// Takes a cut at `epoch`, found current by a manifest check at `checked_at`; returns its id.
+    pub fn take(&mut self, epoch: u64, checked_at: Duration) -> u64 {
+        self.next += 1;
+        self.held.insert(
+            self.next,
+            HeldCut {
+                epoch,
+                current_at: checked_at,
+                lost: false,
+            },
+        );
+        self.next
+    }
+
+    /// A manifest check at `now` found `epoch` current: its live cuts count their age from now. An ended cut stays
+    /// ended.
+    pub fn seen(&mut self, epoch: u64, now: Duration, max_age: Duration) {
+        for c in self.held.values_mut() {
+            if c.epoch == epoch && !c.lost && now.saturating_sub(c.current_at) < max_age {
+                c.current_at = now;
+            }
+        }
+    }
+
+    /// Ends the cut `id`; nothing for an unknown id.
+    pub fn release(&mut self, id: u64) {
+        self.held.remove(&id);
+    }
+
+    /// Ends every cut: the lease was found gone or changed.
+    pub fn lose_all(&mut self) {
+        for c in self.held.values_mut() {
+            c.lost = true;
+        }
+    }
+
+    /// Whether the cut `id` is live at `now`.
+    pub fn check(&self, id: u64, now: Duration, max_age: Duration) -> Result<u64, CutEnd> {
+        let c = self.held.get(&id).ok_or(CutEnd::Unknown)?;
+        if c.lost {
+            Err(CutEnd::LeaseLost)
+        } else if now.saturating_sub(c.current_at) >= max_age {
+            Err(CutEnd::Expired)
+        } else {
+            Ok(c.epoch)
+        }
+    }
+
+    /// The lowest epoch of the cuts live at `now`; `None` without one.
+    pub fn lowest(&self, now: Duration, max_age: Duration) -> Option<u64> {
+        self.held
+            .keys()
+            .filter_map(|&id| self.check(id, now, max_age).ok())
+            .min()
+    }
+
+    /// How many cuts are held, live or ended and not yet released.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether no cut is held.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +431,7 @@ mod tests {
             refresh_counter: 7,
             boot_id: [3; 16],
             created_at: -4,
+            highest_read: 0x0304,
         };
         let b = s.encode_file([5; 16], 2);
         // Offsets from the A.15 table.
@@ -338,7 +440,8 @@ mod tests {
         assert_eq!(&b[72..80], &7u64.to_le_bytes());
         assert_eq!(&b[80..96], &[3; 16]);
         assert_eq!(&b[96..104], &(-4i64).to_le_bytes());
-        assert_eq!(&b[104..124], &[0; 20]);
+        assert_eq!(&b[104..112], &0x0304u64.to_le_bytes());
+        assert_eq!(&b[112..124], &[0; 12]);
         assert_eq!(&b[124..128], &crc32c(&b[64..124]).to_le_bytes());
         assert_eq!(&b[64..], &s.encode()[..]);
         for i in 64..LEASE_LEN {

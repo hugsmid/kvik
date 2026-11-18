@@ -11,7 +11,8 @@ use kvik_log::writer::Position as LogPos;
 
 use super::*;
 use crate::config::StoreConfig;
-use crate::durable::reader::{DurableReader, log_reader};
+use crate::durable::reader::DurableReader;
+use crate::durable::start::log_reader;
 use crate::durable::{Emitted, Writer};
 use crate::env::{Env, ManualClock, MemFs};
 use crate::health::LossKind;
@@ -332,14 +333,10 @@ fn the_watchs_reports_taken_in_parts_equal_a_full_reads_and_it_keeps_no_segment_
     }
     damage(&fs, &dir, b"W-SIX");
 
-    let mut watch = Watch::with_part(
-        log_reader(&dir, &env, Duration::from_secs(60)).unwrap(),
-        Finder::default(),
-        1,
-    );
+    let mut watch = Watch::with_part(log_reader(&dir, &env).unwrap(), Finder::default(), 1);
     watch.catch_up(&Latch::default()).unwrap();
     assert_eq!(watch.kept_bytes(), 0);
-    let full = DurableReader::open(&dir, &env, Duration::from_secs(60))
+    let full = DurableReader::open(&dir, &env, Duration::from_secs(60), Duration::from_secs(60))
         .unwrap()
         .losses()
         .unwrap();
