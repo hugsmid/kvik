@@ -1,4 +1,4 @@
-//! The deliverer's intake of the log: refreshes, the losses they find (design §3.1), and the batches taken once
+//! The deliverer's intake of the log: refreshes, the losses they find (Q-930), and the batches taken once
 //! acknowledged.
 
 use super::*;

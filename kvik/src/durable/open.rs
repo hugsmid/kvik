@@ -48,7 +48,7 @@ impl Writer {
         let start_losses = start_losses(&writer, env.boot.current());
         let latch = Arc::new(Latch::default());
         // The kept log, read once in parts: the registry, the decision state, the counters and the losses passed over
-        // (roadmap 11.0, design §3.5); its reader then becomes the loss watch.
+        // (roadmap 11.0, Q-947); its reader then becomes the loss watch (Q-927).
         let kept = match start::log_reader(&dir, &env) {
             Ok(r) => start::read_kept(
                 r,
@@ -219,7 +219,7 @@ impl Writer {
                 None => Ok(()),
             }
         });
-        // The loss watch gives up its reader; its reports stay (design §3.2).
+        // The loss watch gives up its reader; its reports stay (Q-926).
         lock(&self.watch).close();
         // Every cursor file whose state changed, after the last mark sync; consumers waiting are woken.
         if let Some(h) = &self.hub {

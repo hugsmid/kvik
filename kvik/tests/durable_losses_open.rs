@@ -1,5 +1,5 @@
 //! A loss found while the store is open decides as a restart over it does, and what the process reports, counts and
-//! answers after it (design §5.2 of the reconciling design: regions, Q-750 and Q-755, summaries, windows).
+//! answers after it: regions (Q-929), Q-750 and Q-755, summaries (Q-930), windows (Q-921).
 
 mod common;
 
@@ -166,7 +166,7 @@ fn a_loss_found_while_open_decides_as_a_restart_over_it_does() {
         .unwrap();
 }
 
-/// Q-750 and Q-755 as ruled (design §2.3): after a found loss, a replay whose key's segment holds a second damaged
+/// Q-750 and Q-755 as ruled: after a found loss (Q-921), a replay whose key's segment holds a second damaged
 /// batch that no scanning reader has met is recorded unchecked and counted for the run.
 #[test]
 fn after_a_found_loss_a_replay_beside_unfound_damage_is_recorded_unchecked_and_counted() {

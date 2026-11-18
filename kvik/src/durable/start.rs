@@ -7,7 +7,7 @@
 //! undone from that state: the log is then read again whole into an index of every fact, as before roadmap 11.0.
 //!
 //! Every event goes through the loss watch's [`Finder`] first, so each region the start passes over is a loss in
-//! every run, as a reader process reports it (design §3.5), and the reader that read the log becomes the watch.
+//! every run, as a reader process reports it (Q-947), and the reader that read the log becomes the watch.
 
 use std::collections::BTreeMap;
 use std::path::Path;

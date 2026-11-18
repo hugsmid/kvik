@@ -239,7 +239,7 @@ pub(crate) struct Deliverer {
     recent: recent::Recent,
     /// Invalid regions the reader passed over, by segment and offset: lost (Q-750).
     damaged: Regions,
-    /// Finds the losses in what the reader returns, for the latch of the process (design §3.1).
+    /// Finds the losses in what the reader returns, for the latch of the process (Q-930).
     finder: Finder,
     latch: Arc<LossLatch>,
     /// The latch's closed ranges already taken.

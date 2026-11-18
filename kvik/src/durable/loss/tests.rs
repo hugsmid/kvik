@@ -406,7 +406,7 @@ fn a_region_inside_a_report_held_too_wide_still_reaches_the_latch_with_its_close
     assert!(f.apply(&[tail], at(7)).is_empty(), "met again, nothing new");
 }
 
-/// Invariant I2 (design §2.2): a plan never outlives a forgetting. A call that waits for room plans again, so a loss
+/// A plan never outlives a forgetting (Q-921, Q-943). A call that waits for room plans again, so a loss
 /// latched during the wait is taken in: the replay of the lost fact, a duplicate when first planned, is recorded.
 #[test]
 fn a_loss_latched_while_a_call_waits_for_room_is_taken_in_when_it_plans_again() {
