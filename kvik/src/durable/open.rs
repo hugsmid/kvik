@@ -185,6 +185,7 @@ impl Writer {
             latch,
             watch: Mutex::new(watch),
             start_losses,
+            bucket_warning: config.log.bucket_warning(),
             env,
         });
         // A tzdata entry when the host's release is not the version in force, before ingest (`docs/api.md`

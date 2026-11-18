@@ -64,7 +64,7 @@ The keys roadmap section 4 needs; all may change between opens.
 
 | Key | Type | Default | Limits |
 |---|---|---|---|
-| `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
+| `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments. A crafted or damaged file's cost to a start is promised as measured at the default (Q-970), so above it `attach_backup` first logs a warning through `tracing`, for a bucket others may be able to write |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
 | `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: the ceiling of the batch-sync interval, and the interval before the first sample; 0 disables the sync budget, so batch syncs run back to back. Mark syncs, timed or forced, spend nothing of the budget |
 | `log.sync_interval_floor` | `Duration` | 2 ms | spec §3 Group commit: the least batch-sync interval. Any window holds at most its length over the least interval, plus four, batch syncs, so at most 1/floor a second over time: 500 at the default, about 165 GiB of host writes a day at 4 KiB a sync if sustained; a deployment on flash that is sensitive to wear sets a longer floor, with `min_sync_interval` at least as long. At or above `min_sync_interval` the interval is fixed at it (Q-710, Q-981, Q-985) |

@@ -232,11 +232,17 @@ pub(crate) struct Writer {
     watch: Mutex<loss::Watch>,
     /// The losses the start found and could not record (`spec.md` §3 Order of a start, step 3).
     start_losses: Vec<LossReport>,
+    /// What attaching a bucket warns of under this configuration (Q-970).
+    bucket_warning: Option<String>,
 }
 
 impl Writer {
     pub(crate) fn store_id(&self) -> [u8; 16] {
         self.store_id
+    }
+
+    pub(crate) fn bucket_warning(&self) -> Option<&str> {
+        self.bucket_warning.as_deref()
     }
 
     pub(crate) fn dir(&self) -> &Path {

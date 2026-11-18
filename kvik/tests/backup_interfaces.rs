@@ -1,16 +1,20 @@
 //! The backup and restore call signatures (roadmap 8.1d, 8.3d), before they are wired: owned `'static` sinks, the
-//! restore modes and the new reasons, errors and statistics.
+//! restore modes and the new reasons, errors and statistics, and the warning attaching a bucket gives (Q-970).
 
 mod common;
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use common::{BACKENDS, block_on, store_on};
+use common::{BACKENDS, block_on, config_on, store_on};
+use kvik::env::ManualClock;
 use kvik::{
-    BackupError, BackupRefusal, BackupSink, BackupStats, Encryption, ListPage, Reason, RestoreMode,
-    RestoreScope, RestoreStats, SinkError, SinkFuture, Stored,
+    Backend, BackupError, BackupRefusal, BackupSink, BackupStats, Encryption, ListPage, LogConfig,
+    Reason, RestoreMode, RestoreScope, RestoreStats, SinkError, SinkFuture, Store, Stored,
 };
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 struct Closed;
 
@@ -74,4 +78,65 @@ fn the_backup_reasons_errors_and_statistics_exist() {
     assert!(e.to_string().contains("another key"));
     assert!(!BackupStats::default().attached);
     assert!(!RestoreStats::default().drill);
+}
+
+/// Collects the messages of warnings and errors logged on this thread.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+impl Subscriber for Warnings {
+    fn enabled(&self, m: &Metadata<'_>) -> bool {
+        *m.level() <= Level::WARN
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, e: &Event<'_>) {
+        struct Message<'a>(&'a mut Vec<String>);
+        impl Visit for Message<'_> {
+            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "message" {
+                    self.0.push(format!("{v:?}"));
+                }
+            }
+        }
+        e.record(&mut Message(&mut self.0.lock().unwrap()));
+    }
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+/// The warnings attaching a bucket logs for a store of `backend` with segments of `segment_size` bytes.
+fn attach_warnings(backend: Backend, segment_size: u64) -> Vec<String> {
+    let name = format!("bucket-warning-{backend:?}-{segment_size}");
+    let clock = ManualClock::new(common::start());
+    let mut log = LogConfig::default();
+    log.segment_size = segment_size;
+    let s = block_on(Store::open(config_on(backend, &name, &clock).log(log))).unwrap();
+    let warnings = Warnings::default();
+    tracing::subscriber::with_default(warnings.clone(), || {
+        let _ = block_on(s.attach_backup(Closed, Encryption::Key([7; 32])));
+    });
+    block_on(s.shutdown()).unwrap();
+    std::mem::take(&mut *warnings.0.lock().unwrap())
+}
+
+#[test]
+fn attaching_a_bucket_warns_only_above_the_default_segment_size_on_the_durable_backend() {
+    let above = 64 << 20 | 4_096;
+    let w = attach_warnings(Backend::Durable, above);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains(&format!("log.segment_size is {above} bytes")) && w[0].contains("Q-970"),
+        "{w:?}"
+    );
+    for size in [16 << 20, 64 << 20] {
+        assert_eq!(
+            attach_warnings(Backend::Durable, size),
+            Vec::<String>::new()
+        );
+    }
+    assert_eq!(attach_warnings(Backend::Model, above), Vec::<String>::new());
 }

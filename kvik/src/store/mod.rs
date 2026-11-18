@@ -458,12 +458,19 @@ impl Store {
             d => d.export_orphaned(range))
     }
 
-    /// Attaches a backup sink (spec §8). Not supported yet.
+    /// Attaches a backup sink (spec §8). Not supported yet. On the durable
+    /// backend with `log.segment_size` above the default it first logs a
+    /// warning through `tracing` (Q-970).
     pub async fn attach_backup<S: BackupSink + 'static>(
         &self,
         _sink: S,
         _key: Encryption,
     ) -> Result<(), BackupError> {
+        if let StoreInner::Durable(d) = &self.inner
+            && let Some(w) = d.bucket_warning()
+        {
+            tracing::warn!("{w}");
+        }
         Err(BackupError::NotSupportedYet { what: "backup" })
     }
 

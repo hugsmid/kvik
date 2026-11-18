@@ -94,7 +94,10 @@ not bounded: a header read costs about 20 to 31 ns, and the dearest crafted 64 M
 (best of five, the worst up to 40 % above; a boundary read failing at the end of a chain of 500,000 empty blocks that
 the candidate then keeps is the dearest, 2.0 s before for the failing chain alone), the same blocks undamaged 0.25 to
 0.37 s; a crafted manifest's header walk 0.19 to 0.30 s per 16 MiB (1.2 to 1.3 s before). What a start is promised
-against the budget is Q-970. Files built to the body bound
+against the budget is this measured figure per file at the default `segment_size` of 64 MiB, not a bound in seconds
+(Q-970): a larger segment costs about `segment_size / 64 MiB` times as much, the 1 GiB maximum some 10 s, and a start
+pays for each crafted file it reads; a store with a larger `segment_size` warns when it is given a bucket, which others
+may be able to write. Files built to the body bound
 measured 0.22 s (nested facts images over every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches
 whose rows share one text value, after damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records;
 0.15 s before) at a start. Every entry type, small and large, costs at most about 2.9 ns a byte to check, a

@@ -16,9 +16,11 @@ once by a torn tail's commit search, and each block's header is read at most eig
 proven: the dearest crafted 64 MiB log segments built cost a start about 0.25 to 0.61 s, and a crafted manifest about
 0.2 to 0.3 s per 16 MiB for its header walk, on the same machine; the cost grows linearly with `log.segment_size` and
 with the number of crafted files a start reads. What is promised against the 1 s restart budget, whether a file
-reaches the store directory or a bucket the store reads from, is an open question (Q-970). The fuzz targets of the log
-segment and the manifest check these counts. Working memory, beyond the file and the read's results, is bounded by
-about two windows. Write access to the store directory can still destroy or alter data.
+reaches the store directory or a bucket the store reads from, is that measured figure per file at the default
+`log.segment_size` of 64 MiB, not a bound in seconds (Q-970). A store with a larger segment size logs a warning when it
+is given a bucket, since a crafted file in a bucket others can write then costs a start that many times more. The fuzz
+targets of the log segment and the manifest check these counts. Working memory, beyond the file and the read's results,
+is bounded by about two windows. Write access to the store directory can still destroy or alter data.
 
 ## Reporting a vulnerability
 Please report suspected vulnerabilities privately through GitHub's private vulnerability reporting: open the

@@ -149,7 +149,8 @@ pub enum MarkSync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LogConfig {
-    /// Segment size (default 64 MiB; 16 MiB to 1 GiB, a multiple of 4,096).
+    /// Segment size (default 64 MiB; 16 MiB to 1 GiB, a multiple of 4,096). Above the default, attaching a bucket
+    /// warns (Q-970).
     pub segment_size: u64,
     /// A segment is sealed after this long at the latest (default 5 minutes).
     pub seal_interval: Duration,
@@ -168,13 +169,32 @@ pub struct LogConfig {
 impl Default for LogConfig {
     fn default() -> Self {
         LogConfig {
-            segment_size: 64 << 20,
+            segment_size: DEFAULT_SEGMENT_SIZE,
             seal_interval: Duration::from_secs(300),
             min_sync_interval: Duration::from_millis(10),
             sync_interval_floor: kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR,
             max_batch_bytes: 1 << 20,
             mark_sync: MarkSync::Interval(Duration::from_secs(1)),
         }
+    }
+}
+
+/// The default `log.segment_size`, the size at which a start's cost on a crafted or damaged file is measured (Q-970).
+const DEFAULT_SEGMENT_SIZE: u64 = 64 << 20;
+
+impl LogConfig {
+    /// The warning for a store that reads files from a bucket, which others may be able to write: `None` at or below
+    /// the default segment size, the only size the cost of a crafted or damaged file is promised at (Q-970).
+    pub(crate) fn bucket_warning(&self) -> Option<String> {
+        (self.segment_size > DEFAULT_SEGMENT_SIZE).then(|| {
+            format!(
+                "log.segment_size is {} bytes, {:.1} times the default of 64 MiB: if others can write the bucket this \
+                 store reads files from, a crafted or damaged file can cost a start about that many times the figure \
+                 measured per file at the default (Q-970)",
+                self.segment_size,
+                self.segment_size as f64 / DEFAULT_SEGMENT_SIZE as f64
+            )
+        })
     }
 }
 
@@ -324,5 +344,23 @@ impl ReaderConfig {
     pub fn cut_max_age(mut self, d: Duration) -> Self {
         self.cut_max_age = d;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bucket_warning_is_given_above_the_default_segment_size_only_and_names_the_ratio() {
+        let mut log = LogConfig::default();
+        assert_eq!(log.bucket_warning(), None);
+        log.segment_size = 16 << 20;
+        assert_eq!(log.bucket_warning(), None);
+        log.segment_size = (64 << 20) + 4_096;
+        assert!(log.bucket_warning().is_some());
+        log.segment_size = 1 << 30;
+        let w = log.bucket_warning().unwrap();
+        assert!(w.contains("1073741824 bytes, 16.0 times"), "{w}");
     }
 }

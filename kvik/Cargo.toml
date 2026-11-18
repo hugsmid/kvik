@@ -36,6 +36,8 @@ kvik-sink-api = { path = "../sinkapi" }
 # Summary nodes: the fold, merge and edge credit windows are evaluated with.
 kvik-tree = { path = "../tree" }
 thiserror = "2"
+# The warning of a segment size above the default for a store that reads files from a bucket (Q-970).
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 kvik-log = { path = "../log", features = ["unmapped-reason"] }

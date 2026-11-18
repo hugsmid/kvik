@@ -707,6 +707,7 @@ dependencies = [
  "loom",
  "proptest",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
