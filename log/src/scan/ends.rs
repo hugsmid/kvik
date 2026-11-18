@@ -27,19 +27,16 @@ const NAMES: u32 = 2;
 /// The chain leaves the block at the entry's target, not yet read when the block was.
 const EXIT: u32 = 3;
 
-/// What the chain from each start in `[base, ahead)` comes to, a word each in a ring indexed by offset: a tag and the
-/// signed distance to its target in 8-byte steps; 0 for a start not read.
+/// What the chain from each start read comes to, a word each in a ring indexed by offset: a tag and the signed distance
+/// to its target in 8-byte steps. The fill writes the starts from `ahead` on, and a start is asked about only from a
+/// candidate on, at most a batch and a block below `ahead`, so every start asked about was written by the fill.
 #[derive(Clone, Debug)]
 pub(crate) struct Ends {
     /// [`SPAN`], or less for the differential tests, so small files cross blocks.
     span: u64,
-    /// The ring's length less one, a power of two less one: it holds at least a batch and a block beyond a candidate
-    /// and the 64 KiB it lags behind one.
+    /// The ring's length less one, a power of two less one: it holds at least a batch and a block beyond a candidate.
     mask: u64,
     slots: Vec<u32>,
-    /// A bit per start: a commit block of the commit length that fits below the limit starts there.
-    commits: Vec<u64>,
-    base: u64,
     ahead: u64,
 }
 
@@ -70,8 +67,6 @@ impl Ends {
             span,
             mask: len - 1,
             slots: Vec::new(),
-            commits: Vec::new(),
-            base: 0,
             ahead: 0,
         }
     }
@@ -85,29 +80,6 @@ impl Ends {
         ((p >> 3) & self.mask) as usize
     }
 
-    /// The entry of `p`, 0 if it was not read.
-    #[inline]
-    fn word(&self, p: u64) -> u32 {
-        if p < self.base || p >= self.ahead {
-            return 0;
-        }
-        self.slots[self.index(p)]
-    }
-
-    /// Forgets the starts below `o`.
-    pub(crate) fn move_to(&mut self, o: u64) {
-        if !self.slots.is_empty() {
-            let n = (o.saturating_sub(self.base) / 8).min(self.mask + 1);
-            for k in 0..n {
-                let i = self.index(self.base + 8 * k);
-                self.slots[i] = 0;
-                self.commits[i / 64] &= !(1 << (i % 64));
-            }
-        }
-        self.base = self.base.max(o);
-        self.ahead = self.ahead.max(self.base);
-    }
-
     /// Reads ahead until every start up to a batch beyond `o`, or up to `limit`, has its entry.
     fn fill(&mut self, reads: &mut Reads<'_>, o: u64, limit: u64) {
         let want = o.saturating_add(MAX_BATCH_DATA + 8).min(limit);
@@ -116,7 +88,6 @@ impl Ends {
         }
         if self.slots.is_empty() {
             self.slots = vec![0; (self.mask + 1) as usize];
-            self.commits = vec![0; (self.mask as usize + 1).div_ceil(64)];
         }
         if reads.valid.is_none() {
             reads.valid = Some(Valid::new(self.mask));
@@ -133,7 +104,7 @@ impl Ends {
             }
             // Earlier starts whose chains left their block into this one take the ends found here, so every exit
             // lies at or past `ahead`.
-            let mut p = o.max(self.base);
+            let mut p = o;
             while p < start {
                 let i = self.index(p);
                 let w = self.slots[i];
@@ -169,8 +140,6 @@ impl Ends {
                 if h.body_len as usize == COMMIT_LEN
                     && p + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit =>
             {
-                let i = self.index(p);
-                self.commits[i / 64] |= 1 << (i % 64);
                 named(reads.bytes, p).map_or(NONE, |s| entry(NAMES, -(((p - s) / 8) as i64)))
             }
             block_type::COMMIT | block_type::SEGMENT_INDEX | block_type::TRAILER => NONE,
@@ -184,15 +153,6 @@ impl Ends {
                 }
             }
         }
-    }
-
-    /// Whether a commit block of the commit length that fits below the limit starts at `p`, if its header was read.
-    #[inline]
-    pub(crate) fn commit_at(&self, p: u64) -> Option<bool> {
-        (self.word(p) != 0).then(|| {
-            let i = self.index(p);
-            self.commits[i / 64] & (1 << (i % 64)) != 0
-        })
     }
 
     /// The first start from `o` on, in steps of 8 bytes below `stop`, whose chain of block headers ends in a commit

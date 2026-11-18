@@ -41,9 +41,10 @@ specified here before the roadmap item that writes it.
 - **Scan bound.** A reader's work on a file of L bytes is bounded whatever its bytes. At most 2L bytes are
   checksummed, plus, in a log segment, once more the bytes of the one direct read that found the first damage (at most
   a batch, 8 MiB). Block headers are read at most 16 times per 8 bytes. Working memory, beyond the file and what the
-  read reports, is about one batch in a segment, with about 12.5 MiB once damage is found (8 MiB of chain ends, 4 MiB
-  of boundary-read verdicts and two bitmaps), and one block (16 MiB) in the manifest. A body checksum is derived from
-  a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not bytes (Q-110).
+  read reports, is about one batch in a segment, with about 12.3 MiB once damage is found (8 MiB of chain ends, 4 MiB
+  of boundary-read verdicts and a bitmap of valid headers), and one block (16 MiB) in the manifest. A body checksum
+  is derived from a table of prefix checksums by a CRC shift, so a block image nested in another costs arithmetic, not
+  bytes (Q-110).
   A body whose checksum holds is checked by its type (A.5, A.6, A.14). A **failed read** is a candidate read in full,
   with at least one body checked, that is rejected: a resynchronisation candidate or a boundary read that keeps no
   batch (A.2), or a manifest record whose checksum holds and whose fields are rejected (A.14). The file is divided into

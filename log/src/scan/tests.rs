@@ -506,38 +506,31 @@ fn put_header(b: &mut [u8], at: u64, t: u8, len: u32) {
 }
 
 #[test]
-fn the_chain_ends_forget_a_start_a_ring_below_what_they_read() {
+fn a_start_a_ring_above_a_candidate_takes_its_own_chain_end() {
     let probe = ends::Ends::new(ends::SPAN);
     let ring = 8 * (probe.ring_len() as u64);
     let x = 1u64 << 20;
     let mut b = vec![0u8; (ring + x + (12 << 20)) as usize];
-    put_header(
-        &mut b,
-        x,
-        block_type::COMMIT,
-        crate::body::COMMIT_LEN as u32,
-    );
+    put_header(&mut b, x, 0x50, 0);
+    let commit = Commit {
+        generation: 0,
+        block_count: 1,
+        first_sequence: 1,
+        last_sequence: 1,
+        commit_time: 0,
+        batch_bytes: 16,
+        batch_crc32c: 0,
+    };
+    let mut c = Vec::new();
+    encode_block(block_type::COMMIT, 0, &commit.encode(), &mut c).unwrap();
+    b[(x + 16) as usize..(x + 80) as usize].copy_from_slice(&c);
     put_header(&mut b, x + ring, 0x50, 0);
     let limit = b.len() as u64;
     let mut reads = Reads::new(&b);
     let mut e = probe;
-    let o = HEADER_LEN as u64;
-    e.next_candidate(&mut reads, o, o + 64, limit);
-    assert_eq!(e.commit_at(x), Some(true));
-    // Moved to just below the start a ring above, then read from past it: that start lies in the gap not read.
+    assert_eq!(e.next_candidate(&mut reads, x - 4_096, x + 4_096, limit), x);
     let o = x + ring - 4_096;
-    e.move_to(o);
-    e.next_candidate(&mut reads, x + ring + 8, x + ring + 16, limit);
-    assert_eq!(e.commit_at(x + ring), None);
-    assert_eq!(e.commit_at(x), None);
-    // Read from below it, the start a ring above is a data header, not the commit block a ring below.
-    let mut e = ends::Ends::new(ends::SPAN);
-    let mut reads = Reads::new(&b);
-    e.next_candidate(&mut reads, HEADER_LEN as u64, HEADER_LEN as u64 + 64, limit);
-    assert_eq!(e.commit_at(x), Some(true));
-    e.move_to(o);
-    e.next_candidate(&mut reads, o, o + 64, limit);
-    assert_eq!(e.commit_at(x + ring), Some(false));
+    assert_eq!(e.next_candidate(&mut reads, o, o + 8_192, limit), o + 8_192);
 }
 
 #[test]

@@ -74,15 +74,12 @@ impl CommitSearch {
         }
     }
 
-    /// Visits every step below `to`, passing those whose header the chain ends read and found no commit block.
+    /// Visits every step below `to`.
     #[inline]
-    fn advance(&mut self, reads: &mut Reads<'_>, to: u64, limit: u64, ends: Option<&Ends>) {
+    fn advance(&mut self, reads: &mut Reads<'_>, to: u64, limit: u64) {
         let to = to.min(self.end);
         while self.next < to && self.next + (BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
-            self.next = match ends.and_then(|e| e.commit_at(self.next)) {
-                Some(false) => self.next + 8,
-                _ => commit_step(reads, self.next, limit, &mut self.found),
-            };
+            self.next = commit_step(reads, self.next, limit, &mut self.found);
         }
     }
 
@@ -181,14 +178,11 @@ impl Chains {
         let mut o = start + 8;
         while o + (2 * BLOCK_HEADER_LEN + COMMIT_LEN) as u64 <= limit {
             if let Some(c) = commits.as_deref_mut() {
-                c.advance(reads, o, limit, self.ends.as_ref());
+                c.advance(reads, o, limit);
             }
             // Block starts below `o`, and table entries below the commit search, are never asked about again.
             if o.saturating_sub(self.pruned) >= 1 << 16 {
                 self.links = self.links.split_off(&o);
-                if let Some(e) = &mut self.ends {
-                    e.move_to(o);
-                }
                 self.pruned = o;
                 reads.forget_below(commits.as_deref().map_or(o, |c| c.next.min(o)));
             }
@@ -256,7 +250,7 @@ impl Chains {
             o += 8;
         }
         if let Some(c) = commits {
-            c.advance(reads, limit, limit, self.ends.as_ref());
+            c.advance(reads, limit, limit);
         }
         Ok(None)
     }

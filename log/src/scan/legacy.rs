@@ -78,7 +78,6 @@ pub fn chain_candidates(bytes: &[u8], from: u64, to: u64, limit: u64, span: u64)
     let mut out = Vec::new();
     let mut o = from;
     while o < to {
-        ends.move_to(o);
         let stop = (o + (1 << 16)).min(to);
         o = ends.next_candidate(&mut reads, o, stop, limit.min(bytes.len() as u64));
         if o < stop {
