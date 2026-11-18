@@ -1,4 +1,4 @@
-//! The durable cut per log (query design §3.2): `(manifest epoch, durable position, reset stamp)`, held by a read
+//! The durable cut per log (Q-850, Q-903): `(manifest epoch, durable position, reset stamp)`, held by a read
 //! while it runs, with the stamp rule of its call kind (spec §7 Readers).
 //!
 //! - A materialised call (`live`, `at`, `window`, `buckets`, `calendar`, `interval`, `series`, and `facts` until it

@@ -1,5 +1,5 @@
 //! The series directory's entries and the status file's content, supplied to `kvik-maint` through the seal hook
-//! (`format.md` A.18; the query design's section 4). [`SeriesFold`] folds every durable batch the deliverer's
+//! (`format.md` A.18). [`SeriesFold`] folds every durable batch the deliverer's
 //! [`super::index::Index`] takes into bounded per-series state, in position order, and answers as of a position at
 //! or below the last synced mark: batches above the mark known when they arrive wait in a short queue.
 //!

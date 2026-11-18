@@ -1,4 +1,4 @@
-//! The single-flight refresh (query design §3.5, Q-902): calls that arrive together share one refresh, and a call that
+//! The single-flight refresh (Q-902): calls that arrive together share one refresh, and a call that
 //! arrives while one runs waits for the next, so every call gets a view read after it began. A follower takes the
 //! leader's view; on the leader's error it leads or follows once more, then reports the error.
 //!
@@ -158,8 +158,8 @@ mod tests {
 
     type Call = thread::JoinHandle<Result<Arc<u32>, u32>>;
 
-    /// A call on another thread; if it leads round `r`, its refresh returns `outcome(r)` once `calls - r` calls wait for
-    /// it or a later round, so that round `r` ends with every call that has not ended waiting.
+    /// A call on another thread; if it leads round `r`, its refresh returns `outcome(r)` once `calls - r` calls wait
+    /// for it or a later round, so that round `r` ends with every call that has not ended waiting.
     fn call(
         flight: &Arc<Flight<u32, u32>>,
         rounds: &Arc<AtomicU32>,

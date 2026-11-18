@@ -1,4 +1,4 @@
-//! The manifest as a reader holds it between calls (query design §3.1): checked by path at every call, by its
+//! The manifest as a reader holds it between calls (Q-852): checked by path at every call, by its
 //! length, its file identity where the platform gives one and the bytes of the last record the reader holds; a longer
 //! manifest is parsed from the offset last parsed to, a shorter or changed one from its start.
 

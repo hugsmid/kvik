@@ -28,7 +28,7 @@
 //! what is new: at most one segment's bytes per reader handle while it follows a segment. A whole-file read of an
 //! earlier segment is freed when the refresh ends, and the kept bytes are freed when another segment is followed.
 //!
-//! A call's file work does not grow with the log (query design §3.1): one read of the mark (a second one only after a
+//! A call's file work does not grow with the log (Q-852): one read of the mark (a second one only after a
 //! pass that took something, the check above), the manifest checked by path and parsed only past what the reader
 //! holds (`manifest`), the open segment's new bytes, the last batch read again, and no directory listing once the
 //! reader has caught up: later segments are opened by name, with a listing only if one is not found.
@@ -307,7 +307,7 @@ pub struct Update {
     pub discarded: bool,
 }
 
-/// A cut of the log (query design §3.2): the manifest epoch whose files it reads, the durable position and the reset
+/// A cut of the log (Q-850, Q-903): the manifest epoch whose files it reads, the durable position and the reset
 /// stamp it was read under. Its lease protects it until it is released, expires or ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cut {

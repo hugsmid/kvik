@@ -1,4 +1,4 @@
-//! The read side of a durable store (query design §2, §3).
+//! The read side of a durable store (Q-850 to Q-854, Q-900 to Q-904).
 
 pub(crate) mod cut;
 pub(crate) mod flight;

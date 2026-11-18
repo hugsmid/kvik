@@ -1,4 +1,4 @@
-//! A reader's lease and cuts (`spec.md` §7 Readers, query design §3.3): the lease names the lowest epoch of the live
+//! A reader's lease and cuts (`spec.md` §7 Readers, Q-853, Q-854): the lease names the lowest epoch of the live
 //! cuts and records the highest epoch read; it is written when either would change or half of `lease_refresh` has
 //! passed; a cut lives `cut_max_age` from the last manifest check that found its epoch current; a lease found gone or
 //! changed ends every cut.
@@ -62,7 +62,7 @@ impl LogReader {
         Ok(true)
     }
 
-    /// Takes a cut at what the reader holds (query design §3.2): the manifest epoch it last read, the durable position
+    /// Takes a cut at what the reader holds (Q-903): the manifest epoch it last read, the durable position
     /// and the reset stamp. The lease names that epoch or a lower one while the cut is live. Its age counts from the
     /// last manifest check that found its epoch current, not from now.
     pub fn hold(&mut self) -> Cut {

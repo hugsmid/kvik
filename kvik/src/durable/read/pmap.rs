@@ -1,4 +1,4 @@
-//! A persistent ordered map (query design §3.5, Q-900): a B-tree of reference-counted nodes, so a clone shares every
+//! A persistent ordered map (Q-900): a B-tree of reference-counted nodes, so a clone shares every
 //! node and a change copies only the nodes on the path it touches.
 
 use std::fmt;
@@ -284,7 +284,7 @@ impl<'a, K, V> Cursor<'a, K, V> {
     }
 }
 
-/// The entries of a map between two bounds, read from both ends as they are asked for (query design §3.5: a read
+/// The entries of a map between two bounds, read from both ends as they are asked for (Q-900: a read
 /// that wants the last fact before a time costs a descent, not the series).
 pub(crate) struct Range<'a, K, V> {
     front: Cursor<'a, K, V>,

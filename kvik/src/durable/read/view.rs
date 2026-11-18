@@ -1,4 +1,4 @@
-//! The views a reader publishes (query design §3.5): what one refresh found, shared by every call that takes it and
+//! The views a reader publishes (Q-900, Q-903): what one refresh found, shared by every call that takes it and
 //! read with no lock. A view holds one cut of the log reader for as long as it lives; a call's cut is its view's
 //! (Q-903).
 

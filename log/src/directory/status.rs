@@ -87,7 +87,7 @@ pub struct StatusFile {
     pub health: u8,
     /// Flags ([`flag`]).
     pub flags: u8,
-    /// The pressure flag (section 3.4 of the query design; set by roadmap 9.0g, clear before it).
+    /// The pressure flag (`format.md` A.18; set by roadmap 9.0g, clear before it).
     pub pressure: bool,
     /// When the flag was last set.
     pub pressure_since: Option<i64>,

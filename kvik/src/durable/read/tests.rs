@@ -1,4 +1,4 @@
-//! Calls that share views (query design §3.5): no call waits for another's work, concurrent calls equal sequential
+//! Calls that share views (Q-902, Q-903): no call waits for another's work, concurrent calls equal sequential
 //! ones at the same cuts, and a view's cut follows the lease rules (Q-903).
 
 use std::collections::{HashMap, HashSet};

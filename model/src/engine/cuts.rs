@@ -5,7 +5,7 @@
 use super::{Error, FileId, Model, ReadResult, Reader, ResetStamp};
 use crate::types::Nanos;
 
-/// A cut a reader process holds (query design §3.2).
+/// A cut a reader process holds (Q-903).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cut {
     /// Its id.

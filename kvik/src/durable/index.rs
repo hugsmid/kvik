@@ -1,6 +1,6 @@
 //! What a process knows of the kept log: the registry, every fact by series, the commit time of every batch, and
 //! the losses its reads found ([`Finder`]), built from what a log reader returns and cut back when it voids what it
-//! took (`spec.md` §7 Readers). Each reader holds one, and its views share its structure (query design §3.5): a
+//! took (`spec.md` §7 Readers). Each reader holds one, and its views share its structure (Q-900): a
 //! clone copies no entry, and a change copies the nodes it touches. The writer's start and the deliverer hold one
 //! without facts.
 
@@ -559,8 +559,8 @@ mod tests {
         }
     }
 
-    /// An index of `series` series with 20 facts each in 80 batches, published, then given one batch with one fact: what that
-    /// batch cost the map.
+    /// An index of `series` series with 20 facts each in 80 batches, published, then given one batch with one fact:
+    /// what that batch cost the map.
     fn cost_of_one_fact(series: u32) -> Counts {
         let mut i = Index::default();
         let mut next = 1;

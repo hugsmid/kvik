@@ -143,7 +143,8 @@ fn compare(n: usize, at: usize, place: Place, small: bool) -> Result<(), TestCas
 }
 
 /// Three stores per case, compared on outcomes and flags (positions left out), on `losses()` apart from `recorded`
-/// (and `last` with sealed segments, Q-937) and on `series()`: one finds the loss while open, one finds it and restarts, one restarts without finding it.
+/// (and `last` with sealed segments, Q-937) and on `series()`: one finds the loss while open, one finds it and
+/// restarts, one restarts without finding it.
 #[test]
 fn a_loss_found_while_open_decides_as_a_restart_over_it_does() {
     let cases = (ProptestConfig::default().cases / 8).max(8);

@@ -2,10 +2,10 @@
 //! renews, and the writer's view of the lease files it finds.
 //!
 //! A reader names in its lease the lowest manifest epoch of its live cuts ([`Cuts`]); the writer keeps what a live
-//! lease may still read. Each lease carries a refresh counter that the reader increments at every renewal. The writer expires a lease whose
-//! counter has not changed for [`LEASE_EXPIRY`] of the writer's monotonic clock since the writer first observed
-//! that value, and treats a lease of another boot as void; it deletes void and expired leases. A lease is never
-//! synced.
+//! lease may still read. Each lease carries a refresh counter that the reader increments at every renewal. The
+//! writer expires a lease whose counter has not changed for [`LEASE_EXPIRY`] of the writer's monotonic clock since
+//! the writer first observed that value, and treats a lease of another boot as void; it deletes void and expired
+//! leases. A lease is never synced.
 //!
 //! Nothing the writer removes today needs a lease: it deletes only segments that hold no batch (`spec.md` §3).
 //! [`LeaseTable::oldest_live_epoch`] is what the removal of retired files (roadmap 6.3) and tier eviction (8.1)
@@ -324,7 +324,7 @@ impl LeaseTable {
     }
 }
 
-/// Why a reader's cut ended (query design §3.3, `spec.md` §7 Readers).
+/// Why a reader's cut ended (`spec.md` §7 Readers, Q-853).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CutEnd {
     /// Held for `cut_max_age` or longer.

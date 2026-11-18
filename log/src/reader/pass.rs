@@ -47,7 +47,7 @@ impl LogReader {
         let names: Box<dyn Iterator<Item = SegmentName>> = if first == 0 {
             Box::new(self.listed(&mut listing, first, mark)?.to_vec().into_iter())
         } else {
-            // Caught up: the segments from the one followed to the mark's, by file id (query design §3.1).
+            // Caught up: the segments from the one followed to the mark's, by file id (Q-852).
             Box::new((first..=mark.file_id).map(move |file_id| SegmentName {
                 generation: if file_id == first {
                     first_generation

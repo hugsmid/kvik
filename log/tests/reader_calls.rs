@@ -1,4 +1,4 @@
-//! A reader call's cost and its cuts. The cost against the age of the store (query design §3.1): the file-system
+//! A reader call's cost and its cuts. The cost against the age of the store (Q-852): the file-system
 //! calls, directory entries listed and file writes of one call, counted through the `Fs` seam, on stores with 10 and
 //! with 1,000 sealed segments. The lease rules of `spec.md` §7 Readers: the lease names the lowest epoch of the live
 //! cuts, a cut ends after `cut_max_age`, and a lease found gone or changed ends every cut.

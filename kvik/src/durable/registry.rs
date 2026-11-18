@@ -50,7 +50,7 @@ impl Series {
 /// The registry: a function of the entries applied to it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Registry {
-    /// Shared with the views a reader has published (query design §3.5).
+    /// Shared with the views a reader has published (Q-900).
     series: PMap<u32, Arc<Series>>,
     /// Site zones by effective time; of two at one time the later in the log.
     site_zones: BTreeMap<i64, String>,

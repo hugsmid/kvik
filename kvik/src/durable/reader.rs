@@ -1,6 +1,6 @@
 //! A reader on the durable log (`docs/api.md` Reader processes): the log reader of `kvik-log`, which takes no lock
 //! and reads up to the durable mark, and an [`Index`] of what it returned. Every call takes a view published by a
-//! refresh that began after the call did, and runs on it with no lock under the view's cut (query design §3.5,
+//! refresh that began after the call did, and runs on it with no lock under the view's cut (Q-902, Q-903,
 //! [`cut`], [`view`](super::read::view)). The refresh notes the losses it finds in the process's latch and forgets
 //! every range the latch took since the last one from the index the view is cloned from (Q-938).
 
