@@ -294,7 +294,11 @@ impl ManifestPort for Port {
             .ok_or_else(|| PortError::Io(std::io::ErrorKind::NotFound.into()))?;
         let img = image::read(&bytes, &ID).map_err(std::io::Error::other)?;
         // A record that cannot be read stops the upload of those after it (spec §8 Generations).
-        if img.corrupt.iter().any(|c| c.before_epoch > after) {
+        if img
+            .corrupt
+            .iter()
+            .any(|c| c.before_epoch.is_none_or(|b| b > after))
+        {
             return Err(PortError::Io(std::io::Error::other("a corrupt record")));
         }
         let mut v: Vec<Record> = img.records().filter(|r| r.epoch > after).cloned().collect();

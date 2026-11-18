@@ -118,6 +118,8 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-928 | §3 Recovery rule 2, §11 Health (Q-200) | Damage to a batch of the kept log that the store's own reader finds at a query |
 | Q-937 | §3 Recovery rule 2; `api.md` Health | A damaged last batch of a sealed segment reported as lost to the head of the log |
 | Q-811 | `format-compacted.md` B.1, B.2 | Format details settled while writing the compacted segment's layout |
+| Q-872 | §7 Manifest step 4; `format.md` A.14 | The epochs a rebuild takes above a corrupt span with no later record |
+| Q-873 | `format.md` A common rules (Scan bound); `design.md` Budgets; `SECURITY.md` | The time of the header walk on a crafted file |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -805,9 +807,9 @@ model's `f64::min` may pick the other zero, which compares equal; the tree's tes
 folds states by index, so it counts a transition and splits the time in state between two keys; the model folds by
 name, counting no transition and one key. The two backends' `transitions` and time-in-state then differ for the same
 facts.
-**Settled at the review of roadmap 7.1a:** the names of a state series are distinct. A definition declaring a name
-twice is refused by both backends (`kvik/tests/api.rs` `a_state_name_declared_twice_is_refused`), and a definition
-entry carrying one is invalid content in the log (`format.md` A.6 field 13; `log/tests/batches.rs`), so index and name
+**Settled at the review of roadmap 7.1a:** the names of a state series are distinct. A definition declaring a name twice
+is refused by both backends (`kvik/tests/api.rs` `a_state_name_declared_twice_is_refused`), and a definition entry
+carrying one is invalid content in the log (`format.md` A.6 field 13; `log/tests/entries_checks.rs`), so index and name
 count the same transitions (`spec.md` §2.1 `value type`).
 
 ## Q-190 — The Parquet export schema as a user contract
@@ -2049,31 +2051,162 @@ segment is never backed up, so a silent indefinite retry is a hidden loss of bac
 `a_description_that_never_opens_is_retried_with_doubling_waits_and_degrades_health_once_the_wait_reaches_the_cap`,
 `segment_unreadable_clears_when_a_read_succeeds`.
 
-## Q-650 — A manifest search that passes a window and finds no later record (OWNER)
+## Q-650 — A manifest search that passes a window and finds no later record
 
 **Scenario.** A crafted manifest: after a damaged record, checksum-valid record images in one 16 MiB window fail their
 field checks until they have used the window's budget, so the forward search passes the rest of the window
 (`format.md` A, common rules: scan bound; Q-110). No valid record of a higher epoch follows. A valid synced record
 inside the passed part is never looked at. Damage cannot reach this: a counted record needs a valid checksum.
-**Now (provisional, not settled).** The passed bytes are part of the torn tail, as for any invalid last record: the
-writer truncates them at a start (`spec.md` §7 Manifest), with no report. A valid record beyond the window still
-makes the span corrupt, as before.
-**Proposed default: report corrupt.** The search did not look at those bytes, so the reader does not know they are a
-torn record; everywhere else the engine reports what it cannot account for. Reporting the record corrupt keeps the
-bytes and runs the copy or rebuild path. It needs a corrupt span with no later record in `kvik_files::image::Image`
-and in the rebuild record's field 7 (which names the epoch of the valid record after a span), a new form, so the
-owner decides.
+**Was (provisional).** The passed bytes were part of the torn tail, as for any invalid last record: the writer
+truncated them at a start, with no report.
+**Settled (owner's ruling, 2026-11-17): report corrupt.** The search did not look at those bytes, so the reader does
+not know they are a torn record. Both readers now report them corrupt: the start's reader returns
+`ManifestError::Corrupt` at the end of the last valid record (`log/src/manifest.rs` `read_all`), and the whole-file
+reader gives a corrupt span with no later record, `CorruptSpan { before_epoch: None, end: <file end> }`, always the
+last span, with the image not torn (`files/src/image.rs`). The bytes are kept and the copy or rebuild path runs, as
+for any corrupt record. The rebuild record's field 7 writes such a span's `before` as 0 (only the last span may),
+`Rebuild::gaps` and `appender::Gap::before` carry it as `None`, a copy of it is any valid record above the span's
+`after`, and step 3 counts it as a span with room for several records (field 6), since its extent is unknown.
+`spec.md` §7 Manifest and `format.md` A.14 say so. Tests: `files/src/image.rs`
+`a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`,
+`a_full_crafted_window_stays_within_the_budget_and_a_smoke_ceiling`; `log/tests/crafted_files.rs`
+`a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget`,
+`a_full_crafted_manifest_window_stays_within_the_budget_and_a_smoke_ceiling`; `files/tests/open_span.rs`
+`q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span`;
+`files/tests/records.rs` `q650_field_7_writes_a_span_with_no_later_record_as_0_and_only_as_the_last`; the files fuzz
+target checks that a span with no later record holds the rest of the file. Natural damage is unchanged: it never
+reaches the window rule, so a torn tail stays a torn tail. Added at the review: a copy written back for such a span
+goes before it and its bytes are kept whole after the copy, never written over or dropped, as the passed part may
+hold valid records (`kvik_files::rebuild::repair_with_copy`; `files/tests/open_span.rs`
+`q650_a_copy_written_back_keeps_an_open_spans_bytes_after_it`); the rebuild's epochs go above what such a span may
+hold (Q-872); and that it counts as several records in step 3 is pinned by
+`q650_a_loss_no_valid_record_names_behind_an_open_span_counts_in_field_6`. A passed part that holds only zeros, where
+no record can be, is still reported corrupt, not a torn tail: only a crafted file reaches it, and the copy or rebuild
+path is safe for it.
 
-## Q-651 — The crafted-file worst case against the 1 s restart budget (OWNER)
+## Q-651 — The crafted-file worst case against the 1 s restart budget
 
-**Scenario.** A crafted 64 MiB log segment reaches the scan bound's worst case (`format.md` A, common rules): about
-390 MiB of bodies checked, about 2 s at 100 ns per row; 0.6 s at 16 MiB; a crafted manifest about 0.45 s per 16 MiB at
-a refresh. The 1 s restart budget (`design.md` Budgets) is exceeded at 64 MiB.
-**Now.** `design.md` and `SECURITY.md` state the figures and that the budget is exceeded; the Q-110 ruling meant
-crafted files to be bounded rather than placed outside the budget. The failed-read budget alone cannot reach 1 s: the
-2L term (each kept body checked at most twice) is about 0.7 s at 64 MiB by the same arithmetic.
-**Needed.** The owner's choice: amend the published promise (crafted files bounded at about 2 s per 64 MiB, outside
-the 1 s budget), or tighten the bound by other means (a cheaper body check, or each kept body checked once).
+**Scenario.** A crafted 64 MiB log segment reached the scan bound's worst case (`format.md` A, common rules): about
+390 MiB of bodies checked, about 2 s at 100 ns per row; 0.6 s at 16 MiB; a crafted manifest about 0.45 s per 16 MiB
+at a refresh. The 1 s restart budget (`design.md` Budgets) was exceeded at 64 MiB.
+**Settled (owner's ruling, 2026-11-17): tighten the scan; the published 1 s promise stays.** Both means the ruling
+named, chosen by measurement (release build, one shared 4-core cloud machine, one run at a time; the harness is
+`log/tests/crafted_files.rs` `crafted_worst_cases_timed` and `files/src/image.rs` `crafted_manifests_timed`, both
+ignored tests):
+1. Each kept body is checked once. A boundary read judged every body of a batch and the batch read then checked them
+   again (`read_batch`); it now reads the judged batch without checking its bodies again
+   (`kvik_log::batch::read_judged_batch`, a recovery entry found from the entry headers), so body checks total at
+   most L instead of 2L, and the read that reaches a window's budget adds at most a batch instead of two:
+   264 MiB of bodies for a 64 MiB segment instead of 390 MiB (`ScanStats::within_bound`; a manifest has its own,
+   `within_manifest_bound`, with a body as its window and no direct read).
+2. Cheaper body checks with the same verdict. The facts check keeps no row and validates text through
+   `kvik_log::utf8::HeapText`: directly while the text checked stays within the heap's length, then from a table built
+   in one pass, so rows that all name one 255-byte value cost a constant each (it was a decode and a copy, about
+   100 ns a row). The entries check copies no text and builds no entry that needs memory; an entry's fields are
+   split once into a list with an index by id (a lookup scanned the whole list, so a definition with 65,536 state
+   names cost 20 lookups of 65,536), and state names are checked and told distinct in one pass (Q-870). The start's
+   manifest reader reads a record's fields without keeping them and a lost range in one pass; the whole-file reader
+   copies no field and gathers no ignorable field until the record's checks hold, keeps a field its type does not
+   repeat at most twice, and finds an undefined field in the same pass, with the error it gave before.
+Measured, before and after: nested facts images over every window of a 64 MiB segment 0.90 s and 0.22 s; 64 MiB of
+batches whose rows share one text value, after damage, 1.85 s and 0.10 s; a 16 MiB manifest window of rejected records
+0.15 s and 0.08 s at a start, 0.31 s and 0.10 s at a refresh (0.13 s with Q-872's pass); per byte checked, about 0.5 ns
+for facts and at most about 2.9 ns for entries, every type small and large (Q-870). So against the bound a crafted 64
+MiB segment costs at most about 0.8 s in body checks, 16 MiB about 0.22 s, and a crafted manifest at most about 0.09 s
+per 16 MiB at a start and 0.15 s at a refresh: inside the 1 s budget. The header walk is bounded in count only; its time
+is Q-873. `format.md` A common rules (scan bound), `design.md` Budgets and `SECURITY.md` state the figures.
+Natural damage is unchanged: the verdicts are the same and the window rule is untouched. Tests:
+`log/tests/body_check.rs` (each check against its decoder, the text table against `std::str::from_utf8`, and
+`state_names_at_the_limit_are_told_distinct_and_past_it_refused`), `log/tests/batch_assembly.rs`
+`after_damage_a_recovery_entry_not_alone_is_still_invalid_content` (the entry first, last or between others) and
+`a_judged_batch_finds_a_recovery_entry_as_the_full_check_does`, `log/src/manifest.rs`
+`a_lost_range_field_given_twice_is_read_from_its_first_occurrence`,
+`log/tests/crafted_files.rs` `after_damage_each_kept_body_is_checked_once` and the crafted tests of Q-110 at the
+tighter budget, `log/tests/scan_bound.rs` (the differential property against the reference scan at the new bound),
+`log/src/scan/tests.rs` `the_bound_holds_body_checks_and_the_failed_read_budget_per_window`, `files/tests/records.rs`
+`a_rejected_record_gives_the_same_error_with_its_fields_kept_at_most_twice`; the fuzz targets assert the new bounds.
+The in-tree comparisons of each check with its decoder share the code they compare. Independent of it are the text
+table against `std::str::from_utf8`, the state-name check against a sort (Q-870), the field index against a linear
+search (a debug assertion, so every debug test checks it) and the reference scan; the record decoder and the start's
+lost range were compared with the decoders before this change once, by a differential of about 1.8 million inputs at
+the review, with no difference but Q-650's.
+
+## Q-870 — Definitions and short state names against the 1 s restart budget
+
+**Scenario.** After the first cut of Q-651, a definition entry cost about 460 ns to check whatever it held (some
+thirty field lookups by binary search, and a set built for its names), about 3.8 ns a byte for small gauge
+definitions and 5.3 for small two-name state definitions; a definition of 65,536 state names of 3 bytes (8 bytes of
+body a name) cost about 5.7 ns a byte, and small routing entries 5.5. Against the bound (264 MiB of bodies at 64 MiB)
+that is 1.0 to 1.5 s, above the 1 s restart budget.
+**Settled (technical decision, no format change).** Requiring names in ascending order was rejected: field 13 is
+in index order, the order facts and exports use. The check is made cheaper instead (`log/src/entries/decode.rs`,
+`definition.rs`), with the same verdicts:
+1. An entry's fields are split once, with a table of allowed and repeated ids per entry type, into a list that keeps
+   an index by id, cleared per entry, so a lookup costs a constant; the check builds no boxed entry, selection list
+   or consumer list.
+2. State names are checked and keyed in one pass: a name of up to 7 bytes is packed into one word with its length,
+   so equal keys are equal names; a longer one is hashed by `RandomState` and equal hashed keys are settled by a sort.
+   Up to 8 names are compared pairwise; more go into an open-addressing table of 2n slots under a keyed mix with a
+   per-process random seed and multiplier, so no input is slow on purpose. A probe run over 128 slots ends in a sort,
+   so the worst case stays `n log n` whatever the keys.
+Measured (release build, one shared 4-core cloud machine, the best of three runs; `log/tests/crafted_files.rs`
+`crafted_worst_cases_timed` builds every entry type, small and large, short names ASCII and not, and reports the
+dearest): the dearest body is now a definition of 65,536 state names of two 4-byte characters (8 bytes, hashed), 2.8 to
+3.1 ns a byte; other short names 2.0 to 2.9 (one 4-byte character, a letter and a 3-byte character, and 3, 4 and 8 ASCII
+bytes); small definitions about 1 ns (gauge 1.1, two-name states 0.9), small routing entries 1.0, every other entry at
+most about 1.3, facts 0.4. So the body checks of a crafted segment cost at most about 0.8 s at 64 MiB and 0.22 s at 16
+MiB, inside the budget; the header walk, which this does not count, is Q-873. `format.md` A common rules (scan bound),
+`design.md` Budgets and `SECURITY.md` state the figures. Tests: `log/tests/body_check.rs`
+`state_names_are_checked_as_a_plain_reference_checks_them` (a sort as the reference, both sides of the pairwise limit)
+and `state_names_at_the_limit_are_told_distinct_and_past_it_refused`; `log/src/entries/definition.rs`
+`the_sort_after_a_long_probe_run_and_after_equal_hashed_keys_gives_the_same_verdict`,
+`packed_keys_tell_apart_names_that_differ_in_length_or_any_one_byte` and
+`a_short_name_of_invalid_utf8_is_refused_on_both_sides_of_the_pairwise_limit`; the field index is checked against a
+linear search by a debug assertion.
+
+## Q-872 — The epochs a rebuild takes above a corrupt span with no later record
+Recorded at the review of the Q-650 ruling. For the owner's acceptance.
+**Scenario.** A rebuild took its first epoch above every epoch a valid record names, every closed span's later
+epoch and the leases. A span with no later record (Q-650) has no later epoch, so the rebuild record took the last
+valid epoch + 1: the epochs of records the span may hold, synced and perhaps uploaded under
+`manifest/<generation>/<epoch>`. The rebuilt records at those epochs are then not uploaded, or meet another record
+under their key, and a restore reads a chain without the rebuild.
+**Decided.** Such a span bounds the rebuild's epochs from above (`kvik_files::image::CorruptSpan::epoch_ceiling`): the
+higher of the last valid epoch and the highest epoch above it that a checksum-valid record image starting in the span
+names, whether or not its fields pass (`named_epoch`; the search now also visits the passed part of a window for this,
+with checksums and no field checks, so the window rule's bound on body checks is unchanged), plus the records of 40
+bytes, the shortest record, that the span's length could hold, for records after it that damage has made unreadable. The
+two add, as a record after a named one that jumped may be damaged. Epochs normally rise by one a record; after a start
+they may jump above a lease (`format.md` A.14), which names an epoch a reader saw, and the record images give that case.
+Not covered: a record that itself jumped above a lease and is damaged, with no whole record after it, is named by
+nothing and lies above the length bound; the rebuild may then take its epoch again, as a torn tail reuses the epochs of
+the records it drops, and the upload meets the earlier record under that key. A crafted image may name a very high epoch
+and use up the epochs left, which a crafted valid record can do already. Cost: the passed part's headers and checksums,
+about 0.13 s at a refresh for a crafted 16 MiB window (0.10 s before). `spec.md` §7 Manifest step 4 and `format.md` A.14
+say so. Tests: `files/tests/open_span.rs` `q872_a_rebuild_takes_no_epoch_of_a_valid_record_hidden_in_an_open_span` (the
+review's probe), `q872_a_hidden_record_far_above_the_spans_length_still_bounds_the_rebuilds_epochs`,
+`q872_a_damaged_record_after_a_jumped_one_is_below_the_rebuilds_epochs` and
+`q650_a_crafted_tail_with_no_later_record_is_kept_corrupt_and_its_rebuild_names_an_open_span` (the length bound);
+`files/src/image.rs` `a_crafted_search_passes_the_rest_of_a_window_once_failed_reads_use_its_budget` and
+`an_open_spans_epoch_ceiling_adds_its_room_to_the_higher_of_the_last_valid_and_the_named_epoch`.
+
+## Q-873 — The time of the header walk on a crafted file
+Recorded at the re-check of the Q-651 ruling; older than it (the same at `524a5cb`). A technical decision: the
+published promise is kept.
+**Scenario.** The scan bound (`format.md` A, common rules) counts header reads and checksummed bytes, and Q-651 bounds
+the time of body checks. A file can hold a valid block header every 8 bytes, each naming a plausible length and a
+body checksum that does not hold (4 free bytes a header make the next one valid). No body is checked and no read
+fails, so the window rule never applies, and the counts stay inside the bound (about 3 header reads per 8 bytes of the
+16 allowed). Measured at the re-check (release build, one shared 4-core cloud machine): a 64 MiB segment 7.75 s
+(16 MiB 1.5 to 1.7 s; 0.31 s when every block is of the commit type), a 16 MiB manifest 1.15 to 1.33 s with either
+reader: about 0.3 µs a header read in the segment, each following a length to another part of the file, and 0.65 µs a
+candidate in the manifest, the CRC shift of `PrefixCrc::range`. The 1 s restart budget is exceeded.
+**Now.** `format.md`, `design.md` Budgets and `SECURITY.md` state these figures beside the body checks' and say the
+walk is bounded in count, not yet in time.
+**Decided.** The header walk is to be bounded in time so that every crafted file fits the 1 s restart budget, keeping
+the promise, by roadmap 4.9e before gate 4.9 (for example a cheaper checksum shift, a table per length class, fewer
+header reads per offset, or a budget of header reads per window that damage cannot reach). Not done with the Q-651
+fix round: it is more than a small change, and its acceptance rule must be shown again against damage.
 
 ## Q-670 (c) — The pattern grammar as a public promise
 Recorded by roadmap 5.6a, for the owner; (a) and (b) settled by the owner's ruling (see Settled).
@@ -3006,7 +3139,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -3092,8 +3225,6 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-613 | 8.3d | Files of the generation read that no record names; reported by roadmap 8.3g in `Prepared::unnamed`; surfaced by `Store::restore` at 8.3d |
 | Q-614 | 8.3 | Silent restore of an earlier state (a lost last record, a hidden one behind more than 8 skipped epochs, the last old record before an unfinished rebuilt manifest) and the uploaded form's missing version marker; recorded by the review of 8.3g; owner decision pending |
 | Q-615 | 8.3d | The source records read after the claim, so each retry takes a generation; recorded by the review of 8.3g |
-| Q-650 | 6.3b | OWNER. A manifest search past a window with no later record: torn (built, provisional) or corrupt (proposed, safer, needs a new span form); recorded by the fix round of roadmap 4.9d |
-| Q-651 | 4.9 | OWNER. Gate; the crafted-file worst case (about 2 s per 64 MiB segment) against the 1 s restart budget; recorded at the re-check of roadmap 4.9d |
 | Q-670 (c) | 5.6 | Gate, owner; the pattern grammar and `RouteError` as public interface; recorded by roadmap 5.6a, (a) and (b) settled by the owner's ruling |
 | Q-680 | 5.5b | `Outcome` level and `LogStats.acknowledged`; recorded at the review of 5.5a; owner confirmation pending |
 | Q-681 | 5.5b | What `max_unsynced` bounds; recorded at the review of 5.5a; owner decision only for a hard bound |
@@ -3131,6 +3262,8 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-853 | 9.0b2 | `cut_max_age` 30 minutes by default, at most an hour, zero refused, aged from the last check that found its epoch current, on the environment's clock; decided by roadmap 9.0b1 and its review |
 | Q-854 | 9.0b2 | The lease records the highest epoch read; decided by the lead at 9.0b1's review, to be confirmed at the re-check |
 | Q-811 | 6.2a2 | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; open for the two obligations it names for 6.2a2 (memory of the writer and the canonical check; the stall on decreasing commit times) |
+| Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
+| Q-873 | 4.9e | Decided at the re-check of the Q-651 ruling: the header walk is bounded in time so that every crafted file fits the 1 s restart budget, by roadmap 4.9e before gate 4.9 |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud
@@ -3336,7 +3469,7 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-103 | What an automatic manifest rebuild cannot recover from local files | §7 Manifest (the rebuilt manifest carries every valid record with its old epoch and reconstructs only the corrupt record's effect; no fact about a file or a loss held by one record alone; (a) liveness from valid records and named inputs, a file found in deep never live for that reason, an unlocated file not a lost range until cold, the mirror path and deep have answered; (b) a restore record never rebuilt, read from the local restore record file or deep, else read-only, and a drill never rebuilds; (c) identities kept from valid records, cause unknown where none is given, and a double fault listed under its first missing position and counted; (d) a provisional rebuild after `manifest.rebuild_wait`, uploads, evictions and removals held, deep's copy winning when it answers (the wait and acknowledgement: Q-107, settled)), §8 Eviction at 90 days (a file holding a lost range leaves the local tiers only after that loss's record is uploaded or mirrored), §8 Generations ((f) uploads in epoch order, a rebuilt manifest self-contained, uploaded once final; the local restore record file), §11 Health, invariants 10 and 27 (the counted double-fault exception), `format.md` A.12, A.14 (cause 5 unknown, rebuild record fields 5 ((g) the `file_id` floor) and 6, field 100 old epoch; (e) no fact held only by a quarantine or tier-move record) and Part B (chunk index and local restore record), `api.md` `LossCause::Unknown`, `Reason::ManifestRebuilt.provisional`, `manifest.rebuild_wait`. Engine fault tests with roadmap 6.3, 8.2 and 8.3: corrupt in turn a tier-move record of an evicted file, a publish-and-retire record whose inputs are in deep, a lost-range record, its extension and its acknowledgement, the restore record (with and without its local copy); a sink that does not answer (ingest resumes after the wait, nothing uploaded or removed, the manifest equal to a direct repair once it answers); a restore from records, a rebuild record and carried records; ids issued after a rebuild above the floor; a property that no evictions and one corrupt record shorten `losses()` |
 | Q-104 | A supplied `Absent` value with a quality other than bad | §2.5 (recorded as NaN is: quality bad, no value, flagged and counted as `absent_supplied`, the supplied quality kept for the duplicate rule; never live state, so on a state or text series the previous value stays live, and "unknown" is a declared state), §2.4, row 31, `api.md` Core types and `series_stats` (`absent_supplied`). Model: `Model::commit`; `tests/rules.rs` `s2_5_absent_recorded_bad_whatever_quality_supplied`, `s2_4_absent_compared_by_supplied_quality`, `s2_5_absent_changes_no_summary_or_live_state`. Engine: round trip of `no_value` rows at each supplied quality with roadmap 4.3 |
 | Q-105 | Reading a segment: zeros below the mark, unknown skippable blocks in a batch, refusals while resynchronising, the first batch against `base_sequence`, a header that disagrees with its name | `format.md` A.2 ((a) sixteen zero bytes at a block boundary are end of data only when the limit is the end of the file, an `.open` segment scanned without a mark, and every byte to it is zero; below the mark's offset or before the seal blocks zeros start an invalid region, also when they run to that limit), A.7 ((b) `block_count`, `batch_bytes` and `batch_crc32c` cover every block before the commit block; a skipped block takes no sequence and carries no `received_at`; a batch of skipped blocks alone is not complete; every block before the seal blocks belongs to a batch; (d) the first batch starts at or above `base_sequence`, higher only after an invalid region or with a recovery entry, checked by recovery at roadmap 4.5), common rules ((c) a version refusal only from a valid position or in an otherwise complete batch at a resynchronisation candidate; any other block image is not a block), A.12 ((e) a header disagreeing with its name is refused, never scanned or deleted). As implemented in `kvik-log`; `log/tests/segment.rs` pins each part |
-| Q-106 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, the parameter change, the recovery entry alone | `format.md` common rules ((a) a reader applies only the listed checks; a canonical check also requires the canonical bytes), A.5 ((b) canonical heap in row order, none shared, a reader accepting any offsets inside the heap, shared bytes included; (c) unpadded payload lengths, plain wins a tie), A.6 ((d) presence checked as invalid content, a named-state series needs a name, kind and value type not compared; (e) entries share a block up to 16 MiB; (f) entry type 5 refused until roadmap 5.2, field 41 skipped (superseded by Q-46: field 41 is the reset stamp); (g) fields 25 and 26 allowed in a parameter change since Q-100, fields without a range take any value, a change with only field 1 valid; (h) a recovery entry not alone in its batch is invalid content), A.11 (nothing allocated from a declared count or length before it is checked; output bounded by the row and entry limits). As implemented in `kvik-log`, with (g) changed for Q-100; `log/tests/batches.rs` pins each part |
+| Q-106 | Decoding batch bodies: canonical form against the checks, the text heap, run-length choice, entry field presence, entries block splitting, reserved ids, the parameter change, the recovery entry alone | `format.md` common rules ((a) a reader applies only the listed checks; a canonical check also requires the canonical bytes), A.5 ((b) canonical heap in row order, none shared, a reader accepting any offsets inside the heap, shared bytes included; (c) unpadded payload lengths, plain wins a tie), A.6 ((d) presence checked as invalid content, a named-state series needs a name, kind and value type not compared; (e) entries share a block up to 16 MiB; (f) entry type 5 refused until roadmap 5.2, field 41 skipped (superseded by Q-46: field 41 is the reset stamp); (g) fields 25 and 26 allowed in a parameter change since Q-100, fields without a range take any value, a change with only field 1 valid; (h) a recovery entry not alone in its batch is invalid content), A.11 (nothing allocated from a declared count or length before it is checked; output bounded by the row and entry limits). As implemented in `kvik-log`, with (g) changed for Q-100; `log/tests/batches.rs`, `facts_checks.rs`, `entries_checks.rs` and `batch_assembly.rs` pin each part |
 | Q-107 | The wait before a provisional manifest rebuild, leaving the read-only state, and acknowledging a provisional rebuild | §7 Manifest, Deep unreachable (owner: the wait is counted on the monotonic clock from each start, once deep has been asked and failed, and a restart starts it again; accepted limit: a process restarting more often than the wait stays read-only, `rebuild_manifest` being the way out; the store leaves read-only by itself when the wait ends or deep answers, the start resuming from step 4, the one exception to §3 Write or sync failure; a provisional rebuild cannot be acknowledged until it is final), §3 Write or sync failure, §11 Health, `api.md` Health. Engine fault tests with roadmap 6.3: the wait across restarts; leaving read-only when deep answers during the wait; the acknowledgement refused while provisional |
 | Q-109 | A forged seal in an `.open` file | `format.md` A.4, the states recovery may find (settled at gate 4.9 by a structural rule, with no checksum pass at open and no change to A.9: an `.open` file counts as seal-written only if its seal blocks start exactly at the end of its last complete batch, the trailer's `batch_count` and `last_sequence` equal the scan's, and it is not the last segment in use; otherwise the trailer and end marker are bytes of what precedes them, and recovery reads the file again with them ignored, so a torn tail's commit blocks and definitions count; `log/tests/recovery.rs` `a_forged_seal_after_a_torn_batch_in_the_last_segment_hides_nothing`, `a_forged_seal_in_a_segment_that_is_not_the_last_in_use_is_ignored`, `a_forged_seal_in_the_last_segment_is_a_torn_tail`) |
 | Q-117 | A recovery entry adopted after its own sync failed | §3 Recovery rule 3, Last batch written again, and Order of a start step 3 (an adopted entry is written again in place before the sync of step 3, whatever the mark; extends the Q-87 ruling). Scenario: a readable mark of the old boot; the start's sync of its recovery entry fails, so the entry is in the page cache only; the next start on the same boot adopts it, and its sync writes nothing; the mark then names F, a batch is acknowledged at F + 1, and a power loss removes the entry, which the following start reports as `data_lost` with nothing damaged (`log/tests/recovery.rs`, `an_adopted_entry_whose_own_sync_failed_is_written_again`) |
@@ -3444,6 +3577,9 @@ The specification wins where the documents differ. These follow from it, for the
 | Q-802 | A chunk's value bounds | `docs/format-compacted.md` B.1 Bounds (decided by the lead for the compaction track, applied by roadmap 6.2a1: IEEE 754 total order without NaN and a `has_nan` flag; decimals at the chunk's highest stored scale; no bounds rather than saturated ones. `chunk/src/file/stats.rs`) |
 | Q-803 | The chunk summary | `docs/format-compacted.md` B.1 Chunk directory (decided by the lead for the compaction track, applied by roadmap 6.2a1: defined and not written in v1; its safe use depends on conditions only the summary tree's item can state and test) |
 | Q-805 | Commit times in compacted data | `docs/format-compacted.md` B.1 Commit times (decided by the lead for the compaction track, applied by roadmap 6.2a1: a per-file table of whole batches with `received_at` and the commit time, about a byte a reading, so as-of time keeps the log's precision after a release; a position no row holds makes the file invalid) |
+| Q-650 | A manifest search that passes a window and finds no later record | `spec.md` §7 Manifest; `format.md` A.14 (settled by the owner's ruling: the passed bytes are a corrupt span with no later record, kept and repaired by a copy or a rebuild; the rebuild record's field 7 writes its `before` as 0; see the question) |
+| Q-651 | The crafted-file worst case against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled by the owner's ruling: each kept body checked once and cheaper body checks with the same verdicts, measured inside the budget; see the question) |
+| Q-870 | Definitions and short state names against the 1 s restart budget | `format.md` common rules (Scan bound); `design.md` Budgets; `SECURITY.md` (settled as a technical decision with no format change: fields split once and found by an index, state names keyed and told distinct by a randomised table that sorts after a long probe run; every entry type measured at most about 2.9 ns a byte, the body checks of a crafted 64 MiB segment about 0.8 s; see the question) |
 
 ## Where the model differs from the specification
 The model implements the summary semantics (§5, §6), calendar results (§5.7, §6 Windows: a day or month result is a

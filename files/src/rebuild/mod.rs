@@ -357,12 +357,13 @@ pub fn plan(
         })
     };
     let acks: Vec<_> = old.acknowledged_ranges().collect();
-    // Two corrupt records, or one corrupt span whose epochs leave room for more than one record (Q-174).
+    // Two corrupt records, or one corrupt span whose epochs leave room for more than one record (Q-174); a span with
+    // no later record may hold any number (Q-650).
     let several = image.corrupt.len() >= 2
-        || image
-            .corrupt
-            .iter()
-            .any(|s| s.before_epoch.saturating_sub(s.after_epoch) > 2);
+        || image.corrupt.iter().any(|s| {
+            s.before_epoch
+                .is_none_or(|b| b.saturating_sub(s.after_epoch) > 2)
+        });
     let mut restated: Vec<LostRange> = Vec::new();
     let mut identities_rebuilt = 0u32;
     for l in input.losses {
@@ -419,11 +420,12 @@ pub fn plan(
         });
     }
 
-    // Step 4's records: epochs above every epoch a valid record names and every lease.
+    // Step 4's records: epochs above every epoch a valid record names, every lease and every epoch a corrupt span
+    // may hold (Q-872).
     let top = valid
         .iter()
         .flat_map(|r| r.epochs_named())
-        .chain(image.corrupt.iter().map(|s| s.before_epoch))
+        .chain(image.corrupt.iter().map(|s| s.epoch_ceiling()))
         .chain([input.lease_epoch])
         .max()
         .unwrap_or(0);

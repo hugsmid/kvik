@@ -38,6 +38,7 @@ model           model model
 log-properties  log   properties
 log-fuzz-inputs log   fuzz_inputs
 log-batches     log   batches
+log-batch-assembly log batch_assembly
 log-model       log   model_differential
 log-histories   log   model_histories
 log-writer      log   writer
@@ -48,6 +49,7 @@ log-seal-describe log seal_describe
 log-scan-bound  log   scan_bound
 log-pacing      log   pacing
 log-directories log   directories
+log-body-check  log   body_check
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
 kvik-patterns   kvik  patterns

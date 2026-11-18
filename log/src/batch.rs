@@ -5,7 +5,7 @@
 
 use crate::block::{BLOCK_HEADER_LEN, BlockFault, BlockHeader, RawBlock, block_type, encode_block};
 use crate::body::{COMMIT_LEN, Commit, DataPrefix};
-use crate::content::DataBody;
+use crate::content::{DataBody, decode_block};
 use crate::content_error::BodyError;
 use crate::crc::Crc32c;
 use crate::error::{Element, EncodeError, FormatError};
@@ -111,7 +111,7 @@ pub(crate) fn read_batch<'a>(
     refusal: Refusal,
     keep: bool,
 ) -> BatchRead<'a> {
-    read_batch_at(reads, 0, id, o, limit, min_first, refusal, keep)
+    read_batch_at(reads, 0, id, o, limit, min_first, refusal, keep, false)
 }
 
 /// [`read_batch`] on `bytes` holding the file from offset `base`: offsets and limits are the file's; the blocks of
@@ -136,6 +136,31 @@ pub(crate) fn read_batch_in<'a>(
         min_first,
         refusal,
         keep,
+        false,
+    )
+}
+
+/// [`read_batch`] of a batch whose data blocks a boundary read of this scan has already judged, each body passing
+/// the checks of its type: the bodies are not checked again, so a kept body is checked once (Q-651); with `keep`,
+/// each is decoded for its content outside the counted checks.
+pub(crate) fn read_judged_batch<'a>(
+    reads: &mut Reads<'a>,
+    id: &SegmentIdentity,
+    o: u64,
+    limit: u64,
+    min_first: u64,
+    keep: bool,
+) -> BatchRead<'a> {
+    read_batch_at(
+        reads,
+        0,
+        id,
+        o,
+        limit,
+        min_first,
+        Refusal::AtOnce,
+        keep,
+        true,
     )
 }
 
@@ -149,6 +174,7 @@ fn read_batch_at<'a>(
     min_first: u64,
     refusal: Refusal,
     keep: bool,
+    judged: bool,
 ) -> BatchRead<'a> {
     let incomplete = |fault| BatchRead::Incomplete { fault };
     let (Some(rel), Some(limit)) = (o.checked_sub(base), limit.checked_sub(base)) else {
@@ -189,6 +215,19 @@ fn read_batch_at<'a>(
             block_type::COMMIT => break b,
             // The body checks of A.5 and A.6; an unknown critical element inside is refused like an unknown
             // critical block.
+            block_type::FACTS | block_type::ENTRIES if judged => {
+                let Ok(p) = DataPrefix::decode(t, b.body) else {
+                    return incomplete(BatchFault::Content);
+                };
+                recovery |= t == block_type::ENTRIES && crate::entries::holds_recovery(b.body);
+                if keep {
+                    let Ok(body) = decode_block(t, b.body) else {
+                        return incomplete(BatchFault::Content);
+                    };
+                    bodies.push(body);
+                }
+                Some(p)
+            }
             block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body, keep) {
                 Ok((p, r, body)) => {
                     recovery |= r;

@@ -617,8 +617,11 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   bytes of the last valid record again in place and syncs, so that a record kept from the page cache after a failed
   sync is on disk before a successor is appended (§3 Order of a start, step 4). On reading, an invalid record is passed by searching forward, at
   8-byte boundaries, for a valid record with a higher epoch, under the window rule of the scan bound (`format.md` A,
-  common rules; Q-650), which damage does not reach. An invalid record followed by a valid one was synced
-  and is **corrupt**. An invalid last record is a **torn tail**: the writer drops it at start and truncates the
+  common rules), which damage does not reach. An invalid record followed by a valid one was synced
+  and is **corrupt**. So is an invalid record after which the search passed part of a window under that rule and
+  found no valid record: the bytes it did not look at are not known to be a torn record, so they are kept and the
+  record is fetched again or the manifest rebuilt, as for any corrupt record (a corrupt span with no later record,
+  Q-650). Any other invalid last record is a **torn tail**: the writer drops it at start and truncates the
   file after the last valid record (§3 Order of a start, step 4). So that dropping is always safe, the last record is neither uploaded nor acted
   on irreversibly (no file it retires, moves or quarantines is removed) until a later record has been synced; the
   writer appends an empty record when it needs one, and at once after a restore record. What a dropped record
@@ -664,10 +667,11 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
      Where two corrupt records leave an identity unknown, the loss is listed under its first missing position,
      unacknowledged, and the rebuild record counts it.
   4. Writes the new manifest as `MANIFEST.new` (`format.md` A.12), opened by a rebuild record that carries, per file
-     kind, a `file_id` floor above every id seen (`format.md` A.14), with epochs above
-     every epoch named by a valid record and by any lease file (as above); syncs it; renames it over the old file while no handle
-     holds that open (§3 Sync primitive); syncs the directory. A `MANIFEST.new` left by a crash is removed at the
-     next start.
+     kind, a `file_id` floor above every id seen (`format.md` A.14), with epochs above every epoch named by a valid
+     record and by any lease file (as above), and above the epochs a corrupt span with no later record is taken to
+     hold (`format.md` A.14; Q-872 says the one case that bound cannot cover); syncs it; renames it over the old file
+     while no handle holds that open (§3 Sync primitive); syncs the directory. A `MANIFEST.new` left by a crash is
+     removed at the next start.
   A rebuilt manifest takes no file as verified in another tier until it has been verified there again (§7 inputs
   kept, §8).
   The rebuild is reported: health is degraded (`manifest_rebuilt`) until the rebuild is acknowledged, and rebuilds are
@@ -700,7 +704,7 @@ cached windows (§6 Cache) of calendar-length series and rebuilds nothing, there
   start, the rebuild is provisional again, with the holds and the refused acknowledgement, and health stays degraded
   (`manifest_rebuilt`, provisional) until deep answers. Two corrupt records read as one span
   when nothing valid lies between them; a span whose epochs leave room for more than one record (the next valid
-  epoch more than 2 above the last valid one before it) counts as two for step 3.
+  epoch more than 2 above the last valid one before it), or that has no later record, counts as two for step 3.
 - Compaction of compacted files (merging overlapping chunks created by late data) publishes outputs and retires
   inputs in one record. Policy: merge when a series' chunks overlapping any 15-minute span exceed 4.
 - A sealed file's **inputs are kept** until the file is verified in another tier. Log segments are never retired by

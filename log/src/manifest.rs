@@ -134,7 +134,8 @@ pub enum ManifestError {
     /// No valid header, or one of another kind or store.
     #[error("the manifest's header is invalid")]
     Header,
-    /// An invalid record followed by a valid one: it was synced, so it is corrupt. Fetching it again or
+    /// An invalid record followed by a valid one: it was synced, so it is corrupt. Also a search that passed part of a
+    /// window under the scan bound's window rule and found no valid record after (Q-650). Fetching it again or
     /// rebuilding the manifest is roadmap 6.3 (Q-116 (a)).
     #[error("the manifest record at offset {0} is corrupt")]
     Corrupt(u64),
@@ -143,17 +144,33 @@ pub enum ManifestError {
     Unsupported(FormatError),
 }
 
-fn fields(body: &[u8]) -> Option<Vec<(u16, &[u8])>> {
-    let mut out = Vec::new();
+/// The fields of a field list, in order; [`fields_fit`] first tells whether every field fits.
+fn fields(body: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     let mut at = 0usize;
-    while at < body.len() {
-        let h = body.get(at..at + 4)?;
+    std::iter::from_fn(move || {
+        let h = body.get(at..at.checked_add(4)?)?;
         let id = u16::from_le_bytes([h[0], h[1]]);
         let len = usize::from(u16::from_le_bytes([h[2], h[3]]));
-        out.push((id, body.get(at + 4..at + 4 + len)?));
+        let v = body.get(at + 4..at + 4 + len)?;
+        at = (at + 4 + len).div_ceil(4) * 4;
+        Some((id, v))
+    })
+}
+
+/// Whether every field of a field list fits in it, read without keeping them (Q-651).
+fn fields_fit(body: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at < body.len() {
+        let Some(h) = body.get(at..at + 4) else {
+            return false;
+        };
+        let len = usize::from(u16::from_le_bytes([h[2], h[3]]));
+        if body.get(at + 4..at + 4 + len).is_none() {
+            return false;
+        }
         at = (at + 4 + len).div_ceil(4) * 4;
     }
-    Some(out)
+    true
 }
 
 fn position(v: &[u8]) -> Option<RecordPosition> {
@@ -169,8 +186,15 @@ fn u64_of(v: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(v.try_into().ok()?))
 }
 
-fn decode_lost(list: &[(u16, &[u8])]) -> Option<LostRange> {
-    let get = |id: u16| list.iter().find(|(i, _)| *i == id).map(|(_, v)| *v);
+/// A lost range from a field list that fits, each field's first occurrence taken, in one pass (Q-651).
+fn decode_lost(list: &[u8]) -> Option<LostRange> {
+    let mut first: [Option<&[u8]>; 14] = [None; 14];
+    for (id, v) in fields(list) {
+        if let Some(slot) = first.get_mut(usize::from(id)) {
+            slot.get_or_insert(v);
+        }
+    }
+    let get = |id: u16| first[usize::from(id)];
     Some(LostRange {
         identity: position(get(1)?)?,
         first: position(get(2)?)?,
@@ -245,12 +269,13 @@ impl<'a> Search<'a> {
         }
         let generation = u32::from_le_bytes(body[8..12].try_into().unwrap_or_default());
         self.body += body.len() as u64;
-        let Some(list) = fields(&body[RECORD_PREFIX..]) else {
+        let list = &body[RECORD_PREFIX..];
+        if !fields_fit(list) {
             self.failed.charge(self.base + at, body.len() as u64);
             return Ok(None);
-        };
+        }
         let lost = match t {
-            RECORD_LOST_RANGE => match decode_lost(&list) {
+            RECORD_LOST_RANGE => match decode_lost(list) {
                 Some(l) => Some(l),
                 None => {
                     self.failed.charge(self.base + at, body.len() as u64);
@@ -290,7 +315,7 @@ pub fn read_manifest(bytes: &[u8], store_id: &[u8; 16]) -> Result<ManifestRead, 
     read_manifest_with_stats(bytes, store_id).0
 }
 
-/// [`read_manifest`], with the work it did; [`ScanStats::within_bound`] holds for every input (`format.md` A, common
+/// [`read_manifest`], with the work it did; [`ScanStats::within_manifest_bound`] holds for every input (`format.md` A, common
 /// rules: scan bound).
 pub fn read_manifest_with_stats(
     bytes: &[u8],
@@ -371,9 +396,11 @@ fn records_in(
     // bound).
     let min = records.last().map_or(last_epoch, |r| r.epoch);
     let mut probe = valid_end + 8;
+    let mut passed = false;
     while probe + (BLOCK_HEADER_LEN as u64) <= len {
         let next = search.failed.next_from(base + probe) - base;
         if next != probe {
+            passed = true;
             probe = next;
             continue;
         }
@@ -381,6 +408,10 @@ fn records_in(
             return Err(ManifestError::Corrupt(base + valid_end));
         }
         probe += 8;
+    }
+    // Bytes the search did not look at are not known to be a torn record: corrupt, with no later record (Q-650).
+    if passed {
+        return Err(ManifestError::Corrupt(base + valid_end));
     }
     for r in &mut records {
         r.offset += base;
@@ -470,10 +501,10 @@ pub fn listed_segments(bytes: &[u8], read: &ManifestRead) -> BTreeSet<(u32, u64)
         let Ok(b) = read_block(bytes, r.offset, bytes.len() as u64) else {
             continue;
         };
-        let Some(list) = b.body.get(RECORD_PREFIX..).and_then(fields) else {
+        let Some(list) = b.body.get(RECORD_PREFIX..).filter(|l| fields_fit(l)) else {
             continue;
         };
-        for (_, v) in list.iter().filter(|(id, _)| named.contains(id)) {
+        for (_, v) in fields(list).filter(|(id, _)| named.contains(id)) {
             let Some(v) = v.get(skip..) else {
                 continue;
             };
@@ -607,6 +638,42 @@ mod tests {
             read_manifest(&unk, &[2; 16]),
             Err(ManifestError::Unsupported(_))
         ));
+    }
+
+    /// Q-651: the start's reader takes a lost-range field's first occurrence, in one pass, as it did field by field:
+    /// a valid identity then an invalid one is read, an invalid one then a valid one is a corrupt record.
+    #[test]
+    fn a_lost_range_field_given_twice_is_read_from_its_first_occurrence() {
+        let with_identity_twice = |first: &[u8], second: &[u8]| {
+            let record = encode_record(RECORD_LOST_RANGE, 2, 0, 1, Some(&lost(4, 9)));
+            let body = &record[16..];
+            // The prefix, field 1, a second field 1, then the rest.
+            let mut again = body[..24].to_vec();
+            push_field(&mut again, 1, first);
+            push_field(&mut again, 1, second);
+            again.extend_from_slice(&body[24 + 16..]);
+            let mut m = encode_initial([2; 16], 0);
+            encode_block(RECORD_LOST_RANGE, 0, &again, &mut m).unwrap();
+            m.extend(encode_record(RECORD_EMPTY, 3, 0, 2, None));
+            read_manifest(&m, &[2; 16])
+        };
+        let valid = pos_bytes((0, 4));
+        let r = with_identity_twice(&valid, &[1, 2, 3]).unwrap();
+        assert_eq!(r.records.len(), 3);
+        assert_eq!(r.records[1].lost, Some(lost(4, 9)));
+        assert!(matches!(
+            with_identity_twice(&[1, 2, 3], &valid),
+            Err(ManifestError::Corrupt(_))
+        ));
+        assert_eq!(
+            with_identity_twice(&valid, &pos_bytes((0, 5)))
+                .unwrap()
+                .records[1]
+                .lost
+                .as_ref()
+                .map(|l| l.identity),
+            Some((0, 4))
+        );
     }
 
     #[test]

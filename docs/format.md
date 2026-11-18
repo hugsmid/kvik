@@ -52,15 +52,25 @@ specified here before the roadmap item that writes it.
   in (Q-110). Failed reads caused by damage check disjoint bodies, each inside its own batch, so those starting in one
   segment window check less than the window and one batch beyond it, 16 MiB; a manifest record needs a valid checksum
   to fail this way. Damage to a file the engine wrote, or older complete batches left at their offsets, therefore never
-  reach the budget; overlapping bodies, which only a crafted file has, do. In a segment, body checks total at most 2L,
-  the direct read that found damage, and per window the budget and the read that reached it (two batches): about
-  390 MiB of bodies for a 64 MiB segment and 100 MiB for a 16 MiB one. A facts row takes at least 20 bytes of body
-  and decodes in about 100 ns at most (a 255-byte text value, release build), so a crafted segment costs at most
-  about 2 s at 64 MiB and 0.6 s at 16 MiB, against 29 to 170 ms for an undamaged one. A crafted manifest costs at most
-  about 0.25 s per 16 MiB for the start's reader and 0.45 s for the whole-file reader (measured: 0.16 s and 0.28 s on
-  a crafted 16.5 MB window; Q-230). An undamaged segment is read in one pass of direct checksums; the bounded reading
-  starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231). Apart from
-  the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
+  reach the budget; overlapping bodies, which only a crafted file has, do. Each body a scan keeps is checked once (a
+  boundary read's verdicts are not checked again when its batch is read), so in a segment body checks total at most
+  L, the direct read that found damage, and per window the budget and the read that reached it (a batch): about
+  264 MiB of bodies for a 64 MiB segment and 72 MiB for a 16 MiB one. The checks keep no row or entry and copy no
+  text; text values that many rows name are checked at a cost linear in their heap, an entry's fields are split once
+  and found by their id, state names are told distinct by a table of their keys under a per-process random hash (with
+  a sort once a probe run grows long, so no input costs more than `n log n`), and a manifest record's fields are read
+  in one pass that keeps none of a rejected record's (Q-651, Q-870). Measured (release build, one shared 4-core cloud
+  machine, the best of three runs, every entry type small and large): at most about 2.9 ns a byte, for definitions of
+  65,536 state names of two 4-byte characters, 2.2 to 2.6 ns for other short names, about 1 ns for small definitions,
+  at most about 1.3 ns for every other entry and about 0.5 ns for facts, so the body checks of a crafted segment cost
+  at most about 0.8 s at 64 MiB and 0.22 s at 16 MiB, against 29 to 170 ms for an undamaged one; those of a crafted
+  manifest at most about 0.09 s per 16 MiB for the start's reader and 0.15 s for the whole-file reader (Q-651). The
+  header reads are bounded in count, not yet in time: a file holding a valid block header every 8 bytes, each with a
+  body checksum that does not hold, checks no body and fails no read, and measured 7.75 s for a 64 MiB segment and
+  1.2 to 1.3 s for a 16 MiB manifest. Bounding that walk to the restart budget is roadmap 4.9e (Q-873). An undamaged
+  segment is read in one pass of direct checksums; the bounded
+  reading starts at the first boundary read that finds no complete batch and holds to the end of the scan (Q-231).
+  Apart from the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.
 
 ### A.1 File header (64 bytes, every file except the mark)
 | Offset | Size | Field | Notes |
@@ -603,7 +613,8 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   local file name, any header's list of inputs, any valid record and the mark; 6 losses listed under their first
   missing position because no valid record names their identity, `u32`; 7 repeated, each corrupt span the rebuild
   stood in for, as the epochs of the valid records around it in the manifest it rebuilt: after `u64` (0 for none),
-  before `u64`, in ascending order and not overlapping), the first record of a rebuilt manifest.
+  before `u64` (0 for none: a span with no later record, Q-650, only the last), in ascending order and not
+  overlapping), the first record of a rebuilt manifest.
   Every record carried into a rebuilt manifest, whatever its type, holds field 100, its old epoch `u64` (`spec.md`
   §7 Manifest); a record already holding field 100 (carried by an earlier rebuild) keeps it, and a reference to a
   record by epoch, such as a rebuild record's fields 1 and 2, is matched against field 100 where a record has it. `0x21` publish and retire, `0x22` sealed log segment, `0x25` restore, `0x26` quarantine and `0x27` copy verified are
@@ -702,7 +713,13 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   for a valid record with a higher epoch; the last record is never acted on irreversibly until a successor is
   synced. Once failed reads starting in one 16 MiB window of the file have checked 16 MiB of body (common rules:
   scan bound), the search passes the rest of that window: a valid record beyond it makes the passed bytes part of the
-  corrupt span; with none, they are part of the torn tail (provisional, Q-650).
+  corrupt span; with none, the passed bytes and everything after them are a corrupt span with no later record, kept
+  and never truncated, and repaired by a copy or a rebuild like any corrupt record (Q-650): a copy is written before
+  the span's bytes, which stay after it (so with n copies in the bucket the span is settled over n reads, each writing
+  the manifest again), and a rebuild takes its epochs above the higher of the last valid epoch before the span and
+  every epoch a checksum-valid record image starting in it names, plus the records of 40 bytes, the shortest, that the
+  span could hold (Q-872). Damage does not reach the window rule, so a torn tail is never reported
+  this way.
 - Every file is self-describing: its header and trailer carry everything a publish record says about it (kind,
   class, `file_id`, generation, position range, input `file_id`s, plaintext SHA-256 of the body; a log segment's
   hash is computed from its bytes, A.9). A corrupt record with no copy is rebuilt by the writer itself, by the
@@ -714,9 +731,9 @@ All of them go through the `Fs` seam (`api.md`), without unsafe code.
   acknowledgement record names is provisional at a start, also one that was final before it: the store holds uploads, evictions, removals and
   retirements, and refuses to append an acknowledgement of it, until the mirror path and deep have answered in that
   run for every corrupt span its field 7 names (`spec.md` §7 Deep unreachable); a copy is a valid record whose epoch
-  lies strictly between the span's two epochs. Field 6 counts restated losses no
+  lies strictly between the span's two epochs, or above the first for a span with no later record. Field 6 counts restated losses no
   valid record names where the old manifest held two corrupt spans, or one whose next valid epoch is more than 2
-  above the last valid one before it.
+  above the last valid one before it, or one with no later record.
 
 ## A.15 Cursor file and lease file
 - **Cursor**, `cursors/<name>.cur`, kind 4: an A.1 header then blocks of type `0x30`, **appended**, one per cursor

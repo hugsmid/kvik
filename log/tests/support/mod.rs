@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod checks;
+
 use kvik_log::batch::{BatchBuilder, SegmentIdentity};
 use kvik_log::block::block_type;
 use kvik_log::body::DataPrefix;

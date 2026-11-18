@@ -369,7 +369,7 @@ fn q171_a_rebuild_no_acknowledgement_names_stays_provisional_across_a_restart() 
     let rb = app.catalogue().rebuild(e).unwrap().record.clone();
     let g = Gap {
         after: rb.last_valid_before,
-        before: rb.presumed_epoch + 1,
+        before: Some(rb.presumed_epoch + 1),
     };
     assert_eq!(app.pending(), &[g]);
     assert_eq!(g.after, img.corrupt[0].after_epoch);
@@ -675,7 +675,7 @@ fn q171_after_a_restart_a_corrupt_record_whose_epoch_jumped_is_still_taken_from_
         g,
         Gap {
             after: 2,
-            before: 7
+            before: Some(7)
         }
     );
     drop(app);

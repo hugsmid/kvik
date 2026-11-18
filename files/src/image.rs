@@ -25,17 +25,22 @@ pub struct Placed {
     pub record: Record,
 }
 
-/// The bytes between two valid records that hold no valid record: one or more corrupt records.
+/// The bytes between two valid records that hold no valid record: one or more corrupt records. A span with no
+/// later record is the rest of the file after a search that passed part of a window under the scan bound's window
+/// rule and found no valid record (Q-650): kept and repaired as any corrupt record, never dropped as a torn tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorruptSpan {
     /// Where the first invalid byte starts (the end of the last valid record before it, or of the header).
     pub offset: u64,
-    /// Where the next valid record starts.
+    /// Where the next valid record starts; the file's end for a span with no later record.
     pub end: u64,
     /// The epoch of the last valid record before it, 0 for none.
     pub after_epoch: u64,
-    /// The epoch of the next valid record.
-    pub before_epoch: u64,
+    /// The epoch of the next valid record; `None` for a span with no later record, always the last span.
+    pub before_epoch: Option<u64>,
+    /// For a span with no later record, the highest epoch above `after_epoch` that a checksum-valid record image
+    /// starting in it names, whether or not its fields pass; 0 for none and for any other span.
+    pub named_epoch: u64,
 }
 
 impl CorruptSpan {
@@ -44,7 +49,20 @@ impl CorruptSpan {
     pub fn presumed_epoch(&self) -> u64 {
         self.after_epoch + 1
     }
+
+    /// An epoch no record the span may hold exceeds (Q-872): below `before_epoch`; for a span with no later record,
+    /// the higher of `named_epoch` and `after_epoch`, plus the records its length could hold, as records after a named
+    /// one may be unreadable.
+    pub fn epoch_ceiling(&self) -> u64 {
+        self.before_epoch.unwrap_or_else(|| {
+            let room = (self.end.saturating_sub(self.offset)) / MIN_RECORD_LEN;
+            self.named_epoch.max(self.after_epoch).saturating_add(room)
+        })
+    }
 }
+
+/// The shortest record block: a header and the record prefix (`format.md` A.2, A.14).
+const MIN_RECORD_LEN: u64 = (BLOCK_HEADER_LEN + RECORD_PREFIX) as u64;
 
 /// A manifest as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +75,7 @@ pub struct Image {
     pub corrupt: Vec<CorruptSpan>,
     /// Just past the last valid record (the header's end when there is none).
     pub valid_end: u64,
-    /// Whether any byte follows the last valid record: a torn tail to drop.
+    /// Whether any byte follows the last valid record and no corrupt span holds it: a torn tail to drop.
     pub torn: bool,
 }
 
@@ -90,6 +108,8 @@ struct Search<'a> {
     headers: u64,
     body: u64,
     failed: FailedReads,
+    /// The highest epoch a checksum-valid record image read since it was last reset names.
+    named: u64,
 }
 
 impl<'a> Search<'a> {
@@ -100,6 +120,7 @@ impl<'a> Search<'a> {
             headers: 0,
             body: 0,
             failed: FailedReads::new(u64::from(MAX_BODY_LEN)),
+            named: 0,
         }
     }
 
@@ -113,38 +134,9 @@ impl<'a> Search<'a> {
     }
 
     fn record_at(&mut self, at: u64, min_epoch: u64) -> Result<Option<Placed>, FormatError> {
-        let bytes = self.bytes;
-        self.sums.forget_below(at);
-        let Some(start) = usize::try_from(at).ok() else {
+        let Some((h, body)) = self.image_at(at, min_epoch) else {
             return Ok(None);
         };
-        let Some(raw) = bytes.get(start..start.saturating_add(BLOCK_HEADER_LEN)) else {
-            return Ok(None);
-        };
-        let raw: &[u8; BLOCK_HEADER_LEN] = raw.try_into().unwrap_or(&[0; BLOCK_HEADER_LEN]);
-        if raw.iter().all(|&b| b == 0) {
-            return Ok(None);
-        }
-        self.headers += 1;
-        let Some(h) = BlockHeader::decode(raw).filter(|h| h.block_type != 0) else {
-            return Ok(None);
-        };
-        // Judged on the header and the body's first bytes before the body is checksummed, so that a search over bytes
-        // that imitate headers claiming long bodies checksums only candidates that could be the record looked for: a
-        // body that holds the record prefix and fits in the file, and an epoch above the previous record's.
-        if h.body_len > MAX_BODY_LEN || (h.body_len as usize) < RECORD_PREFIX {
-            return Ok(None);
-        }
-        let body_start = start + BLOCK_HEADER_LEN;
-        let Some(body) = bytes.get(body_start..body_start + h.body_len as usize) else {
-            return Ok(None);
-        };
-        if u64::from_le_bytes(body[..8].try_into().unwrap_or_default()) <= min_epoch {
-            return Ok(None);
-        }
-        if self.sums.range(body_start as u64, body.len() as u64) != Some(h.body_crc32c) {
-            return Ok(None);
-        }
         self.body += body.len() as u64;
         match Record::decode(h.block_type, h.skippable(), body) {
             Ok(r) if r.epoch > min_epoch => Ok(Some(Placed {
@@ -162,6 +154,38 @@ impl<'a> Search<'a> {
             }),
         }
     }
+
+    /// A checksum-valid record image at `at` whose epoch is above `min_epoch`, its fields not checked; its epoch is
+    /// noted in `named`.
+    fn image_at(&mut self, at: u64, min_epoch: u64) -> Option<(BlockHeader, &'a [u8])> {
+        let bytes = self.bytes;
+        self.sums.forget_below(at);
+        let start = usize::try_from(at).ok()?;
+        let raw = bytes.get(start..start.saturating_add(BLOCK_HEADER_LEN))?;
+        let raw: &[u8; BLOCK_HEADER_LEN] = raw.try_into().unwrap_or(&[0; BLOCK_HEADER_LEN]);
+        if raw.iter().all(|&b| b == 0) {
+            return None;
+        }
+        self.headers += 1;
+        let h = BlockHeader::decode(raw).filter(|h| h.block_type != 0)?;
+        // Judged on the header and the body's first bytes before the body is checksummed, so that a search over bytes
+        // that imitate headers claiming long bodies checksums only candidates that could be the record looked for: a
+        // body that holds the record prefix and fits in the file, and an epoch above the previous record's.
+        if h.body_len > MAX_BODY_LEN || (h.body_len as usize) < RECORD_PREFIX {
+            return None;
+        }
+        let body_start = start + BLOCK_HEADER_LEN;
+        let body = bytes.get(body_start..body_start + h.body_len as usize)?;
+        let epoch = u64::from_le_bytes(body[..8].try_into().unwrap_or_default());
+        if epoch <= min_epoch {
+            return None;
+        }
+        if self.sums.range(body_start as u64, body.len() as u64) != Some(h.body_crc32c) {
+            return None;
+        }
+        self.named = self.named.max(epoch);
+        Some((h, body))
+    }
 }
 
 /// Reads a whole manifest file.
@@ -169,7 +193,7 @@ pub fn read(bytes: &[u8], store_id: &[u8; 16]) -> Result<Image, ReadError> {
     read_with_stats(bytes, store_id).0
 }
 
-/// [`read`], with the work it did; [`ScanStats::within_bound`] holds for every input (`format.md` A, common rules).
+/// [`read`], with the work it did; [`ScanStats::within_manifest_bound`] holds for every input (`format.md` A, common rules).
 pub fn read_with_stats(bytes: &[u8], store_id: &[u8; 16]) -> (Result<Image, ReadError>, ScanStats) {
     let mut search = Search::new(bytes);
     let r = read_all(bytes, store_id, &mut search);
@@ -197,6 +221,7 @@ fn read_all(
     let mut at = HEADER_LEN as u64;
     loop {
         let min = records.last().map_or(0, |p| p.record.epoch);
+        search.named = 0;
         if at < len
             && let Some(p) = search.record_at(at, min).map_err(ReadError::Unsupported)?
         {
@@ -208,10 +233,15 @@ fn read_all(
         // budget of a window, the rest of it is passed as damaged (`format.md` A, common rules: scan bound).
         let mut probe = at + 8;
         let mut found = None;
+        let mut passed = false;
         while probe + (BLOCK_HEADER_LEN as u64) <= len {
             let next = search.failed.next_from(probe);
             if next != probe {
-                probe = next;
+                // Passed bytes are not searched, but the epochs of record images in them bound what the span may
+                // hold, at the cost of checksums alone (Q-872).
+                passed = true;
+                search.image_at(probe, min);
+                probe += 8;
                 continue;
             }
             if let Some(p) = search
@@ -229,21 +259,34 @@ fn read_all(
                     offset: at,
                     end: p.offset,
                     after_epoch: min,
-                    before_epoch: p.record.epoch,
+                    before_epoch: Some(p.record.epoch),
+                    named_epoch: 0,
                 });
                 at = p.end;
                 records.push(p);
+            }
+            // Bytes the search did not look at are not known to be a torn record (Q-650).
+            None if passed => {
+                corrupt.push(CorruptSpan {
+                    offset: at,
+                    end: len,
+                    after_epoch: min,
+                    before_epoch: None,
+                    named_epoch: search.named,
+                });
+                break;
             }
             None => break,
         }
     }
     let valid_end = at.min(len);
+    let open = corrupt.last().is_some_and(|s| s.before_epoch.is_none());
     Ok(Image {
         header,
         records,
         corrupt,
         valid_end,
-        torn: len > valid_end,
+        torn: !open && len > valid_end,
     })
 }
 
@@ -267,6 +310,23 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q-872: an open span's ceiling is the higher of the last valid epoch and the named one, plus the records of 40
+    /// bytes its length could hold; a closed span's is its later epoch.
+    #[test]
+    fn an_open_spans_epoch_ceiling_adds_its_room_to_the_higher_of_the_last_valid_and_the_named_epoch()
+     {
+        let span = |named, before| CorruptSpan {
+            offset: 64,
+            end: 64 + 400,
+            after_epoch: 100,
+            before_epoch: before,
+            named_epoch: named,
+        };
+        assert_eq!(span(0, None).epoch_ceiling(), 110);
+        assert_eq!(span(500, None).epoch_ceiling(), 510);
+        assert_eq!(span(500, Some(103)).epoch_ceiling(), 103);
+    }
     use kvik_log::block::FLAG_SKIPPABLE;
 
     /// `n` block headers 16 bytes apart after a damaged word, each claiming a body that runs to the end of the file
@@ -307,7 +367,10 @@ mod tests {
                 stats.bytes_checksummed <= 2 * len,
                 "{stats:?} for {len} bytes"
             );
-            assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+            assert!(
+                stats.within_manifest_bound(len),
+                "{stats:?} for {len} bytes"
+            );
         }
     }
 
@@ -315,11 +378,15 @@ mod tests {
     /// fields: record `k` starts inside a field of every record before it. Each has a valid checksum and no field 1,
     /// so each is read in full and rejected.
     fn crafted(m: u64, g: u64) -> Vec<u8> {
+        crafted_with(m, g, 0x8001)
+    }
+
+    /// [`crafted`] with the shared fields of id `field`.
+    fn crafted_with(m: u64, g: u64, field: u16) -> Vec<u8> {
         use kvik_log::crc::{crc32c, crc32c_shift};
         let put = |f: &mut Vec<u8>, at: u64, b: &[u8]| {
             f[at as usize..at as usize + b.len()].copy_from_slice(b);
         };
-        let field = 0x8001u16;
         let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
             .encode()
             .to_vec();
@@ -376,11 +443,24 @@ mod tests {
         f.extend(empty(1 << 40));
         let (img, stats) = read_with_stats(&f, &[9; 16]);
         assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
-        assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+        assert!(stats.within_manifest_bound(f.len() as u64), "{stats:?}");
         assert!(stats.bytes_body_checked >= BUDGET, "{stats:?}");
-        // The record in the passed part of the window is not found: the file reads as a torn tail.
+        // The record in the passed part of the window is not found, and nothing after it: the passed bytes are a
+        // corrupt span with no later record, kept rather than dropped (Q-650). Its epoch is named, as one the span
+        // may hold (Q-872).
         let img = img.unwrap();
-        assert!(img.records.is_empty() && img.corrupt.is_empty() && img.torn);
+        assert!(img.records.is_empty() && !img.torn);
+        assert_eq!(
+            img.corrupt,
+            [CorruptSpan {
+                offset: HEADER_LEN as u64,
+                end: f.len() as u64,
+                after_epoch: 0,
+                before_epoch: None,
+                named_epoch: 1 << 40,
+            }]
+        );
+        assert!(img.is_corrupt());
         // A record in the next window is found: the damaged record and the window form one corrupt span.
         let window = u64::from(MAX_BODY_LEN);
         f.resize(window as usize, 0);
@@ -393,7 +473,8 @@ mod tests {
                 offset: HEADER_LEN as u64,
                 end: window,
                 after_epoch: 0,
-                before_epoch: 1 << 41,
+                before_epoch: Some(1 << 41),
+                named_epoch: 0,
             }]
         );
     }
@@ -406,11 +487,68 @@ mod tests {
         let t = std::time::Instant::now();
         let (img, stats) = read_with_stats(&f, &[9; 16]);
         let elapsed = t.elapsed();
-        assert!(img.unwrap().torn);
+        assert_eq!(img.unwrap().corrupt[0].before_epoch, None);
         assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
-        assert!(stats.within_bound(len), "{stats:?} for {len} bytes");
+        assert!(
+            stats.within_manifest_bound(len),
+            "{stats:?} for {len} bytes"
+        );
         // A smoke ceiling for a slow shared machine; the pin is the budget.
         assert!(elapsed.as_secs() < 5, "{elapsed:?} for {len} bytes");
+    }
+
+    /// Empty records of `fields` empty ignorable fields each, valid, filling about `len` bytes.
+    fn valid_wide_records(len: u64, fields: usize) -> Vec<u8> {
+        let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+            .encode()
+            .to_vec();
+        let mut epoch = 1;
+        while (f.len() as u64) < len {
+            let mut body = kvik_log::manifest::encode_record(
+                kvik_log::manifest::RECORD_EMPTY,
+                epoch,
+                0,
+                0,
+                None,
+            )[16..40]
+                .to_vec();
+            for _ in 0..fields {
+                body.extend_from_slice(&0x8001u16.to_le_bytes());
+                body.extend_from_slice(&[0, 0]);
+            }
+            kvik_log::block::encode_block(0x20, 0, &body, &mut f).unwrap();
+            epoch += 1;
+        }
+        f
+    }
+
+    /// The crafted manifests against the restart budget, timed (Q-651). Run in a release build, one at a time:
+    /// `cargo test --release -p kvik-files --lib -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn crafted_manifests_timed() {
+        let window = crafted(20_000, 3_900_000);
+        let own = crafted_with(20_000, 3_900_000, 2);
+        let wide = valid_wide_records(16 << 20, 1 << 20);
+        for (name, f) in [
+            ("failed reads in one window, ignorable fields", &window),
+            ("failed reads in one window, repeated own fields", &own),
+            ("valid wide records", &wide),
+        ] {
+            let t = std::time::Instant::now();
+            let (img, stats) = read_with_stats(f, &[9; 16]);
+            let whole = t.elapsed();
+            img.unwrap();
+            let t = std::time::Instant::now();
+            let _ = kvik_log::manifest::read_manifest_with_stats(f, &[9; 16]);
+            let start = t.elapsed();
+            println!(
+                "{name}, {} MiB: whole-file reader {:.3} s, start's reader {:.3} s, {stats:?}",
+                f.len() >> 20,
+                whole.as_secs_f64(),
+                start.as_secs_f64()
+            );
+        }
     }
 
     #[test]
@@ -433,7 +571,8 @@ mod tests {
                 offset: third,
                 end: fourth,
                 after_epoch: 2,
-                before_epoch: 4,
+                before_epoch: Some(4),
+                named_epoch: 0,
             }]
         );
         assert!(!img.torn);

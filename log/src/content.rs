@@ -298,20 +298,24 @@ pub(crate) fn check_block(
     })?;
     Ok(match (t, keep) {
         (block_type::FACTS, false) => {
-            FactsBlock::decode(body)?;
+            FactsBlock::check(body)?;
             (prefix, false, None)
         }
-        (block_type::FACTS, true) => (
-            prefix,
-            false,
-            Some(DataBody::Facts(FactsBlock::decode(body)?)),
-        ),
         (_, false) => (prefix, crate::entries::check(body)?.1, None),
         (_, true) => {
-            let e = EntriesBlock::decode(body)?;
-            let recovery = e.entries.iter().any(Entry::is_recovery);
-            (prefix, recovery, Some(DataBody::Entries(e)))
+            let body = decode_block(t, body)?;
+            let recovery =
+                matches!(&body, DataBody::Entries(e) if e.entries.iter().any(Entry::is_recovery));
+            (prefix, recovery, Some(body))
         }
+    })
+}
+
+/// A facts or entries body decoded, every check of its type applied (A.5, A.6).
+pub(crate) fn decode_block(t: u8, body: &[u8]) -> Result<DataBody, BodyError> {
+    Ok(match t {
+        block_type::FACTS => DataBody::Facts(FactsBlock::decode(body)?),
+        _ => DataBody::Entries(EntriesBlock::decode(body)?),
     })
 }
 

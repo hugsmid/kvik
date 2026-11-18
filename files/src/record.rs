@@ -90,9 +90,10 @@ pub struct Rebuild {
     /// Field 6: losses listed under their first missing position because no valid record names their identity.
     pub identities_rebuilt: u32,
     /// Field 7, repeated: every corrupt span the rebuild stood in for, as the epochs of the valid records around it in
-    /// the manifest it rebuilt (`after`, `before`; 0 for no record before), in ascending order. A start asks the copy
-    /// sources about each of them again while the rebuild is unacknowledged.
-    pub gaps: Vec<(u64, u64)>,
+    /// the manifest it rebuilt (`after`, `before`; 0 for no record before, `None` written as 0 for no record after,
+    /// the last span only, Q-650), in ascending order. A start asks the copy sources about each of them again while
+    /// the rebuild is unacknowledged.
+    pub gaps: Vec<(u64, Option<u64>)>,
 }
 
 /// What a record says.
@@ -267,7 +268,7 @@ impl Record {
                 list.push((6, r.identities_rebuilt.to_le_bytes().to_vec()));
                 for (a, b) in &r.gaps {
                     let mut v = a.to_le_bytes().to_vec();
-                    v.extend_from_slice(&b.to_le_bytes());
+                    v.extend_from_slice(&b.unwrap_or(0).to_le_bytes());
                     list.push((7, v));
                 }
             }
@@ -346,45 +347,55 @@ impl Record {
         let epoch = fields::u64_at(body, 0);
         let generation = fields::u32_at(body, 8);
         let written_at = fields::u64_at(body, 16) as i64;
-        let list = fields::parse(&body[RECORD_PREFIX..])
-            .ok_or(RecordError::Invalid("a field that does not fit"))?;
+        let list = &body[RECORD_PREFIX..];
+        if !fields::fit(list) {
+            return Err(RecordError::Invalid("a field that does not fit"));
+        }
+        // No field is copied, and ignorable ones are not gathered, until the record's checks hold; a field the type
+        // does not repeat is kept at most twice, as a second one is already rejected. So a rejected record costs one
+        // pass over its fields and keeps few of them (Q-651).
+        let (defined, repeated): (&[u16], &[u16]) = match t {
+            record_type::PUBLISH => (&[1, 2], &[1, 2]),
+            record_type::SEALED => (&[1], &[1]),
+            record_type::LOST_RANGE => (&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], &[]),
+            record_type::ACKNOWLEDGEMENT => (&[1, 2], &[1]),
+            record_type::REBUILD => (&[1, 2, 3, 4, 5, 6, 7], &[5, 7]),
+            _ => (&[], &[]),
+        };
+        let mut seen = [0u8; 14];
+        let mut undefined = None;
         let mut old_epoch = None;
         let mut own: Vec<(u16, &[u8])> = Vec::new();
-        let mut ignorable = Vec::new();
-        let mut other = Vec::new();
-        for (id, v) in list {
+        let mut other: Vec<(u16, &[u8])> = Vec::new();
+        for (id, v) in fields::iter(list) {
             if id == FIELD_OLD_EPOCH {
                 if old_epoch.is_some() {
                     return Err(RecordError::Invalid("field 100 twice"));
                 }
                 old_epoch = Some(u64_of(v).ok_or(RecordError::Invalid("field 100 not 8 bytes"))?);
             } else if !known {
-                other.push((id, v.to_vec()));
-            } else if id >= 0x8000 {
-                ignorable.push((id, v.to_vec()));
-            } else {
-                own.push((id, v));
+                other.push((id, v));
+            } else if id < 0x8000 {
+                if !defined.contains(&id) {
+                    undefined.get_or_insert(id);
+                } else if repeated.contains(&id) {
+                    own.push((id, v));
+                } else if let Some(n) = seen.get_mut(usize::from(id)).filter(|n| **n < 2) {
+                    *n += 1;
+                    own.push((id, v));
+                }
             }
         }
-        let unknown = |field: u16| {
-            RecordError::Unsupported(Element::Field {
+        // The first field the type does not define, after every field 100 check.
+        if let Some(field) = undefined {
+            return Err(RecordError::Unsupported(Element::Field {
                 entry_type: t,
                 field,
-            })
-        };
-        let only = |defined: &[u16]| -> Result<(), RecordError> {
-            match own.iter().find(|(id, _)| !defined.contains(id)) {
-                Some((id, _)) => Err(unknown(*id)),
-                None => Ok(()),
-            }
-        };
+            }));
+        }
         let body = match t {
-            record_type::EMPTY => {
-                only(&[])?;
-                Body::Empty
-            }
+            record_type::EMPTY => Body::Empty,
             record_type::PUBLISH => {
-                only(&[1, 2])?;
                 let mut p = Publish::default();
                 for (id, v) in &own {
                     let d = FileDescription::decode(v).map_err(RecordError::Invalid)?;
@@ -398,7 +409,6 @@ impl Record {
                 Body::Publish(p)
             }
             record_type::SEALED => {
-                only(&[1])?;
                 let s = own
                     .iter()
                     .map(|(_, v)| FileDescription::decode(v))
@@ -408,13 +418,11 @@ impl Record {
                 Body::Sealed(s)
             }
             record_type::LOST_RANGE => {
-                only(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])?;
                 let l = decode_lost(&own)?;
                 check_lost(&l).map_err(RecordError::Invalid)?;
                 Body::LostRange(l)
             }
             record_type::ACKNOWLEDGEMENT => {
-                only(&[1, 2])?;
                 let mut a = Acknowledgement::default();
                 for (id, v) in &own {
                     if *id == 1 {
@@ -438,7 +446,6 @@ impl Record {
                 Body::Acknowledgement(a)
             }
             record_type::REBUILD => {
-                only(&[1, 2, 3, 4, 5, 6, 7])?;
                 let r = decode_rebuild(&own)?;
                 check_rebuild(&r).map_err(RecordError::Invalid)?;
                 Body::Rebuild(r)
@@ -446,11 +453,19 @@ impl Record {
             _ => Body::Other {
                 record_type: t,
                 skippable,
-                fields: other,
+                fields: other.into_iter().map(|(id, v)| (id, v.to_vec())).collect(),
             },
         };
         crate::tier::CopyVerified::from_body(&body).transpose()?;
         crate::restore::RestoreRecord::from_body(&body).transpose()?;
+        let ignorable = if known {
+            fields::iter(list)
+                .filter(|&(id, _)| id >= 0x8000)
+                .map(|(id, v)| (id, v.to_vec()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             epoch,
             generation,
@@ -586,7 +601,8 @@ fn decode_rebuild(own: &[(u16, &[u8])]) -> Result<Rebuild, RecordError> {
                 if v.len() != 16 {
                     return Err(bad("a corrupt span not 16 bytes"));
                 }
-                Ok((fields::u64_at(v, 0), fields::u64_at(v, 8)))
+                let before = fields::u64_at(v, 8);
+                Ok((fields::u64_at(v, 0), (before != 0).then_some(before)))
             })
             .collect::<Result<Vec<_>, _>>()?,
     })
@@ -659,7 +675,12 @@ fn check_rebuild(r: &Rebuild) -> Result<(), &'static str> {
     if !r.floors.windows(2).all(|w| w[0].0 < w[1].0) {
         return Err("file id floors not in strictly ascending order of kind");
     }
-    if r.gaps.iter().any(|(a, b)| a >= b) || !r.gaps.windows(2).all(|w| w[0].1 <= w[1].0) {
+    if r.gaps.iter().any(|(a, b)| b.is_some_and(|b| *a >= b))
+        || !r
+            .gaps
+            .windows(2)
+            .all(|w| w[0].1.is_some_and(|b| b <= w[1].0))
+    {
         return Err("corrupt spans out of order");
     }
     Ok(())
