@@ -135,7 +135,7 @@ pub use health::{
 };
 pub use read::{
     Aggregate, Aggregated, Bucket, CalendarPeriod, CalendarWindow, ChartData, Facts, Live,
-    LiveValue, ReaderState, Resolution, ResultFlags, View, Window, WindowResult,
+    LiveValue, ReaderState, Resolution, ResultFlags, Snapshot, View, Window, WindowResult,
 };
 pub use series::{
     CalendarUnit, ChangedAtKind, CounterRules, ExcessPrecision, IntervalLength, Kind,

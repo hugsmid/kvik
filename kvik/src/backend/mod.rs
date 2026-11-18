@@ -1796,6 +1796,39 @@ impl Slot {
         })
     }
 
+    /// Every result a snapshot gives, taken now (`docs/api.md` Snapshot): the model holds no cut.
+    pub(crate) fn snapshot(&mut self) -> Result<crate::read::ModelSnapshot> {
+        let state = self.refresh()?;
+        let now = self.now();
+        let ids: Vec<SeriesId> = self.specs.keys().copied().collect();
+        let mut live = BTreeMap::new();
+        let mut series = BTreeMap::new();
+        let mut names = BTreeSet::new();
+        for id in ids {
+            live.insert(id, self.live(id).map_err(Error::query));
+            let info = self.series(SeriesKey::Id(id)).map_err(Error::query);
+            if let Ok(i) = &info {
+                names.extend(i.names.iter().cloned());
+            }
+            series.insert(id, info);
+        }
+        let names = names
+            .into_iter()
+            .filter_map(|n| {
+                let id = self.series(SeriesKey::Name(n.clone())).ok()?.id;
+                Some((n, id))
+            })
+            .collect();
+        Ok(crate::read::ModelSnapshot {
+            state,
+            now,
+            live,
+            series,
+            names,
+            losses: self.losses(),
+        })
+    }
+
     pub(crate) fn refresh(&mut self) -> Result<ReaderState> {
         self.readable()?;
         Ok(ReaderState {

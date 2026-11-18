@@ -1,11 +1,15 @@
 //! Query types (spec §2.3, §5.7, §6; `docs/api.md` Reading).
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::QueryError;
+use crate::health::LossReport;
+use crate::series::{SeriesInfo, SeriesKey};
 use crate::time::{LocalDate, Span, TimeRange, Timestamp, ZoneName};
 
-use crate::types::{Fact, Position, Value};
+use crate::types::{Fact, Position, SeriesId, Value};
 
 /// An aggregate over a window (spec §6 Aggregates).
 #[derive(Clone, Debug, PartialEq)]
@@ -318,4 +322,125 @@ pub struct ReaderState {
     pub stamp: crate::types::ResetStamp,
     /// When the lease was last renewed.
     pub lease_renewed_at: Timestamp,
+}
+
+/// Static reads at one cut (`docs/api.md` Snapshot): live state, series and losses as of one durable position, with
+/// `now` taken when it was made. Owned, `Send + 'static` and cheap to clone. With the durable backend it ends with
+/// [`QueryError::CutExpired`] once its cut is `cut_max_age` old or its lease was found gone (spec §7 Readers); the
+/// caller takes another.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    inner: SnapshotInner,
+}
+
+#[derive(Clone, Debug)]
+enum SnapshotInner {
+    Model(Arc<ModelSnapshot>),
+    Durable(Arc<DurableSnapshot>),
+}
+
+/// The model backend's results, all taken when the snapshot was made: the model holds no cut.
+#[derive(Debug)]
+pub(crate) struct ModelSnapshot {
+    pub(crate) state: ReaderState,
+    pub(crate) now: crate::time::Timestamp,
+    pub(crate) live: BTreeMap<SeriesId, Result<Live, QueryError>>,
+    pub(crate) series: BTreeMap<SeriesId, Result<SeriesInfo, QueryError>>,
+    /// Every name of a series, with what resolving it gives.
+    pub(crate) names: BTreeMap<String, SeriesId>,
+    pub(crate) losses: Vec<LossReport>,
+}
+
+#[derive(Debug)]
+struct DurableSnapshot {
+    reader: Arc<crate::durable::DurableReader>,
+    view: Arc<crate::durable::SnapshotView>,
+    now: i64,
+}
+
+impl Snapshot {
+    pub(crate) fn model(m: ModelSnapshot) -> Self {
+        Snapshot {
+            inner: SnapshotInner::Model(Arc::new(m)),
+        }
+    }
+
+    pub(crate) fn durable(reader: Arc<crate::durable::DurableReader>) -> Result<Self, QueryError> {
+        let now = reader.now();
+        let view = reader.snapshot()?;
+        Ok(Snapshot {
+            inner: SnapshotInner::Durable(Arc::new(DurableSnapshot { reader, view, now })),
+        })
+    }
+
+    /// Runs `f` on a durable snapshot's view while its cut is live.
+    fn on<R>(
+        d: &DurableSnapshot,
+        f: impl FnOnce(&crate::durable::SnapshotView) -> Result<R, QueryError>,
+    ) -> Result<R, QueryError> {
+        d.reader.check(&d.view)?;
+        let r = f(&d.view);
+        d.reader.check(&d.view)?;
+        r
+    }
+
+    /// Live state at the snapshot's cut and `now` (spec §2.3).
+    pub fn live(&self, id: SeriesId) -> Result<Live, QueryError> {
+        match &self.inner {
+            SnapshotInner::Model(m) => m
+                .live
+                .get(&id)
+                .map_or(Err(QueryError::UnknownSeries), copied),
+            SnapshotInner::Durable(d) => {
+                Self::on(d, |v| crate::durable::live_at(&d.reader, v, id, d.now))
+            }
+        }
+    }
+
+    /// What the store knew about a series at the snapshot's cut, by id or by name.
+    pub fn series(&self, key: impl Into<SeriesKey>) -> Result<SeriesInfo, QueryError> {
+        let key = key.into();
+        match &self.inner {
+            SnapshotInner::Model(m) => {
+                let id = match &key {
+                    SeriesKey::Id(id) => Some(*id),
+                    SeriesKey::Name(n) => m.names.get(n).copied(),
+                };
+                id.and_then(|id| m.series.get(&id))
+                    .map_or(Err(QueryError::UnknownSeries), copied)
+            }
+            SnapshotInner::Durable(d) => Self::on(d, |v| crate::durable::series_at(v, &key)),
+        }
+    }
+
+    /// Every loss report the files held at the snapshot's cut.
+    pub fn losses(&self) -> Result<Vec<LossReport>, QueryError> {
+        match &self.inner {
+            SnapshotInner::Model(m) => Ok(m.losses.clone()),
+            SnapshotInner::Durable(d) => Self::on(d, |v| Ok(crate::durable::losses_at(v))),
+        }
+    }
+
+    /// What the reader held at the snapshot's cut.
+    pub fn state(&self) -> ReaderState {
+        match &self.inner {
+            SnapshotInner::Model(m) => m.state,
+            SnapshotInner::Durable(d) => crate::durable::state_at(&d.view),
+        }
+    }
+
+    /// The `now` the snapshot's live state is judged at (spec §6 `now`).
+    pub fn now(&self) -> crate::time::Timestamp {
+        match &self.inner {
+            SnapshotInner::Model(m) => m.now,
+            SnapshotInner::Durable(d) => crate::time::Timestamp(d.now),
+        }
+    }
+}
+
+fn copied<T: Clone>(r: &Result<T, QueryError>) -> Result<T, QueryError> {
+    match r {
+        Ok(v) => Ok(v.clone()),
+        Err(e) => Err(crate::durable::copy_error(e)),
+    }
 }

@@ -72,6 +72,21 @@ impl Finder {
         found.into_iter().map(|(f, _)| f).collect()
     }
 
+    /// Takes the recovery entries a registry file holds, with their positions (spec §2.1: it keeps every one), for a
+    /// reader that reads the log only above it.
+    pub(crate) fn seed_recoveries(
+        &mut self,
+        entries: impl IntoIterator<Item = (LogPos, Recovery)>,
+    ) {
+        self.recoveries.extend(entries);
+    }
+
+    /// For a reader that reads the log only above `through`: the last valid position before what it reads, with no
+    /// commit time known.
+    pub(crate) fn seed_floor(&mut self, through: LogPos) {
+        self.voided_to = Some(through);
+    }
+
     /// The last batch read before now: its last position and, when known, its commit time.
     fn before(&self) -> Option<(LogPos, Option<i64>)> {
         match self.voided_to {

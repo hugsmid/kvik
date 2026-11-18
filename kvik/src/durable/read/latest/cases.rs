@@ -1,0 +1,367 @@
+//! Latest values in the cases the state alone cannot tell, and what a reader holds (roadmap 9.0c; Q-1004, Q-1006).
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use kvik_log::directory::Family;
+use kvik_log::directory::series::SeriesDirectory;
+
+use super::tests::{Rig, S, plain, write_directory};
+use crate::config::LogConfig;
+use crate::durable::reader::DurableReader;
+use crate::env::Fs;
+use crate::error::QueryError;
+use crate::health::LossKind;
+use crate::read::Live;
+use crate::time::Timestamp;
+use crate::types::{Intent, Reading, Value};
+use crate::{Reader, SeriesId};
+
+fn durable(r: &Reader) -> Arc<DurableReader> {
+    r.durable().expect("a durable reader").unwrap()
+}
+
+fn text(l: &Live) -> Option<&str> {
+    match l {
+        Live::Value(v) => match &v.fact.value {
+            Value::Text(t) => Some(t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A log that seals by time: seals run on the log's own monotonic clock, which the rig's clock does not drive.
+fn sealing() -> LogConfig {
+    LogConfig {
+        seal_interval: Duration::from_millis(300),
+        ..LogConfig::default()
+    }
+}
+
+impl Rig {
+    /// Waits until the segment holding `bytes` is sealed; returns its path.
+    fn wait_sealed_with(&self, bytes: &[u8]) -> std::path::PathBuf {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let holding = self.segments().into_iter().find(|p| {
+                self.fs
+                    .read(p)
+                    .is_some_and(|b| b.windows(bytes.len()).any(|w| w == bytes))
+            });
+            if let Some(p) = holding
+                .clone()
+                .filter(|p| p.extension().is_some_and(|e| e == "kvl"))
+            {
+                return p;
+            }
+            assert!(Instant::now() < deadline, "not sealed: {holding:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits until the writer has written a series directory through `sequence` or later.
+    fn wait_directory(&self, sequence: u64) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let store_id = kvik_log::store::read_descriptor(&*self.env.fs, &self.dir)
+            .unwrap()
+            .store_id;
+        let through = || {
+            kvik_log::directory::read_latest(&*self.env.fs, &self.dir, Family::Series, |b| {
+                SeriesDirectory::decode(b, &store_id)
+            })
+            .ok()
+            .flatten()
+            .map_or(0, |(_, d)| d.through.sequence)
+        };
+        while through() < sequence {
+            assert!(
+                Instant::now() < deadline,
+                "no series directory through {sequence}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn agrees(&self, r: &Reader, i: usize) {
+        let want = self.model.reader().live(self.ids[i]).unwrap();
+        assert_eq!(
+            plain(r.live(self.ids[i]).unwrap()),
+            plain(want),
+            "series {i}"
+        );
+    }
+
+    fn at(&self, secs: i64) -> Timestamp {
+        Timestamp(self.clock.wall().0 + secs * S)
+    }
+
+    fn note(&self, secs: i64, t: &str) -> Reading {
+        Reading::new(self.ids[2], self.at(secs), Value::Text(t.into()))
+    }
+
+    /// Shuts the store, writes a series directory through the last batch, and opens the store again.
+    fn directory(&mut self) {
+        self.shut();
+        write_directory(&self.env, &self.dir, usize::MAX).expect("a batch");
+        self.reopen();
+    }
+
+    fn segments(&self) -> Vec<std::path::PathBuf> {
+        self.fs
+            .paths()
+            .into_iter()
+            .filter(|p| {
+                p.starts_with(self.dir.join("log"))
+                    && p.extension().is_some_and(|e| e == "open" || e == "kvl")
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn a_pending_fact_falling_due_after_the_directory_is_live_from_its_entry_with_no_search() {
+    let mut rig = Rig::new("pending");
+    // A scheduled series: a fact ahead of now is pending, not live.
+    rig.emit(&[(1, -4, 0, 0, 0), (1, 30, 1, 0, 0)], false);
+    rig.directory();
+    let r = rig.reader();
+    for secs in [0, 31, 60] {
+        rig.clock.advance(Duration::from_secs(secs));
+        rig.agrees(&r, 1);
+        rig.agrees(&rig.long, 1);
+    }
+    let d = durable(&r);
+    assert!(d.seeded());
+    assert_eq!((d.searches(), durable(&rig.long).searches()), (0, 0));
+    // Two pending facts: the entry names the earliest only, so the reader looks once the first falls due.
+    rig.emit(&[(1, 30, 1, 0, 0), (1, 90, 0, 0, 0)], false);
+    rig.directory();
+    let r = rig.reader();
+    for secs in [0, 31, 60] {
+        rig.clock.advance(Duration::from_secs(secs));
+        rig.agrees(&r, 1);
+        rig.agrees(&rig.long, 1);
+    }
+    assert_eq!(durable(&rig.long).searches(), 0);
+    rig.check().unwrap();
+}
+
+#[test]
+fn a_bad_latest_fact_is_passed_over_and_a_candidate_corrected_to_bad_costs_one_search_per_call() {
+    let mut rig = Rig::new("bad");
+    rig.emit(&[(0, -30, 0, 0, 0), (0, -4, 1, 0, 0)], false);
+    rig.emit(&[(0, -2, 0, 3, 0)], false);
+    rig.agrees(&rig.long, 0);
+    let long = durable(&rig.long);
+    assert_eq!(long.searches(), 0);
+    rig.emit(&[(0, -4, 0, 3, 0)], true);
+    rig.agrees(&rig.long, 0);
+    assert_eq!(long.searches(), 1);
+    rig.agrees(&rig.long, 0);
+    assert_eq!(long.searches(), 2);
+    // A reader continuing the directory reads the entry's unsure mark.
+    rig.directory();
+    let r = rig.reader();
+    rig.agrees(&r, 0);
+    assert_eq!(durable(&r).searches(), 1);
+    rig.check().unwrap();
+}
+
+#[test]
+fn future_and_outranked_facts_are_live_only_when_current_and_due_with_no_search() {
+    let mut rig = Rig::new("ahead");
+    rig.emit(&[(0, -4, 0, 0, 0), (0, 30, 1, 0, 0)], false);
+    rig.emit(&[(3, -4, 0, 0, 2)], false);
+    rig.emit(&[(3, -4, 1, 0, 1)], true);
+    for secs in [0, 31] {
+        rig.clock.advance(Duration::from_secs(secs));
+        for i in [0, 3] {
+            rig.agrees(&rig.long, i);
+        }
+    }
+    assert_eq!(durable(&rig.long).searches(), 0);
+    let Live::Value(v) = rig.long.live(rig.ids[3]).unwrap() else {
+        panic!("a live value");
+    };
+    assert_eq!(v.fact.changed_at, Some(2));
+    rig.check().unwrap();
+}
+
+#[test]
+fn a_quiet_series_candidate_is_read_once_with_every_other_unmet_one() {
+    let mut rig = Rig::new("quiet");
+    rig.emit(
+        &[(2, -300, 0, 0, 0), (0, -300, 0, 0, 0), (6, -300, 0, 0, 0)],
+        false,
+    );
+    rig.clock.advance(Duration::from_secs(3_600));
+    rig.directory();
+    let r = rig.reader();
+    let d = durable(&r);
+    assert_eq!(text(&r.live(rig.ids[2]).unwrap()), Some("one"));
+    assert_eq!(d.lookups(), 1);
+    for _ in 0..3 {
+        for i in [0, 2, 6] {
+            rig.agrees(&r, i);
+        }
+    }
+    assert!(d.seeded());
+    assert_eq!((d.lookups(), d.searches()), (1, 0));
+}
+
+#[test]
+fn a_readers_memory_does_not_grow_with_the_facts() {
+    let mut rig = Rig::new("memory");
+    let early = rig.reader();
+    let series = [0usize, 1, 2, 6];
+    let mut held = Vec::new();
+    for calls in [20u64, 160] {
+        while rig.clock.wall().0 < super::tests::T0 + i64::try_from(calls).unwrap() * 50 * S {
+            let rs: Vec<_> = (0..50)
+                .map(|k| (series[k % 4], -50 + k as i64, k as u8, (k / 4) as u8 % 3, 0))
+                .collect();
+            rig.emit(&rs, false);
+            rig.clock.advance(Duration::from_secs(50));
+        }
+        let fresh = rig.reader();
+        let mut seen = Vec::new();
+        for r in [&early, &rig.long, &fresh] {
+            for i in series {
+                rig.agrees(r, i);
+                r.series(rig.ids[i]).unwrap();
+            }
+            seen.push(durable(r).footprint());
+        }
+        held.push(seen);
+    }
+    for (small, large) in held[0].iter().zip(&held[1]) {
+        assert_eq!(small.0, large.0, "series, full facts and entries held");
+        assert!(!large.1, "no fact index");
+        // The log reader keeps the segment it follows, up to the mark, and no more.
+        let segment = usize::try_from(LogConfig::default().segment_size).unwrap();
+        assert!(
+            large.2 <= segment,
+            "{} bytes kept by the log reader",
+            large.2
+        );
+    }
+    let (series_held, rows, _) = held[1][2].0;
+    assert!(series_held == 4 && rows <= 3 * 4, "{:?}", held[1][2]);
+}
+
+#[test]
+fn a_text_candidate_in_a_maximal_batch_is_read_whole_from_its_position() {
+    let log = LogConfig {
+        max_batch_bytes: 8 << 20,
+        ..LogConfig::default()
+    };
+    let mut rig = Rig::with_log("maximal", log);
+    let n = 26_000i64;
+    let readings: Vec<Reading> = (0..n)
+        .map(|k| {
+            let t = Timestamp(rig.clock.wall().0 - (n - k) * 1_000_000);
+            Reading::new(rig.ids[2], t, Value::Text(format!("{k:0>255}")))
+        })
+        .collect();
+    rig.emit_readings(&readings, Intent::Normal);
+    rig.agrees(&rig.long, 2);
+    rig.directory();
+    let r = rig.reader();
+    let live = r.live(rig.ids[2]).unwrap();
+    assert_eq!(text(&live), Some(format!("{:0>255}", n - 1).as_str()));
+    rig.agrees(&r, 2);
+    assert!(durable(&r).seeded());
+    assert_eq!(durable(&r).lookups(), 1);
+    let largest = rig
+        .segments()
+        .iter()
+        .map(|p| rig.fs.read(p).unwrap().len())
+        .max()
+        .unwrap();
+    assert!(largest > 7 << 20, "{largest} bytes");
+}
+
+#[test]
+fn a_loss_found_while_open_breaks_the_state_shows_the_loss_and_never_the_lost_fact() {
+    let mut rig = Rig::new("loss");
+    let id: SeriesId = rig.ids[2];
+    rig.emit_readings(&[rig.note(-30, "NOTE-AAA")], Intent::Normal);
+    rig.emit_readings(&[rig.note(-4, "NOTE-BBB")], Intent::Normal);
+    let store = rig.store.take().unwrap();
+    let own = store.reader();
+    assert_eq!(text(&own.live(id).unwrap()), Some("NOTE-BBB"));
+    for p in rig.segments() {
+        let bytes = rig.fs.read(&p).unwrap();
+        if let Some(at) = bytes.windows(8).position(|w| w == b"NOTE-BBB") {
+            rig.fs.poke(&p, at, b"X");
+        }
+    }
+    let lost =
+        |l: Vec<crate::LossReport>| l.iter().filter(|l| l.kind == LossKind::DataLost).count();
+    assert_eq!(lost(store.losses()), 1);
+    assert_eq!(text(&own.live(id).unwrap()), Some("NOTE-AAA"));
+    assert_eq!(lost(own.losses()), 1);
+    assert!(
+        durable(&own).footprint().1,
+        "the broken state answers from a fact index"
+    );
+    // A reader whose own pass finds the loss folded nothing from it.
+    let fresh = rig.reader();
+    assert_eq!(text(&fresh.live(id).unwrap()), Some("NOTE-AAA"));
+    assert_eq!(lost(fresh.losses()), 1);
+    assert!(!durable(&fresh).footprint().1);
+    rig.store = Some(store);
+}
+
+#[test]
+fn a_candidate_whose_segment_is_gone_is_reported_at_every_call_never_passed_over() {
+    let mut rig = Rig::with_log("missing", sealing());
+    let v = 2_222.5f64;
+    rig.emit_readings(
+        &[Reading::new(rig.ids[0], rig.at(-4), Value::F64(v))],
+        Intent::Normal,
+    );
+    let written = rig.long.refresh().unwrap().durable.sequence;
+    let sealed = rig.wait_sealed_with(&v.to_le_bytes());
+    rig.wait_directory(written);
+    rig.emit(&[(2, -2, 1, 0, 0)], false);
+    let r = rig.reader();
+    r.refresh().unwrap();
+    assert!(durable(&r).seeded());
+    rig.fs.remove_file(&sealed).unwrap();
+    for _ in 0..3 {
+        let e = r.live(rig.ids[0]);
+        assert!(matches!(e, Err(QueryError::NotAvailable { .. })), "{e:?}");
+    }
+}
+
+#[test]
+fn damage_under_a_directorys_candidate_never_shows_the_lost_fact() {
+    let mut rig = Rig::new("under");
+    let id = rig.ids[2];
+    rig.emit_readings(&[rig.note(-30, "NOTE-AAA")], Intent::Normal);
+    rig.emit_readings(&[rig.note(-4, "NOTE-BBB")], Intent::Normal);
+    rig.directory();
+    rig.emit(&[(0, -2, 0, 0, 0)], false);
+    for p in rig.segments() {
+        let bytes = rig.fs.read(&p).unwrap();
+        if let Some(at) = bytes.windows(8).position(|w| w == b"NOTE-BBB") {
+            rig.fs.poke(&p, at, b"X");
+        }
+    }
+    // The reader starts in the segment holding the directory's `through`, under the damage.
+    let r = rig.reader();
+    assert_eq!(text(&r.live(id).unwrap()), Some("NOTE-AAA"));
+    let lost = r
+        .losses()
+        .iter()
+        .filter(|l| l.kind == LossKind::DataLost)
+        .count();
+    assert_eq!(lost, 1);
+    let d = durable(&r);
+    assert!(
+        d.seeded() && d.footprint().1,
+        "seeded, then answered from a fact index"
+    );
+}

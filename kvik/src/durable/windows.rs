@@ -225,10 +225,11 @@ pub(crate) fn live_in(
     Ok(live_with(&p, clocks, id, s, now))
 }
 
-/// Live state (spec §2.3, §5.4) at the reader's `now` ([`live_in`]).
+/// Live state (spec §2.3, §5.4) at the reader's `now`, from the series directory and the log tail
+/// ([`super::read::latest::live`]).
 pub(crate) fn live(r: &DurableReader, id: SeriesId) -> Result<Live, QueryError> {
     let now = r.now();
-    r.with(|i, _| live_in(i, r.clocks(), id, now))
+    r.with_latest(|v| super::read::latest::live(r, v, id, now))
 }
 
 /// A window result (spec §6), a calendar result among them (spec §5.7: a window over its span, in the site zone or

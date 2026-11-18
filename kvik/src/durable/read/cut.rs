@@ -261,7 +261,7 @@ mod tests {
             }))),
         );
         let clock = rig.clock.clone();
-        let call = r.with(|_, _| {
+        let call = r.with_latest(|_| {
             clock.advance(MAX_AGE / 2);
             Ok(())
         });

@@ -156,6 +156,60 @@ pub(crate) fn fact_out(s: &Stored) -> Fact {
     }
 }
 
+/// A series of `registry` by id or name.
+pub(crate) fn lookup<'a>(registry: &'a Registry, key: &SeriesKey) -> Result<&'a Series, Error> {
+    match key {
+        SeriesKey::Id(id) => registry.get(id.0),
+        SeriesKey::Name(n) => registry.resolve(n),
+    }
+    .ok_or_else(|| {
+        Error::UnknownSeries(match key {
+            SeriesKey::Id(id) => id.to_string(),
+            SeriesKey::Name(n) => n.clone(),
+        })
+    })
+}
+
+/// What the registry knows about a series, with its latest recorded `t` and lateness reference (spec §2.2), the
+/// reference shown for an observed series only.
+pub(crate) fn series_info(s: &Series, latest_t: Option<i64>, reference: Option<i64>) -> SeriesInfo {
+    SeriesInfo {
+        id: SeriesId(s.def.id),
+        name: s.names.last().cloned().unwrap_or_default(),
+        names: s.names.clone(),
+        spec: s.spec.clone(),
+        staleness: s
+            .def
+            .staleness
+            .map(|n| Duration::from_nanos(u64::try_from(n).unwrap_or(0))),
+        retired_at: s.retired_at.map(Timestamp),
+        latest_t: latest_t.map(Timestamp),
+        lateness_reference: reference
+            .filter(|_| s.spec.timing == Timing::Observed)
+            .map(Timestamp),
+    }
+}
+
+/// The registry file's content for `entries` up to `through` (`format.md` A.16), with the id floor `floor` or the
+/// highest id `registry` names, whichever is higher.
+pub(crate) fn registry_file(
+    entries: &PMap<LogPos, (i64, Entry)>,
+    registry: &Registry,
+    through: LogPos,
+    floor: u32,
+) -> RegistryFile {
+    RegistryFile {
+        generation: through.generation,
+        through: through.sequence,
+        max_series_id: floor.max(registry.highest()),
+        entries: entries
+            .range(Bound::Unbounded, Bound::Included(&through))
+            .filter(|(p, _)| p.generation == through.generation)
+            .map(|(p, (t, e))| (p.sequence, *t, e.clone()))
+            .collect(),
+    }
+}
+
 impl Index {
     /// An index that keeps no facts: [`Index::series_facts`] and the calls on facts see none.
     pub(crate) fn without_facts() -> Self {
@@ -279,17 +333,7 @@ impl Index {
     /// The registry file's content for the kept log up to `through` (`format.md` A.16), with the id floor `floor`
     /// or the highest id the kept log names, whichever is higher.
     pub(crate) fn registry_file(&self, through: LogPos, floor: u32) -> RegistryFile {
-        RegistryFile {
-            generation: through.generation,
-            through: through.sequence,
-            max_series_id: floor.max(self.registry.highest()),
-            entries: self
-                .entries
-                .range(Bound::Unbounded, Bound::Included(&through))
-                .filter(|(p, _)| p.generation == through.generation)
-                .map(|(p, (t, e))| (p.sequence, *t, e.clone()))
-                .collect(),
-        }
+        registry_file(&self.entries, &self.registry, through, floor)
     }
 
     /// The facts of a series in `(t, position)` order.
@@ -354,16 +398,7 @@ impl Index {
     }
 
     fn lookup(&self, key: &SeriesKey) -> Result<&Series, Error> {
-        match key {
-            SeriesKey::Id(id) => self.registry.get(id.0),
-            SeriesKey::Name(n) => self.registry.resolve(n),
-        }
-        .ok_or_else(|| {
-            Error::UnknownSeries(match key {
-                SeriesKey::Id(id) => id.to_string(),
-                SeriesKey::Name(n) => n.clone(),
-            })
-        })
+        lookup(&self.registry, key)
     }
 
     /// The latest recorded `t` of a series (spec §2.2).
@@ -392,21 +427,11 @@ impl Index {
     pub(crate) fn series(&self, key: &SeriesKey) -> Result<SeriesInfo, Error> {
         let s = self.lookup(key)?;
         let id = s.def.id;
-        Ok(SeriesInfo {
-            id: SeriesId(id),
-            name: s.names.last().cloned().unwrap_or_default(),
-            names: s.names.clone(),
-            spec: s.spec.clone(),
-            staleness: s
-                .def
-                .staleness
-                .map(|n| Duration::from_nanos(u64::try_from(n).unwrap_or(0))),
-            retired_at: s.retired_at.map(Timestamp),
-            latest_t: self.latest_t(id).map(Timestamp),
-            lateness_reference: (s.spec.timing == Timing::Observed)
-                .then(|| self.lateness_reference(id).map(Timestamp))
-                .flatten(),
-        })
+        Ok(series_info(
+            s,
+            self.latest_t(id),
+            self.lateness_reference(id),
+        ))
     }
 
     /// The last position whose batch's commit time is at or before `at` (spec §2.3 As-of time).

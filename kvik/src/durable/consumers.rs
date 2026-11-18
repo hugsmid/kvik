@@ -79,7 +79,9 @@ impl Writer {
             None => self
                 .reader()
                 .map_err(|e| Error::Internal(e.to_string()))?
-                .with_again(|i, _| Ok(i.registry_file(st.mark_synced, st.max_series_id)))
+                .with_latest_again(|v| {
+                    Ok(v.latest().registry_file(st.mark_synced, st.max_series_id))
+                })
                 .map_err(|e| Error::Internal(e.to_string()))?,
         };
         let wall = self.env.clock.wall().0;

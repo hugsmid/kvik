@@ -75,6 +75,26 @@ fn later(a: Option<Kept>, b: Kept, versioned: bool) -> Kept {
 }
 
 impl State {
+    /// The live candidate: the latest current fact that is not bad and not ahead of the horizon.
+    pub(crate) fn candidate(&self) -> Option<Kept> {
+        self.candidate
+    }
+
+    /// The earliest and the latest good fact ahead of the horizon that the state keeps.
+    pub(crate) fn ahead(&self) -> [Option<Kept>; 2] {
+        [self.pending, self.last_ahead]
+    }
+
+    /// The latest recorded `t` and the lateness reference (spec §2.2).
+    pub(crate) fn latest(&self) -> (Option<i64>, Option<i64>) {
+        (self.latest_t, self.reference)
+    }
+
+    /// Whether the candidate may not be the live fact (`format.md` A.18 bit 3).
+    pub(crate) fn unsure(&self) -> bool {
+        self.unsure_until.is_some() || self.ahead_unsure()
+    }
+
     /// Facts ahead that fell due by `horizon` reach the candidate: once the latest has, every one has.
     pub(crate) fn promote(&mut self, horizon: i64, versioned: bool) {
         if let Some(l) = self.last_ahead.filter(|l| l.t <= horizon) {
@@ -118,7 +138,7 @@ impl State {
             return;
         }
         if f.t > horizon {
-            self.ahead(k, good, versioned);
+            self.keep_ahead(k, good, versioned);
             return;
         }
         let unsure = |u: &mut Option<i64>| *u = Some(u.map_or(k.t, |x| x.max(k.t)));
@@ -186,7 +206,7 @@ impl State {
     }
 
     /// A fact ahead of the horizon: the earliest and latest good ones are kept, any between only counted.
-    fn ahead(&mut self, k: Kept, good: bool, versioned: bool) {
+    fn keep_ahead(&mut self, k: Kept, good: bool, versioned: bool) {
         let outranks = |o: Option<Kept>| {
             o.is_some_and(|o| o.t == k.t && k.rank(versioned) > o.rank(versioned))
         };
