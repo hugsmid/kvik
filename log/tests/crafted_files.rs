@@ -243,11 +243,13 @@ fn crafted_manifest(m: u64, g: u64, t: u8, field: u16) -> Vec<u8> {
     let f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
         .encode()
         .to_vec();
-    crafted_after(f, 1_000, m, g, t, field)
+    crafted_after(f, 1_000, (m, g, t, field), false)
 }
 
-/// [`crafted_manifest`]'s damaged record and crafted records after `f`, the crafted epochs from `epoch`.
-fn crafted_after(mut f: Vec<u8>, epoch: u64, m: u64, g: u64, t: u8, field: u16) -> Vec<u8> {
+/// [`crafted_manifest`]'s damaged record and crafted records after `f`, the crafted epochs from `epoch`; with
+/// `overrun` the shared list's last field runs past the bodies, so no record's field list parses.
+fn crafted_after(mut f: Vec<u8>, epoch: u64, shape: (u64, u64, u8, u16), overrun: bool) -> Vec<u8> {
+    let (m, g, t, field) = shape;
     f.extend_from_slice(&[0xFF; 8]);
     let base = f.len() as u64;
     let e = (base + 48 * m + 4 * g).div_ceil(8) * 8;
@@ -255,6 +257,9 @@ fn crafted_after(mut f: Vec<u8>, epoch: u64, m: u64, g: u64, t: u8, field: u16) 
     let shared = base + 48 * m - 8;
     for i in 0..(e - shared) / 4 {
         put(&mut f, shared + 4 * i, &field.to_le_bytes());
+    }
+    if overrun {
+        put(&mut f, e - 2, &4u16.to_le_bytes());
     }
     let mut inner: Option<u32> = None;
     for k in (0..m).rev() {
@@ -306,27 +311,34 @@ fn a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_i
 }
 
 /// The failed reads' charges and the search's probes name the same window when a reader parses only a tail from a
-/// base that is not a multiple of the window.
+/// base that is not a multiple of the window: records whose field list does not parse, and lost ranges that do not
+/// decode.
 #[test]
 fn a_crafted_manifest_tail_read_from_inside_a_window_charges_the_window_it_probes() {
-    let mut f = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
+    let mut prefix = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
         .encode()
         .to_vec();
     let mut epoch = 0;
-    while (f.len() as u64) < MW + MW / 2 {
+    while (prefix.len() as u64) < MW + MW / 2 {
         epoch += 1;
-        f.extend(encode_record(RECORD_EMPTY, epoch, 0, 0, None));
+        prefix.extend(encode_record(RECORD_EMPTY, epoch, 0, 0, None));
     }
-    let base = f.len() as u64;
-    assert!(base % MW != 0);
-    let f = crafted_after(f, epoch + 1, 2_000, 100_000, RECORD_LOST_RANGE, 0x8001);
-    let (whole, whole_stats) = read_manifest_with_stats(&f, &[9; 16]);
-    let whole = whole.unwrap();
-    assert_eq!((whole.records.len() as u64, whole.valid_end), (epoch, base));
-    let (tail, stats) = read_records_with_stats(&f[base as usize..], base, epoch);
-    assert_eq!(tail, Ok((Vec::new(), base)));
-    assert!(within_budget(stats.failed_bytes_peak), "{stats:?}");
-    assert_eq!(stats.failed_bytes_peak, whole_stats.failed_bytes_peak);
+    let base = prefix.len() as u64;
+    assert!(!base.is_multiple_of(MW));
+    for overrun in [true, false] {
+        let shape = (2_000, 100_000, RECORD_LOST_RANGE, 0x8001);
+        let f = crafted_after(prefix.clone(), epoch + 1, shape, overrun);
+        let (whole, whole_stats) = read_manifest_with_stats(&f, &[9; 16]);
+        let whole = whole.unwrap();
+        assert_eq!((whole.records.len() as u64, whole.valid_end), (epoch, base));
+        let (tail, stats) = read_records_with_stats(&f[base as usize..], base, epoch);
+        assert_eq!(tail, Ok((Vec::new(), base)));
+        assert!(
+            within_budget(stats.failed_bytes_peak),
+            "{overrun}: {stats:?}"
+        );
+        assert_eq!(stats.failed_bytes_peak, whole_stats.failed_bytes_peak);
+    }
 }
 
 #[test]

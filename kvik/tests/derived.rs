@@ -254,7 +254,7 @@ fn a_fact_found_lost_while_open_is_never_counted_by_a_series_directory_of_the_ru
     let mut c = w.config();
     c.log.seal_interval = Duration::from_secs(2);
     let s = block_on(Store::open(c)).unwrap();
-    let g = block_on(s.define_series(gauge("site/dev/m0"))).unwrap();
+    let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
     // With a consumer each emit's batch is taken, and folded, before the emit returns.
     let consumer = block_on(s.consumer("c", kvik::Start::Now, kvik::Select::None)).unwrap();
     for (k, v) in [(0, 1_111.5), (1, 2_222.5), (2, 3_333.5)] {
@@ -283,7 +283,7 @@ fn a_fact_found_lost_while_open_is_never_counted_by_a_series_directory_of_the_ru
 fn a_series_directory_through_a_region_the_start_meets_is_not_continued() {
     let w = World::new("derived-lost-start");
     let s = open(&w);
-    let g = block_on(s.define_series(gauge("site/dev/m0"))).unwrap();
+    let g = block_on(s.define_series(gauge("site/dev/power"))).unwrap();
     emit(&s, &[num(g, 0, 1_111.5)]);
     let lost = emit(&s, &[num(g, 1, 2_222.5)]);
     wait_sealed(&w, 1);
