@@ -86,6 +86,7 @@ use crate::content_error::BodyError;
 use crate::crc::crc32c;
 use crate::error::FormatError;
 use crate::fs::Fs;
+use crate::header::HEADER_LEN;
 use crate::lease::{CutEnd, Cuts, LEASE_EXPIRY, LEASE_LEN, LEASE_REFRESH, LeaseSlot, lease_name};
 use crate::manifest::{LostRange, ManifestError};
 use crate::mark::{MarkSlot, ResetStamp};
@@ -349,6 +350,9 @@ struct View {
     recent: VecDeque<Fingerprint>,
     /// Regions returned, by file and byte span: one met again with a new extent is returned again (Q-200).
     regions: BTreeSet<(u64, u64, u64)>,
+    /// Batches whose last position is at or below this are passed over, their recovery entries included: what a
+    /// series directory already holds ([`LogReader::start_after`]).
+    floor: Position,
 }
 
 /// The bytes of the segment followed up to the mark, kept between refreshes so that a refresh reads and zeroes only
@@ -490,17 +494,79 @@ impl LogReader {
     /// renews the lease when due (module documentation; `api.md` `refresh`). On an error nothing the reader
     /// holds changes and nothing it found is lost: the next refresh finds it again.
     pub fn refresh(&mut self) -> Result<Update, ReaderError> {
-        self.refresh_inner(None).map(|(u, _)| u)
+        self.refresh_inner(None, None).map(|(u, _)| u)
     }
 
     /// [`LogReader::refresh`] that stops after the batch that brings the items it returns to `max_items` or more,
     /// so that a reader taking a long log holds one part of it at a time. Returns whether more may follow; until a
     /// call returns `false`, [`ReaderState::durable`] is the last position returned rather than the mark's.
     pub fn refresh_some(&mut self, max_items: usize) -> Result<(Update, bool), ReaderError> {
-        self.refresh_inner(Some(max_items.max(1)))
+        self.refresh_inner(Some(max_items.max(1)), None)
     }
 
-    fn refresh_inner(&mut self, budget: Option<usize>) -> Result<(Update, bool), ReaderError> {
+    /// [`LogReader::refresh_some`] that returns no batch above `upto`, as if the mark stood there: a second reader
+    /// brought to another reader's cut. [`ReaderState::durable`] is the mark's position once it returns `false`.
+    pub fn refresh_upto(
+        &mut self,
+        max_items: usize,
+        upto: Position,
+    ) -> Result<(Update, bool), ReaderError> {
+        self.refresh_inner(Some(max_items.max(1)), Some(upto))
+    }
+
+    /// Before the first refresh: starts the reader in the segment of the mark's generation that holds the position
+    /// after `after` (the newest whose header's `base_sequence` is at most one above it, looked for from the mark's
+    /// segment back), and passes over every batch at or below `after`, so that a reader continuing a series directory
+    /// (`format.md` A.18) reads only what the file does not cover. Returns whether it found that segment; if not, or
+    /// after a refresh, nothing changes and the reader reads from the log's start.
+    pub fn start_after(&mut self, after: Position) -> Result<bool, ReaderError> {
+        if self.view.generation.is_some() || self.view.taken != Position::default() {
+            return Ok(false);
+        }
+        let mark = self.read_mark()?;
+        let marked = Position {
+            generation: mark.generation,
+            sequence: mark.last_sequence,
+        };
+        if after.generation != mark.generation || after > marked || mark.file_id == 0 {
+            return Ok(false);
+        }
+        let mut names = self.segments()?;
+        names.retain(|n| n.generation == mark.generation && n.file_id <= mark.file_id);
+        for name in names.into_iter().rev() {
+            let Some((n, f)) = self.open_segment(name)? else {
+                continue;
+            };
+            let mut head = [0u8; HEADER_LEN];
+            let read = files::read_at_full(&*f, &mut head, 0)
+                .map_err(io_err(&self.log_dir.join(n.to_string())))?;
+            let Some(h) = (read == HEADER_LEN)
+                .then(|| crate::header::FileHeader::decode(&head))
+                .flatten()
+            else {
+                continue;
+            };
+            if h.base_sequence == 0 || h.base_sequence > after.sequence.saturating_add(1) {
+                continue;
+            }
+            self.view = View {
+                generation: Some(mark.generation),
+                file_id: n.file_id,
+                segment_generation: n.generation,
+                taken: after,
+                floor: after,
+                ..View::default()
+            };
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn refresh_inner(
+        &mut self,
+        budget: Option<usize>,
+        upto: Option<Position>,
+    ) -> Result<(Update, bool), ReaderError> {
         let mark = self.read_mark()?;
         self.take_manifest()?;
         let epoch = self.manifest.epoch;
@@ -513,7 +579,7 @@ impl LogReader {
         let mut view = self.view.clone();
         let mut events = Vec::new();
         let mut scratch = std::mem::take(&mut self.scratch);
-        let read = self.read_log(&mut view, &mark, &mut events, &mut scratch, budget);
+        let read = self.read_log(&mut view, &mark, &mut events, &mut scratch, (budget, upto));
         if scratch.file_id.is_none() && scratch.whole.is_none() {
             scratch.bytes = Vec::new();
         }

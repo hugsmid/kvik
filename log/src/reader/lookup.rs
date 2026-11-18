@@ -59,6 +59,8 @@ pub struct Lookup {
     pub complete: Vec<bool>,
     /// The mark's position read up to.
     pub durable: Position,
+    /// The mark's reset stamp: facts at or below a cut taken under another stamp may differ from the cut's.
+    pub stamp: crate::mark::ResetStamp,
     /// Segments read for the lookup.
     pub segments_read: u64,
     /// Whether the lease was renewed when due ([`LogReader::keep_alive`]).
@@ -378,6 +380,7 @@ impl LogReader {
                 generation: mark.generation,
                 sequence: mark.last_sequence,
             },
+            stamp: mark.stamp,
             segments_read: 0,
         };
         if wanted.is_empty() {
