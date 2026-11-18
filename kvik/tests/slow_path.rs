@@ -33,9 +33,37 @@ fn unreadable(s: &Store) -> Option<(u64, u64, u64, u64)> {
 }
 
 /// A segment's file id, from its name (`format.md` A.12).
-fn file_id(p: &Path) -> u64 {
-    let name = p.file_stem().unwrap().to_string_lossy();
-    name.rsplit('-').next().unwrap().parse().unwrap()
+/// Waits, on the real clock the log's timers use, until one sealed segment holds the values `v` in a row (their bytes
+/// as stored); returns it and their offset. A seal by time can fall anywhere between two calls, so a batch is found by
+/// its content, not by the count of seals before it.
+fn sealed_holding(w: &World, v: &[f64]) -> (PathBuf, usize) {
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+    for _ in 0..4_000 {
+        let held: Vec<_> = sealed(w, 0)
+            .into_iter()
+            .filter_map(|p| {
+                let b = w.fs.read(&p).unwrap();
+                let at = b.windows(bytes.len()).position(|x| x == bytes)?;
+                Some((p, at))
+            })
+            .collect();
+        if let [one] = &held[..] {
+            return one.clone();
+        }
+        assert!(
+            held.is_empty(),
+            "the values are in more than one sealed segment"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("no sealed segment holds the values");
+}
+
+/// Damages the byte at `facts`, inside the batch [`sealed_holding`] found.
+fn flip(w: &World, facts: &(PathBuf, usize)) {
+    let (path, at) = facts;
+    let bytes = w.fs.read(path).unwrap();
+    w.fs.poke(path, *at, &[bytes[*at] ^ 0xFF]);
 }
 
 /// Waits, on the real clock the log's timers use, until the store's log has `n` sealed segments.
@@ -68,10 +96,7 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
     let g = block_on(s.define_series(gauge("site/meter/power"))).unwrap();
     sealed(&w, 1);
     block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 2.0)])).unwrap();
-    let facts = sealed(&w, 2)
-        .into_iter()
-        .max_by_key(|p| file_id(p))
-        .unwrap();
+    let facts = sealed_holding(&w, &[1.0, 2.0]);
     // An hour later: the first readings leave the recent window, and the segment holding them is sealed.
     block_on(s.emit(&[num(g, 3_600, 3.0)])).unwrap();
     sealed(&w, 3);
@@ -103,8 +128,7 @@ fn a_reading_outside_the_recent_window_is_checked_against_the_log_across_seals_r
     ));
     assert_eq!(s.stats().ingest.slow_path, 3);
     // Damage while the store runs, in the batch of the first readings: never read as "no such key".
-    let bytes = w.fs.read(&facts).unwrap();
-    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    flip(&w, &facts);
     let ack = block_on(s.emit(&[num(g, 0, 1.0)])).unwrap();
     assert!(
         matches!(
@@ -259,17 +283,13 @@ fn a_fact_whose_earlier_facts_cannot_be_read_is_delivered_unchecked() {
         ..num(v, secs, value)
     };
     block_on(s.emit(&[version(0, 1.0, 5)])).unwrap();
-    let facts = sealed(&w, 2)
-        .into_iter()
-        .max_by_key(|p| file_id(p))
-        .unwrap();
+    let facts = sealed_holding(&w, &[1.0]);
     // An hour on, in event time and on the clock: the first key leaves both windows.
     w.clock.advance(Duration::from_secs(3_600));
     block_on(s.emit(&[version(3_600, 2.0, 5)])).unwrap();
     sealed(&w, 3);
     drain(&mut c);
-    let bytes = w.fs.read(&facts).unwrap();
-    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    flip(&w, &facts);
     // A lower version of the first key: outranked, but the fact that outranks it cannot be read.
     let ack = block_on(s.emit(&[version(0, 3.0, 3)])).unwrap();
     assert!(matches!(
@@ -308,16 +328,12 @@ fn a_fact_whose_earlier_facts_were_found_lost_is_delivered_checked() {
         ..num(v, secs, value)
     };
     block_on(s.emit(&[version(0, 1.0, 5)])).unwrap();
-    let facts = sealed(&w, 2)
-        .into_iter()
-        .max_by_key(|p| file_id(p))
-        .unwrap();
+    let facts = sealed_holding(&w, &[1.0]);
     w.clock.advance(Duration::from_secs(3_600));
     block_on(s.emit(&[version(3_600, 2.0, 5)])).unwrap();
     sealed(&w, 3);
     drain(&mut c);
-    let bytes = w.fs.read(&facts).unwrap();
-    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    flip(&w, &facts);
     assert_eq!(s.losses().len(), 1);
     let ack = block_on(s.emit(&[version(0, 3.0, 3)])).unwrap();
     assert!(matches!(
@@ -391,10 +407,7 @@ fn an_evaluation_without_its_facts_is_counted_although_it_delivers_nothing() {
     .unwrap();
     sealed(&w, 1);
     block_on(s.emit(&[num(g, 0, 20.0)])).unwrap();
-    let facts = sealed(&w, 2)
-        .into_iter()
-        .max_by_key(|p| file_id(p))
-        .unwrap();
+    let facts = sealed_holding(&w, &[20.0]);
     drain(&mut c);
     // An hour on, a reading without a value: the live-state fact is the first, before the window.
     w.clock.advance(Duration::from_secs(3_600));
@@ -402,8 +415,7 @@ fn an_evaluation_without_its_facts_is_counted_although_it_delivers_nothing() {
     sealed(&w, 3);
     drain(&mut c);
     assert_eq!(s.stats().delivery.evaluations_unchecked, 0);
-    let bytes = w.fs.read(&facts).unwrap();
-    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    flip(&w, &facts);
     block_on(s.emit(&[num(g, 3_601, f64::NAN)])).unwrap();
     let ds = drain(&mut c);
     assert!(
@@ -429,18 +441,14 @@ fn a_region_a_consumers_read_meets_after_the_open_is_counted() {
     drain(&mut c);
     sealed(&w, 1);
     block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 2.0)])).unwrap();
-    let facts = sealed(&w, 2)
-        .into_iter()
-        .max_by_key(|p| file_id(p))
-        .unwrap();
+    let facts = sealed_holding(&w, &[1.0, 2.0]);
     block_on(s.emit(&[num(g, 2, 3.0)])).unwrap();
     block_on(s.shutdown()).unwrap();
     drop((c, s));
     let s = open();
     assert_eq!(unreadable(&s), None);
     // Damage after the open, in records the consumer has still to be sent: its read of the log passes over it.
-    let bytes = w.fs.read(&facts).unwrap();
-    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    flip(&w, &facts);
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     drain(&mut c);
     assert_eq!(s.stats().delivery.regions_unread, 1);
@@ -463,16 +471,12 @@ fn a_region_a_consumer_met_first_is_no_longer_counted_once_the_process_reports_i
     drain(&mut c);
     sealed(&w, 1);
     block_on(s.emit(&[num(g, 0, 1.0), num(g, 1, 2.0)])).unwrap();
-    let facts = sealed(&w, 2)
-        .into_iter()
-        .max_by_key(|p| file_id(p))
-        .unwrap();
+    let facts = sealed_holding(&w, &[1.0, 2.0]);
     block_on(s.emit(&[num(g, 2, 3.0)])).unwrap();
     block_on(s.shutdown()).unwrap();
     drop((c, s));
     let s = open();
-    let bytes = w.fs.read(&facts).unwrap();
-    w.fs.poke(&facts, 100, &[bytes[100] ^ 0xFF]);
+    flip(&w, &facts);
     let mut c = block_on(s.consumer("c", Start::Now, Select::None)).unwrap();
     drain(&mut c);
     assert!(unreadable(&s).is_some_and(|(_, _, _, r)| r >= 1));
