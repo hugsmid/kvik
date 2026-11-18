@@ -39,8 +39,8 @@ pub(crate) struct Chains {
     pruned: u64,
     /// The reference scan's walks run to the chain's end, as before the scan bound.
     reference: bool,
-    /// The bounded scan's chain ends, read ahead (Q-873); `None` for the reference scan and for walks remembered in
-    /// `links`, as before Q-873 (`legacy::scan_with_walked_links`).
+    /// The bounded scan's chain ends, read ahead (Q-873); `None` for the reference scan and for the walked chains
+    /// remembered in `links` (`legacy::scan_with_walked_links`).
     ends: Option<Ends>,
     #[cfg(test)]
     pub(crate) peak: usize,
@@ -140,7 +140,7 @@ impl Chains {
         }
     }
 
-    /// The bounded scan's chains walked from each candidate and remembered in an ordered map, as before Q-873.
+    /// The walked chains: each candidate's chain walked and remembered in an ordered map, the oracle of the chain ends.
     pub(crate) fn walked() -> Self {
         Self {
             links: BTreeMap::new(),
@@ -155,13 +155,14 @@ impl Chains {
     /// Steps forward 8 bytes at a time from an invalid region at `start` and returns the first complete batch
     /// (A.2). With `commits`, also runs the tail's commit search up to the limit.
     ///
-    /// Candidates are judged on block headers first. Each chain of consecutive block headers is walked once,
-    /// without checksumming any body: the commit block it ends in is remembered for every block start on it, and a
-    /// block too long for a batch ends the chain. A candidate `o` goes further only when that commit's
-    /// `batch_bytes` is the distance from `o`, which one candidate per commit block is; then its framing and
-    /// `batch_crc32c` are checked on headers ([`framing_holds`]); only a candidate that passes is read in full,
-    /// its body checksums taken from the prefix table (Q-110). Once failed reads in a window have checked
-    /// [`super::FAILED_READ_BUDGET`] bytes of body, the rest of the window is not read (Q-110).
+    /// Candidates are judged on block headers first: a candidate `o` goes further only when the chain of block
+    /// headers from it ends in a commit block whose `batch_bytes` is the distance from `o`, which one candidate per
+    /// commit block is. The bounded scan takes that from [`Ends`], read ahead (Q-873); the walked chains and the
+    /// reference scan walk each candidate's chain (`chain_end`). Then its framing and `batch_crc32c` are
+    /// checked on headers ([`framing_holds`]); only a candidate that passes is read in full, its body checksums taken
+    /// from the prefix table (Q-110), or from the verdicts of a boundary read that walked its chain (`walks`, Q-873).
+    /// Once failed reads in a window have checked [`super::FAILED_READ_BUDGET`] bytes of body, the rest of the window
+    /// is not read (Q-110).
     pub(crate) fn resync<'a>(
         &mut self,
         reads: &mut Reads<'a>,

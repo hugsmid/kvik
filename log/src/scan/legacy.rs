@@ -30,7 +30,7 @@ pub fn scan_ignoring_seal<'a>(
     ignoring_seal(bytes, id, legacy)
 }
 
-/// [`super::scan`] with each candidate's chain walked and remembered in an ordered map, as before Q-873: the oracle of
+/// [`super::scan`] by the walked chains, each candidate's chain walked and remembered in an ordered map: the oracle of
 /// the chain ends read ahead.
 pub fn scan_with_walked_links<'a>(
     bytes: &'a [u8],

@@ -76,6 +76,11 @@ impl Ends {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn ring_len(&self) -> usize {
+        (self.mask + 1) as usize
+    }
+
     fn index(&self, p: u64) -> usize {
         ((p >> 3) & self.mask) as usize
     }
@@ -217,6 +222,11 @@ impl Ends {
             } else {
                 stop.min(self.ahead - MAX_BATCH_DATA - 7)
             };
+            debug_assert!(
+                run > o,
+                "the chain ends were read up to {} only",
+                self.ahead
+            );
             while o < run {
                 if self.slots[self.index(o)] == NAMES {
                     return o;

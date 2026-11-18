@@ -491,3 +491,121 @@ fn failed_reads_are_charged_per_window_and_pass_the_rest_of_one_past_its_budget(
     z.charge(8, FAILED_READ_BUDGET);
     assert_eq!(z.next_from(16), 16);
 }
+
+/// A checksum-valid block header of type `t` and body length `len` at `at`.
+fn put_header(b: &mut [u8], at: u64, t: u8, len: u32) {
+    let h = crate::block::BlockHeader {
+        block_type: t,
+        flags: FLAG_SKIPPABLE,
+        body_len: len,
+        body_crc32c: 0,
+    }
+    .encode();
+    b[at as usize..at as usize + 16].copy_from_slice(&h);
+}
+
+#[test]
+fn the_chain_ends_forget_a_start_a_ring_below_what_they_read() {
+    let probe = ends::Ends::new(ends::SPAN);
+    let ring = 8 * (probe.ring_len() as u64);
+    let x = 1u64 << 20;
+    let mut b = vec![0u8; (ring + x + (12 << 20)) as usize];
+    put_header(
+        &mut b,
+        x,
+        block_type::COMMIT,
+        crate::body::COMMIT_LEN as u32,
+    );
+    put_header(&mut b, x + ring, 0x50, 0);
+    let limit = b.len() as u64;
+    let mut reads = Reads::new(&b);
+    let mut e = probe;
+    let o = HEADER_LEN as u64;
+    e.next_candidate(&mut reads, o, o + 64, limit);
+    assert_eq!(e.commit_at(x), Some(true));
+    // Moved to just below the start a ring above, then read from past it: that start lies in the gap not read.
+    let o = x + ring - 4_096;
+    e.move_to(o);
+    e.next_candidate(&mut reads, x + ring + 8, x + ring + 16, limit);
+    assert_eq!(e.commit_at(x + ring), None);
+    assert_eq!(e.commit_at(x), None);
+    // Read from below it, the start a ring above is a data header, not the commit block a ring below.
+    let mut e = ends::Ends::new(ends::SPAN);
+    let mut reads = Reads::new(&b);
+    e.next_candidate(&mut reads, HEADER_LEN as u64, HEADER_LEN as u64 + 64, limit);
+    assert_eq!(e.commit_at(x), Some(true));
+    e.move_to(o);
+    e.next_candidate(&mut reads, o, o + 64, limit);
+    assert_eq!(e.commit_at(x + ring), Some(false));
+}
+
+#[test]
+fn the_valid_header_ring_holds_only_aligned_starts_from_its_base() {
+    let mut v = reads::Valid::new((1 << 10) - 1);
+    let ring = 8 << 10;
+    v.move_to(ring);
+    v.mark(ring + 64);
+    assert!(v.holds(ring + 64));
+    // A step's other offsets, and the start a ring below, are not taken for it.
+    for p in [ring + 60, ring + 68, ring + 71, 64] {
+        assert!(!v.holds(p), "{p}");
+    }
+    v.mark(ring + 68);
+    assert!(!v.holds(ring + 68));
+    v.move_to(ring + 72);
+    assert!(!v.holds(ring + 64));
+}
+
+#[test]
+fn a_header_read_again_must_fit_below_the_limit_asked() {
+    let mut b = vec![0u8; 256];
+    put_header(&mut b, 64, 0x50, 0);
+    let mut reads = Reads::new(&b);
+    assert!(reads.peek(64, 256).is_some());
+    assert!(reads.peek(64, 72).is_none());
+    assert!(reads.block(64, 72).is_err());
+    let mut reads = Reads::new(&b);
+    let mut v = reads::Valid::new((1 << 10) - 1);
+    v.mark(64);
+    reads.valid = Some(v);
+    assert!(reads.peek(64, 72).is_none());
+    assert!(reads.peek(64, 256).is_some());
+}
+
+/// [`chained_images`] whose chain ends in an entries block whose checksum holds and whose body fails its checks.
+fn chained_images_to_invalid_content(k: u64) -> (Vec<u8>, SegmentIdentity, u64) {
+    let (mut b, id) = chained_images(k);
+    b.truncate(b.len() - 64 - 8);
+    let mut body = alias_batch(&id, 1, 0);
+    body.truncate(body.len() - 64);
+    let mut body = body[16..].to_vec();
+    body[16] = 2;
+    encode_block(block_type::ENTRIES, 0, &body, &mut b).unwrap();
+    let invalid = body.len() as u64;
+    b.extend_from_slice(&[0xFF; 8]);
+    b.resize(b.len() + 64, 0);
+    (b, id, invalid)
+}
+
+#[test]
+fn boundary_reads_ending_at_one_invalid_body_check_it_once() {
+    for k in [8u64, 64] {
+        let (bytes, id, invalid) = chained_images_to_invalid_content(k);
+        let (old, _) = legacy::scan(&bytes, &id, ScanLimit::End);
+        let (new, stats) = scan_with_stats(&bytes, &id, ScanLimit::End);
+        assert_eq!(new, old);
+        let r = new.unwrap();
+        assert_eq!(r.batches.len() as u64, k);
+        let kept: u64 = r
+            .batches
+            .iter()
+            .flat_map(|b| &b.blocks)
+            .map(|b| b.block.body.len() as u64)
+            .sum();
+        // The direct read that found the damage, then the first boundary read: the stop's body twice in all.
+        assert!(
+            stats.bytes_body_checked <= kept + 2 * invalid,
+            "{stats:?}: kept {kept}, the invalid body {invalid}"
+        );
+    }
+}

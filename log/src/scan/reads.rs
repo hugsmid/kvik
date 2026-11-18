@@ -115,8 +115,8 @@ impl ScanStats {
     }
 }
 
-/// The starts whose block header the chain ends read and found valid, a bit each in a ring indexed by offset (Q-873):
-/// a header read there again is taken without its checksum.
+/// The starts whose block header the scan read and found valid once damage was found, a bit each in a ring indexed by
+/// offset (Q-873): a header read there again is taken without its checksum.
 #[derive(Clone, Debug)]
 pub(crate) struct Valid {
     bits: Vec<u64>,
@@ -145,7 +145,7 @@ impl Valid {
         }
     }
 
-    fn holds(&self, p: u64) -> bool {
+    pub(crate) fn holds(&self, p: u64) -> bool {
         self.index(p)
             .is_some_and(|i| self.bits[i / 64] & (1 << (i % 64)) != 0)
     }
@@ -225,9 +225,13 @@ impl<'a> Reads<'a> {
         check_block(t, body)
     }
 
+    /// Forgets the prefix table and the valid headers below `offset`, which the scan does not ask about again.
     pub(crate) fn forget_below(&mut self, offset: u64) {
         if let Some(t) = &mut self.sums {
             t.forget_below(offset);
+        }
+        if let Some(v) = &mut self.valid {
+            v.move_to(offset);
         }
     }
 
@@ -245,6 +249,9 @@ impl<'a> Reads<'a> {
             self.checksums += 1;
             let found = peek_raw(self.bytes, offset, limit)?;
             self.recent = [Some((offset, found.0, found.1)), self.recent[0]];
+            if let Some(v) = &mut self.valid {
+                v.mark(offset);
+            }
             Some(found)
         })
     }
@@ -290,7 +297,13 @@ impl<'a> Reads<'a> {
             Some((h, raw)) => read_body(bytes, offset, limit, h, raw, crc),
             None => {
                 self.checksums += 1;
-                read_block_with(bytes, offset, limit, crc)
+                let b = read_block_with(bytes, offset, limit, crc);
+                if b.is_ok()
+                    && let Some(v) = &mut self.valid
+                {
+                    v.mark(offset);
+                }
+                b
             }
         }
     }

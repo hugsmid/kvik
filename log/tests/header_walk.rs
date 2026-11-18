@@ -43,7 +43,7 @@ fn chain_word(f: &mut [u8], p: usize, t: Option<u8>, lens: (u32, u32), x: &mut L
     }
 }
 
-/// The re-check's shape: from `s`, a valid block header at every 8 bytes up to 2 MiB before the end, each claiming a
+/// From `s`, a valid block header at every 8 bytes up to 2 MiB before the end, each claiming a
 /// body of at least 4 KiB that fits and whose checksum does not hold; every type `t` if given, else any.
 fn headers_everywhere(mut f: Vec<u8>, len: usize, t: Option<u8>) -> Vec<u8> {
     let s = f.len().next_multiple_of(8);
@@ -225,6 +225,176 @@ fn dearest_entries_batches(mut f: Vec<u8>, len: usize) -> Vec<u8> {
     f
 }
 
+/// A skippable block with `body`, its body checksum `crc` or the right one.
+fn skippable(body: &[u8], crc: Option<u32>) -> Vec<u8> {
+    let mut out = BlockHeader {
+        block_type: 0x90,
+        flags: FLAG_SKIPPABLE,
+        body_len: body.len() as u32,
+        body_crc32c: crc.unwrap_or_else(|| crc32c(body)),
+    }
+    .encode()
+    .to_vec();
+    out.extend_from_slice(body);
+    out.resize(out.len().next_multiple_of(8), 0);
+    out
+}
+
+/// An 8-byte body whose skippable block reads as a plausible header at each of its three 8-byte steps.
+fn plausible_body() -> [u8; 8] {
+    for x in 1u32.. {
+        let mut body = [0u8; 8];
+        body[..4].copy_from_slice(&[0x90, 1, (x >> 8) as u8, x as u8]);
+        body[4..].copy_from_slice(&(64u32 + 8 * (x >> 16)).to_le_bytes());
+        let b = skippable(&body, None);
+        let (t, len) = (b[8], u32::from_le_bytes(b[12..16].try_into().unwrap()));
+        let seal_or_commit = [
+            0,
+            block_type::COMMIT,
+            block_type::SEGMENT_INDEX,
+            block_type::TRAILER,
+        ];
+        if !seal_or_commit.contains(&t) && u64::from(len) < W - 64 {
+            return body;
+        }
+    }
+    unreachable!()
+}
+
+/// A batch at the end of `f` of sequence `seq`: a facts block of one row and `n` skippable blocks of `body`.
+fn push_batch(f: &mut Vec<u8>, seq: u64, n: usize, body: &[u8]) {
+    let mut blocks = vec![(block_type::FACTS, 0, facts_body(seq, T0, &[(1, T0, 1.0)]))];
+    blocks.extend((0..n).map(|_| (0x90, FLAG_SKIPPABLE, body.to_vec())));
+    let at = f.len() as u64;
+    f.extend_from_slice(&raw_batch(&ID, at, &blocks, seq, seq, T0));
+}
+
+fn push_one_row(f: &mut Vec<u8>, seq: u64) {
+    let at = f.len() as u64;
+    let b = facts_batch(seq, T0, &[(1, T0, 1.0)])
+        .encode(&ID, at, T0)
+        .unwrap();
+    f.extend_from_slice(&b);
+}
+
+/// A chain of `n` skippable blocks of `body`, the last with a wrong body checksum, and a commit block naming the
+/// chain's start whose framing and `batch_crc32c` hold.
+fn push_broken_chain(f: &mut Vec<u8>, seq: u64, n: usize, body: &[u8]) {
+    let o = f.len();
+    let mut d = ID.store_id.to_vec();
+    d.extend_from_slice(&ID.file_id.to_le_bytes());
+    d.extend_from_slice(&(o as u64).to_le_bytes());
+    for i in 0..n {
+        let crc = (i + 1 == n).then(|| crc32c(body) ^ 1);
+        let b = skippable(body, crc);
+        d.extend_from_slice(&b[..12]);
+        f.extend_from_slice(&b);
+    }
+    let commit = Commit {
+        generation: ID.generation,
+        block_count: n as u32,
+        first_sequence: seq,
+        last_sequence: seq,
+        commit_time: 0,
+        batch_bytes: (f.len() - o) as u64,
+        batch_crc32c: crc32c(&d),
+    };
+    encode_block(block_type::COMMIT, 0, &commit.encode(), f).unwrap();
+}
+
+/// After damage, units of a kept one-row batch, one skippable block and a chain of `n` blocks of `body`: the boundary
+/// read after the kept batch walks the chain and fails, and the chain's start is a candidate. When `kept`, the chain
+/// is a batch (a facts block first), which the candidate keeps; else its last block's body checksum is wrong.
+fn walked_then_read(len: usize, n: usize, body: &[u8], kept: bool) -> Vec<u8> {
+    let mut f = damaged_start();
+    let mut seq = 1;
+    while f.len() + 256 + (n + 1) * (16 + body.len().next_multiple_of(8)) + 64 <= len {
+        push_one_row(&mut f, seq);
+        f.extend_from_slice(&skippable(body, None));
+        if kept {
+            push_batch(&mut f, seq + 1, n, body);
+        } else {
+            push_broken_chain(&mut f, seq + 1, n, body);
+        }
+        seq += 2;
+    }
+    f.resize(len, 0);
+    f
+}
+
+/// Units of damage, a kept one-row batch when `at_boundary`, and a batch of a facts block and `n` blocks of `body`:
+/// the large batch is read at a boundary, or found by resynchronisation, inside the bytes the chain ends read.
+fn kept_after_damage(len: usize, n: usize, body: &[u8], at_boundary: bool) -> Vec<u8> {
+    let mut f = damaged_start();
+    let mut seq = 1;
+    while f.len() + 512 + n * (16 + body.len().next_multiple_of(8)) <= len {
+        if at_boundary {
+            push_one_row(&mut f, seq);
+            seq += 1;
+        }
+        push_batch(&mut f, seq, n, body);
+        seq += 1;
+        f.extend_from_slice(&[0xFF; 8]);
+    }
+    f.resize(len, 0);
+    f
+}
+
+/// Undamaged batches of a facts block and `n` empty skippable blocks: what reporting the blocks costs.
+fn undamaged_batches(len: usize, n: usize) -> Vec<u8> {
+    let mut f = vec![0u8; HEADER_LEN];
+    let mut seq = 1;
+    while f.len() + 512 + 16 * n <= len {
+        push_batch(&mut f, seq, n, &[]);
+        seq += 1;
+    }
+    f.resize(len, 0);
+    f
+}
+
+/// After damage, units of a damaged word and a kept batch of one entries block, a definition of 65,536 state names
+/// of four ASCII letters placed so that every 8-byte step of the names is a plausible header: each body is checked
+/// and each of its steps takes a header checksum.
+fn plausible_entries_after_damage(len: usize) -> Vec<u8> {
+    let mut f = damaged_start();
+    let letters: Vec<u8> = (b'a'..=b'z').chain(b'A'..=b'Z').collect();
+    for id in 1u32.. {
+        let mut d = definition(id, "sssss", "");
+        d.1[3].1 = vec![3];
+        let at = d.1.iter().position(|(f, _)| *f == 14).unwrap();
+        let names = (0..65_536usize).map(|k| {
+            let c = |i: u32| letters[k / letters.len().pow(i) % letters.len()];
+            (13u16, vec![c(0), c(1), c(2), c(3)])
+        });
+        d.1.splice(at..at, names);
+        let at = f.len();
+        let bytes = entries_batch(u64::from(id), T0, &[d])
+            .encode(&ID, at as u64, T0)
+            .unwrap();
+        if at + bytes.len() + 8 > len {
+            break;
+        }
+        f.extend_from_slice(&bytes);
+        f.extend_from_slice(&[0xFF; 8]);
+    }
+    f.resize(len, 0);
+    f
+}
+
+/// The 8-byte steps whose header the chain ends checksum: a type and length that could be part of a batch.
+fn plausible_steps(f: &[u8]) -> u64 {
+    let mut n = 0;
+    for p in (HEADER_LEN..f.len().saturating_sub(15)).step_by(8) {
+        let len = u64::from(u32::from_le_bytes(f[p + 4..p + 8].try_into().unwrap()));
+        n += u64::from(match f[p] {
+            0 | block_type::SEGMENT_INDEX | block_type::TRAILER => false,
+            block_type::COMMIT => len == COMMIT_LEN as u64,
+            _ => 16 + len.next_multiple_of(8) <= W,
+        });
+    }
+    n
+}
+
 fn damaged_start() -> Vec<u8> {
     let mut f = vec![0u8; HEADER_LEN + 8];
     f[HEADER_LEN..].fill(0xFF);
@@ -243,24 +413,26 @@ fn cpu() -> f64 {
 }
 
 fn timed(name: &str, f: &[u8]) -> ScanStats {
-    let (mut best, mut best_cpu, mut stats) = (f64::INFINITY, f64::INFINITY, ScanStats::default());
+    let (mut best, mut worst, mut best_cpu) = (f64::INFINITY, 0f64, f64::INFINITY);
+    let mut stats = ScanStats::default();
     for _ in 0..5 {
         let (t, c) = (Instant::now(), cpu());
         let (r, s) = scan_with_stats(f, &ID, ScanLimit::End);
-        best = best.min(t.elapsed().as_secs_f64());
+        let took = t.elapsed().as_secs_f64();
+        (best, worst) = (best.min(took), worst.max(took));
         best_cpu = best_cpu.min(cpu() - c);
         r.unwrap();
         stats = s;
     }
     assert!(stats.within_bound(f.len() as u64), "{stats:?}");
     println!(
-        "{name}, {} MiB: {best:.3} s ({best_cpu:.2} s of CPU), {stats:?}",
+        "{name}, {} MiB: {best:.3} s, worst {worst:.3} s ({best_cpu:.2} s of CPU), {stats:?}",
         f.len() >> 20
     );
     stats
 }
 
-/// The scan agrees with the scan as before Q-873, which walks each candidate's chain, and reads each step's header
+/// The scan agrees with the walked chains, which walk each candidate's chain, and reads each step's header
 /// once ahead of the candidates and once more where it starts a commit block, for the tail's commit search.
 fn agrees_and_reads_each_header_once(f: &[u8], commits: u64) {
     let len = f.len() as u64;
@@ -279,8 +451,42 @@ fn agrees_and_reads_each_header_once(f: &[u8], commits: u64) {
 #[test]
 fn a_header_at_every_step_has_each_header_read_once() {
     for t in [None, Some(block_type::FACTS), Some(block_type::COMMIT)] {
-        let f = headers_everywhere(damaged_start(), 2 << 20, t);
+        let f = headers_everywhere(damaged_start(), 3 << 20, t);
+        let valid = (HEADER_LEN..f.len() - 16)
+            .step_by(8)
+            .filter(|&p| BlockHeader::decode(f[p..p + 16].try_into().unwrap()).is_some())
+            .count();
+        assert!(valid > 100_000, "{valid}");
         agrees_and_reads_each_header_once(&f, 0);
+    }
+}
+
+#[test]
+fn files_longer_than_the_ring_take_at_most_one_header_checksum_a_plausible_step() {
+    let len = 24usize << 20;
+    let wide = plausible_body();
+    let shapes = [
+        skippable_chains(damaged_start(), len, 4_096),
+        framed_candidates(damaged_start(), len, 1_000),
+        walked_then_read(len, 100_000, &[], false),
+        walked_then_read(len, 100_000, &[], true),
+        walked_then_read(len, 60_000, &wide, false),
+        kept_after_damage(len, 100_000, &[], true),
+        kept_after_damage(len, 100_000, &[], false),
+        skippable_batches(damaged_start(), len, 100_000),
+        headers_everywhere(damaged_start(), 3 << 20, None),
+        named_walks(damaged_start(), 2 << 20),
+    ];
+    for f in &shapes {
+        let (r, stats) = scan_with_stats(f, &ID, ScanLimit::End);
+        let (walked, _) = legacy::scan_with_walked_links(f, &ID, ScanLimit::End);
+        assert_eq!(r, walked);
+        assert!(stats.within_bound(f.len() as u64), "{stats:?}");
+        let plausible = plausible_steps(f);
+        assert!(
+            stats.header_checksums <= plausible + 64,
+            "{stats:?}: {plausible} plausible steps"
+        );
     }
 }
 
@@ -361,7 +567,7 @@ fn crafted_header_walks_timed() {
     let (r, _) = legacy::scan_with_walked_links(&f, &ID, ScanLimit::End);
     r.unwrap();
     println!(
-        "  the same, chains walked and remembered as before Q-873: {:.3} s",
+        "  the same, by the walked chains: {:.3} s",
         t.elapsed().as_secs_f64()
     );
     let header = FileHeader::new(kind::MANIFEST, 0, 1, 0, STORE)
@@ -371,4 +577,50 @@ fn crafted_header_walks_timed() {
         let m = headers_everywhere(header.clone(), 16 << 20, t);
         timed_manifest(&format!("manifest, a header every 8 bytes, type {t:?}"), &m);
     }
+}
+
+/// Crafted shapes that stack the passes over one file's own bytes (Q-873, Q-970), timed as
+/// [`crafted_header_walks_timed`]: a boundary read that walks a chain and fails, then the chain read as a candidate;
+/// batches kept after damage, at a boundary or by resynchronisation; a body checked whose every step takes a header
+/// checksum; and undamaged batches of the same blocks, what reporting them costs.
+#[test]
+#[ignore = "a measurement"]
+fn stacked_passes_timed() {
+    let len = 64 << 20;
+    let wide = plausible_body();
+    for (what, body, n) in [
+        ("empty", &[][..], 500_000),
+        ("empty", &[][..], 4_096),
+        ("8-byte plausible", &wide[..], 340_000),
+    ] {
+        for kept in [false, true] {
+            let f = walked_then_read(len, n, body, kept);
+            let then = if kept { "keeps" } else { "fails at its last" };
+            timed(
+                &format!(
+                    "a boundary read fails on a chain of {n} {what} blocks the candidate then {then}"
+                ),
+                &f,
+            );
+        }
+        for at_boundary in [true, false] {
+            let f = kept_after_damage(len, n, body, at_boundary);
+            let how = if at_boundary {
+                "at a boundary"
+            } else {
+                "by resynchronisation"
+            };
+            timed(
+                &format!("damage, then batches of {n} {what} blocks kept {how}"),
+                &f,
+            );
+        }
+    }
+    let f = plausible_entries_after_damage(len);
+    timed(
+        "damage, then batches of state names whose every step is a plausible header",
+        &f,
+    );
+    let f = undamaged_batches(len, 500_000);
+    timed("undamaged batches of 500000 empty skippable blocks", &f);
 }

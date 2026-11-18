@@ -37,7 +37,7 @@ proptest! {
 }
 
 /// The scan with chain ends read ahead (Q-873), at its own block and at blocks small enough for these files to cross,
-/// gives `scan`'s report, and so does the scan as before Q-873, which walks each candidate's chain.
+/// gives `scan`'s report, and so do the walked chains, which walk each candidate's chain.
 fn ends_agree(
     f: &[u8],
     limit: ScanLimit,
