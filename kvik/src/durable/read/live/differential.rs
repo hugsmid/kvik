@@ -175,7 +175,7 @@ impl Rig {
         let store = w.open();
         let mdir = PathBuf::from(format!("live-model/{}", next()));
         let model = block_on(Store::open(
-            StoreConfig::new(&mdir, "Europe/London")
+            StoreConfig::new(&mdir, "Etc/UTC")
                 .create_if_missing(true)
                 .backend(Backend::Model)
                 .env(Env::test(w.clock.clone())),

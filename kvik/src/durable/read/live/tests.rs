@@ -47,7 +47,7 @@ impl World {
 
     pub(super) fn open(&self) -> Store {
         block_on(Store::open(
-            StoreConfig::new(&self.dir, "Europe/London")
+            StoreConfig::new(&self.dir, "Etc/UTC")
                 .create_if_missing(true)
                 .env(self.env.clone())
                 .log(self.log.clone()),
