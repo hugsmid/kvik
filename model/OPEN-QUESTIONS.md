@@ -3511,9 +3511,9 @@ monotonic clock, so an injected clock decides freshness in tests. `min_batch_int
 A `Latest` member is due at the earliest of: a fact ahead falling due, a candidate above `now` or an interval reading
 becoming ready, and its staleness passing (in event time, or from the refreshing commit in the writer's process,
 spec §5.4); at once, and so at every batch interval, when its state cannot tell. A batch judges again only the
-members it brought facts or entries for, those due, and, after a call in the writer's process refreshed live
-staleness, every member; so an idle `Latest` with nothing due costs nothing and one with a due time costs one
-judgement per due time.
+members it brought facts or entries for, those due, and those whose live staleness a call of the writer's process
+refreshed since the last batch (its acknowledgement can follow the batch that brought its fact); so an idle `Latest`
+with nothing due costs nothing and one with a due time costs one judgement per due time.
 **Pinned by.** `kvik/src/durable/read/live/cases.rs`
 `staleness_and_a_value_falling_due_update_latest_with_no_new_fact`,
 `a_reading_is_in_a_batch_within_the_poll_interval_in_a_reader_process_and_at_once_in_the_writers`; the budget S13 in
