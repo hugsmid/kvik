@@ -84,14 +84,14 @@ specified here before the roadmap item that writes it.
   block. Measured (release build, one shared 4-core cloud machine, the best of five runs, the worst at most 40 %
   above it; runs at other hours up to 30 % slower again): a header read costs about 20 to 31 ns with the rest of the
   scan's work, and the dearest crafted 64 MiB segments built cost 0.25 to 0.61 s: a valid header every 8 bytes 0.25
-  s (5.7 s before), commit blocks naming data headers 0.25 s, candidates whose framing holds 0.25 to 0.27 s, chains
+  s (5.7 s before), commit blocks naming data headers 0.24 s, candidates whose framing holds 0.25 to 0.27 s, chains
   of empty skippable blocks read in full 0.35 to 0.43 s, a boundary read that fails at the end of such a chain the
   candidate then reads 0.35 s (2.0 s before), the same chain a batch the candidate keeps 0.61 s, batches of them kept
-  after damage 0.39 to 0.57 s, and batches of state names whose every 8-byte step is a plausible header, each body
-  checked and each step checksummed, 0.31 s. Undamaged batches of the same 16-byte blocks cost 0.26 s, most of it
-  building the report. The reads are bounded and the time measured, not bounded: what a start is promised for a
-  crafted or damaged file, against the 1 s restart budget, is Q-970; a crafted manifest's header walk measured 0.20
-  to 0.28 s per 16 MiB with either reader (0.84 to 0.89 s before). An undamaged segment is read in one pass of direct
+  after damage 0.33 to 0.57 s, and batches of state names whose every 8-byte step is a plausible header, each body
+  checked and each step checksummed, 0.31 s. Undamaged batches of the same 16-byte blocks cost 0.25 to 0.37 s, most of
+  it building the report. The reads are bounded and the time measured, not bounded: what a start is promised for a
+  crafted or damaged file, against the 1 s restart budget, is Q-970; a crafted manifest's header walk measured 0.19
+  to 0.30 s per 16 MiB with either reader (0.84 to 0.89 s before). An undamaged segment is read in one pass of direct
   checksums; the bounded reading starts at the first boundary read that finds no complete batch and holds to the end
   of the scan (Q-231).
   Apart from the window rule, which damage does not reach, the acceptance rules (A.2, A.14) are unchanged.

@@ -1488,15 +1488,15 @@ read and twice more by the read of the batch it keeps, plus twice by the commit 
 those of the walked chains and the reference scan, and the window rule and the charges are unchanged. Measured
 (release build, one shared 4-core cloud machine, the best of five, the worst at most 40 % above it, and runs at other
 hours up to 30 % slower again; a header read costs about 20 to 31 ns with the rest of the scan's work), 64 MiB: a
-valid header every 8 bytes 0.25 s (16 MiB 0.06 s; 5.7 s before), commit blocks naming data headers 0.25 s (3.1 s),
+valid header every 8 bytes 0.25 s (16 MiB 0.06 s; 5.7 s before), commit blocks naming data headers 0.24 s (3.1 s),
 candidates whose framing holds 0.25 to 0.27 s, chains of empty skippable blocks read in full 0.35 to 0.43 s, batches
-of them kept after damage 0.39 to 0.57 s (at a boundary 0.54 s), a boundary read that fails at the end of a chain of
-500,000 such blocks the candidate then reads in full 0.35 s (2.0 s before), the same chain a batch the candidate keeps
-0.61 s, the dearest built, chains of 4,096 blocks 0.30 to 0.42 s, 8-byte bodies whose every step is a plausible header
-0.28 to 0.37 s, batches of state names whose every step is a plausible header, each body checked and each step
-checksummed, 0.31 s, kept batches of the dearest entries 0.26 s; undamaged batches of 500,000 empty blocks 0.26 s,
-most of it building the report; a 16 MiB manifest with a header every 8 bytes 0.20 to 0.28 s with either reader (0.84
-to 0.89 s before). Tests: `log/tests/header_walk.rs`
+of them kept after damage 0.33 to 0.57 s (at a boundary 0.52 to 0.56 s), a boundary read that fails at the end of a
+chain of 500,000 such blocks the candidate then reads in full 0.35 s (2.0 s before), the same chain a batch the
+candidate keeps 0.61 s, the dearest built, chains of 4,096 blocks 0.30 to 0.47 s, 8-byte bodies whose every step is a
+plausible header 0.29 to 0.40 s, batches of state names whose every step is a plausible header, each body checked and
+each step checksummed, 0.31 s, kept batches of the dearest entries 0.23 to 0.26 s; undamaged batches of 500,000 empty
+blocks 0.25 to 0.37 s, most of it building the report; a 16 MiB manifest with a header every 8 bytes 0.19 to 0.30 s
+with either reader (0.84 to 0.89 s before). Tests: `log/tests/header_walk.rs`
 `files_longer_than_the_ring_take_one_header_checksum_and_a_few_reads_a_plausible_step` (header checksums within the
 plausible steps and header reads per plausible step on ten shapes of 24 MiB, against the walked chains),
 `a_candidate_on_a_chain_a_boundary_read_rejected_is_charged_what_reading_it_checks` (the charge equals the walked

@@ -84,7 +84,7 @@ and a block's header is read at most eight times, each block judged once by the 
 end kept in a ring of 4-byte entries. Time is measured, not bounded: a header read costs about 20 to 31 ns, and the
 dearest crafted 64 MiB segments built cost 0.25 to 0.61 s (best of five, the worst up to 40 % above; a boundary read
 failing at the end of a chain of 500,000 empty blocks that the candidate then keeps is the dearest, 2.0 s before for the
-failing chain alone), undamaged batches of the same blocks 0.26 s; a crafted manifest's header walk 0.20 to 0.28 s per
+failing chain alone), the same blocks undamaged 0.25 to 0.37 s; a crafted manifest's header walk 0.19 to 0.30 s per
 16 MiB (1.2 to 1.3 s before). What a start is promised against the budget is Q-970. Files built to the body bound
 measured 0.22 s (nested facts images over every window of a 64 MiB segment; 0.90 s before), 0.10 s (64 MiB of batches
 whose rows share one text value, after damage; 1.85 s before) and 0.08 s (a 16 MiB manifest window of rejected records;
