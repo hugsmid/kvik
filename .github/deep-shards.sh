@@ -42,6 +42,7 @@ log-recovery    log   recovery    --rest
 log-kill-long   log   recovery    --ignored kill_loop_long
 log-reader      log   reader
 log-scan-bound  log   scan_bound
+log-scan-differential log scan_differential
 log-body-check  log   body_check
 kvik-windows    kvik  windows
 kvik-consumers  kvik  consumer_properties
