@@ -507,3 +507,59 @@ fn a_segment_damaged_or_unreadable_is_reason_other_and_degrades_the_status_file(
     }
     assert_eq!(status_health(Vec::new()), (health::OK, Vec::new()));
 }
+
+/// The latch's find of batch `lost`, met between the batches before and after it, at byte `start` of segment 1.
+fn found(h: &[ReadBatch], lost: usize, start: u64) -> Vec<crate::durable::loss::Find> {
+    use kvik_log::scan::{InvalidRegion, LossCause as ScanCause};
+    let region = ReadEvent::Corruption {
+        file_id: 1,
+        region: InvalidRegion {
+            start,
+            end: start + 64,
+            last_sequence_before: Some(h[lost - 1].last.sequence),
+            first_sequence_after: Some(h[lost + 1].first.sequence),
+            cause: ScanCause::Corruption,
+        },
+    };
+    let events = [
+        ReadEvent::Batch(h[lost - 1].clone()),
+        region,
+        ReadEvent::Batch(h[lost + 1].clone()),
+    ];
+    crate::durable::loss::Finder::default().apply(&events, h.last().unwrap().last)
+}
+
+/// A loss found ahead of what the fold took, and found again once the fold has passed over it (its batch never
+/// arrives), leaves the fold whole; a loss found at a batch it folded stops it (Q-952).
+#[test]
+fn a_loss_found_ahead_of_the_fold_leaves_it_whole_and_one_behind_it_stops_it() {
+    use crate::durable::loss::{FoundBy, Latch};
+    let one = Gen {
+        series: 1,
+        dt: 0,
+        quality: 3,
+        absent: false,
+        future: false,
+        changed_at: 0,
+        unsynced: false,
+        kind: 0,
+    };
+    let h = history(&vec![vec![one]; 10]);
+    let fold = SeriesFold::new(h.last().unwrap().last);
+    let latch = Arc::new(Latch::default());
+    fold.watch_losses(latch.clone());
+    for b in &h[..4] {
+        fold.batch(b);
+    }
+    latch.note(&found(&h, 6, 600), FoundBy::Scan);
+    for (k, b) in h.iter().enumerate().skip(4) {
+        if k != 6 {
+            fold.batch(b);
+        }
+    }
+    assert!(fold.entries(h.last().unwrap().last, T0).is_some());
+    latch.note(&found(&h, 6, 600), FoundBy::Query);
+    assert!(fold.entries(h.last().unwrap().last, T0).is_some());
+    latch.note(&found(&h, 2, 200), FoundBy::Scan);
+    assert!(fold.entries(h.last().unwrap().last, T0).is_none());
+}
