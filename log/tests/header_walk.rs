@@ -461,23 +461,25 @@ fn a_header_at_every_step_has_each_header_read_once() {
     }
 }
 
+/// Header reads per plausible step on each shape: the chain ends' one, and per block a boundary read's two, a
+/// candidate's framing, a read in full of a batch kept or of blocks no boundary read walked.
 #[test]
-fn files_longer_than_the_ring_take_at_most_one_header_checksum_a_plausible_step() {
+fn files_longer_than_the_ring_take_one_header_checksum_and_a_few_reads_a_plausible_step() {
     let len = 24usize << 20;
     let wide = plausible_body();
     let shapes = [
-        skippable_chains(damaged_start(), len, 4_096),
-        framed_candidates(damaged_start(), len, 1_000),
-        walked_then_read(len, 100_000, &[], false),
-        walked_then_read(len, 100_000, &[], true),
-        walked_then_read(len, 60_000, &wide, false),
-        kept_after_damage(len, 100_000, &[], true),
-        kept_after_damage(len, 100_000, &[], false),
-        skippable_batches(damaged_start(), len, 100_000),
-        headers_everywhere(damaged_start(), 3 << 20, None),
-        named_walks(damaged_start(), 2 << 20),
+        (skippable_chains(damaged_start(), len, 4_096), 4),
+        (framed_candidates(damaged_start(), len, 1_000), 3),
+        (walked_then_read(len, 100_000, &[], false), 4),
+        (walked_then_read(len, 100_000, &[], true), 5),
+        (walked_then_read(len, 60_000, &wide, false), 2),
+        (kept_after_damage(len, 100_000, &[], true), 5),
+        (kept_after_damage(len, 100_000, &[], false), 4),
+        (skippable_batches(damaged_start(), len, 100_000), 5),
+        (headers_everywhere(damaged_start(), 3 << 20, None), 2),
+        (named_walks(damaged_start(), 2 << 20), 2),
     ];
-    for f in &shapes {
+    for (f, reads) in &shapes {
         let (r, stats) = scan_with_stats(f, &ID, ScanLimit::End);
         let (walked, _) = legacy::scan_with_walked_links(f, &ID, ScanLimit::End);
         assert_eq!(r, walked);
@@ -485,6 +487,10 @@ fn files_longer_than_the_ring_take_at_most_one_header_checksum_a_plausible_step(
         let plausible = plausible_steps(f);
         assert!(
             stats.header_checksums <= plausible + 64,
+            "{stats:?}: {plausible} plausible steps"
+        );
+        assert!(
+            stats.headers_visited <= reads * plausible + 64,
             "{stats:?}: {plausible} plausible steps"
         );
     }
