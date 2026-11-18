@@ -96,6 +96,18 @@ impl Drop for Session {
     }
 }
 
+/// The manifest's lost ranges at `v`.
+fn recorded(v: &View) -> Vec<(LogPos, LogPos)> {
+    let at = |(generation, sequence)| LogPos {
+        generation,
+        sequence,
+    };
+    v.lost_ranges()
+        .iter()
+        .map(|l| (at(l.first), at(l.last)))
+        .collect()
+}
+
 fn next_pos(p: LogPos) -> LogPos {
     LogPos {
         generation: p.generation,
@@ -187,6 +199,8 @@ struct Next {
     at: (u64, usize),
     recorded: Vec<(LogPos, LogPos)>,
     refreshes: u64,
+    /// The session was closed as idle.
+    idle: bool,
 }
 
 /// What the pieces of a batch brought, before the live reads are brought to its cut.
@@ -249,7 +263,19 @@ impl Session {
     }
 
     pub(crate) fn cancel(&mut self, id: LiveId) -> bool {
-        self.reads.remove(&id).is_some()
+        let was = self.reads.remove(&id).is_some();
+        if self.reads.is_empty() {
+            self.leave();
+        }
+        was
+    }
+
+    /// Gives up the subscription: a later open starts afresh.
+    fn leave(&mut self) {
+        if let Some(s) = self.sub.take() {
+            self.reader.hub().unsubscribe(s);
+        }
+        self.started = false;
     }
 
     fn mono(&self) -> Duration {
@@ -357,6 +383,8 @@ impl Session {
         if !self.started {
             self.started = true;
             self.at = (v.round(), 0);
+            self.recorded = recorded(&v);
+            self.refreshes = r.clocks().refreshes();
             r.hub().start(sub, v.round(), self.cap());
         }
         let out = self.batch(&r, &v, sub, mono);
@@ -367,7 +395,11 @@ impl Session {
         self.at = next.at;
         self.recorded = next.recorded;
         self.refreshes = next.refreshes;
-        r.hub().advance(sub, next.at.0);
+        if next.idle {
+            self.leave();
+        } else {
+            r.hub().advance(sub, next.at.0);
+        }
         if next.batch.is_some() {
             self.last_batch = Some(mono);
         }
@@ -384,17 +416,7 @@ impl Session {
     ) -> Result<Next, QueryError> {
         let taken = r.hub().take(sub, v.round(), mono);
         let refreshes = r.clocks().refreshes();
-        let recorded: Vec<(LogPos, LogPos)> = v
-            .lost_ranges()
-            .iter()
-            .map(|l| {
-                let at = |(generation, sequence)| LogPos {
-                    generation,
-                    sequence,
-                };
-                (at(l.first), at(l.last))
-            })
-            .collect();
+        let recorded = recorded(v);
         let mut reads = self.reads.clone();
         let mut events: Vec<(LiveId, LiveEvent)> = Vec::new();
         let now = r.now();
@@ -413,6 +435,7 @@ impl Session {
                 at: self.at,
                 recorded,
                 refreshes,
+                idle: true,
             });
         }
         let lagged = taken.lagged
@@ -465,6 +488,7 @@ impl Session {
             at,
             recorded,
             refreshes,
+            idle: false,
         })
     }
 
