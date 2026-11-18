@@ -486,7 +486,7 @@ fn files_longer_than_the_ring_take_one_header_checksum_and_a_few_reads_a_plausib
         assert!(stats.within_bound(f.len() as u64), "{stats:?}");
         let plausible = plausible_steps(f);
         assert!(
-            stats.header_checksums <= plausible + 64,
+            (plausible.saturating_sub(128)..=plausible + 64).contains(&stats.header_checksums),
             "{stats:?}: {plausible} plausible steps"
         );
         assert!(
