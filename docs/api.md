@@ -401,6 +401,11 @@ pub enum PointCheck { Kept, VoidAbove(Position), Unknown }
   own window clock, `now`, from its open. It has no instant of the writer's last commit, so it measures the live
   staleness of an observed series in event time, `now − t` of the live-state fact (open: Q-140).
 - `reader.health()` reports what the files hold (loss reports), not the writer's counters.
+- From roadmap 9.0c a reader process holds per series the bounded latest-value state of the series directory
+  (`format.md` A.18) and the registry, not every fact: it continues the newest valid directory and reads the log above
+  it, and serves `live`, `series` and `losses` from that, looking a fact up in the log where the state cannot tell
+  (Q-1003, Q-1004). A call that reads facts (windows, `facts`, `at`, `buckets`, calendar results) builds the full fact
+  index at its first use and keeps it, until roadmap 9.0f (Q-1000).
 - Between calls a reader keeps the bytes of the log segment it follows up to the mark, so that a call reads only
   what is new: at most one segment's bytes (`segment_size`, 64 MiB by default) per reader handle while it follows a
   segment. They are freed when it moves to another segment; a whole earlier segment read in one call is freed at
@@ -423,7 +428,13 @@ pub enum View { Current, AsOf(Position), AsOfTime(Timestamp), History }
 pub struct FactRow { pub series, pub t, pub position, pub received_at, pub value, pub quality,
                      pub supplied_quality, pub flags: FactFlags, pub changed_at: Option<u64> }
 pub fn at(&self, id: SeriesId, t: Timestamp, view: View) -> Result<Option<FactRow>, QueryError>;   // the fact in force at t
+pub fn snapshot(&self) -> Result<Snapshot, QueryError>;   // roadmap 9.0c: static reads at one cut and one `now`
+pub struct Snapshot;   // live(id), series(key), losses(), state(), now(); owned, Send + 'static, cheap to clone
 ```
+- `snapshot` answers `live`, `series` and `losses` at one cut, with `now` taken when it is made (Q-1005). Like any
+  read under a cut it ends with `CutExpired` once the cut is `cut_max_age` old or its lease was found gone, and the
+  caller takes another. Windows and facts join it with roadmap 9.0f. On the model backend it holds the results taken
+  when it was made.
 - `at` returns the fact with the greatest event time ≤ `t` that a window can credit (not bad quality, not displaced),
   as `view` selects it (for a versioned series, the version the view selects), with its `changed_at`; `None` if there
   is none. It lets a client show, for example, the issue time of the value a window's leading stretch carries in.
