@@ -7,7 +7,9 @@ use std::path::Path;
 
 use common::block_on;
 use common::durable::{World, damage, data_lost, gauge, history, note, num};
-use kvik::{Health, Kind, LossKind, Position, Reason, Select, SeriesId, SeriesSpec, Start, Store};
+use kvik::{
+    Health, Kind, LossKind, Position, Reason, Select, SeriesId, SeriesSpec, Start, Store, Value,
+};
 
 #[test]
 fn a_batch_damaged_while_the_store_is_open_is_reported_at_once_and_its_replay_recorded() {
@@ -591,9 +593,11 @@ fn damage_inside_a_loss_reported_too_wide_reaches_the_stores_reader_and_its_repl
     block_on(s.shutdown()).unwrap();
 }
 
-/// A loss watch not polled across the removal of the segment it stands in, as retention or compaction removes one:
-/// the log reader passes over a segment no listing holds (Q-852), so the watch reads on from the segments present,
-/// reports no loss for the removed positions and still finds damage written after them (Q-927).
+/// A loss watch not polled across the removal of the segment it stands in: the log reader passes over a segment no
+/// listing holds and voids what it took from it, so the watch reads on from the segments present and still finds
+/// damage written after them (Q-927, Q-950). The rule is for a removal a manifest record names, as retention and
+/// compaction will write; none removes a segment yet. This removal has no record, and today no reader reports its
+/// positions lost (Q-951, for the owner).
 #[test]
 fn an_unpolled_watch_reads_on_past_the_removal_of_the_segment_it_stands_in() {
     let w = World::new("unpolled-watch");
@@ -624,5 +628,57 @@ fn an_unpolled_watch_reads_on_past_the_removal_of_the_segment_it_stands_in() {
     sealed_with(&w, b"UW-FOUR");
     damage(&w, b"UW-FOUR");
     assert_eq!(data_lost(&s.losses()).len(), 1);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// After the void of a removed segment, a damaged region at the head of the next segment takes its first position
+/// from the void, so the loss is reported from the removed segment's first position; with no batch after it in its
+/// segment it runs to the mark read, past the intact batch that follows. Too wide, never too narrow (Q-951).
+#[test]
+fn a_region_after_a_removed_segment_is_reported_from_the_removed_positions() {
+    let w = World::new("removed-then-region");
+    let mut config = w.config();
+    config.log.seal_interval = std::time::Duration::from_millis(20);
+    let s = block_on(Store::open(config)).unwrap();
+    let id = block_on(s.define_series(SeriesSpec::new("a/b/note", Kind::Text, ""))).unwrap();
+    let mut at = Vec::new();
+    for (k, t) in ["RR-ZERO", "RR-ONE", "RR-TWO"].iter().enumerate() {
+        at.push(
+            block_on(s.emit(&[note(id, k as i64, t)]))
+                .unwrap()
+                .first()
+                .unwrap(),
+        );
+        sealed_with(&w, t.as_bytes());
+        if k == 1 {
+            assert!(data_lost(&s.losses()).is_empty());
+        }
+    }
+    let three = block_on(s.emit(&[note(id, 3, "RR-THREE")]))
+        .unwrap()
+        .first()
+        .unwrap();
+    let (path, _) = w
+        .segments()
+        .into_iter()
+        .find(|(_, b)| b.windows(6).any(|x| x == b"RR-ONE"))
+        .unwrap();
+    kvik::env::Fs::remove_file(&*w.fs, &path).unwrap();
+    damage(&w, b"RR-TWO");
+    assert_eq!(
+        data_lost(&s.losses()),
+        vec![(at[1], Some(at[1]), Some(three), false)]
+    );
+    let texts: Vec<_> = history(&s.reader(), id)
+        .into_iter()
+        .map(|f| f.value)
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            Value::Text("RR-ZERO".into()),
+            Value::Text("RR-THREE".into())
+        ]
+    );
     block_on(s.shutdown()).unwrap();
 }

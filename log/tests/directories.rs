@@ -478,24 +478,29 @@ fn failed_writes_leave_no_temporary_file_and_back_off() {
 
 #[test]
 fn the_first_read_lists_no_segment_above_the_synced_mark() {
-    let mut r = Rig::new(cfg());
-    ingest(&mut r, 300, 0);
+    // A seal by time takes the next segment into use with no commit, so it can lie above the synced mark until the
+    // next mark sync; a seal by size never does (Q-630, Q-949).
+    let mut r = Rig::new(WriterConfig {
+        seal_interval: Duration::from_secs(1),
+        segment_size: 1 << 20,
+        ..cfg()
+    });
+    ingest(&mut r, 3, 0);
     r.settle();
     r.dirs = None;
-    let before = r.sealed().len();
     let mut k = 0;
-    while r.sealed().len() == before {
-        ingest(&mut r, 3, 60_000_000 + k * 1_000_000);
+    let synced = loop {
+        if k % 2 == 0 {
+            r.submit(vec![fact(1, 60_000_000 + k * 1_000_000, Quality::Good)]);
+        }
+        r.step();
+        r.clock.advance(10 * MS);
         k += 1;
-        assert!(k < 400, "no new seal");
-    }
-    // A seal follows the first commit into the next segment, whose mark sync names a position past it (Q-630), so
-    // the writer never seals above its synced mark: the directories are given a synced mark inside the last seal.
-    let last = r.sealed().last().unwrap().last();
-    assert!(last <= r.w.as_ref().unwrap().stats().mark_synced);
-    let synced = Position {
-        sequence: last.sequence - 1,
-        ..last
+        let synced = r.w.as_ref().unwrap().stats().mark_synced;
+        if r.sealed().iter().any(|s| s.last() > synced) {
+            break synced;
+        }
+        assert!(k < 2_000, "no seal above the synced mark");
     };
     let start = r.w.as_ref().unwrap().directory_start();
     let opts = DirectoryOptions {

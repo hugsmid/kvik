@@ -492,3 +492,18 @@ fn a_continued_pending_fact_of_a_versioned_series_has_no_rank_to_keep_it() {
     let e = continue_after(&h, 1);
     assert!(e.pending_more || e.pending.is_some_and(|p| p.position.sequence == 4));
 }
+
+#[test]
+fn a_segment_damaged_or_unreadable_is_reason_other_and_degrades_the_status_file() {
+    use kvik_log::writer::Reason as LogReason;
+    for r in [
+        LogReason::SegmentDamaged { file_id: 7 },
+        LogReason::SegmentUnreadable { file_id: 7 },
+    ] {
+        assert_eq!(
+            status_health(vec![r]),
+            (health::DEGRADED, vec![reason::OTHER])
+        );
+    }
+    assert_eq!(status_health(Vec::new()), (health::OK, Vec::new()));
+}

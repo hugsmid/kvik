@@ -220,3 +220,84 @@ fn a_store_read_only_by_a_fault_of_its_own_writes_no_status_file() {
     assert!(st.is_none(), "a read-only store reported {st:?}");
     let _ = block_on(s.shutdown());
 }
+
+fn data_lost(s: &Store) -> usize {
+    s.losses()
+        .iter()
+        .filter(|l| l.kind == kvik::LossKind::DataLost)
+        .count()
+}
+
+/// Damages the eight bytes of `v` in every log segment that holds them.
+fn damage(w: &World, v: f64) {
+    let bytes = v.to_bits().to_le_bytes();
+    let held: Vec<_> =
+        w.fs.paths()
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "open" || e == "kvl"))
+            .filter_map(|p| w.fs.read(&p).map(|b| (p, b)))
+            .filter(|(_, b)| b.windows(8).any(|x| x == bytes))
+            .collect();
+    assert!(!held.is_empty());
+    for (p, b) in held {
+        let at = b.windows(8).position(|x| x == bytes).unwrap();
+        w.fs.poke(&p, at, &[b[at] ^ 0xFF]);
+    }
+}
+
+/// A fact the process finds lost after the deliverer folded it: no series directory written afterwards counts it, so
+/// none is written in the run (A.18: a file is a function of the kept log only while nothing at or below `through` is
+/// lost since).
+#[test]
+fn a_fact_found_lost_while_open_is_never_counted_by_a_series_directory_of_the_run() {
+    let w = World::new("derived-lost-open");
+    let mut c = w.config();
+    c.log.seal_interval = Duration::from_secs(2);
+    let s = block_on(Store::open(c)).unwrap();
+    let g = block_on(s.define_series(gauge("site/dev/m0"))).unwrap();
+    // With a consumer each emit's batch is taken, and folded, before the emit returns.
+    let consumer = block_on(s.consumer("c", kvik::Start::Now, kvik::Select::None)).unwrap();
+    for (k, v) in [(0, 1_111.5), (1, 2_222.5), (2, 3_333.5)] {
+        emit(&s, &[num(g, k, v)]);
+    }
+    damage(&w, 2_222.5);
+    let all = Timestamp(0)..Timestamp(i64::MAX);
+    assert_eq!(s.reader().facts(g, all, View::History).unwrap().count(), 2);
+    assert_eq!(data_lost(&s), 1);
+    emit(&s, &[num(g, 1, 2_222.5)]);
+    wait_sealed(&w, 1);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(d) = series_dir(&w) {
+            check(&s, &d, &[g]);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(consumer);
+    block_on(s.shutdown()).unwrap();
+}
+
+/// A series directory through a position the next start finds lost, in a sealed segment no lost range records, is
+/// not continued: the reopened store's next file agrees with what it shows.
+#[test]
+fn a_series_directory_through_a_region_the_start_meets_is_not_continued() {
+    let w = World::new("derived-lost-start");
+    let s = open(&w);
+    let g = block_on(s.define_series(gauge("site/dev/m0"))).unwrap();
+    emit(&s, &[num(g, 0, 1_111.5)]);
+    let lost = emit(&s, &[num(g, 1, 2_222.5)]);
+    wait_sealed(&w, 1);
+    wait_for(&w, lost);
+    emit(&s, &[num(g, 2, 3_333.5)]);
+    damage(&w, 2_222.5);
+    let all = Timestamp(0)..Timestamp(i64::MAX);
+    assert_eq!(s.reader().facts(g, all, View::History).unwrap().count(), 2);
+    assert_eq!(data_lost(&s), 1);
+    block_on(s.shutdown()).unwrap();
+    let s = open(&w);
+    assert_eq!(data_lost(&s), 1, "the start meets the region again");
+    let last = emit(&s, &[num(g, 3, 4_444.5)]);
+    let d = wait_for(&w, last);
+    check(&s, &d, &[g]);
+    block_on(s.shutdown()).unwrap();
+}

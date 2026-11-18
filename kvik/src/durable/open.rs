@@ -112,7 +112,14 @@ impl Writer {
                 start_fault = Some(registry_fault(&dir, &e));
             }
         }
-        let hook = derived::hook(&writer, &*env.fs, &dir, descriptor.store_id);
+        let hook = derived::hook(
+            &writer,
+            &*env.fs,
+            &dir,
+            descriptor.store_id,
+            &latch,
+            &recorded,
+        );
         // Consumers resume from their cursor files and the kept log (`spec.md` §3 Order of a start, step 7).
         let clocks = Arc::new(clock::Clocks::new(env.clock.clone()));
         let hub = match deliver::Deliverer::open(

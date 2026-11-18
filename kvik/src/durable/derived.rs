@@ -16,8 +16,12 @@ use kvik_log::directory::series::{Candidate, CandidateValue, Pending, SeriesEntr
 use kvik_log::directory::status::{counter, health, reason};
 use kvik_log::entries::{Entry, Versioning};
 use kvik_log::facts::{FactRow, Quality, Value};
+use kvik_log::manifest::LostRange;
 use kvik_log::reader::ReadBatch;
 use kvik_log::writer::{Position as LogPos, SealHook, SeriesEntries, StatusContent, Watch};
+
+use super::loss::Latch;
+use crate::health::LossKind;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -326,10 +330,12 @@ struct Fold {
     defined: BTreeMap<u32, bool>,
     /// The fold's `now`: the latest receive time or write time it has seen.
     horizon: i64,
-    /// A void reached below what was folded: the state no longer follows the log.
+    /// A void or a lost range reached what was folded: the state no longer follows the log.
     broken: bool,
     /// The last synced mark known.
     synced: LogPos,
+    /// The latch's closed ranges already looked at.
+    closed_seen: usize,
 }
 
 impl Fold {
@@ -374,6 +380,9 @@ type Synced = Box<dyn Fn() -> LogPos + Send + Sync>;
 pub(crate) struct SeriesFold {
     fold: Mutex<Fold>,
     synced: OnceLock<Synced>,
+    /// The process's losses: a range found lost after the fold took it breaks the fold, as a void below it does
+    /// (A.18: a file is a function of the kept log only while nothing at or below `through` is lost since).
+    latch: OnceLock<Arc<Latch>>,
 }
 
 impl std::fmt::Debug for SeriesFold {
@@ -392,6 +401,26 @@ impl SeriesFold {
                 ..Fold::default()
             }),
             synced: OnceLock::new(),
+            latch: OnceLock::new(),
+        }
+    }
+
+    /// Breaks the fold on every range the latch takes from now on that reaches what it took, folded or waiting.
+    pub(crate) fn watch_losses(&self, latch: Arc<Latch>) {
+        let mut f = lock(&self.fold);
+        let _ = latch.closed_since(&mut f.closed_seen);
+        let _ = self.latch.set(latch);
+    }
+
+    fn take_losses(&self, f: &mut Fold) {
+        let Some(latch) = self.latch.get() else {
+            return;
+        };
+        let taken = f.queued.back().map_or(f.applied, |q| q.last.max(f.applied));
+        for (first, _) in latch.closed_since(&mut f.closed_seen) {
+            if first <= taken {
+                f.broken = true;
+            }
         }
     }
 
@@ -416,6 +445,7 @@ impl SeriesFold {
     pub(crate) fn batch(&self, b: &ReadBatch) {
         let synced = self.synced.get().map(|f| f());
         let mut f = lock(&self.fold);
+        self.take_losses(&mut f);
         if let Some(s) = synced {
             f.synced = f.synced.max(s);
         }
@@ -465,6 +495,7 @@ impl SeriesFold {
     /// time folded.
     pub(crate) fn entries(&self, limit: LogPos, written_at: i64) -> Option<SeriesEntries> {
         let mut f = lock(&self.fold);
+        self.take_losses(&mut f);
         if f.broken {
             return None;
         }
@@ -532,34 +563,39 @@ impl Hook {
     }
 }
 
+/// A log reason's code in the status file (A.18).
+fn status_reason(r: &kvik_log::writer::Reason) -> u16 {
+    use kvik_log::writer::Reason as LogReason;
+    match r {
+        LogReason::IngestWaiting(_) => reason::INGEST_WAITING,
+        LogReason::DiskLow { .. } => reason::DISK_LOW,
+        LogReason::DiskCritical { .. } => reason::DISK_CRITICAL,
+        LogReason::SealBlocked { .. } => reason::SEAL_BLOCKED,
+        // A sealed segment no record lists that fails its checks or cannot be read (Q-221, Q-640): no code of its own
+        // in A.18.
+        _ => reason::OTHER,
+    }
+}
+
+/// The level and the sorted codes the status file carries for `reasons`.
+fn status_health(reasons: Vec<kvik_log::writer::Reason>) -> (u8, Vec<u16>) {
+    let mut codes: Vec<u16> = reasons.iter().map(status_reason).collect();
+    codes.sort_unstable();
+    codes.dedup();
+    let level = if codes.contains(&reason::DISK_CRITICAL) {
+        health::CRITICAL
+    } else if codes.is_empty() {
+        health::OK
+    } else {
+        health::DEGRADED
+    };
+    (level, codes)
+}
+
 impl Parts {
     /// The reasons the file carries and the level over them (A.18: partial until `kvik health`, roadmap 9.0e).
     fn health(&self) -> (u8, Vec<u16>) {
-        use kvik_log::writer::Reason as LogReason;
-        let mut reasons: Vec<u16> = self
-            .watch
-            .reasons()
-            .into_iter()
-            .map(|r| match r {
-                LogReason::IngestWaiting(_) => reason::INGEST_WAITING,
-                LogReason::DiskLow { .. } => reason::DISK_LOW,
-                LogReason::DiskCritical { .. } => reason::DISK_CRITICAL,
-                LogReason::SealBlocked { .. } => reason::SEAL_BLOCKED,
-                // A sealed segment no record lists that fails its checks or cannot be read (Q-221, Q-640): no code of
-                // its own in A.18.
-                _ => reason::OTHER,
-            })
-            .collect();
-        reasons.sort_unstable();
-        reasons.dedup();
-        let level = if reasons.contains(&reason::DISK_CRITICAL) {
-            health::CRITICAL
-        } else if reasons.is_empty() {
-            health::OK
-        } else {
-            health::DEGRADED
-        };
-        (level, reasons)
+        status_health(self.watch.reasons())
     }
 
     fn read_only(&self) -> bool {
@@ -614,22 +650,46 @@ impl SealHook for Hook {
 }
 
 /// The seal hook of a store opening: its fold continues from the newest series directory that is still a function of
-/// the kept log (A.18 Validation, as the writer applies it), or starts empty.
+/// the kept log (A.18 Validation, as the writer applies it), or starts empty. A file is not continued when the start
+/// met a region at or below its `through` that no lost range of the manifest holds (`latch`, `recorded`): its
+/// counts include facts the store reports lost. The fold then watches `latch` for losses found later.
 pub(crate) fn hook(
     writer: &kvik_log::writer::LogWriter,
     fs: &dyn kvik_log::fs::Fs,
     dir: &std::path::Path,
     store_id: [u8; 16],
+    latch: &Arc<Latch>,
+    recorded: &[LostRange],
 ) -> Arc<Hook> {
     let fold = SeriesFold::new(writer.stats().mark_synced);
     let start = writer.directory_start();
-    if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start) {
+    if let Some((f, d)) = kvik_log::writer::kept_series(fs, dir, &store_id, &start)
+        && !lost_since(&latch.found(), recorded, d.through)
+    {
         fold.seed(d.through, d.judged_at.max(f.written_at), &d.entries);
     }
+    fold.watch_losses(latch.clone());
     Arc::new(Hook {
         fold: Arc::new(fold),
         parts: OnceLock::new(),
     })
+}
+
+/// Whether a lost range in `found` begins at or below `through` and no lost range of the manifest holds it.
+fn lost_since(
+    found: &[crate::health::LossReport],
+    recorded: &[LostRange],
+    through: LogPos,
+) -> bool {
+    let at = |p: crate::types::Position| (p.generation, p.sequence);
+    found
+        .iter()
+        .filter(|l| l.kind == LossKind::DataLost)
+        .filter_map(|l| Some((at(l.first?), at(l.last?))))
+        .any(|(first, last)| {
+            first <= (through.generation, through.sequence)
+                && !recorded.iter().any(|r| r.first <= first && last <= r.last)
+        })
 }
 
 /// The options `kvik-maint` writes the derived files with.
