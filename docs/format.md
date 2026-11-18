@@ -1112,7 +1112,8 @@ largest of the last 16 seals, would pass 32 MiB, and otherwise at least every 15
 at most 32 MiB, and while a due write waits for the mark sync (or for the deliverer to take the batches) at most 32
 MiB plus the seals since. Segments that seal by size (the default 64 MiB) are covered at every seal; small timed
 seals at the 15-minute rule. A reader whose uncovered sealed bytes pass its 64 MiB allowance waits one mark-sync
-interval and tries again before `DirectoryUnavailable` (Q-773). The cadence holds while one seal (its read, CRC32C
+interval and tries again before `DirectoryUnavailable` (Q-773; built with roadmap 9.0e: until then a reader
+reads whatever lies above the directory it continues, Q-1003). The cadence holds while one seal (its read, CRC32C
 and SHA-256) takes less time than a segment takes to fill. The status file: every 60 s and at once on a change of
 health or pressure (looked at once a second).
 
