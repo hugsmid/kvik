@@ -362,3 +362,40 @@ fn facts_encode_refuses_what_it_cannot_write() {
         }))
     );
 }
+
+#[test]
+fn a_batch_whose_facts_body_fails_its_checks_is_invalid_content_whether_or_not_content_is_kept() {
+    use kvik_log::block::block_type;
+    use kvik_log::scan::{Found, LossCause, ScanLimit, Scanner};
+    let body = |first: u64, c: &[(u8, u8, Vec<u8>)], rows: u32| {
+        let mut b = facts_raw(rows, c);
+        b[..8].copy_from_slice(&first.to_le_bytes());
+        b
+    };
+    let mut bad = plain_columns(2);
+    set(&mut bad, 5, 0, vec![1, 6]);
+    let mut f = vec![0u8; kvik_log::header::HEADER_LEN];
+    let bad_at = f.len() as u64;
+    f.extend(raw_batch(
+        &ID,
+        bad_at,
+        &[(block_type::FACTS, 0, body(1, &bad, 2))],
+        1,
+        2,
+        0,
+    ));
+    let good_at = f.len() as u64;
+    let good = (block_type::FACTS, 0, body(3, &plain_columns(1), 1));
+    f.extend(raw_batch(&ID, good_at, &[good], 3, 3, 0));
+    f.resize(f.len() + 64, 0);
+    for keep in [false, true] {
+        let s = Scanner::new(&f, &ID, ScanLimit::End).unwrap();
+        let s = if keep { s.keeping_content() } else { s };
+        let found: Vec<_> = s.collect();
+        assert!(
+            matches!(&found[..], [Ok(Found::Region(r)), Ok(Found::Batch(b))]
+                if r.start == bad_at && r.cause == LossCause::InvalidContent && b.offset == good_at),
+            "keep {keep}: {found:?}"
+        );
+    }
+}

@@ -193,6 +193,54 @@ impl SealHook for Behind {
     }
 }
 
+/// A hook whose series fold is broken: it never gives a series directory, and counts the times it is asked.
+#[derive(Debug, Default)]
+struct Broken(std::sync::atomic::AtomicU64);
+
+impl SealHook for Broken {
+    fn series(&self, _: Position, _: i64) -> Option<SeriesEntries> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+}
+
+#[test]
+fn a_series_directory_the_hook_cannot_give_backs_off_and_counts_no_failed_write() {
+    let fs = MemFs::new();
+    let hook = Arc::new(Broken::default());
+    let start = DirectoryStart {
+        generation: 0,
+        stamp: None,
+        reset_after: None,
+        segment_size: 1 << 20,
+        disk_critical: 0,
+        series_bytes: 1,
+        restored: Vec::new(),
+    };
+    let opts = DirectoryOptions {
+        hook: Some(hook.clone()),
+        status_interval: None,
+    };
+    let mut d = Directories::new(Arc::new(fs.clone()), &dir(), STORE_ID, start, opts);
+    let r = seal(Position::default(), 4096);
+    d.sealed(r.clone());
+    let mut now = Duration::ZERO;
+    for _ in 0..600 {
+        d.run(r.last(), now, T0);
+        now += Duration::from_secs(1);
+    }
+    let asked = hook.0.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (2..=20).contains(&asked),
+        "asked {asked} times in ten minutes"
+    );
+    assert_eq!(d.stats().failed, 0, "no derived-file write failed");
+    assert!(
+        d.stats().written > 0,
+        "the log directory is written meanwhile"
+    );
+}
+
 /// The uncovered sealed bytes of `seals`, as a reader counts them: those above the series directory's `through`.
 fn uncovered(seals: &[SegmentRecord], d: &Directories, at_or_below: Position) -> u64 {
     let through = d.series_through().unwrap_or_default();

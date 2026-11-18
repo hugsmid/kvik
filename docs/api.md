@@ -67,7 +67,7 @@ The keys roadmap section 4 needs; all may change between opens.
 | `log.segment_size` | `u64` bytes | 64 MiB | 16 MiB – 1 GiB, a multiple of 4,096; applies to new segments |
 | `log.seal_interval` | `Duration` | 5 min | > 0 |
 | `log.min_sync_interval` | `Duration` | 10 ms | spec §3 Group commit: the ceiling of the batch-sync interval, and the interval before the first sample; 0 disables the sync budget, so batch syncs run back to back. Mark syncs, timed or forced, spend nothing of the budget |
-| `log.sync_interval_floor` | `Duration` | 2 ms | spec §3 Group commit: the least batch-sync interval. Any window holds at most its length over the interval, plus four, batch syncs, so at most 1/floor a second over time: 500 at the default, about 165 GiB of host writes a day at 4 KiB a sync if sustained; a deployment on flash that is sensitive to wear sets a longer floor, with `min_sync_interval` at least as long. At or above `min_sync_interval` the interval is fixed at it (Q-710, Q-981, Q-985) |
+| `log.sync_interval_floor` | `Duration` | 2 ms | spec §3 Group commit: the least batch-sync interval. Any window holds at most its length over the least interval, plus four, batch syncs, so at most 1/floor a second over time: 500 at the default, about 165 GiB of host writes a day at 4 KiB a sync if sustained; a deployment on flash that is sensitive to wear sets a longer floor, with `min_sync_interval` at least as long. At or above `min_sync_interval` the interval is fixed at it (Q-710, Q-981, Q-985) |
 | `log.max_batch_bytes` | `u64` | 1 MiB | 64 KiB – 8 MiB |
 | `log.mark_sync` | `MarkSync::Interval(Duration)` or `MarkSync::EveryCommit` | `Interval(1 s)` | `Interval(d)` is spec §3's `mark_sync_interval` (`format.md` A.10), the same key; forced to `EveryCommit` without a boot identity; `EveryCommit` avoids the remount limit of spec §3 Recovery rule 1. Batches holding an entry that is not a fact, and the first batch in each segment when it is unflagged (Q-630), force a mark sync at once either way |
 | `log.max_unsynced` | `Duration` | 1 s | > 0 and at most the `mark_sync` interval: the latest the writer starts the sync after the first flagged batch (a batch of series at `Durability::Written`) written since the last sync (spec §3 Commit). A power loss or a kernel crash removes at most the readings acknowledged since the last log sync that returned, so a slow device widens that window (Q-681) |
@@ -529,7 +529,8 @@ let facts = store.export_orphaned(range)?;     // orphaned facts (spec §2.1), f
   mark or the manifest unreadable), `losses()` returns those the process already holds and health is at least
   `Degraded` with `LossesUnknown`, never `Ok` (spec §11 Health, Q-201). A sealed segment that disappears with no
   manifest record naming its removal is a loss only where a reader of the process had read from it: that reader's
-  next call fails (`LossesUnknown` for `losses()` and `health()`, `NotAvailable` for a query). A reader that had not,
+  next call fails, and so does every later one until the store, or the reader process, is restarted
+  (`LossesUnknown` for `losses()` and `health()` at every poll, `NotAvailable` for every query). A reader that had not,
   a reader process opened later and the next start pass over it, and its positions are reported by none of them
   (Q-951, open). A `DataLost` holds health `Degraded` until it is closed (spec §8
   Self-repair): restored in full from a copy, its re-send stage ended (`repair_done`, `repair.resend_wait`), or by

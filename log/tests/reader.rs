@@ -442,6 +442,40 @@ fn a_caught_up_reader_whose_newest_batch_segment_is_gone_reports_it_missing() {
 }
 
 #[test]
+fn a_reader_that_found_its_newest_batch_segment_gone_fails_every_later_call_until_reopened() {
+    let mut r = Rig::new(WriterConfig {
+        seal_interval: Duration::from_secs(1),
+        segment_size: 1 << 20,
+        ..cfg()
+    });
+    r.submit(items(2, 0));
+    r.drain();
+    r.refresh().unwrap();
+    let first = r.mark().unwrap().file_id;
+    for _ in 0..200 {
+        r.step();
+        r.clock.advance(10 * MS);
+    }
+    let name = SegmentName {
+        generation: 0,
+        file_id: first,
+        sealed: true,
+    };
+    r.fs.remove_file(&log_path(&name.to_string())).unwrap();
+    for k in 0..3 {
+        r.submit(items(2, 100 + 10 * k));
+        r.drain();
+        assert!(
+            matches!(r.refresh(), Err(ReaderError::SegmentMissing { file_id }) if file_id == first),
+            "call {k}"
+        );
+    }
+    // Q-951: a reader opened since, as after a restart, passes over the removed segment.
+    r.open_reader().unwrap();
+    assert!(r.refresh().is_ok());
+}
+
+#[test]
 fn a_reader_follows_segment_rolls_and_seals() {
     let mut r = Rig::new(WriterConfig {
         segment_size: 8 << 10,

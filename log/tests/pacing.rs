@@ -16,7 +16,7 @@ use kvik_log::content::Item;
 use kvik_log::entries::Entry;
 use kvik_log::fs::{FaultOp, MemFs};
 use kvik_log::store::{MARK, NewStore, StoreDir};
-use kvik_log::writer::{Clock, Log, LogWriter, MarkSync, SYNC_BURST, SystemClock, WriterConfig};
+use kvik_log::writer::{Clock, Log, LogWriter, MarkSync, SYNC_BURST, WriterConfig};
 use proptest::prelude::*;
 
 const BURST: usize = SYNC_BURST as usize;
@@ -310,6 +310,22 @@ fn a_spent_budget_holds_arrivals_for_the_next_refill_and_they_form_one_batch() {
     s.turn(ready, FAST);
     assert_eq!(s.starts.len(), BURST + 1);
     assert!(s.ids[BURST..].iter().all(|id| s.covered[id] == ready));
+}
+
+#[test]
+fn after_a_quiet_period_exactly_four_batch_syncs_start_back_to_back() {
+    let mut s = Sim::new(Setup::base());
+    let mut at = START;
+    for k in 0..5 {
+        s.push();
+        s.turn(at, FAST);
+        at += FAST;
+        assert_eq!(s.starts.len(), (k + 1).min(4), "call {k}");
+    }
+    assert_eq!(
+        s.starts,
+        (0..4).map(|k| START + FAST * k).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -737,26 +753,27 @@ fn the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the
         ..Setup::base()
     }
     .config();
-    let clock = Arc::new(SystemClock::default());
-    let w = LogWriter::open(store, cfg, Some([9; 16]), clock.monotonic(), T0).unwrap();
-    let log = Log::start(w, clock).unwrap();
-    let waits: Vec<_> = (0..=BURST)
-        .map(|k| {
-            let t = std::time::Instant::now();
-            log.submit(vec![fact(T0 + k as i64)])
-                .unwrap()
-                .wait()
-                .unwrap();
-            t.elapsed()
-        })
-        .collect();
+    // The clock stands still until the test moves it, so only the budget can let a call through.
+    let clock = Arc::new(ManualClock::default());
+    *lock(&clock.0) = START;
+    let w = LogWriter::open(store, cfg, Some([9; 16]), START, T0).unwrap();
+    let log = Log::start(w, clock.clone()).unwrap();
+    for k in 0..BURST {
+        log.submit(vec![fact(T0 + k as i64)])
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    let mut held = log.submit(vec![fact(T0 + BURST as i64)]).unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    for _ in 0..20 {
+        assert!(
+            std::pin::Pin::new(&mut held).poll(&mut cx).is_pending(),
+            "the call past the burst waits for the refill"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    *lock(&clock.0) = START + interval;
+    held.wait().unwrap();
     log.shutdown().unwrap();
-    assert!(
-        waits[..BURST].iter().all(|w| *w < interval / 4),
-        "the burst waited: {waits:?}"
-    );
-    assert!(
-        waits[BURST] >= interval / 2,
-        "the call past the burst: {waits:?}"
-    );
 }

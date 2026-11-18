@@ -123,6 +123,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-872 | §7 Manifest step 4; `format.md` A.14 | The epochs a rebuild takes above a corrupt span with no later record |
 | Q-970 | `format.md` A common rules (Scan bound); `design.md` Budgets; `SECURITY.md` | What a start is promised on a crafted or damaged file, against the 1 s restart budget |
 | Q-990 | `format.md` A common rules (Scan bound) | A batch kept after damage, with its content kept (decided by the lead) |
+| Q-991 | `format.md` A.18 Status file | What the count of failed derived-file writes counts (decided by the lead) |
 | Q-960 | `format.md` A.17 Uploaded forms | No kept bucket holds the record form from before roadmap 8.3g |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-962 | §8 Generations; `api.md` Restore | What an operator may accept when a marker names records the bucket does not hold |
@@ -1768,7 +1769,7 @@ below the bound. macOS before and after:
 **Superseded** (2026-11-18) by Q-980: the two-clock grid, its half-interval spacing after any log sync and the
 stored lateness accepted "at the bound" are gone with the schedule they paced. The sync budget refills by time, so a
 late wake or a stall leaves the refill in the budget and stores no delay; the rate bound is kept (any window holds at
-most its length over the interval, plus four, batch syncs). `cadence.rs` is replaced by the scenarios of
+most its length over the least interval, plus four, batch syncs). `cadence.rs` is replaced by the scenarios of
 `log/tests/pacing.rs` (`late_wakes_and_stalled_turns_delay_no_later_call`,
 `a_timed_seal_delays_only_a_call_arriving_during_its_sync_and_by_no_more_than_it`,
 `a_spent_budget_holds_arrivals_for_the_next_refill_and_they_form_one_batch`,
@@ -3141,14 +3142,17 @@ lead's decision at the re-check, where it is sound today; what remains is for th
 **Scenario.** Sealed segments A, B and C; B holds acknowledged facts. B disappears and no manifest record names its
 removal: nothing in the tree removes a sealed segment yet, so today such a removal is a fault.
 **Now.** A caught-up reader whose newest returned batch lies in B checks that batch at its next call; B gone under
-either extension is `SegmentMissing` (`log/src/reader/pass.rs` `check_recent`): `LossesUnknown` for the loss watch at
-every call, `NotAvailable` for a query (`log/tests/reader.rs`
-`a_caught_up_reader_whose_newest_batch_segment_is_gone_reports_it_missing`; `kvik/tests/durable_losses.rs`
-`a_watch_whose_segment_is_removed_reports_losses_unknown`). Sound because recovery deletes only segments holding no
-batch in use, and a seal only renames. Every other reader stays silent: one that stood in an earlier segment passes
-over B as it must over a segment recovery deleted (Q-852), and a first pass, a reader process opened later and the
-next start list what is there (`a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found`).
-The same fault is therefore reported or not by where each reader stood. `docs/api.md` (Health) states the limit.
+either extension is `SegmentMissing` (`log/src/reader/pass.rs` `check_recent`). It lasts for that reader until the
+store, or the reader process, is restarted, as the reader keeps that batch as its newest: every later call fails,
+`LossesUnknown` for the loss watch at every poll and `NotAvailable` for every query (`log/tests/reader.rs`
+`a_caught_up_reader_whose_newest_batch_segment_is_gone_reports_it_missing`,
+`a_reader_that_found_its_newest_batch_segment_gone_fails_every_later_call_until_reopened`;
+`kvik/tests/durable_losses.rs` `a_watch_whose_segment_is_removed_reports_losses_unknown`). Sound because recovery
+deletes only segments holding no batch in use, and a seal only renames. Every other reader stays silent: one that stood
+in an earlier segment passes over B as it must over a segment recovery deleted (Q-852), and a first pass, a reader
+process opened later and the next start list what is there
+(`a_removed_segment_no_reader_stands_in_is_passed_over_and_later_damage_still_found`). The same fault is therefore
+reported or not by where each reader stood. `docs/api.md` (Health) states the limit.
 **Edge, pinned.** After a removed segment a reader passed over, a damaged region at the head of the next segment takes
 its first position from the last batch read before it (`loss::Finder`), so its report and closed range take in B's
 positions; with no batch after it in its segment the report runs to the mark read (Q-937). Too wide, never too
@@ -3175,9 +3179,24 @@ nowhere and a scan keeping content counts what one without counts; a body kept a
 decode, as before Q-651, and failed reads stay as cheap as Q-651 made them.
 A decode that fails where the check passed would be a verdict the two disagree on, which Q-651's property rules out;
 it ends the batch as invalid content.
-**Pinned by.** `log/src/scan/tests.rs` `batches_kept_after_damage_keep_their_content_with_each_body_checked_once`; the
-segment fuzz target and `log/tests/scan_differential.rs` compare a scan keeping content with one that does not:
-findings, content and counts.
+**Pinned by.** `log/src/scan/tests/kept_content.rs`
+`batches_kept_after_damage_keep_their_content_with_each_body_checked_once`,
+`a_boundary_read_that_keeps_no_batch_decodes_no_body_for_its_content` and
+`a_candidate_a_failed_boundary_read_walked_keeps_its_content`; the segment fuzz target and
+`log/tests/scan_differential.rs` compare a scan keeping content with one that does not: findings, content and counts.
+
+## Q-991 — What the status file's count of failed derived-file writes counts
+Decided by the lead with the follow-ups to the derived files and the sync budget, for review.
+**Scenario.** While the durable backend's series fold is broken, the seal hook gives no series directory. The writer
+backed off and counted each attempt as a failed write, so counter 14 of the status file (`format.md` A.18,
+"derived-file writes that failed") rose about once a minute although no write failed.
+**Decided.** The counter counts a derived file whose write failed or was not tried for lack of space, and a failed
+step of the start's preparation of `derived/` (as before, `log/tests/directories_faults.rs`
+`a_start_that_backs_off_asks_to_run_again_after_its_wait`). A series directory the hook cannot give, one ahead of
+the synced mark and one that makes no progress back off as before and count nothing (`log/src/writer/directories.rs`
+`back_off`).
+**Pinned by.** `log/tests/directories.rs`
+`a_series_directory_the_hook_cannot_give_backs_off_and_counts_no_failed_write`.
 
 ## Q-810 — What the manifest's layout of a compacted file may repeat from the file
 Recorded by roadmap 6.2a1. **Settled by the lead** at its review.
@@ -3551,6 +3570,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-970 | 4.9 | Gate; recorded by roadmap 4.9e: the scan's work is bounded per byte and its time measured per file at the default segment size; the owner chooses what a start is promised |
 | Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
+| Q-991 | 9.0c | Decided by the lead: counter 14 counts failed writes and failed start steps, not a series directory the hook cannot give; for review |
 | Q-960 | 8.3 | Confirm no kept bucket holds the record form from before 8.3g (was Q-614 (f)); recorded when the owner's ruling on Q-614 was applied; owner confirmation pending |
 | Q-961 | 8.3d | The marker errors, switches and reports at `Store::restore`, and pacing the retries; recorded when the owner's ruling on Q-614 was applied |
 | Q-962 | 8.3 | Accepting an earlier state when a marker names records the bucket does not hold; recorded by the review of the Q-614 work; owner decision pending, the proposal built off by default |

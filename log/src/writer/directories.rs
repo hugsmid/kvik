@@ -226,7 +226,7 @@ pub fn kept_series(
 pub struct DirectoryStats {
     /// Files written.
     pub written: u64,
-    /// Writes that failed (or were not tried for lack of space) and wait to be tried again.
+    /// Writes that failed (or were not tried for lack of space); a series directory the hook cannot give is not one.
     pub failed: u64,
     /// Sealed segments described again from their files at the start (not reused from a group file).
     pub described: u64,
@@ -411,8 +411,14 @@ impl Directories {
         self.retry_in(work, now).is_some()
     }
 
+    /// A write that failed, or was not tried for lack of space: counted, then backed off.
     fn failed(&mut self, work: Work, now: Duration) {
         self.stats.failed += 1;
+        self.back_off(work, now);
+    }
+
+    /// Waits before `work` is tried again, counting nothing: no write failed (A.18 counter 14).
+    fn back_off(&mut self, work: Work, now: Duration) {
         let n = self.backoff.get(&work).map_or(0, |b| b.0).saturating_add(1);
         let wait = RETRY
             .saturating_mul(1 << n.min(16).saturating_sub(1))
@@ -658,16 +664,16 @@ impl Directories {
             return false;
         }
         let Some(s) = self.call(|h| h.series(synced, wall)) else {
-            self.failed(Work::Series, now);
+            self.back_off(Work::Series, now);
             return false;
         };
         if s.through > synced || s.through.sequence == 0 {
-            self.failed(Work::Series, now);
+            self.back_off(Work::Series, now);
             return false;
         }
         if self.series_through.is_some_and(|t| s.through <= t) {
             // No progress: the hook is behind the seals; tried again after a wait.
-            self.failed(Work::Series, now);
+            self.back_off(Work::Series, now);
             return false;
         }
         let d = SeriesDirectory {
