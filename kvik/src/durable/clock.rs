@@ -16,6 +16,8 @@ struct State {
     mono: u64,
     /// Per series id, the monotonic time of its last commit that refreshes live staleness.
     refreshed: BTreeMap<u32, u64>,
+    /// Calls to [`Clocks::refresh`] that refreshed a series.
+    refreshes: u64,
 }
 
 /// See the module documentation.
@@ -32,6 +34,7 @@ impl Clocks {
             now: env.wall().0,
             mono: env.monotonic().0,
             refreshed: BTreeMap::new(),
+            refreshes: 0,
         };
         Clocks {
             env,
@@ -64,6 +67,13 @@ impl Clocks {
         for &id in ids {
             s.refreshed.insert(id, mono);
         }
+        s.refreshes += 1;
+    }
+
+    /// How many calls have refreshed a series: a live read judges the staleness of its observed series again when
+    /// this moves.
+    pub(crate) fn refreshes(&self) -> u64 {
+        self.lock().refreshes
     }
 
     /// Nanoseconds on the monotonic clock since the last commit that refreshed series `id` in this process.

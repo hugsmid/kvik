@@ -134,15 +134,17 @@ pub use health::{
     MarkSyncMode, Reason, RestoreStats, SeriesStats, SetAsideReport, Stats,
 };
 pub use read::{
-    Aggregate, Aggregated, Bucket, CalendarPeriod, CalendarWindow, ChartData, Facts, Live,
-    LiveValue, ReaderState, Resolution, ResultFlags, Snapshot, View, Window, WindowResult,
+    Aggregate, Aggregated, Answer, Appended, Bucket, CalendarPeriod, CalendarWindow, ChartData,
+    CloseReason, Facts, Live, LiveEvent, LiveId, LiveOptions, LiveValue, Part, Query, ReaderState,
+    Resolution, ResultFlags, Selection, SessionOptions, Snapshot, UpdateBatch, Updated, View,
+    Window, WindowResult,
 };
 pub use series::{
     CalendarUnit, ChangedAtKind, CounterRules, ExcessPrecision, IntervalLength, Kind,
     ParameterChange, RetentionClass, SeriesInfo, SeriesKey, SeriesSpec, StateValues, Timing,
     ValueType,
 };
-pub use store::{Consumer, Reader, Store};
+pub use store::{Consumer, LiveSession, Reader, Store};
 pub use time::{LocalDate, LocalTime, ParseError, Span, TimeRange, Timestamp, ZoneName};
 pub use types::{
     Ack, Fact, FactFlags, FactRow, Intent, Outcome, Pending, Position, Quality, Reading,

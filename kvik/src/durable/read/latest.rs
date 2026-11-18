@@ -286,6 +286,46 @@ impl Latest {
         }
     }
 
+    /// The registry as of position `p`, from the entries held (a cut inside a refresh's read, Q-1014).
+    pub(crate) fn registry_at(&self, p: LogPos) -> Registry {
+        let mut r = Registry::default();
+        for (_, e) in self
+            .entries
+            .range(Bound::Unbounded, Bound::Included(&p))
+            .map(|(_, v)| v)
+        {
+            r.apply(e);
+        }
+        r
+    }
+
+    /// The earliest time after `now` at which series `id`'s live fact may change with no new fact: a fact ahead
+    /// falling due, a candidate above `now` or an interval reading becoming ready (spec §4; the query design's
+    /// section 3.6). A state that cannot tell, or a broken one, is due at once.
+    pub(crate) fn due(&self, id: u32, versioned: bool, p: &Params, now: i64) -> Option<i64> {
+        if self.broken {
+            return Some(now.saturating_add(1));
+        }
+        let h = self.series.get(&id)?;
+        let mut st = h.state.clone();
+        st.promote(now, versioned);
+        if st.unsure() {
+            return Some(now.saturating_add(1));
+        }
+        let [first, last] = st.ahead();
+        let c = st.candidate();
+        [
+            first.map(|k| k.t),
+            last.map(|k| k.t),
+            c.map(|k| k.t),
+            c.map(|k| p.ready_at(k.t)),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|t| *t > now)
+        .min()
+    }
+
     /// Every series whose candidate at `now` the fold did not meet, with it.
     pub(crate) fn unmet(&self, now: i64) -> Vec<(u32, Kept)> {
         self.series
@@ -339,7 +379,7 @@ fn search(
     v: &View,
     series: &Series,
     p: &Params,
-    now: i64,
+    (now, upto): (i64, Option<LogPos>),
 ) -> Result<Option<Stored>, QueryError> {
     r.count_search();
     let versioned = series.def.versioning != Versioning::None;
@@ -351,7 +391,11 @@ fn search(
             from: lo,
             to: hi,
         }];
-        let found = current(r.lookup(v, &wanted)?, versioned);
+        let mut facts = r.lookup(v, &wanted)?;
+        if let Some(u) = upto {
+            facts.retain(|f| f.position <= u);
+        }
+        let found = current(facts, versioned);
         if let Some((_, s)) = found
             .range((Bound::Unbounded, Bound::Included(now)))
             .rev()
@@ -429,8 +473,10 @@ pub(crate) fn live(
         Judged::Fact(s) if windows::reading_of(series, &s).is_some() => Some(s),
         Judged::Row(k) => match r.resolved(v, id.0, k, now)? {
             Some(s) if windows::reading_of(series, &s).is_some() => Some(s),
-            Some(_) => search(r, v, series, &p, now)?,
-            None if recorded_lost(v.lost_ranges(), k.position) => search(r, v, series, &p, now)?,
+            Some(_) => search(r, v, series, &p, (now, None))?,
+            None if recorded_lost(v.lost_ranges(), k.position) => {
+                search(r, v, series, &p, (now, None))?
+            }
             // A fact the directory names that the log no longer holds, as a segment removed before the lookup's
             // reader opened (Q-951): never read as absence (Q-1004).
             None => {
@@ -439,9 +485,29 @@ pub(crate) fn live(
                 });
             }
         },
-        Judged::Fact(_) | Judged::Unsure => search(r, v, series, &p, now)?,
+        Judged::Fact(_) | Judged::Unsure => search(r, v, series, &p, (now, None))?,
     };
     Ok(match fact {
+        Some(s) => windows::live_with(&p, r.clocks(), id, &s, now),
+        None => Live::None,
+    })
+}
+
+/// Live state of series `id` at `now` as of position `upto` at or below `v`'s cut (Q-1014): the live fact searched
+/// for in the log among the facts at or below it, with the registry as of it.
+pub(crate) fn live_upto(
+    r: &DurableReader,
+    v: &View,
+    id: SeriesId,
+    (now, upto): (i64, LogPos),
+) -> Result<Live, QueryError> {
+    let registry = v.latest().registry_at(upto);
+    let series = registry.get(id.0).ok_or(QueryError::UnknownSeries)?;
+    let p = windows::params(&series.def);
+    if p.timing == KmTiming::Forecast {
+        return Ok(Live::None);
+    }
+    Ok(match search(r, v, series, &p, (now, Some(upto)))? {
         Some(s) => windows::live_with(&p, r.clocks(), id, &s, now),
         None => Live::None,
     })

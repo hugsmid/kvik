@@ -32,7 +32,7 @@ mod loss;
 mod open;
 #[cfg(test)]
 mod pause;
-mod read;
+pub(crate) mod read;
 pub(crate) mod reader;
 #[cfg(test)]
 mod registering;
@@ -301,6 +301,12 @@ impl Writer {
         );
         *r = Some(opened.clone());
         Ok(opened)
+    }
+
+    /// A handle woken at every turn of the writer that published something, the durable mark's moves among them:
+    /// what the live sessions of this process wait on (the query design's section 3.6).
+    pub(crate) fn progress(&self) -> Option<kvik_log::writer::Watch> {
+        self.log().as_ref().map(Log::watch)
     }
 
     /// From the deliverer's held state; the reader of the process only when there is no deliverer or its

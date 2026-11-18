@@ -28,6 +28,7 @@ use super::index::{Index, Stored, pos};
 use super::loss::{Find, Latch};
 use super::read::cut;
 use super::read::flight::Flight;
+use super::read::hub::{Collector, Hub};
 use super::read::latest::{self, Latest};
 use super::read::view::{Cuts, View};
 use crate::backend::Error;
@@ -124,6 +125,8 @@ pub(crate) struct DurableReader {
     searches: AtomicU64,
     /// The first round continued a series directory.
     seeded: AtomicBool,
+    /// What each round read, for the live sessions on this reader.
+    hub: Hub,
     #[cfg(test)]
     lookups_made: AtomicU64,
 }
@@ -328,6 +331,7 @@ impl DurableReader {
             #[cfg(test)]
             lookups_made: AtomicU64::new(0),
             seeded: AtomicBool::new(false),
+            hub: Hub::default(),
         })
     }
 
@@ -355,7 +359,7 @@ impl DurableReader {
         self.work.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn monotonic(&self) -> Duration {
+    pub(crate) fn monotonic(&self) -> Duration {
         Duration::from_nanos(self.clock.monotonic().0)
     }
 
@@ -418,8 +422,20 @@ impl DurableReader {
         Ok(v)
     }
 
+    /// The view of the last round, with no refresh, unless it lacks the fact index its broken state needs.
+    pub(crate) fn current(&self) -> Option<Arc<View>> {
+        self.flight
+            .current()
+            .filter(|v| !v.latest().broken() || v.index().is_some())
+    }
+
+    /// The shared tail of the live sessions on this reader.
+    pub(crate) fn hub(&self) -> &Hub {
+        &self.hub
+    }
+
     /// Ends a call on `v`: whether its cut is still live, and the release of views no call holds.
-    fn end(&self, v: Arc<View>) -> Result<(), QueryError> {
+    pub(crate) fn end(&self, v: Arc<View>) -> Result<(), QueryError> {
         let live = self.check(&v);
         drop(v);
         self.release_dropped();
@@ -508,6 +524,7 @@ impl DurableReader {
         }
         let latest = w.latest.as_mut().expect("seeded above");
         let mut own = Vec::new();
+        let mut tail = self.hub.collector();
         let taken = take(
             log,
             w.part,
@@ -518,6 +535,9 @@ impl DurableReader {
             |events, durable| {
                 let found = latest.apply(events, durable);
                 own.extend(found.iter().map(|f| f.closed));
+                if let Some(c) = tail.as_mut() {
+                    c.events(events, &found);
+                }
                 found
             },
         );
@@ -534,18 +554,23 @@ impl DurableReader {
             latest.break_off();
         }
         // The ranges this pass found held no fact it folded; any other closed range may (Q-938).
-        let mut lose =
-            |latest: &mut Latest, facts: &mut Option<FactsReader>, recorded: &[LostRange]| {
-                for (first, last) in self.latch.closed_since(&mut w.closed_seen) {
-                    if !own.contains(&(first, last)) {
-                        latest.lose(first, last, recorded);
-                    }
-                    if let Some(f) = facts.as_mut() {
-                        f.index.forget(first, last);
+        let mut lose = |latest: &mut Latest,
+                        facts: &mut Option<FactsReader>,
+                        tail: &mut Option<Collector>,
+                        recorded: &[LostRange]| {
+            for (first, last) in self.latch.closed_since(&mut w.closed_seen) {
+                if !own.contains(&(first, last)) {
+                    latest.lose(first, last, recorded);
+                    if let Some(c) = tail.as_mut() {
+                        c.gap(first, last);
                     }
                 }
-            };
-        lose(latest, &mut w.facts, log.lost_ranges());
+                if let Some(f) = facts.as_mut() {
+                    f.index.forget(first, last);
+                }
+            }
+        };
+        lose(latest, &mut w.facts, &mut tail, log.lost_ranges());
         if (latest.broken() || self.want_facts.load(Ordering::SeqCst)) && w.facts.is_none() {
             w.facts = Some(FactsReader {
                 log: self.second_reader().map_err(failed)?,
@@ -573,15 +598,18 @@ impl DurableReader {
                 }
             }
         }
-        lose(latest, &mut w.facts, log.lost_ranges());
+        lose(latest, &mut w.facts, &mut tail, log.lost_ranges());
         if log.lost_ranges() != &*w.lost_ranges {
             w.lost_ranges = log.lost_ranges().into();
         }
+        let seq = self
+            .hub
+            .finish(tail, st.durable, self.monotonic(), self.cut_max_age);
         Ok(Arc::new(View::new(
             (latest.clone(), w.facts.as_ref().map(|f| f.index.clone())),
             st,
             w.lost_ranges.clone(),
-            cut::take(log),
+            (cut::take(log), seq),
             began,
             self.cuts.clone(),
         )))

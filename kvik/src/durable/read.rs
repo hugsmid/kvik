@@ -2,7 +2,9 @@
 
 pub(crate) mod cut;
 pub(crate) mod flight;
+pub(crate) mod hub;
 pub(crate) mod latest;
+pub(crate) mod live;
 pub(crate) mod pmap;
 #[cfg(test)]
 mod tests;

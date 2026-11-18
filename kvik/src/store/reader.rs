@@ -1,7 +1,8 @@
 //! The [`Reader`] handle (`docs/api.md` Reader processes, Reading).
 
 use super::*;
-use crate::read::Snapshot;
+use crate::read::{SessionOptions, Snapshot};
+use crate::store::LiveSession;
 
 /// A read-only handle (`docs/api.md` Reader processes, Reading). Calls are
 /// blocking and take no lock on the directory; it keeps reading after the
@@ -105,6 +106,24 @@ impl Reader {
                 .map(Snapshot::model)
                 .map_err(|e| e.query()),
             _ => Snapshot::durable(self.durable().expect("a durable reader")?),
+        }
+    }
+
+    /// A session of live reads with the default pacing (`docs/api.md` Live reads).
+    pub fn session(&self) -> LiveSession {
+        LiveSession::new(self, SessionOptions::default()).expect("the default options are valid")
+    }
+
+    /// A session of live reads paced by `options`; intervals below their least are [`QueryError::Invalid`].
+    pub fn session_with(&self, options: SessionOptions) -> Result<LiveSession, QueryError> {
+        LiveSession::new(self, options)
+    }
+
+    /// What the writer of this process wakes its live sessions with; `None` in a reader process.
+    pub(crate) fn progress(&self) -> Option<kvik_log::writer::Watch> {
+        match &self.inner {
+            ReaderInner::Store(w) => w.progress(),
+            _ => None,
         }
     }
 

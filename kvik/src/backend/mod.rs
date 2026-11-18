@@ -11,6 +11,7 @@
 
 pub(crate) mod convert;
 mod error;
+pub(crate) mod live;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};

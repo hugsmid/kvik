@@ -43,6 +43,8 @@ pub(crate) struct View {
     state: ReaderState,
     lost_ranges: Arc<[LostRange]>,
     cut: Cut,
+    /// The number of the refresh's round in the reader's shared tail ([`super::hub`]).
+    round: u64,
     /// When the refresh that took the cut began, on the reader's monotonic clock: the cut's epoch was current from
     /// then on.
     current_at: Duration,
@@ -67,7 +69,7 @@ impl View {
         (latest, facts): (Latest, Option<Index>),
         state: ReaderState,
         lost_ranges: Arc<[LostRange]>,
-        cut: Cut,
+        (cut, round): (Cut, u64),
         current_at: Duration,
         cuts: Arc<Cuts>,
     ) -> Self {
@@ -78,6 +80,7 @@ impl View {
             state,
             lost_ranges,
             cut,
+            round,
             current_at,
             lost_seen,
             cuts,
@@ -107,6 +110,11 @@ impl View {
     /// The cut.
     pub(crate) fn cut(&self) -> &Cut {
         &self.cut
+    }
+
+    /// The number of the refresh's round in the reader's shared tail.
+    pub(crate) fn round(&self) -> u64 {
+        self.round
     }
 
     /// How long the cut has been live at `now`.
