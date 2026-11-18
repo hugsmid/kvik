@@ -128,6 +128,10 @@ struct H {
 
 impl H {
     fn new() -> Self {
+        Self::with_min_sync(Duration::ZERO)
+    }
+
+    fn with_min_sync(min_sync_interval: Duration) -> Self {
         let fs = MemFs::new();
         let new = NewStore {
             store_id: STORE_ID,
@@ -139,7 +143,7 @@ impl H {
         let store = StoreDir::open(Arc::new(fs.clone()), Path::new("store"), Some(&new)).unwrap();
         let cfg = WriterConfig {
             segment_size: 12 << 20,
-            min_sync_interval: Duration::ZERO,
+            min_sync_interval,
             disk_critical: 0,
             disk_low_bytes: 0,
             relaxed_limits: true,
@@ -318,6 +322,45 @@ fn fnv(bytes: &[u8], mut h: u64) -> u64 {
         h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+#[test]
+fn calls_put_back_follow_at_once_while_the_budget_holds_and_a_turn_that_commits_nothing_spends_nothing()
+ {
+    let mut h = H::with_min_sync(Duration::from_millis(10));
+    h.maint = false;
+    let mut g = h.greedy(vec![facts(1, T0, 3, 0), vec![recovery()]]);
+    assert_eq!(h.step(&mut g), 1);
+    assert_eq!(
+        h.w.sync_ready_at(),
+        Duration::ZERO,
+        "the budget still holds syncs"
+    );
+    assert_eq!(h.step(&mut g), 1);
+    for s in 2..4 {
+        h.submit(facts(s, T0, 1, 0));
+        assert_eq!(h.step_queue(), 1);
+    }
+    // No clock: one sync per 10 ms. Four syncs a millisecond apart leave three tenths of one; each round below
+    // refills one and spends one, so the budget holds 1.3 syncs as each large call comes and a turn that spent one
+    // would leave it short.
+    for series in 4.. {
+        assert!(series < 12, "a roll found no segment ahead");
+        h.now += Duration::from_millis(9);
+        let mut big = h.greedy(vec![facts(series, T0, BIG, 255)]);
+        if h.step(&mut big) == 0 {
+            g = big;
+            break;
+        }
+    }
+    assert_eq!(h.w.waiting(), Some(Wait::NoSegment));
+    assert!(
+        h.w.sync_ready_at() <= h.now,
+        "a turn that commits nothing spends nothing of the budget"
+    );
+    h.maint = true;
+    h.run_maint();
+    assert_eq!(h.step(&mut g), 1);
 }
 
 #[test]

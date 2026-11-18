@@ -70,7 +70,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-301 | §8 Restore (the paragraph after step 4) | The files a resumed restore fetches |
 | Q-302 | §8 Restore (Failures and end), §8 Corrupt block | The lost range of a listed file the bucket has lost, and files other than log segments |
 | Q-303 | §8 Generations, §7 Readers; `format.md` A.1 kind 12 | The local restore record file |
-| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix, pending the next NVMe run) |
+| Q-310 | `design.md` Budgets; §3 Group commit | The delivery budget's p50 at exactly 100 calls a second with the default bound (settled by an engineering fix; its schedule superseded by Q-980) |
 | Q-322 | §3 Durable mark; `format.md` A.10 Update | A torn mark update that makes a damaged older slot valid again |
 | Q-341 | §8 Bucket; `format.md` A.17 Probe | The attach probe at `<sid>/probe`: its wrong-hash put there, and an attach after a full restore |
 | Q-342 | §8 Continuous backup, Generations; `api.md` `BackupStats` | `backed_up_through` in a restored generation |
@@ -106,6 +106,9 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-753 | §2.3 Live state, §4 Outranked facts, §5.1, §6 Restart and resume | What the deliverer keeps in memory and reads from the log |
 | Q-754 | §7 Readers | The lookup's batch maps in a reader of another process across a reset stamp or generation |
 | Q-755 | §2.4, §3 Recovery rule 2, §8 Corrupt block, §11 Health | Damage found during a run recorded durably as a loss |
+| Q-710 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The default floor of the batch-sync interval |
+| Q-711 | `kvik_log::WriterConfig`, `kvik_log::LogStats` | New fields in the log crate's `WriterConfig` and `LogStats` |
+| Q-712 | §3 Group commit | The constants of the adaptive interval |
 | Q-760 | §2.2 `changed_at`; `format.md` A.5 | A stored `changed_at` of kind `time` above `i64::MAX` |
 | Q-761 | `docs/export.md` Partitioned layout | Long and renamed series names in the partitioned layout |
 | Q-832 | §5.1, §8 tree checkpoints, §11 `series_stats`, §13 Restart | A start independent of the log's length without tree checkpoints |
@@ -123,6 +126,12 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-960 | `format.md` A.17 Uploaded forms | No kept bucket holds the record form from before roadmap 8.3g |
 | Q-961 | `api.md` Backup and restore, Restore | The last-uploaded marker at `Store::restore`: the switches, the errors and the reports |
 | Q-962 | §8 Generations; `api.md` Restore | What an operator may accept when a marker names records the bucket does not hold |
+| Q-980 | §3 Group commit, Commit | Batch syncs paced by a timer on an idle disk: group commit on a sync budget |
+| Q-981 | §3 Group commit, §13 Sync rate and SSD wear; `api.md` Configuration | The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval` |
+| Q-982 | §3 Group commit, Sealing | What spends the sync budget: batch syncs only, counted at the start of their turn |
+| Q-983 | §3 Group commit, §13 Sync rate and SSD wear; `design.md` Budgets | The device-time term of the budget against the latency of loads above it (OWNER) |
+| Q-984 | §3 Group commit; `kvik_log::LogStats` | The smoothed sync time and `sync_interval` under the budget |
+| Q-985 | §3 Group commit | The burst of the sync budget: four batch syncs |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -1756,6 +1765,16 @@ to the call source, for one batch after a quiet period.
 after a late start, saturation with late wakes and stalls, a burst after a quiet period, a stray call at and just
 below the bound. macOS before and after:
 `docs/measurements/4.8-commit-latency.md`, the dated note under Results: macOS.
+**Superseded** (2026-11-18) by Q-980: the two-clock grid, its half-interval spacing after any log sync and the
+stored lateness accepted "at the bound" are gone with the schedule they paced. The sync budget refills by time, so a
+late wake or a stall leaves the refill in the budget and stores no delay; the rate bound is kept (any window holds at
+most its length over the interval, plus four, batch syncs). `cadence.rs` is replaced by the scenarios of
+`log/tests/pacing.rs` (`late_wakes_and_stalled_turns_delay_no_later_call`,
+`a_timed_seal_delays_only_a_call_arriving_during_its_sync_and_by_no_more_than_it`,
+`a_spent_budget_holds_arrivals_for_the_next_refill_and_they_form_one_batch`,
+`under_load_batch_syncs_run_at_the_interval_or_as_the_previous_one_returns`,
+`a_25_ms_stall_holds_the_ceiling_until_the_estimate_falls_and_the_floor_returns_within_45_syncs`,
+`the_calls_that_arrive_during_a_sync_form_one_batch_as_it_returns_while_the_budget_holds`).
 
 ## Q-320 — Which bytes beyond a same-boot mark make a reset point
 
@@ -2371,6 +2390,9 @@ thread ran at most 3,500 to 6,000 readings behind the last acknowledged position
 `the_delivery_counters_reach_the_same_counts_with_or_without_a_consumer` (`kvik/tests/emit_without_consumers.rs`).
 
 ## Q-710 — The default floor of the batch-sync interval
+Recorded by the adaptive interval of the log writer; entered here as the owner ruled it, with the change that landed
+it. The measurement note it cites, `docs/measurements/4.8-adaptive-sync-interval.md`, is on that change's line and
+not in this tree.
 
 **Scenario.** The batch-sync interval adapts to the device between `log.sync_interval_floor` and
 `log.min_sync_interval` (spec §3 Group commit). With a floor of 2 ms a fast device waits about 2 ms instead of 10,
@@ -2387,6 +2409,9 @@ to 2 ms in a change of its own after the commit latency rows (`docs/measurements
 showed no regression against the fixed 10 ms rows beyond their run-to-run spread. The design's own marks were not
 all met on that machine: one writer of 2,000-reading batches ran at about twice the fixed rate but far below bound 0,
 since its sync of about 0.5 ms keeps the interval near 4 ms; the owner's ruling did not depend on them.
+**Since.** Q-980 keeps the floor and its default and keeps the bound the ruling was given on: batch syncs run at
+most 1/`sync_interval_floor` per second over time. It adds a burst of four batch syncs to any window (Q-985), which
+the ruling did not cover (Q-983), and makes the floor a store key, as the ruling's remedy needs (Q-981).
 
 ## Q-711 — New fields in the log crate's `WriterConfig` and `LogStats`
 
@@ -2398,6 +2423,7 @@ forbidding struct expressions outside the crate (every test and benchmark builds
 `..WriterConfig::default()`; no literal in the tree names every field). The log crate is not published.
 `kvik::LogConfig` and `kvik::LogStats` are `#[non_exhaustive]` already and take the new key and statistics
 compatibly.
+**Since.** Q-981 adds the floor to `kvik::LogConfig`; `kvik::LogStats` does not carry the two statistics (Q-984).
 
 ## Q-712 — The constants of the adaptive interval
 
@@ -2419,6 +2445,7 @@ schedule allows one; this stays inside the stated rate and spacing bounds, which
 with 1 MiB batches the interval holds itself near the ceiling, and a single closed-loop writer of large calls runs
 well below bound 0 (`docs/measurements/4.8-adaptive-sync-interval.md`); the run on the Linux NVMe target decides
 whether the multiplier or the floor needs tuning for single closed-loop writers.
+**Since.** Q-980 keeps the constants; the interval is now the refill period of the sync budget, not a spacing.
 
 ## Q-713 — A `min_sync_interval` beyond `u64` nanoseconds
 
@@ -2431,6 +2458,9 @@ is an estimate, so a ceiling above about 584 years counts as 584 years from the 
 accepted is refused, and the schedule's additions stay far inside `Duration`
 (`a_ceiling_near_the_largest_duration_schedules_without_overflow`,
 `a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample`).
+**Since.** Q-980 keeps the interval in `u64` nanoseconds and counts the budget in `u128`; the tests are now
+`the_largest_sample_and_ceiling_saturate`, `the_ready_time_saturates` and
+`an_interval_near_the_largest_duration_schedules_without_overflow`.
 
 ## Q-750 — The slow path of the duplicate rule meeting damage found during a run
 Recorded by roadmap 11.0. **Settled by the owner's ruling** at its review.
@@ -3256,6 +3286,131 @@ mismatch. The default stays "fail loudly", per the ruling.
 **Model.** Not modelled.
 **Tests.** `backup/tests/restore_marker.rs` (`q962_*`).
 
+## Q-980 — Batch syncs paced by a timer on an idle disk: group commit on a sync budget
+Recorded by the flush-pacing change; decided by the lead (2026-11-18) after its first form failed review.
+**Scenario.** The adaptive interval (Q-710 to Q-713) spaced batch syncs `clamp(8 × d, floor, min_sync_interval)`
+apart, `d` the smoothed sync time, inside the Q-310 two-clock schedule. On a consumer NVMe disk with an `fdatasync`
+p50 of about 1.1 ms, 16 writers each sending its next batch when the last is acknowledged reached 3,090 batches a
+second at p50 4.8 ms, against 15,000 at 0.9 ms for a durable PostgreSQL on the same disk; the log harness's lone
+writer had p50 5.0 ms at the default and 0.32 ms with the bound at 0. The first form of this change synced a batch at
+once unless calls had waited as the previous sync returned, and kept the floor only then. Its review found that this
+dropped the rate bound for callers that arrive further apart than one sync time, the load of spec §13 (N unbatched
+1 Hz series): on the writer core, 4,000 staggered calls a second at a 0.13 ms sync made 4,000 batch syncs a second,
+and 800 at 1.1 ms made 800 (the adaptive rule: 500 and 113), with the slow-device caps and the eighth of device time
+gone too.
+**Decided (lead).** A promise beats the latency target. Group commit on a sync budget, a token bucket: it holds
+four batch syncs (Q-985), is full at the start and refills at one per interval, the adaptive interval of Q-712 and
+Q-713 unchanged. With no log sync in flight, a batch is synced at once while the budget holds a sync, and otherwise
+as soon as its refill reaches one; calls that arrive meanwhile queue, and the next batch sync takes all of them (up
+to `max_batch_bytes`). A call is acknowledged only once the sync covering it has returned and the mark has moved,
+with the Q-630 mark sync for the first batch of each segment, the forced mark sync for a batch that is not all facts
+and the timed mark sync unchanged (it was not the bottleneck: one a second). The budget is counted in billionths of
+a sync, refilled by elapsed time at the interval in force, rounded down, and the wait for the next sync rounded up,
+so the refill has reached a whole sync when the wait ends (`log/src/writer/pacing.rs` `Budget`). So any window holds
+at most its length over the least interval, plus four, batch syncs; a writer under the budget's rate waits for no
+timer; a late wake or a stall leaves its refill in the budget and stores no delay. Durability, the format, the mark
+protocol and recovery do not change; the reference model has no timing. The Q-310 schedule goes (that entry's note).
+**Tests.** `log/tests/pacing.rs`: the writer against a reference schedule of the rule on generated arrival patterns
+(calls also arriving while a sync is in flight, by the manual clock the fake file system advances), with and without
+a clock, every start, covering sync and acknowledgement compared; the window bound on any history at the least
+interval, and on a steady device at its interval; a lone writer under budget never delayed; no acknowledgement
+before its covering sync returns, and every segment byte durable at each acknowledgement (with the mark synced for
+the first batch, Q-630); one sync covers every call that arrived during the previous one; staggered callers at the
+review's rates; slow devices at the fixed schedule's ceiling; the writer thread's burst and refill; `writer.rs`
+`group_commit_syncs_at_once_within_the_budget_then_batches_until_its_refill`.
+
+## Q-981 — The interval's bounds as store keys: `sync_interval_floor` and `min_sync_interval`
+Recorded and decided by the flush-pacing change, for the lead's acceptance; the default floor is the owner's (Q-710).
+**Scenario.** Spec §13 names a longer `sync_interval_floor` as the remedy for wear, but the store's `LogConfig` had
+no such key: a store could only lower the interval, through `min_sync_interval`, and never raise the floor above
+2 ms (review of the first form, finding 2). The first form also made a floor of 0 mean back to back.
+**Decided.** `log.sync_interval_floor` is a key of the store's `LogConfig` (default 2 ms; compatible, as `LogConfig`
+is `#[non_exhaustive]`), passed to the log writer with `min_sync_interval`. The bounds keep their adaptive meaning:
+the interval is eight times the smoothed sync time within [min(floor, `min_sync_interval`), `min_sync_interval`],
+and `min_sync_interval` before the first sample; `min_sync_interval` at 0 disables the budget (batch syncs back to
+back); a floor of 0 leaves the rate bounded by eight sync times, as the adaptive rule did (the first form's "floor 0
+means back to back" is withdrawn). §13's remedy is a longer floor with `min_sync_interval` at least as long, which
+now bounds every load.
+**Tests.** `kvik/src/durable/open.rs` `the_store_passes_both_pacing_keys_to_the_log_with_the_logs_defaults`;
+`log/tests/pacing.rs` `a_zero_ceiling_starts_each_batch_sync_under_load_as_the_previous_one_returns`,
+`under_load_batch_syncs_run_at_the_interval_or_as_the_previous_one_returns` (a zero floor at eight sync times),
+`a_floor_above_the_ceiling_fixes_the_interval_at_the_ceiling`, `the_default_floor_is_2_ms_under_a_10_ms_ceiling`.
+
+## Q-982 — What spends the sync budget: batch syncs only, counted at the start of their turn
+Recorded and decided by the flush-pacing change, for the lead's acceptance.
+**Decided.** Each batch sync spends one sync of the budget, counted at the start of the writer's turn that runs it.
+The sync that takes a segment into use at a timed seal and every mark sync spend nothing (as under Q-310, they took
+no slot of the bound); a turn that commits nothing (no segment yet for the batch) spends nothing; calls put back from
+a batch follow at once while the budget holds a sync. Counting at the turn's start means a timed mark sync run first
+in the same turn can bring two batch syncs closer than the interval, by at most that mark sync; both are still
+counted, so the window bound holds.
+**Tests.** `log/tests/pacing.rs` `a_seal_sync_spends_nothing_of_the_budget_and_leaves_the_estimate_alone`,
+`a_mark_sync_leaves_the_estimate_alone`; `log/tests/batch_bytes.rs`
+`calls_put_back_follow_at_once_while_the_budget_holds_and_a_turn_that_commits_nothing_spends_nothing`.
+
+## Q-983 — The device-time term of the budget against the latency of loads above it (OWNER)
+Recorded by the flush-pacing change. For the owner.
+**What the budget settles.** The bound Q-710 was ruled on holds again for every load: batch syncs at most
+1/`sync_interval_floor` per second over time (500 at the default), 1/`min_sync_interval` (100) on a device whose
+sync takes 1.25 ms or more, and at most about an eighth of the device's time in between. On the writer core, 4,000
+staggered calls a second at a 0.13 ms sync make 504 batch syncs in a second (500 plus the burst), 800 at 1.1 ms make
+118 (113 plus the burst), 1,000 at 5 ms make 104. Slow devices keep the fixed schedule's 100 a second at 1.25, 5 and
+10 ms.
+**What remains.** (1) The stated bound gains a burst: any window holds up to four batch syncs more than its length
+over the interval (Q-985), which the Q-710 ruling did not cover. (2) The cost of the `8 × d` term to loads above the
+budget's rate. Under the budget a lone writer that waits for each acknowledgement, or several such writers, run at one
+sync per interval, so on a fast device they get the adaptive rule's latency back, not the sync time. Commit latency
+on the shared test machine (virtual disk; batch sync p50 about 0.1 ms when syncs run back to back and 0.3 ms when
+spaced; two runs each, interleaved; adaptive rule / first form / budget):
+
+| Load, floor 2 ms | p50 ms | Calls/s | Batch syncs/s |
+|---|---|---|---|
+| 1 writer, back to back | 3.03 / 0.13 / 3.42 | 306 / 6,857 / 280 | 306 / 6,857 / 280 |
+| 16 writers, back to back | 4.05 / 2.32 / 3.17 | 3,734 / 8,096 / 4,348 | 234 / 780 / 272 |
+| 1,000 staggered 1 Hz series | 2.16 / 0.27 / 2.08 | 1,000 each | 284 / 996 / 296 |
+| 16 writers, 200 calls/s | 0.56 / 0.47 / 0.50 | 200 each | 174 / 182 / 178 |
+
+With a floor of 0 the budget's figures are the same within the spread (the interval is eight sync times either way).
+On the NVMe target (sync about 1.1 ms, interval about 8.8 ms) the rule gives, by estimate: about 114 batch syncs a
+second for any closed-loop load, so one writer at p50 near 8.8 ms and 16 writers near the 3,090 calls a second at
+about 5 ms that started this change; staggered loads under about 110 calls a second keep the sync time. Only loads
+under the budget's rate gain.
+**Options.** (a) Accept as built: the bound and the device-time cap, with closed-loop loads above the rate at the
+adaptive rule's latency. (b) Drop the `8 × d` term (rate 1/floor only): by the first form's figures, one writer at
+about 2 ms and 16 writers at about 8,000 calls a second at about 2.3 ms on a fast device, still at most 500 batch syncs
+a second; the costs are the device time (on the NVMe target a 1.1 ms sync every 2 ms, about 55 % of the device under
+sustained load, against an eighth) and the slow-device caps (a 1.25 ms device up to 800 syncs a second against 100,
+2 ms up to 500, 5 ms up to 200; 10 ms and above unchanged), at 4 KiB or more a sync. (c) A smaller multiplier, between
+the two (Q-712's sweep: 4 halved the wait and ran about 1.7 times the syncs of 8). (d) A larger burst, which helps
+only a burst of closed-loop calls, not a steady one.
+**For now.** (a), the lead's decision. Settle by gate 4.9, on the run on the Linux NVMe target, which should include
+a staggered open-loop load between 400 and 2,000 calls a second and report batch syncs a second.
+
+## Q-984 — The smoothed sync time and `sync_interval` under the budget
+Recorded and decided by the flush-pacing change, for the lead's acceptance.
+**Decided.** The first form kept the smoothed sync time as a statistic only; under the budget it sets the interval
+again (Q-712), sampled from batch syncs that succeed only, `None` before the first sample and with no clock (then the
+interval stays at `min_sync_interval`). `sync_interval` (the interval in force) and `sync_time` are fields of
+`kvik_log::LogStats`, not of the store's `LogStats` in `api.md`.
+**Tests.** `log/tests/pacing.rs` `the_smoothed_sync_time_stays_between_the_last_sample_and_the_largest`,
+`after_a_peak_the_estimate_falls_at_least_an_eighth_of_the_way_per_sync`, `a_failed_sync_leaves_the_estimate_alone`,
+`only_the_batch_sync_is_timed_not_the_batch_write_or_the_mark_update`, `log_start_times_batch_syncs_on_its_clock`.
+
+## Q-985 — The burst of the sync budget: four batch syncs
+Recorded and decided by the flush-pacing change, for the lead's acceptance.
+**Scenario.** A token bucket needs a depth. One sync would delay any load just under the rate at its first jitter
+and give a quiet period's first few calls a wait; a deep bucket would let the device be held in back-to-back syncs
+after every quiet spell and loosen the window bound.
+**Decided.** Four (`kvik_log::writer::SYNC_BURST`, a constant, not a key). It is the excess over the rate in any
+window, a constant (four syncs, 16 KiB at 4 KiB a sync), not a rate; after a quiet period it covers the first call
+synced alone, the batch of calls that arrived during that sync and two more short clusters (several adapters
+reporting on the same second) without a wait; it holds the device at most four syncs back to back (about 4.4 ms on
+the NVMe target) before the rate applies; and a closed-loop writer above the rate reaches it after four syncs.
+**Tests.** `pacing.rs` `a_full_budget_lets_the_burst_through_at_once_then_one_sync_per_interval`;
+`log/tests/pacing.rs` `a_lone_writer_above_budget_runs_at_one_sync_per_interval_after_the_burst`,
+`the_writer_thread_syncs_a_lone_writer_at_once_within_the_budget_and_holds_the_next_for_its_refill`, and the window
+properties.
+
 ## Open at v0.2
 
 The specification was tagged v0.2 with these questions still open, by the owner's decision. Each is to be settled
@@ -3268,7 +3423,7 @@ Q-87 was reopened there. Q-87 and Q-100 to Q-107 were settled after gate 3.3 by 
 the owner's rulings. Q-121 and Q-122 were recorded by roadmap 4.7, which settled Q-122. Gate 4.9 settled Q-109 and parts
 of Q-115, Q-116
 and Q-118, recorded Q-115 (n), and added the parts of Q-115, Q-116 and Q-118 still open to this table. The first run of
-the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950.
+the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b) on Linux (ext4 and XFS). Roadmap 5.1 settled Q-121 and recorded Q-123; roadmap 5.1a recorded Q-124 and Q-125, both settled after its review. Roadmap 5.2 recorded Q-130 to Q-132, and its review settled them with Q-91, Q-95 and Q-116 (b) and (m). Roadmap 5.4 recorded Q-140 to Q-142. Roadmap 6.1 recorded Q-150, settled at its review. Roadmap 8.2 recorded Q-160 to Q-164; the interfaces commit of roadmap 8.1 and 8.3 recorded Q-198. Roadmap 6.4a recorded Q-190 to Q-197, the provisional Parquet export schema (`docs/export.md`). Roadmap 6.3a recorded Q-171 to Q-175, settled Q-171 and Q-174 at its review, withdrew Q-172 and moved the parts of 6.3 it does not build to 6.3b. Roadmap 7.1a recorded Q-180 to Q-182, settled at its review. Roadmap 8.1a settled Q-160 and Q-162, settled Q-198 (e) and (f), and recorded Q-210 to Q-214. Roadmap 8.1b recorded Q-270 and Q-271. The Linux NVMe run of roadmap 4.8 recorded Q-310. Roadmap 8.1c recorded Q-280 to Q-285. Roadmap 6.3b recorded Q-220 and Q-221, and its review recorded and settled Q-640. Roadmap 8.3a recorded Q-290 to Q-295, settled Q-108, Q-290 and Q-293, and Q-295 by the owner's ruling at its review, and left the claim points of Q-39 (f), Q-161 and Q-163 to the restore executor. Roadmap 8.3b recorded Q-300 to Q-305 and settled Q-39 (f), Q-82, Q-213, Q-214 and Q-305. Stacking 8.3b on 8.3a settled Q-300, settled Q-271 as superseded, and recorded and settled Q-340, both by the owner's rulings, and recorded Q-341 and Q-342. Roadmap 4.9d settled Q-110, and recorded Q-230 and Q-231, which the owner then ruled on; its fix round recorded Q-650, and its re-check Q-651; the owner ruled on both on 2026-11-17, and Q-870 was recorded by that work and settled by its fix round, whose re-check recorded Q-873. Roadmap 4.9e settled Q-873 and recorded Q-970. Roadmap 5.5a settled Q-170 and recorded Q-250 to Q-253; its review recorded Q-254 to Q-259, Q-680 and Q-681. Roadmap 5.6a settled Q-88 and recorded Q-670, whose parts (a) and (b) the owner's ruling settled after it. Roadmap 8.3g recorded Q-610 to Q-613 and settled Q-304; its review recorded Q-614 and Q-615; the owner's ruling on its part (d) settled Q-612. The owner's rulings of 2026-11-16 settled Q-190 to Q-197, leaving Q-191 (b) to 8.3, Q-192 (b) to 6.4b, Q-196 (c) to 8.3 and the calendar part of Q-197 to 7.3; applying them recorded Q-760 and Q-761. The adaptive interval of the log writer recorded Q-710 to Q-713. The flush-pacing change recorded Q-980 to Q-985 and superseded the schedule of Q-310. The owner's ruling of 2026-11-17 settled Q-614 (the last-uploaded marker); applying it recorded Q-960 and Q-961, and its review Q-962. The store-path quick wins recorded Q-704 to Q-706; the lead settled Q-705 and Q-706. The adaptive batch-sync interval recorded Q-710 to Q-713; the owner settled Q-710, the lead decided Q-711 and Q-712, and its review settled Q-713. Roadmap 11.0 (the bounded decision history) recorded Q-750 to Q-755; the owner settled Q-750 at its review. The first profiling sweep recorded Q-830 to Q-835; the lead decided Q-830, settled Q-831, declined Q-833, kept Q-832 with Q-752, recorded Q-834 only and deferred Q-835. Its re-check recorded Q-836. Roadmap 9.0a (the derived files) recorded Q-773 to Q-779 and decided Q-774; its review decided Q-773 and settled Q-779, and its recheck recorded Q-780. Roadmap 6.2a1 recorded Q-810 and Q-811 and applied Q-797, Q-802, Q-803 and Q-805; its review settled Q-810 by the lead and accepted Q-811. Roadmap 9.0b1 (bounded refresh, the cut and the lease rules) recorded Q-850 to Q-853 and moved Q-773, Q-774 and Q-776 to 9.0c; its review recorded Q-854, decided by the lead, and moved Q-850 to 9.0f. Roadmap 9.0b2 (published views and the single-flight refresh) recorded and decided Q-900 to Q-903 and recorded Q-904. Integrating the durable fixes with bounded decision history recorded Q-925 and Q-937 and settled Q-921 to Q-924, Q-926, Q-927, Q-938 and Q-940 to Q-945; merging it into the engine recorded Q-928 and settled Q-929, Q-930, Q-946 and Q-947, merging roadmap 9.0b1 into it settled Q-948 and Q-949, and merging roadmap 6.2a1 settled Q-950.
 
 | Question | Settle by roadmap item | Note |
 |---|---|---|
@@ -3326,7 +3481,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-301 | 8.3 | The files a resumed restore fetches; recorded by roadmap 8.3b; exact for a log-only restore |
 | Q-302 | 8.3 | A restore's lost range and files other than log segments; recorded by roadmap 8.3b |
 | Q-303 | 8.3 | The local restore record file (kind 12); recorded by roadmap 8.3b |
-| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, to be confirmed by the next NVMe run before gate 4.9 |
+| Q-310 | 4.9 | Gate; recorded by the Linux NVMe run of roadmap 4.8; settled by the engineering fix to the sync schedule, whose schedule Q-980 supersedes; the next NVMe run before gate 4.9 confirms the budget under Q-980 |
 | Q-341 | 8.1d | The attach probe at `<sid>/probe`, also after a full restore; recorded when 8.3b was stacked on 8.1c |
 | Q-342 | 8.1d | `backed_up_through` in a restored generation; recorded when 8.3b was stacked on 8.1c |
 | Q-321 | 8.1 | Tiers and eviction: the log start needs another anchor than position 1 before the last sealed segment leaves the log directory, or a start reports a false `data_lost` from 1; settled otherwise after the review of Q-320 |
@@ -3357,9 +3512,9 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-680 | 5.5b | `Outcome` level and `LogStats.acknowledged`; recorded at the review of 5.5a; owner confirmation pending |
 | Q-681 | 5.5b | What `max_unsynced` bounds; recorded at the review of 5.5a; owner decision only for a hard bound |
 | Q-704 | 6.3b | The delivery reader's skipped refresh once the manifest changes during a run; recorded by the store-path quick wins |
-| Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9 |
+| Q-710 | 4.9 | Gate; the default `log.sync_interval_floor`: 2 ms by the owner's ruling, applied after the commit latency rows (indicative, a shared virtual machine); to be confirmed by the run on the Linux NVMe target before gate 4.9; its bound kept by Q-980 |
 | Q-711 | 4.9 | Gate; new fields in the log crate's `WriterConfig` and `LogStats`; decided by the lead with the first change, awaiting the owner's acceptance |
-| Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the sweep kept 8; awaiting the owner's acceptance |
+| Q-712 | 4.9 | Gate; the adaptive interval's constants; decided by the lead (8, an eighth, rise at once, batch syncs only); the sweep kept 8; awaiting the owner's acceptance; the budget's rate under Q-980 |
 | Q-751 | 5.6 | The recent windows' memory: constants per series and `limits.window_memory` store-wide, decided by the lead at the review of roadmap 11.0 |
 | Q-752 | 7.1b | A start bounded in memory but not in time until tree checkpoints carry the decision state; recorded by roadmap 11.0 |
 | Q-753 | 5.6 | The deliverer's recent window and its reads of the log; decided by the lead with roadmap 11.0 |
@@ -3373,6 +3528,12 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-780 | 8.3 | The log directory across a generation change: restored ends in the root; recorded by roadmap 9.0a |
 | Q-754 | 9.0f | The lookup's batch maps across a reset stamp or generation, for reader processes; recorded by roadmap 11.0 |
 | Q-755 | 6.3b | Damage found during a run recorded durably as a loss; health held degraded meanwhile by the lead's decision at the re-check of roadmap 11.0 |
+| Q-980 | 4.9 | Decided by the lead (the sync budget); confirmed by the next NVMe run |
+| Q-981 | 4.9 | Decided by the flush-pacing change (the floor a store key; the default stays the owner's 2 ms); for the lead's acceptance |
+| Q-982 | 4.9 | Decided by the flush-pacing change; for the lead's acceptance |
+| Q-983 | 4.9 | OWNER. Gate; the `8 × d` term against closed-loop latency above the budget, and the burst in the stated bound; (a) for now |
+| Q-984 | 4.9 | Decided by the flush-pacing change; for the lead's acceptance |
+| Q-985 | 4.9 | Decided by the flush-pacing change (a burst of four); for the lead's acceptance |
 | Q-760 | 5.6 | Gate; recorded when the owner's ruling on Q-195 (a) was applied |
 | Q-761 | 6.4b | Partitioned export layout; recorded when the owner's ruling on Q-196 was applied |
 | Q-832 | 7.1b | A start that skips old segments; kept with Q-752 by the lead; recorded by the first profiling sweep |
@@ -3827,7 +3988,7 @@ finds a higher generation claimed stops uploading and stays read-only across res
 | Cursor file synced at most every 1 s | §4 Consumer state (and at once when a confirmation changes a latch, Q-132) | The cursor and the latches are durable at once on confirmation; the mark file is synced first when the cursor would name a position above the last synced mark (§3 Durable mark) | — |
 | Age of a replayed delivery | §4 Replay: from `received_at` | Not modelled; replayed deliveries keep their original times | `consumer_down_for_a_day_resumes_from_cursor_replayed` |
 | Back-pressure wait | §3, §11: the wait is measured | Waits are counted, not timed (the model is synchronous) | `tests/rules.rs` `s3_full_ingest_queue_waits`, `tests/edge_cases.rs` `row_13_…` |
-| Group commit and the batch-sync interval | §3 Group commit: batch syncs are due at least the interval apart and start at least half of it after any log sync (Q-310); the interval follows the smoothed batch-sync duration between `sync_interval_floor` and `min_sync_interval` (Q-710 to Q-712); a batch takes in what arrives meanwhile | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous); `log/tests/pacing.rs` checks the writer against a reference schedule | — |
+| Group commit and its sync budget | §3 Group commit: a batch with nothing in flight is synced at once while the sync budget holds a sync, else at its next refill, taking everything queued (Q-980 to Q-985) | Not modelled: each commit is one batch and one sync, with no timing (the model is synchronous) | — |
 | Live staleness for stale-for conditions | §2.5, §5.4: bad-quality facts do not refresh it (see Q-16) | Any routed reading refreshes it; a resume takes the time since the last reading's `received_at` | `tests/open_questions.rs` `q16_stale_for_true_now_reported_true_on_resync` |
 | Clock jumps in health | §6 Windows, §11 | Not modelled | — |
 | Unknown condition and live state during a restore | §6 Conditions, §2.3 Live state, §4 Resync, §8 Restore step 2, invariant 16 (Q-49 (b)): an evaluation with no local detail is skipped and counted (`evaluations_unknown`), the condition keeps its latched state, `resync` reports "unknown", and the first evaluation with detail is a transition if it differs from the latch or there is none; live state of a series whose latest recorded `t` no local fact or stored node holds is unknown, not none | Not modelled: a series that stores no level answers windows and live state during a restore from its local facts, without a flag; nothing is reported unknown or counted | — |

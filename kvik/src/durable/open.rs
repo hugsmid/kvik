@@ -347,3 +347,29 @@ fn writer_config(config: &StoreConfig) -> WriterConfig {
         ..WriterConfig::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_store_passes_both_pacing_keys_to_the_log_with_the_logs_defaults() {
+        let mut config = StoreConfig::default();
+        assert_eq!(
+            writer_config(&config).sync_interval_floor,
+            kvik_log::writer::DEFAULT_SYNC_INTERVAL_FLOOR
+        );
+        assert_eq!(
+            writer_config(&config).min_sync_interval,
+            WriterConfig::default().min_sync_interval
+        );
+        config.log.sync_interval_floor = Duration::from_millis(50);
+        config.log.min_sync_interval = Duration::from_millis(100);
+        let w = writer_config(&config);
+        assert_eq!(
+            (w.sync_interval_floor, w.min_sync_interval),
+            (Duration::from_millis(50), Duration::from_millis(100))
+        );
+    }
+}

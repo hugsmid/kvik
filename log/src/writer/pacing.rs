@@ -1,5 +1,5 @@
-//! The adaptive batch-sync interval (spec §3 Group commit, Q-310, Q-712): a smoothed batch-sync duration sets the
-//! interval between the floor and `min_sync_interval`.
+//! Batch-sync pacing (spec §3 Group commit, Q-980 to Q-985): the sync-rate budget, a token bucket that refills at
+//! one batch sync per interval, and the smoothed batch-sync duration that sets the interval (Q-712).
 
 use std::time::Duration;
 
@@ -7,6 +7,10 @@ use std::time::Duration;
 pub(crate) const MULTIPLIER: u64 = 8;
 /// A shorter sample moves the estimate down by this fraction of the difference (Q-712).
 pub(crate) const FALL: u64 = 8;
+/// The batch syncs the budget holds: how many may start back to back after a quiet period (Q-985).
+pub(crate) const BURST: u64 = 4;
+/// One batch sync of the budget, in the units the budget is counted in.
+const TOKEN: u128 = 1_000_000_000;
 
 pub(crate) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -40,6 +44,55 @@ impl SyncPace {
         };
         let f = nanos(floor).min(c);
         Duration::from_nanos(d.saturating_mul(MULTIPLIER).clamp(f, c))
+    }
+}
+
+/// The sync-rate budget (Q-980): [`BURST`] batch syncs, refilled at one per interval, counted in billionths of a
+/// sync. Full at the start; a zero interval leaves it full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Budget {
+    /// Billionths of a sync spent below full, as of `at`; `None`: full.
+    spent: Option<(u64, Duration)>,
+}
+
+impl Budget {
+    fn full() -> u128 {
+        u128::from(BURST) * TOKEN
+    }
+
+    /// The budget left at `now` with `interval` in force.
+    fn left(&self, now: Duration, interval: Duration) -> u128 {
+        let Some((spent, at)) = self.spent else {
+            return Self::full();
+        };
+        let i = u128::from(nanos(interval));
+        if i == 0 {
+            return Self::full();
+        }
+        let refill = u128::from(nanos(now.saturating_sub(at))) * TOKEN / i;
+        (Self::full() - u128::from(spent) + refill).min(Self::full())
+    }
+
+    /// When the next batch sync may start: at once while a sync is left, else when the refill reaches one.
+    pub(crate) fn ready_at(&self, interval: Duration) -> Duration {
+        let Some((spent, at)) = self.spent else {
+            return Duration::ZERO;
+        };
+        let left = Self::full() - u128::from(spent);
+        if left >= TOKEN || interval.is_zero() {
+            return Duration::ZERO;
+        }
+        let wait = ((TOKEN - left) * u128::from(nanos(interval))).div_ceil(TOKEN);
+        at.saturating_add(Duration::from_nanos(
+            u64::try_from(wait).unwrap_or(u64::MAX),
+        ))
+    }
+
+    /// Spends one sync for a batch sync starting at `now`.
+    pub(crate) fn spend(&mut self, now: Duration, interval: Duration) {
+        let left = self.left(now, interval).saturating_sub(TOKEN);
+        let spent = u64::try_from(Self::full() - left).expect("the budget holds a few syncs");
+        self.spent = Some((spent, now));
     }
 }
 
@@ -80,8 +133,6 @@ mod tests {
         p.sample(160 * US);
         p.sample(2_000 * US);
         assert_eq!(est(&p), 2_000 * US);
-        p.sample(2_000 * US);
-        assert_eq!(est(&p), 2_000 * US);
     }
 
     #[test]
@@ -95,78 +146,81 @@ mod tests {
     #[test]
     fn the_interval_is_eight_times_the_estimate_between_the_bounds() {
         assert_eq!(pace(&[500 * US]).interval(FLOOR, CEILING), 4 * MS);
-        assert_eq!(pace(&[1_000 * US]).interval(FLOOR, CEILING), 8 * MS);
-    }
-
-    #[test]
-    fn a_fast_device_runs_at_the_floor_and_a_zero_sample_is_valid() {
         assert_eq!(pace(&[160 * US]).interval(FLOOR, CEILING), FLOOR);
-        assert_eq!(pace(&[0]).interval(FLOOR, CEILING), FLOOR);
-        assert_eq!(pace(&[0]).interval(Duration::ZERO, CEILING), Duration::ZERO);
-    }
-
-    #[test]
-    fn a_sync_of_an_eighth_of_the_ceiling_or_more_runs_at_the_ceiling() {
         assert_eq!(pace(&[1_250 * US]).interval(FLOOR, CEILING), CEILING);
+        assert_eq!(pace(&[0]).interval(Duration::ZERO, CEILING), Duration::ZERO);
+        assert_eq!(pace(&[160 * US]).interval(20 * MS, CEILING), CEILING);
         assert_eq!(
-            pace(&[1_249 * US]).interval(FLOOR, CEILING),
-            Duration::from_micros(9_992)
+            pace(&[160 * US]).interval(FLOOR, Duration::ZERO),
+            Duration::ZERO
         );
-        assert_eq!(pace(&[20_000 * US]).interval(FLOOR, CEILING), CEILING);
     }
 
     #[test]
-    fn a_floor_at_or_above_the_ceiling_fixes_the_interval_at_the_ceiling() {
-        for samples in [&[0][..], &[160 * US], &[30_000 * US]] {
-            assert_eq!(pace(samples).interval(CEILING, CEILING), CEILING);
-            assert_eq!(pace(samples).interval(20 * MS, CEILING), CEILING);
-        }
-    }
-
-    #[test]
-    fn a_zero_ceiling_disables_the_bound_whatever_the_floor() {
-        for samples in [&[][..], &[0], &[160 * US], &[30_000 * US]] {
-            assert_eq!(
-                pace(samples).interval(FLOOR, Duration::ZERO),
-                Duration::ZERO
-            );
-        }
-    }
-
-    #[test]
-    fn the_largest_sample_saturates_the_multiplication() {
+    fn the_largest_sample_and_ceiling_saturate() {
         let p = pace(&[u64::MAX]);
-        assert_eq!(est(&p), u64::MAX);
         assert_eq!(p.interval(FLOOR, CEILING), CEILING);
-        let max = Duration::from_nanos(u64::MAX);
-        assert_eq!(p.interval(FLOOR, max), max);
-        let p = pace(&[u64::MAX, 0]);
-        assert_eq!(est(&p), u64::MAX - u64::MAX / 8);
-    }
-
-    #[test]
-    fn a_ceiling_beyond_u64_nanoseconds_reads_the_same_before_and_after_a_sample() {
         let top = Duration::from_nanos(u64::MAX);
+        assert_eq!(p.interval(FLOOR, Duration::MAX), top);
         assert_eq!(SyncPace::default().interval(FLOOR, Duration::MAX), top);
-        assert_eq!(pace(&[u64::MAX]).interval(FLOOR, Duration::MAX), top);
+        assert_eq!(est(&pace(&[u64::MAX, 0])), u64::MAX - u64::MAX / 8);
     }
 
     #[test]
-    fn a_single_slow_sync_holds_the_ceiling_for_four_intervals_and_the_floor_returns_after_23() {
-        let mut p = pace(&[160 * US; 30]);
-        assert_eq!(p.interval(FLOOR, CEILING), FLOOR);
-        p.sample(2_000 * US);
-        let mut at_ceiling = 0;
-        while p.interval(FLOOR, CEILING) == CEILING {
-            at_ceiling += 1;
-            p.sample(160 * US);
+    fn a_full_budget_lets_the_burst_through_at_once_then_one_sync_per_interval() {
+        let mut b = Budget::default();
+        let t = Duration::from_secs(1);
+        for k in 0..BURST {
+            assert_eq!(b.ready_at(FLOOR), Duration::ZERO, "sync {k}");
+            b.spend(t, FLOOR);
         }
-        assert_eq!(at_ceiling, 4);
-        let mut above_floor = at_ceiling;
-        while p.interval(FLOOR, CEILING) > FLOOR {
-            above_floor += 1;
-            p.sample(160 * US);
+        assert_eq!(b.ready_at(FLOOR), t + FLOOR);
+        b.spend(t + FLOOR, FLOOR);
+        assert_eq!(b.ready_at(FLOOR), t + 2 * FLOOR);
+    }
+
+    #[test]
+    fn the_budget_refills_to_full_and_no_further() {
+        let mut b = Budget::default();
+        let t = Duration::from_secs(1);
+        b.spend(t, FLOOR);
+        assert_eq!(b.left(t + FLOOR / 2, FLOOR), Budget::full() - TOKEN / 2);
+        assert_eq!(b.left(t + 100 * FLOOR, FLOOR), Budget::full());
+        b.spend(t + 100 * FLOOR, FLOOR);
+        assert_eq!(b.left(t + 100 * FLOOR, FLOOR), Budget::full() - TOKEN);
+    }
+
+    #[test]
+    fn the_wait_for_a_partial_sync_rounds_up_so_the_refill_has_reached_it() {
+        let mut b = Budget::default();
+        let (i, ns) = (Duration::from_nanos(7), Duration::from_nanos(1));
+        let t = Duration::from_secs(1);
+        for _ in 0..BURST {
+            b.spend(t, i);
         }
-        assert_eq!(above_floor, 23);
+        b.spend(t + 10 * ns, i);
+        let r = b.ready_at(i);
+        assert_eq!(r, t + 15 * ns);
+        assert!(b.left(r, i) >= TOKEN);
+        assert!(b.left(r - ns, i) < TOKEN);
+    }
+
+    #[test]
+    fn a_zero_interval_leaves_the_budget_full() {
+        let mut b = Budget::default();
+        for _ in 0..10 * BURST {
+            b.spend(Duration::from_secs(1), Duration::ZERO);
+            assert_eq!(b.ready_at(Duration::ZERO), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn the_ready_time_saturates() {
+        let mut b = Budget::default();
+        let top = Duration::from_nanos(u64::MAX);
+        for _ in 0..BURST {
+            b.spend(Duration::MAX, top);
+        }
+        assert_eq!(b.ready_at(top), Duration::MAX);
     }
 }

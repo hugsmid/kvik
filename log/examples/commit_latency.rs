@@ -336,6 +336,9 @@ enum Load {
     },
     /// One writer, `readings` readings per call, each call submitted when the previous one is acknowledged.
     BackToBack { readings: u32 },
+    /// `writers` writers of one reading per call, each submitting its next call when its previous one is
+    /// acknowledged (closed loop).
+    Closed { writers: u32 },
     /// `threads` writers submitting calls of `readings` readings as fast as back-pressure allows.
     Saturation { threads: u32, readings: u32 },
 }
@@ -353,6 +356,7 @@ impl Load {
             } => format!("{writers} writers, {per_sec} calls/s × {readings}"),
             Load::BackToBack { readings: 1 } => "back to back, 1 writer".into(),
             Load::BackToBack { readings } => format!("back to back, 1 writer × {readings}/call"),
+            Load::Closed { writers } => format!("back to back, {writers} writers"),
             Load::Saturation { threads, readings } => {
                 format!("saturation {threads} × {readings}/call")
             }
@@ -384,12 +388,21 @@ fn loads(short: bool) -> Vec<(Load, u64)> {
         (
             Load::Paced {
                 writers: 16,
+                per_sec: 50,
+                readings: 10,
+            },
+            d(20, 5),
+        ),
+        (
+            Load::Paced {
+                writers: 16,
                 per_sec: 200,
                 readings: 10,
             },
             d(20, 5),
         ),
         (Load::BackToBack { readings: 1 }, d(10, 3)),
+        (Load::Closed { writers: 16 }, d(10, 3)),
         (Load::BackToBack { readings: 2000 }, d(10, 3)),
         (
             Load::Saturation {
@@ -417,7 +430,7 @@ struct Setup {
 }
 
 impl Setup {
-    const ALL: [Setup; 4] = [
+    const ALL: [Setup; 5] = [
         Setup {
             min_sync: Duration::ZERO,
             floor: Duration::ZERO,
@@ -431,6 +444,11 @@ impl Setup {
         Setup {
             min_sync: Duration::from_millis(10),
             floor: Duration::from_millis(2),
+            every_commit: false,
+        },
+        Setup {
+            min_sync: Duration::from_millis(10),
+            floor: Duration::ZERO,
             every_commit: false,
         },
         Setup {
@@ -509,8 +527,8 @@ fn wait_until(t: Instant) {
     }
 }
 
-/// How late a 5 ms sleep wakes, p50 and max of 50, in ms. The writer waits on timers too (`min_sync_interval`, the
-/// timed mark sync), so slack added by the operating system shows in the results.
+/// How late a 5 ms sleep wakes, p50 and max of 50, in ms. The writer waits on timers too (the refill of the sync
+/// budget, the timed mark sync), so slack added by the operating system shows in the results.
 fn timer_slack() -> String {
     let mut v: Vec<u64> = (0..50)
         .map(|_| {
@@ -587,7 +605,7 @@ fn schedule(load: Load, secs: u64) -> Vec<(Duration, u32, u32)> {
             }
             out.sort_unstable();
         }
-        Load::BackToBack { .. } | Load::Saturation { .. } => {}
+        Load::BackToBack { .. } | Load::Closed { .. } | Load::Saturation { .. } => {}
     }
     out
 }
@@ -670,6 +688,38 @@ fn run_load(log: &Arc<Log>, sync_log: &SyncLog, load: Load, secs: u64, setup: Se
                 }
                 calls += 1;
                 total += u64::from(count);
+            }
+        }
+        Load::Closed { writers } => {
+            let end = start + Duration::from_secs(secs);
+            let handles: Vec<_> = (0..writers)
+                .map(|w| {
+                    let log = log.clone();
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        let mut n = 0u64;
+                        while Instant::now() < end {
+                            let t0 = Instant::now();
+                            let p = log
+                                .submit(vec![reading(1 + w, n)])
+                                .expect("submit in a closed loop");
+                            let mut s = track(t0, p);
+                            if let Outcome::Pending(p) = s.outcome {
+                                s.outcome = Outcome::Ready(p.wait());
+                            }
+                            if tx.send(s).is_err() {
+                                break;
+                            }
+                            n += 1;
+                        }
+                        n
+                    })
+                })
+                .collect();
+            for h in handles {
+                let n = h.join().expect("a closed-loop writer");
+                calls += n;
+                total += n;
             }
         }
         Load::Saturation {
@@ -1092,8 +1142,10 @@ fn main() {
     for (rep, r) in &runs {
         // How late the generator sent, for the open-loop loads: latency counts from the submit call, so lateness
         // would not show in it (coordinated omission) but would bunch arrivals.
-        let (lag, lag_max) = if matches!(r.load, Load::BackToBack { .. } | Load::Saturation { .. })
-        {
+        let (lag, lag_max) = if matches!(
+            r.load,
+            Load::BackToBack { .. } | Load::Closed { .. } | Load::Saturation { .. }
+        ) {
             ("–".into(), "–".into())
         } else {
             (pct(&r.lag, 99.0), ms(r.lag.last().copied().unwrap_or(0)))

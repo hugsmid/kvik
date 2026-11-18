@@ -153,10 +153,11 @@ pub struct LogConfig {
     pub segment_size: u64,
     /// A segment is sealed after this long at the latest (default 5 minutes).
     pub seal_interval: Duration,
-    /// The ceiling of the batch-sync interval (default 10 ms; 0 disables the bound; spec §3 Group commit).
+    /// The ceiling of the batch-sync interval (default 10 ms; 0 disables the sync-rate budget; spec §3 Group
+    /// commit, Q-981).
     pub min_sync_interval: Duration,
-    /// The least batch-sync interval, which adapts to the sync's duration between this and `min_sync_interval`;
-    /// at or above `min_sync_interval` the interval is fixed (default 2 ms; spec §3 Group commit, Q-710).
+    /// The least batch-sync interval: batch syncs run at most one per floor over time, plus a burst of four
+    /// (default 2 ms; at or above `min_sync_interval` the interval is fixed; spec §3 Group commit, Q-710, Q-981).
     pub sync_interval_floor: Duration,
     /// Largest batch (default 1 MiB; 64 KiB to 8 MiB).
     pub max_batch_bytes: u64,
