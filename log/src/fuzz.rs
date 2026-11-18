@@ -13,7 +13,7 @@ use crate::mark::read_mark;
 use crate::scan::{Found, ScanLimit, ScanReport, Scanner, Tail, scan_with_stats};
 
 /// A scan that keeps the content its checks decoded finds what one that does not finds, and that content is what
-/// [`BatchContent::decode`] gives.
+/// [`BatchContent::decode`] gives, with the same work counted (Q-990).
 fn same_with_kept_content(data: &[u8], id: &SegmentIdentity, limit: ScanLimit) {
     let (Ok(plain), Ok(kept)) = (
         Scanner::new(data, id, limit),
@@ -21,7 +21,8 @@ fn same_with_kept_content(data: &[u8], id: &SegmentIdentity, limit: ScanLimit) {
     ) else {
         return;
     };
-    let plain: Vec<_> = plain.collect();
+    let mut plain_scanner = plain;
+    let plain: Vec<_> = plain_scanner.by_ref().collect();
     let mut kept_scanner = kept;
     let mut found = Vec::new();
     while let Some(f) = kept_scanner.next() {
@@ -38,6 +39,7 @@ fn same_with_kept_content(data: &[u8], id: &SegmentIdentity, limit: ScanLimit) {
         plain, found,
         "a scan keeping content finds what one without does"
     );
+    assert_eq!(plain_scanner.stats(), kept_scanner.stats());
 }
 
 /// Feeds `data` to every decoder of this crate as a log segment, a mark file, a lease file, a registry file and each

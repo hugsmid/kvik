@@ -142,7 +142,7 @@ pub(crate) fn read_batch_in<'a>(
 
 /// [`read_batch`] of a batch whose data blocks a boundary read of this scan has already judged, each body passing
 /// the checks of its type: the bodies are not checked again, so a kept body is checked once (Q-651); with `keep`,
-/// each is decoded for its content outside the counted checks.
+/// each is decoded for its content outside the counted checks (Q-990).
 pub(crate) fn read_judged_batch<'a>(
     reads: &mut Reads<'a>,
     id: &SegmentIdentity,
@@ -220,12 +220,6 @@ fn read_batch_at<'a>(
                     return incomplete(BatchFault::Content);
                 };
                 recovery |= t == block_type::ENTRIES && crate::entries::holds_recovery(b.body);
-                if keep {
-                    let Ok(body) = decode_block(t, b.body) else {
-                        return incomplete(BatchFault::Content);
-                    };
-                    bodies.push(body);
-                }
                 Some(p)
             }
             block_type::FACTS | block_type::ENTRIES => match reads.check_body(t, b.body, keep) {
@@ -306,6 +300,15 @@ fn read_batch_at<'a>(
     // A recovery entry is the only entry of its batch (A.6).
     if recovery && commit.last_sequence != commit.first_sequence {
         return incomplete(BatchFault::Content);
+    }
+    // Decoded only once the batch is kept, so a read that keeps none does no work its charge leaves out (Q-990).
+    if keep && judged {
+        for d in blocks.iter().filter(|d| d.prefix.is_some()) {
+            let Ok(body) = decode_block(d.block.header.block_type, d.block.body) else {
+                return incomplete(BatchFault::Content);
+            };
+            bodies.push(body);
+        }
     }
     BatchRead::Complete(
         Batch {

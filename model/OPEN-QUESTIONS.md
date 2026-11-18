@@ -120,6 +120,7 @@ is named; tests are in `tests/open_questions.rs` unless stated. Identifiers are 
 | Q-811 | `format-compacted.md` B.1, B.2 | Format details settled while writing the compacted segment's layout |
 | Q-872 | §7 Manifest step 4; `format.md` A.14 | The epochs a rebuild takes above a corrupt span with no later record |
 | Q-873 | `format.md` A common rules (Scan bound); `design.md` Budgets; `SECURITY.md` | The time of the header walk on a crafted file |
+| Q-990 | `format.md` A common rules (Scan bound) | A batch kept after damage, with its content kept (decided by the lead) |
 
 ## Q-16 — Which commits refresh live staleness
 **Scenario.** S = 3 minutes. (a) A series has been silent for 10 minutes and is stale; a late fact for last week is
@@ -3064,6 +3065,22 @@ over a gap in positions, option (b), would otherwise ask for acknowledgement of 
 retirement). Whether that limit stands until 6.3b, or a start should check file ids against something durable
 before then.
 
+## Q-990 — A batch kept after damage, with its content kept
+Decided by the lead when the scan-bound rulings (Q-651) met the scan that keeps the content its checks decode (the
+bounded decision history), for review.
+**Scenario.** After damage a scan reads at block boundaries through the walk, and the boundary read checks each body
+once; the batch it then keeps is read without checking its bodies again (Q-651). A scan keeping content (recovery's
+scan to the end, a reader's pass) needs each kept body decoded, which that read no longer did.
+**Decided.** When content is kept, the judged read decodes each facts and entries body of its batch once every
+check of the batch holds (`log/src/batch.rs` `read_judged_batch`), so a read that keeps no batch decodes nothing; the
+boundary read keeps its cheaper check. The decode is the content asked for, not a check, so `ScanStats` counts it
+nowhere and a scan keeping content counts what one without counts; a body kept after damage costs one check and one
+decode, as before Q-651, and failed reads stay as cheap as Q-651 made them.
+A decode that fails where the check passed would be a verdict the two disagree on, which Q-651's property rules out;
+it ends the batch as invalid content.
+**Pinned by.** `log/src/scan/tests.rs` `batches_kept_after_damage_keep_their_content_with_each_body_checked_once`; the
+segment fuzz target compares a scan keeping content with one that does not, findings, content and counts.
+
 ## Q-810 — What the manifest's layout of a compacted file may repeat from the file
 Recorded by roadmap 6.2a1. **Settled by the lead** at its review.
 **Scenario.** The compaction track's plan gives the publish record's layout (field 3 of `0x21`; the owner accepted
@@ -3264,6 +3281,7 @@ the `fault-trials` workflow settled Q-86 (b) on Linux, and its third run Q-52 (b
 | Q-811 | 6.2a2 | Format details of `format-compacted.md`, accepted at the review of roadmap 6.2a1; open for the two obligations it names for 6.2a2 (memory of the writer and the canonical check; the stall on decreasing commit times) |
 | Q-872 | 4.9 | Decided with the review of the Q-650 ruling: a rebuild's epochs go above what an open span may hold; for the owner's acceptance |
 | Q-873 | 4.9e | Decided at the re-check of the Q-651 ruling: the header walk is bounded in time so that every crafted file fits the 1 s restart budget, by roadmap 4.9e before gate 4.9 |
+| Q-990 | 4.9 | Decided by the lead: a batch kept after damage has its bodies decoded for its content outside the counted checks; for review |
 
 Not a question: the figures behind §3 Sync primitive. The 2.2 spike measured sync costs on macOS only; roadmap 4.8
 measured the engine's commit path on macOS and added a harness and a workflow that run it on Linux and Windows cloud

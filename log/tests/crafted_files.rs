@@ -317,7 +317,7 @@ fn a_crafted_manifest_search_passes_the_rest_of_a_window_once_failed_reads_use_i
 
 /// The failed reads' charges and the search's probes name the same window when a reader parses only a tail from a
 /// base that is not a multiple of the window: records whose field list does not parse, and lost ranges that do not
-/// decode.
+/// decode; both reads report the window they passed corrupt (Q-650).
 #[test]
 fn a_crafted_manifest_tail_read_from_inside_a_window_charges_the_window_it_probes() {
     let mut prefix = FileHeader::new(kind::MANIFEST, 0, 1, 0, [9; 16])
@@ -334,10 +334,9 @@ fn a_crafted_manifest_tail_read_from_inside_a_window_charges_the_window_it_probe
         let shape = (2_000, 100_000, RECORD_LOST_RANGE, 0x8001);
         let f = crafted_after(prefix.clone(), epoch + 1, shape, overrun);
         let (whole, whole_stats) = read_manifest_with_stats(&f, &[9; 16]);
-        let whole = whole.unwrap();
-        assert_eq!((whole.records.len() as u64, whole.valid_end), (epoch, base));
+        assert_eq!(whole, Err(ManifestError::Corrupt(base)));
         let (tail, stats) = read_records_with_stats(&f[base as usize..], base, epoch);
-        assert_eq!(tail, Ok((Vec::new(), base)));
+        assert_eq!(tail, Err(ManifestError::Corrupt(base)));
         assert!(
             within_budget(stats.failed_bytes_peak),
             "{overrun}: {stats:?}"
